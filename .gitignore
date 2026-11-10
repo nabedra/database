@@ -1,1 +1,10 @@
 .env
+/server/target/
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/dist/
+**/*.egg-info/
+/artifacts/
+*.key
+*.pem

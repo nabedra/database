@@ -1,0 +1,31 @@
+[package]
+name = "meshdb-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+publish = false
+
+[dependencies]
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
+axum-server = { version = "=0.9.1", default-features = false, features = ["tls-rustls"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
+http-body-util = "=0.1.5"
+mime = "=0.3.18"
+tracing = "=0.1.44"
+clap = { version = "=4.6.7", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["raw_value", "arbitrary_precision"] }
+uuid = { version = "=1.29.2", features = ["serde", "v4"] }
+aws-config = "=1.13.1"
+aws-sdk-s3 = "=1.158.0"
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "io-util"] }
+
+arrow-array = "=60.1.0"
+arrow-schema = "=60.1.0"
+parquet = { version = "=60.1.0", default-features = false, features = ["arrow"] }
+bytes = "=1.12.1"
+
+[dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
+http-body = "=1.1.0"

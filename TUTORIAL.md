@@ -1,0 +1,278 @@
+# Using MeshDB v0
+
+Build a small task tracker with the current implementation. You will start the
+server, create a table through Python, write and query rows, and verify that the
+data survives a server restart. Run shell commands from the repository root.
+
+MeshDB v0 has a synchronous Python client, a Rust server, and S3 storage. Python
+validates inputs and sends JSON operations to the server. The server reads and
+writes immutable Parquet files in S3. Only the server needs AWS credentials;
+your Python application needs its URL and shared bearer token.
+
+## 1 Install the client and build the server
+
+You need Python 3.11 or newer, Rust 1.94.1 or newer with Cargo, and access to an
+existing S3 general purpose bucket. There is no local disk storage mode in v0.
+
+```sh
+python3.11 -m venv orm/.venv
+orm/.venv/bin/python -m pip install -e ./orm
+
+export CARGO_BUILD_JOBS=2
+export CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_PROFILE_TEST_DEBUG=0
+cargo build --locked --manifest-path server/Cargo.toml
+```
+
+The client uses only the Python standard library at runtime. Installing it does
+not start a server.
+
+## 2 Configure and start the server
+
+Use two terminals. In terminal 1, configure an AWS profile that can read and
+conditionally write objects in the bucket. The server also supports the normal
+AWS SDK credential chain, including environment credentials and roles.
+
+For this checkout's testing bucket:
+
+```sh
+export AWS_PROFILE='<your-configured-profile>'
+export AWS_REGION='us-east-1'
+export MESHDB_S3_BUCKET='meshdb-testing'
+export MESHDB_S3_PREFIX="test-001-tutorial-$(orm/.venv/bin/python -c 'import uuid; print(uuid.uuid4().hex)')/"
+```
+
+Replace the profile placeholder. Supply `MESHDB_TOKEN` privately in both
+terminals, using the same nonempty, header-safe bearer token. Then start the
+server in terminal 1:
+
+```sh
+: "${MESHDB_TOKEN:?Set the shared bearer token in this terminal}"
+server/target/debug/meshdb-server serve --host 127.0.0.1 --port 8000
+```
+
+Keep this terminal open. The bucket and prefix identify the database. The
+generated prefix gives this tutorial its own namespace; retain its value for
+the restart step. Run one server process per bucket/prefix.
+
+The server does not load the repository `.env` automatically. That file uses
+`BUCKET_NAME`, while the server requires `MESHDB_S3_BUCKET`. Do not source or
+print the supplied credential file. See the [server configuration
+guide](server/README.md#configuration) for other deployment settings.
+
+In terminal 2, check that the server can answer requests and read its catalog:
+
+```sh
+curl --fail --silent --show-error -o /dev/null http://127.0.0.1:8000/health/live
+curl --fail --silent --show-error -o /dev/null http://127.0.0.1:8000/health/ready
+```
+
+Both commands should finish successfully with no output. Readiness checks the
+catalog; it does not scan table files or verify write permission.
+
+## 3 Connect and create a table
+
+In terminal 2, confirm that the same token is set and open Python:
+
+```sh
+: "${MESHDB_TOKEN:?Set the same bearer token as the server}"
+orm/.venv/bin/python
+```
+
+Paste the following Python blocks into this same session, in order:
+
+```python
+import os
+import uuid
+from meshdb import DB, col
+
+db = DB("http://127.0.0.1:8000", os.environ["MESHDB_TOKEN"])
+table_name = "tutorial_tasks_" + uuid.uuid4().hex
+tasks = db.create_table(
+    table_name,
+    {"id": str, "title": str, "priority": int, "done": bool},
+    key="id",
+)
+print(tasks.name)
+print(tasks.schema)
+```
+
+`DB(...)` validates the connection settings without contacting the server.
+`create_table(...)` sends a request and returns a table handle. Each run uses a
+fresh table name, so it can coexist with an earlier run.
+
+Schemas accept exactly `str`, `int`, `float`, and `bool`. Every column is
+required and nonnullable. Integers must fit signed int64 and floats must be
+finite. Values must match their declared types exactly; `1` cannot fill a
+`float` column and `True` cannot fill an `int` column. The primary key must be a
+unique `str` or `int` column.
+
+## 4 Insert and retrieve tasks
+
+```python
+inserted = tasks.insert_many([
+    {"id": "t1", "title": "Read the guide", "priority": 1, "done": True},
+    {"id": "t2", "title": "Build a demo", "priority": 3, "done": False},
+    {"id": "t3", "title": "Write tests", "priority": 2, "done": False},
+])
+assert inserted == 3
+
+print(tasks.get("t2"))
+# {'id': 't2', 'title': 'Build a demo', 'priority': 3, 'done': False}
+
+assert tasks.get("missing") is None
+```
+
+`insert_many` is one atomic operation. A duplicate key anywhere in the batch,
+including a key already stored in the table, rejects the entire batch. To add
+one row, use `tasks.insert(full_row)`.
+
+## 5 Filter and query the table
+
+```python
+open_tasks = tasks.where(done=False)
+urgent = open_tasks.where(col("priority") >= 2)
+query = urgent.select("id", "title").order_by("priority", desc=True).limit(10)
+
+assert query.collect() == [
+    {"id": "t2", "title": "Build a demo"},
+    {"id": "t3", "title": "Write tests"},
+]
+assert query.count() == 2
+print(query.explain())
+```
+
+Builders such as `where`, `select`, `order_by`, and `limit` return new queries
+without making requests. They leave `open_tasks` and `urgent` unchanged.
+`collect`, `count`, and `explain` each send a request. Explain reads metadata
+without scanning rows; collect and count each read a fresh committed snapshot.
+Separate calls may therefore observe different data if another client writes.
+
+The server filters, orders, limits, then projects columns. You can sort by
+`priority` without including it in the returned columns. Default ordering is
+primary-key ascending; explicit sort ties also use primary-key ascending.
+Count respects an explicit limit, so `urgent.limit(1).count()` returns `1`.
+
+Combine comparisons with `&`, `|`, and `~`, with parentheses around comparisons:
+
+```python
+matches = tasks.where((col("priority") >= 2) & (col("done") == False))
+assert matches.count() == 2
+```
+
+Python `and`, `or`, and `not` cannot combine these query expressions.
+
+## 6 Update replace and delete rows
+
+```python
+updated = tasks.update("t2", {"done": True})
+assert updated is True
+assert tasks.get("t2")["title"] == "Build a demo"
+
+tasks.upsert({
+    "id": "t3", "title": "Write integration tests", "priority": 3, "done": False,
+})
+
+deleted = tasks.delete("t1")
+assert deleted is True
+assert tasks.get("t1") is None
+assert tasks.query().count() == 2
+```
+
+`update` changes only the supplied columns and returns `False` for a missing
+row. It cannot change the primary key, even to its existing value. `upsert`
+requires a complete row and replaces the whole existing row or inserts a new
+one. Delete returns `False` when the key is already absent.
+
+These calls commit separately. Only the batch insertion above is one atomic
+batch; there is no transaction spanning multiple calls.
+
+## 7 Restart and reopen the table
+
+Leave Python running in terminal 2. In terminal 1, press Ctrl+C and wait for the
+server to exit. It stops accepting work and drains admitted operations. Restart
+it in that same terminal, retaining the bucket, prefix, and token:
+
+```sh
+server/target/debug/meshdb-server serve --host 127.0.0.1 --port 8000
+```
+
+Do not rerun the prefix generation command, since that would select a different
+database. Back in your existing Python session:
+
+```python
+reopened = db.table(table_name)
+assert reopened.id == tasks.id
+assert reopened.query().count() == 2
+assert reopened.get("t2")["done"] is True
+print([table.name for table in db.tables()])
+```
+
+A new application process can also reopen the table by its printed name with
+`db.table("<printed-table-name>")`; it does not recreate the schema.
+
+On restart, the server follows `catalog.json` in S3. Each catalog entry points
+to an immutable file at `tables/<table_id>/<commit_id>.parquet`. A write that
+changes rows uploads a complete replacement snapshot, then conditionally
+updates the catalog. That catalog update commits the change. Reads continue to
+use the snapshot referenced by the catalog they observed.
+
+## 8 Handle errors and storage limits
+
+For example, trying to insert the same key again raises `ConflictError`:
+
+```python
+from meshdb import ConflictError
+
+try:
+    reopened.insert({"id": "t2", "title": "Duplicate", "priority": 1, "done": False})
+except ConflictError as error:
+    print(error.code, error.request_id, error.outcome)
+```
+
+Invalid schema values raise `ValidationError`; rejected authentication raises
+`AuthenticationError`; missing tables raise `NotFoundError`. Error objects
+carry a code, request ID, HTTP status, and outcome when available.
+
+If a mutation raises `UnknownOutcomeError`, it may already have committed or
+may still commit. Inspect and reconcile the intended change before deciding
+whether to write again. An immediate read showing old data does not prove
+rollback. The client never retries automatically, and request IDs do not
+deduplicate writes. See [errors and uncertain
+writes](orm/README.md#errors-and-uncertain-writes).
+
+Key lookups and queries scan entire tables, and changes rewrite entire table
+snapshots. Batch related inserts when possible. Keep these limits in mind:
+
+| Item | Maximum |
+| --- | --- |
+| Schema | 128 columns |
+| One insert batch | 10,000 rows |
+| One collected result | 10,000 rows |
+| Encoded JSON request or response including envelope | 8 MiB each |
+| One table | 100,000 rows and 64 MiB of decoded row payload |
+
+Byte limits may be reached before row limits. Oversized results fail instead
+of truncating. Use an explicit limit or fewer selected columns for smaller
+results. Count returns a scalar and can count more than 10,000 matching rows.
+v0 has no pagination, streaming, SQL, joins, indexes, or schema migrations.
+
+## 9 Finish the tutorial
+
+The examples retain the table so you can inspect it after another restart.
+If you want to remove this tutorial table from the catalog, run this optional
+step in Python:
+
+```python
+reopened.drop()
+```
+
+Drop retains the Parquet snapshots in S3. There is no garbage collection in v0.
+After a drop, existing handles raise `NotFoundError`. Recreating the same name
+produces a new table ID, so obtain a new handle before using it.
+
+For a remote deployment, configure [native HTTPS](server/README.md#configuration)
+and connect with an `https://` URL. The client verifies certificates and
+hostnames; a private CA can be supplied with `DB(..., ca_file="/path/to/ca.pem")`.
+The [Python API guide](orm/README.md) covers the full method contracts, and the
+[server guide](server/README.md) covers deployment and operation settings.

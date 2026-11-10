@@ -1,0 +1,107 @@
+"""Actual local subprocess lifecycle guard. No dotenv reads or AWS calls."""
+
+import os
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from acceptance_support import AcceptanceConfig
+from server_process import ServerProcess, ServerProcessError
+
+
+class ProcessGuard(unittest.TestCase):
+    def test_local_process_restart_and_failed_start_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "fixture-server"
+            binary.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
+                import argparse
+                import os
+                import signal
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                parser = argparse.ArgumentParser()
+                parser.add_argument("command", choices=["serve"])
+                parser.add_argument("--host")
+                parser.add_argument("--port", type=int)
+                parser.add_argument("--workers", type=int)
+                parser.add_argument("--queue-size", type=int)
+                args = parser.parse_args()
+                assert args.host == "127.0.0.1"
+                assert (args.workers, args.queue_size) == (4, 64)
+                assert os.environ["MESHDB_S3_BUCKET"] == "meshdb-testing"
+                assert os.environ["MESHDB_S3_PREFIX"].endswith("/")
+                assert os.environ["AWS_ACCESS_KEY_ID"] == "synthetic-key"
+                assert "AWS_ENDPOINT_URL" not in os.environ
+                assert "AWS_PROFILE" not in os.environ
+                assert os.environ["MESHDB_TOKEN"]
+
+                def terminate(signum, frame):
+                    print("STOP", os.getpid(), flush=True)
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, terminate)
+                class Health(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        ready = "never-ready" not in os.environ["MESHDB_S3_PREFIX"]
+                        self.send_response(200 if self.path == "/health/ready" and ready else 503)
+                        self.end_headers()
+                    def log_message(self, *args):
+                        pass
+
+                with HTTPServer((args.host, args.port), Health) as server:
+                    print("START", os.getpid(), os.environ["MESHDB_S3_PREFIX"], flush=True)
+                    server.serve_forever()
+                '''), encoding="utf-8")
+            binary.chmod(0o700)
+            config = AcceptanceConfig("meshdb-testing", "us-east-1", {
+                "AWS_REGION": "us-east-1", "AWS_ACCESS_KEY_ID": "synthetic-key",
+                "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
+            })
+            namespace = config.allocate_prefix(2, "lifecycle", run_id="local")
+            log = root / "child.log"
+            with patch.dict(os.environ, {"AWS_ENDPOINT_URL": "invalid", "AWS_PROFILE": "invalid",
+                                         "MESHDB_S3_BUCKET": "invalid", "MESHDB_S3_PREFIX": "invalid"}):
+                server = ServerProcess(config, namespace, binary=binary, log_path=log,
+                                       startup_timeout=3, shutdown_timeout=1)
+                token = server.private_token
+                with server:
+                    first_pid = server.pid
+                    self.assertTrue(server.api_url.startswith("http://127.0.0.1:"))
+                    self.assertIsNone(server.returncode)
+                    self.assertNotIn(token, repr(server))
+                self.assertEqual(server.returncode, 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(first_pid, 0)
+                with self.assertRaisesRegex(RuntimeError, "scenario failed"):
+                    with server:
+                        self.assertNotEqual(first_pid, server.pid)
+                        self.assertEqual(token, server.private_token)
+                        raise RuntimeError("scenario failed")
+                self.assertEqual(server.returncode, 0)
+                self.assertEqual(server.stop(), 0)
+
+                failed_log = root / "failed.log"
+                failed = ServerProcess(config, config.allocate_prefix(2, "never-ready"),
+                                       binary=binary, log_path=failed_log,
+                                       startup_timeout=0.8, shutdown_timeout=1)
+                with self.assertRaises(ServerProcessError) as failure:
+                    failed.start()
+                self.assertNotIn(token, str(failure.exception))
+                self.assertEqual(failed.returncode, 0)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(failed.pid, 0)
+                self.assertIn(f"STOP {failed.pid}", failed_log.read_text())
+                self.assertEqual(log.read_text().count(namespace.prefix), 2)
+                self.assertEqual(log.read_text().count("STOP"), 2)
+
+                # Incomplete TLS settings must fail before any child launches.
+                with self.assertRaises(ServerProcessError):
+                    ServerProcess(config, namespace, binary=binary, tls_cert=root / "cert.pem")
+
+
+if __name__ == "__main__":
+    unittest.main()
