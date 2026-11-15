@@ -12,4 +12,4 @@ When you are given a task or asked to make a change, do the following:
 
 To file the PR, use the `file-pr` skill in this repo. Include before and after pictures or videos for UI changes and give a concise description of the problem and solution of the PR
 
-Also include, if possible, screenshots and videos of a terminal running or other methods to visualize the functionality implemented (diagrams, charts, etc.) and efficiency and time benchmarks for logic implementations (jitter, lag, time-to-first-token, results from the tests for scaling or load scenarios...)
+Also always include screenshots and videos of the functional implementation of logic, or other methods to visualize the feature (diagrams, charts, etc.) and efficiency and time benchmarks (jitter, lag, time-to-first-token, results from the tests for scaling or load scenarios...)
