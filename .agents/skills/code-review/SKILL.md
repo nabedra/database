@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Call when doing QA, code review or testing
+description: Use when asked to do QA, code review or testing
 ---
 
 When you are asked to review a PR, an implementation or the like, do the following:
@@ -27,6 +27,6 @@ Do check point 0's most fundamental checks for compilation, syntax errors, plaus
 
 # Rubric-style reviewing
 
-When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, ask them or use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
+When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, assume you shall use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
 
 Try to spawn as many subagents as possible without interfering with the tests of each other. E.g., if Test 2a has to wait for Test 1a to be done, then don't run a subagent for Test 2a until Test 1a is done; but if Test 1a and Test 1b, and 1c and 1d... can be done in parallel, spawn a subagent for each.
