@@ -1,8 +1,4 @@
-use meshdb_server::{partition_size, storage};
-#[path = "../src/config.rs"]
-mod config;
-
-use config::{Config, ServeOptions};
+use meshdb_server::config::{self, Config, ServeOptions};
 use std::{env::VarError, path::PathBuf};
 
 fn configured(
@@ -29,8 +25,6 @@ fn configured(
 
 #[test]
 fn defaults_and_explicit_options_use_storage_namespace() {
-    // Keep the production constructor part of the checked contract without reading the environment.
-    let _: fn(ServeOptions) -> Result<Config, config::ConfigError> = Config::from_env;
     let config = configured(ServeOptions::default(), &[]).unwrap();
     assert_eq!(
         config.options().host,

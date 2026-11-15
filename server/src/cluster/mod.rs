@@ -10,10 +10,10 @@ pub(crate) mod heartbeat;
 pub mod member;
 pub(crate) mod membership;
 pub(crate) mod provision;
+pub mod runtime;
 pub mod state;
 pub mod store;
 // Remove the allowance when startup callers land.
 #[allow(dead_code)]
 pub(crate) mod startup_config;
 pub(crate) mod startup_material;
-pub mod runtime;

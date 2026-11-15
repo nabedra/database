@@ -74,17 +74,11 @@ mod tests {
     use super::{MAX_PARTITION_BYTES, PartitionSize};
 
     #[test]
-    fn accepts_64_mib_as_the_default_hard_cap() {
-        for input in ["64MiB", "67108864B"] {
-            assert_eq!(input.parse::<PartitionSize>().unwrap().bytes(), 67_108_864);
-        }
-        assert_eq!(PartitionSize::default().bytes(), 67_108_864);
-    }
-
-    #[test]
     fn units_use_si_and_iec_byte_arithmetic() {
         for (input, bytes) in [
             ("1 B", 1),
+            ("64MiB", 67_108_864),
+            ("67108864B", 67_108_864),
             ("64kb", 64_000),
             ("64 kb", 64_000),
             ("64 Kb", 64_000),

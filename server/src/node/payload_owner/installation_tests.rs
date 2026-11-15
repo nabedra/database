@@ -6298,3 +6298,164 @@ async fn checked_control_continues_original_tcp_reader_through_eof() {
         assert_eq!(valid, case == 0, "TCP case {case}");
     }
 }
+
+#[tokio::test]
+async fn self_dependency_account_reaps_while_original_operation_response_is_retained() {
+    let (owners, threads, path, process) = booted(1, 1, 0).await;
+    let transport = Arc::new(Semaphore::new(2));
+    let binding = owners
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .local()
+        .unwrap()
+        .fixture_binding(100);
+    let permit = uuid::Uuid::from_u128(20100);
+    let mut operation = owners
+        .prepare_pair(
+            Role::Operation,
+            transport.clone().try_acquire_owned().unwrap(),
+            None,
+        )
+        .unwrap();
+    let installed = {
+        let mut state = owners.shared.state.lock().unwrap();
+        let (registry, local) = state.parts();
+        registry
+            .reserve_pair_locked(
+                local.unwrap(),
+                &mut operation,
+                &process,
+                binding.clone(),
+                permit,
+                None,
+                tests::limits(),
+            )
+            .unwrap()
+            .install_entry_locked()
+    };
+    drop(operation);
+    let mut account = installed.account.unwrap();
+    let mut stream = installed.stream;
+    account.ready().await.unwrap();
+    stream.ready().await.unwrap();
+    let response = account.retain_delivery().unwrap();
+
+    // Self TCP jobs use the same dependency permit as their original operation.
+    let mut job = owners
+        .prepare_pair(
+            Role::Dependency,
+            transport.clone().try_acquire_owned().unwrap(),
+            None,
+        )
+        .unwrap();
+    let installed = {
+        let mut state = owners.shared.state.lock().unwrap();
+        let (registry, local) = state.parts();
+        registry
+            .reserve_pair_locked(
+                local.unwrap(),
+                &mut job,
+                &process,
+                binding.clone(),
+                permit,
+                Some((uuid::Uuid::from_u128(3), uuid::Uuid::from_u128(4))),
+                tests::limits(),
+            )
+            .unwrap()
+            .install_entry_locked()
+    };
+    drop(job);
+    let mut job_stream = installed.stream;
+    job_stream.ready().await.unwrap();
+    let dependency_account = {
+        let state = owners.shared.state.lock().unwrap();
+        state
+            .payload
+            .entries
+            .iter()
+            .find(|entry| matches!(entry.guards.owner(), Some(DistributedOwner::Dependency(_))))
+            .unwrap()
+            .slot
+            .id
+    };
+    let closed = owners
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .close_dependency_locked(&binding, permit);
+    drop(job_stream);
+    // Drive the real handles through job cleanup and account reaping while the
+    // original operation and its response hold are deliberately still alive.
+    let released = tokio::time::timeout(
+        WATCHDOG,
+        poll_fn(|cx| {
+            reap_shared(&owners.shared, Some(cx));
+            let state = owners.shared.state.lock().unwrap();
+            if state.payload.failed {
+                Poll::Ready(false)
+            } else if state
+                .payload
+                .entries
+                .iter()
+                .all(|entry| entry.slot.id != dependency_account)
+            {
+                Poll::Ready(true)
+            } else {
+                Poll::Pending
+            }
+        }),
+    )
+    .await;
+    let (counts, retained_operation, retained_response) = {
+        let state = owners.shared.state.lock().unwrap();
+        let retained = state
+            .payload
+            .entries
+            .iter()
+            .any(|entry| Arc::ptr_eq(&entry.slot, &account.slot));
+        (
+            state.local().unwrap().counts(),
+            retained,
+            *account.slot.delivery_holds.lock().unwrap() == 1,
+        )
+    };
+    let operation_scratch_retained = account
+        .slot
+        .disk
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|disk| disk.operation.is_some());
+    let charged_transport = transport.available_permits();
+    drop(response);
+    drop(stream);
+    drop(account);
+    drop(process);
+    let drained = tokio::time::timeout(WATCHDOG, owners.close_and_drain()).await;
+    if !matches!(drained, Ok(Ok(()))) {
+        // The pre-fix failure quarantines original handles. Dispose them before
+        // reporting the regression so the failing test leaves no worker/scratch.
+        tokio::time::timeout(WATCHDOG, tests::quarantine_teardown(&owners))
+            .await
+            .unwrap();
+    }
+    let joined = tokio::time::timeout(WATCHDOG, threads.shutdown()).await;
+    let empty = std::fs::read_dir(&path).unwrap().count() == 0;
+    std::fs::remove_dir(path).unwrap();
+    assert!(matches!(
+        closed,
+        Ok(super::super::admission::Close::Pending)
+    ));
+    assert!(
+        matches!(released, Ok(true)),
+        "self dependency account release: {released:?}"
+    );
+    assert_eq!(counts, (1, 0, 0, 0, 1));
+    assert!(retained_operation && retained_response && operation_scratch_retained);
+    assert_eq!(charged_transport, 1);
+    assert!(matches!(drained, Ok(Ok(()))) && matches!(joined, Ok(Ok(()))) && empty);
+    assert_eq!(transport.available_permits(), 2);
+}

@@ -665,7 +665,9 @@ impl<'de> Deserialize<'de> for LogicalPredicate {
 }
 // Serde structs can otherwise accept positional JSON arrays. Wire objects must
 // carry named fields, including nested query/order/predicate objects.
-pub(crate) fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+pub(crate) fn deserialize_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<T, D::Error> {
     struct ObjectVisitor<T>(std::marker::PhantomData<T>);
     impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
         type Value = T;

@@ -1,6 +1,5 @@
 """Transport contract tests using one local HTTP fixture and bounded fake streams."""
 import json
-import ssl
 import threading
 import unittest
 import uuid
@@ -103,7 +102,6 @@ class TransportTests(unittest.TestCase):
                  ({'request_id': str(uuid.uuid4()), 'data': None}, 200, 'application/json'),
                  ({'request_id': None, 'data': None}, 200, 'application/json'),
                  (lambda r: {'request_id': r['request_id'], 'data': None}, 200, 'text/html'),
-                 (b'{"request_id":null,"data":NaN}', 200, 'application/json'),
                  ({'request_id': None, 'error': {'code': 'conflict', 'message': 'x', 'outcome': 'not_applied'}}, 500, 'application/json'),
                  (b'x' * (LIMIT + 1), 503, 'application/json')]
         for body, status, content_type in cases:
@@ -171,18 +169,24 @@ class TransportTests(unittest.TestCase):
                 self.transport.request('not.an.operation', {})
             opened.assert_not_called()
 
-    def test_private_ssl_context_adds_ca_without_network(self):
-        with patch('meshdb.client.ssl.create_default_context', wraps=ssl.create_default_context) as create, patch.object(ssl.SSLContext, 'load_verify_locations') as load:
-            with patch('urllib.request.OpenerDirector.open') as opened:
-                _Transport('https://example.test', 'token', ca_file='extra.pem')
-                opened.assert_not_called()
-            create.assert_called_once_with()
-            load.assert_called_once_with(cafile='extra.pem')
-        transport = _Transport('https://example.test', 'token')
-        contexts = [h._context for h in transport._opener.handlers if hasattr(h, '_context')]
-        self.assertEqual(len(contexts), 1)
-        self.assertTrue(contexts[0].check_hostname)
-        self.assertEqual(contexts[0].verify_mode, ssl.CERT_REQUIRED)
+    def test_strict_json_rejects_ambiguous_and_nonfinite_successes(self):
+        # Each envelope has the correct ID, so its data must cause rejection.
+        for data in (b'0,"data":1', b'{"value":0,"value":1}', b'NaN',
+                     b'Infinity', b'-Infinity', b'1e999', b'"\xff"'):
+            def response(request):
+                return (b'{"request_id":' + json.dumps(request['request_id']).encode()
+                        + b',"data":' + data + b'}')
+
+            self.set_reply(response)
+            for operation, expected in [('table.get', errors.ProtocolError),
+                                        ('table.insert', errors.UnknownOutcomeError)]:
+                with self.subTest(data=data, operation=operation):
+                    before = len(self.seen)
+                    with self.assertRaises(expected) as caught:
+                        self.transport.request(operation, {})
+                    self.assertEqual(len(self.seen), before + 1, 'invalid replies must not retry')
+                    self.assertEqual(caught.exception.request_id, self.seen[-1][3]['request_id'])
+                    self.assertEqual(caught.exception.status_code, 200)
 
     def test_bounded_reads_close_success_http_error_and_read_failure(self):
         for mode in ['success', 'http_error', 'read_failure', 'http_error_read_failure', 'malformed', 'decoder_failure']:

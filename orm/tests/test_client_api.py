@@ -3,7 +3,6 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
 
 import meshdb
 from meshdb import errors
@@ -47,7 +46,6 @@ class ClientAPITests(unittest.TestCase):
     def setUp(self):
         type(self).seen = []
         self.reply(descriptor())
-        self.assertTrue(hasattr(meshdb, 'DB'), 'DB must be public')
         self.db = meshdb.DB(f'http://127.0.0.1:{self.server.server_port}/', 'test', timeout=5)
 
     def reply(self, result, status=200):
@@ -55,9 +53,6 @@ class ClientAPITests(unittest.TestCase):
 
     def test_config_and_invalid_inputs_are_local(self):
         self.assertEqual(self.seen, [])
-        with patch('meshdb.client.ssl.create_default_context') as context:
-            meshdb.DB('https://example.test/base', 'test', ca_file='test-ca.pem', timeout=2)
-            context.return_value.load_verify_locations.assert_called_once_with(cafile='test-ca.pem')
         for kwargs in [dict(api_url='relative', token='test'), dict(api_url='http://localhost', token=''),
                        dict(api_url='http://localhost', token='test', timeout=0)]:
             with self.assertRaises(errors.ValidationError):

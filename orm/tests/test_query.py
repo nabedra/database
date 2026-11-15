@@ -1,5 +1,4 @@
 """Pure query construction, without transport or row execution."""
-import json
 import unittest
 from dataclasses import FrozenInstanceError, dataclass
 
@@ -33,7 +32,6 @@ class QueryTests(unittest.TestCase):
             "order_by": {"column": "age", "desc": True}, "limit": 100,
         }
         self.assertEqual(query._to_wire(), expected)
-        self.assertEqual(json.loads(json.dumps(query._to_wire(), allow_nan=False)), expected)
         wire = query._to_wire()
         wire["select"].clear()
         wire["filter"]["args"][0]["value"] = 0

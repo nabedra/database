@@ -1,5 +1,4 @@
 """Private control transport behavior against a real loopback peer."""
-import importlib.util
 import json
 import socket
 import ssl
@@ -61,9 +60,6 @@ class ControlTransportTests(unittest.TestCase):
         type(self).reply = staticmethod(reply)
 
     def test_policy_lost_reply_is_unknown_and_not_retried(self):
-        # Give a useful RED assertion before the implementation module exists.
-        self.assertIsNotNone(importlib.util.find_spec('meshdb._control_transport'),
-                             'private control transport must handle a lost policy reply')
         def lost(handler, request):
             handler.connection.shutdown(socket.SHUT_RDWR)
             handler.close_connection = True
@@ -107,7 +103,7 @@ class ControlTransportTests(unittest.TestCase):
         cases = [
             (lambda r: {'request_id': r['request_id'], 'data': {}, 'extra': 1}, 200, 0),
             ({'request_id': str(uuid.uuid4()), 'data': {}}, 200, 0),
-            (b'{"request_id":null,"data":1,"data":2}', 200, 0),
+            (lambda r: ('{"request_id":"' + r['request_id'] + '","data":1,"data":2}').encode(), 200, 0),
             (lambda r: ('{"request_id":"' + r['request_id'] + '","data":NaN}').encode(), 200, 0),
             (b'x' * (LIMIT + 1), 200, 0),
             (lambda r: {'request_id': r['request_id'], 'data': {}}, 200, 7),

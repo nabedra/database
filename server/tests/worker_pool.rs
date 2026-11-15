@@ -46,8 +46,6 @@ async fn fixed_threads_route_and_bound_work() {
                         tokio::task::yield_now().await;
                     });
                     assert_eq!(before, thread::current().id());
-                    let sum: usize = (0..1000).sum();
-                    assert_eq!(sum, 499500);
                     Ok((id, thread::current().id()))
                 })
                 .await

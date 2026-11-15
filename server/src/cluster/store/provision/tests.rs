@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     cluster::{
         controller::{Owner, OwnershipChange, ownership_candidate},
-        provision::allocate_start,
+        provision::{allocate_start, managed_capacity},
     },
     storage::{Download, Namespace},
     test_storage::{Fake, ReadGate},
@@ -269,4 +269,68 @@ async fn successful_takeover_fences_old_allocation() {
     let f = s.backend().fake.state.lock().unwrap();
     assert_eq!(Control::decode(&f.objects[KEY].0).unwrap(), takeover);
     assert_ne!(f.objects[KEY].1, "captured");
+}
+
+#[tokio::test]
+async fn unreadable_lost_allocation_reply_keeps_capacity_reserved_after_reload() {
+    let mut c = root();
+    c.policy.desired = 1;
+    c.policy.min_nodes = 1;
+    c.policy.max_nodes = 1;
+    let s = store(&c);
+    let base = s.load_control(deadline()).await.unwrap();
+    let pending = PreparedProvision::prepare(base, candidate(&c, 10)).unwrap();
+    let expected = pending.candidate.clone();
+    {
+        let mut faults = s.backend().fake.state.lock().unwrap();
+        faults.lose_put_response = true;
+        faults.read_failure = true;
+    }
+    assert!(matches!(
+        pending.submit(&s, deadline()).await.unwrap(),
+        OwnershipOutcome::Unknown { current: None }
+    ));
+    assert_eq!(counts(&s), (1, 2));
+
+    // A new observer has no in-memory knowledge of the possible allocation.
+    let restarted = Storage::new(
+        Backend {
+            fake: s.backend().fake.clone(),
+            ..Backend::default()
+        },
+        Namespace::new("test").unwrap(),
+    );
+    {
+        let mut faults = restarted.backend().fake.state.lock().unwrap();
+        faults.lose_put_response = false;
+        faults.read_failure = false;
+    }
+    let loaded = restarted.load_control(deadline()).await.unwrap();
+    assert_eq!(loaded.root(), &expected);
+    assert_eq!(managed_capacity(loaded.root()), Ok(1));
+    assert_eq!(loaded.root().capacity().unwrap().credits, 1);
+    assert!(matches!(
+        allocate_start(loaded.root(), owner(), id(20), id(21), 20, id(22)),
+        Err(StorageError::Conflict)
+    ));
+    // Raising the goal permits a new launch, but cannot reuse the uncertain one.
+    let mut enlarged = loaded.root().clone();
+    enlarged.policy.desired = 2;
+    enlarged.policy.min_nodes = 2;
+    enlarged.policy.max_nodes = 2;
+    for (node, launch) in [(10, 21), (20, 11)] {
+        assert!(matches!(
+            allocate_start(&enlarged, owner(), id(node), id(launch), 20, id(22)),
+            Err(StorageError::Conflict)
+        ));
+    }
+    let successor = allocate_start(&enlarged, owner(), id(20), id(21), 20, id(22))
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(managed_capacity(&successor), Ok(2));
+    assert_eq!(&successor.nodes[0], &expected.nodes[0]);
+    assert_eq!(&successor.intents[0], &expected.intents[0]);
+    assert_eq!(counts(&restarted), (1, 3));
+    assert!(restarted.backend().conditions.lock().unwrap().is_empty());
 }
