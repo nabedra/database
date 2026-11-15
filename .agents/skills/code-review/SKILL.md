@@ -24,3 +24,9 @@ If there is some compatibility issue (i.e., a change of specs; e.g., migrating f
 Do not overcheck. Never ever create AI slop tests that do not add a ton of value to the code and quality review. These are relatively useless because compilation, syntax errors, etc. are already covered in point 0 and in order to make the actually valuable tests (those that imply user interaction with the UI, intercommunication between logic modules, scaling, AWS/Stripe/Third party integration and API usage, memory/CPU/GPU usage...) the "fundamentals" of the repo (it complies, etc) must indeed work well. 
 
 Do check point 0's most fundamental checks for compilation, syntax errors, plausible errors that might occur during code execution in some edge case scenario...
+
+# Rubric-style reviewing
+
+When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, ask them or use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
+
+Try to spawn as many subagents as possible without interfering with the tests of each other. E.g., if Test 2a has to wait for Test 1a to be done, then don't run a subagent for Test 2a until Test 1a is done; but if Test 1a and Test 1b, and 1c and 1d... can be done in parallel, spawn a subagent for each.
