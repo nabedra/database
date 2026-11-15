@@ -25,6 +25,11 @@ Do not overcheck. Never ever create AI slop tests that do not add a ton of value
 
 Do check point 0's most fundamental checks for compilation, syntax errors, plausible errors that might occur during code execution in some edge case scenario...
 
+4. Work in realistic environments
+Always use a testing yet realistic environment. E.g., if you are creating a program that is intended to run on AWS S3, ask the user for credentials/access to the appropriate env (look you might already have them available at some `.env`) to run localized tests on realistic envs. If you have to implement a database on Kubernetes, run locally a set of Docker or Kubernetes runtime and test the whole program there. You have to emulate realistic setups with realistic behaviour that real users might indeed exhibit when engaging with the environment. NOTE: make sure to run tests that are suitable to the CPU, RAM and other computational resources available; you might be working with an Intel i5 and you might have to work around CPU limits there by batching the tests with N rather than 10N parallel threads, or go little by little with a queue of tasks, etc.
+
+NOTE: if you use paid tools such as AWS S3 for the tests, it is even more important to make them high-value and limited in cost. Always try to minimize costs when using paid tools and do not over do the testing, e.g. by running thousands of EC2 instances running for hours. The tests should be very respectful with costs.
+
 # Rubric-style reviewing
 
 When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, assume you shall use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
