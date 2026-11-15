@@ -3,6 +3,7 @@ use crate::{storage::Namespace, test_storage::Fake};
 use std::time::Duration;
 fn binding() -> HeartbeatBinding {
     HeartbeatBinding {
+        resources: None,
         cluster_id: Uuid::from_u128(1),
         node_id: Uuid::from_u128(2),
         incarnation: Uuid::from_u128(3),
@@ -15,12 +16,41 @@ fn binding() -> HeartbeatBinding {
 }
 fn sample() -> HeartbeatSample {
     HeartbeatSample {
+        available_threads: None,
+        available_memory_bytes: None,
         running_operations: 2,
         running_partitions: 3,
         queued_operations: 4,
         queued_partitions: 4,
         drain_id: None,
         accepting: true,
+    }
+}
+#[test]
+fn c01_c02_availability_is_bound_to_advertised_resource_limits() {
+    let mut binding = binding();
+    binding.resources = Some(crate::config::WorkerResources {
+        max_threads: 3,
+        memory_limit_bytes: 1000,
+        task_memory_limit_bytes: 800,
+        control_memory_reserve_bytes: 100,
+    });
+    let mut sample = sample();
+    sample.available_threads = Some(2);
+    sample.available_memory_bytes = Some(700);
+    let record = binding.record(&sample, 1);
+    assert!(record.validate().is_ok());
+    let decoded = Heartbeat::decode(&record.encode().unwrap()).unwrap();
+    assert_eq!(decoded.available_threads, Some(2));
+    assert_eq!(decoded.available_memory_bytes, Some(700));
+    for (threads, bytes) in [
+        (Some(4), Some(700)),
+        (Some(2), Some(901)),
+        (None, Some(700)),
+    ] {
+        sample.available_threads = threads;
+        sample.available_memory_bytes = bytes;
+        assert!(binding.record(&sample, 2).validate().is_err());
     }
 }
 fn deadline() -> Instant {

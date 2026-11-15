@@ -131,12 +131,117 @@ where
         })
     }
 }
+struct NetworkBody {
+    body: axum::body::Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl hyper::body::Body for NetworkBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 pub(crate) async fn serve_router(
     listener: TcpListener,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    serve_router_with_budget(listener, app, tls, 64, shutdown).await
+}
+
+pub(crate) async fn serve_router_with_budget(
+    listener: TcpListener,
+    app: axum::Router,
+    tls: Option<RustlsConfig>,
+    data_connections: usize,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    if data_connections == 0 || data_connections > 8192 {
+        return Err(io::Error::other("invalid data connection budget"));
+    }
+    let data = std::sync::Arc::new(tokio::sync::Semaphore::new(data_connections));
+    let ingress = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let receipts = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let replicas = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let bootstrap = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let controls = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+    let app = app.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let data = data.clone();
+            let ingress = ingress.clone();
+            let receipts = receipts.clone();
+            let replicas = replicas.clone();
+            let bootstrap = bootstrap.clone();
+            let controls = controls.clone();
+            async move {
+                let path = request.uri().path();
+                let class = if path == "/internal/v1/queue" {
+                    request
+                        .headers()
+                        .get("x-meshdb-queue-class")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("progress")
+                } else if path == "/internal/v1/enroll" {
+                    "bootstrap"
+                } else if path == "/v1/requests" && request.method() == axum::http::Method::POST {
+                    "ingress"
+                } else if path.starts_with("/v1/requests/") {
+                    "receipt"
+                } else if path.starts_with("/health/")
+                    || (path.starts_with("/internal/")
+                        && path != "/internal/v1/jobs"
+                        && path != "/internal/v1/operations")
+                    || path.starts_with("/v1/cluster/")
+                {
+                    "progress"
+                } else {
+                    "data"
+                };
+                let permit = match class {
+                    "ingress" => ingress,
+                    "receipt" => receipts,
+                    "replica" => replicas,
+                    "bootstrap" => bootstrap,
+                    "progress" => controls,
+                    _ => data,
+                }
+                .try_acquire_owned();
+                match permit {
+                    Ok(permit) => next.run(request).await.map(|body| {
+                        axum::body::Body::new(NetworkBody {
+                            body,
+                            _permit: permit,
+                        })
+                    }),
+                    Err(_) => {
+                        let error = crate::api::response::encode_error(
+                            None,
+                            crate::protocol::ProtocolError::new(
+                                crate::protocol::ErrorCode::Overloaded,
+                                "listener request class capacity exhausted",
+                                crate::protocol::Outcome::NotApplied,
+                            ),
+                        );
+                        axum::http::Response::builder()
+                            .status(error.status)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(error.body))
+                            .unwrap()
+                    }
+                }
+            }
+        },
+    ));
     let app = app.layer(axum::middleware::from_fn(
         |request: axum::extract::Request, next: axum::middleware::Next| async move {
             if let Some(charge) = request.extensions().get::<HeaderCharge>() {
@@ -158,7 +263,9 @@ pub(crate) async fn serve_router(
         .max_buf_size(16384)
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(5));
-    let total = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    let total = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        data_connections + 16 + 8 + 8 + 4 + 8 + 24,
+    ));
     let headers = std::sync::Arc::new(tokio::sync::Semaphore::new(24));
     let serve = async {
         match tls {
@@ -199,52 +306,65 @@ pub async fn serve<B: ObjectStore + 'static>(
     tls: Option<RustlsConfig>,
     shutdown: impl Future<Output = io::Result<()>>,
 ) -> io::Result<()> {
-    let handle = Handle::new();
-    let result = async {
-        let app =
-            api::router(engine.clone(), executor.clone(), token).merge(api::health::router(engine));
-        let listener = listener.into_std()?;
-        let (failed, mut failures) = tokio::sync::mpsc::channel(1);
-        let server = axum_server::from_tcp(listener)?
-            .handle(handle.clone())
-            .accept_error_handler(move |address, error| {
-                // A failed TLS handshake belongs to one client. Only errors
-                // from the listening socket shut down the process.
-                if address.is_none() {
-                    let _ = failed.try_send(error.kind());
-                }
-            });
-        let serving = async {
-            match tls {
-                Some(tls) => {
-                    server
-                        .acceptor(RustlsAcceptor::new(tls))
-                        .serve(app.into_make_service())
-                        .await
-                }
-                None => server.serve(app.into_make_service()).await,
-            }
-        };
-        let shutdown = async {
-            tokio::select! {
-                signal = shutdown => signal,
-                Some(kind) = failures.recv() => Err(io::Error::new(kind, "listener failed")),
-            }
-        };
-        tokio::pin!(serving);
-        tokio::select! {
-            result = &mut serving => result,
-            signal = shutdown => {
-                executor.stop_accepting();
-                handle.graceful_shutdown(None);
-                let served = serving.await;
-                signal.and(served)
-            }
-        }
+    serve_configured(
+        listener,
+        engine,
+        executor,
+        token,
+        tls,
+        shutdown,
+        crate::config::ExecutionConfig::default(),
+        false,
+        false,
+    )
+    .await
+}
+
+pub async fn serve_configured<B: ObjectStore + 'static>(
+    listener: TcpListener,
+    engine: Engine<B>,
+    executor: Executor,
+    token: String,
+    tls: Option<RustlsConfig>,
+    shutdown: impl Future<Output = io::Result<()>>,
+    execution: crate::config::ExecutionConfig,
+    cold_start: bool,
+    migrate_catalog: bool,
+) -> io::Result<()> {
+    let (app, queue_tasks, queue) = api::router_with_queue_startup(
+        engine.clone(),
+        executor.clone(),
+        token,
+        execution,
+        cold_start,
+        migrate_catalog,
+    )
+    .map_err(|_| io::Error::other("invalid queue configuration"))?;
+    if let Err(error) = queue.initialize(&engine).await {
+        executor.stop_accepting();
+        queue_tasks.stop_accepting();
+        executor.drain().await;
+        queue_tasks.drain().await;
+        return Err(io::Error::other(error.message));
     }
+    let signal_result = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let outcome = signal_result.clone();
+    let ingress = executor.clone();
+    let result = serve_router(
+        listener,
+        app.merge(api::health::router(engine)),
+        tls,
+        async move {
+            let result = shutdown.await;
+            ingress.stop_accepting();
+            *outcome.lock().unwrap() = Some(result);
+        },
+    )
     .await;
     executor.stop_accepting();
-    handle.graceful_shutdown(None);
     executor.drain().await;
-    result
+    queue_tasks.stop_accepting();
+    queue_tasks.drain().await;
+    let signal = signal_result.lock().unwrap().take().unwrap_or(Ok(()));
+    signal.and(result)
 }

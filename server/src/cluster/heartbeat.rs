@@ -5,6 +5,7 @@ use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HeartbeatBinding {
+    pub(crate) resources: Option<crate::config::WorkerResources>,
     pub(crate) cluster_id: Uuid,
     pub(crate) node_id: Uuid,
     pub(crate) incarnation: Uuid,
@@ -16,6 +17,8 @@ pub(crate) struct HeartbeatBinding {
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct HeartbeatSample {
+    pub(crate) available_threads: Option<u64>,
+    pub(crate) available_memory_bytes: Option<u64>,
     pub(crate) running_operations: u64,
     pub(crate) running_partitions: u64,
     pub(crate) queued_operations: u64,
@@ -114,6 +117,9 @@ fn check_deadline(deadline: Instant) -> Result<(), StorageError> {
 impl HeartbeatBinding {
     fn record(&self, sample: &HeartbeatSample, sequence: u64) -> Heartbeat {
         Heartbeat {
+            available_threads: sample.available_threads,
+            available_memory_bytes: sample.available_memory_bytes,
+            resources: self.resources,
             version: 1,
             cluster_id: self.cluster_id,
             node_id: self.node_id,
@@ -141,6 +147,8 @@ impl HeartbeatBinding {
         }
         self.record(
             &HeartbeatSample {
+                available_threads: None,
+                available_memory_bytes: None,
                 running_operations: 0,
                 running_partitions: 0,
                 queued_operations: 0,
@@ -160,6 +168,7 @@ impl HeartbeatBinding {
             && h.operation_slots == self.operation_slots
             && h.partition_slots == self.partition_slots
             && h.queue_size == self.queue_size
+            && h.resources == self.resources
     }
 }
 /// Definite absence is Ok(None). All other failures retain their sanitized category.

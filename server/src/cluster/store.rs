@@ -261,3 +261,6 @@ mod drain;
 // Pending drain reconciliation runtime caller.
 #[allow(unused_imports)]
 pub(crate) use drain::PreparedDrain;
+
+mod scheduler;
+pub(crate) use scheduler::PreparedScheduler;

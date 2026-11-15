@@ -1,8 +1,9 @@
 //! Metadata-only publication against one captured v3 root. No execution or table
 //! uploads happen here. See PreparedPublication for the caller's sequencing duty.
 use super::{
-    CatalogEntry, ClusterCatalog, Decision, HistoryBudget, HistoryLookup, LoadedClusterCatalog,
-    MAX_DECISION_BYTES, ObjectKey, ObjectStore, Storage, StorageError, TableData, WriteCondition,
+    CatalogEntry, CatalogFence, ClusterCatalog, Decision, HistoryBudget, HistoryLookup,
+    LoadedClusterCatalog, MAX_DECISION_BYTES, ObjectKey, ObjectStore, Storage, StorageError,
+    TableData, WriteCondition,
 };
 use std::{collections::BTreeMap, future::Future};
 use tokio::time::{Instant, timeout_at};
@@ -48,6 +49,29 @@ impl PreparedPublication {
         tables: BTreeMap<String, CatalogEntry>,
         decision: Decision,
     ) -> Result<Self, StorageError> {
+        if base.catalog().fence.is_some() {
+            return Err(StorageError::Conflict);
+        }
+        Self::prepare_inner(base, tables, decision)
+    }
+    /// Capture the expected owner from admitted work, never from a fresh root.
+    pub fn prepare_fenced(
+        base: LoadedClusterCatalog,
+        tables: BTreeMap<String, CatalogEntry>,
+        decision: Decision,
+        expected: CatalogFence,
+    ) -> Result<Self, StorageError> {
+        expected.validate()?;
+        if base.catalog().fence != Some(expected) || base.catalog().format_version != 4 {
+            return Err(StorageError::Conflict);
+        }
+        Self::prepare_inner(base, tables, decision)
+    }
+    fn prepare_inner(
+        base: LoadedClusterCatalog,
+        tables: BTreeMap<String, CatalogEntry>,
+        decision: Decision,
+    ) -> Result<Self, StorageError> {
         let old = base.catalog();
         if decision.id == old.commit_id
             || decision.parent != old.decision_head
@@ -76,11 +100,12 @@ impl PreparedPublication {
             }
         }
         let root = ClusterCatalog {
-            format_version: 3,
+            format_version: old.format_version,
             revision: decision.revision,
             commit_id: decision.id,
             tables,
             decision_head: Some(decision.id),
+            fence: old.fence,
         };
         let decision_bytes = decision.encode()?;
         let root_bytes = root.encode()?;

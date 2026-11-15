@@ -15,6 +15,21 @@ use uuid::Uuid;
 /// Both valid JSON bodies may double in size when quoted in the outer record.
 pub const MAX_DECISION_BYTES: usize = 4 * MAX_BODY_BYTES + 64 * 1024;
 
+/// Included in the conditional catalog root, so stale owners cannot publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogFence {
+    pub run_id: Uuid,
+    pub scheduler_term: u64,
+}
+impl CatalogFence {
+    pub fn validate(self) -> Result<(), StorageError> {
+        if self.run_id.is_nil() || self.scheduler_term == 0 {
+            return Err(StorageError::InvalidCatalog);
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterCatalog {
     pub format_version: u32,
@@ -22,6 +37,8 @@ pub struct ClusterCatalog {
     pub commit_id: Uuid,
     pub tables: BTreeMap<String, CatalogEntry>,
     pub decision_head: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence: Option<CatalogFence>,
 }
 impl ClusterCatalog {
     /// Prepare an in-memory v3 root. Performs no conditional migration or I/O.
@@ -33,11 +50,15 @@ impl ClusterCatalog {
             commit_id: catalog.commit_id,
             tables: catalog.tables.clone(),
             decision_head: None,
+            fence: None,
         })
     }
     pub fn validate(&self) -> Result<(), StorageError> {
-        if self.format_version != 3 {
-            return Err(StorageError::UnsupportedCatalog);
+        match (self.format_version, self.fence) {
+            (3, None) => {}
+            (4, Some(fence)) => fence.validate()?,
+            (3 | 4, _) => return Err(StorageError::InvalidCatalog),
+            _ => return Err(StorageError::UnsupportedCatalog),
         }
         Catalog {
             format_version: 2,
@@ -57,9 +78,11 @@ impl ClusterCatalog {
             tables: Box<RawValue>,
             #[serde(deserialize_with = "required_nullable")]
             decision_head: Option<Uuid>,
+            #[serde(default)]
+            fence: Option<CatalogFence>,
         }
         let wire: Wire = object(bytes, MAX_CATALOG_BYTES)?;
-        if wire.format_version != 3 {
+        if !matches!(wire.format_version, 3 | 4) {
             return Err(StorageError::UnsupportedCatalog);
         }
         // Keep raw tables through the legacy decoder, which owns object shape,
@@ -81,13 +104,16 @@ impl ClusterCatalog {
             MAX_CATALOG_BYTES,
         )?;
         let catalog = Catalog::decode(&bytes)?;
-        Ok(Self {
-            format_version: 3,
+        let decoded = Self {
+            format_version: wire.format_version,
             revision: catalog.revision,
             commit_id: catalog.commit_id,
             tables: catalog.tables,
             decision_head: wire.decision_head,
-        })
+            fence: wire.fence,
+        };
+        decoded.validate()?;
+        Ok(decoded)
     }
     pub fn encode(&self) -> Result<Vec<u8>, StorageError> {
         self.validate()?;

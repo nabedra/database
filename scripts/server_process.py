@@ -11,6 +11,7 @@ import socket
 import ssl
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +29,8 @@ class ServerProcess:
     temporary file that closes on stop. Logs may contain sensitive server data.
     """
 
+    _launch_lock = threading.Lock()
+
     def __init__(self, config, namespace, *, binary=None, startup_timeout=30,
                  shutdown_timeout=10, log_path=None, tls_cert=None, tls_key=None,
                  test_ca=None, workers=4, partition_size=None):
@@ -43,6 +46,7 @@ class ServerProcess:
         if partition_size is not None:
             self._worker_args.extend(["--partition_size", partition_size])
         self._env = config.server_env(namespace)
+        self._namespace = namespace
         self._binary = Path(binary if binary is not None else
                             Path(__file__).resolve().parents[1] / "server/target/debug/meshdb-server").resolve()
         self._startup_timeout = startup_timeout
@@ -92,7 +96,11 @@ class ServerProcess:
         return self._process.poll() if self._process is not None else None
 
     def start(self):
-        """Start or restart the same namespace; return self after readiness."""
+        """Start after readiness; a proven prior child exit permits a cold run.
+
+        The allocated namespace retains that exact process receipt across helper
+        instances. This never acknowledges migration of an unknown old catalog.
+        """
         if self._process is not None and self._process.poll() is None:
             raise ServerProcessError("Server is already running.")
         # Also close a previous launch's artifact if it exited between calls.
@@ -104,12 +112,20 @@ class ServerProcess:
             else:
                 fd = os.open(self._log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 self._log = os.fdopen(fd, "ab")
-            self._process = subprocess.Popen(
-                [str(self._binary), "serve", "--host", "127.0.0.1", "--port", str(self._port),
-                 *self._worker_args, "--queue-size", "64", *self._tls_args],
-                env=self._env, stdin=subprocess.DEVNULL, stdout=self._log,
-                stderr=subprocess.STDOUT, close_fds=True,
-            )
+            with self._launch_lock:
+                previous = self._namespace._server_process
+                if previous is not None and previous.poll() is None:
+                    raise ServerProcessError("The allocated namespace still has an unexited owned server.")
+                # poll() is an actual exit observation on the original owned
+                # child. A fresh namespace never receives this acknowledgement.
+                restart = ["--cold-start"] if previous is not None else []
+                self._process = subprocess.Popen(
+                    [str(self._binary), "serve", "--host", "127.0.0.1", "--port", str(self._port),
+                     *self._worker_args, "--queue-size", "64", *self._tls_args, *restart],
+                    env=self._env, stdin=subprocess.DEVNULL, stdout=self._log,
+                    stderr=subprocess.STDOUT, close_fds=True,
+                )
+                object.__setattr__(self._namespace, "_server_process", self._process)
             while self._process.poll() is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

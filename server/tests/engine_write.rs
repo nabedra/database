@@ -637,13 +637,22 @@ async fn mutation_workers_overlap_and_drain_without_publication_on_error() {
         }
         let threads = engine.storage().backend().threads.lock().unwrap().clone();
         assert_eq!(threads.len(), 2);
-        assert_ne!(threads[0].0, threads[1].0);
         assert!(
             threads
                 .iter()
-                .all(|(_, name)| name.starts_with("meshdb-worker-"))
+                .all(|(_, name)| !name.starts_with("meshdb-worker-"))
         );
-        assert_ne!(threads[0].1, threads[1].1);
+        let usage = engine.worker_pool().scheduler().usage();
+        assert_eq!(usage[0].1, 0, "storage waits must release CPU capacity");
+        assert!(usage[0].2 > 0, "private candidate input bytes stay charged");
+        engine
+            .worker_pool()
+            .submit(99, |_, _| Ok(()))
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
         gates[0].release.add_permits(1);
         engine
             .worker_pool()

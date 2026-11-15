@@ -71,6 +71,7 @@ pub(crate) enum Command {
         expected: Box<JobEnvelope>,
     },
     ExecuteCaptured(Arc<crate::storage::Storage<crate::storage::HttpStore>>),
+    ExecutePrepared(crate::engine::CapturedInput),
     StagePrepared {
         table: uuid::Uuid,
         commit: uuid::Uuid,
@@ -170,6 +171,7 @@ pub(super) struct Slot {
     kind: Kind,
     deadline: Option<Instant>,
     disk: Mutex<Option<ManuallyDrop<Disk>>>,
+    retained_memory: Mutex<Option<crate::scheduling::MemoryCharge>>,
     handoff: Mutex<Handoff>,
     wake: watch::Sender<bool>,
     children: Mutex<usize>,
@@ -238,6 +240,7 @@ impl Slot {
     fn discard(&self) {
         let value = self.disk.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(value.map(ManuallyDrop::into_inner));
+        self.retained_memory.lock().unwrap().take();
         #[cfg(test)]
         self.hooks
             .lock()
@@ -362,6 +365,9 @@ pub(super) struct PayloadRegistry {
     entries: Vec<Entry>,
     accepted_limit: usize,
     operation_bound: usize,
+    operation_stream_bound: usize,
+    dependency_stream_bound: usize,
+    outgoing_bound: usize,
     positions: Vec<Option<u64>>,
     records: Vec<Option<AcceptedOwner>>,
     controls: Vec<Entry>,
@@ -607,6 +613,8 @@ struct Shared {
     operations: Arc<Semaphore>,
     operation_transport: Arc<Semaphore>,
     dependency_transport: Arc<Semaphore>,
+    outgoing: Arc<Semaphore>,
+    outgoing_limit: usize,
 }
 pub(crate) struct PayloadOwners {
     shared: Arc<Shared>,
@@ -674,6 +682,9 @@ impl PayloadOwners {
                         entries: Vec::with_capacity(8481),
                         accepted_limit: 8481,
                         operation_bound: 4352,
+                        operation_stream_bound: 16,
+                        dependency_stream_bound: 16,
+                        outgoing_bound: 16,
                         positions: vec![None; 8481],
                         records: (0..8768).map(|_| None).collect(),
                         controls: Vec::with_capacity(64),
@@ -692,6 +703,8 @@ impl PayloadOwners {
                 operations,
                 operation_transport,
                 dependency_transport,
+                outgoing: Arc::new(Semaphore::new(16)),
+                outgoing_limit: 16,
             }),
         }
     }
@@ -871,6 +884,7 @@ impl PayloadOwners {
             kind,
             deadline,
             disk: Mutex::new(Some(ManuallyDrop::new(Disk::empty()))),
+            retained_memory: Mutex::new(None),
             handoff: Mutex::new(Handoff { cancelled: false }),
             wake,
             children: Mutex::new(0),
@@ -1474,6 +1488,63 @@ pub(super) async fn run_command(
     run(pool, slot, Work::Command(command)).await
 }
 async fn run(pool: &WorkerPool, slot: &Arc<Slot>, work: Work) -> Result<Reply> {
+    let work = match work {
+        Work::Command(Command::ExecuteCaptured(storage)) => {
+            let job = {
+                let disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;
+                let Processor::AcceptedRequest(job) =
+                    &disk.as_ref().ok_or(OwnerError::Invalid)?.processor
+                else {
+                    return Err(OwnerError::Invalid);
+                };
+                job.clone()
+            };
+            let (input, charge) = crate::engine::prepare_captured(&storage, pool, &job)
+                .await
+                .map_err(|_| OwnerError::Invalid)?;
+            let request = job.scheduler_request_id();
+            let cell = slot.clone();
+            let (reply, mut charge) = pool
+                .submit_buffered(
+                    request,
+                    1,
+                    vec![charge],
+                    pool.resources().task_memory_limit_bytes,
+                    move |_, runtime| {
+                        Ok(execute(
+                            &cell,
+                            Work::Command(Command::ExecutePrepared(input)),
+                            runtime,
+                        ))
+                    },
+                )
+                .await
+                .map_err(|_| OwnerError::Invalid)?
+                .receive()
+                .await
+                .map_err(|_| OwnerError::Invalid)?;
+            let retained = {
+                let disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;
+                match &disk.as_ref().ok_or(OwnerError::Invalid)?.processor {
+                    Processor::Accepted(rows, _) => {
+                        let payload = rows.iter().map(crate::snapshot::row_payload).sum::<usize>();
+                        crate::snapshot::memory_shape(&job.table, rows.len(), payload, 0)
+                            .map_err(|_| OwnerError::Invalid)?
+                    }
+                    _ => 4096,
+                }
+            };
+            charge
+                .shrink_to(retained.min(charge.bytes()))
+                .map_err(|_| OwnerError::Invalid)?;
+            *slot.retained_memory.lock().unwrap() = Some(charge);
+            return reply;
+        }
+        Work::Command(Command::UploadStaged(storage)) => {
+            return upload_staged(pool, slot, storage).await;
+        }
+        other => other,
+    };
     let cell = slot.clone();
     let submit = pool.submit(
         (slot.id % pool.worker_count().get() as u64) as usize,
@@ -1493,6 +1564,98 @@ async fn run(pool: &WorkerPool, slot: &Arc<Slot>, work: Work) -> Result<Reply> {
     .await
     .map_err(|_| OwnerError::FailedDrain)?;
     job.receive().await.map_err(|_| OwnerError::FailedDrain)?
+}
+async fn upload_staged(
+    pool: &WorkerPool,
+    slot: &Arc<Slot>,
+    storage: Arc<crate::storage::Storage<crate::storage::HttpStore>>,
+) -> Result<Reply> {
+    let uploads = {
+        let mut disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;
+        std::mem::take(&mut disk.as_mut().ok_or(OwnerError::Invalid)?.uploads)
+    };
+    let request = pool.request_id();
+    for (table, commit, ordinal, result) in uploads {
+        let (_, parts) = result.into_parts();
+        for (i, part) in parts.unwrap_or_default().into_iter().enumerate() {
+            if slot.cancelled() {
+                return Err(OwnerError::Cancelled);
+            }
+            let n = ordinal
+                .checked_add(u32::try_from(i).map_err(|_| OwnerError::Invalid)?)
+                .ok_or(OwnerError::Invalid)?;
+            let key = crate::storage::ObjectKey::partition(table, commit, n);
+            let charge = pool
+                .scheduler()
+                .reserve_memory(request, 0, pool.resources().task_memory_limit_bytes)
+                .await
+                .map_err(|_| OwnerError::Refused)?;
+            let ((meta, bytes), _charge) = pool
+                .submit_buffered(
+                    request,
+                    1,
+                    vec![charge],
+                    pool.resources().task_memory_limit_bytes,
+                    move |_, _| {
+                        let (meta, mut reader) = part.into_reader().map_err(|_| {
+                            crate::protocol::ProtocolError::new(
+                                crate::protocol::ErrorCode::StorageUnavailable,
+                                "staged partition unavailable",
+                                crate::protocol::Outcome::NotApplied,
+                            )
+                        })?;
+                        crate::scheduling::check_task_memory(
+                            meta.byte_size.checked_mul(3).ok_or_else(|| {
+                                crate::protocol::ProtocolError::new(
+                                    crate::protocol::ErrorCode::LimitExceeded,
+                                    "staged bytes exceed limit",
+                                    crate::protocol::Outcome::NotApplied,
+                                )
+                            })?,
+                        )?;
+                        let mut bytes = Vec::new();
+                        bytes
+                            .try_reserve_exact(meta.byte_size as usize)
+                            .map_err(|_| {
+                                crate::protocol::ProtocolError::new(
+                                    crate::protocol::ErrorCode::LimitExceeded,
+                                    "staged allocation limit",
+                                    crate::protocol::Outcome::NotApplied,
+                                )
+                            })?;
+                        reader.read_to_end(&mut bytes).map_err(|_| {
+                            crate::protocol::ProtocolError::new(
+                                crate::protocol::ErrorCode::StorageUnavailable,
+                                "staged partition unavailable",
+                                crate::protocol::Outcome::NotApplied,
+                            )
+                        })?;
+                        Ok((meta, bytes))
+                    },
+                )
+                .await
+                .map_err(|_| OwnerError::Invalid)?
+                .receive()
+                .await
+                .map_err(|_| OwnerError::Invalid)?;
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            let wrote = tokio::time::timeout_at(
+                deadline,
+                storage.put(&key, bytes.clone(), crate::storage::WriteCondition::Create),
+            )
+            .await;
+            if !matches!(wrote,Ok(Ok(ref token)) if !token.is_empty()) {
+                let confirmed =
+                    tokio::time::timeout_at(deadline, storage.read(&key, meta.byte_size as usize))
+                        .await;
+                if !matches!(confirmed,Ok(Ok(object)) if object.bytes==bytes && !object.etag.is_empty())
+                {
+                    return Err(OwnerError::Invalid);
+                }
+            }
+        }
+    }
+    Ok(Reply::Ready)
 }
 enum Work {
     Initialize(Initial, Option<Arc<Slot>>),
@@ -1588,6 +1751,32 @@ fn execute(slot: &Slot, work: Work, runtime: &tokio::runtime::Runtime) -> Result
                                     )
                                     .map_err(|_| OwnerError::Invalid)?,
                             };
+                        Ok(Reply::Accepted(Box::new(result)))
+                    }
+                    Command::ExecutePrepared(input) => {
+                        let Processor::AcceptedRequest(job) =
+                            std::mem::replace(&mut d.processor, Processor::Empty)
+                        else {
+                            return Err(OwnerError::Invalid);
+                        };
+                        let mut output = LocalOutput {
+                            slot,
+                            disk: d,
+                            expected: &job,
+                        };
+                        let result = match crate::engine::run_prepared(&job, input, &mut output) {
+                            Ok(result) => result,
+                            Err(error) => output
+                                .accept(
+                                    &job,
+                                    JobResult::Error {
+                                        code: error.code,
+                                        message: error.message,
+                                    },
+                                    Vec::new(),
+                                )
+                                .map_err(|_| OwnerError::Invalid)?,
+                        };
                         Ok(Reply::Accepted(Box::new(result)))
                     }
                     Command::StagePrepared {
@@ -2160,18 +2349,48 @@ impl PayloadOwners {
             deadline,
             move |slot, parent| {
                 Some(LocalProduction(Box::pin(async move {
-                    let index = job.ordinal as usize;
                     let parent = parent.ok_or(OwnerError::Invalid)?;
+                    let (input, charge) =
+                        crate::engine::prepare_captured(&storage, &partition, &job)
+                            .await
+                            .map_err(|_| OwnerError::Invalid)?;
+                    let request = job.scheduler_request_id();
+                    let worker_slot = slot.clone();
+                    let worker_job = job.clone();
                     // Keep this future and every accepted Job until settlement, even after cancellation.
                     let submitted = partition
-                        .submit(index, move |_, runtime| {
-                            let _execution = execution;
-                            Ok(produce(&slot, &parent, runtime, &storage, &job))
-                        })
+                        .submit_buffered(
+                            request,
+                            1,
+                            vec![charge],
+                            partition.resources().task_memory_limit_bytes,
+                            move |_, _| {
+                                let _execution = execution;
+                                Ok(produce(&worker_slot, &parent, &worker_job, input))
+                            },
+                        )
                         .await
                         .map_err(|_| OwnerError::Refused)?;
                     drop(queue);
-                    submitted.receive().await.map_err(|_| OwnerError::Invalid)?
+                    let (reply, mut charge) =
+                        submitted.receive().await.map_err(|_| OwnerError::Invalid)?;
+                    let reply = reply?;
+                    let retained = {
+                        let disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;
+                        match &disk.as_ref().ok_or(OwnerError::Invalid)?.processor {
+                            Processor::Accepted(rows, _) => {
+                                let payload = rows.iter().map(crate::snapshot::row_payload).sum();
+                                crate::snapshot::memory_shape(&job.table, rows.len(), payload, 0)
+                                    .map_err(|_| OwnerError::Invalid)?
+                            }
+                            _ => 4096,
+                        }
+                    };
+                    charge
+                        .shrink_to(retained.min(charge.bytes()))
+                        .map_err(|_| OwnerError::Invalid)?;
+                    *slot.retained_memory.lock().unwrap() = Some(charge);
+                    Ok(reply)
                 })))
             },
         )
@@ -2272,12 +2491,11 @@ fn local_error() -> super::job::JobError {
         message: "local output rejected".into(),
     }
 }
-fn produce<B: crate::storage::ObjectStore>(
+fn produce(
     slot: &Slot,
     parent: &Slot,
-    runtime: &tokio::runtime::Runtime,
-    storage: &crate::storage::Storage<B>,
     job: &JobEnvelope,
+    input: crate::engine::CapturedInput,
 ) -> Result<Reply> {
     let _change = slot.evidence.begin(false).expect("accepted production");
     let mut disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;
@@ -2302,7 +2520,7 @@ fn produce<B: crate::storage::ObjectStore>(
             disk: d,
             expected: job,
         };
-        let envelope = crate::engine::run_captured(runtime, storage, job, &mut output)
+        let envelope = crate::engine::run_prepared(job, input, &mut output)
             .map_err(|_| OwnerError::Invalid)?;
         Ok(Reply::Accepted(Box::new(envelope)))
     }));
@@ -2366,7 +2584,7 @@ impl PayloadRegistry {
 impl PayloadRegistry {
     pub(super) fn bounded(local: &super::admission::LocalAdmission) -> Self {
         let (o, p) = local.owner_bounds();
-        let bound = 1 + o + 4096 + 32;
+        let bound = 1 + o + 4096 + 48;
         Self {
             evidence: local.evidence(),
             proof: Default::default(),
@@ -2377,6 +2595,9 @@ impl PayloadRegistry {
             entries: Vec::with_capacity(bound),
             accepted_limit: bound,
             operation_bound: o,
+            operation_stream_bound: 16,
+            dependency_stream_bound: 16,
+            outgoing_bound: 16,
             positions: vec![None; bound],
             records: (0..o + p + 64).map(|_| None).collect(),
             controls: Vec::with_capacity(64),
@@ -2436,12 +2657,47 @@ impl PayloadOwners {
                 operations: Arc::new(Semaphore::new(0)),
                 operation_transport: Arc::new(Semaphore::new(0)),
                 dependency_transport: Arc::new(Semaphore::new(0)),
+                outgoing: Arc::new(Semaphore::new(16)),
+                outgoing_limit: 16,
                 #[cfg(test)]
                 releasing: Mutex::new(None),
                 #[cfg(test)]
                 pair_preparing: Mutex::new(None),
             }),
         }
+    }
+    pub(super) fn from_receiver_with_streams(
+        pool: WorkerPool,
+        state: Arc<Mutex<super::admission::ReceiverState>>,
+        outgoing: usize,
+    ) -> Self {
+        let mut owners = Self::from_receiver(pool, state);
+        let shared = Arc::get_mut(&mut owners.shared).expect("new owner registry");
+        shared.outgoing = Arc::new(Semaphore::new(outgoing));
+        shared.outgoing_limit = outgoing;
+        {
+            let mut state = shared.state.lock().unwrap();
+            let (o, p) = state.local().expect("distributed receiver").owner_bounds();
+            let registry = &mut state.payload;
+            registry.operation_stream_bound = o.min(256);
+            registry.dependency_stream_bound = p.min(1024);
+            registry.outgoing_bound = outgoing;
+            let bound = 1
+                + registry.operation_bound
+                + 4096
+                + registry.operation_stream_bound
+                + registry.dependency_stream_bound
+                + outgoing;
+            registry.positions.resize(bound, None);
+            registry.accepted_limit = bound;
+            registry
+                .entries
+                .reserve(bound.saturating_sub(registry.entries.capacity()));
+        }
+        owners
+    }
+    pub(crate) fn outgoing_capacity(&self) -> usize {
+        self.shared.outgoing_limit
     }
     pub(super) fn start_boot(
         &self,
@@ -2793,8 +3049,11 @@ impl PayloadRegistry {
         let end_accounts = 1 + self.operation_bound;
         let end_dependencies = end_accounts + 4096;
         let stream_range = match pair.role {
-            Role::Operation => end_dependencies..end_dependencies + 16,
-            Role::Dependency => end_dependencies + 16..end_dependencies + 32,
+            Role::Operation => end_dependencies..end_dependencies + self.operation_stream_bound,
+            Role::Dependency => {
+                end_dependencies + self.operation_stream_bound
+                    ..end_dependencies + self.operation_stream_bound + self.dependency_stream_bound
+            }
         };
         let stream_position = self.free_position(stream_range)?;
         let existing = if matches!(pair.role, Role::Dependency) {
@@ -3625,6 +3884,19 @@ impl PayloadOwners {
         let _ = activate.send(());
         Ok(ticket)
     }
+    /// The ordinary publisher and registered drain cycles share one writer for
+    /// this boot, preserving heartbeat sequence and conditional-write ownership.
+    pub(super) fn heartbeat_writer(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<crate::cluster::heartbeat::HeartbeatWriter>>> {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .payload
+            .proof
+            .heartbeat_writer()
+    }
     pub(super) async fn wait_proof(
         &self,
         ticket: &super::drain_observation::ProofTicket,
@@ -3716,3 +3988,6 @@ fn begin_result(
     };
     Ok(Reply::Receiving(kind))
 }
+
+mod parallel;
+pub(super) use parallel::ForkSource;

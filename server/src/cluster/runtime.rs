@@ -26,7 +26,7 @@ use crate::{
 use axum::{
     Router,
     body::Body,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     response::Response,
     routing::{get, post},
 };
@@ -37,7 +37,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -49,6 +49,8 @@ use tokio::{
 };
 use uuid::Uuid;
 type Result<T> = http::Result<T>;
+#[path = "provider_runtime.rs"]
+mod provider_runtime;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +69,7 @@ struct Init {
     name: String,
     initial_policy: InitialPolicy,
     provisioning: String,
-    bridge: Option<serde_json::Value>,
+    bridge: Option<provider_runtime::Bridge>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +86,7 @@ fn deadline() -> Instant {
 }
 
 struct Api {
+    bridge: Option<provider_runtime::Bridge>,
     attached: AttachedConfig,
     storage: Arc<Storage<HttpStore>>,
     pool: WorkerPool,
@@ -93,10 +96,14 @@ struct Api {
     guard: Mutex<OwnershipGuard>,
     changes: tokio::sync::Mutex<()>,
     observations: Arc<Mutex<Observations>>,
+    status_observations: Mutex<Observations>,
     data: Executor,
     controls: Executor,
+    submissions: Executor,
     accepting: AtomicBool,
-    next: AtomicUsize,
+    cold_start: AtomicBool,
+    authority_epoch: AtomicU64,
+    new_run: AtomicBool,
 }
 impl Api {
     async fn load(&self) -> Result<LoadedControl> {
@@ -128,6 +135,7 @@ impl Api {
                 until.saturating_sub(now.unix_ms()) > root.timing.lease_ms - root.timing.renew_ms
             })
         {
+            self.ensure_catalog_fence(owner).await?;
             return Ok(owner);
         }
         let change = if root.controller.owner_id == Some(self.process)
@@ -162,14 +170,110 @@ impl Api {
         })
         .await;
         let result = result.unwrap_or(Err(StorageError::Unavailable));
-        let mut guard = self.guard.lock().unwrap();
-        if !guard
-            .finish(stamp, result, sample())
-            .map_err(|_| unavailable())?
+        let owner = {
+            let mut guard = self.guard.lock().unwrap();
+            if !guard
+                .finish(stamp, result, sample())
+                .map_err(|_| unavailable())?
+            {
+                return Err(unavailable());
+            }
+            guard.check(sample()).map_err(|_| unavailable())?
+        };
+        self.ensure_catalog_fence(owner).await?;
+        Ok(owner)
+    }
+    async fn ensure_catalog_fence(&self, owner: Owner) -> Result<()> {
+        use crate::storage::{CatalogFence, FenceTransition};
+        let loaded = self
+            .storage
+            .load_cluster_catalog()
+            .await
+            .map_err(|_| unavailable())?;
+        let old = loaded.catalog().fence;
+        let cold = self.cold_start.load(Ordering::Acquire);
+        let control = self.load().await?;
+        if control.root().controller.owner_id != Some(owner.process_id)
+            || control.root().controller.epoch != owner.epoch
         {
             return Err(unavailable());
         }
-        guard.check(sample()).map_err(|_| unavailable())
+        let previous = control.root().scheduler.coordinator_node;
+        let coordinator = previous
+            .filter(|id| {
+                control.root().nodes.iter().any(|n| {
+                    n.node_id == *id
+                        && n.state == NodeState::Ready
+                        && n.registration == Registration::Verified
+                })
+            })
+            .or_else(|| {
+                control
+                    .root()
+                    .nodes
+                    .iter()
+                    .find(|n| {
+                        n.state == NodeState::Ready && n.registration == Registration::Verified
+                    })
+                    .map(|n| n.node_id)
+            });
+        let newly_owned = self.authority_epoch.load(Ordering::Acquire) != owner.epoch;
+        let advance = (newly_owned && old.is_some() && control.root().scheduler.scheduler_term > 0)
+            || cold
+            || (previous.is_some() && previous != coordinator);
+        let changed =
+            control.root().scheduler.scheduler_term == 0 || previous != coordinator || advance;
+        let term = if changed {
+            let prepared =
+                super::store::PreparedScheduler::prepare(control, owner, coordinator, advance)
+                    .map_err(|_| unavailable())?;
+            match prepared
+                .submit(&self.storage, deadline())
+                .await
+                .map_err(|_| unavailable())?
+            {
+                OwnershipOutcome::Acknowledged(root) | OwnershipOutcome::ObservedExact(root) => {
+                    root.root().scheduler.scheduler_term
+                }
+                _ => return Err(unavailable()),
+            }
+        } else {
+            control.root().scheduler.scheduler_term
+        };
+        if !cold && old.is_some_and(|f| f.scheduler_term == term) {
+            self.authority_epoch.store(owner.epoch, Ordering::Release);
+            return Ok(());
+        }
+        let transition = if old.is_none() {
+            FenceTransition::Migrate
+        } else if cold {
+            FenceTransition::ColdStart
+        } else {
+            FenceTransition::Takeover
+        };
+        let new_run = cold || old.is_none();
+        let run_id = if new_run {
+            Uuid::new_v4()
+        } else {
+            old.unwrap().run_id
+        };
+        self.storage
+            .fence_cluster_catalog(
+                &loaded,
+                CatalogFence {
+                    run_id,
+                    scheduler_term: term,
+                },
+                transition,
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        if new_run {
+            self.new_run.store(true, Ordering::Release);
+        }
+        self.cold_start.store(false, Ordering::Release);
+        self.authority_epoch.store(owner.epoch, Ordering::Release);
+        Ok(())
     }
     async fn publish(
         &self,
@@ -214,6 +318,9 @@ impl Api {
             auth::verify_enrollment(&bytes).map_err(|_| failure(ErrorCode::Unauthorized))
         })
         .await?;
+        if proof.claims().resources().is_none() {
+            return Err(invalid());
+        }
         self.ownership().await?;
         let _serial = self.changes.lock().await;
         let loaded = self.load().await?;
@@ -228,6 +335,24 @@ impl Api {
         let incarnation = proof.claims().incarnation();
         let session = proof.claims().session_id();
         let root = loaded.root().clone();
+        let resource = proof.claims().resources().ok_or_else(invalid)?;
+        resource
+            .validate_execution(&root.template.execution)
+            .map_err(|_| invalid())?;
+        let mut advertised = root.template.clone();
+        advertised.resources = Some(resource);
+        if proof.claims().operation_slots()
+            != crate::node::queue_runtime::coordination_capacity(&advertised)? as u64
+            || proof.claims().partition_slots()
+                != crate::node::queue_runtime::job_coordination_capacity(&advertised)? as u64
+        {
+            return Err(invalid());
+        }
+        crate::node::queue_runtime::validate_coordination_capacity(
+            &root,
+            Some((node_id, resource)),
+            None,
+        )?;
         let plan = cpu(&self.pool, move |_| {
             registration_plan(&root, owner, &proof, Uuid::new_v4())
                 .map_err(|_| failure(ErrorCode::Conflict))
@@ -291,6 +416,31 @@ impl Api {
             .check(sample())
             .map_err(|_| unavailable())?;
         let root = loaded.root().clone();
+        let join = if let Ok(scheduler) = crate::node::queue_runtime::scheduler(&root) {
+            let bytes = serde_json::to_vec(&crate::node::queue_runtime::Command::Join {
+                node_id: node.node_id,
+            })
+            .map_err(|_| invalid())?;
+            let result = crate::node::queue_transport::exchange(
+                &self.client,
+                &self.signer,
+                &root,
+                scheduler,
+                bytes,
+            )
+            .await?;
+            match serde_json::from_slice::<crate::node::queue_runtime::Reply>(&result)
+                .map_err(|_| invalid())?
+            {
+                crate::node::queue_runtime::Reply::Joined { token } => {
+                    Some((scheduler.clone(), token))
+                }
+                crate::node::queue_runtime::Reply::Error { error } => return Err(error),
+                _ => return Err(invalid()),
+            }
+        } else {
+            None
+        };
         let observation = reply.observation().clone();
         let candidate = cpu(&self.pool, move |_| {
             let input = ReadinessInput {
@@ -304,106 +454,189 @@ impl Api {
             ready_candidate(&root, owner, &input, Uuid::new_v4()).map_err(|_| unavailable())
         })
         .await?;
-        self.publish(loaded, candidate).await?;
+        let publication = self.publish(loaded, candidate).await;
+        if publication.is_ok() {
+            self.ensure_catalog_fence(owner).await?;
+        }
+        if let Some((scheduler, token)) = join {
+            let current = self.load().await?;
+            let bytes = serde_json::to_vec(&crate::node::queue_runtime::Command::Unseal { token })
+                .map_err(|_| invalid())?;
+            let response = crate::node::queue_transport::exchange(
+                &self.client,
+                &self.signer,
+                current.root(),
+                &scheduler,
+                bytes,
+            )
+            .await?;
+            if let crate::node::queue_runtime::Reply::Error { error } =
+                serde_json::from_slice(&response).map_err(|_| invalid())?
+            {
+                return Err(error);
+            }
+        }
+        publication?;
+        self.new_run.store(false, Ordering::Release);
         Ok(())
     }
-    async fn route(&self, bytes: Vec<u8>) -> Result<EncodedResponse> {
-        let original = bytes.clone();
-        let (id, mutation) = cpu(&self.pool, move |_| {
-            let parsed = protocol::parse_request(&original)?;
-            Ok((parsed.request_id, parsed.operation.is_mutation()))
-        })
-        .await?;
-        match self.route_inner(bytes).await {
-            Err(_) if mutation => Ok(encode_error(Some(id), unknown())),
-            result => result,
-        }
-    }
-    async fn route_inner(&self, bytes: Vec<u8>) -> Result<EncodedResponse> {
+    async fn observe_losses(&self) -> Result<()> {
+        let _serial = self.changes.lock().await;
         let loaded = self.load().await?;
         let root = loaded.root().clone();
-        let storage = self.storage.clone();
-        let observations = self.observations.clone();
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
-        let signer = self.signer.clone();
-        let (context, endpoint) = cpu(&self.pool, move |runtime| {
-            let parsed = protocol::parse_request(&bytes)?;
-            observations
-                .lock()
-                .unwrap()
-                .reconcile_members(&root, Instant::now())
-                .map_err(|_| unavailable())?;
-            for step in 0..root.nodes.len() {
-                let node = &root.nodes[(start.wrapping_add(step)) % root.nodes.len()];
-                if node.state != NodeState::Ready || node.registration != Registration::Verified {
-                    continue;
-                }
-                let binding = heartbeat_binding(&root, node)?;
-                let loaded = runtime.block_on(load_heartbeat(&storage, &binding, deadline()));
-                let fresh = {
-                    let mut observed = observations.lock().unwrap();
-                    match loaded {
-                        Ok(Some(h)) if h.heartbeat().accepting => {
-                            observed
-                                .observe(&binding, h.heartbeat(), Instant::now())
-                                .map_err(|_| unavailable())?;
-                            observed
-                                .fresh(
-                                    &binding,
-                                    Instant::now(),
-                                    Duration::from_millis(root.timing.expiry_ms),
-                                )
-                                .unwrap_or(false)
-                        }
-                        _ => {
-                            let _ = observed.read_failed(&binding, Instant::now());
-                            false
-                        }
-                    }
-                };
-                if !fresh {
-                    continue;
-                }
-                let ids = auth::RequestIds {
-                    operation: Some(parsed.request_id),
-                    digest: Some(http::digest(&bytes)),
-                    ..Default::default()
-                };
-                let context = signer.context(&root, node, auth::Route::Operations, ids, bytes)?;
-                return Ok((context, node.endpoint.clone().ok_or_else(unavailable)?));
-            }
-            Err(unavailable())
-        })
-        .await?;
-        let id = context.auth().operation_id();
-        match http::small_exchange(
-            &self.client,
-            &self.signer,
-            context,
-            &endpoint,
-            &self.storage,
-            &self.pool,
-        )
-        .await
+        let owner = self
+            .guard
+            .lock()
+            .unwrap()
+            .check(sample())
+            .map_err(|_| unavailable())?;
+        if root.controller.owner_id != Some(owner.process_id)
+            || root.controller.epoch != owner.epoch
         {
-            Ok(reply) => Ok(EncodedResponse {
-                status: reply.status(),
-                body: reply.bytes().to_vec(),
-            }),
-            Err(_) => Ok(encode_error(
-                id,
-                protocol::ProtocolError::new(
-                    ErrorCode::OutcomeUnknown,
-                    "worker outcome unavailable",
-                    protocol::Outcome::Unknown,
-                ),
-            )),
+            return Err(unavailable());
+        }
+        self.observations
+            .lock()
+            .unwrap()
+            .reconcile_members(&root, Instant::now())
+            .map_err(|_| unavailable())?;
+        for node in root.nodes.iter().filter(|n| {
+            matches!(n.state, NodeState::Ready | NodeState::Starting)
+                && n.registration != Registration::Unregistered
+        }) {
+            let binding = heartbeat_binding(&root, node)?;
+            let heartbeat = load_heartbeat(&self.storage, &binding, deadline()).await;
+            let input = {
+                let mut observed = self.observations.lock().unwrap();
+                match heartbeat {
+                    Ok(Some(h)) => {
+                        observed
+                            .observe(&binding, h.heartbeat(), Instant::now())
+                            .map_err(|_| unavailable())?;
+                    }
+                    _ => {
+                        observed
+                            .read_failed(&binding, Instant::now())
+                            .map_err(|_| unavailable())?;
+                    }
+                }
+                observed
+                    .expiry_input(
+                        &binding,
+                        Instant::now(),
+                        Duration::from_millis(root.timing.expiry_ms),
+                    )
+                    .map_err(|_| unavailable())?
+            };
+            if let Some(input) = input {
+                if !self
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .matches_expiry(
+                        &binding,
+                        &input,
+                        Instant::now(),
+                        Duration::from_millis(root.timing.expiry_ms),
+                    )
+                    .map_err(|_| unavailable())?
+                {
+                    continue;
+                }
+                let candidate =
+                    super::membership::loss_candidate(&root, owner, &input, Uuid::new_v4())
+                        .map_err(|_| unavailable())?;
+                self.publish(loaded, candidate).await?;
+                self.ensure_catalog_fence(owner).await?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+    async fn queue_call(
+        &self,
+        command: crate::node::queue_runtime::Command,
+    ) -> Result<crate::node::queue_runtime::Reply> {
+        let loaded = self.load().await?;
+        let root = loaded.root();
+        let node = crate::node::queue_runtime::scheduler(root)?;
+        let bytes = serde_json::to_vec(&command).map_err(|_| invalid())?;
+        let submission = matches!(command, crate::node::queue_runtime::Command::Submit { .. });
+        let bytes =
+            crate::node::queue_transport::exchange(&self.client, &self.signer, root, node, bytes)
+                .await
+                .map_err(|error| if submission { unknown() } else { error })?;
+        let reply = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        match reply {
+            crate::node::queue_runtime::Reply::Error { error } => Err(error),
+            other => Ok(other),
+        }
+    }
+    async fn submit(&self, bytes: Vec<u8>) -> Result<crate::request_queue::RequestRecord> {
+        protocol::parse_request(&bytes)?;
+        match self
+            .queue_call(crate::node::queue_runtime::Command::Submit { body: bytes })
+            .await?
+        {
+            crate::node::queue_runtime::Reply::Record { record } => Ok(record),
+            _ => Err(invalid()),
+        }
+    }
+    async fn lookup(
+        &self,
+        run_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<crate::request_queue::Receipt> {
+        match self
+            .queue_call(crate::node::queue_runtime::Command::Lookup { run_id, request_id })
+            .await?
+        {
+            crate::node::queue_runtime::Reply::Receipt { receipt } => Ok(receipt),
+            _ => Err(invalid()),
+        }
+    }
+    async fn route(
+        &self,
+        bytes: Vec<u8>,
+        staging: crate::scheduling::MemoryCharge,
+    ) -> Result<EncodedResponse> {
+        let parsed = protocol::parse_request(&bytes)?;
+        let id = parsed.request_id;
+        let mutation = parsed.operation.is_mutation();
+        drop(parsed);
+        let record = match self.submit(bytes).await {
+            Ok(record) => record,
+            Err(error) => return Ok(route_failure(id, mutation, false, error)),
+        };
+        let run_id = record.run_id;
+        let request_id = record.request_id;
+        drop(record);
+        drop(staging);
+        loop {
+            let receipt = match self.lookup(run_id, request_id).await {
+                Ok(receipt) => receipt,
+                Err(error) => return Ok(route_failure(id, mutation, true, error)),
+            };
+            if receipt.state == crate::request_queue::RequestState::Abandoned {
+                return Ok(encode_error(Some(id), unknown()));
+            }
+            if receipt.state.terminal() {
+                return Ok(if let Some(error) = receipt.error {
+                    encode_error(Some(id), error)
+                } else {
+                    let body = serde_json::to_vec(&json!({"request_id":id,"data":receipt.result}))
+                        .map_err(|_| invalid())?;
+                    EncodedResponse { status: 200, body }
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 }
 pub(crate) fn heartbeat_binding(root: &Control, node: &Node) -> Result<HeartbeatBinding> {
     let session = node.session.as_ref().ok_or_else(unavailable)?;
     Ok(HeartbeatBinding {
+        resources: node.resources,
         cluster_id: root.cluster_id,
         node_id: node.node_id,
         incarnation: node.incarnation.ok_or_else(unavailable)?,
@@ -462,6 +695,28 @@ async fn enroll(State(api): State<Arc<Api>>, request: Request) -> Response {
         Err(e) => response(encode_error(None, e)),
     }
 }
+fn route_failure(
+    id: Uuid,
+    mutation: bool,
+    accepted: bool,
+    error: protocol::ProtocolError,
+) -> EncodedResponse {
+    encode_error(
+        Some(id),
+        if accepted
+            || mutation
+                && matches!(
+                    error.code,
+                    ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
+                )
+        {
+            unknown()
+        } else {
+            error
+        },
+    )
+}
+
 fn unknown() -> protocol::ProtocolError {
     protocol::ProtocolError::new(
         ErrorCode::OutcomeUnknown,
@@ -479,12 +734,19 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
     ) {
         return response(encode_error(None, failure(ErrorCode::Unauthorized)));
     }
+    if !crate::api::json_content_type(request.headers()) {
+        return response(encode_error(None, invalid()));
+    }
     let admitted = match api.data.try_admit() {
         Ok(v) => v,
         Err(_) => return response(encode_error(None, unknown())),
     };
     let work = admitted.spawn(move || async move {
         let result = async {
+            let _staging = api.pool.scheduler().charge_memory(
+                0,
+                (3 * protocol::MAX_BODY_BYTES + protocol::MAX_DECODED_PAYLOAD_BYTES) as u64,
+            )?;
             let length = http::framing(request.headers(), protocol::MAX_BODY_BYTES, false)?
                 .ok_or_else(invalid)?;
             let bytes = http::read_small(
@@ -493,7 +755,7 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
                 Instant::now() + Duration::from_secs(30),
             )
             .await?;
-            api.route(bytes).await
+            api.route(bytes, _staging).await
         }
         .await;
         Ok(response(result.unwrap_or_else(|e| encode_error(None, e))))
@@ -505,6 +767,75 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
             .unwrap_or_else(|e| response(encode_error(None, e))),
         Err(e) => response(encode_error(None, e)),
     }
+}
+
+async fn run_initialization(State(api): State<Arc<Api>>, request: Request) -> Response {
+    if !http::bearer(
+        request.headers(),
+        &api.attached.local().prepared.auth.enrollment_token,
+    ) {
+        return response(encode_error(None, failure(ErrorCode::Unauthorized)));
+    }
+    let result=async{let loaded=api.storage.load_cluster_catalog().await.map_err(|_|unavailable())?;Ok::<_,protocol::ProtocolError>(EncodedResponse{status:200,body:serde_json::to_vec(&json!({"fence":loaded.catalog().fence,"initialization_allowed":api.new_run.load(Ordering::Acquire)})).map_err(|_|invalid())?})}.await;
+    response(result.unwrap_or_else(|e| encode_error(None, e)))
+}
+
+async fn submit_request(State(api): State<Arc<Api>>, request: Request) -> Response {
+    if !http::bearer(
+        request.headers(),
+        &api.attached.local().prepared.auth.data_token,
+    ) {
+        return response(encode_error(None, failure(ErrorCode::Unauthorized)));
+    }
+    if !crate::api::json_content_type(request.headers()) {
+        return response(encode_error(None, invalid()));
+    }
+    let admitted = match api.submissions.try_admit() {
+        Ok(admitted) => admitted,
+        Err(error) => return response(encode_error(None, error)),
+    };
+    let operation=admitted.spawn(move||async move{
+        if !api.accepting.load(Ordering::Acquire){return Err(unavailable());}
+        let _staging=api.pool.scheduler().charge_memory(0,(3*protocol::MAX_BODY_BYTES+protocol::MAX_DECODED_PAYLOAD_BYTES) as u64)?;
+        let length=http::framing(request.headers(),protocol::MAX_BODY_BYTES,false)?.ok_or_else(invalid)?;
+        let bytes=http::read_small(request.into_body(),length,Instant::now()+Duration::from_secs(30)).await?;
+        let parsed=protocol::parse_request(&bytes)?;let id=parsed.request_id;drop(parsed);
+        Ok(match api.submit(bytes).await{
+            Ok(record)=>EncodedResponse{status:202,body:serde_json::to_vec(&json!({"request_id":record.request_id,"run_id":record.run_id,"state":"queued"})).map_err(|_|invalid())?},
+            Err(error)=>encode_error(Some(id),error),
+        })
+    });
+    let result = match operation {
+        Ok(operation) => operation.receive().await,
+        Err(error) => Err(error),
+    };
+    response(result.unwrap_or_else(|error| encode_error(None, error)))
+}
+async fn receipt_request(
+    State(api): State<Arc<Api>>,
+    Path((run_id, request_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if !http::bearer(
+        request.headers(),
+        &api.attached.local().prepared.auth.data_token,
+    ) {
+        return response(encode_error(None, failure(ErrorCode::Unauthorized)));
+    }
+    let (run_id, request_id) = match (Uuid::parse_str(&run_id), Uuid::parse_str(&request_id)) {
+        (Ok(run), Ok(id)) => (run, id),
+        _ => return response(encode_error(None, invalid())),
+    };
+    if request.uri().query().is_some() {
+        return response(encode_error(Some(request_id), invalid()));
+    }
+    response(match api.lookup(run_id, request_id).await {
+        Ok(receipt) => EncodedResponse {
+            status: 200,
+            body: serde_json::to_vec(&receipt).unwrap(),
+        },
+        Err(error) => encode_error(Some(request_id), error),
+    })
 }
 
 async fn frame(stream: &mut UnixStream, end: Option<Instant>) -> Result<Vec<u8>> {
@@ -576,13 +907,26 @@ fn supervisor() -> Result<UnixStream> {
     UnixStream::from_std(stream).map_err(|_| invalid())
 }
 pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
+    run_api_configured(path, false, false).await
+}
+pub async fn run_api_with_cold_start(
+    path: PathBuf,
+    cold_start: bool,
+) -> std::result::Result<(), &'static str> {
+    run_api_configured(path, cold_start, false).await
+}
+pub async fn run_api_configured(
+    path: PathBuf,
+    cold_start: bool,
+    migrate_catalog: bool,
+) -> std::result::Result<(), &'static str> {
     let mut channel = supervisor().map_err(|_| "protocol_error")?;
     let (pool, threads) = WorkerPool::start(
         NonZeroUsize::new(2).unwrap(),
         tokio::runtime::Handle::current(),
     )
     .map_err(|_| "startup_failed")?;
-    let result = api_process(path, &mut channel, pool).await;
+    let result = api_process(path, &mut channel, pool, cold_start, migrate_catalog).await;
     if result.is_err() {
         let _ = send(
             &mut channel,
@@ -594,18 +938,40 @@ pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
     let joined = threads.shutdown().await.map_err(|_| "startup_failed");
     result.map_err(|_| "startup_failed").and(joined)
 }
-async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) -> Result<()> {
+async fn api_process(
+    path: PathBuf,
+    channel: &mut UnixStream,
+    pool: WorkerPool,
+    cold_start: bool,
+    migrate_catalog: bool,
+) -> Result<()> {
     let startup_end = Instant::now() + Duration::from_secs(30);
     let init: Init =
         serde_json::from_slice(&frame(channel, Some(startup_end)).await?).map_err(|_| invalid())?;
+    let provisioning = match (init.provisioning.as_str(), init.bridge.as_ref()) {
+        ("external", None) if init.initial_policy.mode == "fixed" => Provisioning::External,
+        ("managed", Some(bridge)) => {
+            bridge.validate()?;
+            Provisioning::Managed
+        }
+        _ => return Err(invalid()),
+    };
+    let policy_mode = match init.initial_policy.mode.as_str() {
+        "fixed" => PolicyMode::Fixed,
+        "autoscale" => PolicyMode::Autoscale,
+        _ => return Err(invalid()),
+    };
     if init.version != 1
         || init.kind != "init"
-        || init.provisioning != "external"
-        || init.bridge.is_some()
-        || init.initial_policy.mode != "fixed"
-        || init.initial_policy.desired != init.initial_policy.min_nodes
-        || init.initial_policy.desired != init.initial_policy.max_nodes
-        || init.initial_policy.desired > 1024
+        || init.initial_policy.max_nodes > 1024
+        || init.initial_policy.min_nodes > init.initial_policy.desired
+        || init.initial_policy.desired > init.initial_policy.max_nodes
+        || (policy_mode == PolicyMode::Fixed
+            && (init.initial_policy.desired != init.initial_policy.min_nodes
+                || init.initial_policy.desired != init.initial_policy.max_nodes))
+        || (policy_mode == PolicyMode::Autoscale
+            && (init.initial_policy.min_nodes == 0
+                || init.initial_policy.desired != init.initial_policy.min_nodes))
     {
         return Err(invalid());
     }
@@ -658,16 +1024,17 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
             template_fingerprint: template.fingerprint().map_err(|_| invalid())?,
             lifecycle_fingerprint: local.lifecycle.as_str().into(),
             worker_semantic_fingerprint: local.backend.worker.as_str().into(),
-            adapter_contract: None,
+            adapter_contract: (provisioning == Provisioning::Managed)
+                .then(|| "meshdb.callbacks.v1".into()),
         },
-        provisioning: Provisioning::External,
+        provisioning,
         template: template.clone(),
         timing: local.prepared.input.value.lifecycle.clone(),
         revision: 1,
         change_id: Uuid::new_v4(),
         policy: Policy {
             revision: 1,
-            mode: PolicyMode::Fixed,
+            mode: policy_mode,
             desired: init.initial_policy.desired,
             min_nodes: init.initial_policy.min_nodes,
             max_nodes: init.initial_policy.max_nodes,
@@ -679,6 +1046,8 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
             lease_until_ms: None,
         },
         scheduler: Scheduler {
+            coordinator_node: None,
+            scheduler_term: 0,
             cooldown_until_ms: 0,
             backoff_until_ms: 0,
             failures: 0,
@@ -689,11 +1058,19 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
         nodes: vec![],
         intents: vec![],
     };
-    let attached = cpu(&pool, {
+    let proposed_fence = crate::storage::CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    };
+    let (attached, initialization_new) = cpu(&pool, {
         let storage = storage.clone();
         move |runtime| {
-            runtime
-                .block_on(storage.initialize_cluster_catalog())
+            let catalog = runtime
+                .block_on(storage.initialize_fenced_cluster_catalog(
+                    proposed_fence,
+                    migrate_catalog,
+                    false,
+                ))
                 .map_err(|e| {
                     eprintln!("meshdb-server: catalog initialization {e}");
                     unavailable()
@@ -704,15 +1081,20 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
                     eprintln!("meshdb-server: control initialization {e}");
                     unavailable()
                 })?;
-            check_attach(loaded, local, &init.name, Provisioning::External).map_err(|e| {
+            let attached = check_attach(loaded, local, &init.name, provisioning).map_err(|e| {
                 eprintln!("meshdb-server: attachment {e}");
                 invalid()
-            })
+            })?;
+            Ok((attached, catalog.catalog().fence == Some(proposed_fence)))
         }
     })
     .await?;
     let tls = crate::runtime::retained_tls(attached.local().prepared.tls.as_ref())?;
+    let bridge = init.bridge;
+    let data_coordination =
+        crate::node::queue_runtime::coordination_capacity(&attached.root().template)?;
     let api = Arc::new(Api {
+        bridge,
         attached,
         storage,
         pool,
@@ -722,25 +1104,69 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
         guard: Mutex::new(OwnershipGuard::new(process)),
         changes: tokio::sync::Mutex::new(()),
         observations: Arc::new(Mutex::new(Observations::new(process, Instant::now()))),
-        data: Executor::new(16, 0)?,
+        status_observations: Mutex::new(Observations::new(process, Instant::now())),
+        data: Executor::new(data_coordination, 0)?,
         controls: Executor::new(8, 0)?,
+        submissions: Executor::new(16, 0)?,
         accepting: AtomicBool::new(false),
-        next: AtomicUsize::new(0),
+        cold_start: AtomicBool::new(cold_start),
+        authority_epoch: AtomicU64::new(0),
+        new_run: AtomicBool::new(initialization_new),
     });
-    send(channel, json!({"version":1,"type":"prepared","cluster_id":api.attached.root().cluster_id,"bound_url":bound_url,"authorize_url":null}), startup_end).await?;
+    let authorizer = if api.bridge.is_some() {
+        Some(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|_| unavailable())?,
+        )
+    } else {
+        None
+    };
+    let authorize_url = authorizer.as_ref().map(|l| {
+        format!(
+            "http://127.0.0.1:{}/private/v1/authorize",
+            l.local_addr().unwrap().port()
+        )
+    });
+    send(channel, json!({"version":1,"type":"prepared","cluster_id":api.attached.root().cluster_id,"bound_url":bound_url,"authorize_url":authorize_url}), startup_end).await?;
     let activate: Message =
         serde_json::from_slice(&frame(channel, Some(startup_end)).await?).map_err(|_| invalid())?;
     if activate.version != 1 || activate.kind != "activate" {
         return Err(invalid());
     }
-    // A replacement process must own the retained lease before advertising readiness.
+    // Additional API processes route to the existing fenced scheduler. Only an
+    // explicit new/cold run must acquire controller ownership before readiness.
     while api.ownership().await.is_err() {
+        if !cold_start && !initialization_new {
+            if let (Ok(control), Ok(catalog), Ok(now)) = (
+                api.load().await,
+                api.storage.load_cluster_catalog().await,
+                sample(),
+            ) {
+                if follower_ready(
+                    &control.root().controller,
+                    control.root().scheduler.scheduler_term,
+                    catalog.catalog().fence,
+                    now.unix_ms(),
+                    false,
+                ) {
+                    break;
+                }
+            }
+        }
         if Instant::now() >= startup_end {
             return Err(unavailable());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let (stop, mut renew_stop) = watch::channel(false);
+    let authorizer = authorizer.map(|listener| {
+        tokio::spawn(provider_runtime::authorizer(
+            api.clone(),
+            listener,
+            stop.subscribe(),
+        ))
+    });
     let renewal_interval = Duration::from_millis(api.attached.root().timing.renew_ms);
     let owner = api.clone();
     let renewal = tokio::spawn(async move {
@@ -764,6 +1190,8 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
                     let _ = owner.probe(root.clone(), node.clone()).await;
                 }
             }
+            let _ = owner.observe_losses().await;
+            let _ = owner.provider_tick().await;
             tokio::select! { _ = probe_stop.changed() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
         }
     });
@@ -771,14 +1199,21 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
     let ready = send(channel, json!({"version":1,"type":"ready","cluster_id":api.attached.root().cluster_id,"bound_url":bound_url}), startup_end).await;
     let app = Router::new()
         .route("/v1/operations", post(operations))
+        .route(
+            "/v1/cluster/operations",
+            post(provider_runtime::cluster_operations),
+        )
+        .route("/v1/requests", post(submit_request))
+        .route("/v1/requests/{run_id}/{request_id}", get(receipt_request))
         .route("/internal/v1/enroll", post(enroll))
+        .route("/internal/v1/queue/run", get(run_initialization))
         .route("/health/live", get(|| async { "true" }))
         .route("/health/ready", get(|| async { "true" }))
         .with_state(api.clone());
     let served = if ready.is_ok() {
         crate::runtime::serve_router(listener, app, tls, async {
             tokio::select! { _ = frame(channel, None) => {}, _ = crate::runtime::shutdown_signal() => {} }
-            api.accepting.store(false,Ordering::Release); api.data.stop_accepting(); api.controls.stop_accepting();
+            api.accepting.store(false,Ordering::Release); api.data.stop_accepting(); api.controls.stop_accepting();api.submissions.stop_accepting();
         }).await.map_err(|_| unavailable())
     } else {
         ready
@@ -786,11 +1221,79 @@ async fn api_process(path: PathBuf, channel: &mut UnixStream, pool: WorkerPool) 
     api.accepting.store(false, Ordering::Release);
     api.data.stop_accepting();
     api.controls.stop_accepting();
+    api.submissions.stop_accepting();
     stop.send_replace(true);
     let (renewed, probed) = tokio::join!(renewal, probes);
     api.data.drain().await;
     api.controls.drain().await;
+    api.submissions.drain().await;
     renewed.map_err(|_| unavailable())?;
     probed.map_err(|_| unavailable())?;
+    if let Some(authorizer) = authorizer {
+        authorizer.await.map_err(|_| unavailable())??;
+    }
     served
+}
+
+fn follower_ready(
+    controller: &Controller,
+    scheduler_term: u64,
+    fence: Option<crate::storage::CatalogFence>,
+    now_ms: u64,
+    requires_ownership: bool,
+) -> bool {
+    !requires_ownership
+        && controller.owner_id.is_some()
+        && controller.lease_state == LeaseState::Held
+        && controller
+            .lease_until_ms
+            .is_some_and(|until| until > now_ms)
+        && scheduler_term > 0
+        && fence.is_some_and(|fence| fence.scheduler_term == scheduler_term)
+}
+
+#[cfg(test)]
+mod queue_response_tests {
+    use super::*;
+    #[test]
+    fn u02_q05_follower_api_attaches_only_to_live_matching_authority() {
+        let mut controller = Controller {
+            owner_id: Some(Uuid::new_v4()),
+            epoch: 3,
+            lease_state: LeaseState::Held,
+            lease_until_ms: Some(2000),
+        };
+        let fence = crate::storage::CatalogFence {
+            run_id: Uuid::new_v4(),
+            scheduler_term: 7,
+        };
+        assert!(follower_ready(&controller, 7, Some(fence), 1000, false));
+        assert!(!follower_ready(&controller, 7, Some(fence), 1000, true));
+        assert!(!follower_ready(&controller, 8, Some(fence), 1000, false));
+        assert!(!follower_ready(&controller, 7, None, 1000, false));
+        assert!(!follower_ready(&controller, 0, Some(fence), 1000, false));
+        assert!(!follower_ready(&controller, 7, Some(fence), 2000, false));
+        controller.lease_state = LeaseState::Released;
+        assert!(!follower_ready(&controller, 7, Some(fence), 1000, false));
+        controller.lease_state = LeaseState::Held;
+        controller.owner_id = None;
+        assert!(!follower_ready(&controller, 7, Some(fence), 1000, false));
+    }
+    #[test]
+    fn q04_t04_post_accept_lookup_failure_preserves_identity_and_unknown_outcome() {
+        let id = Uuid::new_v4();
+        for mutation in [false, true] {
+            let encoded =
+                route_failure(id, mutation, true, http::failure(ErrorCode::LimitExceeded));
+            let value: serde_json::Value = serde_json::from_slice(&encoded.body).unwrap();
+            assert_eq!(encoded.status, 503);
+            assert_eq!(value["request_id"], id.to_string());
+            assert_eq!(value["error"]["code"], "outcome_unknown");
+            assert_eq!(value["error"]["outcome"], "unknown");
+        }
+        let encoded = route_failure(id, true, false, http::failure(ErrorCode::Overloaded));
+        assert_eq!(encoded.status, 429);
+        let value: serde_json::Value = serde_json::from_slice(&encoded.body).unwrap();
+        assert_eq!(value["error"]["outcome"], "not_applied");
+    }
 }

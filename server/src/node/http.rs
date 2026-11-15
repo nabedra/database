@@ -250,6 +250,13 @@ impl Signer {
             sequence: Mutex::new(sequence),
         })
     }
+    pub(crate) fn sign_queue(&self, bytes: &[u8]) -> Result<[u8; 64]> {
+        match &self.key {
+            Key::Api(key) => key.sign_queue(bytes),
+            Key::Worker(key) => key.sign_queue(bytes),
+        }
+        .map_err(|_| invalid())
+    }
     pub(crate) fn sender(&self) -> &Sender {
         &self.sender
     }

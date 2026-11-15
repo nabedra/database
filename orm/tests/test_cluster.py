@@ -188,3 +188,34 @@ class ClusterTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ResourceCapacityTests(unittest.TestCase):
+    def test_c01_capacity_reports_keep_heterogeneous_limits(self):
+        from meshdb.cluster import _node
+        for threads in (1, 2, 4):
+            node = status()['nodes'][0]
+            node.update(partition_slots=threads,
+                        resources=dict(max_threads=threads, memory_limit_bytes=1000 * threads,
+                                       task_memory_limit_bytes=500 * threads,
+                                       control_memory_reserve_bytes=100 * threads),
+                        available_threads=threads - 1,
+                        available_memory_bytes=800 * threads)
+            self.assertEqual(_node(node), node)
+
+    def test_c02_capacity_overstatement_and_incomplete_reports_fail(self):
+        from meshdb.cluster import _node
+        node = status()['nodes'][0]
+        node.update(resources=dict(max_threads=4, memory_limit_bytes=4000,
+                                   task_memory_limit_bytes=2000, control_memory_reserve_bytes=400),
+                    available_threads=3, available_memory_bytes=3000)
+        for change in (dict(available_threads=5), dict(available_threads=True),
+                       dict(available_memory_bytes=3601), dict(available_memory_bytes=None),
+                       dict(resources=None)):
+            with self.subTest(change=change):
+                with self.assertRaises(errors.ValidationError):
+                    _node(dict(node, **change))
+        missing = dict(node)
+        del missing['available_threads']
+        with self.assertRaises(errors.ValidationError):
+            _node(missing)

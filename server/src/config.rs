@@ -11,6 +11,18 @@ use std::{
 /// Plain inputs for the future CLI parser.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ServeOptions {
+    /// Confirm all previous catalog writers are stopped before migrating format 1/2/3.
+    #[arg(long, default_value_t = false)]
+    pub migrate_catalog: bool,
+    /// Fence a previous stopped local run and abandon its pending memory queue.
+    #[arg(long, default_value_t = false)]
+    pub cold_start: bool,
+    /// JSON execution limits; when supplied these override legacy queue and partition flags.
+    #[arg(long)]
+    pub execution_config: Option<PathBuf>,
+    /// JSON worker limits; when supplied max_threads overrides --workers.
+    #[arg(long)]
+    pub resources_config: Option<PathBuf>,
     /// IP address to bind.
     #[arg(long, default_value_t = ServeOptions::default().host)]
     pub host: IpAddr,
@@ -37,6 +49,10 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
+            migrate_catalog: false,
+            cold_start: false,
+            execution_config: None,
+            resources_config: None,
             host: Ipv4Addr::LOCALHOST.into(),
             port: 8000,
             workers: 4,
@@ -55,6 +71,8 @@ pub struct Config {
     namespace: Namespace,
     token: String,
     admission_limit: usize,
+    execution: ExecutionConfig,
+    resources: WorkerResources,
 }
 
 impl fmt::Debug for Config {
@@ -88,10 +106,28 @@ impl Config {
     /// Reads only MeshDB settings. AWS credentials and region stay with Storage::connect.
     /// Missing prefix uses the default; an empty or non-Unicode prefix is invalid.
     pub fn from_lookup(
-        options: ServeOptions,
+        mut options: ServeOptions,
         mut lookup: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
-        if options.workers == 0 {
+        let supplied_resources: Option<WorkerResources> = options
+            .resources_config
+            .as_deref()
+            .map(read_resource_config)
+            .transpose()?;
+        if let Some(resources) = supplied_resources {
+            resources.validate()?;
+            options.workers = resources.max_threads as usize;
+        }
+        let supplied_execution: Option<ExecutionConfig> = options
+            .execution_config
+            .as_deref()
+            .map(read_resource_config)
+            .transpose()?;
+        if let Some(execution) = &supplied_execution {
+            execution.validate()?;
+            options.partition_size = execution.partition_size;
+        }
+        if options.workers == 0 || options.workers > 256 {
             return Err(ConfigError("workers must be at least 1"));
         }
         let admission_limit = options
@@ -101,6 +137,18 @@ impl Config {
             .ok_or(ConfigError(
                 "workers plus queue size exceeds the supported limit",
             ))?;
+        let resources = supplied_resources.unwrap_or(WorkerResources {
+            max_threads: options.workers as u64,
+            ..Default::default()
+        });
+        let execution = supplied_execution.unwrap_or(ExecutionConfig {
+            max_pending_requests: admission_limit as u64,
+            partition_size: options.partition_size,
+            ..Default::default()
+        });
+        let admission_limit = usize::try_from(execution.max_pending_requests)
+            .map_err(|_| ConfigError("invalid admission limit"))?;
+        resources.validate_execution(&execution)?;
         let bucket = required(
             &mut lookup,
             "MESHDB_S3_BUCKET",
@@ -139,9 +187,17 @@ impl Config {
             namespace,
             token,
             admission_limit,
+            execution,
+            resources,
         })
     }
 
+    pub fn execution(&self) -> ExecutionConfig {
+        self.execution.clone()
+    }
+    pub fn resources(&self) -> WorkerResources {
+        self.resources
+    }
     pub fn options(&self) -> &ServeOptions {
         &self.options
     }
@@ -182,4 +238,139 @@ fn readable_file(path: &Path, error: ConfigError) -> Result<(), ConfigError> {
     }
     // The opened handle closes here. Bootstrap reopens and parses PEM before binding.
     Ok(())
+}
+
+/// Versioned cluster-wide queue and logical-request limits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionConfig {
+    pub max_workers_per_request: u64,
+    pub max_pending_requests: u64,
+    pub max_queue_bytes_per_replica: u64,
+    pub max_retained_result_bytes_per_worker: u64,
+    pub result_retention_ms: u64,
+    pub queue_replication: QueueReplication,
+    pub queue_lifetime: QueueLifetime,
+    pub partition_size: PartitionSize,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueReplication {
+    AllReadyWorkers,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueLifetime {
+    LiveCluster,
+}
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            max_workers_per_request: 4,
+            max_pending_requests: 1024,
+            max_queue_bytes_per_replica: 256 << 20,
+            max_retained_result_bytes_per_worker: 64 << 20,
+            result_retention_ms: 300_000,
+            queue_replication: QueueReplication::AllReadyWorkers,
+            queue_lifetime: QueueLifetime::LiveCluster,
+            partition_size: PartitionSize::default(),
+        }
+    }
+}
+impl ExecutionConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=2048).contains(&self.max_workers_per_request)
+            || !(1..=1_000_000).contains(&self.max_pending_requests)
+            || self.max_queue_bytes_per_replica == 0
+            || self.max_retained_result_bytes_per_worker == 0
+            || self.max_queue_bytes_per_replica > isize::MAX as u64
+            || self.max_retained_result_bytes_per_worker > isize::MAX as u64
+            || !(1..=86_400_000).contains(&self.result_retention_ms)
+            || self
+                .max_queue_bytes_per_replica
+                .checked_add(self.max_retained_result_bytes_per_worker)
+                .is_none()
+        {
+            return Err(ConfigError("invalid execution limits"));
+        }
+        Ok(())
+    }
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Local ceilings advertised in the signed enrollment and checked before readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerResources {
+    pub max_threads: u64,
+    pub memory_limit_bytes: u64,
+    pub task_memory_limit_bytes: u64,
+    pub control_memory_reserve_bytes: u64,
+}
+impl Default for WorkerResources {
+    fn default() -> Self {
+        Self {
+            max_threads: 4,
+            memory_limit_bytes: 8 << 30,
+            task_memory_limit_bytes: 512 << 20,
+            control_memory_reserve_bytes: 256 << 20,
+        }
+    }
+}
+impl WorkerResources {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(1..=256).contains(&self.max_threads)
+            || self.memory_limit_bytes > isize::MAX as u64
+            || self.task_memory_limit_bytes == 0
+            || self.control_memory_reserve_bytes == 0
+            || self.control_memory_reserve_bytes >= self.memory_limit_bytes
+            || self.task_memory_limit_bytes
+                > self.memory_limit_bytes - self.control_memory_reserve_bytes
+        {
+            return Err(ConfigError("invalid worker resource limits"));
+        }
+        Ok(())
+    }
+    pub fn working_bytes(&self) -> u64 {
+        self.memory_limit_bytes
+            .saturating_sub(self.control_memory_reserve_bytes)
+    }
+    pub fn validate_execution(&self, execution: &ExecutionConfig) -> Result<(), ConfigError> {
+        self.validate()?;
+        execution.validate()?;
+        let reserved = execution
+            .max_queue_bytes_per_replica
+            .checked_add(execution.max_retained_result_bytes_per_worker)
+            .and_then(|bytes| bytes.checked_add(self.control_memory_reserve_bytes))
+            .ok_or(ConfigError("worker memory accounting overflow"))?;
+        if reserved >= self.memory_limit_bytes
+            || self.task_memory_limit_bytes > self.memory_limit_bytes - reserved
+        {
+            return Err(ConfigError("queue, results and task exceed worker memory"));
+        }
+        Ok(())
+    }
+}
+
+fn read_resource_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
+    use std::io::Read;
+    let file =
+        File::open(path).map_err(|_| ConfigError("resource configuration is unavailable"))?;
+    if !file
+        .metadata()
+        .map_err(|_| ConfigError("resource configuration is unavailable"))?
+        .is_file()
+    {
+        return Err(ConfigError("resource configuration must be a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ConfigError("resource configuration is unavailable"))?;
+    if bytes.len() > 16 * 1024 {
+        return Err(ConfigError("resource configuration exceeds byte limit"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ConfigError("invalid resource configuration"))
 }

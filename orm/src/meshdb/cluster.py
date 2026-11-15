@@ -24,6 +24,7 @@ _NODE_KEYS = {
     'operation_slots', 'partition_slots', 'running_operations', 'running_partitions',
     'queued_operations', 'queued_partitions', 'heartbeat_age_seconds',
 }
+_NODE_RESOURCE_KEYS = {'resources', 'available_threads', 'available_memory_bytes'}
 _INTENT_KEYS = {'request_id', 'node_id', 'resource_id', 'action', 'state', 'attempts', 'error_code'}
 # Error codes are bounded machine tokens, never free-form provider messages.
 _ERROR_CODE = re.compile(r'[A-Za-z0-9_.:-]{1,256}')
@@ -88,7 +89,10 @@ def _policy_fields(data: dict) -> None:
 
 
 def _node(value: object) -> dict:
-    data = _record(value, _NODE_KEYS, 'Node')
+    if (type(value) is not dict or not _NODE_KEYS <= value.keys()
+            or not value.keys() <= _NODE_KEYS | _NODE_RESOURCE_KEYS):
+        raise ValidationError('Node must have exactly the specified fields')
+    data = value.copy()
     _uuid(data['node_id'], 'Node ID')
     if data['incarnation'] is not None:
         _uuid(data['incarnation'], 'Incarnation')
@@ -97,9 +101,34 @@ def _node(value: object) -> dict:
     _choice(data['state'], ('starting', 'ready', 'draining', 'lost', 'stopped'), 'Node state')
     for kind in ('operations', 'partitions'):
         slot_key = 'operation_slots' if kind == 'operations' else 'partition_slots'
-        slots = _integer(data[slot_key], slot_key, 1, 256)
+        slots = _integer(data[slot_key], slot_key, 1, 1024 if kind == 'partitions' and data.get('resources') is not None else 256)
         _integer(data['running_' + kind], 'Running ' + kind, 0, slots)
         _integer(data['queued_' + kind], 'Queued ' + kind, 0, 4096)
+    resources = data.get('resources')
+    if resources is not None:
+        resources = _record(resources, {'max_threads', 'memory_limit_bytes',
+                                       'task_memory_limit_bytes', 'control_memory_reserve_bytes'},
+                            'Worker resources')
+        threads = _integer(resources['max_threads'], 'Worker threads', 1, 256)
+        if threads > data['partition_slots']:
+            raise ValidationError('Worker job coordination slots must cover its compute threads')
+        for key in ('memory_limit_bytes', 'task_memory_limit_bytes', 'control_memory_reserve_bytes'):
+            _integer(resources[key], key, 1, 2**63 - 1)
+        working = resources['memory_limit_bytes'] - resources['control_memory_reserve_bytes']
+        if working <= 0 or resources['task_memory_limit_bytes'] > working:
+            raise ValidationError('Worker memory limits contradict each other')
+        data['resources'] = resources
+    if ('available_threads' in data) != ('available_memory_bytes' in data):
+        raise ValidationError('Worker availability fields must appear together')
+    if 'available_threads' in data:
+        threads, memory = data['available_threads'], data['available_memory_bytes']
+        if (threads is None) != (memory is None):
+            raise ValidationError('Worker availability fields must both be known or null')
+        if threads is not None:
+            if resources is None:
+                raise ValidationError('Worker availability requires validated resource ceilings')
+            _integer(threads, 'Available worker threads', 0, resources['max_threads'])
+            _integer(memory, 'Available worker memory', 0, working)
     age = data['heartbeat_age_seconds']
     # Integers are finite without converting arbitrarily large JSON integers to float.
     if age is not None and (type(age) not in (int, float) or age < 0
@@ -233,6 +262,8 @@ class Cluster:
                 error.outcome = None
                 raise error
             if (current['counts']['ready'] == accepted['desired']
+                    and current['counts']['starting'] == 0
+                    and current['counts']['draining'] == 0
                     and not any(intent['state'] in ('pending', 'in_progress', 'reconciling')
                                 for intent in current['intents'])):
                 return

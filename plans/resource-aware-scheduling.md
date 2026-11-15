@@ -1,12 +1,12 @@
 MeshDB should share worker CPU and memory across concurrent requests while preserving accepted work through individual failures and publishing each mutation atomically.
 
-Status: requirements recorded on 2026-11-15; implementation and configuration below are proposed. No runtime changes or benchmark results accompany this plan. The latest queue requirement supersedes a disk-durable queue: surviving worker memory preserves outstanding work; stopping every worker abandons it. Durable table data remains intact.
+Status: approved requirements recorded on 2026-11-15, implemented by the resource-aware scheduling change. Execution evidence and its integration boundaries are recorded in [the acceptance ledger](../docs/testing/scheduler-evidence.md). The latest queue requirement supersedes a disk-durable queue: surviving worker memory preserves outstanding work; stopping every worker abandons it. Durable table data remains intact.
 
 ---
 
 The API accepts requests; workers coordinate and execute partition jobs. A node handles many partitions and several requests over time. `serve` becomes a convenience composition of the same API and local worker used by a remote deployment. Admission, scheduling, memory limits, transactions, recovery, and results have the same semantics in both topologies.
 
-Add these proposed configuration objects to the versioned cluster configuration and worker bootstrap. Values are examples, not measured defaults; byte fields are positive integers.
+These configuration objects are part of the versioned cluster configuration and worker bootstrap. Values are examples, not measured defaults; byte fields are positive integers.
 
 ```json
 {
@@ -38,7 +38,7 @@ Add these proposed configuration objects to the versioned cluster configuration 
 
 `max_threads` bounds concurrent partition, codec, and reducer execution across all compute pools on that worker. Do not multiply this budget by request count or create an unbounded blocking pool. Bound and report the separate network/control runtime overhead. Bound queue copies and retained results as part of the worker's total memory budget. A new worker copies outstanding queue records before it becomes ready; bootstrap uses separate authenticated capacity and does not need a query slot.
 
-Keep the existing synchronous Python operation methods. Route them internally through the same queue. Add a proposed asynchronous receipt interface so queued work can be observed without keeping a connection open:
+Keep the existing synchronous Python operation methods. Route them internally through the same queue. The asynchronous receipt interface observes queued work without keeping a connection open:
 
 ```text
 POST /v1/requests
@@ -73,7 +73,7 @@ flowchart TD
 
 Use an event-driven scheduler with per-request pending jobs. Replace fixed partition-to-thread assignment, per-request window barriers, and sequential remote partition loops. A free compute slot can execute the next eligible partition from any request. Partition file boundaries remain independent of worker count.
 
-Proposed policy: choose an eligible request with the lowest dominant resource share, `max(its_reserved_threads / cluster_threads, its_reserved_bytes / cluster_working_bytes)`, breaking ties by acceptance sequence. Pick a worker with available CPU and sufficient memory that minimizes projected dominant utilization, breaking ties by node ID. Re-evaluate after every completion, resource release, capacity update, join, or loss. Local reservation is authoritative; stale observations cannot oversubscribe a worker. Reserve CPU and memory together, or reserve neither.
+Scheduling policy: choose an eligible request with the lowest dominant resource share, `max(its_reserved_threads / cluster_threads, its_reserved_bytes / cluster_working_bytes)`, breaking ties by acceptance sequence. Pick a worker with available CPU and sufficient memory that minimizes projected dominant utilization, breaking ties by node ID. Re-evaluate after every completion, resource release, capacity update, join, or loss. Local reservation is authoritative; stale observations cannot oversubscribe a worker. Reserve CPU and memory together, or reserve neither.
 
 The scheduler may bypass a temporarily unfit request so other work progresses. After 32 grant rounds of bypass, give the oldest request priority and earmark newly freed memory until one of its jobs fits; unrelated work can use unreserved resources. Reject a job that exceeds every eligible worker's total task budget. Running jobs are nonpreemptive; fairness applies at job boundaries. Do not hold compute permits while awaiting remote child jobs, queue replication, storage, or a commit lock. Preserve bounded progress capacity for reductions, settlement, heartbeats, and cancellation. Control progress cannot depend on an exhausted data queue.
 
@@ -109,20 +109,20 @@ Autoscaling may react to queue age and sustained resource demand only when a rea
 
 ---
 
-Implementation tasks are proposed and unchecked. Runtime work should follow approval of the configuration and receipt contracts. The reusable assertions and measurements live in [the scheduler test contract](../docs/testing/scheduler-contract.md).
+Implementation tasks follow the approved configuration and receipt contracts. The reusable assertions and measurements live in [the scheduler test contract](../docs/testing/scheduler-contract.md). A checked implementation task does not replace the executed assertions and scope recorded in the acceptance ledger.
 
 | Task | Concrete result | Depends on | Acceptance cases |
 | --- | --- | --- | --- |
-| [ ] S1 | Versioned execution config, per-node resources, signed enrollment and capacity reports | None | C01-C03 |
-| [ ] S2 | CPU/byte reservations and bounded partition/reducer memory | S1 | C04-C07, M01-M03 |
-| [ ] S3 | Replicated RAM admission, receipts, deduplication and finite overflow | S1 | Q01-Q06 |
-| [ ] S4 | Run/term fencing and transactional publication/reconciliation | S3 | R01-R06, T01-T06 |
-| [ ] S5 | Work-conserving scheduling across concurrent requests | S2, S3 | C04-C07, F01-F03 |
-| [ ] S6 | Shared local/remote runtime and ORM queue integration | S4, S5 | U01-U03, Q04-Q06 |
+| [x] S1 | Versioned execution config, per-node resources, signed enrollment and capacity reports | None | C01-C03 |
+| [x] S2 | CPU/byte reservations and bounded partition/reducer memory | S1 | C04-C07, M01-M03 |
+| [x] S3 | Replicated RAM admission, receipts, deduplication and finite overflow | S1 | Q01-Q06 |
+| [x] S4 | Run/term fencing and transactional publication/reconciliation | S3 | R01-R06, T01-T06 |
+| [x] S5 | Work-conserving scheduling across concurrent requests | S2, S3 | C04-C07, F01-F03 |
+| [x] S6 | Shared local/remote runtime and ORM queue integration | S4, S5 | U01-U03, Q04-Q06 |
 | [ ] S7 | Fault injection, process scenarios, reproducible utilization/load evidence | S4-S6 | All cases, B01-B02 |
-| [ ] S8 | Optional provisioning adapters with safe drain and queue handoff | S6, adapter authorization | A01-A02 |
+| [x] S8 | Optional provisioning adapters with safe drain and queue handoff | S6, adapter authorization | A01-A02 |
 
-S2 and S3 can proceed independently after S1; S4 and S5 can proceed independently after S3 and their listed prerequisites. Delegate implementation tasks according to the repository change skill. No delegate or runtime implementation is part of this documentation change.
+S2 and S3 can proceed independently after S1; S4 and S5 can proceed independently after S3 and their listed prerequisites. Implementation tasks use the parallel worker workflow from the repository change skill.
 
 ---
 

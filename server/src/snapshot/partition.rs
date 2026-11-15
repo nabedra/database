@@ -72,9 +72,15 @@ pub(crate) fn encode_partition_range_each(
         return Ok(());
     }
     let mut pending = vec![(0, rows.len(), range)];
+    let working = super::memory_shape(table, rows.len(), rows.iter().map(row_payload).sum(), 0)?;
+    let mut retained_encoded = 0u64;
     while let Some((start, end, range)) = pending.pop() {
         let slice = &rows[start..end];
-        let attempt = encode_bounded(table, slice);
+        let simultaneous = retained_encoded
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(working))
+            .ok_or_else(limit)?;
+        let attempt = encode_bounded(table, slice, simultaneous);
         let split = match &attempt {
             Ok(bytes) => bytes.len() > target.bytes() && slice.len() > 1,
             Err(e) => e.code == ErrorCode::LimitExceeded && slice.len() > 1,
@@ -101,19 +107,30 @@ pub(crate) fn encode_partition_range_each(
                 },
             ));
         } else {
+            let bytes = attempt?;
+            retained_encoded = retained_encoded
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(limit)?;
             emit(EncodedPartition {
                 range,
                 row_count: slice.len() as u64,
                 payload_bytes: slice.iter().map(row_payload).sum::<usize>() as u64,
-                bytes: attempt?,
+                bytes,
             })?;
         }
     }
     Ok(())
 }
 
-fn encode_bounded(table: &TableDescriptor, rows: &[Row]) -> Result<Vec<u8>, ProtocolError> {
-    let mut sink = BoundedSink::default();
+fn encode_bounded(
+    table: &TableDescriptor,
+    rows: &[Row],
+    working_bytes: u64,
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut sink = BoundedSink {
+        working_bytes,
+        ..Default::default()
+    };
     let result = encode_into(table, rows, &mut sink);
     if sink.exceeded {
         return Err(limit());
@@ -129,6 +146,7 @@ fn encode_bounded(table: &TableDescriptor, rows: &[Row]) -> Result<Vec<u8>, Prot
 struct BoundedSink {
     bytes: Vec<u8>,
     exceeded: bool,
+    working_bytes: u64,
 }
 impl Write for BoundedSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -136,6 +154,14 @@ impl Write for BoundedSink {
         if bytes.len() > remaining {
             self.exceeded = true;
             return Err(io::Error::other("partition byte limit exceeded"));
+        }
+        let charged = (self.bytes.len() as u64)
+            .checked_add(bytes.len() as u64)
+            .and_then(|encoded| encoded.checked_mul(4))
+            .and_then(|encoded| encoded.checked_add(self.working_bytes));
+        if charged.is_none_or(|charged| crate::scheduling::check_task_memory(charged).is_err()) {
+            self.exceeded = true;
+            return Err(io::Error::other("partition working memory limit exceeded"));
         }
         // Exact growth prevents Vec's geometric reservation from exceeding the
         // file cap. This bounds the output sink, not Arrow's working memory.

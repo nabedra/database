@@ -45,69 +45,115 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 }
             }
         };
-        let coordinator = self.coordinator().clone();
-        let mut results =
-            partition::map_files(self.worker_pool(), selected, move |file, runtime| {
-                let loaded = partition::load_file(runtime, coordinator.storage(), &table, &file)?;
-                Ok(loaded
+        let worker_table = table.clone();
+        let mut results = partition::map_prepared(
+            self.worker_pool(),
+            self.storage(),
+            table,
+            selected,
+            |file| Some(file.clone()),
+            move |_, loaded| {
+                let row = loaded
                     .rows
                     .into_iter()
-                    .find(|row| partition::row_key(&table, row) == payload.key))
-            })
-            .await?;
-        Ok(results.pop().flatten())
+                    .find(|row| partition::row_key(&worker_table, row) == payload.key);
+                let retained = row.as_ref().map_or(0, |row| {
+                    crate::snapshot::memory_shape(
+                        &worker_table,
+                        1,
+                        crate::snapshot::row_payload(row),
+                        0,
+                    )
+                    .unwrap_or(u64::MAX)
+                });
+                Ok((row, retained))
+            },
+        )
+        .await?;
+        Ok(results.pop().and_then(|buffered| buffered.value))
     }
 
     pub async fn collect(&self, payload: QueryPayload) -> Result<Vec<Row>, ProtocolError> {
         let (table, entry, payload) = self.read_query_context(payload).await?;
-        let coordinator = self.coordinator().clone();
         let worker_table = table.clone();
         let worker_query = payload.query.clone();
-        let parts = partition::map_files(
+        let parts = partition::map_prepared(
             self.worker_pool(),
+            self.storage(),
+            table.clone(),
             partition::files(&entry),
-            move |file, runtime| {
-                let loaded =
-                    partition::load_file(runtime, coordinator.storage(), &worker_table, &file)?;
-                Ok((
-                    loaded.rows.len(),
-                    loaded.payload_bytes,
-                    query::local_collect(&worker_table, &worker_query, loaded.rows),
-                ))
+            |file| Some(file.clone()),
+            move |_, loaded| {
+                let count = loaded.rows.len();
+                let payload = loaded.payload_bytes;
+                let rows = query::local_collect(&worker_table, &worker_query, loaded.rows);
+                let retained = snapshot_retained(&worker_table, &rows)?;
+                Ok(((count, payload, rows), retained))
             },
         )
         .await?;
-        check_totals(parts.iter().map(|(rows, bytes, _)| (*rows, *bytes)))?;
-        self.worker_pool()
-            .submit(0, move |_, _| {
-                let rows: Vec<Row> = parts.into_iter().flat_map(|(_, _, rows)| rows).collect();
-                query::reduce_collect(&table, &payload.query, &rows)
-            })
+        check_totals(parts.iter().map(|part| (part.value.0, part.value.1)))?;
+        if parts.is_empty() {
+            return query::reduce_collect(&table, &payload.query, &[]);
+        }
+        let mut charges = Vec::new();
+        let mut parts_rows = Vec::new();
+        for part in parts {
+            charges.push(part.charge);
+            parts_rows.push(part.value.2);
+        }
+        let (result, _charge) = self
+            .worker_pool()
+            .submit_buffered(
+                self.worker_pool().request_id(),
+                1,
+                charges,
+                self.worker_pool().resources().task_memory_limit_bytes,
+                move |_, _| {
+                    let count = parts_rows.iter().try_fold(0usize, |sum, rows| {
+                        sum.checked_add(rows.len())
+                            .ok_or_else(|| failure(ErrorCode::LimitExceeded, "reduction row count"))
+                    })?;
+                    let mut rows = Vec::new();
+                    rows.try_reserve_exact(count).map_err(|_| {
+                        failure(ErrorCode::LimitExceeded, "reduction allocation limit")
+                    })?;
+                    for part in parts_rows {
+                        rows.extend(part);
+                    }
+                    query::reduce_collect(&table, &payload.query, &rows)
+                },
+            )
             .await?
             .receive()
-            .await
+            .await?;
+        Ok(result)
     }
 
     pub async fn count(&self, payload: QueryPayload) -> Result<u64, ProtocolError> {
         let (table, entry, payload) = self.read_query_context(payload).await?;
-        let coordinator = self.coordinator().clone();
         let query = payload.query.clone();
-        let parts = partition::map_files(
+        let parts = partition::map_prepared(
             self.worker_pool(),
+            self.storage(),
+            table,
             partition::files(&entry),
-            move |file, runtime| {
-                let loaded = partition::load_file(runtime, coordinator.storage(), &table, &file)?;
+            |file| Some(file.clone()),
+            move |_, loaded| {
                 Ok((
-                    loaded.rows.len(),
-                    loaded.payload_bytes,
-                    query::local_count(&query, &loaded.rows),
+                    (
+                        loaded.rows.len(),
+                        loaded.payload_bytes,
+                        query::local_count(&query, &loaded.rows),
+                    ),
+                    64,
                 ))
             },
         )
         .await?;
-        check_totals(parts.iter().map(|(rows, bytes, _)| (*rows, *bytes)))?;
-        let total = parts.into_iter().try_fold(0u64, |sum, (_, _, count)| {
-            sum.checked_add(count)
+        check_totals(parts.iter().map(|part| (part.value.0, part.value.1)))?;
+        let total = parts.into_iter().try_fold(0u64, |sum, part| {
+            sum.checked_add(part.value.2)
                 .ok_or_else(|| failure(ErrorCode::LimitExceeded, "count exceeds limit"))
         })?;
         Ok(total.min(payload.query.limit.unwrap_or(u64::MAX)))
@@ -157,4 +203,12 @@ fn check_totals(parts: impl Iterator<Item = (usize, usize)>) -> Result<(), Proto
 
 fn failure(code: ErrorCode, message: &str) -> ProtocolError {
     ProtocolError::new(code, message, Outcome::NotApplied)
+}
+
+fn snapshot_retained(table: &TableDescriptor, rows: &[Row]) -> Result<u64, ProtocolError> {
+    let payload = rows.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(crate::snapshot::row_payload(row))
+            .ok_or_else(|| failure(ErrorCode::LimitExceeded, "retained rows limit"))
+    })?;
+    crate::snapshot::memory_shape(table, rows.len(), payload, 0)
 }

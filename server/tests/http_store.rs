@@ -98,7 +98,7 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     use tower::ServiceExt;
 
     async fn request(app: &Router, operation: &str, payload: Value) -> (u16, Value) {
-        let id = "11111111-1111-4111-8111-111111111111";
+        let id = uuid::Uuid::new_v4().to_string();
         let response = app
             .clone()
             .oneshot(
@@ -132,11 +132,15 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     )
     .unwrap();
     let engine = Engine::new(storage, pool, "1 B".parse().unwrap());
-    let app = api::router(
+    let (app, queue_tasks) = api::router_with_migration(
         engine.clone(),
         Executor::new(1, 0).unwrap(),
         "api-token".into(),
-    );
+        Default::default(),
+        false,
+        true,
+    )
+    .unwrap();
     let (status, created) = request(
         &app,
         "table.create",
@@ -149,23 +153,27 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
         .rev()
         .map(|id| json!({"id":id,"rank":id % 3,"label":format!("row{id}")}))
         .collect();
-    assert_eq!(
-        request(
-            &app,
-            "table.insert_many",
-            json!({"table_id":table_id,"rows":rows})
-        )
-        .await,
-        (
-            200,
-            json!({"request_id":"11111111-1111-4111-8111-111111111111","data":12})
-        )
-    );
-    let catalog = engine.storage().load_catalog().await.unwrap().catalog;
+    let (insert_status, inserted) = request(
+        &app,
+        "table.insert_many",
+        json!({"table_id":table_id,"rows":rows}),
+    )
+    .await;
+    assert_eq!(insert_status, 200);
+    assert_eq!(inserted["data"], 12);
+    let catalog = engine
+        .storage()
+        .load_cluster_catalog()
+        .await
+        .unwrap()
+        .catalog()
+        .clone();
     let TableData::Partitioned { files } = &catalog.tables["items"].data else {
         panic!("write must publish a partition manifest")
     };
     assert_eq!(files.len(), 12);
+    queue_tasks.stop_accepting();
+    queue_tasks.drain().await;
     workers.shutdown().await.unwrap();
     drop(app);
     drop(engine);
@@ -179,11 +187,15 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     )
     .unwrap();
     let engine = Engine::new(restarted.storage(), pool, "1 B".parse().unwrap());
-    let app = api::router(
+    let (app, queue_tasks) = api::router_with_migration(
         engine.clone(),
         Executor::new(1, 0).unwrap(),
         "api-token".into(),
-    );
+        Default::default(),
+        true,
+        false,
+    )
+    .unwrap();
     let query = json!({"select":["label"],"filter":{"op":"ge","column":"rank","value":1},"order_by":{"column":"rank","desc":true},"limit":3});
     let (status, result) = request(
         &app,
@@ -197,7 +209,13 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
         json!([{"label":"row2"},{"label":"row5"},{"label":"row8"}])
     );
 
-    let before = engine.storage().load_catalog().await.unwrap().catalog;
+    let before = engine
+        .storage()
+        .load_cluster_catalog()
+        .await
+        .unwrap()
+        .catalog()
+        .clone();
     let (status, result) = request(
         &app,
         "table.insert_many",
@@ -207,9 +225,28 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     assert_eq!(status, 409);
     assert_eq!(result["error"]["code"], "conflict");
     assert_eq!(result["error"]["outcome"], "not_applied");
+    let after = engine.storage().load_cluster_catalog().await.unwrap();
+    assert_eq!(after.catalog().tables, before.tables);
+    assert_eq!(after.catalog().revision, before.revision + 1);
+    let decision = engine
+        .storage()
+        .lookup_decision_by_id(
+            &after,
+            uuid::Uuid::parse_str(result["request_id"].as_str().unwrap()).unwrap(),
+            meshdb_server::storage::HistoryBudget::new(
+                8,
+                64 * 1024,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decision.response_status, 409);
     assert_eq!(
-        engine.storage().load_catalog().await.unwrap().catalog,
-        before
+        serde_json::from_str::<Value>(&decision.response_body).unwrap(),
+        result
     );
     let (status, missing) = request(&app, "table.get", json!({"table_id":table_id,"key":12})).await;
     assert_eq!(status, 200);
@@ -240,6 +277,8 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     let (status, result) = request(&app, "query.count", json!({"table_id":table_id,"query":{"select":null,"filter":null,"order_by":null,"limit":null}})).await;
     assert_eq!(status, 200);
     assert_eq!(result["data"], 11);
+    queue_tasks.stop_accepting();
+    queue_tasks.drain().await;
     workers.shutdown().await.unwrap();
 }
 

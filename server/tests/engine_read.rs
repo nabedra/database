@@ -230,8 +230,9 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
     let reads = take_keys(&engine);
     assert_eq!(reads.len(), 2);
     assert!(reads[1].ends_with("/1.parquet"));
-    assert_eq!(
-        engine
+    // Object storage futures run on the network/coordinator runtime.
+    assert!(
+        !engine
             .storage()
             .backend()
             .threads
@@ -239,8 +240,8 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
             .unwrap()
             .last()
             .unwrap()
-            .2,
-        "meshdb-worker-1"
+            .2
+            .starts_with("meshdb-worker-")
     );
     let mut payload = all(&table);
     payload.query = serde_json::from_value(serde_json::json!({
@@ -491,23 +492,22 @@ async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
     );
     publish(&engine, &table, &[row(9, "replacement", 9.0, true)]).await;
     engine.drop(table.id).await.unwrap();
-    // Create now shares worker 0 with the captured legacy read. Poll it to
-    // admission, then release that read so schema validation can run.
-    let mut recreate = Box::pin(engine.create(CreatePayload {
-        name: table.name.clone(),
-        schema: table.schema.clone(),
-        key: table.key.clone(),
-        format: table.format,
-    }));
-    use std::{future::Future, task::Poll};
+    // A captured download does not prevent unrelated schema computation.
+    let replacement = engine
+        .create(CreatePayload {
+            name: table.name.clone(),
+            schema: table.schema.clone(),
+            key: table.key.clone(),
+            format: table.format,
+        })
+        .await
+        .unwrap();
     assert!(
-        std::future::poll_fn(|cx| Poll::Ready(recreate.as_mut().poll(cx)))
-            .await
-            .is_pending()
+        !task.is_finished(),
+        "captured storage request remains gated"
     );
     take_keys(&engine);
     gate.release.add_permits(1);
-    let replacement = recreate.await.unwrap();
     assert_eq!(
         task.await.unwrap().unwrap(),
         vec![rows[1].clone(), rows[2].clone(), rows[0].clone()]
@@ -582,15 +582,24 @@ async fn partition_workers_capture_across_drop_and_drain_after_error() {
         }
         let threads = engine.storage().backend().threads.lock().unwrap().clone();
         assert_eq!(threads.len(), 2);
-        assert_ne!(threads[0].1, threads[1].1);
-        for (object, _, name) in threads {
-            assert!(name.starts_with("meshdb-worker-"));
-            assert!(name.ends_with(if object.ends_with("/0.parquet") {
-                "0"
-            } else {
-                "1"
-            }));
-        }
+        assert!(
+            threads
+                .iter()
+                .all(|(_, _, name)| !name.starts_with("meshdb-worker-"))
+        );
+        let usage = engine.worker_pool().scheduler().usage();
+        assert_eq!(usage[0].1, 0, "downloads must not consume CPU slots");
+        assert!(usage[0].2 > 0, "download buffers remain charged");
+        // Both storage barriers entered before either opens. Independent CPU
+        // work must also complete while both downloads remain gated.
+        engine
+            .worker_pool()
+            .submit(99, |_, _| Ok(()))
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
         assert_eq!(take_keys(&engine).len(), 3);
         engine.drop(table.id).await.unwrap();
         take_keys(&engine);

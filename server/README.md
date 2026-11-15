@@ -1,14 +1,83 @@
 # MeshDB v0 server
 
 The `meshdb-server` Rust binary serves the table and query API over HTTP or
-native HTTPS. S3 is its only durable store. Run one process per bucket/prefix;
-v0 does not coordinate multiple server processes sharing a namespace.
+native HTTPS. Durable table data uses the configured object store. `serve`
+composes one API with a local worker; `api --config PATH` and
+`worker --bootstrap PATH` run separate processes with the same request, receipt,
+and atomic publication contracts.
 
 The [Python ORM guide](../orm/README.md) covers client installation and the full
 API. The [partition workers rubric](../plans/partition-workers.md) records current
 storage and worker contracts and task status. The [v0 server contract](../plan-v0/server.md)
 and [v0 implementation tracker](../plan-v0/implementation.md) are historical
 baselines; their single-file and request-only worker descriptions predate this change.
+
+## Worker queue and resource configuration
+
+`POST /v1/operations` waits for the terminal response. `POST /v1/requests` accepts
+the same `{request_id, operation, payload}` envelope and returns HTTP 202 with
+`request_id`, `run_id`, and `state: "queued"`. `GET /v1/requests/{run_id}/{request_id}`
+returns its state, result, and protocol error. Both interfaces use the data bearer
+token. A 202 response confirms replication to all ready workers, never successful
+mutation publication.
+
+Requests and read snapshots live in replicated worker RAM. Individual failures
+retain accepted work while another complete copy survives. Joining workers copy
+outstanding requests before readiness; drains transfer copies before removal.
+After a fixed/manual cluster's last queue holder stops, use `--cold-start` on
+the API or local `serve` to fence old authority and create a fresh run. Old unfinished receipts become abandoned;
+durable mutation decisions and committed rows remain available. Heartbeat expiry
+can fence a failed incarnation but never authorizes an automatic cold start.
+A configured provider can establish a new empty run only after fresh inventory
+proves that every retained member stopped, as described in
+[provider configuration](../docs/testing/provisioning-adapters.md).
+
+A brand new namespace creates a fenced format 4 catalog. An existing format
+1/2/3 catalog requires `--migrate-catalog`, which confirms that previous writers
+have been stopped. Keep old writers stopped after the transition. Migration and
+cold start are separate operations.
+
+For local `serve`, `--execution-config PATH` and `--resources-config PATH` read
+strict JSON configuration objects matching
+[the scheduling configuration](../plans/resource-aware-scheduling.md). Legacy
+`--workers`, `--queue-size`, and `--partition-size` supply defaults when those
+files are absent. Distributed worker templates carry `execution` and each
+worker's `resources`; signed enrollment preserves heterogeneous CPU/RAM ceilings.
+Each worker reports its actual limits, derived coordination capacity, and bounded
+control thread/transport overhead in its startup announcement. The binary uses
+two Tokio network threads and at most four Tokio blocking threads; each worker
+has two separate control codec threads. Partition, Arrow/codec, and reducer work
+share the advertised compute thread limit. Legacy
+`operation_slots` no longer serializes queued requests as compute permits. Signed
+`operation_slots` reports request coordination capacity; signed `partition_slots`
+reports bounded job coordination/prefetch capacity. `resources.max_threads` is the
+compute ceiling. A worker reserves at least two job actors per compute thread
+plus progress capacity, independently of its legacy partition-slot hint.
+
+Each request exposes a frontier of twice the compute capacity of its allowed
+workers. The coordinator validates enough outgoing stream capacity for three
+such frontiers plus progress slots before accepting a worker enrollment or
+scaling policy. An unsupported topology reports the minimum required
+`control_memory_reserve_bytes`; it does not silently restrict the advertised CPU
+capacity. Worker listeners reserve separate connection classes for job data,
+16 submissions, 8 receipts, 8 ordinary replicas, 4 bootstrap transfers,
+8 control requests, and 24 unclassified header handshakes. Signed queue metadata
+binds the command to its connection class, which the decoded body must match.
+Bootstrap copies and small control replies have reserved memory independent of
+request staging and ordinary replica traffic. Startup announcements report these
+network bounds and the derived outgoing stream limit.
+
+Queue/result caps are charged for the lifetime of the worker. Active request
+bodies, pinned snapshots, partition stages, outputs, and reductions retain
+separate memory charges through settlement. Shared compute grants enforce
+`max_threads`; coordinator waits, queue copies, storage I/O, and commit waits do
+not hold those grants. Memory accounting contains ordinary allocation failures;
+it does not provide process isolation from native aborts or an OS OOM kill.
+
+Use [the scheduler test contract](../docs/testing/scheduler-contract.md) to assess
+individual acceptance cases. `scripts/acceptance_scheduler.py` exercises real TCP
+queue/recovery gates with a local conditional store. Those assertions do not
+establish AWS or Kubernetes behavior.
 
 ## Build and start
 
@@ -46,6 +115,11 @@ reuse `server/target`. The disk-saving settings are
 
 ## Configuration
 
+These environment settings configure the standalone S3 `serve` backend.
+Supervised `api --config PATH` and `worker --bootstrap PATH` instead read their
+explicit HTTP-backend, authentication and worker configuration files; see
+[cluster process acceptance](#cluster-process-acceptance).
+
 | Environment variable | Requirement and meaning |
 | --- | --- |
 | `MESHDB_S3_BUCKET` | Required, nonempty existing S3 general purpose bucket. The server does not create buckets. |
@@ -57,7 +131,7 @@ reuse `server/target`. The disk-saving settings are
 | `AWS_SESSION_TOKEN` | Required with temporary environment credentials; otherwise optional. |
 | `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` | Optional standard AWS shared-file location overrides. |
 
-The server uses the AWS SDK's standard credential and region chains, including
+The S3 backend uses the AWS SDK's standard credential and region chains, including
 shared profiles and roles. AWS credentials stay on the server; clients need only
 the API URL and bearer token. The configured identity needs access to read and
 conditionally write objects beneath the database prefix.
@@ -74,17 +148,25 @@ Clap help/version options:
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | An IPv4 or IPv6 address. Nonloopback binding must be explicit. |
 | `--port` | `8000` | Unsigned 16-bit port. |
-| `--workers` | `4` | At least 1 persistent local OS worker thread; also sets the separate executing-request budget. |
+| `--workers` | `4` | Default local compute thread ceiling, in `1..256`; overridden by `resources.max_threads` when a resource file is supplied. |
 | `--partition-size`, alias `--partition_size` | `67108864 B` | Positive integer with a supported unit, at most 67,108,864 bytes. |
-| `--queue-size` | `64` | Nonnegative queued operation count; zero is valid. |
+| `--queue-size` | `64` | Legacy additional pending-request default and ingress coordination backlog; zero is valid. An execution file supplies the request queue limit directly. |
+| `--execution-config` | Absent | Readable strict JSON execution limits, including request count, replica/result bytes, retention and partition size. |
+| `--resources-config` | Absent | Readable strict JSON compute and memory ceilings; `max_threads` overrides `--workers`. |
+| `--migrate-catalog` | `false` | Explicitly confirm that previous writers are stopped before upgrading a format 1/2/3 catalog to fenced format 4. |
+| `--cold-start` | `false` | Explicitly fence a previous stopped local run and start an empty request queue while retaining committed data. |
 | `--tls-cert` | Absent | Readable PEM certificate file, supplied with `--tls-key`. |
 | `--tls-key` | Absent | Readable matching PEM private key, supplied with `--tls-cert`. |
 
-The checked sum of workers and queue size must fit the executor's semaphore
-limit. Authentication and admission precede operation-body reads. At most
-`workers + queue-size` operations are admitted and at most `workers` execute;
-full or stopped admission returns `429 overloaded`. Request admission and
-partition dispatch have separate budgets.
+Without an execution file, `workers + queue-size` supplies
+`execution.max_pending_requests`; checked configuration arithmetic must fit the
+supported limits. Authentication and bounded ingress admission precede body
+reads. Acceptance then requires queue-count and replica-byte capacity and copies
+on all ready workers. Compute saturation queues accepted work within those caps.
+Ingress or queue saturation can return `429 overloaded` before acceptance;
+already accepted records retain their identity through terminal settlement.
+Coordination and ingress limits are separate from compute grants and the full
+worker-memory request queue.
 
 For example:
 
@@ -99,16 +181,15 @@ Only positive integer quantities are valid. Bare numbers, signs, decimal
 notation, zero, overflow and values above 64 MiB are rejected. The default and
 hard maximum are 64 MiB, exactly 67,108,864 bytes; `64MiB` and `67108864B` are accepted.
 
-Exactly N persistent local OS threads handle partition work for `--workers N`.
-The original index in the captured manifest selects worker `index % N`, including
-when a keyed operation selects only one file. Each worker fetches its own file,
-decodes it and evaluates the operation or encodes replacement files on that
-thread. Each worker has one queued-job slot; each operation dispatches at most
-N outstanding jobs and awaits every admitted job through errors. More partitions
-run in later windows; fewer partitions leave some workers idle. The coordinator
-combines results and publishes the catalog. These are local threads in one
-process. Changing N on restart is safe and does not change storage partition
-count or require rewriting files.
+`--workers N` supplies N persistent local compute threads unless the resource
+file overrides that ceiling. Partition, codec and reducer jobs from concurrent
+requests share those slots. A free slot takes the next eligible job; completions
+release capacity and refill the frontier without waiting for a dispatch window.
+CPU and working-memory reservations apply together, and remote node allocations
+respect `max_workers_per_request`, including reduction. Coordination, storage
+waits, queue replication and settlement use separate bounded progress capacity.
+Changing the compute ceiling on restart preserves partition identities and
+committed table contents; worker count does not determine file count.
 
 Without TLS flags, the listener serves HTTP. To serve native HTTPS on an
 explicit nonloopback address:
@@ -122,7 +203,7 @@ server/target/release/meshdb-server serve --host 0.0.0.0 --port 8443 \
 Clients must trust the certificate's CA and verify its hostname. For a private
 CA, use curl's `--cacert /path/to/ca.pem` or the ORM's `ca_file` argument, as
 shown in the ORM guide. Invalid configuration, inaccessible or invalid catalog
-data, and invalid TLS material fail startup before listening. A definitely
+data, and invalid TLS material fail startup before HTTP ingress begins. A definitely
 missing catalog is initialized with a conditional create; an unreadable or
 unsupported catalog is never replaced with an empty database.
 
@@ -162,19 +243,26 @@ configuration values.
 
 ## Storage behavior and limits
 
-Within the prefix, `catalog.json` references immutable Parquet files. Version 2
-catalogs support mixed Legacy entries at `tables/<table_id>/<commit_id>.parquet`
-and Partitioned entries whose files are at
-`tables/<table_id>/<commit_id>/<ordinal>.parquet`.
+Within the prefix, `catalog.json` is the conditional publication root. Current
+runtime publications use format 4, which stores the durable decision head and
+`run_id`/scheduler-term fence alongside table references. An ownership takeover
+or cold start updates that same root, so an old attempt's catalog ETag cannot
+publish after its fence has been superseded.
+
+The table layouts introduced in format 2 remain supported inside format 4:
+Legacy entries at `tables/<table_id>/<commit_id>.parquet` and Partitioned entries
+at `tables/<table_id>/<commit_id>/<ordinal>.parquet`.
 A manifest records each file's typed primary-key range, row count, closed byte
 size and decoded payload size. Ranges are ordered, contiguous, lower-inclusive
 and upper-exclusive, with unbounded outer ends. Empty tables use `files: []`
 and create no Parquet object.
 
-Version 1 remains readable without startup or read-time rewriting. New catalog
-publications use version 2. A legacy table migrates to partitions only on an
-actual data change; reads and no-op mutations retain its legacy file. A catalog
-can therefore contain both layouts. Old binaries reject version 2 catalogs.
+Existing format 1/2/3 roots require `--migrate-catalog` after their previous
+writers have stopped. Migration preserves table/file references and existing
+decision history, then establishes a format 4 fence before accepting work. Keep
+older writers stopped afterward. Upgrading the root does not rewrite table data:
+a Legacy table becomes partitioned on an actual data change, while reads and
+no-op mutations retain its existing file. Mixed table layouts remain valid.
 
 Each read captures one fresh catalog and retains its referenced files during
 writes or drops, without taking the mutation lock. Keyed gets and mutations
@@ -184,12 +272,12 @@ shared workers. The coordinator combines their results with one global ordering,
 ascending-primary-key tie-break, limit and projection; count sums matches and
 applies the global limit. Explain remains metadata-only.
 
-Mutating requests serialize under the existing in-process coordinator while
-their partitions prepare in parallel. After all preparation and aggregate limit
-checks succeed, object uploads run sequentially. One conditional catalog PUT
-against the previous opaque ETag commits the whole mutation. Preparation or
-upload failure publishes no partial table, though uploads can leave orphan
-objects. This design makes no throughput or scaling guarantee.
+Concurrent mutations prepare private candidates from captured catalogs. Every
+affected partition and aggregate limit must pass before one conditional catalog
+PUT publishes the complete reference set and durable request decision under the
+current fence. A CAS loser recomputes against a fresh catalog within its bounded
+retry policy. Preparation or upload failure exposes no partial table. Uploaded
+objects that the root never references remain invisible orphans.
 
 The size target measures closed Parquet bytes, including metadata and footer.
 New files split by primary-key range toward the configured target. A singleton
@@ -204,13 +292,15 @@ table. Old snapshots and orphan uploads remain in S3. Dropping removes only the
 catalog entry and deletes no objects. Recovery follows the catalog, never a
 listing or the newest-looking file.
 
-Conditional publication conflicts return `conflict`. After an ambiguous catalog
-PUT, the server rereads once; a matching commit UUID proves success, otherwise
-it reports `outcome_unknown` with outcome `unknown`. Publication is not retried
-automatically. Request IDs provide no idempotency or deduplication. After an
-unknown outcome, inspect and reconcile data before deciding on another write;
-an immediate old read or timeout does not prove rollback. The ORM also performs
-no automatic retries.
+Accepted requests deduplicate by their exact identity and body. An identical
+same-run submission attaches to its existing execution or receipt; a different
+body conflicts. Mutations also retain durable decisions, so recovery reconciles
+a catalog PUT whose response was lost instead of applying the mutation twice.
+An unresolved publication reports `outcome_unknown` with outcome `unknown`;
+a timeout or an older read does not prove rollback. Recover the same receipt or
+reconcile the durable decision before choosing another logical write. A complete
+worker shutdown abandons outstanding memory work rather than resubmitting it.
+The ORM performs no automatic mutation resubmission.
 
 Schemas contain 1 to 128 columns and exactly four nonnullable scalar types:
 `utf8` strings, signed `int64` integers, finite `float64` values and `bool`.
@@ -232,9 +322,10 @@ duplicate-key validation.
 Partitioning does not multiply table, request, batch or result limits.
 Limits produce `limit_exceeded`, without truncation. Only server-generated
 Parquet snapshots are supported; this is not a general Parquet file importer.
-v0 has no garbage collection, general transactions across calls, SQL, joins,
-grouping/aggregations, indexes, streaming or distributed execution. Query
-`count` is supported as described in the ORM guide.
+The server has no garbage collection, general transactions across calls, SQL,
+joins, grouping/aggregations, indexes or public result-streaming interface.
+Partition jobs can execute on separate worker processes through the configured
+cluster runtime. Query `count` is supported as described in the ORM guide.
 
 ## Focused checks and live acceptance
 
@@ -254,7 +345,10 @@ server itself supports profiles and roles.
 
 Each runner allocates fresh `test-<number>-<scenario>-<random-run-id>/` prefixes,
 starts its own server and retains S3 fixtures. Restart scenarios reuse only
-their own allocated namespace. Do not substitute the default database prefix
+their own allocated namespace. The process helper retains the original child
+receipt on that namespace and supplies `--cold-start` only after observing that
+child's exit, including when a new helper changes the worker count. It never
+silently acknowledges migration of a pre-existing legacy catalog. Do not substitute the default database prefix
 or manually replay a recorded acceptance prefix. Run the runners sequentially:
 
 ```sh
@@ -280,16 +374,17 @@ routed CRUD, global query results, atomic failure and retained objects, then
 restarts that namespace with three workers instead of two. Both runs use a
 64 KB target. Retain its fixtures and sanitized report, and record the exact
 command, report, outcome and allocated prefix under [scripts/notes/](../scripts/notes/).
-Never source, print or commit the supplied dotenv file or credentials. Its live
-S3 run [passed all 53 checks](../scripts/notes/PW-E02.md); see the
-[current rubric](../plans/partition-workers.md) for final audit status.
+Never source, print or commit the supplied dotenv file or credentials. Its historical live S3 run
+[passed all 53 partition checks](../scripts/notes/PW-E02.md). That report predates
+the replicated queue and format 4 fences; current scheduler/provider evidence is
+listed below.
 
 Historical implementation details are recorded in the notes for
 [configuration](notes/R10a.md), [CLI](notes/R10b.md),
 [operations HTTP](notes/R09.md), [health](notes/R09b.md),
 [S3/catalogs](notes/R02.md) and [publication](notes/R04.md).
 
-## Local API and worker milestone
+## Cluster process acceptance
 
 A local process acceptance runner starts a real HTTP object store, a supervised
 API and two manually enrolled worker processes with synthetic credentials. It
@@ -300,19 +395,30 @@ Run from the repository root using the existing dependency cache:
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
   cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin meshdb-server
-python3 scripts/acceptance_nodes.py --binary server/target/debug/meshdb-server
+python3.11 scripts/acceptance_nodes.py --binary server/target/debug/meshdb-server
 ```
 
-The runner needs only Python's standard library and loopback TCP. It creates and
+The runner needs Python 3.11+, its standard library and loopback TCP. It creates and
 removes its own SQLite store and configuration. It reads no dotenv or cloud
 profiles. Its startup exchange demonstrates `meshdb-server api --config PATH`
 over the inherited `MESHDB_SUPERVISOR_FD` socket and
 `meshdb-server worker --bootstrap PATH`. An API requires that supervisor
-exchange; it is not an unsupervised standalone command.
+exchange; it is not an unsupervised standalone command. `api` also accepts
+`--migrate-catalog` and `--cold-start` with the same migration and cold-run
+confirmation requirements described above.
 
-This milestone supports the HTTP storage backend, external provisioning and a
-fixed worker policy. Managed provisioning, autoscaling, administration routes,
-S3 runtime composition and positive safe-termination authorization remain
-unfinished. Signal shutdown stops admission and waits for owned work; it is not
-a distributed idle certificate. See [runtime evidence](notes/DN-runtime-integration.md)
-for executed checks and limits.
+The supervised cluster uses the HTTP object backend. It supports heterogeneous
+workers, replicated in-memory requests, fenced publication, public cluster
+administration and configured provider callbacks. The Kubernetes adapter creates
+workers and uses fresh drain evidence before termination. The standalone S3
+backend remains available through the `s3` feature; supervised S3 composition
+requires a separate storage integration.
+
+The scheduling, failure, and provider fixtures are
+`scripts/acceptance_scheduler.py`, `scripts/acceptance_scheduler_load.py`, and
+`scripts/acceptance_providers.py`. Their case mappings and execution results are
+recorded in [scheduler evidence](../docs/testing/scheduler-evidence.md).
+See [provider configuration](../docs/testing/provisioning-adapters.md) for managed
+workers and the live-infrastructure verification boundary. Signal shutdown drains
+owned local work; provider termination additionally requires a distributed idle
+proof.

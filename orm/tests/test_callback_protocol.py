@@ -44,6 +44,23 @@ def record(resource='resource', state='running'):
     return dict(resource_id=resource, cluster_id=C, node_id=N, request_id=R, state=state)
 
 
+class ResourceBootstrapTests(unittest.TestCase):
+    def test_optional_resource_execution_limits_survive_managed_bridge(self):
+        value = command()
+        bootstrap = value['payload']['bootstrap']
+        bootstrap['resources'] = dict(max_threads=2, memory_limit_bytes=8 << 30,
+            task_memory_limit_bytes=512 << 20, control_memory_reserve_bytes=256 << 20)
+        bootstrap['execution'] = dict(max_workers_per_request=4, max_pending_requests=1024,
+            max_queue_bytes_per_replica=256 << 20, max_retained_result_bytes_per_worker=64 << 20,
+            result_retention_ms=300000, queue_replication='all_ready_workers',
+            queue_lifetime='live_cluster', partition_size='64 MiB')
+        decoded = p._decode_command(wire(value))
+        self.assertEqual(decoded.value['payload']['bootstrap']['resources']['max_threads'], 2)
+        bootstrap['resources']['control_memory_reserve_bytes'] = bootstrap['resources']['memory_limit_bytes']
+        with self.assertRaises(p._CallbackProtocolError):
+            p._decode_command(wire(value))
+
+
 class Authority:
     """Independent HTTP wire fixture, one accepted connection, no production codec."""
     def __init__(self, response=None, mode=None):

@@ -281,9 +281,9 @@ def run(binary):
             assert status == 200 and value["data"] == rows, value
             status, value = call(api_door.url, "query.count", query, auth["data_token"])
             assert status == 200 and value["data"] == len(rows), value
-            # Two coordinators mutate the same captured table. Their CAS loser
-            # must recompute instead of dropping the winning rows.
-            before = [sum(r[0] == "/internal/v1/operations" for r in door.requests) for door in worker_doors]
+            # Two accepted mutations capture the same table. The fenced queue
+            # owner runs both concurrently; their CAS loser must recompute
+            # instead of dropping the winning rows.
             gate = {"barrier": threading.Barrier(2), "reads": 0}
             with store_door.lock:
                 store_door.catalog_gate = gate
@@ -296,8 +296,6 @@ def run(binary):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(competing, [120, 121]))
             assert all(status == 200 for status, _ in results), results
-            after = [sum(r[0] == "/internal/v1/operations" for r in door.requests) for door in worker_doors]
-            assert all(b == a + 1 for a, b in zip(before, after)), (before, after)
             assert gate["reads"] == 2, "both coordinators must capture the catalog before either publishes"
             rows.extend([{"id": n, "text": "competing"} for n in [120, 121]])
             assert call(api_door.url, "query.collect", query, auth["data_token"])[1]["data"] == rows

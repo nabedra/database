@@ -189,6 +189,7 @@ fn handoff(
 fn hb_binding(root: &Control) -> HeartbeatBinding {
     let n = &root.nodes[0];
     HeartbeatBinding {
+        resources: None,
         cluster_id: root.cluster_id,
         node_id: n.node_id,
         incarnation: n.incarnation.unwrap(),
@@ -209,6 +210,8 @@ async fn receipt(
     let b = hb_binding(root);
     let mut w = HeartbeatWriter::new(b.clone()).unwrap();
     let h = HeartbeatSample {
+        available_threads: None,
+        available_memory_bytes: None,
         running_operations: 0,
         running_partitions: 0,
         queued_operations: 0,

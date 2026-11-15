@@ -145,7 +145,7 @@ impl Scope {
 // All DTO fields remain private. These item allowances cover the pending R03a2
 // consumers only, and should be removed when those consumers land.
 macro_rules! record {($name:ident {$($(#[$a:meta])* $f:ident:$t:ty),* $(,)?})=>{
- #[allow(dead_code)] #[derive(Clone,PartialEq,Eq,Serialize)] pub(crate) struct $name {$($f:$t),*}
+ #[allow(dead_code)] #[derive(Clone,PartialEq,Eq,Serialize)] pub(crate) struct $name {$($(#[$a])* $f:$t),*}
  impl DecodeRecord for $name {fn decode_record<'de,D:Deserializer<'de>>(d:D)->Result<Self,D::Error>{
  #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct Wire {$($(#[$a])* $f:$t),*}
  let w:Wire=deserialize_object(d)?; Ok(Self{$($f:w.$f),*})
@@ -200,6 +200,8 @@ record!(ReplyAuth {
     control_sha256: String,
 });
 record!(EnrollmentUnsigned {
+ #[serde(default, skip_serializing_if="Option::is_none")]
+ resources:Option<crate::config::WorkerResources>,
  version:Number,
  #[serde(deserialize_with="uuid")] cluster_id:Uuid,
  #[serde(deserialize_with="uuid")] node_id:Uuid,
@@ -261,6 +263,8 @@ record!(DrainReply {
     heartbeat_sequence: Number,
 });
 record!(Enrollment {
+ #[serde(default, skip_serializing_if="Option::is_none")]
+ resources:Option<crate::config::WorkerResources>,
  version:Number,
  #[serde(deserialize_with="uuid")] cluster_id:Uuid,
  #[serde(deserialize_with="uuid")] node_id:Uuid,
@@ -422,7 +426,12 @@ impl Auth {
                 && self.sequence.0 > 0
                 && self.path == actual.route
                 && self.scope == actual.route.scope()
-                && self.sender.role == self.scope.role()
+                && (self.sender.role == self.scope.role()
+                    || (self.scope == Scope::Operation
+                        && self.sender.role == Role::Worker
+                        && self.sender.node_id == Some(self.receiver.node_id)
+                        && self.sender.incarnation == Some(self.receiver.incarnation)
+                        && self.sender.session_id == Some(self.receiver.session_id)))
                 && self.dependency_id == actual.dependency
                 && hex_ok(&self.control_sha256, 64),
         )?;
@@ -481,7 +490,10 @@ impl ReplyAuth {
             v.version.0 == 1
                 && v.request_sequence.0 > 0
                 && v.sender.role == Role::Worker
-                && v.receiver.role == v.scope.role()
+                && (v.receiver.role == v.scope.role()
+                    || (v.scope == Scope::Operation
+                        && v.receiver.role == Role::Worker
+                        && v.receiver == v.sender))
                 && (100..=599).contains(&v.status.0)
                 && hex_ok(&v.control_sha256, 64),
         )?;
@@ -524,8 +536,12 @@ impl EnrollmentUnsigned {
         hex_ok(&self.public_key, 64)
             && configuration::api_url(&self.endpoint)
             && (1..=256).contains(&self.operation_slots.0)
-            && (1..=256).contains(&self.partition_slots.0)
+            && (1..=if self.resources.is_some() { 1024 } else { 256 })
+                .contains(&self.partition_slots.0)
             && self.queue_size.0 <= 4096
+            && self
+                .resources
+                .is_none_or(|r| r.validate().is_ok() && r.max_threads <= self.partition_slots.0)
     }
 }
 impl Enrollment {
@@ -542,6 +558,7 @@ impl Enrollment {
             operation_slots: value.operation_slots,
             partition_slots: value.partition_slots,
             queue_size: value.queue_size,
+            resources: value.resources,
             proof,
         };
         Self::decode(&value.encode()?)
@@ -559,6 +576,7 @@ impl Enrollment {
             operation_slots: self.operation_slots,
             partition_slots: self.partition_slots,
             queue_size: self.queue_size,
+            resources: self.resources,
         }
     }
     pub(crate) fn unsigned_bytes(&self) -> Result<Vec<u8>, Error> {
@@ -658,6 +676,9 @@ access!(Enrollment {
     session_id: Uuid => |s: &Enrollment| s.session_id,
 });
 impl Enrollment {
+    pub(crate) fn resources(&self) -> Option<crate::config::WorkerResources> {
+        self.resources
+    }
     #[allow(dead_code)] // C03 enrollment callers pending.
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint

@@ -21,7 +21,7 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Opti
 macro_rules! record {
     ($vis:vis $name:ident { $($(#[$attr:meta])* $field:ident: $ty:ty),* $(,)? }) => {
         #[derive(Serialize, PartialEq, Eq)]
-        $vis struct $name { $($field: $ty),* }
+        $vis struct $name { $($(#[$attr])* $field: $ty),* }
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d:D)->Result<Self,D::Error> {
                 #[derive(Deserialize)] #[serde(deny_unknown_fields)]
@@ -45,6 +45,10 @@ record!(Target {
     #[serde(deserialize_with="member::nullable_uuid")] incarnation_id: Option<Uuid>,
 });
 record!(Bootstrap {
+    #[serde(default, skip_serializing_if="crate::config::ExecutionConfig::is_default")]
+    execution:crate::config::ExecutionConfig,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    resources:Option<crate::config::WorkerResources>,
     version: u64,
     #[serde(deserialize_with="member::uuid")] cluster_id: Uuid,
     #[serde(deserialize_with="member::uuid")] node_id: Uuid,
@@ -285,6 +289,8 @@ fn expected_start(
             request_id: intent.launch_id,
             node_id: intent.node_id,
             bootstrap: Bootstrap {
+                execution: t.execution.clone(),
+                resources: t.resources,
                 version: 1,
                 cluster_id: root.cluster_id,
                 node_id: intent.node_id,
@@ -785,4 +791,59 @@ impl ReplyContext {
         }
         Ok(())
     }
+}
+
+/// Reconstruct the exact configured command and its retained delivery before
+/// granting one bridge entry. Inventory is bound to the currently observed root.
+pub(super) fn authorize_command(
+    raw: &[u8],
+    root: &Control,
+    attached: &AttachedConfig,
+) -> Result<(Uuid, Owner, String, bool), StorageError> {
+    let wire: CommandWire = object(raw)?;
+    let owner = Owner {
+        process_id: wire.owner_id,
+        epoch: wire.epoch,
+    };
+    if root.controller.owner_id != Some(owner.process_id)
+        || root.controller.epoch != owner.epoch
+        || root.controller.lease_state != LeaseState::Held
+        || root.provisioning != Provisioning::Managed
+        || wire.cluster_id != root.cluster_id
+    {
+        return Err(StorageError::Conflict);
+    }
+    let digest = match wire.action.as_str() {
+        "start" => validate_start_bytes(raw, root, attached)?,
+        "stop" => validate_stop_bytes(raw, root)?,
+        "inventory" => {
+            let expected = InventoryCommand::build(root, owner, wire.invocation_id)?;
+            let _: Empty = object(wire.payload.get().as_bytes())?;
+            if wire.version != 1 || wire.intent_id.is_some() || wire.target.is_some() {
+                return Err(StorageError::Conflict);
+            }
+            // Inventory has a canonical empty payload and no retained intent.
+            let _ = expected;
+            digest(raw)
+        }
+        _ => return Err(StorageError::Conflict),
+    };
+    if wire.action != "inventory" {
+        let intent = root
+            .intents
+            .iter()
+            .find(|i| Some(i.request_id) == wire.intent_id)
+            .ok_or(StorageError::Conflict)?;
+        if intent.state != member::IntentState::InProgress
+            || intent.delivery.as_ref().is_none_or(|d| {
+                d.invocation_id != wire.invocation_id
+                    || d.owner_id != owner.process_id
+                    || d.epoch != owner.epoch
+                    || d.command_sha256 != digest
+            })
+        {
+            return Err(StorageError::Conflict);
+        }
+    }
+    Ok((wire.invocation_id, owner, digest, wire.action == "stop"))
 }

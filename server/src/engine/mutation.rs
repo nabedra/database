@@ -37,6 +37,34 @@ pub fn apply(
 ) -> Result<Mutation, ProtocolError> {
     table.validate()?;
     operation.validate_for_table(table)?;
+    crate::snapshot::check_rows_memory(table, &rows, 0)?;
+    let added = match operation {
+        Operation::InsertMany(p) => p.rows.as_slice(),
+        Operation::Insert(p) => std::slice::from_ref(&p.row),
+        Operation::Upsert(p) => std::slice::from_ref(&p.row),
+        Operation::Update(p) => std::slice::from_ref(&p.values),
+        _ => &[],
+    };
+    let extra = added.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(crate::snapshot::row_payload(row))
+            .ok_or_else(|| error(ErrorCode::LimitExceeded, "mutation memory limit"))
+    })?;
+    let existing = rows.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(crate::snapshot::row_payload(row))
+            .ok_or_else(|| error(ErrorCode::LimitExceeded, "mutation memory limit"))
+    })?;
+    crate::snapshot::check_memory_shape(
+        table,
+        rows.len()
+            .checked_add(added.len())
+            .ok_or_else(|| error(ErrorCode::LimitExceeded, "mutation memory limit"))?,
+        existing
+            .checked_add(extra)
+            .ok_or_else(|| error(ErrorCode::LimitExceeded, "mutation memory limit"))?,
+        0,
+    )?;
+    rows.try_reserve_exact(added.len())
+        .map_err(|_| error(ErrorCode::LimitExceeded, "mutation allocation limit"))?;
     let (result, changed) = match operation {
         Operation::Insert(p) => {
             if rows.iter().any(|row| row[&table.key] == p.row[&table.key]) {
@@ -157,3 +185,44 @@ fn check_growth(current: usize, additional: usize) -> Result<(), ProtocolError> 
 fn error(code: ErrorCode, message: &str) -> ProtocolError {
     ProtocolError::new(code, message, Outcome::NotApplied)
 }
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::protocol::{ColumnType, TableFormat, UpdatePayload};
+    #[test]
+    fn m01_update_values_are_checked_before_cloning_into_candidate() {
+        let table = TableDescriptor {
+            id: uuid::Uuid::nil(),
+            name: "memory".into(),
+            key: "id".into(),
+            format: TableFormat::Parquet,
+            schema: [
+                ("id".into(), ColumnType::Int64),
+                ("text".into(), ColumnType::Utf8),
+            ]
+            .into(),
+        };
+        let operation = Operation::Update(UpdatePayload {
+            table_id: table.id,
+            key: Key::Int64(1),
+            values: [("text".into(), Scalar::Utf8("x".repeat(16 * 1024)))].into(),
+        });
+        let rows = vec![
+            ([
+                ("id".into(), Scalar::Int64(1)),
+                ("text".into(), Scalar::Utf8("small".into())),
+            ])
+            .into(),
+        ];
+        crate::scheduling::with_task_limit(8192, || {
+            assert_eq!(
+                apply(&table, &operation, rows).unwrap_err().code,
+                ErrorCode::LimitExceeded
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests;

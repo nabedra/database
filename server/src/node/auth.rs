@@ -58,7 +58,7 @@ pub(crate) use sequence::SenderSequence;
 mod replay;
 
 #[allow(unused_imports)] // Pending receiver admission/runtime consumer.
-pub(crate) use replay::{ReplayState, ReplayedRequest};
+pub(crate) use replay::{ReplayMembership, ReplayState, ReplayedRequest};
 #[allow(unused_imports)] // Pending checked semantic transfer.
 pub(crate) use verify::{RequestBinding, RequestBody, RequestHandoff};
 

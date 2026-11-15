@@ -115,6 +115,7 @@ pub(crate) fn allocate_start(
     result.revision = revision;
     result.change_id = proposal;
     let node = Node {
+        resources: Some(root.template.worker_resources()),
         node_id,
         launch_id: Some(launch_id),
         resource_id: None,
@@ -123,8 +124,10 @@ pub(crate) fn allocate_start(
         incarnation: None,
         retired_incarnations: vec![],
         endpoint: None,
-        operation_slots: root.template.operation_slots,
-        partition_slots: root.template.partition_slots,
+        operation_slots: crate::node::queue_runtime::coordination_capacity(&root.template)
+            .map_err(|_| StorageError::LimitExceeded)? as u64,
+        partition_slots: crate::node::queue_runtime::job_coordination_capacity(&root.template)
+            .map_err(|_| StorageError::LimitExceeded)? as u64,
         queue_size: root.template.queue_size,
         registration: Registration::Unregistered,
         session: None,
@@ -183,3 +186,72 @@ pub(super) use stop::{
 mod termination;
 #[allow(unused_imports)] // Later supervised terminal inventory caller.
 pub(super) use termination::{TerminationClass, TerminationPlan, reconcile_termination};
+
+/// Persist one bounded desired-capacity adjustment. Demand is observed by the
+/// live owner; no accepted request record is ever changed by this transition.
+pub(crate) fn demand_candidate(
+    root: &Control,
+    owner: Owner,
+    pending: u64,
+    running: u64,
+    oldest_wait_ms: u64,
+    now_ms: u64,
+    proposal: Uuid,
+) -> Result<Option<ProvisionCandidate>, StorageError> {
+    let observation = delivery::base(root, owner, proposal)?;
+    if root.policy.mode != super::state::PolicyMode::Autoscale
+        || now_ms < root.scheduler.cooldown_until_ms
+        || now_ms < root.scheduler.backoff_until_ms
+    {
+        return Ok(None);
+    }
+    let mut result = root.clone();
+    let pressure = pending > 0 && oldest_wait_ms >= root.timing.stabilization_ms;
+    if pressure && root.policy.desired < root.policy.max_nodes {
+        result.policy.desired += 1;
+        result.scheduler.low_since_ms = None;
+    } else if pending == 0 && running == 0 && root.policy.desired > root.policy.min_nodes {
+        match root.scheduler.low_since_ms {
+            None => result.scheduler.low_since_ms = Some(now_ms),
+            Some(since) if now_ms.saturating_sub(since) >= root.timing.stabilization_ms => {
+                result.policy.desired -= 1;
+                result.scheduler.low_since_ms = None;
+            }
+            _ => return Ok(None),
+        }
+    } else if root.scheduler.low_since_ms.is_some() {
+        result.scheduler.low_since_ms = None;
+    } else {
+        return Ok(None);
+    }
+    if result.policy.desired != root.policy.desired {
+        result.policy.revision = result
+            .policy
+            .revision
+            .checked_add(1)
+            .ok_or(StorageError::LimitExceeded)?;
+        result.scheduler.cooldown_until_ms = now_ms
+            .checked_add(root.timing.cooldown_ms)
+            .ok_or(StorageError::LimitExceeded)?;
+    }
+    Ok(Some(delivery::finish(
+        root,
+        owner,
+        observation,
+        result,
+        proposal,
+    )?))
+}
+
+/// Complete inventory must contain no unknown launch, resource collision or
+/// contradiction with a retained terminal decision before capacity changes.
+pub(super) fn inventory_clean(
+    root: &Control,
+    owner: Owner,
+    inventory: &crate::cluster::callback::InventoryEvidence,
+) -> Result<bool, StorageError> {
+    Ok(matches!(
+        reconcile::classify_inventory(root, owner, inventory)?,
+        reconcile::InventoryClass::Clean
+    ))
+}

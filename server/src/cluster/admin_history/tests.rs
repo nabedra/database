@@ -276,7 +276,7 @@ async fn hard_record_limit_stops_before_next_get() {
     assert_eq!(s.backend().state.lock().unwrap().gets, 4097);
     assert_eq!(s.backend().state.lock().unwrap().puts, 0);
 }
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn hard_byte_limit_is_not_deadline_exhaustion() {
     let (s, l, b) = fixture(headed(9, 30), &[]).await;
     for seq in 1..=9 {

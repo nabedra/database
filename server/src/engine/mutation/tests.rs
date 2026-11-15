@@ -1,8 +1,6 @@
-use meshdb_server::protocol;
+use super::{MutationResult, apply};
+use crate::protocol;
 use protocol::*;
-#[path = "../src/engine/mutation.rs"]
-mod mutation;
-use mutation::{MutationResult, apply};
 
 fn table() -> TableDescriptor {
     serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000001","name":"items","schema":{"id":"int64","name":"utf8","score":"float64","active":"bool"},"key":"id","format":"parquet"}"#).unwrap()

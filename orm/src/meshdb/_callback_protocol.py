@@ -118,8 +118,26 @@ def _load(raw):
 
 
 def _bootstrap(value, payload):
+    _require(type(value) is dict)
+    optional = set(value) & {'resources', 'execution'}
     _fields(value, 'version cluster_id node_id request_id api_urls listen advertise_url '
-                   'storage enrollment_token tls operation_slots partition_slots queue_size partition_size')
+                   'storage enrollment_token tls operation_slots partition_slots queue_size partition_size '
+                   + ' '.join(sorted(optional)))
+    if 'resources' in value:
+        r = value['resources']
+        _fields(r, 'max_threads memory_limit_bytes task_memory_limit_bytes control_memory_reserve_bytes')
+        _require(all(type(v) is int and 0 < v <= 2**63 - 1 for v in r.values()))
+        _require(r['max_threads'] <= 256 and r['control_memory_reserve_bytes'] < r['memory_limit_bytes']
+                 and r['task_memory_limit_bytes'] <= r['memory_limit_bytes'] - r['control_memory_reserve_bytes'])
+    if 'execution' in value:
+        e = value['execution']
+        _fields(e, 'max_workers_per_request max_pending_requests max_queue_bytes_per_replica '
+                   'max_retained_result_bytes_per_worker result_retention_ms queue_replication queue_lifetime partition_size')
+        _require(all(type(e[k]) is int and 0 < e[k] <= 2**63 - 1 for k in (
+            'max_workers_per_request', 'max_pending_requests', 'max_queue_bytes_per_replica',
+            'max_retained_result_bytes_per_worker', 'result_retention_ms')))
+        _require(e['queue_replication'] == 'all_ready_workers' and e['queue_lifetime'] == 'live_cluster')
+        _text(e['partition_size'])
     _version(value['version'])
     for key in ('cluster_id', 'node_id', 'request_id'):
         _require(value[key] == payload[key])

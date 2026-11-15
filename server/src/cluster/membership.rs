@@ -100,9 +100,8 @@ pub(crate) fn registration_plan(
                 && e.request_id().is_some(),
         )?;
         require(
-            n.operation_slots == e.operation_slots()
-                && n.partition_slots == e.partition_slots()
-                && n.queue_size == e.queue_size(),
+            e.resources()
+                .is_none_or(|r| r.validate_execution(&root.template.execution).is_ok()),
         )?;
         let start = root
             .intents
@@ -136,7 +135,8 @@ pub(crate) fn registration_plan(
                     && n.endpoint.as_deref() == Some(e.endpoint())
                     && n.operation_slots == e.operation_slots()
                     && n.partition_slots == e.partition_slots()
-                    && n.queue_size == e.queue_size(),
+                    && n.queue_size == e.queue_size()
+                    && n.resources == e.resources(),
             )?;
             // Exact recovery precedes proposal checks and all advancing arithmetic.
             return Ok(RegistrationPlan::Existing(n.clone()));
@@ -175,6 +175,7 @@ pub(crate) fn registration_plan(
             result.nodes.insert(
                 i,
                 Node {
+                    resources: e.resources(),
                     node_id: e.node_id(),
                     launch_id: None,
                     resource_id: Some(format!("external:{}", e.node_id())),
@@ -200,6 +201,7 @@ pub(crate) fn registration_plan(
     n.operation_slots = e.operation_slots();
     n.partition_slots = e.partition_slots();
     n.queue_size = e.queue_size();
+    n.resources = e.resources();
     n.registration = Registration::Registered;
     let candidate = candidate(root, owner, observation, proposal, result)?;
     if new_admission {

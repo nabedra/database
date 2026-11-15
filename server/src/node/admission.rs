@@ -21,7 +21,7 @@ struct Capacity {
 #[allow(dead_code)] // R04b/c construction is pending.
 impl Capacity {
     fn new(workers: usize, queue: usize) -> Result<Self, Refusal> {
-        if !(1..=256).contains(&workers) || queue > 4096 {
+        if !(1..=1024).contains(&workers) || queue > 4096 {
             return Err(Refusal::Invalid);
         }
         Ok(Self { workers, queue })
@@ -225,6 +225,31 @@ impl LocalAdmission {
         partition_workers: usize,
         queue: usize,
     ) -> Result<Self, Refusal> {
+        if operation_workers > 256 || partition_workers > 256 {
+            return Err(Refusal::Invalid);
+        }
+        Self::new_with_job_slots(
+            cluster,
+            key,
+            coordinator,
+            initialization,
+            operation_workers,
+            partition_workers,
+            queue,
+        )
+    }
+    pub(super) fn new_with_job_slots(
+        cluster: Uuid,
+        key: &WorkerSigningKey,
+        coordinator: Arc<Sender>,
+        initialization: Uuid,
+        operation_workers: usize,
+        partition_workers: usize,
+        queue: usize,
+    ) -> Result<Self, Refusal> {
+        if operation_workers > 256 {
+            return Err(Refusal::Invalid);
+        }
         let operation_capacity = Capacity::new(operation_workers, queue)?;
         let partition_capacity = Capacity::new(partition_workers, queue)?;
         if coordinator.public_key().map_err(|_| Refusal::Invalid)? != key.public_key() {
@@ -922,10 +947,10 @@ mod ownership_tests {
             );
             assert_eq!(
                 state.payload.bounds(),
-                (1 + o + q + 4096 + 32, o + q + p + q + 64)
+                (1 + o + q + 4096 + 48, o + q + p + q + 64)
             );
             let (payload, records) = state.payload.bounds();
-            assert!(payload <= 8481 && records <= 8768);
+            assert!(payload <= 8497 && records <= 8768);
         }
     }
     #[test]
@@ -1883,6 +1908,7 @@ impl Binding {
 pub(super) struct DurableRequestView {
     eligible: super::auth::EligibleRequest,
     durable: DurableView,
+    membership: super::auth::ReplayMembership,
 }
 impl std::fmt::Debug for DurableRequestView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1922,8 +1948,11 @@ impl DurableRequestView {
                 coordinators.push(Arc::new(sender.clone()));
             }
         }
+        let membership =
+            super::auth::ReplayMembership::prepare(root).map_err(|_| Refusal::Invalid)?;
         Ok(Self {
             eligible,
+            membership,
             durable: DurableView {
                 boot,
                 observation,
@@ -2243,7 +2272,11 @@ impl ReceiverState {
         let ReceiverMode::Distributed(local, replay) = &mut self.mode else {
             return Err(Refusal::Invalid.into());
         };
-        let DurableRequestView { eligible, durable } = view;
+        let DurableRequestView {
+            eligible,
+            durable,
+            membership,
+        } = view;
         // A foreign boot is not an observation of this receiver's root history.
         if !local.boot.same_boot(&durable.boot) || !local.boot.same_boot(eligible.local()) {
             return Err(Refusal::Stale.into());
@@ -2252,6 +2285,7 @@ impl ReceiverState {
         let local_order = local.observe(durable);
         replay_order?;
         local_order?;
+        replay.observe_membership(membership)?;
         if !eligible.matches_content(&content) || !local.boot.same_boot(eligible.local()) {
             return Err(Refusal::Stale.into());
         }
@@ -2313,6 +2347,24 @@ impl ReceiverState {
                 Ok(AcceptedRoute::Job(AcceptedWork { owners, start }))
             }
             (PreparedRoute::Control(entry), _) => {
+                // Reserve the bounded anti-reopen fence before spending replay
+                // or installing any owner. A pending or absent dependency is
+                // fenced alike, so a delayed older Open cannot follow closed:true.
+                let closed_permit = match eligible.pending() {
+                    P::Open { .. } => {
+                        replay.check_dependency_open(
+                            eligible.auth().sender(),
+                            content.dependency().ok_or(Refusal::Invalid)?.permit_id(),
+                        )?;
+                        None
+                    }
+                    P::Close { .. } => Some(replay.prepare_dependency_close(
+                        eligible.auth().sender(),
+                        content.dependency().ok_or(Refusal::Invalid)?.permit_id(),
+                        eligible.auth().sequence(),
+                    )?),
+                    _ => None,
+                };
                 let reservation =
                     LocalControlReservation::prepare(local, eligible.pending(), &content)?;
                 let mut owner = self.payload.reserve_control_locked(entry)?;
@@ -2322,6 +2374,9 @@ impl ReceiverState {
                 let handoff = replay.consume(eligible, content)?.into_handoff();
                 let control = owner.install_request_locked(handoff, reservation.local.boot());
                 let (result, close) = reservation.commit();
+                if let Some(closed_permit) = closed_permit {
+                    replay.commit_dependency_close(closed_permit);
+                }
                 if let Some(key) = close {
                     self.payload.cancel_dependency_locked(key);
                 }
@@ -2484,6 +2539,7 @@ impl BarrierPreparation {
         }
         let session = node.session.as_ref().ok_or(Refusal::Invalid)?;
         let binding = crate::cluster::heartbeat::HeartbeatBinding {
+            resources: node.resources,
             cluster_id: root.cluster_id,
             node_id: node.node_id,
             incarnation: node.incarnation.ok_or(Refusal::Invalid)?,
@@ -2555,6 +2611,8 @@ impl ReceiverState {
             authority,
             generation,
             heartbeat: crate::cluster::heartbeat::HeartbeatSample {
+                available_threads: None,
+                available_memory_bytes: None,
                 running_operations: snapshot.operations.running as u64,
                 running_partitions: snapshot.partitions.running as u64,
                 queued_operations: snapshot.operations.queued as u64,

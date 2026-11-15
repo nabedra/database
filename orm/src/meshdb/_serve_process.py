@@ -182,14 +182,15 @@ class _Owner:
                 self.saved[signum] = signal.getsignal(signum)
                 signal.signal(signum, handler)
 
-    def spawn(self, config):
+    def spawn(self, config, *, cold_start=False, migrate_catalog=False):
         self.channel, self.peer = socket.socketpair()
         self.channel.setblocking(False)
         env = os.environ.copy()
         env.pop('MESHDB_SUPERVISOR_FD', None)
         env['MESHDB_SUPERVISOR_FD'] = str(self.peer.fileno())
         self.child = subprocess.Popen(
-            [resolve_server_binary(), 'api', '--config', os.path.abspath(config)],
+            [resolve_server_binary(), 'api', '--config', os.path.abspath(config)]
+            + (['--cold-start'] if cold_start else []) + (['--migrate-catalog'] if migrate_catalog else []),
             env=env, pass_fds=(self.peer.fileno(),), close_fds=True,
             start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.peer.close()
@@ -408,7 +409,7 @@ class _ExitReceipt:
             raise _failure('shutdown_failed') from None
 
 
-def run_process(config_path, startup, *, prepared, stop, _receipt=None):
+def run_process(config_path, startup, *, prepared, stop, _receipt=None, cold_start=False, migrate_catalog=False):
     """Block owning one child; hooks install bridge admission and close it.
 
     `prepared(record)` runs before activate. `stop()` runs once on every exit,
@@ -427,7 +428,10 @@ def run_process(config_path, startup, *, prepared, stop, _receipt=None):
         owner.install()
         deadline = time.monotonic() + _STARTUP_SECONDS
         _initial(startup)
-        owner.spawn(config_path)
+        if cold_start or migrate_catalog:
+            owner.spawn(config_path, cold_start=cold_start, migrate_catalog=migrate_catalog)
+        else:
+            owner.spawn(config_path)
         owner.send(startup, deadline)
         first = owner.receive(deadline)
         managed = startup['provisioning'] == 'managed'

@@ -152,20 +152,16 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 }
             }
         }
-        let coordinator = self.coordinator().clone();
         let worker_table = table.clone();
         let target = self.partition_size();
-        let prepared = partition::map_indexed(
+        let prepared = partition::map_prepared(
             self.worker_pool(),
+            self.storage(),
+            table.clone(),
             groups.into_iter().collect(),
-            move |job, runtime| {
-                let rows = match &job.file {
-                    Some(file) => {
-                        partition::load_file(runtime, coordinator.storage(), &worker_table, file)?
-                            .rows
-                    }
-                    None => Vec::new(),
-                };
+            |job: &Work| job.file.clone(),
+            move |job, loaded| {
+                let rows = loaded.rows;
                 let applied = mutation::apply(&worker_table, &job.operation, rows)?;
                 let encoded = if applied.changed {
                     Some(snapshot::encode_partition_range(
@@ -177,20 +173,26 @@ impl<B: ObjectStore + 'static> Engine<B> {
                 } else {
                     None
                 };
-                Ok(Prepared {
-                    index: job.index,
-                    result: applied.result,
-                    encoded,
-                })
+                let retained = encoded.as_ref().map_or(0, |parts| {
+                    parts.iter().map(|p| p.bytes.len() as u64 + 1024).sum()
+                });
+                Ok((
+                    Prepared {
+                        index: job.index,
+                        result: applied.result,
+                        encoded,
+                    },
+                    retained,
+                ))
             },
         )
         .await?;
-        let changed = prepared.iter().any(|p| p.encoded.is_some());
+        let changed = prepared.iter().any(|p| p.value.encoded.is_some());
         let result = if let Some(len) = batch_len {
             mutation::MutationResult::Count(len)
         } else {
             // A keyed operation has exactly one owning job.
-            match &prepared[0].result {
+            match &prepared[0].value.result {
                 mutation::MutationResult::Null => mutation::MutationResult::Null,
                 mutation::MutationResult::Found(found) => mutation::MutationResult::Found(*found),
                 mutation::MutationResult::Count(_) => unreachable!(),
@@ -199,9 +201,13 @@ impl<B: ObjectStore + 'static> Engine<B> {
         if !changed {
             return Ok(result);
         }
+        let mut retained = Vec::new();
         let mut replacements: BTreeMap<_, _> = prepared
             .into_iter()
-            .filter_map(|p| p.encoded.map(|encoded| (p.index, encoded)))
+            .filter_map(|p| {
+                retained.push(p.charge);
+                p.value.encoded.map(|encoded| (p.value.index, encoded))
+            })
             .collect();
         let old_files = match entry.data {
             TableData::Partitioned { files } => files,

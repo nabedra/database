@@ -21,6 +21,7 @@ pub fn collect(
     rows: &[Row],
 ) -> Result<Vec<Row>, ProtocolError> {
     validate(table, query)?;
+    crate::snapshot::check_rows_memory(table, rows, 0)?;
     let matched: Vec<&Row> = rows
         .iter()
         .filter(|row| matches_filter(query, row))
@@ -48,6 +49,7 @@ pub(crate) fn reduce_collect(
     query: &Query,
     rows: &[Row],
 ) -> Result<Vec<Row>, ProtocolError> {
+    crate::snapshot::check_rows_memory(table, rows, 0)?;
     finish_collect(table, query, rows.iter().collect())
 }
 
@@ -97,6 +99,7 @@ fn finish_collect(
 #[allow(dead_code)] // Retained pure evaluator API, exercised by query integration tests.
 pub fn count(table: &TableDescriptor, query: &Query, rows: &[Row]) -> Result<u64, ProtocolError> {
     validate(table, query)?;
+    crate::snapshot::check_rows_memory(table, rows, 0)?;
     let cap = query.limit.unwrap_or(u64::MAX);
     let mut count = 0;
     for row in rows {
@@ -230,3 +233,6 @@ impl Write for BodyBudget {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

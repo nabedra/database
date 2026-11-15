@@ -43,14 +43,26 @@ async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor, WorkerThreads
     let engine = Engine::new(storage, pool, PartitionSize::default());
     let executor = Executor::new(1, queue).unwrap();
     (
-        api::router(engine.clone(), executor.clone(), "test-token".into()),
+        api::router_with_migration(
+            engine.clone(),
+            executor.clone(),
+            "test-token".into(),
+            Default::default(),
+            false,
+            true,
+        )
+        .unwrap()
+        .0,
         engine,
         executor,
         workers,
     )
 }
 fn wire(operation: &str, payload: Value) -> String {
-    json!({"request_id":ID,"operation":operation,"payload":payload}).to_string()
+    wire_with_id(ID, operation, payload)
+}
+fn wire_with_id(id: &str, operation: &str, payload: Value) -> String {
+    json!({"request_id":id,"operation":operation,"payload":payload}).to_string()
 }
 fn request(body: Body, token: Option<&str>, content_type: Option<&str>) -> Request<Body> {
     let mut builder = Request::post("/v1/operations");
@@ -90,6 +102,8 @@ fn error(value: &Value, code: &str, id: Value) {
 #[tokio::test]
 async fn framing_protocol_errors_and_strict_request_ids() {
     let (app, engine, _, workers) = fixture(0).await;
+    let schema_id = uuid::Uuid::new_v4().to_string();
+    let missing_id = uuid::Uuid::new_v4().to_string();
     let (status, value) = json_request(app.clone(), wire("table.list", json!({}))).await;
     assert_eq!(status, 200);
     assert_eq!(value, json!({"request_id":ID,"data":[]}));
@@ -100,17 +114,18 @@ async fn framing_protocol_errors_and_strict_request_ids() {
             json!(ID),
         ),
         (
-            wire(
+            wire_with_id(
+                &schema_id,
                 "table.create",
                 json!({"name":"items","schema":{"id":"int64"},"key":"missing","format":"parquet"}),
             ),
             "validation_error",
-            json!(ID),
+            json!(schema_id),
         ),
         (
-            wire("table.describe", json!({"name":"missing"})),
+            wire_with_id(&missing_id, "table.describe", json!({"name":"missing"})),
             "not_found",
-            json!(ID),
+            json!(missing_id),
         ),
         (
             format!(
@@ -335,10 +350,25 @@ async fn cancelled_handler_retains_mutation_and_drain_until_completion() {
         );
         gate.release.add_permits(1);
         drain.await;
-        let catalog = engine.storage().load_catalog().await.unwrap().catalog;
-        assert_eq!(catalog.revision, 1);
-        assert!(catalog.tables.contains_key("items"));
-        assert_eq!(engine.storage().backend().state.lock().unwrap().puts, 2);
+        let loaded = engine.storage().load_cluster_catalog().await.unwrap();
+        assert_eq!(loaded.catalog().revision, 1);
+        assert!(loaded.catalog().tables.contains_key("items"));
+        let decision = engine
+            .storage()
+            .lookup_decision_by_id(
+                &loaded,
+                uuid::Uuid::parse_str(ID).unwrap(),
+                meshdb_server::storage::HistoryBudget::new(
+                    8,
+                    64 * 1024,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.response_status, 200);
         workers.shutdown().await.unwrap();
     })
     .await

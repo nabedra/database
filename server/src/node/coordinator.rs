@@ -16,8 +16,12 @@ use crate::{
         LoadedClusterCatalog, PartitionFile, PreparedPublication, PublicationOutcome, TableData,
     },
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+mod resources;
+mod settlement;
+pub(super) use resources::RemoteScheduler;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -35,15 +39,46 @@ struct Peers<'a> {
     binding: Binding,
     authority: StartSubject,
     digest: String,
-    opened: BTreeMap<Uuid, Uuid>,
-    next: usize,
+    opened: tokio::sync::Mutex<BTreeMap<Uuid, crate::cluster::member::Node>>,
+    fence: crate::storage::CatalogFence,
+    queue_binding: job::QueueBinding,
+    sequence: u64,
+    cap: usize,
+    result_charge: std::sync::Mutex<Option<crate::scheduling::MemoryCharge>>,
 }
 impl Peers<'_> {
+    async fn frontier(&self) -> Result<usize> {
+        let root = self.worker.root().await?;
+        super::queue_runtime::validate_coordination_capacity(&root, None, None)
+    }
     async fn current(&self) -> Result<()> {
         let root = self.worker.root().await?;
+        if self
+            .worker
+            .queue
+            .current_binding(self.binding.operation_id())?
+            != self.queue_binding
+        {
+            return Err(unavailable());
+        }
+        if root.scheduler.scheduler_term != self.fence.scheduler_term
+            || root.scheduler.coordinator_node != self.worker.signer.sender().node_id()
+        {
+            return Err(unavailable());
+        }
+        let fence = self.fence;
+        let catalog = self
+            .worker
+            .storage
+            .load_cluster_catalog()
+            .await
+            .map_err(|_| unavailable())?;
+        if catalog.catalog().fence != Some(fence) {
+            return Err(unavailable());
+        }
         let pin = self.worker.pin;
         let authority = self.authority.clone();
-        cpu(&self.worker.cpu, move |_| {
+        cpu(&self.worker.control_cpu, move |_| {
             authority
                 .check(&root, &pin)
                 .map(|_| ())
@@ -52,12 +87,21 @@ impl Peers<'_> {
         .await
     }
 
-    async fn control(&self, node: Uuid, permit: Uuid, route: Route) -> Result<()> {
+    async fn control(
+        &self,
+        target: &crate::cluster::member::Node,
+        permit: Uuid,
+        route: Route,
+    ) -> Result<bool> {
         let root = self.worker.root().await?;
         let member = root
             .nodes
             .iter()
-            .find(|n| n.node_id == node)
+            .find(|n| {
+                n.node_id == target.node_id
+                    && n.incarnation == target.incarnation
+                    && n.session == target.session
+            })
             .ok_or_else(unavailable)?
             .clone();
         let signer = self.worker.signer.clone();
@@ -68,7 +112,7 @@ impl Peers<'_> {
             ..Default::default()
         };
         let endpoint = member.endpoint.clone().ok_or_else(unavailable)?;
-        let context = cpu(&self.worker.cpu, move |_| {
+        let context = cpu(&self.worker.control_cpu, move |_| {
             signer.context(
                 &root,
                 &member,
@@ -85,65 +129,107 @@ impl Peers<'_> {
             context,
             &endpoint,
             &self.worker.storage,
-            &self.worker.cpu,
+            &self.worker.control_cpu,
         )
         .await?;
-        if reply.dependency().is_some_and(|d| d.permit_id() == permit)
-            || reply.close().is_some_and(|d| d.permit_id() == permit)
-        {
-            Ok(())
-        } else {
-            Err(unavailable())
+        match route {
+            Route::DependencyOpen => reply
+                .dependency()
+                .filter(|d| d.permit_id() == permit)
+                .map(|_| true)
+                .ok_or_else(unavailable),
+            Route::DependencyClose => reply
+                .close()
+                .filter(|d| d.permit_id() == permit)
+                .map(|d| d.closed())
+                .ok_or_else(unavailable),
+            _ => Err(invalid()),
         }
     }
+    async fn settlement_evidence(
+        &self,
+        target: &crate::cluster::member::Node,
+        permit: Uuid,
+    ) -> settlement::Evidence {
+        if let Ok(catalog) = self.worker.storage.load_cluster_catalog().await {
+            if catalog
+                .catalog()
+                .fence
+                .is_some_and(|fence| fence != self.fence)
+            {
+                return settlement::Evidence::Fenced;
+            }
+        }
+        if let Ok(root) = self.worker.root().await {
+            if root
+                .nodes
+                .iter()
+                .find(|node| node.node_id == target.node_id)
+                .is_some_and(|node| {
+                    node.incarnation != target.incarnation
+                        || matches!(
+                            node.state,
+                            crate::cluster::member::NodeState::Lost
+                                | crate::cluster::member::NodeState::Stopped
+                        )
+                })
+            {
+                return settlement::Evidence::Fenced;
+            }
+        }
+        match self.control(target, permit, Route::DependencyClose).await {
+            Ok(true) => settlement::Evidence::Closed,
+            Ok(false) | Err(_) => settlement::Evidence::Pending,
+        }
+    }
+    async fn settle_dependency<G, C>(
+        &self,
+        target: &crate::cluster::member::Node,
+        permit: Uuid,
+        grant: G,
+        child: C,
+    ) -> C {
+        let child = settlement::retain_until_settled(
+            grant,
+            child,
+            || self.settlement_evidence(target, permit),
+            tokio::time::sleep,
+        )
+        .await;
+        self.opened.lock().await.remove(&permit);
+        child
+    }
     async fn finish(&self) {
-        for (&node, &permit) in &self.opened {
-            let _ = self.control(node, permit, Route::DependencyClose).await;
+        let opened = self.opened.lock().await.clone();
+        for (permit, target) in opened {
+            self.settle_dependency(&target, permit, (), ()).await;
         }
     }
     async fn job(
-        &mut self,
+        &self,
+        member: crate::cluster::member::Node,
+        permit: Uuid,
         job: JobEnvelope,
         lease: &mut PayloadLease,
+        may_exist: &mut bool,
+        verified_settled: &mut bool,
     ) -> Result<job::ResultEnvelope> {
-        let root = self.worker.root().await?;
-        let members: Vec<_> = root
-            .nodes
-            .iter()
-            .filter(|n| {
-                n.state == crate::cluster::member::NodeState::Ready
-                    && n.registration == crate::cluster::member::Registration::Verified
-            })
-            .cloned()
-            .collect();
-        if members.is_empty() {
+        // Dedicated child dependencies include self-targeted work. Closing the
+        // operation's primary permit would wait for this coordinator itself.
+        *may_exist = true;
+        self.opened.lock().await.insert(permit, member.clone());
+        if !self.control(&member, permit, Route::DependencyOpen).await? {
             return Err(unavailable());
         }
-        let member = members[self.next % members.len()].clone();
-        self.next = self.next.wrapping_add(1);
-        let own = Some(member.node_id) == self.worker.signer.sender().node_id();
-        let permit = if own {
-            self.worker
-                .receiver
-                .lock()
-                .unwrap()
-                .local()
-                .and_then(|l| l.permit_for_binding(&self.binding))
-                .ok_or_else(unavailable)?
-        } else if let Some(permit) = self.opened.get(&member.node_id) {
-            *permit
-        } else {
-            let permit = Uuid::new_v4();
-            self.control(member.node_id, permit, Route::DependencyOpen)
-                .await?;
-            self.opened.insert(member.node_id, permit);
-            permit
-        };
         let root = self.worker.root().await?;
         let member = root
             .nodes
             .iter()
-            .find(|n| n.node_id == member.node_id)
+            .find(|n| {
+                n.node_id == member.node_id
+                    && n.incarnation == member.incarnation
+                    && n.session == member.session
+            })
             .ok_or_else(unavailable)?
             .clone();
         let endpoint = member.endpoint.clone().ok_or_else(unavailable)?;
@@ -157,7 +243,7 @@ impl Peers<'_> {
             dependency: Some(permit),
             digest: Some(self.digest.clone()),
         };
-        let (context, framed) = cpu(&self.worker.cpu, move |_| {
+        let (context, framed) = cpu(&self.worker.control_cpu, move |_| {
             let bytes = job::encode_job(&job).map_err(|_| invalid())?;
             let context = signer.context(&root, &member, Route::Jobs, ids, bytes)?;
             let mut framed = Vec::with_capacity(context.initial_bytes().len() + 10);
@@ -195,7 +281,7 @@ impl Peers<'_> {
             return Err(invalid());
         }
         let root = self.worker.root().await?;
-        let handoff = cpu(&self.worker.cpu, move |_| {
+        let handoff = cpu(&self.worker.control_cpu, move |_| {
             let signed = auth::verify_reply(&a, &sig, 200, &context).map_err(|_| invalid())?;
             let content =
                 auth::check_reply_content(&signed, first.payload).map_err(|_| invalid())?;
@@ -215,6 +301,7 @@ impl Peers<'_> {
         else {
             return Err(invalid());
         };
+        *verified_settled = true;
         if let JobResult::Error { code, .. } = result.result {
             lease
                 .command(Command::ClearReceived)
@@ -226,6 +313,77 @@ impl Peers<'_> {
         Ok(*result)
     }
 }
+impl Peers<'_> {
+    async fn dispatch_job(
+        &self,
+        job: JobEnvelope,
+        source: &super::payload_owner::ForkSource,
+    ) -> Result<(job::ResultEnvelope, PayloadLease)> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        self.current().await?;
+        let root = self.worker.root().await?;
+        let view = self.worker.remote_scheduler.view(&root)?;
+        let grant = view
+            .scheduler
+            .reserve_remote_memory(self.sequence, self.cap, resources::task_bytes(&job)?)
+            .await?;
+        let member = view
+            .nodes
+            .get(&grant.node_id())
+            .ok_or_else(unavailable)?
+            .clone();
+        let mut child = self
+            .worker
+            .owners
+            .fork_stream(source, deadline)
+            .await
+            .map_err(|_| unavailable())?;
+        let permit = Uuid::new_v4();
+        let mut may_exist = false;
+        let mut verified_settled = false;
+        let result = async {
+            child.ready().await.map_err(|_| unavailable())?;
+            self.job(
+                member.clone(),
+                permit,
+                job,
+                &mut child,
+                &mut may_exist,
+                &mut verified_settled,
+            )
+            .await
+        }
+        .await;
+        let child = if may_exist {
+            if verified_settled {
+                // A checked result through EOF proves the remote task settled.
+                // Dependency cleanup still remains owned through its close reply.
+                drop(grant);
+                self.settle_dependency(&member, permit, (), child).await
+            } else {
+                // The queue actor remains the single owner while uncertain
+                // children settle; stop dependent dispatch without inventing a
+                // terminal result or changing this attempt's captured identity.
+                let _ = self
+                    .worker
+                    .mark_reconciling(self.binding.operation_id())
+                    .await;
+                self.settle_dependency(&member, permit, grant, child).await
+            }
+        } else {
+            drop(grant);
+            child
+        };
+        match result {
+            Ok(result) => Ok((result, child)),
+            Err(error) => {
+                let _ = child.dispose().await;
+                Err(error)
+            }
+        }
+    }
+}
+
 pub(super) async fn execute(
     worker: &Worker,
     binding: Binding,
@@ -235,13 +393,31 @@ pub(super) async fn execute(
     lease: &mut PayloadLease,
 ) -> Result<EncodedResponse> {
     let mutation = request.operation.is_mutation();
+    let queue_binding = worker.queue.current_binding(request.request_id)?;
     let mut peers = Peers {
         worker,
         binding,
         authority,
         digest: http::digest(&bytes),
-        opened: BTreeMap::new(),
-        next: 0,
+        opened: tokio::sync::Mutex::new(BTreeMap::new()),
+        fence: crate::storage::CatalogFence {
+            run_id: queue_binding.run_id,
+            scheduler_term: queue_binding.scheduler_term,
+        },
+        queue_binding,
+        sequence: worker
+            .queue
+            .request_sequence(request.request_id)
+            .ok_or_else(unavailable)?,
+        cap: worker
+            .ready
+            .prepared
+            .input
+            .value
+            .template
+            .execution
+            .max_workers_per_request as usize,
+        result_charge: std::sync::Mutex::new(None),
     };
     let result = execute_inner(&mut peers, request, bytes, lease).await;
     peers.finish().await;
@@ -259,7 +435,7 @@ pub(super) async fn execute(
     })
 }
 async fn execute_inner(
-    peers: &mut Peers<'_>,
+    peers: &Peers<'_>,
     request: Request,
     bytes: Box<[u8]>,
     lease: &mut PayloadLease,
@@ -271,22 +447,33 @@ async fn execute_inner(
         let storage = peers.worker.storage.clone();
         let original = bytes.clone();
         let id = request.request_id;
-        let (loaded, replay) = cpu(&peers.worker.cpu, move |runtime| {
-            let loaded = runtime
-                .block_on(storage.load_cluster_catalog())
-                .map_err(|_| unavailable())?;
-            let replay = if is_mutation {
-                Some(
-                    runtime
-                        .block_on(storage.lookup_decision(&loaded, id, &original, budget))
-                        .map_err(|_| unavailable())?,
-                )
-            } else {
-                None
-            };
-            Ok((loaded, replay))
-        })
-        .await?;
+        let pinned = if is_mutation {
+            None
+        } else {
+            peers.worker.queue.pinned(id)
+        };
+        let expected_fence = peers.fence;
+        let loaded = if let Some(pinned) = pinned {
+            pinned
+        } else {
+            storage
+                .load_cluster_catalog()
+                .await
+                .map_err(|_| unavailable())?
+        };
+        if is_mutation && loaded.catalog().fence != Some(expected_fence) {
+            return Err(unavailable());
+        }
+        let replay = if is_mutation {
+            Some(
+                storage
+                    .lookup_decision(&loaded, id, &original, budget)
+                    .await
+                    .map_err(|_| unavailable())?,
+            )
+        } else {
+            None
+        };
         match replay {
             Some(HistoryLookup::Found(d)) => return Ok(terminal(d)),
             Some(HistoryLookup::IdentityConflict) => return Err(error(ErrorCode::Conflict)),
@@ -297,10 +484,23 @@ async fn execute_inner(
         let calculated = calculate(peers, &loaded, request.operation.clone(), commit, lease).await;
         let (tables, encoded) = match calculated {
             Ok((tables, value)) => {
-                let encoded = cpu(&peers.worker.cpu, move |_| {
-                    Ok(response::encode_success(id, &value, false))
-                })
-                .await?;
+                let charge = peers.result_charge.lock().unwrap().take();
+                let encoded = if let Some(charge) = charge {
+                    peers
+                        .worker
+                        .cpu
+                        .submit_precharged(peers.sequence, peers.cap, charge, move |_, _| {
+                            Ok(response::encode_success(id, &value, false))
+                        })
+                        .await?
+                        .receive()
+                        .await?
+                } else {
+                    cpu(&peers.worker.cpu, move |_| {
+                        Ok(response::encode_success(id, &value, false))
+                    })
+                    .await?
+                };
                 (tables, encoded)
             }
             Err(e)
@@ -349,7 +549,7 @@ async fn execute_inner(
             } else {
                 base.tables.clone()
             };
-            PreparedPublication::prepare(loaded, tables, decision)
+            PreparedPublication::prepare_fenced(loaded, tables, decision, expected_fence)
                 .map_err(|_| error(ErrorCode::LimitExceeded))
         })
         .await?;
@@ -366,12 +566,10 @@ async fn execute_inner(
         }
         peers.current().await?;
         let storage = peers.worker.storage.clone();
-        let outcome = cpu(&peers.worker.cpu, move |runtime| {
-            runtime
-                .block_on(candidate.publish(&storage, budget))
-                .map_err(|_| unavailable())
-        })
-        .await?;
+        let outcome = candidate
+            .publish(&storage, budget)
+            .await
+            .map_err(|_| unavailable())?;
         match outcome {
             PublicationOutcome::Terminal(d) => return Ok(terminal(d)),
             PublicationOutcome::IdentityConflict => return Err(error(ErrorCode::Conflict)),
@@ -419,6 +617,7 @@ fn envelope(
     task: Task,
 ) -> Result<JobEnvelope> {
     Ok(JobEnvelope {
+        queue_binding: Some(peers.queue_binding),
         version: 1,
         cluster_id: peers.worker.ready.prepared.input.value.cluster_id,
         operation_id: peers.binding.operation_id(),
@@ -436,7 +635,7 @@ fn envelope(
     })
 }
 async fn calculate(
-    peers: &mut Peers<'_>,
+    peers: &Peers<'_>,
     loaded: &LoadedClusterCatalog,
     operation: Operation,
     commit: Uuid,
@@ -515,6 +714,7 @@ async fn calculate(
             let mut total = 0u64;
             let mut source_rows = 0u64;
             let mut source_bytes = 0u64;
+            let mut jobs = Vec::new();
             for (index, file) in selected.into_iter().enumerate() {
                 let task = match &op {
                     Operation::Get(p) => Task::Get {
@@ -531,58 +731,143 @@ async fn calculate(
                     },
                     _ => unreachable!(),
                 };
-                let job = envelope(peers, loaded, &table, index, task)?;
-                let result = peers.job(job, lease).await?;
-                let (r, b) = match result.result {
-                    JobResult::Get {
-                        source_rows,
-                        source_payload_bytes,
-                        ..
-                    }
-                    | JobResult::Collect {
-                        source_rows,
-                        source_payload_bytes,
-                        ..
-                    } => {
-                        let Reply::Rows(part) = lease
-                            .command(Command::TakeRows)
-                            .await
-                            .map_err(|_| unavailable())?
-                        else {
-                            return Err(invalid());
-                        };
-                        rows.extend(part);
-                        (source_rows, source_payload_bytes)
-                    }
-                    JobResult::Count {
-                        source_rows,
-                        source_payload_bytes,
-                        matched_rows,
-                    } => {
-                        total = total
-                            .checked_add(matched_rows)
-                            .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-                        lease
-                            .command(Command::ClearReceived)
-                            .await
-                            .map_err(|_| unavailable())?;
-                        (source_rows, source_payload_bytes)
-                    }
-                    _ => return Err(invalid()),
+                jobs.push((index, envelope(peers, loaded, &table, index, task)?));
+            }
+            let source = peers
+                .worker
+                .owners
+                .fork_source(lease)
+                .map_err(|_| unavailable())?;
+            let frontier = peers.frontier().await?;
+            let mut pending = jobs.into_iter();
+            let mut running = FuturesUnordered::new();
+            let mut failure: Option<ProtocolError> = None;
+            let mut ordered_rows = BTreeMap::new();
+            let mut charges = Vec::new();
+            let mut retained = 0u64;
+            loop {
+                while failure.is_none() && running.len() < frontier {
+                    let Some((index, job)) = pending.next() else {
+                        break;
+                    };
+                    let source = &source;
+                    running.push(async move { (index, peers.dispatch_job(job, source).await) });
+                }
+                let Some((index, received)) = running.next().await else {
+                    break;
                 };
-                source_rows = source_rows
-                    .checked_add(r)
-                    .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-                source_bytes = source_bytes
-                    .checked_add(b)
-                    .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-                if source_rows > protocol::MAX_TABLE_ROWS as u64
-                    || source_bytes > protocol::MAX_DECODED_PAYLOAD_BYTES as u64
-                {
-                    return Err(error(ErrorCode::LimitExceeded));
+                let (result, mut child) = match received {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                        continue;
+                    }
+                };
+                let processed = async {
+                    if failure.is_some() {
+                        return Ok(());
+                    }
+                    let (r, b) = match result.result {
+                        JobResult::Get {
+                            source_rows,
+                            source_payload_bytes,
+                            ..
+                        }
+                        | JobResult::Collect {
+                            source_rows,
+                            source_payload_bytes,
+                            ..
+                        } => {
+                            let charge_bytes = crate::snapshot::memory_shape(
+                                &table,
+                                source_rows as usize,
+                                source_payload_bytes as usize,
+                                0,
+                            )?;
+                            retained = retained
+                                .checked_add(charge_bytes)
+                                .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
+                            if retained > peers.worker.cpu.resources().task_memory_limit_bytes {
+                                return Err(error(ErrorCode::LimitExceeded));
+                            }
+                            charges.push(
+                                peers
+                                    .worker
+                                    .cpu
+                                    .scheduler()
+                                    .charge_memory(0, charge_bytes)?,
+                            );
+                            let Reply::Rows(part) = child
+                                .command(Command::TakeRows)
+                                .await
+                                .map_err(|_| unavailable())?
+                            else {
+                                return Err(invalid());
+                            };
+                            ordered_rows.insert(index, part);
+                            (source_rows, source_payload_bytes)
+                        }
+                        JobResult::Count {
+                            source_rows,
+                            source_payload_bytes,
+                            matched_rows,
+                        } => {
+                            total = total
+                                .checked_add(matched_rows)
+                                .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
+                            child
+                                .command(Command::ClearReceived)
+                                .await
+                                .map_err(|_| unavailable())?;
+                            (source_rows, source_payload_bytes)
+                        }
+                        _ => return Err(invalid()),
+                    };
+                    source_rows = source_rows
+                        .checked_add(r)
+                        .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
+                    source_bytes = source_bytes
+                        .checked_add(b)
+                        .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
+                    if source_rows > protocol::MAX_TABLE_ROWS as u64
+                        || source_bytes > protocol::MAX_DECODED_PAYLOAD_BYTES as u64
+                    {
+                        return Err(error(ErrorCode::LimitExceeded));
+                    }
+                    Ok(())
+                }
+                .await;
+                let disposed = child.dispose().await.map_err(|_| unavailable());
+                if let Err(error) = processed.and(disposed) {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
                 }
             }
-            let value = cpu(&peers.worker.cpu, move |_| match op {
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            for part in ordered_rows.into_values() {
+                rows.try_reserve(part.len())
+                    .map_err(|_| error(ErrorCode::LimitExceeded))?;
+                rows.extend(part);
+            }
+            let root = peers.worker.root().await?;
+            let remote = peers.worker.remote_scheduler.view(&root)?;
+            let local = remote
+                .nodes
+                .iter()
+                .find(|(_, node)| Some(node.node_id) == peers.worker.signer.sender().node_id())
+                .map(|(id, _)| *id)
+                .ok_or_else(unavailable)?;
+            let budget = peers.worker.cpu.resources().task_memory_limit_bytes;
+            let remote_reduction = remote
+                .scheduler
+                .reserve_on(peers.sequence, peers.cap, local, budget)
+                .await?;
+            let work = move |_, _: &tokio::runtime::Runtime| match op {
                 Operation::Get(_) => Ok(ExecuteResult::Row(rows.pop())),
                 Operation::Collect(p) => {
                     crate::engine::reduce_collect(&table, &p.query, &rows).map(ExecuteResult::Rows)
@@ -591,8 +876,27 @@ async fn calculate(
                     total.min(p.query.limit.unwrap_or(u64::MAX)),
                 )),
                 _ => unreachable!(),
-            })
-            .await?;
+            };
+            let value = if charges.is_empty() {
+                peers
+                    .worker
+                    .cpu
+                    .submit_request(peers.sequence, peers.cap, budget, work)
+                    .await?
+                    .receive()
+                    .await?
+            } else {
+                let (value, charge) = peers
+                    .worker
+                    .cpu
+                    .submit_buffered(peers.sequence, peers.cap, charges, budget, work)
+                    .await?
+                    .receive()
+                    .await?;
+                *peers.result_charge.lock().unwrap() = Some(charge);
+                value
+            };
+            drop(remote_reduction);
             Ok((tables, value))
         }
         operation => {
@@ -623,6 +927,12 @@ async fn calculate(
             let mut replacements = BTreeMap::new();
             let mut upload_ordinal = 0u32;
             let mut result = crate::engine::MutationResult::Null;
+            let source = peers
+                .worker
+                .owners
+                .fork_source(lease)
+                .map_err(|_| unavailable())?;
+            let mut jobs = Vec::new();
             for (index, task) in groups {
                 let task = match task {
                     Task::Prepare {
@@ -638,11 +948,76 @@ async fn calculate(
                     },
                     _ => unreachable!(),
                 };
-                let job = envelope(peers, loaded, &table, index, task)?;
-                let received = peers.job(job, lease).await?;
-                let JobResult::Prepared { effect, .. } = received.result else {
-                    return Err(invalid());
+                jobs.push((index, envelope(peers, loaded, &table, index, task)?));
+            }
+            let frontier = peers.frontier().await?;
+            let mut pending = jobs.into_iter();
+            let mut running = FuturesUnordered::new();
+            let mut failure = None;
+            let mut effects = BTreeMap::new();
+            loop {
+                while failure.is_none() && running.len() < frontier {
+                    let Some((index, job)) = pending.next() else {
+                        break;
+                    };
+                    let source = &source;
+                    running.push(async move { (index, peers.dispatch_job(job, source).await) });
+                }
+                let Some((index, received)) = running.next().await else {
+                    break;
                 };
+                let (received, mut child) = match received {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                        continue;
+                    }
+                };
+                let processed = async {
+                    if failure.is_some() {
+                        return Ok(());
+                    }
+                    let JobResult::Prepared { effect, .. } = received.result else {
+                        return Err(invalid());
+                    };
+                    let Reply::Parts(parts) = child
+                        .command(Command::StagePrepared {
+                            table: id,
+                            commit,
+                            ordinal: upload_ordinal,
+                        })
+                        .await
+                        .map_err(|_| unavailable())?
+                    else {
+                        return Err(invalid());
+                    };
+                    if let Some(parts) = parts {
+                        upload_ordinal = upload_ordinal
+                            .checked_add(u32::try_from(parts.len()).map_err(|_| invalid())?)
+                            .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
+                        replacements.insert(index, parts);
+                    }
+                    child
+                        .transfer_staged_to(lease)
+                        .await
+                        .map_err(|_| unavailable())?;
+                    effects.insert(index, effect);
+                    Ok(())
+                }
+                .await;
+                let disposed = child.dispose().await.map_err(|_| unavailable());
+                if let Err(error) = processed.and(disposed) {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if let Some((_, effect)) = effects.pop_last() {
                 result = match effect {
                     job::Effect::Null {} => crate::engine::MutationResult::Null,
                     job::Effect::Found { value } => crate::engine::MutationResult::Found(value),
@@ -650,23 +1025,6 @@ async fn calculate(
                         crate::engine::MutationResult::Count(value as usize)
                     }
                 };
-                let Reply::Parts(parts) = lease
-                    .command(Command::StagePrepared {
-                        table: id,
-                        commit,
-                        ordinal: upload_ordinal,
-                    })
-                    .await
-                    .map_err(|_| unavailable())?
-                else {
-                    return Err(invalid());
-                };
-                if let Some(parts) = parts {
-                    upload_ordinal = upload_ordinal
-                        .checked_add(parts.len() as u32)
-                        .ok_or_else(|| error(ErrorCode::LimitExceeded))?;
-                    replacements.insert(index, parts);
-                }
             }
             if let Some(n) = batch_len {
                 result = crate::engine::MutationResult::Count(n);

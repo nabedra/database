@@ -25,6 +25,7 @@ fn root(external: bool) -> Control {
 fn setup() -> (Control, HeartbeatBinding) {
     let mut r = root(true);
     let b = HeartbeatBinding {
+        resources: None,
         cluster_id: r.cluster_id,
         node_id: id(3),
         incarnation: id(4),
@@ -35,6 +36,7 @@ fn setup() -> (Control, HeartbeatBinding) {
         queue_size: 64,
     };
     r.nodes.push(Node {
+        resources: None,
         node_id: b.node_id,
         launch_id: None,
         resource_id: Some(format!("external:{}", b.node_id)),
@@ -59,6 +61,8 @@ fn setup() -> (Control, HeartbeatBinding) {
 fn beat(b: &HeartbeatBinding, seq: u64) -> Heartbeat {
     b.record(
         &HeartbeatSample {
+            available_threads: None,
+            available_memory_bytes: None,
             running_operations: 0,
             running_partitions: 0,
             queued_operations: 0,
@@ -424,6 +428,7 @@ async fn drain_receipt_requires_progress_and_current_configured_evidence() {
     let wrong_drain = loaded(105, &b, Some(id(78)), false).await;
     assert!(o.drain_heartbeat(&r, &b, &wrong_drain, t + e, e).is_err());
     let wrong_binding = HeartbeatBinding {
+        resources: None,
         session_id: id(111),
         ..b.clone()
     };
@@ -1392,4 +1397,36 @@ async fn autoscale_loaded_duplicate_retains_contradiction_check_after_raw_failur
         auto_ingest(&mut o, &r, &b, contradictory, t, 1000).await,
         Err(StorageError::InvalidCatalog)
     ));
+}
+
+#[test]
+fn r01_r05_lease_renewal_does_not_postpone_worker_loss() {
+    let (mut root, binding) = setup();
+    let now = Instant::now();
+    let expiry = Duration::from_millis(root.timing.expiry_ms);
+    let mut observed = Observations::new(id(90), now);
+    observed.reconcile_members(&root, now).unwrap();
+    observed.observe(&binding, &beat(&binding, 1), now).unwrap();
+    observed.observe(&binding, &beat(&binding, 2), now).unwrap();
+    for round in 1..=4 {
+        root.controller.lease_until_ms = Some(round + 1);
+        next(&mut root);
+        let at = now + expiry * round as u32 / 4;
+        observed.reconcile_members(&root, at).unwrap();
+        observed.read_failed(&binding, at).unwrap();
+    }
+    let expired = observed
+        .expiry_input(&binding, now + expiry, expiry)
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired.grace_anchor, now);
+    assert_eq!(expired.last_advance, Some(now));
+    let owner = crate::cluster::controller::Owner {
+        process_id: id(90),
+        epoch: root.controller.epoch,
+    };
+    let candidate =
+        crate::cluster::membership::loss_candidate(&root, owner, &expired, id(999)).unwrap();
+    let (_, _, lost) = candidate.into_parts();
+    assert_eq!(lost.nodes[0].state, NodeState::Lost);
 }

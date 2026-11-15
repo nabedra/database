@@ -99,6 +99,10 @@ struct TlsWire<'a> {
 }
 #[derive(Serialize)]
 struct Worker<'a> {
+    #[serde(skip_serializing_if = "crate::config::ExecutionConfig::is_default")]
+    execution: crate::config::ExecutionConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<crate::config::WorkerResources>,
     api_urls: &'a [String],
     listen: &'a str,
     operation_slots: u64,
@@ -226,6 +230,8 @@ pub(crate) fn worker(
     hash(
         WORKER,
         &Worker {
+            execution: template.execution.clone(),
+            resources: template.resources,
             api_urls: &template.api_urls,
             listen: &template.listen,
             operation_slots: template.operation_slots,

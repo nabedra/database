@@ -75,6 +75,32 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
             (valid.clone(), "opaque".into()),
         );
     assert_eq!(status(app.clone(), "/health/ready").await, 200);
+    // Readiness validates all supported formats without authorizing migration.
+    let mut legacy: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    legacy["format_version"] = 1.into();
+    let mut cluster =
+        meshdb_server::storage::ClusterCatalog::from_catalog(&Catalog::empty()).unwrap();
+    let v3 = cluster.encode().unwrap();
+    cluster.format_version = 4;
+    cluster.fence = Some(meshdb_server::storage::CatalogFence {
+        run_id: uuid::Uuid::new_v4(),
+        scheduler_term: 1,
+    });
+    for bytes in [
+        serde_json::to_vec(&legacy).unwrap(),
+        v3,
+        cluster.encode().unwrap(),
+    ] {
+        engine
+            .storage()
+            .backend()
+            .state
+            .lock()
+            .unwrap()
+            .objects
+            .insert("health/catalog.json".into(), (bytes, "opaque".into()));
+        assert_eq!(status(app.clone(), "/health/ready").await, 200);
+    }
     engine
         .storage()
         .backend()
@@ -124,7 +150,7 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
     assert_eq!(status(app, "/health/ready").await, 200);
     {
         let state = engine.storage().backend().state.lock().unwrap();
-        assert_eq!(state.gets, 6);
+        assert_eq!(state.gets, 9);
         assert_eq!(state.puts, 0);
         assert!(state.put_keys.is_empty());
     }

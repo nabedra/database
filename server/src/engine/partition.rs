@@ -50,7 +50,7 @@ pub(super) fn load_file<B: ObjectStore>(
     table: &TableDescriptor,
     file: &ReadFile,
 ) -> Result<LoadedRows, ProtocolError> {
-    let (object, cap, count) = match file {
+    let (object, mut cap, count) = match file {
         ReadFile::Legacy { object, row_count } => (
             ObjectKey::parse_snapshot(object, table.id),
             snapshot::MAX_ENCODED_SNAPSHOT_BYTES,
@@ -62,6 +62,21 @@ pub(super) fn load_file<B: ObjectStore>(
             f.row_count,
         ),
     };
+    let count = usize::try_from(count).map_err(|_| corrupt())?;
+    match file {
+        ReadFile::Partition(f) => {
+            cap = usize::try_from(f.byte_size).map_err(|_| corrupt())?;
+            snapshot::check_memory_shape(
+                table,
+                count,
+                usize::try_from(f.payload_bytes).map_err(|_| corrupt())?,
+                cap,
+            )?;
+        }
+        ReadFile::Legacy { .. } => {
+            cap = legacy_input_cap(table, count, cap)?;
+        }
+    }
     let object = runtime
         .block_on(storage.read(&object.map_err(storage_failure)?, cap))
         .map_err(storage_failure)?;
@@ -70,7 +85,7 @@ pub(super) fn load_file<B: ObjectStore>(
     {
         return Err(corrupt());
     }
-    let rows = snapshot::decode(table, Bytes::from(object.bytes), Some(count))?;
+    let rows = snapshot::decode(table, Bytes::from(object.bytes), Some(count as u64))?;
     let partition = match file {
         ReadFile::Partition(f) => Some((&f.range, f.payload_bytes)),
         ReadFile::Legacy { .. } => None,
@@ -80,6 +95,196 @@ pub(super) fn load_file<B: ObjectStore>(
         rows,
         payload_bytes,
     })
+}
+
+fn legacy_input_cap(
+    table: &TableDescriptor,
+    count: usize,
+    maximum: usize,
+) -> Result<usize, ProtocolError> {
+    let base = snapshot::memory_shape(table, count, 0, 0)?;
+    crate::scheduling::check_task_memory(base)?;
+    // Legacy catalogs have no encoded/payload sizes. Bound the download itself,
+    // then the codec validates actual metadata and decoded payload before growth.
+    Ok(
+        crate::scheduling::task_memory_limit().map_or(maximum, |budget| {
+            maximum.min((budget.saturating_sub(base) / 4) as usize)
+        }),
+    )
+}
+
+pub(crate) struct DownloadedFile {
+    file: ReadFile,
+    bytes: Vec<u8>,
+    charge: crate::scheduling::MemoryCharge,
+}
+impl DownloadedFile {
+    pub(crate) fn into_parts(self) -> (ReadFile, Vec<u8>, crate::scheduling::MemoryCharge) {
+        (self.file, self.bytes, self.charge)
+    }
+}
+pub(crate) async fn download_file<B: ObjectStore>(
+    storage: &Storage<B>,
+    pool: &WorkerPool,
+    request: u64,
+    table: &TableDescriptor,
+    file: ReadFile,
+) -> Result<DownloadedFile, ProtocolError> {
+    let budget = pool.resources().task_memory_limit_bytes;
+    let (object, cap) = match &file {
+        ReadFile::Legacy { object, row_count } => {
+            let cap = crate::scheduling::with_task_limit(budget, || {
+                legacy_input_cap(
+                    table,
+                    usize::try_from(*row_count).map_err(|_| corrupt())?,
+                    snapshot::MAX_ENCODED_SNAPSHOT_BYTES,
+                )
+            })?;
+            (ObjectKey::parse_snapshot(object, table.id), cap)
+        }
+        ReadFile::Partition(f) => {
+            crate::scheduling::with_task_limit(budget, || {
+                snapshot::check_memory_shape(
+                    table,
+                    usize::try_from(f.row_count).map_err(|_| corrupt())?,
+                    usize::try_from(f.payload_bytes).map_err(|_| corrupt())?,
+                    usize::try_from(f.byte_size).map_err(|_| corrupt())?,
+                )
+            })?;
+            (
+                ObjectKey::parse_partition(&f.object, table.id),
+                usize::try_from(f.byte_size).map_err(|_| corrupt())?,
+            )
+        }
+    };
+    let object = object.map_err(storage_failure)?;
+    let charge = pool.scheduler().reserve_memory(request, 0, budget).await?;
+    let object = storage.read(&object, cap).await.map_err(storage_failure)?;
+    if let ReadFile::Partition(f) = &file
+        && object.bytes.len() as u64 != f.byte_size
+    {
+        return Err(corrupt());
+    }
+    Ok(DownloadedFile {
+        file,
+        bytes: object.bytes,
+        charge,
+    })
+}
+pub(crate) fn decode_downloaded(
+    table: &TableDescriptor,
+    file: &ReadFile,
+    bytes: Vec<u8>,
+) -> Result<LoadedRows, ProtocolError> {
+    let count = match file {
+        ReadFile::Legacy { row_count, .. } => *row_count,
+        ReadFile::Partition(f) => f.row_count,
+    };
+    let rows = snapshot::decode(table, Bytes::from(bytes), Some(count))?;
+    let partition = match file {
+        ReadFile::Partition(f) => Some((&f.range, f.payload_bytes)),
+        ReadFile::Legacy { .. } => None,
+    };
+    let payload_bytes = validate_partition_rows(table, &rows, partition)?;
+    Ok(LoadedRows {
+        rows,
+        payload_bytes,
+    })
+}
+pub(super) struct Buffered<T> {
+    pub value: T,
+    pub charge: crate::scheduling::MemoryCharge,
+}
+/// Download under memory-only reservations, then acquire CPU reusing that memory.
+/// Each completion immediately starts another independent download/compute pipeline.
+pub(super) async fn map_prepared<B, I, T, S, F>(
+    pool: &WorkerPool,
+    storage: &Storage<B>,
+    table: TableDescriptor,
+    inputs: Vec<(usize, I)>,
+    select: S,
+    work: F,
+) -> Result<Vec<Buffered<T>>, ProtocolError>
+where
+    B: ObjectStore,
+    I: Send + 'static,
+    T: Send + 'static,
+    S: Fn(&I) -> Option<ReadFile>,
+    F: Fn(I, LoadedRows) -> Result<(T, u64), ProtocolError> + Send + Sync + 'static,
+{
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let request = pool.request_id();
+    let work = Arc::new(work);
+    let mut pending = inputs.into_iter();
+    let mut running = FuturesUnordered::new();
+    let mut output = Vec::new();
+    let mut error = None;
+    loop {
+        while error.is_none() && running.len() < pool.worker_count().get() {
+            let Some((index, input)) = pending.next() else {
+                break;
+            };
+            let selected = select(&input);
+            let work = work.clone();
+            let table = table.clone();
+            running.push(async move {
+                let prepared = match selected {
+                    Some(file) => Some(download_file(storage, pool, request, &table, file).await?),
+                    None => None,
+                };
+                let (file, bytes, charge) = match prepared {
+                    Some(file) => {
+                        let (f, b, c) = file.into_parts();
+                        (Some(f), b, c)
+                    }
+                    None => (
+                        None,
+                        Vec::new(),
+                        pool.scheduler()
+                            .reserve_memory(request, 0, pool.resources().task_memory_limit_bytes)
+                            .await?,
+                    ),
+                };
+                let job = pool
+                    .submit_buffered(
+                        request,
+                        1,
+                        vec![charge],
+                        pool.resources().task_memory_limit_bytes,
+                        move |_, _| {
+                            let loaded = match file {
+                                Some(file) => decode_downloaded(&table, &file, bytes)?,
+                                None => LoadedRows {
+                                    rows: Vec::new(),
+                                    payload_bytes: 0,
+                                },
+                            };
+                            work(input, loaded)
+                        },
+                    )
+                    .await?;
+                let ((value, retained), mut charge) = job.receive().await?;
+                charge.shrink_to(retained)?;
+                Ok::<_, ProtocolError>((index, Buffered { value, charge }))
+            });
+        }
+        let Some(result) = running.next().await else {
+            break;
+        };
+        match result {
+            Ok(value) => output.push(value),
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e)
+                }
+            }
+        }
+    }
+    if let Some(error) = error {
+        return Err(error);
+    }
+    output.sort_by_key(|(index, _)| *index);
+    Ok(output.into_iter().map(|(_, value)| value).collect())
 }
 
 /// Validate decoded rows with optional partition payload/range/order metadata.
@@ -125,69 +330,6 @@ pub(crate) fn row_key(table: &TableDescriptor, row: &Row) -> Key {
         Scalar::Utf8(s) => Key::Utf8(s.clone()),
         _ => unreachable!("validated primary key"),
     }
-}
-
-/// At most N outstanding jobs. Drain every accepted job even after submission or
-/// receive failure; return the earliest original ordinal error and stop windows.
-pub(super) async fn map_files<T, F>(
-    pool: &WorkerPool,
-    files: Vec<(usize, ReadFile)>,
-    work: F,
-) -> Result<Vec<T>, ProtocolError>
-where
-    T: Send + 'static,
-    F: Fn(ReadFile, &Runtime) -> Result<T, ProtocolError> + Send + Sync + 'static,
-{
-    map_indexed(pool, files, work).await
-}
-
-/// Generic form for mutation jobs carrying both captured file metadata and an
-/// operation. Input indices retain original partition ordinals for worker
-/// assignment and deterministic errors; callers supply ascending indices.
-pub(super) async fn map_indexed<I, T, F>(
-    pool: &WorkerPool,
-    inputs: Vec<(usize, I)>,
-    work: F,
-) -> Result<Vec<T>, ProtocolError>
-where
-    I: Clone + Send + 'static,
-    T: Send + 'static,
-    F: Fn(I, &Runtime) -> Result<T, ProtocolError> + Send + Sync + 'static,
-{
-    let work = Arc::new(work);
-    let mut output = Vec::new();
-    for window in inputs.chunks(pool.worker_count().get()) {
-        let mut jobs = Vec::new();
-        let mut error = None;
-        for (index, file) in window {
-            let work = work.clone();
-            let file = file.clone();
-            match pool
-                .submit(*index, move |_, runtime| work(file, runtime))
-                .await
-            {
-                Ok(job) => jobs.push((*index, job)),
-                Err(e) => {
-                    error = Some((*index, e));
-                    break;
-                }
-            }
-        }
-        for (index, job) in jobs {
-            match job.receive().await {
-                Ok(value) => output.push(value),
-                Err(e) => {
-                    if error.as_ref().is_none_or(|(ordinal, _)| index < *ordinal) {
-                        error = Some((index, e));
-                    }
-                }
-            }
-        }
-        if let Some((_, e)) = error {
-            return Err(e);
-        }
-    }
-    Ok(output)
 }
 
 pub(super) fn storage_failure(error: StorageError) -> ProtocolError {

@@ -409,3 +409,50 @@ fn nested_objects_and_small_input_bounds() {
         .is_err()
     );
 }
+
+#[test]
+fn u01_worker_operation_is_only_a_self_addressed_queue_continuation() {
+    let id = |n| Uuid::from_u128(n);
+    let worker = Sender::worker(id(3), id(4), id(5), "a".repeat(64)).unwrap();
+    let ids = || RequestIds {
+        operation: Some(id(6)),
+        digest: Some("b".repeat(64)),
+        ..Default::default()
+    };
+    let request = Auth::request(
+        id(1),
+        worker.clone(),
+        Receiver::new(id(3), id(4), id(5)),
+        Route::Operations,
+        ids(),
+        "b".repeat(64),
+    )
+    .unwrap();
+    let bytes = request.canonical_bytes().unwrap();
+    let actual = ActualRoute::new("POST", "/internal/v1/operations", None).unwrap();
+    assert!(Auth::decode(&header(std::str::from_utf8(&bytes).unwrap()), &actual).is_ok());
+    let reply = ReplyAuth::response(&request, worker.clone(), 200, "c".repeat(64)).unwrap();
+    assert!(reply.receiver() == &worker);
+    assert!(
+        Auth::request(
+            id(1),
+            worker.clone(),
+            Receiver::new(id(7), id(4), id(5)),
+            Route::Operations,
+            ids(),
+            "b".repeat(64)
+        )
+        .is_err()
+    );
+    assert!(
+        Auth::request(
+            id(1),
+            worker,
+            Receiver::new(id(3), id(4), id(5)),
+            Route::Readiness,
+            RequestIds::default(),
+            "b".repeat(64)
+        )
+        .is_err()
+    );
+}

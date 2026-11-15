@@ -39,9 +39,14 @@ use tokio::{sync::Semaphore, time::Instant};
 use uuid::Uuid;
 
 pub(super) struct Worker {
+    initialization: Uuid,
     pub(super) ready: Arc<BootstrapReady>,
     pub(super) storage: Arc<Storage<HttpStore>>,
     pub(super) cpu: WorkerPool,
+    pub(super) control_cpu: WorkerPool,
+    pub(super) control_budget: crate::scheduling::ResourceScheduler,
+    pub(super) progress_budget: crate::scheduling::ResourceScheduler,
+    pub(super) coordination_slots: usize,
     pub(super) signer: Arc<http::Signer>,
     pub(super) client: http::HttpClient,
     pub(super) owners: Arc<PayloadOwners>,
@@ -52,9 +57,11 @@ pub(super) struct Worker {
     partitions: Executor,
     controls: Executor,
     sending: Executor,
-    operation_transport: Arc<Semaphore>,
+    pub(super) operation_transport: Arc<Semaphore>,
+    pub(super) queue: super::queue_runtime::QueueRuntime,
+    pub(super) remote_scheduler: super::coordinator::RemoteScheduler,
     partition_transport: Arc<Semaphore>,
-    control_transport: Arc<Semaphore>,
+    pub(super) control_transport: Arc<Semaphore>,
     accepting: AtomicBool,
 }
 struct ResponseRetention {
@@ -69,6 +76,10 @@ enum RetainedOwner {
     },
     Control {
         _owner: super::payload_owner::ControlLease,
+    },
+    Drain {
+        _owner: super::payload_owner::ControlLease,
+        _proof: admission::DrainObservation,
     },
 }
 impl hyper::body::Body for ResponseRetention {
@@ -87,7 +98,7 @@ impl hyper::body::Body for ResponseRetention {
 }
 impl Worker {
     pub(super) async fn root(&self) -> Result<crate::cluster::state::Control> {
-        http::load_root(&self.storage, &self.cpu).await
+        http::load_root(&self.storage, &self.control_cpu).await
     }
     async fn start(&self, subject: admission::StartSubject) -> Result<admission::Binding> {
         let binding = subject.binding().map_err(|_| unavailable())?;
@@ -104,7 +115,7 @@ impl Worker {
             self.owners.reap();
             let root = self.root().await?;
             let pin = self.pin;
-            let (returned, checked) = cpu(&self.cpu, move |_| {
+            let (returned, checked) = cpu(&self.control_cpu, move |_| {
                 let checked = subject.check(&root, &pin).map_err(|_| unavailable())?;
                 Ok((subject, checked))
             })
@@ -119,7 +130,7 @@ impl Worker {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    async fn dispatch(
+    pub(super) async fn dispatch(
         self: Arc<Self>,
         request: Request<Body>,
         transport: tokio::sync::OwnedSemaphorePermit,
@@ -155,7 +166,7 @@ impl Worker {
         } else {
             None
         };
-        let signed = cpu(&self.cpu, move |_| {
+        let signed = cpu(&self.control_cpu, move |_| {
             let actual = auth::ActualRoute::new("POST", &path, dependency.as_deref())
                 .map_err(|_| invalid())?;
             auth::verify_request(&a, &signature, &actual)
@@ -188,7 +199,7 @@ impl Worker {
             .ok_or_else(unavailable)?
             .boot();
         let pin = self.pin;
-        let (view, content) = cpu(&self.cpu, move |_| {
+        let (view, content) = cpu(&self.control_cpu, move |_| {
             let content = auth::check_request_content(&signed, bytes).map_err(|_| invalid())?;
             let eligible = auth::check_request_authority(&signed, &root, &boot, &pin)
                 .map_err(|_| http::failure(ErrorCode::Unauthorized))?;
@@ -223,6 +234,30 @@ impl Worker {
         drop(prepared);
         match accepted {
             AcceptedRoute::Operation(work) => {
+                if response_auth.sender().role() != auth::Role::Worker
+                    || response_auth.sender().node_id() != self.signer.sender().node_id()
+                {
+                    return Err(http::failure(ErrorCode::Unauthorized));
+                }
+                let request_id = response_auth.operation_id().ok_or_else(invalid)?;
+                let expected = self.queue.checked_execution(
+                    request_id,
+                    response_auth.request_digest().ok_or_else(invalid)?,
+                )?;
+                let root = self.root().await?;
+                if root.scheduler.coordinator_node != self.signer.sender().node_id()
+                    || root.scheduler.scheduler_term != expected.scheduler_term
+                    || self
+                        .storage
+                        .load_cluster_catalog()
+                        .await
+                        .map_err(|_| unavailable())?
+                        .catalog()
+                        .fence
+                        != Some(expected)
+                {
+                    return Err(unavailable());
+                }
                 let authority = work.start.clone();
                 let binding = self.start(work.start).await?;
                 let mut account = work.owners.account.ok_or_else(unavailable)?;
@@ -274,8 +309,22 @@ impl Worker {
                 let job = accepted.envelope;
                 let mut lease = accepted.lease;
                 let root = self.root().await?;
+                let fence = self
+                    .storage
+                    .load_cluster_catalog()
+                    .await
+                    .map_err(|_| unavailable())?
+                    .catalog()
+                    .fence
+                    .ok_or_else(unavailable)?;
+                if root.scheduler.scheduler_term != fence.scheduler_term
+                    || root.scheduler.coordinator_node != response_auth.sender().node_id()
+                {
+                    return Err(unavailable());
+                }
+                self.queue.validate_job(&job, fence)?;
                 let pin = self.pin;
-                cpu(&self.cpu, move |_| {
+                cpu(&self.control_cpu, move |_| {
                     authority
                         .check(&root, &pin)
                         .map(|_| ())
@@ -324,9 +373,52 @@ impl Worker {
                         serde_json::json!({"version":1,"permit_id":permit.ok_or_else(invalid)?,"closed":closed==admission::Close::Closed})
                     }
                     ControlResult::Drain(_) => {
-                        drop(accepted.response);
-                        accepted.owner.finish().await.map_err(|_| unavailable())?;
-                        return Err(http::failure(ErrorCode::Overloaded));
+                        self.owners.reap();
+                        let root = self.root().await?;
+                        let boot = self
+                            .receiver
+                            .lock()
+                            .unwrap()
+                            .local()
+                            .ok_or_else(unavailable)?
+                            .boot();
+                        let prepared = admission::BarrierPreparation::prepare(&root, boot)
+                            .map_err(|_| unavailable())?;
+                        let sample = self
+                            .receiver
+                            .lock()
+                            .unwrap()
+                            .sample_barrier(prepared, self.initialization, accepted.owner.key())
+                            .map_err(|_| unavailable())?;
+                        let ticket = self
+                            .owners
+                            .publish_proof(sample, self.storage.clone(), deadline)
+                            .map_err(|_| unavailable())?;
+                        self.owners
+                            .wait_proof(&ticket)
+                            .await
+                            .map_err(|_| unavailable())?;
+                        let proof = self
+                            .owners
+                            .take_proof(&ticket, &accepted.owner.key())
+                            .ok_or_else(unavailable)?;
+                        drop(ticket);
+                        let observation =
+                            self.owners.finish_drain(proof).map_err(|_| unavailable())?;
+                        let bytes = auth::DrainReply::from_observation(&observation)
+                            .encode()
+                            .map_err(|_| invalid())?;
+                        let body = Body::new(ResponseRetention {
+                            body: Body::from(bytes.clone()),
+                            _hold: accepted.response,
+                            _owner: RetainedOwner::Drain {
+                                _owner: accepted.owner,
+                                _proof: observation,
+                            },
+                        });
+                        return self
+                            .signer
+                            .response(&response_auth, 200, &bytes, body, false);
                     }
                 };
                 let bytes = serde_json::to_vec(&value).map_err(|_| invalid())?;
@@ -431,9 +523,10 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         .map_err(|_| unavailable())?;
     println!(
         "{}",
-        serde_json::json!({"bound_url":format!("{}://{}",if ready.prepared.tls.is_some(){"https"}else{"http"},listener.local_addr().map_err(|_|unavailable())?)})
+        serde_json::json!({"bound_url":format!("{}://{}",if ready.prepared.tls.is_some(){"https"}else{"http"},listener.local_addr().map_err(|_|unavailable())?),"resources":input.template.worker_resources(),"coordination_slots":super::queue_runtime::coordination_capacity(&input.template)?,"job_coordination_slots":super::queue_runtime::job_coordination_capacity(&input.template)?,"data_connection_slots":super::queue_runtime::job_coordination_capacity(&input.template)?,"queue_ingress_connection_slots":16,"queue_receipt_connection_slots":8,"queue_replica_connection_slots":8,"queue_bootstrap_connection_slots":4,"control_connection_slots":8,"header_connection_slots":24,"outgoing_stream_slots":super::queue_runtime::outgoing_capacity(&input.template)?,"control_threads":2,"network_threads":2,"blocking_threads":4,"control_transport_slots":8})
     );
-    let enrollment=serde_json::to_vec(&serde_json::json!({"version":1,"cluster_id":input.cluster_id,"node_id":input.node_id,"request_id":input.request_id,"incarnation":incarnation,"session_id":session,"public_key":http::hex(&key.public_key()),"endpoint":input.advertise_url,"operation_slots":input.template.operation_slots,"partition_slots":input.template.partition_slots,"queue_size":input.template.queue_size})).map_err(|_|invalid())?;
+    let coordination_slots = super::queue_runtime::coordination_capacity(&input.template)?;
+    let enrollment=serde_json::to_vec(&serde_json::json!({"version":1,"cluster_id":input.cluster_id,"node_id":input.node_id,"request_id":input.request_id,"incarnation":incarnation,"session_id":session,"public_key":http::hex(&key.public_key()),"endpoint":input.advertise_url,"operation_slots":coordination_slots,"partition_slots":super::queue_runtime::job_coordination_capacity(&input.template)?,"queue_size":input.template.queue_size,"resources":input.template.worker_resources()})).map_err(|_|invalid())?;
     let unsigned = auth::EnrollmentUnsigned::decode(&enrollment).map_err(|_| invalid())?;
     let signature = key.sign_enrollment(&unsigned).map_err(|_| invalid())?;
     let enrollment = auth::Enrollment::signed(unsigned, http::hex(&signature))
@@ -487,26 +580,73 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         }
     }
     let pin = pin.ok_or_else(unavailable)?;
-    let local = LocalAdmission::new(
+    let partition_slots = super::queue_runtime::job_coordination_capacity(&input.template)?;
+    let local = LocalAdmission::new_with_job_slots(
         input.cluster_id,
         &key,
         sender,
         initialization,
-        input.template.operation_slots as usize,
-        input.template.partition_slots as usize,
+        coordination_slots,
+        partition_slots,
         input.template.queue_size as usize,
     )
     .map_err(|_| invalid())?;
     let receiver = Arc::new(Mutex::new(ReceiverState::distributed(local)));
     let boot = receiver.lock().unwrap().local().unwrap().boot();
-    let (partition_pool, partition_threads) = WorkerPool::start(
-        NonZeroUsize::new(input.template.partition_slots as usize).ok_or_else(invalid)?,
+    let (partition_pool, partition_threads) = WorkerPool::start_with_resources(
+        input.template.worker_resources(),
         tokio::runtime::Handle::current(),
     )
     .map_err(|_| unavailable())?;
-    let owners = Arc::new(PayloadOwners::from_receiver(
-        partition_pool,
+    let control_limit = input
+        .template
+        .worker_resources()
+        .control_memory_reserve_bytes;
+    if control_limit < 64 * 1024 {
+        return Err(invalid());
+    }
+    let control_budget = crate::scheduling::ResourceScheduler::new(vec![(
+        0,
+        crate::config::WorkerResources {
+            max_threads: 2,
+            memory_limit_bytes: control_limit,
+            task_memory_limit_bytes: control_limit - 1,
+            control_memory_reserve_bytes: 1,
+        },
+    )])?;
+    let progress_bytes = super::queue_runtime::progress_bytes(&input.template);
+    let _progress_charge = control_budget.charge_memory(0, progress_bytes)?;
+    let progress_budget = crate::scheduling::ResourceScheduler::new(vec![(
+        0,
+        crate::config::WorkerResources {
+            max_threads: 2,
+            memory_limit_bytes: progress_bytes,
+            task_memory_limit_bytes: progress_bytes - 1,
+            control_memory_reserve_bytes: 1,
+        },
+    )])?;
+    let _coordination_charge = control_budget.charge_memory(
+        0,
+        super::queue_runtime::coordination_bytes(&input.template)?,
+    )?;
+    let queue_charge_bytes = input
+        .template
+        .execution
+        .max_queue_bytes_per_replica
+        .checked_add(
+            input
+                .template
+                .execution
+                .max_retained_result_bytes_per_worker,
+        )
+        .ok_or_else(invalid)?;
+    let _queue_charge = partition_pool
+        .scheduler()
+        .charge_memory(0, queue_charge_bytes)?;
+    let owners = Arc::new(PayloadOwners::from_receiver_with_streams(
+        partition_pool.clone(),
         receiver.clone(),
+        super::queue_runtime::outgoing_capacity(&input.template)?,
     ));
     let scratch = std::env::temp_dir().join(format!("meshdb-worker-{incarnation}"));
     let work=async {
@@ -516,30 +656,31 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         let configured=super::initialization::InitializedWorker::validate(boot,initialization,ready.clone(),storage.clone(),&cpu_pool).await?;
         receiver.lock().unwrap().complete_initialization(process_ready,configured).map_err(|_|invalid())?;
         let tls=crate::runtime::retained_tls(ready.prepared.tls.as_ref())?;
-        let worker=Arc::new(Worker{ready,storage,cpu:cpu_pool.clone(),signer,client,owners:owners.clone(),receiver,pin,process:Arc::new(process),operations:Executor::new(16,0)?,partitions:Executor::new(16,0)?,controls:Executor::new(8,0)?,sending:Executor::new(16,0)?,operation_transport:Arc::new(Semaphore::new(16)),partition_transport:Arc::new(Semaphore::new(16)),control_transport:Arc::new(Semaphore::new(8)),accepting:AtomicBool::new(true)});
+        let worker=Arc::new(Worker{ready,storage,cpu:partition_pool.clone(),control_cpu:cpu_pool.clone(),control_budget,progress_budget,coordination_slots,signer,client,initialization,owners:owners.clone(),receiver,pin,process:Arc::new(process),operations:Executor::new(coordination_slots,0)?,partitions:Executor::new(partition_slots,0)?,controls:Executor::new(8,0)?,sending:Executor::new(partition_slots,0)?,operation_transport:Arc::new(Semaphore::new(coordination_slots)),partition_transport:Arc::new(Semaphore::new(partition_slots)),control_transport:Arc::new(Semaphore::new(8)),accepting:AtomicBool::new(true),queue:super::queue_runtime::QueueRuntime::new(),remote_scheduler:super::coordinator::RemoteScheduler::new()});
+        worker.initialize_queue().await?;
         let root=worker.root().await?;
         let node=root.nodes.iter().find(|n|Some(n.node_id)==worker.signer.sender().node_id()).ok_or_else(unavailable)?;
-        let mut writer=HeartbeatWriter::new(crate::cluster::runtime::heartbeat_binding(&root,node)?).map_err(|_|invalid())?;
+        let writer=worker.owners.heartbeat_writer();
+        *writer.lock().await=Some(HeartbeatWriter::new(crate::cluster::runtime::heartbeat_binding(&root,node)?).map_err(|_|invalid())?);
         let (stop,mut stopped)=tokio::sync::watch::channel(false);
+        let queue_owner=worker.clone();let queue_task=tokio::spawn(queue_owner.queue_pump(stop.subscribe()));
         let heartbeat_interval=Duration::from_millis(root.timing.heartbeat_ms);
         let owner=worker.clone();
         let heartbeat=tokio::spawn(async move {
             loop {
                 owner.owners.reap();
-                let sample={let state=owner.receiver.lock().unwrap();let snap=state.snapshot_locked();let local=snap.local.ok_or_else(unavailable)?;let (ro,qo,rp,qp)=local.occupancy();HeartbeatSample{running_operations:ro as u64,queued_operations:qo as u64,running_partitions:rp as u64,queued_partitions:qp as u64,drain_id:local.drain_id(),accepting:owner.accepting.load(Ordering::Acquire)&&local.drain_id().is_none()}};
-                let storage=owner.storage.clone();
-                let returned=cpu(&owner.cpu,move |runtime|{let outcome=runtime.block_on(writer.publish(&storage,sample,Instant::now()+Duration::from_secs(5)));Ok((writer,outcome))}).await?;
-                writer=returned.0;
-                if matches!(returned.1,Ok(HeartbeatWriteResult::Exhausted)){owner.accepting.store(false,Ordering::Release);}
+                let sample={let (_,used_threads,used_bytes)=owner.cpu.scheduler().usage()[0];let state=owner.receiver.lock().unwrap();let snap=state.snapshot_locked();let local=snap.local.ok_or_else(unavailable)?;let (ro,qo,rp,qp)=local.occupancy();HeartbeatSample{available_threads:Some(owner.cpu.resources().max_threads.saturating_sub(used_threads)),available_memory_bytes:Some(owner.cpu.resources().working_bytes().saturating_sub(used_bytes)),running_operations:ro as u64,queued_operations:qo as u64,running_partitions:rp as u64,queued_partitions:qp as u64,drain_id:local.drain_id(),accepting:owner.accepting.load(Ordering::Acquire)&&local.drain_id().is_none()}};
+                let outcome=writer.lock().await.as_mut().ok_or_else(unavailable)?.publish(&owner.storage,sample,Instant::now()+Duration::from_secs(5)).await;
+                if matches!(outcome,Ok(HeartbeatWriteResult::Exhausted)){owner.accepting.store(false,Ordering::Release);}
                 tokio::select!{_=stopped.changed()=>break,_=tokio::time::sleep(heartbeat_interval)=>{}}
             }
             Ok::<(),ProtocolError>(())
         });
         let mut app=Router::new();for path in ["operations","jobs","readiness","dependencies/open","dependencies/close","drain"]{app=app.route(&format!("/internal/v1/{path}"),post(internal));}
-        let app=app.route("/health/live",get(||async{"true"})).with_state(worker.clone());
-        let served=crate::runtime::serve_router(listener,app,tls,async{crate::runtime::shutdown_signal().await;worker.accepting.store(false,Ordering::Release);worker.operations.stop_accepting();worker.partitions.stop_accepting();worker.controls.stop_accepting();}).await.map_err(|_|unavailable());
+        let app=app.route(super::queue_transport::PATH,post(super::queue_runtime::handler)).route("/health/live",get(||async{"true"})).with_state(worker.clone());
+        let served=crate::runtime::serve_router_with_budget(listener,app,tls,partition_slots,async{crate::runtime::shutdown_signal().await;worker.accepting.store(false,Ordering::Release);worker.operations.stop_accepting();worker.partitions.stop_accepting();worker.controls.stop_accepting();}).await.map_err(|_|unavailable());
         worker.operations.drain().await;worker.partitions.drain().await;worker.controls.drain().await;worker.sending.drain().await;
-        stop.send_replace(true);heartbeat.await.map_err(|_|unavailable())??;
+        stop.send_replace(true);queue_task.await.map_err(|_|unavailable())??;heartbeat.await.map_err(|_|unavailable())??;
         drop(worker);
         served
     }.await;

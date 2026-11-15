@@ -197,13 +197,55 @@ All client errors below derive from `MeshDBError`, exported by `meshdb`.
 Errors expose `code`, `request_id`, `status_code` and `outcome`. Local errors may
 have no request ID or HTTP status. Server errors preserve their diagnostics;
 `outcome` can be `"not_applied"` or `"unknown"`, while some local/read failures
-have `None`. Use the request UUID to correlate diagnostics. It provides no
-deduplication or idempotency guarantee.
+have `None`. A request UUID identifies one logical queued operation. Submitting the same UUID
+and exact body attaches to that request; a different body conflicts. The client
+does not automatically resubmit operations.
 
-After `UnknownOutcomeError`, do not blindly retry the mutation. Inspect current
-data and reconcile the intended change before deciding whether another write is
-appropriate. An immediate read showing old data does not prove rollback; the
-original operation may still commit. v0 has no request-outcome lookup API.
+After `UnknownOutcomeError`, keep the original identity. A request can still
+commit after its response disappears. Use its receipt or durable mutation
+decision to reconcile the outcome before submitting another logical mutation.
+
+## Queue receipts
+
+Existing table/query methods remain synchronous. They submit through the same
+worker queue as the receipt interface. Acceptance returns a queue identity and
+does not mean a mutation has committed.
+
+```python
+from meshdb import DB
+
+client = DB("http://127.0.0.1:8000", "data-token")
+receipt = client.submit("query.count", {
+    "table_id": table.id,
+    "query": {"select": None, "filter": None, "order_by": None, "limit": None},
+})
+print(receipt.run_id, receipt.request_id, receipt.state)
+terminal = receipt.wait(timeout=30)
+assert terminal.state == "succeeded", terminal.error
+print(terminal.result)
+
+# Reconnect through another API using the same database credentials.
+receipt = client.receipt(receipt.run_id, receipt.request_id)
+```
+
+`RequestReceipt` has `request_id`, `run_id`, `state`, `result`, `error`, and the
+`terminal` property. `poll()` returns a fresh receipt. `wait()` polls until a
+terminal state or its deadline. A wait timeout releases the client transport and
+does not cancel accepted work. To retry an uncertain submission, preserve the
+original UUID and operation payload and pass `request_id=` to `submit()`.
+
+Receipt states are `queued`, `running`, `committing`, `reconciling`, `succeeded`,
+`failed`, and `abandoned`. Query results expire at the configured retention
+interval and then return explicit `NotFoundError`. Durable mutation decisions
+remain reconcilable after result expiration or a run change.
+
+Every ready worker holds complete request records in RAM. An API restart or an
+individual worker failure can recover accepted work from another holder. A
+joining worker copies the queue before readiness. Stopping every worker abandons
+outstanding requests. An explicit `--cold-start` fences prior attempts and starts
+a new run without reconstructing pending requests from storage. Committed rows
+and mutation decisions remain durable. A one-worker deployment has one queue
+copy and cannot survive losing that process.
 
 ## Limits and scope
 
@@ -213,14 +255,15 @@ and server tables at 100,000 rows and 64 MiB of decoded row payload. Byte limits
 can be reached before row limits. The server remains authoritative for stored
 data and commit validation.
 
-The client remains synchronous. On the server, keyed operations route to one
+The table/query methods remain synchronous; receipt submission and polling let
+clients release their connections while work runs. Keyed operations route to one
 primary-key-range partition, and changed mutations rewrite only affected files.
 Queries scan partitions on persistent local OS worker threads and combine
 results with global ordering, ascending-primary-key ties, limit, projection and
 count semantics. Worker count is independent of partition count and can change
-on restart. Mutations serialize under one coordinator while partition
-preparation runs in parallel; uploads are currently sequential before one atomic
-catalog publication. Run one server process per bucket/prefix.
+on restart. A fenced worker scheduler shares compute and memory across requests.
+Mutation preparation produces private immutable files, then one conditional
+catalog update publishes the full operation and its durable decision.
 
 Partitions do not multiply the limits above. New closed Parquet files, including
 metadata, have a 64 MiB hard cap of 67,108,864 bytes. A singleton may exceed a
@@ -228,11 +271,13 @@ smaller configured target but never the cap; an impossible file fails the whole
 mutation. Empty tables have no files. A new target affects new or rewritten
 ranges without repacking unchanged files. Version 1 remains readable; version 2
 can mix Legacy and Partitioned tables. Only an actual data change migrates a
-legacy table. Reads and no-ops do not migrate it, and old binaries reject version 2.
+legacy table. The shared request runtime uses catalog format 4. Upgrading an
+existing format 1/2/3 catalog requires `--migrate-catalog` after stopping every
+old writer. Old binaries must remain stopped after migration.
 Historical objects remain in S3 with no garbage collection.
 
 The API provides no general transactions across calls, joins, import/export,
-schema migrations, model decorators, relationships, indexes, async API or
+schema migrations, model decorators, relationships, indexes, or
 data-frame adapters. The atomic batch remains a single operation.
 
 See the [server guide](../server/README.md#configuration) for size syntax and

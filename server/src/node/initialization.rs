@@ -31,12 +31,35 @@ impl InitializedWorker {
             let local = &ready.prepared.input.value;
             if root.cluster_id != local.cluster_id
                 || root.config.storage_fingerprint != ready.backend.storage.as_str()
-                || root.config.worker_semantic_fingerprint != ready.backend.worker.as_str()
+                || root.template.execution != local.template.execution
+                || root
+                    .template
+                    .partition_size
+                    .parse::<crate::partition_size::PartitionSize>()
+                    .map_err(|_| super::http::invalid())?
+                    != local
+                        .template
+                        .partition_size
+                        .parse::<crate::partition_size::PartitionSize>()
+                        .map_err(|_| super::http::invalid())?
             {
                 return Err(super::http::invalid());
             }
-            boot.check_current(root)
+            let member = boot
+                .check_current(root)
                 .map_err(|_| super::http::invalid())?;
+            if let Some(resources) = member.resources {
+                if resources != local.template.worker_resources()
+                    || member.partition_slots
+                        != super::queue_runtime::job_coordination_capacity(&local.template)? as u64
+                    || member.operation_slots
+                        != super::queue_runtime::coordination_capacity(&local.template)? as u64
+                {
+                    return Err(super::http::invalid());
+                }
+            } else if local.template.resources.is_some() {
+                return Err(super::http::invalid());
+            }
             runtime
                 .block_on(storage.load_cluster_catalog())
                 .map_err(|_| super::http::unavailable())?;
