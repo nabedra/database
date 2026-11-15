@@ -93,6 +93,14 @@ impl Peers<'_> {
         permit: Uuid,
         route: Route,
     ) -> Result<bool> {
+        http::control_backpressure(|| self.control_once(target, permit, route)).await
+    }
+    async fn control_once(
+        &self,
+        target: &crate::cluster::member::Node,
+        permit: Uuid,
+        route: Route,
+    ) -> Result<bool> {
         let root = self.worker.root().await?;
         let member = root
             .nodes

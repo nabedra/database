@@ -111,7 +111,8 @@ class TraceForward(socketserver.BaseRequestHandler):
             operation = auth.get('operation_id')
             queue_auth = json.loads(bytes.fromhex(headers[b'x-meshdb-queue-auth'].decode())) if b'x-meshdb-queue-auth' in headers else {}
             record = dict(method=lines[0].split(b' ')[0].decode('ascii'), path=path, operation_id=operation, node=auth.get('receiver', {}).get('node_id'),
-                          sender=auth.get('sender', {}).get('node_id'), job_id=auth.get('job_id'),
+                          sender=auth.get('sender', {}).get('node_id'), admission_id=auth.get('admission_id'),
+                          dependency_id=auth.get('dependency_id'), job_id=auth.get('job_id'),
                           attempt_id=auth.get('attempt_id'), started=time.monotonic(), forwarded=None,
                           finished=None, request_bytes=len(initial), response_bytes=0, status=None)
             with self.server.lock:
@@ -134,6 +135,18 @@ class TraceForward(socketserver.BaseRequestHandler):
                         record['installed_payload'] = record_metadata(command['record'])
                 else:
                     record['queue_metadata_unobserved'] = 'request exceeds observer capture bound'
+            if path in ('/internal/v1/dependencies/open', '/internal/v1/dependencies/close'):
+                length = int(headers[b'content-length'])
+                assert 0 < length <= 16384
+                while len(body) < length:
+                    chunk = self.request.recv(min(65536, length-len(body)))
+                    if not chunk:
+                        return
+                    body += chunk
+                    record['request_bytes'] += len(chunk)
+                control = json.loads(body)
+                record['permit_id'] = control['permit_id']
+                initial = header + b'\r\n\r\n' + body
             # Jobs use chunked HTTP containing frame-v1 CONTROL/STREAM_END.
             if path == '/internal/v1/jobs':
                 if headers.get(b'transfer-encoding') == b'chunked':
@@ -217,6 +230,12 @@ class TraceForward(socketserver.BaseRequestHandler):
                 if record['status'] not in (None, 200) and 'error_response' in locals() and b'\r\n\r\n' in error_response:
                     try:
                         record['error_reply'] = json.loads(error_response.split(b'\r\n\r\n', 1)[1])
+                    except ValueError:
+                        pass
+                if record['status'] == 200 and 'permit_id' in record and 'error_response' in locals() and b'\r\n\r\n' in error_response:
+                    try:
+                        reply = json.loads(error_response.split(b'\r\n\r\n', 1)[1])
+                        record['control_reply'] = {key: reply[key] for key in ('permit_id', 'closed') if key in reply}
                     except ValueError:
                         pass
                 record['finished'] = time.monotonic()
@@ -702,6 +721,8 @@ def metrics(cluster, observer, since=0):
     storage = [r for r in cluster.storage_traces() if r['started'] >= since]
     jobs = [r for r in traces if r['path'] == '/internal/v1/jobs']
     attempts = collections.Counter(r['job_id'] for r in jobs)
+    opens = collections.Counter((r['operation_id'], r['node'], r.get('permit_id')) for r in traces if r['path'].endswith('/dependencies/open'))
+    closes = collections.Counter((r['operation_id'], r['node'], r.get('permit_id')) for r in traces if r['path'].endswith('/dependencies/close'))
     ordinal_attempts = collections.Counter((r['operation_id'], r['ordinal']) for r in jobs if 'ordinal' in r)
     rss, cpu, heartbeat = {}, {}, collections.defaultdict(list)
     for sample in observer.samples:
@@ -734,6 +755,9 @@ def metrics(cluster, observer, since=0):
                 controlled_storage_read_delays=sum('controlled_storage_delay_seconds' in r for r in storage),
                 job_attempts=len(jobs), repeated_job_identity_attempts=sum(max(0, n - 1) for n in attempts.values()),
                 retried_partition_attempts=sum(max(0, n - 1) for n in ordinal_attempts.values()),
+                dependency_open_retry_attempts=sum(max(0, n - 1) for n in opens.values()),
+                settlement_close_attempts=sum(closes.values()), repeated_settlement_close_attempts=sum(max(0, n - 1) for n in closes.values()),
+                worker_http_status_counts=dict(collections.Counter(str(r['status']) for r in traces if r['status'] is not None)),
                 transport_errors=dict(collections.Counter(r['failure'] for r in traces + storage if 'failure' in r)),
                 unobserved_metrics=['exact_continuous_HTTP_compute_occupancy', 'exact_server_queue_wait', 'HTTP_reduction_reservation_events'],
                 replica_payloads=observed_replica_payloads(all_traces, since),

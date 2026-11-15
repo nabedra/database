@@ -371,6 +371,88 @@ impl Signer {
         response.body(body).map_err(|_| invalid())
     }
 }
+/// An unsigned HTTP error is a backpressure/transport observation only. It
+/// cannot prove that the peer did not apply an earlier or current invocation.
+fn checked_status(status: u16) -> Result<()> {
+    if status == 200 {
+        return Ok(());
+    }
+    let code = match status {
+        400 => ErrorCode::ValidationError,
+        401 | 403 => ErrorCode::Unauthorized,
+        404 => ErrorCode::NotFound,
+        409 => ErrorCode::Conflict,
+        413 => ErrorCode::LimitExceeded,
+        429 => ErrorCode::Overloaded,
+        _ => ErrorCode::StorageUnavailable,
+    };
+    Err(ProtocolError::new(
+        code,
+        "peer control HTTP exchange unavailable",
+        Outcome::Unknown,
+    ))
+}
+/// Retrying a control invocation retains its original logical permit. Each
+/// invocation must construct a fresh signed sender sequence inside `exchange`.
+pub(super) async fn control_backpressure<T, F, Fut>(mut exchange: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut delay = Duration::from_millis(10);
+    for attempt in 0..32 {
+        let result = timeout_at(deadline, exchange()).await.map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "peer control retry deadline exhausted",
+                Outcome::Unknown,
+            )
+        })?;
+        match result {
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::Overloaded | ErrorCode::StorageUnavailable
+                ) && attempt < 31 =>
+            {
+                let wake = Instant::now() + delay;
+                if wake >= deadline {
+                    return Err(error);
+                }
+                tokio::time::sleep_until(wake).await;
+                delay = delay.saturating_mul(2).min(Duration::from_millis(250));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded control attempts always return")
+}
+fn small_response_headers(response: &Response<Body>) -> Result<(u16, String, String, usize)> {
+    let status = response.status().as_u16();
+    checked_status(status)?;
+    let a = one(response.headers(), "x-meshdb-auth")?.to_owned();
+    let signature = one(response.headers(), "x-meshdb-signature")?.to_owned();
+    let length =
+        framing(response.headers(), crate::protocol::MAX_BODY_BYTES, false)?.ok_or_else(invalid)?;
+    Ok((status, a, signature, length))
+}
+fn checked_small_reply(
+    a: &str,
+    signature: &str,
+    status: u16,
+    bytes: Vec<u8>,
+    context: RequestContext,
+    root: &Control,
+) -> Result<auth::ReplyHandoff> {
+    let signed = auth::verify_reply(a, signature, status, &context).map_err(|_| invalid())?;
+    let content = auth::check_reply_content(&signed, bytes).map_err(|_| invalid())?;
+    let eligible = auth::check_reply_authority(&signed, root, &context).map_err(|_| invalid())?;
+    let observation = OwnershipObservation::new(root).map_err(|_| unavailable())?;
+    context
+        .into_reply_handoff(eligible, content, &observation)
+        .map_err(|_| invalid())
+}
 pub(crate) async fn small_exchange(
     client: &HttpClient,
     signer: &Signer,
@@ -387,22 +469,15 @@ pub(crate) async fn small_exchange(
         false,
     )?;
     let response = client.request(request, deadline).await?;
-    let status = response.status().as_u16();
-    let a = one(response.headers(), "x-meshdb-auth")?.to_owned();
-    let signature = one(response.headers(), "x-meshdb-signature")?.to_owned();
-    let length =
-        framing(response.headers(), crate::protocol::MAX_BODY_BYTES, false)?.ok_or_else(invalid)?;
+    let (status, a, signature, length) = small_response_headers(&response)?;
     let bytes = read_small(response.into_body(), length, deadline).await?;
     let root = load_root(storage, pool).await?;
     cpu(pool, move |_| {
-        let signed = auth::verify_reply(&a, &signature, status, &context).map_err(|_| invalid())?;
-        let content = auth::check_reply_content(&signed, bytes).map_err(|_| invalid())?;
-        let eligible =
-            auth::check_reply_authority(&signed, &root, &context).map_err(|_| invalid())?;
-        let observation = OwnershipObservation::new(&root).map_err(|_| unavailable())?;
-        context
-            .into_reply_handoff(eligible, content, &observation)
-            .map_err(|_| invalid())
+        checked_small_reply(&a, &signature, status, bytes, context, &root)
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "http_tests.rs"]
+mod tests;
