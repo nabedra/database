@@ -11,7 +11,12 @@ use meshdb_server::{
     protocol::MAX_BODY_BYTES,
     storage::{Namespace, Storage},
 };
+use meshdb_server::{
+    partition_size::PartitionSize,
+    worker_pool::{WorkerPool, WorkerThreads},
+};
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
 use std::{
     collections::VecDeque,
     pin::Pin,
@@ -27,15 +32,21 @@ mod support;
 use support::{Fake, ReadGate};
 const ID: &str = "11111111-1111-4111-8111-111111111111";
 
-async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor) {
+async fn fixture(queue: usize) -> (Router, Engine<Fake>, Executor, WorkerThreads) {
     let storage = Storage::new(Fake::default(), Namespace::new("api/").unwrap());
     storage.initialize_catalog().await.unwrap();
-    let engine = Engine::new(storage);
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let engine = Engine::new(storage, pool, PartitionSize::default());
     let executor = Executor::new(1, queue).unwrap();
     (
         api::router(engine.clone(), executor.clone(), "test-token".into()),
         engine,
         executor,
+        workers,
     )
 }
 fn wire(operation: &str, payload: Value) -> String {
@@ -78,7 +89,7 @@ fn error(value: &Value, code: &str, id: Value) {
 
 #[tokio::test]
 async fn framing_protocol_errors_and_strict_request_ids() {
-    let (app, engine, _) = fixture(0).await;
+    let (app, engine, _, workers) = fixture(0).await;
     let (status, value) = json_request(app.clone(), wire("table.list", json!({}))).await;
     assert_eq!(status, 200);
     assert_eq!(value, json!({"request_id":ID,"data":[]}));
@@ -164,6 +175,7 @@ async fn framing_protocol_errors_and_strict_request_ids() {
         error(&value, "validation_error", Value::Null);
     }
     assert_eq!(engine.storage().backend().state.lock().unwrap().gets, gets);
+    workers.shutdown().await.unwrap();
 }
 
 struct Frames {
@@ -201,7 +213,7 @@ fn counted_body() -> (Body, Arc<AtomicUsize>) {
 
 #[tokio::test]
 async fn inclusive_body_limit_and_unreadable_frames() {
-    let (app, engine, _) = fixture(0).await;
+    let (app, engine, _, workers) = fixture(0).await;
     let bytes = wire("table.list", json!({}));
     for (extra, expected) in [(0, 200), (1, 413)] {
         let (body, _) = frames(vec![
@@ -230,11 +242,12 @@ async fn inclusive_body_limit_and_unreadable_frames() {
     error(&value, "validation_error", Value::Null);
     assert!(!value.to_string().contains("private"));
     assert_eq!(engine.storage().backend().state.lock().unwrap().gets, gets);
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn authentication_overload_and_queue_do_not_poll_bodies_early() {
-    let (app, _, executor) = fixture(1).await;
+    let (app, _, executor, workers) = fixture(1).await;
     let gate = Arc::new(ReadGate::default());
     let worker_gate = gate.clone();
     let running = executor
@@ -292,12 +305,13 @@ async fn authentication_overload_and_queue_do_not_poll_bodies_early() {
         429
     );
     assert_eq!(polls.load(Ordering::SeqCst), 0);
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn cancelled_handler_retains_mutation_and_drain_until_completion() {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        let (app, engine, executor) = fixture(0).await;
+        let (app, engine, executor, workers) = fixture(0).await;
         let gate = Arc::new(ReadGate::default());
         engine.storage().backend().state.lock().unwrap().read_gate = Some(gate.clone());
         let create = wire(
@@ -324,7 +338,8 @@ async fn cancelled_handler_retains_mutation_and_drain_until_completion() {
         let catalog = engine.storage().load_catalog().await.unwrap().catalog;
         assert_eq!(catalog.revision, 1);
         assert!(catalog.tables.contains_key("items"));
-        assert_eq!(engine.storage().backend().state.lock().unwrap().puts, 3);
+        assert_eq!(engine.storage().backend().state.lock().unwrap().puts, 2);
+        workers.shutdown().await.unwrap();
     })
     .await
     .unwrap();

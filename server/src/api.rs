@@ -118,7 +118,7 @@ fn json_content_type(headers: &HeaderMap) -> bool {
         })
 }
 
-async fn execute_request<B: ObjectStore>(
+async fn execute_request<B: ObjectStore + 'static>(
     engine: Engine<B>,
     request: Request,
     started: Instant,

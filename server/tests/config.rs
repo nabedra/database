@@ -1,4 +1,4 @@
-use meshdb_server::storage;
+use meshdb_server::{partition_size, storage};
 #[path = "../src/config.rs"]
 mod config;
 
@@ -49,16 +49,22 @@ fn defaults_and_explicit_options_use_storage_namespace() {
     assert_eq!(config.bucket(), "test-bucket");
     assert_eq!(config.token(), "private-bearer-value");
     assert_eq!(config.admission_limit(), 68);
+    assert_eq!(
+        config.options().partition_size.bytes(),
+        meshdb_server::partition_size::MAX_PARTITION_BYTES
+    );
 
     let options = ServeOptions {
         host: "::1".parse().unwrap(),
         port: 9000,
         workers: 8,
         queue_size: 12,
+        partition_size: "61 MiB".parse().unwrap(),
         ..ServeOptions::default()
     };
     let config = configured(options, &[("MESHDB_S3_PREFIX", Some("team/data///"))]).unwrap();
     assert_eq!(config.namespace().as_str(), "team/data/");
+    assert_eq!(config.options().partition_size.bytes(), 63_963_136);
     assert_eq!(
         config.options().host,
         "::1".parse::<std::net::IpAddr>().unwrap()

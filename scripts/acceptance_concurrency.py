@@ -27,6 +27,76 @@ _BARRIER_TIMEOUT = 20
 _CATALOG_LIMIT = 1024 * 1024
 _UUID = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 _SNAPSHOT = re.compile(rf'tables/({_UUID})/({_UUID})\.parquet')
+_PARTITION = re.compile(rf'tables/({_UUID})/({_UUID})/(0|[1-9][0-9]*)\.parquet')
+
+
+def _object_match(relative):
+    match = _SNAPSHOT.fullmatch(relative) or _PARTITION.fullmatch(relative)
+    if match is not None and len(match.groups()) == 3:
+        require(int(match[3]) <= 2**32 - 1)
+    return match
+
+
+def _catalog_references(catalog, expected, objects, namespace):
+    require(type(catalog) is dict and type(catalog.get('format_version')) is int
+            and catalog['format_version'] in (1, 2))
+    require(type(catalog.get('revision')) is int and catalog['revision'] > 0)
+    require(type(catalog.get('tables')) is dict and set(catalog['tables']) == set(expected))
+    references = {}
+    for name, (table_id, count) in expected.items():
+        entry = catalog['tables'][name]
+        require(type(entry) is dict and entry.get('id') == table_id
+                and type(entry.get('row_count')) is int and entry['row_count'] == count
+                and entry.get('format') == 'parquet' and entry.get('key') == 'id')
+        data = ({'layout': 'legacy', 'snapshot': entry.get('snapshot')}
+                if catalog['format_version'] == 1 else entry.get('data'))
+        require(type(data) is dict)
+        if data.get('layout') == 'legacy':
+            refs = [data.get('snapshot')]
+            require(type(refs[0]) is str and _SNAPSHOT.fullmatch(refs[0]) is not None)
+        else:
+            require(data.get('layout') == 'partitioned' and type(data.get('files')) is list)
+            require(type(entry.get('schema')) is dict)
+            key_type = entry['schema'].get(entry['key'])
+            require(key_type in ('int64', 'utf8'))
+            files = data['files']
+            refs = []
+            rows = payload = 0
+            previous = None
+            for index, file in enumerate(files):
+                require(type(file) is dict and type(file.get('object')) is str)
+                relative = file['object']
+                require(_PARTITION.fullmatch(relative) is not None)
+                for field in ('row_count', 'byte_size', 'payload_bytes'):
+                    require(type(file.get(field)) is int and file[field] >= 0)
+                require(file['row_count'] > 0 and 0 < file['byte_size'] <= 67108864
+                        and objects.get(relative) == file['byte_size'])
+                bounds = file.get('range')
+                require(type(bounds) is dict and set(bounds) == {'lower', 'upper'}
+                        and bounds['lower'] == previous)
+                for bound in bounds.values():
+                    if bound is not None:
+                        require((key_type == 'utf8' and type(bound) is str)
+                                or (key_type == 'int64' and type(bound) is int
+                                    and -(2**63) <= bound < 2**63))
+                if bounds['lower'] is not None and bounds['upper'] is not None:
+                    require(bounds['lower'] < bounds['upper'])
+                require(index == len(files) - 1 or bounds['upper'] is not None)
+                previous = bounds['upper']
+                rows += file['row_count']
+                payload += file['payload_bytes']
+                refs.append(relative)
+            require(previous is None and rows == count and rows <= 100000 and payload <= 64 * 1024 * 1024)
+        for relative in refs:
+            require(type(relative) is str)
+            match = _object_match(relative)
+            require(match is not None and match[1] == table_id and relative in objects)
+            namespace.key(relative)
+        require(len(set(refs)) == len(refs))
+        references[name] = refs
+    flat = [ref for refs in references.values() for ref in refs]
+    require(len(set(flat)) == len(flat))
+    return references
 
 
 def _unique_object(pairs):
@@ -40,7 +110,9 @@ def _unique_object(pairs):
 class _SnapshotReader:
     """Two guarded S3 read operations, with no command dispatch interface."""
 
-    def __init__(self, config, namespace, directory):
+    def __init__(self, config, namespace, directory, *, scenario="concurrency"):
+        require(scenario in ("concurrency", "partition-workers"))
+        self.scenario = scenario
         self.config = config
         self.namespace = namespace
         self.directory = Path(directory)
@@ -52,7 +124,8 @@ class _SnapshotReader:
     def _guard(self):
         require(self.config.bucket == 'meshdb-testing' and self.config.region == 'us-east-1')
         self.config._check_namespace(self.namespace)
-        require(re.fullmatch(r'test-6-concurrency-[a-z0-9]+(?:-[a-z0-9]+)*/',
+        number = 6 if self.scenario == 'concurrency' else 10
+        require(re.fullmatch(rf'test-{number}-{self.scenario}-[a-z0-9]+(?:-[a-z0-9]+)*/',
                              self.namespace.prefix) is not None)
 
     def listing(self):
@@ -77,7 +150,7 @@ class _SnapshotReader:
                 key = item['Key']
                 require(key.startswith(self.namespace.prefix))
                 relative = key[len(self.namespace.prefix):]
-                require(relative == 'catalog.json' or _SNAPSHOT.fullmatch(relative) is not None)
+                require(relative == 'catalog.json' or _object_match(relative) is not None)
                 require(self.namespace.key(relative) == key and relative not in objects)
                 size = item.get('Size')
                 require(type(size) is int and size > 0)
@@ -89,7 +162,7 @@ class _SnapshotReader:
 
     def read_range(self, relative, start, end):
         self._guard()
-        require(relative == 'catalog.json' or _SNAPSHOT.fullmatch(relative) is not None)
+        require(relative == 'catalog.json' or _object_match(relative) is not None)
         key = self.namespace.key(relative)
         require(type(start) is int and type(end) is int and 0 <= start <= end)
         require(end - start + 1 <= _CATALOG_LIMIT + 1)
@@ -124,23 +197,7 @@ class _SnapshotReader:
         raw = self.read_range('catalog.json', 0, _CATALOG_LIMIT)
         require(len(raw) <= _CATALOG_LIMIT and len(raw) == objects['catalog.json'])
         catalog = json.loads(raw, object_pairs_hook=_unique_object)
-        require(type(catalog) is dict and catalog.get('format_version') == 1
-                and type(catalog.get('format_version')) is int)
-        require(type(catalog.get('revision')) is int and catalog['revision'] > 0)
-        require(type(catalog.get('tables')) is dict and set(catalog['tables']) == set(expected))
-        references = {}
-        for name, (table_id, count) in expected.items():
-            entry = catalog['tables'][name]
-            require(type(entry) is dict and entry.get('id') == table_id
-                    and type(entry.get('row_count')) is int and entry['row_count'] == count
-                    and entry.get('format') == 'parquet' and entry.get('key') == 'id')
-            relative = entry.get('snapshot')
-            require(type(relative) is str)
-            match = _SNAPSHOT.fullmatch(relative)
-            require(match is not None and match[1] == table_id and relative in objects)
-            self.namespace.key(relative)
-            references[name] = relative
-        require(len(set(references.values())) == len(expected))
+        references = _catalog_references(catalog, expected, objects, self.namespace)
         return catalog['revision'], objects, references
 
     def inspect(self, relative, size):
@@ -261,15 +318,16 @@ def _scenario(server, reader, c, record):
         previous = {key for key in baseline_objects if key != 'catalog.json'}
         require(previous <= snapshots and all(objects[key] == baseline_objects[key] for key in previous))
         require(baseline_refs[main.name] != refs[main.name])
-        require(baseline_refs[old.name].startswith(f'tables/{old_id}/'))
-        historical = snapshots - set(refs.values())
-        require(baseline_refs[main.name] in historical and baseline_refs[old.name] in historical)
-        require(sum(key.startswith(f'tables/{main.id}/') for key in snapshots) >= _CLIENTS + 2)
+        require(all(ref.startswith(f'tables/{old_id}/') for ref in baseline_refs[old.name]))
+        current = {ref for group in refs.values() for ref in group}
+        historical = snapshots - current
+        require(set(baseline_refs[main.name]) <= historical and set(baseline_refs[old.name]) <= historical)
+        require(sum(key.startswith(f'tables/{main.id}/') for key in snapshots) >= _CLIENTS + 1)
         record['storage'] = {'catalog_revision': revision, 'object_count': len(objects),
-                             'current_reference_count': len(refs), 'historical_count': len(historical),
+                             'current_reference_count': len(current), 'historical_count': len(historical),
                              'inspected_snapshots': []}
         # Two current, one populated historical main, one populated dropped.
-        for relative in [refs[main.name], refs[new.name], baseline_refs[main.name], baseline_refs[old.name]]:
+        for relative in refs[main.name] + refs[new.name] + baseline_refs[main.name] + baseline_refs[old.name]:
             record['storage']['inspected_snapshots'].append(reader.inspect(relative, objects[relative]))
 
     c.call('catalog_retention_and_parquet_magic', inspect_retention)

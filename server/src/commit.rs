@@ -5,15 +5,24 @@
 use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     storage::{
-        Catalog, LoadedCatalog, ObjectKey, ObjectStore, Storage, StorageError, WriteCondition,
+        Catalog, LoadedCatalog, ObjectKey, ObjectStore, Storage, StorageError, TableData,
+        WriteCondition,
     },
 };
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
-/// Same 80 MiB encoded limit as R03. Kept here to avoid coupling publication to
-/// codec internals. R05/R06 must also bound downloads before collecting bytes.
+/// Temporary Legacy engine allowance only. Partition files use the separate
+/// 64 MiB cap and must match their manifest byte_size.
 pub const MAX_ENCODED_SNAPSHOT_BYTES: usize = 80 * 1024 * 1024;
+
+/// A closed, validated object ready for immutable publication. The caller owns
+/// codec/schema/row validation; publication checks ownership and byte length.
+pub struct PendingObject {
+    pub key: ObjectKey,
+    pub bytes: Vec<u8>,
+}
 
 /// Owns the process-wide mutation lock and its storage. Intentionally not Clone;
 /// clone an Arc to share it, never construct a coordinator per operation.
@@ -74,24 +83,60 @@ impl<B: ObjectStore> MutationSession<'_, B> {
     /// one table. A no-op should simply drop this session without publication.
     pub fn candidate(&self) -> Catalog {
         let mut candidate = self.loaded.catalog.clone();
+        candidate.format_version = 2;
         candidate.revision = self.revision;
         candidate.commit_id = self.commit_id;
         candidate
     }
-    /// Consumes the session, retaining its lock through reconciliation.
-    ///
-    /// Preconditions: snapshot bytes are fully validated, closed encoded Parquet;
-    /// their schema and row count agree with the candidate. An empty table must
-    /// supply valid empty Parquet. This layer does not decode or validate rows.
-    /// Supply exactly one snapshot for a create/data change, or None for a drop.
-    /// Existing table identity, schema, key and format are immutable in v0.
+    /// Compatibility path for the temporary single-snapshot Legacy engine.
+    /// Uses the same validation, upload and reconciliation core as partitions,
+    /// with the original 80 MiB snapshot allowance. None is valid only for drop.
     pub async fn publish(
         self,
         candidate: Catalog,
         snapshot: Option<Vec<u8>>,
     ) -> Result<LoadedCatalog, ProtocolError> {
+        let objects = match snapshot {
+            Some(bytes) => {
+                let key = candidate
+                    .tables
+                    .values()
+                    .find_map(|entry| {
+                        let key = ObjectKey::snapshot(entry.id, self.commit_id);
+                        (entry.legacy_snapshot().ok() == Some(key.as_str())).then_some(key)
+                    })
+                    .ok_or_else(|| {
+                        failure(ErrorCode::ValidationError, "invalid legacy publication")
+                    })?;
+                vec![PendingObject { key, bytes }]
+            }
+            None => vec![],
+        };
+        self.publish_objects(candidate, objects, true).await
+    }
+
+    /// Publish exactly the newly introduced partition references, retaining the
+    /// session lock through all uploads and catalog reconciliation. Empty creates,
+    /// deletion to empty, retained-file changes and drops may need no objects.
+    /// Caller supplies closed Parquet with validated rows/schema and manifest
+    /// accounting. This layer does not decode objects. All validation and bounded
+    /// catalog encoding finish before any PUT. Uploads are sequential and awaited.
+    pub async fn publish_partitions(
+        self,
+        candidate: Catalog,
+        objects: Vec<PendingObject>,
+    ) -> Result<LoadedCatalog, ProtocolError> {
+        self.publish_objects(candidate, objects, false).await
+    }
+
+    async fn publish_objects(
+        self,
+        candidate: Catalog,
+        objects: Vec<PendingObject>,
+        legacy: bool,
+    ) -> Result<LoadedCatalog, ProtocolError> {
         let invalid = || failure(ErrorCode::ValidationError, "invalid publication candidate");
-        if candidate.format_version != self.loaded.catalog.format_version
+        if candidate.format_version != 2
             || candidate.revision != self.revision
             || candidate.commit_id != self.commit_id
         {
@@ -107,31 +152,98 @@ impl<B: ObjectStore> MutationSession<'_, B> {
         if changed.next().is_some() {
             return Err(invalid());
         }
-        let key = match (old.get(name), new.get(name), snapshot.as_ref()) {
-            (Some(_), None, None) => None,
-            (previous, Some(entry), Some(bytes)) => {
-                if bytes.is_empty() {
+        let previous = old.get(name);
+        let entry = new.get(name);
+        if let (Some(previous), Some(entry)) = (previous, entry)
+            && (previous.descriptor(name) != entry.descriptor(name)
+                || matches!(
+                    (&previous.data, &entry.data),
+                    (TableData::Partitioned { .. }, TableData::Legacy { .. })
+                ))
+        {
+            return Err(invalid());
+        }
+        // New objects must be owned by this session. Retained objects can only
+        // come from the affected table's admitted manifest. Routing bounds may
+        // change when an adjacent partition becomes empty; physical facts cannot.
+        let mut expected = BTreeMap::new();
+        let commit_path = self.commit_id.to_string();
+        match entry.map(|entry| &entry.data) {
+            None => {}
+            Some(TableData::Legacy { snapshot }) if legacy => {
+                let entry = entry.unwrap();
+                if *snapshot != ObjectKey::snapshot(entry.id, self.commit_id).as_str() {
                     return Err(invalid());
                 }
-                if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES {
+                expected.insert(snapshot.as_str(), None);
+            }
+            Some(TableData::Partitioned { files }) if !legacy => {
+                let retained: BTreeMap<_, _> = match previous.map(|entry| &entry.data) {
+                    Some(TableData::Partitioned { files }) => files
+                        .iter()
+                        .map(|file| (file.object.as_str(), file))
+                        .collect(),
+                    _ => BTreeMap::new(),
+                };
+                for file in files {
+                    if let Some(old) = retained.get(file.object.as_str()) {
+                        if (file.row_count, file.byte_size, file.payload_bytes)
+                            != (old.row_count, old.byte_size, old.payload_bytes)
+                        {
+                            return Err(invalid());
+                        }
+                    } else {
+                        ObjectKey::parse_partition(&file.object, entry.unwrap().id)
+                            .map_err(|_| invalid())?;
+                        if file.object.split('/').nth(2) != Some(commit_path.as_str()) {
+                            return Err(invalid());
+                        }
+                        if expected
+                            .insert(file.object.as_str(), Some(file.byte_size))
+                            .is_some()
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                }
+            }
+            _ => return Err(invalid()),
+        }
+        let mut supplied = BTreeSet::new();
+        for object in &objects {
+            if !supplied.insert(object.key.as_str()) {
+                return Err(invalid());
+            }
+            let size = expected.get(object.key.as_str()).ok_or_else(invalid)?;
+            if object.bytes.is_empty() {
+                return Err(invalid());
+            }
+            match size {
+                Some(size) => {
+                    if object.bytes.len() > crate::partition_size::MAX_PARTITION_BYTES {
+                        return Err(failure(
+                            ErrorCode::LimitExceeded,
+                            "partition exceeds 64 MiB",
+                        ));
+                    }
+                    if object.bytes.len() as u64 != *size {
+                        return Err(invalid());
+                    }
+                }
+                None if object.bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES => {
                     return Err(failure(
                         ErrorCode::LimitExceeded,
                         "encoded snapshot exceeds 80 MiB",
                     ));
                 }
-                if previous.is_some_and(|p| p.descriptor(name) != entry.descriptor(name)) {
-                    return Err(invalid());
-                }
-                let key = ObjectKey::snapshot(entry.id, self.commit_id);
-                if entry.snapshot != key.as_str() {
-                    return Err(invalid());
-                }
-                Some(key)
+                None => {}
             }
-            _ => return Err(invalid()),
-        };
+        }
+        if supplied.len() != expected.len() {
+            return Err(invalid());
+        }
         // Authoritative catalog validation and the 1 MiB serialization bound
-        // precede every PUT, including the immutable snapshot upload.
+        // precede every PUT, including all immutable object uploads.
         let bytes = candidate.encode().map_err(|e| match e {
             StorageError::LimitExceeded => {
                 failure(ErrorCode::LimitExceeded, "catalog exceeds 1 MiB")
@@ -139,15 +251,15 @@ impl<B: ObjectStore> MutationSession<'_, B> {
             _ => invalid(),
         })?;
         let storage = &self.coordinator.storage;
-        if let (Some(key), Some(snapshot)) = (key, snapshot) {
+        for object in objects {
             storage
-                .put(&key, snapshot, WriteCondition::Create)
+                .put(&object.key, object.bytes, WriteCondition::Create)
                 .await
                 .map_err(|error| {
                     if error == StorageError::Conflict {
                         storage_failure(error)
                     } else {
-                        failure(ErrorCode::StorageUnavailable, "snapshot upload failed")
+                        failure(ErrorCode::StorageUnavailable, "object upload failed")
                     }
                 })?;
         }

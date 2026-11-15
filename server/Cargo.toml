@@ -5,7 +5,13 @@ edition = "2024"
 rust-version = "1.94.1"
 publish = false
 
+[features]
+default = ["s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+
 [dependencies]
+ring = "=0.17.14"
+sha2 = "=0.11.1"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 axum-server = { version = "=0.9.1", default-features = false, features = ["tls-rustls"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
@@ -17,14 +23,25 @@ clap = { version = "=4.6.7", features = ["derive"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["raw_value", "arbitrary_precision"] }
 uuid = { version = "=1.29.2", features = ["serde", "v4"] }
-aws-config = "=1.13.1"
-aws-sdk-s3 = "=1.158.0"
+aws-config = { version = "=1.13.1", optional = true }
+aws-sdk-s3 = { version = "=1.158.0", optional = true }
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "io-util"] }
 
 arrow-array = "=60.1.0"
 arrow-schema = "=60.1.0"
 parquet = { version = "=60.1.0", default-features = false, features = ["arrow"] }
 bytes = "=1.12.1"
+
+# Cached HTTP transport; explicit TLS, no proxy or retry middleware.
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "tls12", "aws-lc-rs"] }
+tokio-util = { version = "=0.7.20", features = ["io"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+
+[target.'cfg(unix)'.dependencies]
+# Bounded startup material reads use O_NONBLOCK before opened-handle validation.
+libc = "=0.2.191"
 
 [dev-dependencies]
 tower = { version = "=0.5.3", features = ["util"] }

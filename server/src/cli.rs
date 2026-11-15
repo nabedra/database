@@ -14,4 +14,14 @@ pub struct Cli {
 pub enum Command {
     /// Serve the MeshDB API.
     Serve(ServeOptions),
+    /// Run the supervised cluster API.
+    Api {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    /// Enroll and run a manually provisioned worker.
+    Worker {
+        #[arg(long)]
+        bootstrap: std::path::PathBuf,
+    },
 }

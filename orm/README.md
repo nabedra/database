@@ -213,11 +213,30 @@ and server tables at 100,000 rows and 64 MiB of decoded row payload. Byte limits
 can be reached before row limits. The server remains authoritative for stored
 data and commit validation.
 
-v0 is synchronous and uses full table scans, including key lookup, and complete
-Parquet snapshot rewrites for changed tables. It provides no general
-transactions across calls, joins, import/export, migrations, model decorators,
-relationships, indexes, async API or data-frame adapters. The atomic batch is a
-single operation, not a general transaction API.
+The client remains synchronous. On the server, keyed operations route to one
+primary-key-range partition, and changed mutations rewrite only affected files.
+Queries scan partitions on persistent local OS worker threads and combine
+results with global ordering, ascending-primary-key ties, limit, projection and
+count semantics. Worker count is independent of partition count and can change
+on restart. Mutations serialize under one coordinator while partition
+preparation runs in parallel; uploads are currently sequential before one atomic
+catalog publication. Run one server process per bucket/prefix.
 
-See the [ORM contract](../plan-v0/orm.md) and
-[server contract](../plan-v0/server.md) for v0 protocol details.
+Partitions do not multiply the limits above. New closed Parquet files, including
+metadata, have a 64 MiB hard cap of 67,108,864 bytes. A singleton may exceed a
+smaller configured target but never the cap; an impossible file fails the whole
+mutation. Empty tables have no files. A new target affects new or rewritten
+ranges without repacking unchanged files. Version 1 remains readable; version 2
+can mix Legacy and Partitioned tables. Only an actual data change migrates a
+legacy table. Reads and no-ops do not migrate it, and old binaries reject version 2.
+Historical objects remain in S3 with no garbage collection.
+
+The API provides no general transactions across calls, joins, import/export,
+schema migrations, model decorators, relationships, indexes, async API or
+data-frame adapters. The atomic batch remains a single operation.
+
+See the [server guide](../server/README.md#configuration) for size syntax and
+worker configuration, and the [partition workers rubric](../plans/partition-workers.md)
+for current storage contracts. The [ORM contract](../plan-v0/orm.md) and
+[server contract](../plan-v0/server.md) are historical v0 baselines; their
+single-file storage and request-only worker descriptions predate partition workers.

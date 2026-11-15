@@ -5,8 +5,10 @@ native HTTPS. S3 is its only durable store. Run one process per bucket/prefix;
 v0 does not coordinate multiple server processes sharing a namespace.
 
 The [Python ORM guide](../orm/README.md) covers client installation and the full
-API. The [server contract](../plan-v0/server.md) defines the wire protocol, and
-the [implementation tracker](../plan-v0/implementation.md) records task status.
+API. The [partition workers rubric](../plans/partition-workers.md) records current
+storage and worker contracts and task status. The [v0 server contract](../plan-v0/server.md)
+and [v0 implementation tracker](../plan-v0/implementation.md) are historical
+baselines; their single-file and request-only worker descriptions predate this change.
 
 ## Build and start
 
@@ -72,7 +74,8 @@ Clap help/version options:
 | --- | --- | --- |
 | `--host` | `127.0.0.1` | An IPv4 or IPv6 address. Nonloopback binding must be explicit. |
 | `--port` | `8000` | Unsigned 16-bit port. |
-| `--workers` | `4` | At least 1 executing operation. |
+| `--workers` | `4` | At least 1 persistent local OS worker thread; also sets the separate executing-request budget. |
+| `--partition-size`, alias `--partition_size` | `67108864 B` | Positive integer with a supported unit, at most 67,108,864 bytes. |
 | `--queue-size` | `64` | Nonnegative queued operation count; zero is valid. |
 | `--tls-cert` | Absent | Readable PEM certificate file, supplied with `--tls-key`. |
 | `--tls-key` | Absent | Readable matching PEM private key, supplied with `--tls-cert`. |
@@ -80,7 +83,32 @@ Clap help/version options:
 The checked sum of workers and queue size must fit the executor's semaphore
 limit. Authentication and admission precede operation-body reads. At most
 `workers + queue-size` operations are admitted and at most `workers` execute;
-full or stopped admission returns `429 overloaded`.
+full or stopped admission returns `429 overloaded`. Request admission and
+partition dispatch have separate budgets.
+
+For example:
+
+```sh
+server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+```
+
+`--partition-size '64 KB'` is equivalent. Units are mandatory and case-insensitive:
+`B`, `KB`, `MB`, `KiB`, `MiB`. Whitespace is optional, so `64kb`, `'64 Kb'` and
+`64KiB` are accepted. SI units use powers of 1000; IEC units use powers of 1024.
+Only positive integer quantities are valid. Bare numbers, signs, decimal
+notation, zero, overflow and values above 64 MiB are rejected. The default and
+hard maximum are 64 MiB, exactly 67,108,864 bytes; `64MiB` and `67108864B` are accepted.
+
+Exactly N persistent local OS threads handle partition work for `--workers N`.
+The original index in the captured manifest selects worker `index % N`, including
+when a keyed operation selects only one file. Each worker fetches its own file,
+decodes it and evaluates the operation or encodes replacement files on that
+thread. Each worker has one queued-job slot; each operation dispatches at most
+N outstanding jobs and awaits every admitted job through errors. More partitions
+run in later windows; fewer partitions leave some workers idle. The coordinator
+combines results and publishes the catalog. These are local threads in one
+process. Changing N on restart is safe and does not change storage partition
+count or require rewriting files.
 
 Without TLS flags, the listener serves HTTP. To serve native HTTPS on an
 explicit nonloopback address:
@@ -134,14 +162,41 @@ configuration values.
 
 ## Storage behavior and limits
 
-Within the prefix, `catalog.json` references immutable
-`tables/<table_id>/<commit_id>.parquet` snapshots. Each read loads one fresh
-catalog and uses its referenced snapshot. Mutations serialize in the process,
-upload a complete replacement table snapshot, then conditionally publish the
-catalog against its previous opaque ETag. That catalog PUT is the commit point.
-Reads take no mutation lock and retain their observed snapshot during writes
-or drops. Key lookups and row queries scan whole tables; changed tables require
-whole-table Parquet rewrites.
+Within the prefix, `catalog.json` references immutable Parquet files. Version 2
+catalogs support mixed Legacy entries at `tables/<table_id>/<commit_id>.parquet`
+and Partitioned entries whose files are at
+`tables/<table_id>/<commit_id>/<ordinal>.parquet`.
+A manifest records each file's typed primary-key range, row count, closed byte
+size and decoded payload size. Ranges are ordered, contiguous, lower-inclusive
+and upper-exclusive, with unbounded outer ends. Empty tables use `files: []`
+and create no Parquet object.
+
+Version 1 remains readable without startup or read-time rewriting. New catalog
+publications use version 2. A legacy table migrates to partitions only on an
+actual data change; reads and no-op mutations retain its legacy file. A catalog
+can therefore contain both layouts. Old binaries reject version 2 catalogs.
+
+Each read captures one fresh catalog and retains its referenced files during
+writes or drops, without taking the mutation lock. Keyed gets and mutations
+route to the owning partition. Changed mutations rewrite only affected files;
+unchanged files retain their object references. Queries scan partitions on the
+shared workers. The coordinator combines their results with one global ordering,
+ascending-primary-key tie-break, limit and projection; count sums matches and
+applies the global limit. Explain remains metadata-only.
+
+Mutating requests serialize under the existing in-process coordinator while
+their partitions prepare in parallel. After all preparation and aggregate limit
+checks succeed, object uploads run sequentially. One conditional catalog PUT
+against the previous opaque ETag commits the whole mutation. Preparation or
+upload failure publishes no partial table, though uploads can leave orphan
+objects. This design makes no throughput or scaling guarantee.
+
+The size target measures closed Parquet bytes, including metadata and footer.
+New files split by primary-key range toward the configured target. A singleton
+may exceed that soft target but never the 67,108,864-byte hard cap. If no valid
+file can fit, the whole mutation fails. Changing the configured size affects
+new or rewritten ranges and does not automatically repack unchanged files.
+Legacy files retain their existing 80 MiB encoded read allowance.
 
 Table handles retain immutable UUID identities. Dropping and recreating a name
 produces a new ID, so old handles return `not_found` instead of targeting the new
@@ -172,7 +227,9 @@ duplicate-key validation.
 | Insert batch or collected row result | 10,000 rows |
 | Table | 100,000 rows |
 | Decoded logical row payload per table | 64 MiB |
+| Closed bytes per new partition file, including metadata | 64 MiB = 67,108,864 bytes |
 
+Partitioning does not multiply table, request, batch or result limits.
 Limits produce `limit_exceeded`, without truncation. Only server-generated
 Parquet snapshots are supported; this is not a general Parquet file importer.
 v0 has no garbage collection, general transactions across calls, SQL, joins,
@@ -205,6 +262,7 @@ orm/.venv/bin/python scripts/acceptance_http.py --binary server/target/debug/mes
 orm/.venv/bin/python scripts/acceptance_lifecycle.py --binary server/target/debug/meshdb-server
 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/meshdb-server
 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/meshdb-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/meshdb-server
 ```
 
 The [HTTP runner](../scripts/acceptance_http.py) checks types, CRUD and queries;
@@ -216,7 +274,45 @@ batches and scans as tables grow. Latencies are individual end-to-end samples,
 not statistical estimates or scaling guarantees. Runners write fresh sanitized
 JSON reports beneath `artifacts/`, or accept `--report` with an unused path.
 
-Implementation details are recorded in the notes for
+The prepared [partition runner](../scripts/acceptance_partitions.py) allocates
+`test-10-partition-workers-<run-id>/`, checks actual object sizes and manifests,
+routed CRUD, global query results, atomic failure and retained objects, then
+restarts that namespace with three workers instead of two. Both runs use a
+64 KB target. Retain its fixtures and sanitized report, and record the exact
+command, report, outcome and allocated prefix under [scripts/notes/](../scripts/notes/).
+Never source, print or commit the supplied dotenv file or credentials. Its live
+S3 run [passed all 53 checks](../scripts/notes/PW-E02.md); see the
+[current rubric](../plans/partition-workers.md) for final audit status.
+
+Historical implementation details are recorded in the notes for
 [configuration](notes/R10a.md), [CLI](notes/R10b.md),
 [operations HTTP](notes/R09.md), [health](notes/R09b.md),
 [S3/catalogs](notes/R02.md) and [publication](notes/R04.md).
+
+## Local API and worker milestone
+
+A local process acceptance runner starts a real HTTP object store, a supervised
+API and two manually enrolled worker processes with synthetic credentials. It
+checks public data operations, TCP peer/self partition jobs, competing writes,
+exact replay after a lost response and API restart, and process shutdown.
+Run from the repository root using the existing dependency cache:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
+  cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin meshdb-server
+python3 scripts/acceptance_nodes.py --binary server/target/debug/meshdb-server
+```
+
+The runner needs only Python's standard library and loopback TCP. It creates and
+removes its own SQLite store and configuration. It reads no dotenv or cloud
+profiles. Its startup exchange demonstrates `meshdb-server api --config PATH`
+over the inherited `MESHDB_SUPERVISOR_FD` socket and
+`meshdb-server worker --bootstrap PATH`. An API requires that supervisor
+exchange; it is not an unsupervised standalone command.
+
+This milestone supports the HTTP storage backend, external provisioning and a
+fixed worker policy. Managed provisioning, autoscaling, administration routes,
+S3 runtime composition and positive safe-termination authorization remain
+unfinished. Signal shutdown stops admission and waits for owned work; it is not
+a distributed idle certificate. See [runtime evidence](notes/DN-runtime-integration.md)
+for executed checks and limits.

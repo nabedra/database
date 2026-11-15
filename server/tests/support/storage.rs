@@ -1,5 +1,4 @@
 //! Conditional in-memory object backend shared by storage and later commit tests.
-use aws_sdk_s3::primitives::ByteStream;
 use meshdb_server::storage::*;
 use std::{
     collections::BTreeMap,
@@ -48,13 +47,14 @@ impl ObjectStore for Fake {
             return Err(StorageError::Unavailable);
         }
         let (bytes, etag) = state.objects.get(key).ok_or(StorageError::NotFound)?;
-        Ok(Download {
-            body: ByteStream::new(aws_sdk_s3::primitives::SdkBody::from_body_1_x(Chunks {
+        Ok(Download::new(
+            Chunks {
                 chunks: bytes.chunks(8).map(bytes::Bytes::copy_from_slice).collect(),
-            })),
-            etag: etag.clone(),
-        })
+            },
+            etag.clone(),
+        ))
     }
+
     async fn put(
         &self,
         key: &str,
@@ -101,17 +101,19 @@ impl ObjectStore for Fake {
 struct Chunks {
     chunks: std::collections::VecDeque<bytes::Bytes>,
 }
-impl http_body::Body for Chunks {
-    type Data = bytes::Bytes;
-    type Error = std::convert::Infallible;
-    fn poll_frame(
+impl tokio::io::AsyncRead for Chunks {
+    fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        std::task::Poll::Ready(
-            self.chunks
-                .pop_front()
-                .map(|chunk| Ok(http_body::Frame::data(chunk))),
-        )
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(chunk) = self.chunks.front_mut() {
+            let len = chunk.len().min(buffer.remaining());
+            buffer.put_slice(&chunk.split_to(len));
+            if chunk.is_empty() {
+                self.chunks.pop_front();
+            }
+        }
+        std::task::Poll::Ready(Ok(()))
     }
 }

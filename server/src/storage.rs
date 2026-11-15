@@ -1,13 +1,24 @@
 //! Bounded object access and validated catalogs. The backend is a trusted adapter;
 //! callers use Storage so every object key stays within its namespace.
-use crate::protocol::{MAX_CATALOG_BYTES, MAX_TABLE_ROWS, Schema, TableDescriptor, TableFormat};
-use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    future::Future,
-};
+use crate::protocol::MAX_CATALOG_BYTES;
+mod control_decision;
+mod decision;
+mod history;
+mod publication;
+pub use control_decision::{ControlDecision, MAX_CONTROL_BODY_BYTES, MAX_CONTROL_DECISION_BYTES};
+pub use decision::{ClusterCatalog, Decision, MAX_DECISION_BYTES};
+pub use history::{HistoryBudget, HistoryLookup, LoadedClusterCatalog};
+pub use publication::{PreparedPublication, PublicationOutcome};
+pub mod http;
+mod manifest;
+pub use http::HttpStore;
+#[cfg(feature = "s3")]
+pub mod s3;
+pub use manifest::*;
+#[cfg(feature = "s3")]
+pub use s3::S3Store;
+use std::{future::Future, pin::Pin};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 /// Sanitized failures. Never contains SDK diagnostics or configuration values.
@@ -65,15 +76,85 @@ fn safe_path(path: &str) -> Result<(), StorageError> {
     }
     Ok(())
 }
-/// Only the catalog and canonical immutable snapshot keys can be addressed.
+/// Only canonical table objects and explicitly typed metadata can be addressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectKey(String);
 impl ObjectKey {
     pub fn catalog() -> Self {
         Self("catalog.json".into())
     }
+    pub fn decision(id: Uuid) -> Self {
+        Self(format!("decisions/{id}.json"))
+    }
+    pub fn control_decision(id: Uuid) -> Self {
+        Self(format!("control-decisions/{id}.json"))
+    }
+    pub fn control() -> Self {
+        Self("cluster/control.json".into())
+    }
+    pub fn heartbeat(incarnation: Uuid) -> Self {
+        Self(format!("cluster/heartbeats/{incarnation}.json"))
+    }
+    pub fn permits_match(&self) -> bool {
+        self.0 == "catalog.json"
+            || self.0 == "cluster/control.json"
+            || self.0.starts_with("cluster/heartbeats/")
+    }
     pub fn snapshot(table_id: Uuid, commit_id: Uuid) -> Self {
         Self(format!("tables/{table_id}/{commit_id}.parquet"))
+    }
+    pub fn partition(table_id: Uuid, commit_id: Uuid, ordinal: u32) -> Self {
+        Self(format!("tables/{table_id}/{commit_id}/{ordinal}.parquet"))
+    }
+    pub fn parse_partition(path: &str, table_id: Uuid) -> Result<Self, StorageError> {
+        safe_path(path)?;
+        let parts: Vec<_> = path.split('/').collect();
+        if parts.len() != 4 || parts[0] != "tables" || parts[1] != table_id.to_string() {
+            return Err(StorageError::InvalidPath);
+        }
+        let commit = Uuid::parse_str(parts[2]).map_err(|_| StorageError::InvalidPath)?;
+        let ordinal = parts[3]
+            .strip_suffix(".parquet")
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or(StorageError::InvalidPath)?;
+        let key = Self::partition(table_id, commit, ordinal);
+        if key.0 != path {
+            return Err(StorageError::InvalidPath);
+        }
+        Ok(key)
+    }
+    /// The shared relative-key guard used by Storage and the S3 adapter.
+    pub fn parse_relative(path: &str) -> Result<Self, StorageError> {
+        if path == "catalog.json" {
+            return Ok(Self::catalog());
+        }
+        if path == "cluster/control.json" {
+            return Ok(Self::control());
+        }
+        for (prefix, constructor) in [
+            ("decisions/", Self::decision as fn(Uuid) -> Self),
+            ("control-decisions/", Self::control_decision),
+            ("cluster/heartbeats/", Self::heartbeat),
+        ] {
+            if let Some(id) = path
+                .strip_prefix(prefix)
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                let id = Uuid::parse_str(id).map_err(|_| StorageError::InvalidPath)?;
+                let key = constructor(id);
+                return if key.0 == path {
+                    Ok(key)
+                } else {
+                    Err(StorageError::InvalidPath)
+                };
+            }
+        }
+        let id = path
+            .split('/')
+            .nth(1)
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or(StorageError::InvalidPath)?;
+        Self::parse_snapshot(path, id).or_else(|_| Self::parse_partition(path, id))
     }
     pub fn parse_snapshot(path: &str, table_id: Uuid) -> Result<Self, StorageError> {
         safe_path(path)?;
@@ -100,18 +181,42 @@ pub enum WriteCondition<'a> {
     Create,
     Match(&'a str),
 }
+/// One complete object representation and its opaque conditional-write version.
+/// Readers must report truncated/failed transfers as I/O errors, never clean EOF.
 pub struct Download {
-    pub body: ByteStream,
+    pub body: Pin<Box<dyn AsyncRead + Send>>,
     pub etag: String,
+}
+impl Download {
+    pub fn new(reader: impl AsyncRead + Send + 'static, etag: String) -> Self {
+        Self {
+            body: Box::pin(reader),
+            etag,
+        }
+    }
+    /// Construct a complete in-memory download, useful for embedded backends and fakes.
+    pub fn from_bytes(bytes: Vec<u8>, etag: String) -> Self {
+        Self::new(std::io::Cursor::new(bytes), etag)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
     pub bytes: Vec<u8>,
     pub etag: String,
 }
-/// Adapter contract: get returns NotFound only for a definite missing object.
-/// Put must apply its condition atomically and never automatically retry.
+/// Trusted backend contract. GET is linearizable and returns a complete object
+/// with a nonempty version for that same representation. NotFound means definite
+/// absence; incomplete reads must fail rather than return a successful prefix.
+///
+/// Create atomically succeeds only for an absent key; Match atomically succeeds
+/// only for the supplied current version. Success means durable bytes and a new,
+/// nonempty, non-ABA version, even when replacing a key with identical bytes.
+/// A failed condition returns Conflict without applying the write. Any failure
+/// that may have applied a write must conservatively return Ambiguous. Adapters
+/// must never automatically retry PUT; callers reconcile possibly applied writes.
+///
 /// Keys are already namespace-qualified by Storage; there is no per-call bucket.
+/// Storage additionally enforces immutable snapshots and namespace validation.
 pub trait ObjectStore: Send + Sync {
     fn get(&self, key: &str) -> impl Future<Output = Result<Download, StorageError>> + Send;
     fn put(
@@ -122,134 +227,6 @@ pub trait ObjectStore: Send + Sync {
     ) -> impl Future<Output = Result<String, StorageError>> + Send;
 }
 
-pub struct S3Store {
-    namespace: Namespace,
-    bucket: String,
-    reads: Client,
-    writes: Client,
-}
-impl S3Store {
-    /// Uses the standard server-side credential and region provider chains.
-    /// The caller supplies configuration explicitly; this never reads .env files.
-    async fn connect(bucket: &str, namespace: Namespace) -> Result<Self, StorageError> {
-        // General purpose bucket names only; reject ARNs, URLs and access points.
-        if !(3..=63).contains(&bucket.len())
-            || !bucket
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-            || !bucket.as_bytes()[0].is_ascii_alphanumeric()
-            || !bucket.as_bytes()[bucket.len() - 1].is_ascii_alphanumeric()
-            || bucket.contains("..")
-            || bucket.parse::<std::net::Ipv4Addr>().is_ok()
-        {
-            return Err(StorageError::Configuration);
-        }
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        if config.region().is_none() {
-            return Err(StorageError::Configuration);
-        }
-        let writes = Client::from_conf(
-            aws_sdk_s3::config::Builder::from(&config)
-                .retry_config(RetryConfig::disabled())
-                .build(),
-        );
-        Ok(Self {
-            namespace,
-            bucket: bucket.into(),
-            reads: Client::new(&config),
-            writes,
-        })
-    }
-}
-impl S3Store {
-    fn check_key(&self, key: &str) -> Result<(), StorageError> {
-        let relative = key
-            .strip_prefix(self.namespace.as_str())
-            .ok_or(StorageError::InvalidPath)?;
-        if relative == "catalog.json" {
-            return Ok(());
-        }
-        let id = relative
-            .split('/')
-            .nth(1)
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .ok_or(StorageError::InvalidPath)?;
-        ObjectKey::parse_snapshot(relative, id).map(|_| ())
-    }
-}
-impl ObjectStore for S3Store {
-    async fn get(&self, key: &str) -> Result<Download, StorageError> {
-        self.check_key(key)?;
-        let response = self
-            .reads
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.as_service_error().and_then(|e| e.code()) != Some("NoSuchBucket")
-                    && error
-                        .raw_response()
-                        .is_some_and(|r| r.status().as_u16() == 404)
-                {
-                    StorageError::NotFound
-                } else {
-                    StorageError::Unavailable
-                }
-            })?;
-        let etag = response
-            .e_tag
-            .filter(|s| !s.is_empty())
-            .ok_or(StorageError::Unavailable)?;
-        Ok(Download {
-            body: response.body,
-            etag,
-        })
-    }
-    async fn put(
-        &self,
-        key: &str,
-        bytes: Vec<u8>,
-        condition: WriteCondition<'_>,
-    ) -> Result<String, StorageError> {
-        self.check_key(key)?;
-        if key != format!("{}catalog.json", self.namespace.as_str())
-            && matches!(condition, WriteCondition::Match(_))
-        {
-            return Err(StorageError::InvalidPath);
-        }
-        let builder = self
-            .writes
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(bytes));
-        let builder = match condition {
-            WriteCondition::Create => builder.if_none_match("*"),
-            WriteCondition::Match(etag) => builder.if_match(etag),
-        };
-        let response = builder.send().await.map_err(|error| {
-            match error.raw_response().map(|r| r.status().as_u16()) {
-                Some(409 | 412) => StorageError::Conflict,
-                Some(400..=499) => StorageError::Unavailable,
-                _ => StorageError::Ambiguous,
-            }
-        })?;
-        response
-            .e_tag
-            .filter(|s| !s.is_empty())
-            .ok_or(StorageError::Ambiguous)
-    }
-}
-
-impl Storage<S3Store> {
-    /// Validate the namespace before loading the standard AWS provider chains.
-    pub async fn connect(bucket: &str, namespace: Namespace) -> Result<Self, StorageError> {
-        let backend = S3Store::connect(bucket, namespace.clone()).await?;
-        Ok(Self::new(backend, namespace))
-    }
-}
 pub struct Storage<B> {
     backend: B,
     namespace: Namespace,
@@ -262,17 +239,31 @@ impl<B: ObjectStore> Storage<B> {
         &self.backend
     }
     pub async fn read(&self, key: &ObjectKey, max_bytes: usize) -> Result<Object, StorageError> {
+        ObjectKey::parse_relative(key.as_str())?;
         let mut download = self
             .backend
             .get(&format!("{}{}", self.namespace.0, key.0))
             .await?;
         let mut bytes = Vec::new();
-        while let Some(chunk) = download.body.next().await {
-            let chunk = chunk.map_err(|_| StorageError::Unavailable)?;
-            if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            // Probe at most one byte beyond the remaining budget to detect excess
+            // without buffering an unbounded body, including when max_bytes is zero.
+            let capacity = chunk
+                .len()
+                .min(max_bytes.saturating_sub(bytes.len()).saturating_add(1));
+            let read = download
+                .body
+                .read(&mut chunk[..capacity])
+                .await
+                .map_err(|_| StorageError::Unavailable)?;
+            if read == 0 {
+                break;
+            }
+            if read > max_bytes.saturating_sub(bytes.len()) {
                 return Err(StorageError::LimitExceeded);
             }
-            bytes.extend_from_slice(&chunk);
+            bytes.extend_from_slice(&chunk[..read]);
         }
         Ok(Object {
             bytes,
@@ -285,11 +276,12 @@ impl<B: ObjectStore> Storage<B> {
         bytes: Vec<u8>,
         condition: WriteCondition<'_>,
     ) -> Result<String, StorageError> {
+        ObjectKey::parse_relative(key.as_str())?;
         if matches!(condition, WriteCondition::Match(etag) if etag.is_empty()) {
             return Err(StorageError::Configuration);
         }
         // Snapshots are immutable even if a caller accidentally requests replacement.
-        if key != &ObjectKey::catalog() && matches!(condition, WriteCondition::Match(_)) {
+        if !key.permits_match() && matches!(condition, WriteCondition::Match(_)) {
             return Err(StorageError::InvalidPath);
         }
         self.backend
@@ -322,143 +314,5 @@ impl<B: ObjectStore> Storage<B> {
             Err(StorageError::Conflict | StorageError::Ambiguous) => self.load_catalog().await,
             Err(error) => Err(error),
         }
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Catalog {
-    pub format_version: u32,
-    pub revision: u64,
-    pub commit_id: Uuid,
-    #[serde(deserialize_with = "unique_map")]
-    pub tables: BTreeMap<String, CatalogEntry>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CatalogEntry {
-    pub id: Uuid,
-    #[serde(deserialize_with = "unique_map")]
-    pub schema: Schema,
-    pub key: String,
-    pub format: TableFormat,
-    pub snapshot: String,
-    pub row_count: u64,
-}
-impl CatalogEntry {
-    pub fn descriptor(&self, name: &str) -> TableDescriptor {
-        TableDescriptor {
-            id: self.id,
-            name: name.into(),
-            schema: self.schema.clone(),
-            key: self.key.clone(),
-            format: self.format,
-        }
-    }
-    pub fn snapshot_key(&self) -> Result<ObjectKey, StorageError> {
-        ObjectKey::parse_snapshot(&self.snapshot, self.id)
-    }
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoadedCatalog {
-    pub catalog: Catalog,
-    pub etag: String,
-}
-impl Catalog {
-    pub fn empty() -> Self {
-        Self {
-            format_version: 1,
-            revision: 0,
-            commit_id: Uuid::from_u128(0x6e894cb9_9b3b_47e5_a964_581df72d7e14),
-            tables: BTreeMap::new(),
-        }
-    }
-    pub fn validate(&self) -> Result<(), StorageError> {
-        if self.format_version != 1 {
-            return Err(StorageError::UnsupportedCatalog);
-        }
-        let mut ids = BTreeSet::new();
-        for (name, table) in &self.tables {
-            table
-                .descriptor(name)
-                .validate()
-                .map_err(|_| StorageError::InvalidCatalog)?;
-            if !ids.insert(table.id)
-                || table.row_count > MAX_TABLE_ROWS as u64
-                || table.snapshot_key().is_err()
-            {
-                return Err(StorageError::InvalidCatalog);
-            }
-        }
-        Ok(())
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        if bytes.len() > MAX_CATALOG_BYTES {
-            return Err(StorageError::LimitExceeded);
-        }
-        let value: serde_json::Value =
-            serde_json::from_slice(bytes).map_err(|_| StorageError::InvalidCatalog)?;
-        if !value.is_object() || !value.get("tables").is_some_and(|v| v.is_object()) {
-            return Err(StorageError::InvalidCatalog);
-        }
-        for entry in value["tables"]
-            .as_object()
-            .ok_or(StorageError::InvalidCatalog)?
-            .values()
-        {
-            if !entry.is_object() || !entry.get("schema").is_some_and(|v| v.is_object()) {
-                return Err(StorageError::InvalidCatalog);
-            }
-        }
-        let catalog: Self =
-            serde_json::from_slice(bytes).map_err(|_| StorageError::InvalidCatalog)?;
-        catalog.validate()?;
-        Ok(catalog)
-    }
-    pub fn encode(&self) -> Result<Vec<u8>, StorageError> {
-        self.validate()?;
-        let mut output = BoundedCatalogWriter(Vec::new());
-        serde_json::to_writer(&mut output, self).map_err(|_| StorageError::LimitExceeded)?;
-        Ok(output.0)
-    }
-}
-
-// Reject duplicate names rather than silently replacing metadata during decoding.
-fn unique_map<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct Visitor<T>(std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
-        type Value = BTreeMap<String, T>;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an object with unique names")
-        }
-        fn visit_map<A: serde::de::MapAccess<'de>>(
-            self,
-            mut map: A,
-        ) -> Result<Self::Value, A::Error> {
-            let mut result = BTreeMap::new();
-            while let Some((key, value)) = map.next_entry::<String, T>()? {
-                if result.insert(key, value).is_some() {
-                    return Err(serde::de::Error::custom("duplicate name"));
-                }
-            }
-            Ok(result)
-        }
-    }
-    deserializer.deserialize_map(Visitor(std::marker::PhantomData))
-}
-struct BoundedCatalogWriter(Vec<u8>);
-impl std::io::Write for BoundedCatalogWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_CATALOG_BYTES.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("catalog byte limit"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }

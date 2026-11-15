@@ -1,4 +1,9 @@
 use meshdb_server::{engine::Engine, protocol, snapshot, storage};
+use meshdb_server::{
+    partition_size::PartitionSize,
+    worker_pool::{WorkerPool, WorkerThreads},
+};
+use std::num::NonZeroUsize;
 #[path = "support/storage.rs"]
 mod support;
 
@@ -12,10 +17,24 @@ struct Backend {
     fake: Fake,
     gate: Mutex<Option<Arc<ReadGate>>>,
     keys: Mutex<Vec<String>>,
+    partition_gates: Mutex<std::collections::BTreeMap<String, Arc<ReadGate>>>,
+    threads: Mutex<Vec<(String, std::thread::ThreadId, String)>>,
 }
 impl ObjectStore for Backend {
     async fn get(&self, key: &str) -> Result<Download, StorageError> {
         self.keys.lock().unwrap().push(key.into());
+        if key.ends_with(".parquet") {
+            self.threads.lock().unwrap().push((
+                key.into(),
+                std::thread::current().id(),
+                std::thread::current().name().unwrap_or("").into(),
+            ));
+        }
+        let partition_gate = self.partition_gates.lock().unwrap().remove(key);
+        if let Some(gate) = partition_gate {
+            gate.entered.add_permits(1);
+            gate.release.acquire().await.unwrap().forget();
+        }
         let gate = if key.ends_with(".parquet") {
             self.gate.lock().unwrap().take()
         } else {
@@ -45,43 +64,116 @@ fn row(id: i64, text: &str, number: f64, flag: bool) -> Row {
     ]
     .into()
 }
-async fn fixture() -> (Engine<Backend>, TableDescriptor, Vec<Row>) {
+async fn fixture() -> (Engine<Backend>, TableDescriptor, Vec<Row>, WorkerThreads) {
     let storage = Storage::new(Backend::default(), Namespace::new("read/").unwrap());
     storage.initialize_catalog().await.unwrap();
-    let engine = Engine::new(storage);
-    let table = engine
-        .create(CreatePayload {
-            name: "mixed".into(),
-            schema: [
-                ("id".into(), ColumnType::Int64),
-                ("text".into(), ColumnType::Utf8),
-                ("number".into(), ColumnType::Float64),
-                ("flag".into(), ColumnType::Bool),
-            ]
-            .into(),
-            key: "id".into(),
-            format: TableFormat::Parquet,
-        })
-        .await
-        .unwrap();
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let engine = Engine::new(storage, pool, PartitionSize::default());
+    let table = TableDescriptor {
+        id: uuid::Uuid::new_v4(),
+        name: "mixed".into(),
+        schema: [
+            ("id".into(), ColumnType::Int64),
+            ("text".into(), ColumnType::Utf8),
+            ("number".into(), ColumnType::Float64),
+            ("flag".into(), ColumnType::Bool),
+        ]
+        .into(),
+        key: "id".into(),
+        format: TableFormat::Parquet,
+    };
     let rows = vec![
         row(3, "three", 2.5, true),
         row(1, "one", 2.5, true),
         row(2, "two", -1.0, false),
     ];
     publish(&engine, &table, &rows).await;
-    (engine, table, rows)
+    (engine, table, rows, workers)
 }
 async fn publish(engine: &Engine<Backend>, table: &TableDescriptor, rows: &[Row]) {
     let session = engine.coordinator().begin().await.unwrap();
     let mut candidate = session.candidate();
-    let entry = candidate.tables.get_mut(&table.name).unwrap();
-    entry.row_count = rows.len() as u64;
-    entry.snapshot = ObjectKey::snapshot(table.id, session.commit_id())
-        .as_str()
-        .into();
+    candidate.tables.insert(
+        table.name.clone(),
+        storage::CatalogEntry {
+            id: table.id,
+            schema: table.schema.clone(),
+            key: table.key.clone(),
+            format: table.format,
+            row_count: rows.len() as u64,
+            data: storage::TableData::Legacy {
+                snapshot: ObjectKey::snapshot(table.id, session.commit_id())
+                    .as_str()
+                    .into(),
+            },
+        },
+    );
     session
         .publish(candidate, Some(snapshot::encode(table, rows).unwrap()))
+        .await
+        .unwrap();
+}
+async fn publish_partitioned(engine: &Engine<Backend>, table: &TableDescriptor, rows: &[Row]) {
+    use meshdb_server::{
+        commit::PendingObject,
+        storage::{KeyRange, PartitionFile, TableData},
+    };
+    let session = engine.coordinator().begin().await.unwrap();
+    let mut candidate = session.candidate();
+    let mut files = Vec::new();
+    let mut uploads = Vec::new();
+    for (index, (part, range)) in [
+        (
+            rows.iter()
+                .filter(|r| matches!(r["id"], Scalar::Int64(n) if n < 2))
+                .cloned()
+                .collect::<Vec<_>>(),
+            KeyRange {
+                lower: None,
+                upper: Some(Key::Int64(2)),
+            },
+        ),
+        (
+            rows.iter()
+                .filter(|r| matches!(r["id"], Scalar::Int64(n) if n >= 2))
+                .cloned()
+                .collect::<Vec<_>>(),
+            KeyRange {
+                lower: Some(Key::Int64(2)),
+                upper: None,
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let encoded =
+            snapshot::encode_partition_range(table, part, range, PartitionSize::default())
+                .unwrap()
+                .pop()
+                .unwrap();
+        let key = ObjectKey::partition(table.id, session.commit_id(), index as u32);
+        files.push(PartitionFile {
+            object: key.as_str().into(),
+            range: encoded.range,
+            row_count: encoded.row_count,
+            byte_size: encoded.bytes.len() as u64,
+            payload_bytes: encoded.payload_bytes,
+        });
+        uploads.push(PendingObject {
+            key,
+            bytes: encoded.bytes,
+        });
+    }
+    let entry = candidate.tables.get_mut(&table.name).unwrap();
+    entry.row_count = rows.len() as u64;
+    entry.data = TableData::Partitioned { files };
+    session
+        .publish_partitions(candidate, uploads)
         .await
         .unwrap();
 }
@@ -107,7 +199,7 @@ fn take_keys(engine: &Engine<Backend>) -> Vec<String> {
 }
 #[tokio::test]
 async fn mixed_get_composed_query_count_and_metadata_explain() {
-    let (engine, table, rows) = fixture().await;
+    let (engine, table, rows, workers) = fixture().await;
     let entry = engine
         .storage()
         .load_catalog()
@@ -125,10 +217,31 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
         take_keys(&engine),
         vec![
             "read/catalog.json".to_owned(),
-            format!("read/{}", entry.snapshot)
+            format!("read/{}", entry.legacy_snapshot().unwrap())
         ]
     );
     assert_eq!(engine.get(key(&table, 99)).await.unwrap(), None);
+    publish_partitioned(&engine, &table, &rows).await;
+    take_keys(&engine);
+    assert_eq!(
+        engine.get(key(&table, 3)).await.unwrap(),
+        Some(rows[0].clone())
+    );
+    let reads = take_keys(&engine);
+    assert_eq!(reads.len(), 2);
+    assert!(reads[1].ends_with("/1.parquet"));
+    assert_eq!(
+        engine
+            .storage()
+            .backend()
+            .threads
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .2,
+        "meshdb-worker-1"
+    );
     let mut payload = all(&table);
     payload.query = serde_json::from_value(serde_json::json!({
         "filter": {"op":"and", "args":[{"op":"eq", "column":"flag", "value":true}, {"op":"gt", "column":"number", "value":0.0}]},
@@ -144,7 +257,7 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
     assert_eq!(
         engine.explain(payload.clone()).await.unwrap(),
         format!(
-            "scan mixed ({})\nfilter {}\nsort number DESC; tie-breaker id ASC\nlimit 1\nprojection text",
+            "scan mixed ({})\nfilter {}\nsort number DESC; tie-breaker id ASC\nlimit 1\nprojection text\npartitions 2; worker execution",
             table.id,
             serde_json::to_string(payload.query.filter.as_ref().unwrap()).unwrap()
         )
@@ -154,10 +267,120 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
         engine.collect(all(&table)).await.unwrap(),
         vec![rows[1].clone(), rows[2].clone(), rows[0].clone()]
     );
+    let session = engine.coordinator().begin().await.unwrap();
+    let mut candidate = session.candidate();
+    let entry = candidate.tables.get_mut(&table.name).unwrap();
+    entry.row_count = 0;
+    entry.data = storage::TableData::Partitioned { files: vec![] };
+    session.publish_partitions(candidate, vec![]).await.unwrap();
+    take_keys(&engine);
+    assert_eq!(engine.get(key(&table, 1)).await.unwrap(), None);
+    assert!(engine.collect(all(&table)).await.unwrap().is_empty());
+    assert_eq!(engine.count(all(&table)).await.unwrap(), 0);
+    assert_eq!(take_keys(&engine), vec!["read/catalog.json"; 3]);
+    workers.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn fresh_reads_validate_before_data_and_explain_needs_no_snapshot() {
-    let (engine, table, _) = fixture().await;
+    let (engine, table, original, workers) = fixture().await;
+    let legacy_catalog = engine
+        .storage()
+        .backend()
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .objects["read/catalog.json"]
+        .clone();
+    publish_partitioned(&engine, &table, &original).await;
+    let good_catalog = engine
+        .storage()
+        .backend()
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .objects["read/catalog.json"]
+        .clone();
+    let good_objects = engine
+        .storage()
+        .backend()
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .clone();
+    for corruption in 0..6 {
+        {
+            let mut state = engine.storage().backend().fake.state.lock().unwrap();
+            state.objects = good_objects.clone();
+            let mut catalog: serde_json::Value = serde_json::from_slice(&good_catalog.0).unwrap();
+            let files = catalog["tables"]["mixed"]["data"]["files"]
+                .as_array_mut()
+                .unwrap();
+            match corruption {
+                0 => files[0]["byte_size"] = (files[0]["byte_size"].as_u64().unwrap() + 1).into(),
+                1 => {
+                    files[0]["payload_bytes"] =
+                        (files[0]["payload_bytes"].as_u64().unwrap() + 1).into()
+                }
+                2 => {
+                    files[0]["range"]["upper"] = serde_json::json!(0);
+                    files[1]["range"]["lower"] = serde_json::json!(0);
+                }
+                3 => {
+                    files[0]["row_count"] = serde_json::json!(2);
+                    catalog["tables"]["mixed"]["row_count"] = serde_json::json!(4);
+                }
+                4 => {
+                    let object = files[0]["object"].as_str().unwrap();
+                    state.objects.remove(&format!("read/{object}"));
+                }
+                _ => {
+                    // A schema-valid but descending file must fail partition validation.
+                    let object = files[1]["object"].as_str().unwrap().to_owned();
+                    let bytes =
+                        snapshot::encode(&table, &[original[0].clone(), original[2].clone()])
+                            .unwrap();
+                    files[1]["byte_size"] = (bytes.len() as u64).into();
+                    state.objects.get_mut(&format!("read/{object}")).unwrap().0 = bytes;
+                }
+            }
+            state.objects.get_mut("read/catalog.json").unwrap().0 =
+                serde_json::to_vec(&catalog).unwrap();
+        }
+        let mut limited = all(&table);
+        limited.query.limit = Some(0);
+        assert_eq!(
+            engine.collect(limited.clone()).await.unwrap_err().code,
+            ErrorCode::StorageUnavailable
+        );
+        assert_eq!(
+            engine.count(limited).await.unwrap_err().code,
+            ErrorCode::StorageUnavailable
+        );
+        if corruption < 4 {
+            assert_eq!(
+                engine
+                    .get(key(&table, if corruption == 2 { -1 } else { 1 }))
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::StorageUnavailable
+            );
+        }
+    }
+    // Restore the legacy fixture for its existing validation cases.
+    engine
+        .storage()
+        .backend()
+        .fake
+        .state
+        .lock()
+        .unwrap()
+        .objects
+        .insert("read/catalog.json".into(), legacy_catalog);
     publish(&engine, &table, &[row(8, "new", 8.0, false)]).await;
     assert_eq!(engine.count(all(&table)).await.unwrap(), 1);
     assert_eq!(engine.get(key(&table, 1)).await.unwrap(), None);
@@ -186,7 +409,10 @@ async fn fresh_reads_validate_before_data_and_explain_needs_no_snapshot() {
     );
     assert_eq!(take_keys(&engine), vec!["read/catalog.json"; 4]);
     let loaded = engine.storage().load_catalog().await.unwrap();
-    let snapshot_key = format!("read/{}", loaded.catalog.tables["mixed"].snapshot);
+    let snapshot_key = format!(
+        "read/{}",
+        loaded.catalog.tables["mixed"].legacy_snapshot().unwrap()
+    );
     let object = engine
         .storage()
         .backend()
@@ -237,10 +463,11 @@ async fn fresh_reads_validate_before_data_and_explain_needs_no_snapshot() {
         engine.explain(all(&table)).await.unwrap_err().code,
         ErrorCode::StorageUnavailable
     );
+    workers.shutdown().await.unwrap();
 }
 #[tokio::test]
 async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
-    let (engine, table, rows) = fixture().await;
+    let (engine, table, rows, workers) = fixture().await;
     let captured = engine
         .storage()
         .load_catalog()
@@ -248,8 +475,9 @@ async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
         .unwrap()
         .catalog
         .tables["mixed"]
-        .snapshot
-        .clone();
+        .legacy_snapshot()
+        .unwrap()
+        .to_owned();
     let gate = Arc::new(ReadGate::default());
     *engine.storage().backend().gate.lock().unwrap() = Some(gate.clone());
     take_keys(&engine);
@@ -263,17 +491,23 @@ async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
     );
     publish(&engine, &table, &[row(9, "replacement", 9.0, true)]).await;
     engine.drop(table.id).await.unwrap();
-    let replacement = engine
-        .create(CreatePayload {
-            name: table.name.clone(),
-            schema: table.schema.clone(),
-            key: table.key.clone(),
-            format: table.format,
-        })
-        .await
-        .unwrap();
+    // Create now shares worker 0 with the captured legacy read. Poll it to
+    // admission, then release that read so schema validation can run.
+    let mut recreate = Box::pin(engine.create(CreatePayload {
+        name: table.name.clone(),
+        schema: table.schema.clone(),
+        key: table.key.clone(),
+        format: table.format,
+    }));
+    use std::{future::Future, task::Poll};
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(recreate.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
     take_keys(&engine);
     gate.release.add_permits(1);
+    let replacement = recreate.await.unwrap();
     assert_eq!(
         task.await.unwrap().unwrap(),
         vec![rows[1].clone(), rows[2].clone(), rows[0].clone()]
@@ -297,4 +531,93 @@ async fn captured_snapshot_completes_across_update_drop_and_name_reuse() {
         ErrorCode::NotFound
     );
     assert_eq!(take_keys(&engine), vec!["read/catalog.json"; 4]);
+    workers.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn partition_workers_capture_across_drop_and_drain_after_error() {
+    for missing in [false, true] {
+        let (engine, table, rows, workers) = fixture().await;
+        publish_partitioned(&engine, &table, &rows).await;
+        let catalog = engine.storage().load_catalog().await.unwrap().catalog;
+        let storage::TableData::Partitioned { files } = &catalog.tables["mixed"].data else {
+            panic!()
+        };
+        let gates: Vec<_> = files
+            .iter()
+            .map(|file| {
+                let gate = Arc::new(ReadGate::default());
+                engine
+                    .storage()
+                    .backend()
+                    .partition_gates
+                    .lock()
+                    .unwrap()
+                    .insert(format!("read/{}", file.object), gate.clone());
+                gate
+            })
+            .collect();
+        if missing {
+            engine
+                .storage()
+                .backend()
+                .fake
+                .state
+                .lock()
+                .unwrap()
+                .objects
+                .remove(&format!("read/{}", files[0].object));
+        }
+        take_keys(&engine);
+        engine.storage().backend().threads.lock().unwrap().clear();
+        let reader = engine.clone();
+        let payload = all(&table);
+        let task = tokio::spawn(async move { reader.collect(payload).await });
+        for gate in &gates {
+            tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.acquire())
+                .await
+                .unwrap()
+                .unwrap()
+                .forget();
+        }
+        let threads = engine.storage().backend().threads.lock().unwrap().clone();
+        assert_eq!(threads.len(), 2);
+        assert_ne!(threads[0].1, threads[1].1);
+        for (object, _, name) in threads {
+            assert!(name.starts_with("meshdb-worker-"));
+            assert!(name.ends_with(if object.ends_with("/0.parquet") {
+                "0"
+            } else {
+                "1"
+            }));
+        }
+        assert_eq!(take_keys(&engine).len(), 3);
+        engine.drop(table.id).await.unwrap();
+        take_keys(&engine);
+        gates[0].release.add_permits(1);
+        engine
+            .worker_pool()
+            .submit(0, |_, _| Ok(()))
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
+        assert!(
+            !task.is_finished(),
+            "operation returned before all admitted jobs finished"
+        );
+        gates[1].release.add_permits(1);
+        let result = task.await.unwrap();
+        if missing {
+            assert_eq!(result.unwrap_err().code, ErrorCode::StorageUnavailable);
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                vec![rows[1].clone(), rows[2].clone(), rows[0].clone()]
+            );
+        }
+        assert!(take_keys(&engine).is_empty());
+        workers.shutdown().await.unwrap();
+    }
 }

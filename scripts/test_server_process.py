@@ -29,9 +29,11 @@ class ProcessGuard(unittest.TestCase):
                 parser.add_argument("--port", type=int)
                 parser.add_argument("--workers", type=int)
                 parser.add_argument("--queue-size", type=int)
+                parser.add_argument("--partition_size")
                 args = parser.parse_args()
                 assert args.host == "127.0.0.1"
-                assert (args.workers, args.queue_size) == (4, 64)
+                assert args.queue_size == 64
+                assert (args.workers, args.partition_size) in ((4, None), (2, "64 KB"), (3, "64 KB"))
                 assert os.environ["MESHDB_S3_BUCKET"] == "meshdb-testing"
                 assert os.environ["MESHDB_S3_PREFIX"].endswith("/")
                 assert os.environ["AWS_ACCESS_KEY_ID"] == "synthetic-key"
@@ -67,6 +69,9 @@ class ProcessGuard(unittest.TestCase):
                                          "MESHDB_S3_BUCKET": "invalid", "MESHDB_S3_PREFIX": "invalid"}):
                 server = ServerProcess(config, namespace, binary=binary, log_path=log,
                                        startup_timeout=3, shutdown_timeout=1)
+                for invalid in (0, -1, True, 1.5, "2"):
+                    with self.assertRaises(ServerProcessError):
+                        ServerProcess(config, namespace, workers=invalid)
                 token = server.private_token
                 with server:
                     first_pid = server.pid
@@ -97,6 +102,12 @@ class ProcessGuard(unittest.TestCase):
                 self.assertIn(f"STOP {failed.pid}", failed_log.read_text())
                 self.assertEqual(log.read_text().count(namespace.prefix), 2)
                 self.assertEqual(log.read_text().count("STOP"), 2)
+
+                for workers in (2, 3):
+                    with ServerProcess(config, namespace, binary=binary, workers=workers,
+                                       partition_size="64 KB", startup_timeout=3) as configured:
+                        self.assertIsNone(configured.returncode)
+                    self.assertEqual(configured.returncode, 0)
 
                 # Incomplete TLS settings must fail before any child launches.
                 with self.assertRaises(ServerProcessError):

@@ -9,5 +9,8 @@ description = "Pure Python client for the MeshDB HTTP API"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+meshdb = "meshdb.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]

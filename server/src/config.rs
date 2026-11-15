@@ -1,5 +1,5 @@
 //! Synchronous startup validation. AWS resolution and TLS parsing belong to bootstrap.
-use crate::storage::Namespace;
+use crate::{partition_size::PartitionSize, storage::Namespace};
 use std::{
     env::{self, VarError},
     fmt,
@@ -20,6 +20,9 @@ pub struct ServeOptions {
     /// Worker count. Config requires at least one worker.
     #[arg(long, default_value_t = ServeOptions::default().workers)]
     pub workers: usize,
+    /// Maximum partition size, with unit B, KB, MB, KiB or MiB (at most 64 MiB).
+    #[arg(long, visible_alias = "partition_size", default_value_t = PartitionSize::default())]
+    pub partition_size: PartitionSize,
     /// Maximum queued requests, including zero.
     #[arg(long, default_value_t = ServeOptions::default().queue_size)]
     pub queue_size: usize,
@@ -37,6 +40,7 @@ impl Default for ServeOptions {
             host: Ipv4Addr::LOCALHOST.into(),
             port: 8000,
             workers: 4,
+            partition_size: PartitionSize::default(),
             queue_size: 64,
             tls_cert: None,
             tls_key: None,

@@ -1,4 +1,9 @@
 use meshdb_server::{engine::Engine, protocol, snapshot, storage};
+use meshdb_server::{
+    partition_size::PartitionSize,
+    worker_pool::{WorkerPool, WorkerThreads},
+};
+use std::num::NonZeroUsize;
 #[path = "support/storage.rs"]
 mod support;
 
@@ -21,15 +26,23 @@ fn payload(name: &str) -> CreatePayload {
     }
 }
 
-async fn engine() -> Engine<Fake> {
+async fn engine() -> (Engine<Fake>, WorkerThreads) {
     let storage = Storage::new(Fake::default(), Namespace::new("test/").unwrap());
     storage.initialize_catalog().await.unwrap();
-    Engine::new(storage)
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    (
+        Engine::new(storage, pool, PartitionSize::default()),
+        workers,
+    )
 }
 
 #[tokio::test]
-async fn creation_publishes_closed_empty_parquet_and_canonical_reference() {
-    let engine = engine().await;
+async fn creation_publishes_only_catalog_with_empty_partition_manifest() {
+    let (engine, workers) = engine().await;
     let clone = engine.clone(); // Fake deliberately does not implement Clone.
     assert!(std::sync::Arc::ptr_eq(
         engine.coordinator(),
@@ -42,29 +55,31 @@ async fn creation_publishes_closed_empty_parquet_and_canonical_reference() {
     assert_eq!(entry.row_count, 0);
     assert_ne!(table.id, loaded.catalog.commit_id);
     assert_eq!(
-        entry.snapshot,
-        ObjectKey::snapshot(table.id, loaded.catalog.commit_id).as_str()
+        entry.data,
+        storage::TableData::Partitioned { files: vec![] }
     );
-    let object = engine
-        .storage()
-        .read(
-            &entry.snapshot_key().unwrap(),
-            snapshot::MAX_ENCODED_SNAPSHOT_BYTES,
-        )
-        .await
-        .unwrap();
-    assert!(object.bytes.starts_with(b"PAR1"));
-    assert!(object.bytes.ends_with(b"PAR1"));
-    assert!(
-        snapshot::decode(&table, object.bytes.into(), Some(0))
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(loaded.catalog.format_version, 2);
+    assert_eq!(loaded.catalog.revision, 1);
+    {
+        let state = engine.storage().backend().state.lock().unwrap();
+        assert_eq!(
+            state.put_keys,
+            vec!["test/catalog.json", "test/catalog.json"]
+        );
+        assert_eq!(state.objects.len(), 1);
+        assert!(
+            state
+                .objects
+                .values()
+                .all(|(bytes, _)| !bytes.starts_with(b"PAR1"))
+        );
+    }
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn fresh_sorted_reads_and_rejected_creates_preserve_catalog() {
-    let engine = engine().await;
+    let (engine, workers) = engine().await;
     let z = engine.create(payload("zebra")).await.unwrap();
     let a = engine.clone().create(payload("alpha")).await.unwrap();
     let gets = engine.storage().backend().state.lock().unwrap().gets;
@@ -107,14 +122,32 @@ async fn fresh_sorted_reads_and_rejected_creates_preserve_catalog() {
     );
     assert_eq!(engine.storage().load_catalog().await.unwrap(), before);
     assert_eq!(engine.storage().backend().state.lock().unwrap().puts, puts);
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn drop_retains_snapshot_and_stale_identity_while_read_failures_never_reset() {
-    let engine = engine().await;
+    let (engine, workers) = engine().await;
     let old = engine.create(payload("same")).await.unwrap();
+    let row: protocol::Row = [
+        ("id".into(), protocol::Scalar::Int64(1)),
+        ("text".into(), protocol::Scalar::Utf8("one".into())),
+        ("number".into(), protocol::Scalar::Float64(1.0)),
+        ("flag".into(), protocol::Scalar::Bool(true)),
+    ]
+    .into();
+    engine
+        .execute(protocol::Operation::Insert(protocol::RowPayload {
+            table_id: old.id,
+            row: row.clone(),
+        }))
+        .await
+        .unwrap();
     let before = engine.storage().load_catalog().await.unwrap();
-    let key = before.catalog.tables["same"].snapshot_key().unwrap();
+    let storage::TableData::Partitioned { files } = &before.catalog.tables["same"].data else {
+        panic!("insert must publish partitions")
+    };
+    let key = ObjectKey::parse_partition(&files[0].object, old.id).unwrap();
     let put_count = engine
         .storage()
         .backend()
@@ -141,11 +174,7 @@ async fn drop_retains_snapshot_and_stale_identity_while_read_failures_never_rese
         .read(&key, snapshot::MAX_ENCODED_SNAPSHOT_BYTES)
         .await
         .unwrap();
-    assert!(
-        snapshot::decode(&old, retained.bytes.into(), Some(0))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(snapshot::decode(&old, retained.bytes.into(), Some(1)).unwrap() == vec![row]);
     let puts = engine.storage().backend().state.lock().unwrap().puts;
     engine
         .storage()
@@ -195,4 +224,5 @@ async fn drop_retains_snapshot_and_stale_identity_while_read_failures_never_rese
         ErrorCode::StorageUnavailable
     );
     assert_eq!(engine.storage().backend().state.lock().unwrap().puts, puts);
+    workers.shutdown().await.unwrap();
 }

@@ -30,11 +30,18 @@ class ServerProcess:
 
     def __init__(self, config, namespace, *, binary=None, startup_timeout=30,
                  shutdown_timeout=10, log_path=None, tls_cert=None, tls_key=None,
-                 test_ca=None):
+                 test_ca=None, workers=4, partition_size=None):
         if any(isinstance(value, bool) or not isinstance(value, (int, float))
                or not math.isfinite(value) or value <= 0
                for value in (startup_timeout, shutdown_timeout)):
             raise ServerProcessError("Startup and shutdown timeouts must be finite positive seconds.")
+        if type(workers) is not int or workers <= 0:
+            raise ServerProcessError("Workers must be a positive integer.")
+        if partition_size is not None and (type(partition_size) is not str or not partition_size.strip()):
+            raise ServerProcessError("Partition size must be a nonempty string.")
+        self._worker_args = ["--workers", str(workers)]
+        if partition_size is not None:
+            self._worker_args.extend(["--partition_size", partition_size])
         self._env = config.server_env(namespace)
         self._binary = Path(binary if binary is not None else
                             Path(__file__).resolve().parents[1] / "server/target/debug/meshdb-server").resolve()
@@ -99,7 +106,7 @@ class ServerProcess:
                 self._log = os.fdopen(fd, "ab")
             self._process = subprocess.Popen(
                 [str(self._binary), "serve", "--host", "127.0.0.1", "--port", str(self._port),
-                 "--workers", "4", "--queue-size", "64", *self._tls_args],
+                 *self._worker_args, "--queue-size", "64", *self._tls_args],
                 env=self._env, stdin=subprocess.DEVNULL, stdout=self._log,
                 stderr=subprocess.STDOUT, close_fds=True,
             )

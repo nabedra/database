@@ -5,6 +5,11 @@ use meshdb_server::{
     engine::Engine,
     storage::{Catalog, Namespace, Storage},
 };
+use meshdb_server::{
+    partition_size::PartitionSize,
+    worker_pool::{WorkerPool, WorkerThreads},
+};
+use std::num::NonZeroUsize;
 use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
 
@@ -12,10 +17,15 @@ use tower::ServiceExt;
 mod support;
 use support::{Fake, ReadGate};
 
-fn fixture() -> (Router, Engine<Fake>) {
+fn fixture() -> (Router, Engine<Fake>, WorkerThreads) {
     let storage = Storage::new(Fake::default(), Namespace::new("health/").unwrap());
-    let engine = Engine::new(storage);
-    (health::router(engine.clone()), engine)
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let engine = Engine::new(storage, pool, PartitionSize::default());
+    (health::router(engine.clone()), engine, workers)
 }
 
 async fn status(app: Router, path: &str) -> u16 {
@@ -38,17 +48,20 @@ async fn status(app: Router, path: &str) -> u16 {
 
 #[tokio::test]
 async fn live_needs_no_authentication_or_storage_access() {
-    let (app, engine) = fixture();
+    let (app, engine, workers) = fixture();
     engine.storage().backend().state.lock().unwrap().denied = true;
     assert_eq!(status(app, "/health/live").await, 200);
-    let state = engine.storage().backend().state.lock().unwrap();
-    assert_eq!(state.gets, 0);
-    assert_eq!(state.puts, 0);
+    {
+        let state = engine.storage().backend().state.lock().unwrap();
+        assert_eq!(state.gets, 0);
+        assert_eq!(state.puts, 0);
+    }
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn readiness_reads_fresh_validated_catalogs_without_writes() {
-    let (app, engine) = fixture();
+    let (app, engine, workers) = fixture();
     let valid = Catalog::empty().encode().unwrap();
     engine
         .storage()
@@ -79,7 +92,7 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
         .read_failure = false;
 
     let mut unsupported: serde_json::Value = serde_json::from_slice(&valid).unwrap();
-    unsupported["format_version"] = 2.into();
+    unsupported["format_version"] = 3.into();
     for bytes in [serde_json::to_vec(&unsupported).unwrap(), b"{}".to_vec()] {
         engine
             .storage()
@@ -109,16 +122,19 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
         .objects
         .insert("health/catalog.json".into(), (valid, "opaque".into()));
     assert_eq!(status(app, "/health/ready").await, 200);
-    let state = engine.storage().backend().state.lock().unwrap();
-    assert_eq!(state.gets, 6);
-    assert_eq!(state.puts, 0);
-    assert!(state.put_keys.is_empty());
+    {
+        let state = engine.storage().backend().state.lock().unwrap();
+        assert_eq!(state.gets, 6);
+        assert_eq!(state.puts, 0);
+        assert!(state.put_keys.is_empty());
+    }
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn readiness_times_out_a_gated_read_while_live_stays_available() {
     tokio::time::timeout(Duration::from_secs(7), async {
-        let (app, engine) = fixture();
+        let (app, engine, workers) = fixture();
         let gate = Arc::new(ReadGate::default());
         engine.storage().backend().state.lock().unwrap().read_gate = Some(gate.clone());
         let started = tokio::time::Instant::now();
@@ -128,9 +144,12 @@ async fn readiness_times_out_a_gated_read_while_live_stays_available() {
         assert!(!ready.is_finished());
         assert_eq!(ready.await.unwrap(), 503);
         assert!(started.elapsed() >= Duration::from_secs(5));
-        let state = engine.storage().backend().state.lock().unwrap();
-        assert_eq!(state.gets, 0);
-        assert_eq!(state.puts, 0);
+        {
+            let state = engine.storage().backend().state.lock().unwrap();
+            assert_eq!(state.gets, 0);
+            assert_eq!(state.puts, 0);
+        }
+        workers.shutdown().await.unwrap();
     })
     .await
     .expect("health read must finish within seven seconds");

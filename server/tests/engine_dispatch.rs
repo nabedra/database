@@ -3,7 +3,12 @@ use meshdb_server::{
     protocol::{ErrorCode, Operation, Outcome, ProtocolError, parse_request},
     storage::{Namespace, Storage, StorageError},
 };
+use meshdb_server::{
+    partition_size::PartitionSize,
+    worker_pool::{WorkerPool, WorkerThreads},
+};
 use serde_json::{Value, json};
+use std::num::NonZeroUsize;
 #[path = "support/storage.rs"]
 mod support;
 use support::Fake;
@@ -35,10 +40,18 @@ fn operation(name: &str, payload: Value) -> Operation {
     );
     operation
 }
-async fn fixture() -> Engine<Fake> {
+async fn fixture() -> (Engine<Fake>, WorkerThreads) {
     let storage = Storage::new(Fake::default(), Namespace::new("dispatch/").unwrap());
     storage.initialize_catalog().await.unwrap();
-    Engine::new(storage)
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    (
+        Engine::new(storage, pool, PartitionSize::default()),
+        workers,
+    )
 }
 fn create(name: &str) -> Value {
     json!({"name":name,"schema":{"id":"int64","text":"utf8"},"key":"id","format":"parquet"})
@@ -49,7 +62,7 @@ async fn data(engine: &Engine<Fake>, name: &str, payload: Value) -> Value {
 
 #[tokio::test]
 async fn parsed_workflow_dispatches_all_thirteen_wire_shapes() {
-    let engine = fixture().await;
+    let (engine, workers) = fixture().await;
     let table = data(&engine, "table.create", create("items")).await;
     assert_eq!(table["name"], "items");
     assert_eq!(table["schema"], create("items")["schema"]);
@@ -57,6 +70,26 @@ async fn parsed_workflow_dispatches_all_thirteen_wire_shapes() {
     assert_eq!(table["format"], "parquet");
     let id = &table["id"];
     assert!(uuid::Uuid::parse_str(id.as_str().unwrap()).is_ok());
+    assert_eq!(
+        data(&engine, "table.get", json!({"table_id":id,"key":1})).await,
+        Value::Null
+    );
+    let empty_query =
+        json!({"table_id":id,"query":{"select":null,"filter":null,"order_by":null,"limit":null}});
+    assert_eq!(
+        data(&engine, "query.collect", empty_query.clone()).await,
+        json!([])
+    );
+    assert_eq!(
+        data(&engine, "query.count", empty_query.clone()).await,
+        json!(0)
+    );
+    assert!(
+        data(&engine, "query.explain", empty_query)
+            .await
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
     let alpha = data(&engine, "table.create", create("alpha")).await;
     assert_eq!(
         data(&engine, "table.describe", json!({"name":"items"})).await,
@@ -127,11 +160,12 @@ async fn parsed_workflow_dispatches_all_thirteen_wire_shapes() {
         data(&engine, "table.drop", json!({"table_id":id})).await,
         Value::Null
     );
+    workers.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn dispatch_preserves_errors_and_uncertain_publication() {
-    let engine = fixture().await;
+    let (engine, workers) = fixture().await;
     let table = data(&engine, "table.create", create("items")).await;
     let id = &table["id"];
     let duplicate = operation("table.create", create("items"));
@@ -189,4 +223,5 @@ async fn dispatch_preserves_errors_and_uncertain_publication() {
             Outcome::Unknown
         )
     );
+    workers.shutdown().await.unwrap();
 }

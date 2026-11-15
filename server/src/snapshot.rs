@@ -2,6 +2,12 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 mod footer;
+mod partition;
+
+// Remove the unused-import allowance when R02a2 wires the captured handler.
+#[allow(unused_imports)]
+pub(crate) use partition::encode_partition_range_each;
+pub use partition::{EncodedPartition, encode_partition_range};
 
 use crate::protocol::{
     self, ColumnType, ErrorCode, MAX_DECODED_PAYLOAD_BYTES, MAX_TABLE_ROWS, Outcome, ProtocolError,
@@ -150,6 +156,19 @@ fn array(name: &str, ty: ColumnType, rows: &[Row]) -> ArrayRef {
 /// Validate before constructing Arrow arrays. Return only a closed Parquet file.
 pub fn encode(table: &TableDescriptor, rows: &[Row]) -> Result<Vec<u8>, ProtocolError> {
     validate_rows(table, rows)?;
+    let mut bytes = Vec::new();
+    encode_into(table, rows, &mut bytes)?;
+    if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES {
+        return Err(limit());
+    }
+    Ok(bytes)
+}
+
+fn encode_into<W: std::io::Write + Send>(
+    table: &TableDescriptor,
+    rows: &[Row],
+    sink: W,
+) -> Result<(), ProtocolError> {
     let schema = Arc::new(schema(table));
     let arrays = table
         .schema
@@ -166,17 +185,10 @@ pub fn encode(table: &TableDescriptor, rows: &[Row]) -> Result<Vec<u8>, Protocol
         .set_max_row_group_row_count(Some(MAX_TABLE_ROWS))
         .set_max_row_group_bytes(None)
         .build();
-    let mut bytes = Vec::new();
-    {
-        let mut writer =
-            ArrowWriter::try_new(&mut bytes, schema, Some(props)).map_err(|_| stored())?;
-        writer.write(&batch).map_err(|_| stored())?;
-        writer.close().map_err(|_| stored())?;
-    }
-    if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES {
-        return Err(limit());
-    }
-    Ok(bytes)
+    let mut writer = ArrowWriter::try_new(sink, schema, Some(props)).map_err(|_| stored())?;
+    writer.write(&batch).map_err(|_| stored())?;
+    writer.close().map_err(|_| stored())?;
+    Ok(())
 }
 
 /// Expected descriptor is mandatory. Supply catalog row_count to check it here;

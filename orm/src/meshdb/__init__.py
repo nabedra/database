@@ -17,10 +17,11 @@ from .expr import Expr, col
 from .query import Query
 from .table import Table
 from .client import DB
+from .cluster import Cluster
 
 __all__ = [
     "Scalar", "Key", "Row", "Schema",
-    "DB", "Expr", "col", "Query", "Table",
+    "DB", "Cluster", "Expr", "col", "Query", "Table",
     "MeshDBError", "ValidationError", "AuthenticationError", "NotFoundError",
     "ConflictError", "LimitExceededError", "OverloadedError", "StorageError",
     "TransportError", "ProtocolError", "UnknownOutcomeError",

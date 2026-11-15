@@ -14,10 +14,12 @@ S3 is the server's only durable store. Run one server process per bucket/prefix.
   table operations, queries and errors.
 - [Server guide](server/README.md): build and serve, environment configuration,
   HTTP requests, native TLS, health and shutdown.
-- [ORM v0 specification](plan-v0/orm.md) and
-  [server v0 specification](plan-v0/server.md): supported contracts.
-- [Implementation and testing rubric](plan-v0/implementation.md): task evidence,
-  review and acceptance tracking. The older [design documents](plan/) describe
+- [Partition workers rubric](plans/partition-workers.md): current partition
+  contracts, task evidence and acceptance tracking.
+- [ORM v0 specification](plan-v0/orm.md), [server v0 specification](plan-v0/server.md)
+  and [v0 implementation rubric](plan-v0/implementation.md): historical baseline
+  documents. Their single-file storage and request-only worker descriptions
+  predate partition workers. The older [design documents](plan/) describe
   broader ideas outside v0.
 
 ## Install and use
@@ -81,16 +83,43 @@ primary key and uses that order to break explicit sort ties. Count includes an
 explicit limit. Dropping and recreating a name creates a new identity; old
 handles remain stale. See the [ORM guide](orm/README.md) for full API behavior.
 
-Key lookups and row queries scan full tables. Mutations that change rows rewrite
-the complete table snapshot, then conditionally publish the catalog. v0 has
-no SQL, joins, indexes, general transactions across calls, garbage collection
-or distributed execution. Atomic batches are single operations. Dropping a
-table removes its catalog entry but retains snapshots and orphan objects.
+Tables use immutable Parquet partitions ordered by primary-key range. Keyed
+operations route to one partition; changed mutations rewrite only affected
+files. Queries scan partitions on local workers and combine results with global
+ordering, primary-key tie-breaking, limit, projection and count semantics.
+Mutations serialize under one coordinator while their partitions prepare in
+parallel. Object uploads are currently sequential, followed by one conditional
+catalog publication. Atomic batches remain single operations.
+
+For example, after configuring the server environment:
+
+```sh
+server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+```
+
+`--partition-size` is equivalent. `--workers N` starts exactly N persistent local
+OS worker threads, independent of storage partition count. Size inputs require
+a positive integer and a case-insensitive `B`, `KB`, `MB`, `KiB` or `MiB` unit,
+with optional whitespace. SI units use 1000; IEC units use 1024. `64kb`,
+`'64 Kb'` and `64KiB` are valid. The default target and hard maximum are 64 MiB,
+or 67,108,864 closed-file bytes including metadata; `64MiB` and `67108864B` are accepted.
+A singleton may exceed a smaller target but never the hard cap. An impossible
+file fails the whole mutation. Empty tables have `files: []`. A new size applies
+to new or rewritten ranges; unchanged files are not automatically repacked.
+
+Version 1 catalogs remain readable. New publications use version 2, which can
+mix Legacy and Partitioned tables. Reads and no-ops do not migrate legacy data;
+an actual data change migrates that table. Old binaries reject version 2.
+See [storage and worker details](server/README.md#storage-behavior-and-limits).
+There is no SQL, joins, indexes, general transactions across calls, garbage
+collection or remote execution. Dropping a table retains historical files and
+orphan objects.
 
 Requests and responses are limited to 8 MiB each, including their JSON envelope.
 Batches and collected results are limited to 10,000 rows; tables are limited to
 100,000 rows and 64 MiB of decoded row payload. Byte limits may be reached first.
-Oversized results fail rather than truncate. There is no pagination or streaming.
+Partitions do not multiply these limits. Oversized results fail rather than
+truncate. There is no pagination or streaming.
 
 The ORM never retries automatically. An uncertain write may have committed even
 if the caller saw a timeout or `UnknownOutcomeError`. Request IDs do not provide
@@ -146,20 +175,24 @@ This strict acceptance configuration ignores ambient AWS profiles. The generic
 server uses the standard AWS SDK credential and region chains, including
 profiles and roles; it neither loads dotenv nor translates `BUCKET_NAME` itself.
 
-Run these four prepared runners sequentially. HTTP covers types, CRUD, queries
+Run these prepared runners sequentially. HTTP covers types, CRUD, queries
 and atomic failures; lifecycle covers actual-process restart and verified native
 HTTPS; concurrency covers independent clients, stale handles and retained
 objects; latency samples single writes, batches and scans at modest table sizes.
+The partition runner checks actual file sizes, routed mutations, global query
+results and a restart from two to three workers in one retained namespace.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_http.py --scenario all --binary server/target/debug/meshdb-server
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_lifecycle.py --scenario all --binary server/target/debug/meshdb-server
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/meshdb-server
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/meshdb-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/meshdb-server
 ```
 
 Each run allocates fresh S3 folders named `test-<number>-<name>-<run-id>/` and
-retains fixtures and snapshots. A restart reuses only its scenario's allocated
+retains fixtures and snapshots. The partition runner allocates
+`test-10-partition-workers-<run-id>/`. A restart reuses only its scenario's allocated
 prefix. Never replay a recorded prefix, delete fixtures or create another bucket.
 Each runner creates a fresh sanitized JSON report beneath the Git-ignored
 `artifacts/` directory; `--report` accepts an unused alternative path. Keep
@@ -170,4 +203,7 @@ credentials. Latency samples provide no throughput or scaling guarantee.
 
 Recorded live evidence is available for [HTTP/S3 acceptance](scripts/notes/E02.md)
 and [restart/native HTTPS acceptance](scripts/notes/E03.md). Consult the
-[rubric](plan-v0/implementation.md) for further evidence and final audit status.
+[partition workers rubric](plans/partition-workers.md) for current evidence and
+final audit status. The [partition acceptance run](scripts/notes/PW-E02.md)
+passed all 53 checks, including actual file sizes and restart with a different
+worker count.

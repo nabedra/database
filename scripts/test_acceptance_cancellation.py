@@ -10,11 +10,14 @@ from unittest.mock import patch
 
 import acceptance_http
 import acceptance_lifecycle
+import acceptance_partitions
 
 
 class CancellationTest(unittest.TestCase):
     def test_report_setup_interrupt_saves_without_starting_work(self):
-        for method_name in ('mkdir', 'open'):
+        for runner, method_name in ((runner, method) for runner in
+                                    (acceptance_lifecycle, acceptance_partitions)
+                                    for method in ('mkdir', 'open')):
             with self.subTest(method_name=method_name), tempfile.TemporaryDirectory() as directory:
                 report = Path(directory) / 'report.json'
                 original = getattr(Path, method_name)
@@ -30,7 +33,7 @@ class CancellationTest(unittest.TestCase):
                 with patch.object(Path, method_name, interrupt_once), \
                         patch.dict('sys.modules', {'acceptance_support': None}), \
                         contextlib.redirect_stdout(io.StringIO()):
-                    result = acceptance_lifecycle.main(['--report', str(report)])
+                    result = runner.main(['--report', str(report)])
                 data = json.loads(report.read_text())
                 self.assertEqual(result, 130)
                 self.assertEqual(data['status'], 'failed')

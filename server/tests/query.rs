@@ -62,6 +62,23 @@ fn composed_typed_query_filters_orders_limits_then_projects() {
         ]
     );
     assert_eq!(query::count(&table(), &q, &rows()).unwrap(), 2);
+    let parts = rows();
+    let matched: Vec<_> = parts
+        .chunks(2)
+        .flat_map(|part| query::local_collect(&table(), &q, part.to_vec()))
+        .collect();
+    assert_eq!(
+        query::reduce_collect(&table(), &q, &matched).unwrap(),
+        query::collect(&table(), &q, &parts).unwrap()
+    );
+    assert_eq!(
+        parts
+            .chunks(2)
+            .map(|part| query::local_count(&q, part))
+            .sum::<u64>()
+            .min(q.limit.unwrap()),
+        2
+    );
 }
 
 #[test]

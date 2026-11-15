@@ -1,19 +1,24 @@
+#[cfg(feature = "s3")]
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
+use meshdb_server::cli::{Cli, Command};
+#[cfg(feature = "s3")]
 use meshdb_server::{
-    cli::{Cli, Command},
     config::Config,
     engine::Engine,
     executor::Executor,
     runtime,
     storage::{S3Store, Storage},
+    worker_pool::WorkerPool,
 };
-use std::{io, net::SocketAddr, process::ExitCode};
+use std::{io, process::ExitCode};
+#[cfg(feature = "s3")]
+use std::{net::SocketAddr, num::NonZeroUsize};
 use tracing_subscriber::{filter::Targets, prelude::*};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let Command::Serve(options) = Cli::parse().command;
+    let command = Cli::parse().command;
     if tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -29,7 +34,12 @@ async fn main() -> ExitCode {
         eprintln!("meshdb-server: diagnostics initialization failed");
         return ExitCode::FAILURE;
     }
-    match run(options).await {
+    let result = match command {
+        Command::Serve(options) => run(options).await,
+        Command::Api { config } => meshdb_server::cluster::runtime::run_api(config).await,
+        Command::Worker { bootstrap } => meshdb_server::node::runtime::run_worker(bootstrap).await,
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("meshdb-server: {message}");
@@ -38,6 +48,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(feature = "s3")]
 async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = Config::from_env(options).map_err(|_| "configuration invalid")?;
     // Select the provider explicitly even if dependencies also enable ring.
@@ -81,29 +92,51 @@ async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'stati
         .initialize_catalog()
         .await
         .map_err(|_| "catalog initialization failed")?;
-    let engine = Engine::new(storage);
     let executor = Executor::new(config.options().workers, config.options().queue_size)
         .map_err(|_| "executor initialization failed")?;
-    let listener = match tokio::net::TcpListener::bind(SocketAddr::new(
-        config.options().host,
-        config.options().port,
-    ))
-    .await
-    {
-        Ok(listener) => listener,
-        Err(_) => {
-            executor.drain().await;
-            return Err("listener failed");
-        }
-    };
-    runtime::serve(
-        listener,
-        engine,
-        executor,
-        config.token().to_owned(),
-        tls,
-        shutdown,
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(config.options().workers).ok_or("configuration invalid")?,
+        tokio::runtime::Handle::current(),
     )
-    .await
-    .map_err(|_| "listener failed")
+    .map_err(|_| "worker initialization failed")?;
+    let engine = Engine::new(storage, pool, config.options().partition_size);
+    // Keep the owner and coordinator runtime alive through every serve exit.
+    // Errors inside this block cannot bypass the awaited worker shutdown below.
+    let result = async {
+        let listener = match tokio::net::TcpListener::bind(SocketAddr::new(
+            config.options().host,
+            config.options().port,
+        ))
+        .await
+        {
+            Ok(listener) => listener,
+            Err(_) => {
+                executor.drain().await;
+                return Err("listener failed");
+            }
+        };
+        runtime::serve(
+            listener,
+            engine,
+            executor,
+            config.token().to_owned(),
+            tls,
+            shutdown,
+        )
+        .await
+        .map_err(|_| "listener failed")
+    }
+    .await;
+    // runtime::serve drains admitted requests before returning. The bind failure
+    // branch also drains the executor before reaching this teardown.
+    let shutdown = workers
+        .shutdown()
+        .await
+        .map_err(|_| "worker shutdown failed");
+    result.and(shutdown)
+}
+
+#[cfg(not(feature = "s3"))]
+async fn run(_: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
+    Err("unsupported configuration: legacy serve requires the s3 feature")
 }

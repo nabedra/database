@@ -1,4 +1,6 @@
-use meshdb_server::{protocol::*, snapshot::*};
+use meshdb_server::{
+    partition_size::MAX_PARTITION_BYTES, protocol::*, snapshot::*, storage::KeyRange,
+};
 use uuid::Uuid;
 
 fn table() -> TableDescriptor {
@@ -231,15 +233,31 @@ fn oversized_metadata_and_string_page_fail_before_arrow_allocation() {
 fn roundtrip_full_128_column_schema() {
     let mut t = table();
     t.schema = (0..128)
-        .map(|i| (format!("c{i:03}"), ColumnType::Int64))
+        .map(|i| (format!("c{i:03}{}", "x".repeat(60)), ColumnType::Int64))
         .collect();
-    t.key = "c000".into();
+    t.key = format!("c000{}", "x".repeat(60));
     let row: Row = t
         .schema
         .keys()
         .map(|k| (k.clone(), Scalar::Int64(7)))
         .collect();
     let rows = vec![row];
+    let files = encode_partition_range(
+        &t,
+        rows.clone(),
+        KeyRange {
+            lower: None,
+            upper: None,
+        },
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(files.len(), 1);
+    let bytes = &files[0].bytes;
+    let footer_bytes =
+        u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+    assert!(footer_bytes < 1024 * 1024);
+    assert_eq!(decode(&t, bytes.clone().into(), Some(1)).unwrap(), rows);
     assert_eq!(
         decode(&t, encode(&t, &rows).unwrap().into(), Some(1)).unwrap(),
         rows
@@ -249,4 +267,157 @@ fn roundtrip_full_128_column_schema() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn partition_splits_preserve_typed_order_ranges_and_payload() {
+    for string_keys in [false, true] {
+        let mut t = table();
+        if string_keys {
+            t.key = "s".into();
+        }
+        let mut rows = vec![row(12), row(-9), row(2), row(-1), row(0), row(99)];
+        for (r, s) in rows.iter_mut().zip(["雪", "é", "a", "🌍", "z", "Ω"]) {
+            r.insert("s".into(), Scalar::Utf8(s.repeat(100)));
+        }
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| match (&a[&t.key], &b[&t.key]) {
+            (Scalar::Int64(a), Scalar::Int64(b)) => a.cmp(b),
+            (Scalar::Utf8(a), Scalar::Utf8(b)) => a.cmp(b),
+            _ => unreachable!(),
+        });
+        let range = if string_keys {
+            KeyRange {
+                lower: Some(Key::Utf8(String::new())),
+                upper: None,
+            }
+        } else {
+            KeyRange {
+                lower: Some(Key::Int64(-100)),
+                upper: Some(Key::Int64(1000)),
+            }
+        };
+        let target = "1800 B".parse().unwrap();
+        let files = encode_partition_range(&t, rows.clone(), range.clone(), target).unwrap();
+        assert!(files.len() > 1);
+        assert_eq!(files.first().unwrap().range.lower, range.lower);
+        assert_eq!(files.last().unwrap().range.upper, range.upper);
+        assert_eq!(
+            files.iter().map(|f| f.payload_bytes).sum::<u64>(),
+            validate_rows(&t, &rows).unwrap() as u64
+        );
+        let mut decoded = Vec::new();
+        for (i, file) in files.iter().enumerate() {
+            assert!(file.bytes.len() <= 1800 || file.row_count == 1);
+            assert!(file.bytes.len() <= MAX_PARTITION_BYTES);
+            let batch = decode(&t, file.bytes.clone().into(), Some(file.row_count)).unwrap();
+            for r in &batch {
+                let key = match &r[&t.key] {
+                    Scalar::Int64(n) => Key::Int64(*n),
+                    Scalar::Utf8(s) => Key::Utf8(s.clone()),
+                    _ => unreachable!(),
+                };
+                assert!(file.range.contains(&key, t.schema[&t.key]).unwrap());
+            }
+            if i > 0 {
+                let first = match &batch[0][&t.key] {
+                    Scalar::Int64(n) => Key::Int64(*n),
+                    Scalar::Utf8(s) => Key::Utf8(s.clone()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(file.range.lower, Some(first));
+                assert_eq!(files[i - 1].range.upper, file.range.lower);
+            }
+            decoded.extend(batch);
+        }
+        assert_eq!(decoded, expected);
+    }
+}
+
+#[test]
+fn partition_empty_singleton_and_invalid_inputs() {
+    let t = table();
+    let range = KeyRange {
+        lower: None,
+        upper: Some(Key::Int64(5)),
+    };
+    let target = "1 B".parse().unwrap();
+    assert!(
+        encode_partition_range(&t, vec![], range.clone(), target)
+            .unwrap()
+            .is_empty()
+    );
+    let files = encode_partition_range(&t, vec![row(-1)], range.clone(), target).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].range, range);
+    assert!(files[0].bytes.len() > target.bytes());
+    for rows in [vec![row(5)], vec![row(1), row(1)]] {
+        assert!(encode_partition_range(&t, rows, range.clone(), target).is_err());
+    }
+    let mut invalid = row(1);
+    invalid.remove("b");
+    assert!(encode_partition_range(&t, vec![invalid], range, target).is_err());
+    let invalid_range = KeyRange {
+        lower: Some(Key::Utf8("a".into())),
+        upper: None,
+    };
+    assert!(encode_partition_range(&t, vec![], invalid_range, target).is_err());
+}
+
+#[test]
+fn partition_real_hard_cap_splits_multiple_rows_and_rejects_singleton() {
+    let mut t = table();
+    t.schema = [
+        ("id".into(), ColumnType::Int64),
+        ("s".into(), ColumnType::Utf8),
+    ]
+    .into();
+    let range = KeyRange {
+        lower: None,
+        upper: None,
+    };
+    let empty_row = |id| -> Row {
+        [
+            ("id".into(), Scalar::Int64(id)),
+            ("s".into(), Scalar::Utf8(String::new())),
+        ]
+        .into()
+    };
+    let overhead = validate_rows(&t, &[empty_row(0), empty_row(1)]).unwrap();
+    let rows: Vec<Row> = (0..2)
+        .map(|id| {
+            let mut row = empty_row(id);
+            row.insert(
+                "s".into(),
+                Scalar::Utf8("x".repeat((MAX_PARTITION_BYTES - overhead) / 2)),
+            );
+            row
+        })
+        .collect();
+    assert_eq!(validate_rows(&t, &rows).unwrap(), MAX_DECODED_PAYLOAD_BYTES);
+    // The decoded candidate fits, but the real closed codec output crosses the
+    // file cap. The default target equals the cap, so this proves a hard split.
+    assert!(encode(&t, &rows).unwrap().len() > MAX_PARTITION_BYTES);
+    let files = encode_partition_range(&t, rows, range.clone(), Default::default()).unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .iter()
+            .all(|f| f.row_count == 1 && f.bytes.len() <= MAX_PARTITION_BYTES)
+    );
+    drop(files);
+    let mut row = empty_row(0);
+    let overhead = validate_rows(&t, std::slice::from_ref(&row)).unwrap();
+    row.insert(
+        "s".into(),
+        Scalar::Utf8("x".repeat(MAX_PARTITION_BYTES - overhead)),
+    );
+    assert_eq!(
+        validate_rows(&t, std::slice::from_ref(&row)).unwrap(),
+        MAX_DECODED_PAYLOAD_BYTES
+    );
+    assert!(encode(&t, std::slice::from_ref(&row)).unwrap().len() > MAX_PARTITION_BYTES);
+    let e = encode_partition_range(&t, vec![row], range, Default::default()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::LimitExceeded);
+    assert_eq!(e.outcome, Outcome::NotApplied);
 }

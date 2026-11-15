@@ -1,4 +1,4 @@
-//! Pure synchronous evaluation, suitable for a future `spawn_blocking` call.
+//! Pure synchronous evaluation shared by worker execution and query tests.
 //!
 //! Each entry point validates the descriptor and query. The snapshot loader must
 //! supply complete, schema-valid rows with finite floats and unique primary keys.
@@ -14,16 +14,59 @@ use std::cmp::Ordering;
 use std::io::{self, Write};
 
 /// Filter, order, limit, then project. Oversized results fail without truncation.
+#[allow(dead_code)] // Retained pure evaluator API, exercised by query integration tests.
 pub fn collect(
     table: &TableDescriptor,
     query: &Query,
     rows: &[Row],
 ) -> Result<Vec<Row>, ProtocolError> {
     validate(table, query)?;
-    let mut matched: Vec<&Row> = rows
+    let matched: Vec<&Row> = rows
         .iter()
         .filter(|row| matches_filter(query, row))
         .collect();
+    finish_collect(table, query, matched)
+}
+
+/// Filter and locally order full rows; retain key/sort columns until reduction.
+pub(super) fn local_collect(table: &TableDescriptor, query: &Query, rows: Vec<Row>) -> Vec<Row> {
+    let mut matched: Vec<Row> = rows
+        .into_iter()
+        .filter(|row| matches_filter(query, row))
+        .collect();
+    matched.sort_unstable_by(|a, b| compare_rows(table, query, a, b));
+    matched
+}
+
+pub(super) fn local_count(query: &Query, rows: &[Row]) -> u64 {
+    rows.iter().filter(|row| matches_filter(query, row)).count() as u64
+}
+
+/// Apply global order, one limit, projection, and result budgets.
+pub(crate) fn reduce_collect(
+    table: &TableDescriptor,
+    query: &Query,
+    rows: &[Row],
+) -> Result<Vec<Row>, ProtocolError> {
+    finish_collect(table, query, rows.iter().collect())
+}
+
+pub(crate) fn compare_rows(table: &TableDescriptor, query: &Query, a: &Row, b: &Row) -> Ordering {
+    let key_order = || compare(&a[&table.key], &b[&table.key]);
+    match &query.order_by {
+        Some(order) => {
+            let cmp = compare(&a[&order.column], &b[&order.column]);
+            (if order.desc { cmp.reverse() } else { cmp }).then_with(key_order)
+        }
+        None => key_order(),
+    }
+}
+
+fn finish_collect(
+    table: &TableDescriptor,
+    query: &Query,
+    mut matched: Vec<&Row>,
+) -> Result<Vec<Row>, ProtocolError> {
     let result_len = limited_len(matched.len(), query.limit);
     if result_len > MAX_RESULT_ROWS {
         return Err(error(ErrorCode::LimitExceeded, "result exceeds 10000 rows"));
@@ -31,16 +74,7 @@ pub fn collect(
     if result_len == 0 {
         return Ok(Vec::new());
     }
-    matched.sort_unstable_by(|a, b| {
-        let key_order = || compare(&a[&table.key], &b[&table.key]);
-        match &query.order_by {
-            Some(order) => {
-                let cmp = compare(&a[&order.column], &b[&order.column]);
-                (if order.desc { cmp.reverse() } else { cmp }).then_with(key_order)
-            }
-            None => key_order(),
-        }
-    });
+    matched.sort_unstable_by(|a, b| compare_rows(table, query, a, b));
     matched.truncate(result_len);
     let result: Vec<Row> = matched
         .into_iter()
@@ -60,6 +94,7 @@ pub fn collect(
 
 /// Count matches including the limit, without sorting or projecting rows.
 /// The collect row/array limits do not apply to this scalar result.
+#[allow(dead_code)] // Retained pure evaluator API, exercised by query integration tests.
 pub fn count(table: &TableDescriptor, query: &Query, rows: &[Row]) -> Result<u64, ProtocolError> {
     validate(table, query)?;
     let cap = query.limit.unwrap_or(u64::MAX);
@@ -119,7 +154,7 @@ fn limited_len(len: usize, limit: Option<u64>) -> usize {
         .map_or(len, |n| len.min(n))
 }
 
-fn matches_filter(query: &Query, row: &Row) -> bool {
+pub(crate) fn matches_filter(query: &Query, row: &Row) -> bool {
     query
         .filter
         .as_ref()
@@ -167,7 +202,7 @@ fn error(code: ErrorCode, message: &str) -> ProtocolError {
     ProtocolError::new(code, message, Outcome::NotApplied)
 }
 
-fn check_body_budget(value: &impl serde::Serialize) -> Result<(), ProtocolError> {
+pub(super) fn check_body_budget(value: &impl serde::Serialize) -> Result<(), ProtocolError> {
     let mut budget = BodyBudget {
         remaining: MAX_BODY_BYTES,
     };

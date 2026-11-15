@@ -48,12 +48,19 @@ server in terminal 1:
 
 ```sh
 : "${MESHDB_TOKEN:?Set the shared bearer token in this terminal}"
-server/target/debug/meshdb-server serve --host 127.0.0.1 --port 8000
+server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
 ```
 
 Keep this terminal open. The bucket and prefix identify the database. The
 generated prefix gives this tutorial its own namespace; retain its value for
-the restart step. Run one server process per bucket/prefix.
+the restart step. Run one server process per bucket/prefix. This command starts
+four persistent local OS worker threads and sets a 64,000-byte partition target.
+`--partition-size` is an equivalent spelling. Units are mandatory and
+case-insensitive: `B`, `KB`, `MB`, `KiB`, `MiB`. Whitespace is optional, and the
+quantity must be a positive integer. `64kb`, `'64 Kb'` and `64KiB` are valid.
+SI units use 1000 and IEC units use 1024. The default and hard maximum are
+64 MiB, or 67,108,864 bytes; `64MiB` and `67108864B` are accepted. See the
+[server guide](server/README.md#configuration) for worker dispatch details.
 
 The server does not load the repository `.env` automatically. That file uses
 `BUCKET_NAME`, while the server requires `MESHDB_S3_BUCKET`. Do not source or
@@ -194,7 +201,7 @@ server to exit. It stops accepting work and drains admitted operations. Restart
 it in that same terminal, retaining the bucket, prefix, and token:
 
 ```sh
-server/target/debug/meshdb-server serve --host 127.0.0.1 --port 8000
+server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
 ```
 
 Do not rerun the prefix generation command, since that would select a different
@@ -211,11 +218,18 @@ print([table.name for table in db.tables()])
 A new application process can also reopen the table by its printed name with
 `db.table("<printed-table-name>")`; it does not recreate the schema.
 
-On restart, the server follows `catalog.json` in S3. Each catalog entry points
-to an immutable file at `tables/<table_id>/<commit_id>.parquet`. A write that
-changes rows uploads a complete replacement snapshot, then conditionally
-updates the catalog. That catalog update commits the change. Reads continue to
-use the snapshot referenced by the catalog they observed.
+On restart, the server follows `catalog.json` in S3. New tables start with an
+empty `files: []` manifest and no Parquet file. Writes create immutable files at
+`tables/<table_id>/<commit_id>/<ordinal>.parquet`; keyed changes rewrite only
+affected files. Mutating requests serialize while their partitions prepare on
+local workers, then upload objects sequentially before one conditional catalog
+update commits the change. Reads retain the files in their captured catalog.
+
+Worker count is independent of partition count, so you can change `--workers`
+on restart. A changed size target applies only to new or rewritten ranges;
+unchanged files are not repacked. Version 1 data remains readable. An actual
+data change migrates a legacy table to partitions; reads and no-ops do not.
+Version 2 catalogs can mix both layouts, and old binaries reject version 2.
 
 ## 8 Handle errors and storage limits
 
@@ -241,8 +255,9 @@ rollback. The client never retries automatically, and request IDs do not
 deduplicate writes. See [errors and uncertain
 writes](orm/README.md#errors-and-uncertain-writes).
 
-Key lookups and queries scan entire tables, and changes rewrite entire table
-snapshots. Batch related inserts when possible. Keep these limits in mind:
+Keyed operations route to one partition. Queries scan partitions on the workers
+and combine results with global ordering, key tie-breaking, limit, projection
+and count semantics. Partitioning does not multiply any of these limits:
 
 | Item | Maximum |
 | --- | --- |
@@ -251,9 +266,11 @@ snapshots. Batch related inserts when possible. Keep these limits in mind:
 | One collected result | 10,000 rows |
 | Encoded JSON request or response including envelope | 8 MiB each |
 | One table | 100,000 rows and 64 MiB of decoded row payload |
+| One new closed Parquet file including metadata | 64 MiB = 67,108,864 bytes |
 
-Byte limits may be reached before row limits. Oversized results fail instead
-of truncating. Use an explicit limit or fewer selected columns for smaller
+A singleton can exceed the configured soft file target but never the hard cap;
+an impossible file fails the whole mutation. Byte limits may be reached before
+row limits. Oversized results fail instead of truncating. Use an explicit limit or fewer selected columns for smaller
 results. Count returns a scalar and can count more than 10,000 matching rows.
 v0 has no pagination, streaming, SQL, joins, indexes, or schema migrations.
 

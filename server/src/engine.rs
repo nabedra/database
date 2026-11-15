@@ -3,22 +3,30 @@
 //! No table or row cache.
 //! The executor must await admitted mutations through completion, including all
 //! blocking work, even if the client disconnects. This module owns no runtime.
+mod job;
+pub(crate) use job::run_captured;
 mod mutation;
+mod partition;
 mod query;
 mod read;
 mod write;
 
 pub use mutation::MutationResult;
+pub(crate) use partition::row_key;
+pub(crate) use partition::validate_partition_rows;
+pub(crate) use query::{compare_rows, matches_filter};
+pub(crate) use query::{explain as explain_query, reduce_collect};
 use serde::Serialize;
 use std::sync::Arc;
 
 use crate::{
     commit::Coordinator,
+    partition_size::PartitionSize,
     protocol::{
         self, CreatePayload, ErrorCode, Operation, Outcome, ProtocolError, Row, TableDescriptor,
     },
-    snapshot,
-    storage::{CatalogEntry, ObjectKey, ObjectStore, Storage, StorageError},
+    storage::{CatalogEntry, ObjectStore, Storage, StorageError, TableData},
+    worker_pool::WorkerPool,
 };
 use uuid::Uuid;
 
@@ -39,15 +47,19 @@ pub enum ExecuteResult {
     Explain(String),
 }
 
-/// Clone shares the single global mutation coordinator without requiring B: Clone.
+/// Clones share the mutation coordinator and injected worker pool without requiring B: Clone.
 pub struct Engine<B: ObjectStore> {
     coordinator: Arc<Coordinator<B>>,
+    worker_pool: WorkerPool,
+    partition_size: PartitionSize,
 }
 
 impl<B: ObjectStore> Clone for Engine<B> {
     fn clone(&self) -> Self {
         Self {
             coordinator: Arc::clone(&self.coordinator),
+            worker_pool: self.worker_pool.clone(),
+            partition_size: self.partition_size,
         }
     }
 }
@@ -55,16 +67,35 @@ impl<B: ObjectStore> Clone for Engine<B> {
 impl<B: ObjectStore> Engine<B> {
     /// Storage must have completed startup initialization. Never initializes or
     /// repairs metadata. Construct once, then clone Engine for shared execution.
-    pub fn new(storage: Storage<B>) -> Self {
+    pub fn new(
+        storage: Storage<B>,
+        worker_pool: WorkerPool,
+        partition_size: PartitionSize,
+    ) -> Self {
         Self {
             coordinator: Arc::new(Coordinator::new(storage)),
+            worker_pool,
+            partition_size,
         }
+    }
+
+    /// Shared partition dispatch handle. Startup retains its separate lifecycle owner.
+    pub fn worker_pool(&self) -> &WorkerPool {
+        &self.worker_pool
+    }
+
+    /// Validated maximum encoded partition size supplied at startup.
+    pub fn partition_size(&self) -> PartitionSize {
+        self.partition_size
     }
 
     /// Execute one operation, preserving downstream errors without retry or
     /// reclassification. Callers serialize this data into their bounded envelope.
     /// Admitted mutations must be awaited through completion across disconnects.
-    pub async fn execute(&self, operation: Operation) -> Result<ExecuteResult, ProtocolError> {
+    pub async fn execute(&self, operation: Operation) -> Result<ExecuteResult, ProtocolError>
+    where
+        B: 'static,
+    {
         match operation {
             Operation::Create(payload) => self.create(payload).await.map(ExecuteResult::Descriptor),
             Operation::Describe(payload) => self
@@ -99,17 +130,19 @@ impl<B: ObjectStore> Engine<B> {
         self.coordinator.storage()
     }
 
-    /// Validate owned protocol input and publish a fresh identity with a closed,
-    /// empty Parquet snapshot. Returns only after confirmed catalog publication.
+    /// Validate owned protocol input and publish a fresh identity with an
+    /// empty partition manifest. Returns only after confirmed catalog publication.
     pub async fn create(&self, payload: CreatePayload) -> Result<TableDescriptor, ProtocolError> {
         let session = self.coordinator.begin().await?;
-        let payload = tokio::task::spawn_blocking(move || {
-            protocol::validate_schema(&payload.name, &payload.schema, &payload.key)?;
-            // TableFormat has only the protocol-supported Parquet variant.
-            Ok::<_, ProtocolError>(payload)
-        })
-        .await
-        .map_err(|_| blocking_failure())??;
+        let payload = self
+            .worker_pool
+            .submit(0, move |_, _| {
+                protocol::validate_schema(&payload.name, &payload.schema, &payload.key)?;
+                Ok(payload)
+            })
+            .await?
+            .receive()
+            .await?;
         if session.catalog().tables.contains_key(&payload.name) {
             return Err(failure(ErrorCode::Conflict, "table name already exists"));
         }
@@ -120,10 +153,6 @@ impl<B: ObjectStore> Engine<B> {
             key: payload.key,
             format: payload.format,
         };
-        let encoding_table = table.clone();
-        let bytes = tokio::task::spawn_blocking(move || snapshot::encode(&encoding_table, &[]))
-            .await
-            .map_err(|_| blocking_failure())??;
         let mut candidate = session.candidate();
         candidate.tables.insert(
             table.name.clone(),
@@ -132,13 +161,11 @@ impl<B: ObjectStore> Engine<B> {
                 schema: table.schema.clone(),
                 key: table.key.clone(),
                 format: table.format,
-                snapshot: ObjectKey::snapshot(table.id, session.commit_id())
-                    .as_str()
-                    .into(),
+                data: TableData::Partitioned { files: vec![] },
                 row_count: 0,
             },
         );
-        session.publish(candidate, Some(bytes)).await?;
+        session.publish_partitions(candidate, vec![]).await?;
         Ok(table)
     }
 
@@ -188,7 +215,7 @@ impl<B: ObjectStore> Engine<B> {
             .ok_or_else(not_found)?;
         let mut candidate = session.candidate();
         candidate.tables.remove(&name);
-        session.publish(candidate, None).await?;
+        session.publish_partitions(candidate, vec![]).await?;
         Ok(())
     }
 }
@@ -199,10 +226,6 @@ fn failure(code: ErrorCode, message: &str) -> ProtocolError {
 
 fn not_found() -> ProtocolError {
     failure(ErrorCode::NotFound, "table not found")
-}
-
-fn blocking_failure() -> ProtocolError {
-    failure(ErrorCode::InternalError, "table preparation failed")
 }
 
 fn storage_failure(error: StorageError) -> ProtocolError {

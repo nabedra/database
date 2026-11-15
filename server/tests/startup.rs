@@ -26,6 +26,16 @@ fn parser_and_invalid_startup_exit_without_aws() {
     for (args, configured) in [
         (vec!["serve"], false),
         (vec!["serve", "--workers", "0"], true),
+        (
+            vec![
+                "serve",
+                "--workers",
+                "18446744073709551615",
+                "--queue-size",
+                "1",
+            ],
+            true,
+        ),
         (vec!["serve", "--tls-cert", "/synthetic/private-path"], true),
     ] {
         let output = binary(&args, configured);
@@ -39,6 +49,10 @@ fn parser_and_invalid_startup_exit_without_aws() {
     let output = binary(
         &[
             "serve",
+            "--workers",
+            "3",
+            "--partition-size",
+            "7 KiB",
             "--tls-cert",
             path.to_str().unwrap(),
             "--tls-key",
