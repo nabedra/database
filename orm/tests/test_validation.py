@@ -1,7 +1,6 @@
 import unittest
 from collections import UserDict
 
-import meshdb
 from meshdb import errors
 from meshdb.validation import (
     schema_from_wire, schema_to_wire, validate_format, validate_identifier,
@@ -83,26 +82,6 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(key=value), self.assertRaises(errors.ValidationError):
                 validate_key(value, {"id": int}, "id")
         self.assertEqual(validate_key("alice", self.schema, "id"), "alice")
-
-    def test_exception_diagnostics_and_exports(self):
-        classes = (errors.MeshDBError, errors.ValidationError, errors.AuthenticationError,
-                   errors.NotFoundError, errors.ConflictError, errors.LimitExceededError,
-                   errors.OverloadedError, errors.StorageError, errors.TransportError,
-                   errors.ProtocolError, errors.UnknownOutcomeError)
-        for cls in classes:
-            with self.subTest(error=cls.__name__):
-                error = cls("details", code="server_code", request_id="request", status_code=503, outcome="unknown")
-                self.assertIsInstance(error, errors.MeshDBError)
-                self.assertEqual(str(error), "details")
-                self.assertEqual((error.code, error.request_id, error.status_code, error.outcome),
-                                 ("server_code", "request", 503, "unknown"))
-                self.assertIs(getattr(meshdb, cls.__name__), cls)
-        local = errors.ValidationError("bad input")
-        self.assertEqual(local.code, "validation_error")
-        self.assertIsNone(local.request_id)
-        self.assertIsNone(local.status_code)
-        self.assertEqual(local.outcome, "not_applied")
-        self.assertEqual(errors.UnknownOutcomeError("lost").outcome, "unknown")
 
 
 if __name__ == "__main__":

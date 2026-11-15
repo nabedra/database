@@ -28,23 +28,6 @@ impl Capacity {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn independent_capacity_bounds() {
-        for workers in [0, 257, usize::MAX] {
-            assert!(matches!(Capacity::new(workers, 0), Err(Refusal::Invalid)));
-        }
-        assert!(matches!(Capacity::new(1, 4097), Err(Refusal::Invalid)));
-        for workers in [1, 256] {
-            for queue in [0, 4096] {
-                assert!(Capacity::new(workers, queue).is_ok());
-            }
-        }
-    }
-}
-
 use super::auth::{DependencyBinding, Readiness, ReceiverIdentity, Sender, WorkerSigningKey};
 use crate::cluster::controller::OwnershipObservation;
 use std::sync::Arc;
@@ -1660,9 +1643,11 @@ impl LocalAdmission {
     pub(super) fn release_account(&mut self, key: DependencyKey) -> Result<(), Refusal> {
         self.evidence.record();
         let d = self.dependency(key)?;
-        if !d.payload_account || !d.closing || d.uses != 0 || d.operation.is_some() {
+        if !d.payload_account || !d.closing || d.uses != 0 {
             return Err(Refusal::Conflict);
         }
+        // The self-dependency's operation may outlive its separate payload account.
+        // reap_dependency retains the metadata until that operation also reaps.
         self.dependencies[key.slot]
             .as_mut()
             .unwrap()

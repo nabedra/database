@@ -1,9 +1,11 @@
 """Actual local subprocess lifecycle guard. No dotenv reads or AWS calls."""
 
 import os
+import signal
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +15,49 @@ from server_process import ServerProcess, ServerProcessError
 
 
 class ProcessGuard(unittest.TestCase):
+    def test_uncooperative_server_is_killed_reaped_and_reported_as_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'stubborn-server'
+            binary.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+                import signal
+                import sys
+                from http.server import BaseHTTPRequestHandler, HTTPServer
+
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                class Health(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.end_headers()
+                    def log_message(self, *args):
+                        pass
+
+                port = int(sys.argv[sys.argv.index('--port') + 1])
+                with HTTPServer(('127.0.0.1', port), Health) as server:
+                    server.serve_forever()
+                '''), encoding='utf-8')
+            binary.chmod(0o700)
+            config = AcceptanceConfig('meshdb-testing', 'us-east-1', {})
+            namespace = config.allocate_prefix(2, 'stubborn', run_id='local')
+            server = ServerProcess(config, namespace, binary=binary,
+                                   startup_timeout=3, shutdown_timeout=0.2)
+            try:
+                server.start()
+                pid = server.pid
+                started = time.monotonic()
+                with self.assertRaisesRegex(ServerProcessError, 'killed and reaped'):
+                    server.stop()
+                self.assertLess(time.monotonic() - started, 2)
+                self.assertEqual(server.returncode, -signal.SIGKILL)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                self.assertEqual(server.stop(), -signal.SIGKILL)
+            finally:
+                # Reap the real child even when a shutdown regression fails a check.
+                if server._process is not None and server._process.poll() is None:
+                    server._process.kill()
+                    server._process.wait(timeout=2)
+                server.stop()
+
     def test_local_process_restart_and_failed_start_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

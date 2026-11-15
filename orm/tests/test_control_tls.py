@@ -1,4 +1,4 @@
-"""Real TLS evidence for the private cluster administration transport."""
+"""Real TLS trust and rejection for the data and administration transports."""
 
 import importlib.util
 import json
@@ -13,6 +13,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from meshdb._control_transport import _ControlTransport
+from meshdb.client import _Transport
 from meshdb.errors import TransportError, UnknownOutcomeError
 
 
@@ -54,7 +55,57 @@ class _TLSServer(HTTPServer):
         self.handler_failed = True
 
 
-class ControlTLSTests(unittest.TestCase):
+class TransportTLSTests(unittest.TestCase):
+    def test_data_transport_trust_is_private_and_untrusted_calls_deliver_nothing(self):
+        with tempfile.TemporaryDirectory(prefix='meshdb-data-tls-') as directory:
+            material = _create_test_tls(Path(directory) / 'tls')
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(material.server_cert, material.server_key)
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self):
+                    request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    self.server.seen.append((self.path, request))
+                    body = json.dumps({'request_id': request['request_id'], 'data': None}).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *args):
+                    pass
+
+            server = _TLSServer(context, Handler)
+            thread = threading.Thread(target=server.serve_forever, name='meshdb-test-data-https')
+            thread.start()
+            try:
+                url = f'https://127.0.0.1:{server.server_port}/data/'
+                trusted = _Transport(url, 'test-token', ca_file=str(material.ca_cert), timeout=2)
+                self.assertEqual(server.seen, [], 'constructing a client must not send a request')
+                self.assertIsNone(trusted.request('table.insert', {'row': {'id': 'alice'}}))
+                self.assertEqual(server.seen[0][0], '/data/v1/operations')
+                self.assertEqual(server.seen[0][1]['payload'], {'row': {'id': 'alice'}})
+
+                # Loading a CA in one client must not change other clients' trust.
+                untrusted = _Transport(url, 'test-token', timeout=2)
+                for operation, expected in [('table.get', TransportError),
+                                            ('table.insert', UnknownOutcomeError)]:
+                    with self.subTest(operation=operation):
+                        server.handshake_rejected.clear()
+                        with self.assertRaises(expected) as caught:
+                            untrusted.request(operation, {})
+                        self.assertIs(type(caught.exception), expected)
+                        self.assertTrue(server.handshake_rejected.wait(2))
+                        self.assertEqual(len(server.seen), 1, 'untrusted call delivered HTTP data')
+                self.assertIsNone(trusted.request('table.get', {'key': 'alice'}))
+                self.assertEqual(len(server.seen), 2)
+                self.assertFalse(server.handler_failed)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+
     def test_verified_policy_then_untrusted_handshake_is_pre_send(self):
         temporary = tempfile.TemporaryDirectory(prefix='meshdb-control-tls-')
         self.addCleanup(temporary.cleanup)

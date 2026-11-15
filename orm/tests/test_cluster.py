@@ -1,6 +1,5 @@
 """Focused Cluster contract checks against a real loopback HTTP peer."""
 import copy
-import importlib.util
 import json
 import socket
 import threading
@@ -73,8 +72,6 @@ class ClusterTests(unittest.TestCase):
         type(self).drop = False
 
     def client(self):
-        self.assertIsNotNone(importlib.util.find_spec('meshdb.cluster'),
-                             'Cluster must validate policy acceptance over the control endpoint')
         from meshdb.cluster import Cluster
         return Cluster(self.url, 'private-token')
 

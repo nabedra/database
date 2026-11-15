@@ -8,13 +8,11 @@ import unittest
 from unittest.mock import patch
 
 from meshdb import _serve_guard as g, _serve_process as p
-from test_serve_process import CHILD, HOST, ServeProcessTests
+import test_serve_process
+from test_serve_process import CHILD, HOST
 
 
 class ServeExitTests(unittest.TestCase):
-    def setUp(self):
-        self.assertTrue(hasattr(p, '_ExitReceipt'), 'explicit process exit receipt missing')
-
     def startup(self):
         return dict(version=1, type='init', name='test',
                     initial_policy=dict(mode='fixed', desired=0, min_nodes=0, max_nodes=0),
@@ -251,7 +249,7 @@ class ServeExitTests(unittest.TestCase):
 
     def test_signal_receipt_confirms_exit_and_cleanup(self):
         # Reuse the actual signal host and independent readiness watchdog.
-        helper = ServeProcessTests()
+        helper = test_serve_process.ServeProcessTests()
         source = HOST.replace("saved = signal.getsignal(signal.SIGTERM)",
             "receipt = p._ExitReceipt()\nsaved = signal.getsignal(signal.SIGTERM)")
         source = source.replace('prepared=prepared, stop=stop)',

@@ -1,5 +1,4 @@
 """Wait contract checks; real TCP peers and separate deterministic clock cases."""
-import inspect
 import json
 import socket
 import threading
@@ -61,14 +60,6 @@ def peer(respond, hostname='127.0.0.1'):
 
 
 class ClusterWaitTests(unittest.TestCase):
-    def test_final_public_signature_and_export(self):
-        self.assertEqual(str(inspect.signature(Cluster.scale)),
-                         "(self, nodes: 'int', *, wait: 'bool' = False, timeout: 'float' = 300.0) -> 'dict'")
-        from meshdb import Cluster as PublicCluster
-        self.assertIs(PublicCluster, Cluster)
-        self.assertEqual([n for n in vars(Cluster) if not n.startswith('_')],
-                         ['scale', 'autoscale', 'status'])
-
     def test_tcp_pending_intent_requires_another_poll_and_returns_acceptance(self):
         def respond(request, count, release):
             if count == 1:

@@ -89,6 +89,161 @@ impl Drop for Service {
 }
 
 #[tokio::test]
+async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicity() {
+    use axum::{Router, body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use meshdb_server::{api, engine::Engine, executor::Executor, worker_pool::WorkerPool};
+    use serde_json::{Value, json};
+    use std::num::NonZeroUsize;
+    use tower::ServiceExt;
+
+    async fn request(app: &Router, operation: &str, payload: Value) -> (u16, Value) {
+        let id = "11111111-1111-4111-8111-111111111111";
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/operations")
+                    .header("authorization", "Bearer api-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"request_id":id,"operation":operation,"payload":payload})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["request_id"], id);
+        (status, body)
+    }
+
+    let directory =
+        std::env::temp_dir().join(format!("meshdb-engine-http-{}", uuid::Uuid::new_v4()));
+    let mut service = Service::start(directory.clone());
+    let storage = service.storage();
+    storage.initialize_catalog().await.unwrap();
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let engine = Engine::new(storage, pool, "1 B".parse().unwrap());
+    let app = api::router(
+        engine.clone(),
+        Executor::new(1, 0).unwrap(),
+        "api-token".into(),
+    );
+    let (status, created) = request(
+        &app,
+        "table.create",
+        json!({"name":"items","schema":{"id":"int64","rank":"int64","label":"utf8"},"key":"id","format":"parquet"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let table_id = created["data"]["id"].clone();
+    let rows: Vec<_> = (0..12)
+        .rev()
+        .map(|id| json!({"id":id,"rank":id % 3,"label":format!("row{id}")}))
+        .collect();
+    assert_eq!(
+        request(
+            &app,
+            "table.insert_many",
+            json!({"table_id":table_id,"rows":rows})
+        )
+        .await,
+        (
+            200,
+            json!({"request_id":"11111111-1111-4111-8111-111111111111","data":12})
+        )
+    );
+    let catalog = engine.storage().load_catalog().await.unwrap().catalog;
+    let TableData::Partitioned { files } = &catalog.tables["items"].data else {
+        panic!("write must publish a partition manifest")
+    };
+    assert_eq!(files.len(), 12);
+    workers.shutdown().await.unwrap();
+    drop(app);
+    drop(engine);
+    service.stop();
+
+    let restarted = Service::start(directory.clone());
+    service.directory = directory.join("unused");
+    let (pool, workers) = WorkerPool::start(
+        NonZeroUsize::new(2).unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let engine = Engine::new(restarted.storage(), pool, "1 B".parse().unwrap());
+    let app = api::router(
+        engine.clone(),
+        Executor::new(1, 0).unwrap(),
+        "api-token".into(),
+    );
+    let query = json!({"select":["label"],"filter":{"op":"ge","column":"rank","value":1},"order_by":{"column":"rank","desc":true},"limit":3});
+    let (status, result) = request(
+        &app,
+        "query.collect",
+        json!({"table_id":table_id,"query":query}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        result["data"],
+        json!([{"label":"row2"},{"label":"row5"},{"label":"row8"}])
+    );
+
+    let before = engine.storage().load_catalog().await.unwrap().catalog;
+    let (status, result) = request(
+        &app,
+        "table.insert_many",
+        json!({"table_id":table_id,"rows":[{"id":12,"rank":2,"label":"must not persist"},{"id":8,"rank":2,"label":"duplicate"}]}),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(result["error"]["code"], "conflict");
+    assert_eq!(result["error"]["outcome"], "not_applied");
+    assert_eq!(
+        engine.storage().load_catalog().await.unwrap().catalog,
+        before
+    );
+    let (status, missing) = request(&app, "table.get", json!({"table_id":table_id,"key":12})).await;
+    assert_eq!(status, 200);
+    assert_eq!(missing["data"], Value::Null);
+
+    for (operation, payload) in [
+        (
+            "table.update",
+            json!({"table_id":table_id,"key":2,"values":{"rank":-1}}),
+        ),
+        ("table.delete", json!({"table_id":table_id,"key":5})),
+    ] {
+        let (status, result) = request(&app, operation, payload).await;
+        assert_eq!(status, 200);
+        assert_eq!(result["data"], true);
+    }
+    let (status, result) = request(
+        &app,
+        "query.collect",
+        json!({"table_id":table_id,"query":query}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        result["data"],
+        json!([{"label":"row8"},{"label":"row11"},{"label":"row1"}])
+    );
+    let (status, result) = request(&app, "query.count", json!({"table_id":table_id,"query":{"select":null,"filter":null,"order_by":null,"limit":null}})).await;
+    assert_eq!(status, 200);
+    assert_eq!(result["data"], 11);
+    workers.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn actual_service_cas_restart_bounds_and_guards() {
     let directory = std::env::temp_dir().join(format!("meshdb-http-{}", uuid::Uuid::new_v4()));
     let mut service = Service::start(directory.clone());

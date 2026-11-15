@@ -60,7 +60,6 @@ class TableTests(unittest.TestCase):
         return _table_from_descriptor(self.transport, descriptor() if data is None else data)
 
     def test_handle_owns_metadata_and_query_construction_is_local(self):
-        self.assertTrue(hasattr(meshdb, 'Table'), 'Table must be public')
         source = descriptor()
         table = self.table(source)
         self.assertIsInstance(table, meshdb.Table)

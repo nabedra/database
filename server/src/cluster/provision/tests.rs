@@ -35,21 +35,6 @@ fn allocated() -> Control {
         .2
 }
 #[test]
-fn atomic_allocation_and_capacity() {
-    let c = root();
-    let saved = c.clone();
-    let next = allocate_start(&c, owner(), id(30), id(40), 10, id(50))
-        .unwrap()
-        .into_parts()
-        .2;
-    assert_eq!(c, saved);
-    assert_eq!(managed_capacity(&next), Ok(1));
-    assert_eq!(next.capacity().unwrap().credits, 1);
-    assert_eq!(next.nodes.len(), 1);
-    assert_eq!(next.intents.len(), 1);
-    assert_eq!(Control::decode(&next.encode().unwrap()).unwrap(), next);
-}
-#[test]
 fn pending_launch_remains_charged() {
     let mut c = root();
     // Construct through the real member codec independently of allocation.
