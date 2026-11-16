@@ -67,6 +67,10 @@ O22/C07's deterministic writer test holds only asynchronous writer ownership whi
 
 The initial OLAP run found an inaccessible tuple field after extracting shared storage types, which was corrected to use the existing accessor. Its startup assertion then required the intentional new engine suffix in `--version`. The corrected startup target and remaining storage/worker-pool targets passed, and the later full matrix supersedes that earlier composite evidence. The ignored live-S3 fixture remains unexecuted. [Initial output](evidence/oltp/packaging/default-initial.log), [corrected targets](evidence/oltp/packaging/default-final-targets.log), and [feature guard output](evidence/oltp/packaging/feature-compile-guards.log) retain the observed failures and passes.
 
+## Minimum Rust compatibility
+
+All four feature selections passed native macOS all-target compilation with Rust 1.94.1, with one test-import correction for OLAP. Both OLTP selections passed on immutable checkpoint `f958c73`. Its default and OLAP-without-S3 checks failed at the inherited `use super as query;` test import. A separate immutable copy changes only that import to `use crate::engine::query;`; both OLAP selections then pass. The [minimum-version evidence](evidence/oltp/msrv-f958c73/README.md) retains original failures, successful reruns, source hashes and commands. These are compilation checks, not test execution, Linux/Docker acceptance or validation of subsequent distributed changes.
+
 ## Decision-proof correction
 
 The follow-up correction returns `OutcomeUnknown/Unknown` when an existing mutation's namespace, native read or stored decision JSON cannot be read. The O10/O29 regression commits a table, corrupts the persisted proof encoding, then verifies lookup and replay remain unknown without another write, another UUID or changed table metadata. It also checks corrupt namespace lookup. Pure-read errors retain their separate certainty path. This models invalid proof encoding, not native fsync or SST checksum failure.

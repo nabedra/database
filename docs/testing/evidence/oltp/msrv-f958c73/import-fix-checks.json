@@ -1,0 +1,43 @@
+[
+  {
+    "name": "default",
+    "command": [
+      "rustup",
+      "run",
+      "1.94.1",
+      "cargo",
+      "check",
+      "--locked",
+      "--manifest-path",
+      "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-msrv-f958c73-n3ggcp4o/source-import-fix/server/Cargo.toml",
+      "--all-targets"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 91.46377868500713,
+    "base_commit": "f958c737d8c1010db7b5dfeda9977f4bce3e2ed5",
+    "patch": "server/src/engine/query/tests.rs replaces use super as query with use crate::engine::query",
+    "import_file_sha256": "5524bd4ce1fe06280ffb41eb8672b56821fea0082ef28a263bd81d50633641f0"
+  },
+  {
+    "name": "olap-no-s3",
+    "command": [
+      "rustup",
+      "run",
+      "1.94.1",
+      "cargo",
+      "check",
+      "--locked",
+      "--manifest-path",
+      "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-msrv-f958c73-n3ggcp4o/source-import-fix/server/Cargo.toml",
+      "--no-default-features",
+      "--features",
+      "olap",
+      "--all-targets"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 32.9292243259988,
+    "base_commit": "f958c737d8c1010db7b5dfeda9977f4bce3e2ed5",
+    "patch": "server/src/engine/query/tests.rs replaces use super as query with use crate::engine::query",
+    "import_file_sha256": "5524bd4ce1fe06280ffb41eb8672b56821fea0082ef28a263bd81d50633641f0"
+  }
+]

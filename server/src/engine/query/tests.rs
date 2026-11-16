@@ -1,4 +1,4 @@
-use super as query;
+use crate::engine::query;
 use crate::protocol;
 use protocol::*;
 

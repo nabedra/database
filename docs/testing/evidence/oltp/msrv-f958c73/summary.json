@@ -1,0 +1,13 @@
+{
+  "base_commit": "f958c737d8c1010db7b5dfeda9977f4bce3e2ed5",
+  "original_source_tree_sha256": "f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff",
+  "patched_source_tree_sha256": "f2b89aeaacac1cb4c3b9178553bc258c82f1771e1dc36a8a8cf66b4452d377a0",
+  "patch": "server/src/engine/query/tests.rs: use crate::engine::query; replaces use super as query;",
+  "final_all_target_compile_results": {
+    "default": "passed with test import correction",
+    "olap_no_s3": "passed with test import correction",
+    "oltp_no_s3": "passed original checkpoint",
+    "oltp_s3": "passed original checkpoint"
+  },
+  "scope": "Rust 1.94.1 native macOS x86_64 cargo check --all-targets only; no tests, Linux or Docker executed by these checks"
+}
