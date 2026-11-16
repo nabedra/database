@@ -277,9 +277,9 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=9000)
     args = parser.parse_args()
-    token = os.environ.get('MESHDB_STORE_TOKEN', '')
+    token = os.environ.get('NABEDRA_STORE_TOKEN', '')
     if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
-        print('MESHDB_STORE_TOKEN must be a nonempty printable ASCII bearer token.', file=sys.stderr)
+        print('NABEDRA_STORE_TOKEN must be a nonempty printable ASCII bearer token.', file=sys.stderr)
         return 2
     if not args.database or args.database == ':memory:' or not 0 <= args.port <= 65535:
         print('A local database file and a valid TCP port are required.', file=sys.stderr)

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 from gateway_host_fixture import endpoint, collect, BodyLimit, MAX_BODY
-from meshdb.gateway import Gateway, S3, AwsCredentials
+from nabedra.gateway import Gateway, S3, AwsCredentials
 
 RID = '11111111-1111-4111-8111-111111111111'
 RUN = '33333333-3333-4333-8333-333333333333'
@@ -31,7 +31,7 @@ class HostTests(unittest.TestCase):
         with endpoint(lambda *args: calls.append(args)) as url:
             host, port = url.removeprefix('http://').split(':')
             conn = http.client.HTTPConnection(host, int(port), timeout=3)
-            conn.putrequest('POST', '/meshdb/v1/operations')
+            conn.putrequest('POST', '/nabedra/v1/operations')
             conn.putheader('Transfer-Encoding', 'chunked')
             conn.endheaders()
             # Reject from chunk size before allocating/reading its promised bytes.
@@ -50,14 +50,14 @@ class HostTests(unittest.TestCase):
             h = dict((k.lower(),v) for k,v in headers)
             self.assertEqual(h['authorization'], 'Bearer compute-sentinel')
             self.assertNotIn('cookie',h)
-            context = json.loads(base64.urlsafe_b64decode(h['x-meshdb-storage']+'=='))
+            context = json.loads(base64.urlsafe_b64decode(h['x-nabedra-storage']+'=='))
             self.assertEqual(context['credentials']['secret_access_key'],'aws-sentinel')
             seen.append((method,path,body)); order.append('forward')
             if method == 'GET': return 200, (), terminal
             if path.endswith('/requests'): return 202, (), queued
             return 409, (), failure
         with endpoint(upstream, logs) as compute:
-            with Gateway(cluster_url=compute, token='compute-sentinel', mount_path='/meshdb') as gateway:
+            with Gateway(cluster_url=compute, token='compute-sentinel', mount_path='/nabedra') as gateway:
                 @gateway.middleware
                 def auth(ctx):
                     order.append('auth')
@@ -73,13 +73,13 @@ class HostTests(unittest.TestCase):
                     res=gateway.handle(method=method,path=path,headers=headers,body=body)
                     return res.status,res.headers,res.body
                 with endpoint(host, logs) as public, httpx.Client(trust_env=False, timeout=5) as client:
-                    with patch('meshdb.client._Transport.request',side_effect=AssertionError('ORM call')):
+                    with patch('nabedra.client._Transport.request',side_effect=AssertionError('ORM call')):
                         for path,method,body,status,raw in [('/v1/operations','POST',BODY,409,failure),('/v1/requests','POST',BODY,202,queued),(f'/v1/requests/{RUN}/{RID}','GET',b'',200,terminal)]:
-                            response=client.request(method,public+'/meshdb'+path,content=body,headers={'Authorization':'Bearer app-sentinel','Cookie':'cookie-sentinel','Content-Type':'application/json'})
+                            response=client.request(method,public+'/nabedra'+path,content=body,headers={'Authorization':'Bearer app-sentinel','Cookie':'cookie-sentinel','Content-Type':'application/json'})
                             self.assertEqual((response.status_code,response.content),(status,raw))
                             self.assertEqual(response.headers['cache-control'],'no-store')
-                            if status==202: self.assertEqual(response.headers['location'],f'/meshdb/v1/requests/{RUN}/{RID}')
-                    bad=client.post(public+'/meshdb/v1/operations',content=b'{',headers={'Authorization':'Bearer app-sentinel'})
+                            if status==202: self.assertEqual(response.headers['location'],f'/nabedra/v1/requests/{RUN}/{RID}')
+                    bad=client.post(public+'/nabedra/v1/operations',content=b'{',headers={'Authorization':'Bearer app-sentinel'})
                     self.assertEqual(bad.status_code,400)
         self.assertEqual(order,['auth','authorize','forward']*3)
         self.assertEqual([x[2] for x in seen],[BODY,BODY,b''])

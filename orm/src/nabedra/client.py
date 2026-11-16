@@ -1,10 +1,11 @@
-"""Private synchronous HTTP transport and public DB creation/discovery."""
+"""Private synchronous HTTP transport and public Database creation/discovery."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from http.client import HTTPException, IncompleteRead
 import json
 import math
+import os
 import re
 import ssl
 from typing import TYPE_CHECKING, Literal, TypeVar
@@ -16,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 
 from .errors import (
-    AuthenticationError, ConflictError, LimitExceededError, MeshDBError,
+    AuthenticationError, ConflictError, LimitExceededError, NabedraError,
     NotFoundError, OverloadedError, ProtocolError, StorageError, TransportError,
     UnknownOutcomeError, ValidationError,
 )
@@ -85,7 +86,7 @@ class _Transport:
     blocking socket I/O, not cancellation or a server transaction deadline.
     """
 
-    def __init__(self, api_url: str, token: str, *, timeout: float = 30.0,
+    def __init__(self, api_url: str, token: str | None, *, timeout: float = 30.0,
                  ca_file: str | None = None, database: str | None = None) -> None:
         try:
             if (not isinstance(api_url, str) or not api_url
@@ -100,7 +101,7 @@ class _Transport:
             url.port
         except (ValueError, TypeError):
             raise ValidationError('API URL must be absolute HTTP(S), without credentials, query or fragment') from None
-        if not isinstance(token, str) or re.fullmatch(r'[A-Za-z0-9._~+/\-]+=*', token) is None:
+        if token is not None and (not isinstance(token, str) or re.fullmatch(r'[A-Za-z0-9._~+/\-]+=*', token) is None):
             raise ValidationError('Token must be a nonempty safe bearer token')
         if type(timeout) not in (int, float):
             raise ValidationError('Timeout must be positive and finite')
@@ -120,11 +121,16 @@ class _Transport:
             raise ValidationError('Could not load TLS trust configuration') from None
         if database is not None and (not isinstance(database, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', database) is None):
             raise ValidationError('Invalid database selector')
-        self._database_headers = {'X-MeshDB-Database': database} if database is not None else {}
+        self._database_headers = {'X-Nabedra-Database': database} if database is not None else {}
         self._url = urlunsplit((url.scheme, url.netloc, url.path.rstrip('/') + '/v1/operations', '', ''))
         self._token = token
         self._timeout = checked_timeout
         self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
+
+    def _require_token(self) -> str:
+        if self._token is None:
+            raise AuthenticationError('Set NABEDRA_TOKEN or pass token before making a request')
+        return self._token
 
     def request(self, operation: str, payload: dict, *,
                 decode: Callable[[object], _T] | None = None) -> _T | object:
@@ -155,7 +161,7 @@ class _Transport:
         request = Request(self._url, data=body, method='POST', headers={
             **self._database_headers,
             'Content-Type': 'application/json', 'Accept': 'application/json',
-            'Authorization': 'Bearer ' + self._token,
+            'Authorization': 'Bearer ' + self._require_token(),
         })
         mutation = operation in _MUTATIONS
         status = None
@@ -228,7 +234,7 @@ class _Transport:
         code, outcome = error['code'], error['outcome']
         if _ERROR_STATUS.get(code, 500) != status or (code == 'outcome_unknown' and outcome != 'unknown'):
             raise failure('Error code/status/outcome mismatch')
-        error_type = UnknownOutcomeError if outcome == 'unknown' else _ERROR_TYPES.get(code, MeshDBError)
+        error_type = UnknownOutcomeError if outcome == 'unknown' else _ERROR_TYPES.get(code, NabedraError)
         raise error_type(error['message'], code=code, request_id=request_id,
                          status_code=status, outcome=outcome)
 
@@ -238,7 +244,7 @@ class _Transport:
                           data=body, method=method, headers={
                               **self._database_headers,
                               'Content-Type': 'application/json', 'Accept': 'application/json',
-                              'Authorization': 'Bearer ' + self._token,
+                              'Authorization': 'Bearer ' + self._require_token(),
                           })
         status = None
         def failure(message, *, network=False):
@@ -284,7 +290,7 @@ class _Transport:
                 or _ERROR_STATUS.get(error['code'], 500) != status
                 or error['code'] == 'outcome_unknown' and error['outcome'] != 'unknown'):
             raise failure('Invalid receipt error details')
-        kind = UnknownOutcomeError if error['outcome'] == 'unknown' else _ERROR_TYPES.get(error['code'], MeshDBError)
+        kind = UnknownOutcomeError if error['outcome'] == 'unknown' else _ERROR_TYPES.get(error['code'], NabedraError)
         raise kind(error['message'], code=error['code'], outcome=error['outcome'],
                    request_id=request_id, status_code=status)
 
@@ -387,12 +393,33 @@ class RequestReceipt:
         return receipt
 
 
-class DB:
-    """Synchronous table creation and discovery through the server API."""
+class Database:
+    """Synchronous table operations through the server API.
 
-    def __init__(self, api_url: str, token: str, *, timeout: float = 30.0,
-                 ca_file: str | None = None, database: str | None = None) -> None:
-        self._transport = _Transport(api_url, token, timeout=timeout, ca_file=ca_file, database=database)
+    Mode records the workload preference. Both modes currently use the same
+    execution engine. Construction performs no network I/O. Authentication uses
+    an explicit token or NABEDRA_TOKEN and is required when an operation starts.
+    """
+
+    def __init__(self, url: str | None = None, token: str | None = None, *,
+                 mode: Literal['olap', 'oltp'] = 'oltp', timeout: float = 30.0,
+                 ca_file: str | None = None, database: str | None = None,
+                 api_url: str | None = None) -> None:
+        if not isinstance(mode, str) or mode not in ('olap', 'oltp'):
+            raise ValidationError('Mode must be olap or oltp')
+        if api_url is not None:
+            if url is not None:
+                raise ValidationError('Supply url only once')
+            url = api_url
+        if token is None:
+            token = os.environ.get('NABEDRA_TOKEN')
+        self._transport = _Transport(url, token, timeout=timeout, ca_file=ca_file, database=database)
+        self._mode = mode
+
+    @property
+    def mode(self) -> Literal['olap', 'oltp']:
+        """Requested workload preference; both modes share the current engine."""
+        return self._mode
 
     def submit(self, operation: str, payload: dict, *, request_id: str | None = None) -> RequestReceipt:
         """Accept one operation and return its stable queue identity."""
@@ -449,3 +476,7 @@ class DB:
             return tables
 
         return self._transport.request('table.list', {}, decode=list_result)
+
+
+# Convenience alias within the nabedra package.
+DB = Database

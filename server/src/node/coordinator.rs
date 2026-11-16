@@ -277,8 +277,8 @@ impl Peers<'_> {
         if http::one(response.headers(), "content-type")? != "application/octet-stream" {
             return Err(invalid());
         }
-        let a = http::one(response.headers(), "x-meshdb-auth")?.to_owned();
-        let sig = http::one(response.headers(), "x-meshdb-signature")?.to_owned();
+        let a = http::one(response.headers(), "x-nabedra-auth")?.to_owned();
+        let sig = http::one(response.headers(), "x-nabedra-signature")?.to_owned();
         let mut reader = http::framed_reader(response.into_body());
         let first = tokio::time::timeout_at(deadline, reader.next_frame())
             .await

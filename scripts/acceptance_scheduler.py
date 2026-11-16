@@ -1,6 +1,6 @@
 """Deterministic real TCP worker queue/recovery assertions against the local CAS store.
 
-Requires Python 3.11 and a supplied meshdb-server binary. No AWS/provider claim.
+Requires Python 3.11 and a supplied nabedra-database-server binary. No AWS/provider claim.
 """
 import argparse
 import concurrent.futures
@@ -117,11 +117,11 @@ class GateForward:
             sender = receiver = None
             for line in first[1:]:
                 name, value = line.split(b':', 1)
-                if name.lower() == b'x-meshdb-auth':
+                if name.lower() == b'x-nabedra-auth':
                     auth = json.loads(bytes.fromhex(value.strip().decode()))
                     operation = auth['operation_id']
                     sender, receiver = auth['sender']['node_id'], auth['receiver']['node_id']
-                if name.lower() == b'x-meshdb-queue-auth':
+                if name.lower() == b'x-nabedra-queue-auth':
                     claims = json.loads(bytes.fromhex(value.strip().decode()))
                     self.trace = {'command': claims['command'], 'class': claims['class'],
                                   'sender': claims['sender_node'], 'receiver': claims['receiver'],
@@ -223,7 +223,7 @@ class Cluster:
 
     def _initialize(self, execution):
         self.diagnostics = (self.root / 'diagnostics').open('wb')
-        self.env = {'PATH': os.defpath, 'MESHDB_STORE_TOKEN': 'scheduler-store-token'}
+        self.env = {'PATH': os.defpath, 'NABEDRA_STORE_TOKEN': 'scheduler-store-token'}
         self.database = self.root / 'objects.sqlite'
         store = subprocess.Popen([sys.executable, str(Path(__file__).with_name('local_store.py')),
                                   '--database', str(self.database), '--port', '0'], env=self.env,
@@ -257,7 +257,7 @@ class Cluster:
         args = [str(self.binary), 'api', '--config', str(self.root / 'api.json')]
         if cold:
             args.append('--cold-start')
-        process = subprocess.Popen(args, env=dict(self.env, MESHDB_SUPERVISOR_FD=str(child_channel.fileno())),
+        process = subprocess.Popen(args, env=dict(self.env, NABEDRA_SUPERVISOR_FD=str(child_channel.fileno())),
                                    pass_fds=(child_channel.fileno(),), stdout=self.diagnostics, stderr=self.diagnostics)
         self.children.append(process)
         child_channel.close()
@@ -275,7 +275,7 @@ class Cluster:
         self.channels.append(channel)
         channel.settimeout(40)
         process = subprocess.Popen([str(self.binary), 'api', '--config', str(self.root / 'api.json')],
-                                   env=dict(self.env, MESHDB_SUPERVISOR_FD=str(child_channel.fileno())),
+                                   env=dict(self.env, NABEDRA_SUPERVISOR_FD=str(child_channel.fileno())),
                                    pass_fds=(child_channel.fileno(),), stdout=self.diagnostics, stderr=self.diagnostics)
         self.children.append(process)
         child_channel.close()
@@ -424,7 +424,7 @@ class Evidence(list):
 
 def run(binary):
     evidence = Evidence(binary)
-    with tempfile.TemporaryDirectory(prefix='meshdb-scheduler-') as directory:
+    with tempfile.TemporaryDirectory(prefix='nabedra-scheduler-') as directory:
         cluster = Cluster(binary, directory)
         try:
             a = cluster.start_worker(10, 1)

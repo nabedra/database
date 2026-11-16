@@ -8,8 +8,8 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
-from meshdb import errors
-from meshdb.cluster import Cluster
+from nabedra import errors
+from nabedra.cluster import Cluster
 from test_cluster import policy, status
 
 
@@ -117,7 +117,7 @@ class ClusterWaitTests(unittest.TestCase):
 
                 def observe_wait(event, timeout=None):
                     # Observe real native waits without replacing the clock or timer.
-                    if threading.current_thread().name == 'meshdb-control-deadline':
+                    if threading.current_thread().name == 'nabedra-control-deadline':
                         budgets.append(timeout)
                         if len(budgets) >= required:
                             waiting.set()
@@ -140,7 +140,7 @@ class ClusterWaitTests(unittest.TestCase):
                 self.assertTrue(all(0 < value <= limit for value in budgets),
                                 'deadline exceeded the native wait limit')
                 self.assertEqual(failures, [], 'deadline thread raised an exception')
-                self.assertFalse(any(t.name == 'meshdb-control-deadline'
+                self.assertFalse(any(t.name == 'nabedra-control-deadline'
                                      for t in threading.enumerate()))
 
     def test_invalid_inputs_no_io_and_pre_ack_failures_keep_classification(self):
@@ -195,15 +195,15 @@ class ClusterWaitTests(unittest.TestCase):
                     states = ['pending', 'in_progress', 'reconciling', 'failed']
                     return '00000000-0000-0000-0000-000000000004', ready(
                         states[min(len(calls)-2, 3)], 2 if scenario == 'superseded' else 1)
-                from meshdb.cluster import _status
+                from nabedra.cluster import _status
                 def parse(value):
                     result = _status(value)
                     if scenario == 'parse_budget':
                         clock.now = 101.0
                     return result
-                with patch('meshdb.cluster._monotonic', clock.monotonic), \
-                        patch('meshdb.cluster._sleep', clock.sleep), \
-                        patch('meshdb.cluster._status', parse), \
+                with patch('nabedra.cluster._monotonic', clock.monotonic), \
+                        patch('nabedra.cluster._sleep', clock.sleep), \
+                        patch('nabedra.cluster._status', parse), \
                         patch.object(client._transport, 'request', side_effect=request):
                     if scenario in ('progress', 'no_wait'):
                         self.assertEqual(client.scale(1, wait=scenario != 'no_wait', timeout=1), policy(1))

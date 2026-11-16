@@ -1,12 +1,12 @@
 use std::process::Command;
 
 fn binary(args: &[&str], configured: bool) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_meshdb-server"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nabedra-database-server"));
     command.env_clear().args(args);
     if configured {
         command
-            .env("MESHDB_S3_BUCKET", "synthetic-bucket")
-            .env("MESHDB_TOKEN", "synthetic-private-token");
+            .env("NABEDRA_S3_BUCKET", "synthetic-bucket")
+            .env("NABEDRA_TOKEN", "synthetic-private-token");
     }
     command.output().unwrap()
 }
@@ -21,7 +21,7 @@ fn parser_and_invalid_startup_exit_without_aws() {
     ] {
         let output = binary(&args, false);
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("meshdb-server"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("nabedra-database-server"));
     }
     for (args, configured) in [
         (vec!["serve"], false),
@@ -44,7 +44,7 @@ fn parser_and_invalid_startup_exit_without_aws() {
         assert!(error.contains("configuration invalid"), "{error}");
         assert!(!error.contains("private"));
     }
-    let path = std::env::temp_dir().join(format!("meshdb-malformed-{}.pem", std::process::id()));
+    let path = std::env::temp_dir().join(format!("nabedra-malformed-{}.pem", std::process::id()));
     std::fs::write(&path, "not a certificate or private key").unwrap();
     let output = binary(
         &[
@@ -64,6 +64,6 @@ fn parser_and_invalid_startup_exit_without_aws() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
-        "meshdb-server: TLS configuration invalid"
+        "nabedra-database-server: TLS configuration invalid"
     );
 }

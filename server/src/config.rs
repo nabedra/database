@@ -103,7 +103,7 @@ impl Config {
         Self::from_lookup(options, |name| env::var(name))
     }
 
-    /// Reads only MeshDB settings. AWS credentials and region stay with Storage::connect.
+    /// Reads only Nabedra Database settings. AWS credentials and region stay with Storage::connect.
     /// Missing prefix uses the default; an empty or non-Unicode prefix is invalid.
     pub fn from_lookup(
         mut options: ServeOptions,
@@ -151,21 +151,21 @@ impl Config {
         resources.validate_execution(&execution)?;
         let bucket = required(
             &mut lookup,
-            "MESHDB_S3_BUCKET",
-            "MESHDB_S3_BUCKET is required and must be nonempty",
+            "NABEDRA_S3_BUCKET",
+            "NABEDRA_S3_BUCKET is required and must be nonempty",
         )?;
         let token = required(
             &mut lookup,
-            "MESHDB_TOKEN",
-            "MESHDB_TOKEN is required and must be nonempty",
+            "NABEDRA_TOKEN",
+            "NABEDRA_TOKEN is required and must be nonempty",
         )?;
-        let prefix = match lookup("MESHDB_S3_PREFIX") {
+        let prefix = match lookup("NABEDRA_S3_PREFIX") {
             Ok(prefix) => prefix,
-            Err(VarError::NotPresent) => "meshdb-v0/".into(),
-            Err(_) => return Err(ConfigError("MESHDB_S3_PREFIX is invalid")),
+            Err(VarError::NotPresent) => "nabedra-v0/".into(),
+            Err(_) => return Err(ConfigError("NABEDRA_S3_PREFIX is invalid")),
         };
         let namespace =
-            Namespace::new(&prefix).map_err(|_| ConfigError("MESHDB_S3_PREFIX is invalid"))?;
+            Namespace::new(&prefix).map_err(|_| ConfigError("NABEDRA_S3_PREFIX is invalid"))?;
         match (&options.tls_cert, &options.tls_key) {
             (None, None) => {}
             (Some(cert), Some(key)) => {

@@ -84,7 +84,7 @@ class Forward(socketserver.BaseRequestHandler):
                                 sender = receiver = None
                                 for line in lines[1:]:
                                     name, value = line.split(b":", 1)
-                                    if name.lower() == b"x-meshdb-auth":
+                                    if name.lower() == b"x-nabedra-auth":
                                         auth = json.loads(bytes.fromhex(value.strip().decode("ascii")))
                                         sender = auth["sender"]["node_id"]
                                         receiver = auth["receiver"]["node_id"]
@@ -184,11 +184,11 @@ def call(base, operation, payload, token, request_id=None):
 def run(binary):
     children, doors, stalled, channels = [], [], [], []
     channel = None
-    with tempfile.TemporaryDirectory(prefix="meshdb-nodes-") as directory:
+    with tempfile.TemporaryDirectory(prefix="nabedra-nodes-") as directory:
         root = Path(directory)
         diagnostics = (root / "diagnostics").open("wb")
         # Explicit synthetic environment: no AWS profiles or operator material.
-        env = {"PATH": os.defpath, "MESHDB_STORE_TOKEN": "fixture-store-token"}
+        env = {"PATH": os.defpath, "NABEDRA_STORE_TOKEN": "fixture-store-token"}
         try:
             store = subprocess.Popen([sys.executable, str(Path(__file__).with_name("local_store.py")),
                                       "--database", str(root / "objects.sqlite"), "--port", "0"],
@@ -220,7 +220,7 @@ def run(binary):
                 channels.append(channel)
                 channel.settimeout(30)
                 api = subprocess.Popen([str(binary), "api", "--config", str(root / "api.json")],
-                                       env=dict(env, MESHDB_SUPERVISOR_FD=str(child_channel.fileno())),
+                                       env=dict(env, NABEDRA_SUPERVISOR_FD=str(child_channel.fileno())),
                                        pass_fds=(child_channel.fileno(),), stdout=diagnostics,
                                        stderr=diagnostics)
                 children.append(api)
@@ -385,5 +385,5 @@ def run(binary):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "server/target/debug/meshdb-server")
+    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "server/target/debug/nabedra-database-server")
     run(parser.parse_args().binary.resolve())

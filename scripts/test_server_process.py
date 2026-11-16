@@ -104,12 +104,12 @@ class ProcessGuard(unittest.TestCase):
                 assert args.host == "127.0.0.1"
                 assert args.queue_size == 64
                 assert (args.workers, args.partition_size) in ((4, None), (2, "64 KB"), (3, "64 KB"))
-                assert os.environ["MESHDB_S3_BUCKET"] == "meshdb-testing"
-                assert os.environ["MESHDB_S3_PREFIX"].endswith("/")
+                assert os.environ["NABEDRA_S3_BUCKET"] == "meshdb-testing"
+                assert os.environ["NABEDRA_S3_PREFIX"].endswith("/")
                 assert os.environ["AWS_ACCESS_KEY_ID"] == "synthetic-key"
                 assert "AWS_ENDPOINT_URL" not in os.environ
                 assert "AWS_PROFILE" not in os.environ
-                assert os.environ["MESHDB_TOKEN"]
+                assert os.environ["NABEDRA_TOKEN"]
 
                 def terminate(signum, frame):
                     print("STOP", os.getpid(), flush=True)
@@ -118,14 +118,14 @@ class ProcessGuard(unittest.TestCase):
                 signal.signal(signal.SIGTERM, terminate)
                 class Health(BaseHTTPRequestHandler):
                     def do_GET(self):
-                        ready = "never-ready" not in os.environ["MESHDB_S3_PREFIX"]
+                        ready = "never-ready" not in os.environ["NABEDRA_S3_PREFIX"]
                         self.send_response(200 if self.path == "/health/ready" and ready else 503)
                         self.end_headers()
                     def log_message(self, *args):
                         pass
 
                 with HTTPServer((args.host, args.port), Health) as server:
-                    print("START", os.getpid(), os.environ["MESHDB_S3_PREFIX"], "COLD", args.cold_start, flush=True)
+                    print("START", os.getpid(), os.environ["NABEDRA_S3_PREFIX"], "COLD", args.cold_start, flush=True)
                     server.serve_forever()
                 '''), encoding="utf-8")
             binary.chmod(0o700)
@@ -136,7 +136,7 @@ class ProcessGuard(unittest.TestCase):
             namespace = config.allocate_prefix(2, "lifecycle", run_id="local")
             log = root / "child.log"
             with patch.dict(os.environ, {"AWS_ENDPOINT_URL": "invalid", "AWS_PROFILE": "invalid",
-                                         "MESHDB_S3_BUCKET": "invalid", "MESHDB_S3_PREFIX": "invalid"}):
+                                         "NABEDRA_S3_BUCKET": "invalid", "NABEDRA_S3_PREFIX": "invalid"}):
                 server = ServerProcess(config, namespace, binary=binary, log_path=log,
                                        startup_timeout=3, shutdown_timeout=1)
                 for invalid in (0, -1, True, 1.5, "2"):

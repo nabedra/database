@@ -15,7 +15,7 @@ import time
 import types
 import unicodedata
 
-from .errors import MeshDBError, ValidationError
+from .errors import NabedraError, ValidationError
 from .validation import validate_identifier
 
 _MAX_BODY = 1024 * 1024
@@ -34,7 +34,7 @@ _AUTH_DENIALS = {400: 'invalid_command', 401: 'unauthorized',
                  503: 'ownership_unavailable'}
 
 
-class _CallbackProtocolError(MeshDBError):
+class _CallbackProtocolError(NabedraError):
     def __init__(self, code, *, status_code=None):
         super().__init__(_MESSAGES[code], code=code, status_code=status_code)
 

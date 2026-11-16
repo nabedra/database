@@ -1,4 +1,4 @@
-use meshdb_server::config::{self, Config, ServeOptions};
+use nabedra_database_server::config::{self, Config, ServeOptions};
 use std::{env::VarError, path::PathBuf};
 
 fn configured(
@@ -8,15 +8,15 @@ fn configured(
     Config::from_lookup(options, |name| {
         assert!(matches!(
             name,
-            "MESHDB_S3_BUCKET" | "MESHDB_TOKEN" | "MESHDB_S3_PREFIX"
+            "NABEDRA_S3_BUCKET" | "NABEDRA_TOKEN" | "NABEDRA_S3_PREFIX"
         ));
         let value = overrides
             .iter()
             .find(|(key, _)| *key == name)
             .map(|(_, value)| *value)
             .unwrap_or(match name {
-                "MESHDB_S3_BUCKET" => Some("test-bucket"),
-                "MESHDB_TOKEN" => Some("private-bearer-value"),
+                "NABEDRA_S3_BUCKET" => Some("test-bucket"),
+                "NABEDRA_TOKEN" => Some("private-bearer-value"),
                 _ => None,
             });
         value.map(str::to_owned).ok_or(VarError::NotPresent)
@@ -39,13 +39,13 @@ fn defaults_and_explicit_options_use_storage_namespace() {
         (8000, 4, 64)
     );
     assert!(config.options().tls_cert.is_none() && config.options().tls_key.is_none());
-    assert_eq!(config.namespace().as_str(), "meshdb-v0/");
+    assert_eq!(config.namespace().as_str(), "nabedra-v0/");
     assert_eq!(config.bucket(), "test-bucket");
     assert_eq!(config.token(), "private-bearer-value");
     assert_eq!(config.admission_limit(), 68);
     assert_eq!(
         config.options().partition_size.bytes(),
-        meshdb_server::partition_size::MAX_PARTITION_BYTES
+        nabedra_database_server::partition_size::MAX_PARTITION_BYTES
     );
 
     let options = ServeOptions {
@@ -56,7 +56,7 @@ fn defaults_and_explicit_options_use_storage_namespace() {
         partition_size: "61 MiB".parse().unwrap(),
         ..ServeOptions::default()
     };
-    let config = configured(options, &[("MESHDB_S3_PREFIX", Some("team/data///"))]).unwrap();
+    let config = configured(options, &[("NABEDRA_S3_PREFIX", Some("team/data///"))]).unwrap();
     assert_eq!(config.namespace().as_str(), "team/data/");
     assert_eq!(config.options().partition_size.bytes(), 63_963_136);
     assert_eq!(
@@ -71,7 +71,7 @@ fn defaults_and_explicit_options_use_storage_namespace() {
 
 #[test]
 fn required_environment_and_prefix_errors_are_sanitized_and_debug_redacts_token() {
-    for name in ["MESHDB_S3_BUCKET", "MESHDB_TOKEN"] {
+    for name in ["NABEDRA_S3_BUCKET", "NABEDRA_TOKEN"] {
         for value in [None, Some(""), Some(" \t\n")] {
             let error = configured(ServeOptions::default(), &[(name, value)]).unwrap_err();
             assert!(error.to_string().contains(name));
@@ -81,10 +81,10 @@ fn required_environment_and_prefix_errors_are_sanitized_and_debug_redacts_token(
     for prefix in ["", "../secret-prefix-value", "team//data"] {
         let error = configured(
             ServeOptions::default(),
-            &[("MESHDB_S3_PREFIX", Some(prefix))],
+            &[("NABEDRA_S3_PREFIX", Some(prefix))],
         )
         .unwrap_err();
-        assert_eq!(error.to_string(), "MESHDB_S3_PREFIX is invalid");
+        assert_eq!(error.to_string(), "NABEDRA_S3_PREFIX is invalid");
         assert!(!format!("{error:?}").contains("secret-prefix-value"));
     }
     let error = Config::from_lookup(ServeOptions::default(), |_| {
@@ -134,7 +134,7 @@ fn worker_and_admission_bounds_allow_zero_queue() {
 struct TlsFiles(PathBuf);
 impl TlsFiles {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("meshdb-config-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("nabedra-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         Self(dir)
     }

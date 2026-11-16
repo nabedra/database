@@ -1,7 +1,7 @@
 //! U03 seeded event histories across RAM replicas, resource ownership and the
 //! real fenced local mutation engine. Network/process faults have separate tests.
 use futures_util::FutureExt;
-use meshdb_server::{
+use nabedra_database_server::{
     config::WorkerResources,
     engine::Engine,
     partition_size::PartitionSize,
@@ -567,7 +567,7 @@ impl History {
                 .storage()
                 .read(
                     &ObjectKey::parse_partition(&file.object, self.table).unwrap(),
-                    meshdb_server::partition_size::MAX_PARTITION_BYTES,
+                    nabedra_database_server::partition_size::MAX_PARTITION_BYTES,
                 )
                 .await
                 .unwrap();
@@ -580,10 +580,10 @@ impl History {
             for row in rows {
                 let key = row["id"].clone();
                 let text = row["text"].clone();
-                let meshdb_server::protocol::Scalar::Int64(key) = key else {
+                let nabedra_database_server::protocol::Scalar::Int64(key) = key else {
                     panic!("key");
                 };
-                let meshdb_server::protocol::Scalar::Utf8(text) = text else {
+                let nabedra_database_server::protocol::Scalar::Utf8(text) = text else {
                     panic!("text");
                 };
                 assert!(actual.insert(key, text).is_none());
@@ -1012,7 +1012,7 @@ impl Drop for ReleaseCpu {
 /// pending request ownership must remain independent of execution-stage demand.
 #[tokio::test]
 async fn u01_q01_q02_cpu_saturated_local_router_retains_every_accepted_query() {
-    use meshdb_server::{api, config::ExecutionConfig, executor::Executor};
+    use nabedra_database_server::{api, config::ExecutionConfig, executor::Executor};
     let storage = Storage::new(Fake::default(), Namespace::new("cpu-gated-router").unwrap());
     let (pool, threads) = WorkerPool::start_with_resources(
         WorkerResources {

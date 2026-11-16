@@ -1,8 +1,8 @@
 import unittest
 from collections import UserDict
 
-from meshdb import errors
-from meshdb.validation import (
+from nabedra import errors
+from nabedra.validation import (
     schema_from_wire, schema_to_wire, validate_format, validate_identifier,
     validate_key, validate_row, validate_schema,
 )

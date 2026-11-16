@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from ._control_transport import _ControlTransport
 from .errors import (
-    ConflictError, MeshDBError, ProtocolError, TransportError,
+    ConflictError, NabedraError, ProtocolError, TransportError,
     UnknownOutcomeError, ValidationError,
 )
 from .validation import validate_identifier
@@ -248,7 +248,7 @@ class Cluster:
             self._remaining(deadline, request_id)
             try:
                 current = self._read_status(deadline=deadline)
-            except MeshDBError:
+            except NabedraError:
                 # An expired read is a timeout of this accepted policy wait.
                 # Other read failures keep their original diagnostics.
                 self._remaining(deadline, request_id)

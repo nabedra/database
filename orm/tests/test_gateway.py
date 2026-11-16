@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 import httpx
-from meshdb.gateway import Gateway, S3, AwsCredentials
+from nabedra.gateway import Gateway, S3, AwsCredentials
 
 RID = '11111111-1111-4111-8111-111111111111'
 RUN = '33333333-3333-4333-8333-333333333333'
@@ -25,11 +25,11 @@ def response(request):
 
 class GatewayTests(unittest.TestCase):
     def gateway(self, handler=response, **kw):
-        g = Gateway(cluster_url='https://compute.internal', token='private', mount_path='/meshdb',
+        g = Gateway(cluster_url='https://compute.internal', token='private', mount_path='/nabedra',
                     _transport=httpx.MockTransport(handler), **kw)
         self.addCleanup(g.close)
         return g
-    def call(self, g, body=BODY, headers=HEADERS, path='/meshdb/v1/operations', method='POST'):
+    def call(self, g, body=BODY, headers=HEADERS, path='/nabedra/v1/operations', method='POST'):
         return g.handle(method=method, path=path, headers=headers, body=body)
     def test_GW01_raw_order_immutable_and_header_filtering(self):
         seen = []
@@ -39,8 +39,8 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual(req.headers['authorization'], 'Bearer private')
             self.assertNotIn('cookie', req.headers)
             self.assertNotIn('x-extra', req.headers)
-            data = json.loads(base64.urlsafe_b64decode(req.headers['x-meshdb-storage'] + '=='))
-            self.assertEqual(data, {'version':1,'bucket':'app-a','region':'eu-west-1','prefix':'meshdb/',
+            data = json.loads(base64.urlsafe_b64decode(req.headers['x-nabedra-storage'] + '=='))
+            self.assertEqual(data, {'version':1,'bucket':'app-a','region':'eu-west-1','prefix':'nabedra/',
                 'credentials':{'access_key_id':'access-sentinel','secret_access_key':'secret-sentinel','session_token':None,'expires_at':None}})
             return response(req)
         g = self.gateway(upstream)
@@ -58,7 +58,7 @@ class GatewayTests(unittest.TestCase):
         @g.middleware
         def second(ctx):
             seen.append('second')
-        with patch('meshdb.client._Transport.request', side_effect=AssertionError('ORM used')):
+        with patch('nabedra.client._Transport.request', side_effect=AssertionError('ORM used')):
             result = self.call(g, headers=HEADERS + (('Cookie','secret'),('X-Extra','a'),('X-Extra','b')))
         self.assertEqual(result.status,200)
         self.assertEqual(seen, ['first','second','upstream'])
@@ -73,9 +73,9 @@ class GatewayTests(unittest.TestCase):
         for body in bad:
             with self.subTest(body=body[:80]):
                 self.assertEqual(self.call(g,body).status,400)
-        for path in ('/meshdb/admin/status','/meshdb/v1/operations?x=1','/other/v1/operations','https://evil/v1/operations'):
+        for path in ('/nabedra/admin/status','/nabedra/v1/operations?x=1','/other/v1/operations','https://evil/v1/operations'):
             self.assertEqual(self.call(g,path=path).status,400)
-        for headers in (HEADERS+(('X-MeshDB-Storage','forged'),), HEADERS+(('X-MeshDB-Principal','forged'),), HEADERS+(('Authorization','Bearer duplicate'),), HEADERS+(('X-MeshDB-Database','../bad'),)):
+        for headers in (HEADERS+(('X-Nabedra-Storage','forged'),), HEADERS+(('X-Nabedra-Principal','forged'),), HEADERS+(('Authorization','Bearer duplicate'),), HEADERS+(('X-Nabedra-Database','../bad'),)):
             self.assertIn(self.call(g,headers=headers).status,(400,401))
         self.assertEqual(self.call(g,body=b' '* (8*1024*1024+1)).status,413)
         self.assertEqual(self.call(g,headers=HEADERS+(('X-Extra','x'*32768),)).status,413)
@@ -110,8 +110,8 @@ class GatewayTests(unittest.TestCase):
         queued = json.dumps({'request_id':RID,'run_id':RUN,'state':'queued'}, indent=2).encode()
         terminal = json.dumps({'request_id':RID,'run_id':RUN,'state':'succeeded','result':None,'error':None}).encode()
         failure = json.dumps({'request_id':RID,'error':{'code':'conflict','message':'conflict','outcome':'not_applied'}}).encode()
-        for status, raw, path, method, body in ((202,queued,'/meshdb/v1/requests','POST',BODY),
-            (200,terminal,f'/meshdb/v1/requests/{RUN}/{RID}','GET',b''),(409,failure,'/meshdb/v1/operations','POST',BODY)):
+        for status, raw, path, method, body in ((202,queued,'/nabedra/v1/requests','POST',BODY),
+            (200,terminal,f'/nabedra/v1/requests/{RUN}/{RID}','GET',b''),(409,failure,'/nabedra/v1/operations','POST',BODY)):
             g=self.gateway(lambda req:httpx.Response(status,content=raw,headers={'content-type':'application/json','set-cookie':'bad','location':'https://compute.internal/private'}))
             @g.middleware
             def auth(ctx):
@@ -121,7 +121,7 @@ class GatewayTests(unittest.TestCase):
             self.assertEqual((res.status,res.body),(status,raw))
             self.assertNotIn('set-cookie',dict(res.headers))
             if status==202:
-                self.assertEqual(dict(res.headers)['location'],f'/meshdb/v1/requests/{RUN}/{RID}')
+                self.assertEqual(dict(res.headers)['location'],f'/nabedra/v1/requests/{RUN}/{RID}')
         self.assertEqual(contexts[1].receipt.run_id,RUN)
         self.assertIsNone(contexts[1].operation)
     def test_sync_rejects_async_before_callbacks(self):
@@ -131,7 +131,7 @@ class GatewayTests(unittest.TestCase):
             self.fail('Called async')
         self.assertEqual(self.call(g).status,400)
     def test_all_payload_schemas(self):
-        from meshdb.gateway_protocol import payload
+        from nabedra.gateway_protocol import payload
         q={'select':['x'],'filter':{'op':'and','args':[{'op':'eq','column':'x','value':True},{'op':'not','arg':{'op':'gt','column':'x','value':1.0}}]},'order_by':{'column':'x','desc':False},'limit':10**50}
         samples={'table.create':{'name':'a','schema':{'id':'int64'},'key':'id','format':'parquet'},'table.describe':{'name':'a'},'table.list':{},'table.drop':{'table_id':TID},'table.insert':{'table_id':TID,'row':{'x':True}},'table.insert_many':{'table_id':TID,'rows':[{'x':1}]},'table.get':{'table_id':TID,'key':'k'},'table.update':{'table_id':TID,'key':1,'values':{}},'table.upsert':{'table_id':TID,'row':{'x':2}},'table.delete':{'table_id':TID,'key':1}}
         for name in ('query.collect','query.count','query.explain'):
@@ -156,7 +156,7 @@ class AsyncGatewayTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(entered.wait(), 2)
                 large = BODY.replace(b'1e0', b'"' + b'x' * (7 * 1024 * 1024) + b'"')
-                with patch('meshdb.gateway.wire.loads', side_effect=AssertionError('Parsed outside capacity')) as decode:
+                with patch('nabedra.gateway.wire.loads', side_effect=AssertionError('Parsed outside capacity')) as decode:
                     for handle in (g.handle_async, g.handle):
                         result = handle(method='POST', path='/v1/operations', headers=HEADERS, body=large)
                         if asyncio.iscoroutine(result):
@@ -170,8 +170,8 @@ class AsyncGatewayTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await first).status, 200)
             self.assertEqual(len(forwards), 1)
             # An admitted payload failure retains its already validated ID.
-            from meshdb.gateway import wire
-            with patch('meshdb.gateway.wire.loads', wraps=wire.loads) as decode:
+            from nabedra.gateway import wire
+            with patch('nabedra.gateway.wire.loads', wraps=wire.loads) as decode:
                 result = await g.handle_async(method='POST', path='/v1/operations', headers=HEADERS,
                                               body=BODY.replace(b'1e0', b'null'))
                 self.assertEqual(result.status, 400)
@@ -238,8 +238,8 @@ class Block:
         if name.split('.')[0] in {'httpx','boto3','django','flask','fastapi','starlette'}:
             raise ImportError('Optional dependency deliberately absent')
 sys.meta_path.insert(0,Block())
-import meshdb
-from meshdb.aws import default_credentials
+import nabedra
+from nabedra.aws import default_credentials
 provider=default_credentials()
 assert callable(provider)
 assert 'httpx' not in sys.modules and 'boto3' not in sys.modules
@@ -248,10 +248,10 @@ assert not any(n in sys.modules for n in ('flask','django','fastapi','starlette'
         result=subprocess.run([sys.executable,'-c',script],capture_output=True,text=True,env=os.environ.copy(),timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)
     def test_client_selector_on_operations_submit_and_poll(self):
-        from meshdb import DB
+        from nabedra import Database
         from unittest.mock import MagicMock
         calls=[]
-        db=DB('http://127.0.0.1:9999/meshdb','token',database='tenant-a')
+        db=Database('http://127.0.0.1:9999/nabedra','token',database='tenant-a')
         class Reply:
             status=200
             headers={'Content-Type':'application/json'}
@@ -273,9 +273,9 @@ assert not any(n in sys.modules for n in ('flask','django','fastapi','starlette'
         receipt.poll()
         self.assertEqual(len(calls),3)
         for req in calls:
-            self.assertEqual(dict((k.lower(),v) for k,v in req.header_items())['x-meshdb-database'],'tenant-a')
+            self.assertEqual(dict((k.lower(),v) for k,v in req.header_items())['x-nabedra-database'],'tenant-a')
         for selector in ('../bad','bad\r\nheader',''):
-            with self.assertRaises(Exception):DB('https://example.com','token',database=selector)
+            with self.assertRaises(Exception):Database('https://example.com','token',database=selector)
     def test_running_callback_stays_charged_after_deadline_and_close_returns(self):
         import time
         entered=threading.Event();release=threading.Event();finished=threading.Event()

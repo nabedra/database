@@ -1,4 +1,4 @@
-use meshdb_server::storage::*;
+use nabedra_database_server::storage::*;
 #[path = "support/storage.rs"]
 mod fake;
 use fake::Fake;
@@ -113,9 +113,10 @@ async fn namespace_snapshot_validation_and_read_bounds() {
         "tables/../x",
         "tables/cccccccc-cccc-4ccc-8ccc-cccccccccccc/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.parquet",
     ] {
-        catalog.tables.get_mut("users").unwrap().data = meshdb_server::storage::TableData::Legacy {
-            snapshot: path.into(),
-        };
+        catalog.tables.get_mut("users").unwrap().data =
+            nabedra_database_server::storage::TableData::Legacy {
+                snapshot: path.into(),
+            };
         assert!(catalog.encode().is_err());
     }
     let mut catalog = populated();
@@ -217,7 +218,7 @@ fn catalog_codec_rejects_duplicate_names_and_bounds_encoding() {
     for n in 1..=5000_u128 {
         let mut entry = entry.clone();
         entry.id = uuid::Uuid::from_u128(n);
-        entry.data = meshdb_server::storage::TableData::Legacy {
+        entry.data = nabedra_database_server::storage::TableData::Legacy {
             snapshot: ObjectKey::snapshot(entry.id, large.commit_id)
                 .as_str()
                 .into(),
@@ -279,7 +280,7 @@ fn partitioned_document() -> serde_json::Value {
 
 #[test]
 fn mixed_v2_roundtrip_and_typed_routing() {
-    use meshdb_server::protocol::Key;
+    use nabedra_database_server::protocol::Key;
     let mut doc = partitioned_document();
     let legacy = Catalog::decode(FROZEN_V1.as_bytes()).unwrap();
     let mut catalog = Catalog::decode(&serde_json::to_vec(&doc).unwrap()).unwrap();
@@ -418,7 +419,9 @@ fn partition_metadata_rejects_invalid_manifests() {
         ),
         (
             "/tables/users/data/files/0/byte_size",
-            serde_json::json!((meshdb_server::partition_size::MAX_PARTITION_BYTES + 1) as u64),
+            serde_json::json!(
+                (nabedra_database_server::partition_size::MAX_PARTITION_BYTES + 1) as u64
+            ),
         ),
         ("/tables/users/data/files/0/byte_size", serde_json::json!(0)),
     ] {

@@ -5,7 +5,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use meshdb_server::{
+use nabedra_database_server::{
     api,
     config::ExecutionConfig,
     engine::Engine,

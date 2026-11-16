@@ -5,7 +5,7 @@ struct Fixture(std::path::PathBuf);
 impl Fixture {
     fn new() -> Self {
         let path =
-            std::env::temp_dir().join(format!("meshdb-composition-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("nabedra-composition-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }

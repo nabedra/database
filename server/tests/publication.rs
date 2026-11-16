@@ -1,4 +1,4 @@
-use meshdb_server::storage::*;
+use nabedra_database_server::storage::*;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -244,7 +244,7 @@ async fn preparation_rejects_relationships_tables_and_bounds_without_puts() {
     assert!(PreparedPublication::prepare(base.clone(), tables, d.clone()).is_err());
     let mut bad = d;
     bad.request_body
-        .push_str(&" ".repeat(meshdb_server::protocol::MAX_BODY_BYTES));
+        .push_str(&" ".repeat(nabedra_database_server::protocol::MAX_BODY_BYTES));
     assert!(matches!(
         PreparedPublication::prepare(base.clone(), BTreeMap::new(), bad),
         Err(StorageError::LimitExceeded)
@@ -463,7 +463,7 @@ async fn deadline_before_root_is_attempt_error_and_pending_root_is_unknown() {
 
 #[tokio::test]
 async fn encoded_root_bound_is_checked_before_upload() {
-    use meshdb_server::protocol::Key;
+    use nabedra_database_server::protocol::Key;
     let (s, base) = store().await;
     let d = decision(&base, 1);
     let mut table = entry(50);

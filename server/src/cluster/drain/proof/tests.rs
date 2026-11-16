@@ -15,7 +15,7 @@ fn hex(b: &[u8]) -> String {
 }
 fn fixture() -> (Control, WorkerSigningKey) {
     let key = WorkerSigningKey::new().unwrap();
-    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
     let fingerprint = Template::decode(&serde_json::to_vec(&template).unwrap())
         .unwrap()
         .fingerprint()
@@ -29,7 +29,7 @@ fn fixture() -> (Control, WorkerSigningKey) {
 async fn whole_root_confirmation_accepts_actual_loaded_ack() {
     let (root, _) = fixture();
     let fake = Fake::default();
-    let storage = Storage::new(fake, Namespace::new("meshdb/").unwrap());
+    let storage = Storage::new(fake, Namespace::new("nabedra/").unwrap());
     storage
         .put(
             &ObjectKey::control(),

@@ -1,9 +1,9 @@
-use meshdb_server::{
+use nabedra_database_server::{
     engine::Engine,
     protocol::{ErrorCode, Operation, Outcome, ProtocolError, parse_request},
     storage::{Namespace, Storage, StorageError},
 };
-use meshdb_server::{
+use nabedra_database_server::{
     partition_size::PartitionSize,
     worker_pool::{WorkerPool, WorkerThreads},
 };

@@ -2,7 +2,7 @@
 //! Run with --output <file>; JSON includes one warmup and three measured repetitions.
 #![recursion_limit = "256"]
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use meshdb_server::{
+use nabedra_database_server::{
     config::WorkerResources, scheduling::ResourceScheduler, worker_pool::WorkerPool,
 };
 use serde_json::{Value, json};
@@ -305,10 +305,10 @@ async fn repetition(
                                 let queue_ns = arrived.elapsed().as_nanos() as u64;
                                 let mut buffer = Vec::new();
                                 buffer.try_reserve_exact(bytes as usize).map_err(|_| {
-                                    meshdb_server::protocol::ProtocolError::new(
-                                        meshdb_server::protocol::ErrorCode::LimitExceeded,
+                                    nabedra_database_server::protocol::ProtocolError::new(
+                                        nabedra_database_server::protocol::ErrorCode::LimitExceeded,
                                         "benchmark buffer allocation",
-                                        meshdb_server::protocol::Outcome::NotApplied,
+                                        nabedra_database_server::protocol::Outcome::NotApplied,
                                     )
                                 })?;
                                 buffer.resize(bytes as usize, identity as u8);

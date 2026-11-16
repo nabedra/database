@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from meshdb import _serve_args
-from meshdb.errors import ValidationError
+from nabedra import _serve_args
+from nabedra.errors import ValidationError
 
 
 class ServeArgsTests(unittest.TestCase):
@@ -89,17 +89,17 @@ class ServeArgsTests(unittest.TestCase):
             root = Path(directory)
             config = root / "config with spaces.json"
             config.write_text("invalid JSON is Rust's responsibility")
-            with patch.dict(os.environ, {"MESHDB_CONFIG": str(config)}):
+            with patch.dict(os.environ, {"NABEDRA_CONFIG": str(config)}):
                 self.assertEqual(_serve_args._resolve_config_path(), str(config))
             with patch("os.getcwd", return_value=directory):
-                for name in (config.name, "$MESHDB_LITERAL", "~", "$(literal)"):
+                for name in (config.name, "$NABEDRA_LITERAL", "~", "$(literal)"):
                     (root / name).touch()
-                    with patch.dict(os.environ, {"MESHDB_CONFIG": name}):
+                    with patch.dict(os.environ, {"NABEDRA_CONFIG": name}):
                         self.assertEqual(_serve_args._resolve_config_path(), str(root / name))
             failures = []
             for value in (None, "", str(root), str(root / "private-missing"), "private\0path"):
                 # The OS forbids putting NUL in a real environment value.
-                environment = {} if value is None else {"MESHDB_CONFIG": value}
+                environment = {} if value is None else {"NABEDRA_CONFIG": value}
                 with patch("os.environ", environment):
                     with self.assertRaises(ValidationError) as caught:
                         _serve_args._resolve_config_path()
@@ -108,7 +108,7 @@ class ServeArgsTests(unittest.TestCase):
                 self.assertIsNone(caught.exception.__context__)
             config.chmod(0)
             try:
-                with patch.dict(os.environ, {"MESHDB_CONFIG": str(config)}):
+                with patch.dict(os.environ, {"NABEDRA_CONFIG": str(config)}):
                     if os.access(config, os.R_OK):
                         # Root can read chmod(0); emulate denial only there.
                         with patch("os.access", return_value=False), \
@@ -121,7 +121,7 @@ class ServeArgsTests(unittest.TestCase):
             finally:
                 config.chmod(0o600)
             self.assertEqual(len(set(failures)), 1)
-            self.assertIn("MESHDB_CONFIG", failures[0])
+            self.assertIn("NABEDRA_CONFIG", failures[0])
             self.assertNotIn(directory, failures[0])
             self.assertNotIn("private", failures[0])
 

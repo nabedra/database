@@ -25,7 +25,7 @@ impl Fixture {
     pub(in crate::node::auth) fn new() -> Self {
         let key = WorkerSigningKey::new().unwrap();
         let api = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
-        let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+        let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
         let fingerprint = Template::decode(&serde_json::to_vec(&template).unwrap())
             .unwrap()
             .fingerprint()
@@ -130,7 +130,7 @@ impl Fixture {
         let sig = if auth.sender().role() == Role::Worker {
             self.key.sign_request(&auth).unwrap().to_vec()
         } else {
-            let mut input = b"meshdb.http-request.v1\0".to_vec();
+            let mut input = b"nabedra.http-request.v1\0".to_vec();
             input.extend_from_slice(text.as_bytes());
             self.api.sign(&input).as_ref().to_vec()
         };

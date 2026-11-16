@@ -11,8 +11,8 @@ CLI_VERSION = '0.1.0'
 CONFIG_VERSION = 2
 PROTOCOL_VERSION = 1
 BINARY_FAILURE = (
-    'Cannot launch compatible meshdb-server. Set MESHDB_SERVER_BINARY to an '
-    'executable file path or put meshdb-server on PATH.'
+    'Cannot launch compatible nabedra-database-server. Set NABEDRA_SERVER_BINARY to an '
+    'executable file path or put nabedra-database-server on PATH.'
 )
 
 
@@ -24,7 +24,7 @@ def binary_version(path):
                                     stdout=output, stderr=subprocess.DEVNULL, timeout=5)
             output.seek(0)
             data = output.read(257)
-        match = re.fullmatch(rb'meshdb-server (0\.1\.\d+)\s*', data)
+        match = re.fullmatch(rb'nabedra-database-server (0\.1\.\d+)\s*', data)
         if result.returncode == 0 and match:
             return match[1].decode('ascii')
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -38,9 +38,9 @@ def resolve_server_binary(*, check=False):
     Launchers set check=True to probe compatibility. Resolution alone remains
     inert for callers that only need to inspect the executable path.
     """
-    explicit = 'MESHDB_SERVER_BINARY' in os.environ
-    candidates = [os.environ['MESHDB_SERVER_BINARY']] if explicit else [
-        str(Path(sys.prefix) / 'bin' / 'meshdb-server'), shutil.which('meshdb-server')]
+    explicit = 'NABEDRA_SERVER_BINARY' in os.environ
+    candidates = [os.environ['NABEDRA_SERVER_BINARY']] if explicit else [
+        str(Path(sys.prefix) / 'bin' / 'nabedra-database-server'), shutil.which('nabedra-database-server')]
     for candidate in candidates:
         if candidate:
             path = os.path.abspath(candidate)

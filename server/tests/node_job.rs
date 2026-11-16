@@ -1,4 +1,4 @@
-use meshdb_server::node::job::{
+use nabedra_database_server::node::job::{
     PartMeta, PreparationValidator, encode_job, encode_part_meta, encode_result, parse_get_rows,
     parse_job, parse_part_meta, parse_result, validate_get_rows,
 };
@@ -227,7 +227,7 @@ fn nested_wire_objects_and_error_records_are_strict() {
     );
     let get = parse_result(&serde_json::to_vec(&get).unwrap(), &j).unwrap();
     let mut missing = get.clone();
-    if let meshdb_server::node::job::JobResult::Get { found, .. } = &mut missing.result {
+    if let nabedra_database_server::node::job::JobResult::Get { found, .. } = &mut missing.result {
         *found = false;
     }
     assert!(parse_get_rows(b"[]", &missing, &j).is_ok());
@@ -300,7 +300,7 @@ fn internal_get_row_can_exceed_public_response_cap() {
         vec![serde_json::from_value(json!({"id":1,"score":"\0".repeat(3*1024*1024)})).unwrap()];
     assert!(validate_get_rows(&r, &j, &rows).unwrap() > 16 * 1024 * 1024);
     let mut too_small = r.clone();
-    if let meshdb_server::node::job::JobResult::Get {
+    if let nabedra_database_server::node::job::JobResult::Get {
         source_payload_bytes,
         ..
     } = &mut too_small.result
@@ -325,10 +325,12 @@ fn preparation_metadata_stream_scales_and_requires_complete_cover() {
         let mut v = PreparationValidator::new(&r, &j).unwrap();
         for i in 0..count {
             let p = PartMeta {
-                range: meshdb_server::storage::KeyRange {
-                    lower: (i > 0).then_some(meshdb_server::protocol::Key::Int64(i as i64)),
-                    upper: (i + 1 < count)
-                        .then_some(meshdb_server::protocol::Key::Int64((i + 1) as i64)),
+                range: nabedra_database_server::storage::KeyRange {
+                    lower: (i > 0)
+                        .then_some(nabedra_database_server::protocol::Key::Int64(i as i64)),
+                    upper: (i + 1 < count).then_some(
+                        nabedra_database_server::protocol::Key::Int64((i + 1) as i64),
+                    ),
                 },
                 row_count: 1,
                 payload_bytes: 64,
@@ -366,17 +368,17 @@ fn preparation_metadata_stream_scales_and_requires_complete_cover() {
     assert!(v.finish().is_err());
     let r = control(2).unwrap();
     let mut left = p.clone();
-    left.range.upper = Some(meshdb_server::protocol::Key::Int64(10));
+    left.range.upper = Some(nabedra_database_server::protocol::Key::Int64(10));
     let mut right = p.clone();
-    right.range.lower = Some(meshdb_server::protocol::Key::Int64(11));
+    right.range.lower = Some(nabedra_database_server::protocol::Key::Int64(11));
     let mut v = PreparationValidator::new(&r, &j).unwrap();
     v.push(&left).unwrap();
     assert!(v.finish().is_err());
     let mut v = PreparationValidator::new(&r, &j).unwrap();
     v.push(&left).unwrap();
     assert!(v.push(&right).is_err());
-    right.range.lower = Some(meshdb_server::protocol::Key::Int64(10));
-    right.range.upper = Some(meshdb_server::protocol::Key::Int64(20));
+    right.range.lower = Some(nabedra_database_server::protocol::Key::Int64(10));
+    right.range.upper = Some(nabedra_database_server::protocol::Key::Int64(20));
     let mut v = PreparationValidator::new(&r, &j).unwrap();
     v.push(&left).unwrap();
     assert!(v.push(&right).is_err());

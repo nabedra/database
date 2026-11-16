@@ -1,4 +1,4 @@
-MeshDB should share worker CPU and memory across concurrent requests while preserving accepted work through individual failures and publishing each mutation atomically.
+Nabedra Database should share worker CPU and memory across concurrent requests while preserving accepted work through individual failures and publishing each mutation atomically.
 
 Status: approved requirements recorded on 2026-11-15, implemented by the resource-aware scheduling change. Execution evidence and its integration boundaries are recorded in [the acceptance ledger](../docs/testing/scheduler-evidence.md). The latest queue requirement supersedes a disk-durable queue: surviving worker memory preserves outstanding work; stopping every worker abandons it. Durable table data remains intact.
 

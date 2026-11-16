@@ -79,7 +79,7 @@ def main():
     duplicates = sum(run["duplicate_identities"] for run in runs)
     rejected = sum(run["rejected_requests"] for run in runs)
     peak_rss = max(run["process_peak_rss_bytes"] for run in runs) / 2**20
-    fig.suptitle("MeshDB resource/pool microbenchmark\n"
+    fig.suptitle("Nabedra Database resource/pool microbenchmark\n"
                  f"Actual measured runs: {len(runs)} | failed jobs {failed} | rejected requests {rejected} | "
                  f"lost {lost} | duplicate {duplicates} | process RSS high-water {peak_rss:.1f} MiB", fontsize=13)
     for axis in axes.flat:

@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 from test_callback_protocol import C, I, TOKEN, command, wire
 
-if (Path(__file__).parents[1] / 'src/meshdb/_callback_bridge.py').exists():
-    from meshdb import _callback_bridge as implementation
+if (Path(__file__).parents[1] / 'src/nabedra/_callback_bridge.py').exists():
+    from nabedra import _callback_bridge as implementation
 else:
     implementation = None
 

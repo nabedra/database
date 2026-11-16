@@ -173,6 +173,7 @@ fn digest(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+// The callback adapter tag is a persisted format contract, retained across renames.
 impl Config {
     fn validate_fields(&self) -> Result<(), ControlError> {
         check(

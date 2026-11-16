@@ -11,6 +11,7 @@ use std::fmt;
 use uuid::Uuid;
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+// These domains are part of persisted cluster identity, independent of branding.
 const SECRET: &str = "meshdb.config-secret.v1";
 const ROOTS: &str = "meshdb.config-roots.v1";
 const CHAIN: &str = "meshdb.config-chain.v1";

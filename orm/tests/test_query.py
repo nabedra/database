@@ -2,7 +2,7 @@
 import unittest
 from dataclasses import FrozenInstanceError, dataclass
 
-from meshdb import Expr, Query, ValidationError, col
+from nabedra import Expr, Query, ValidationError, col
 
 
 @dataclass(frozen=True)

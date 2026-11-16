@@ -115,7 +115,7 @@ async fn operations<B: ObjectStore + 'static>(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    if request.headers().contains_key("x-meshdb-storage")
+    if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
         return failure(
@@ -237,7 +237,7 @@ async fn submit_request<B: ObjectStore + 'static>(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    if request.headers().contains_key("x-meshdb-storage")
+    if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
         return failure(
@@ -285,7 +285,7 @@ async fn receipt_request<B: ObjectStore + 'static>(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    if request.headers().contains_key("x-meshdb-storage")
+    if request.headers().contains_key("x-nabedra-storage")
         || !authenticated(request.headers(), &state.token)
     {
         return failure(

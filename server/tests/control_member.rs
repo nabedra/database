@@ -1,4 +1,4 @@
-use meshdb_server::cluster::member::{Heartbeat, Intent, MemberError, Node};
+use nabedra_database_server::cluster::member::{Heartbeat, Intent, MemberError, Node};
 use serde_json::{Value, json};
 
 const ID: &str = "11111111-1111-4111-8111-111111111111";

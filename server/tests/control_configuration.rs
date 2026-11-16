@@ -1,4 +1,4 @@
-use meshdb_server::cluster::configuration::{
+use nabedra_database_server::cluster::configuration::{
     ConfigurationError, MAX_TEMPLATE_BYTES, MAX_TIMING_BYTES, Storage, Template, Timing,
 };
 use serde_json::{Value, json};
@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 fn fixture() -> Value {
     json!({"api_urls":["http://API.example:8080/"],"listen":"[::1]:0",
         "storage":{"driver":"http","options":{"base_url":"http://store:0/prefix/",
-        "namespace":"meshdb/","token_file":"/outgoing/token","ca_file":null}},
+        "namespace":"nabedra/","token_file":"/outgoing/token","ca_file":null}},
         "tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,
         "partition_size":"64 MiB"})
 }
@@ -24,7 +24,7 @@ fn round_trip_and_canonical_fingerprint_preserve_complete_outgoing_template() {
         Template::decode(&original.encode().unwrap()).unwrap(),
         original
     );
-    let reordered = br#"{ "tls":null,"storage":{"options":{"token_file":"/outgoing/token","namespace":"meshdb/","ca_file":null,"base_url":"http://store:0/prefix/"},"driver":"http"},"queue_size":64,"partition_slots":4,"partition_size":"64 MiB","operation_slots":4,"listen":"[::1]:0","api_urls":["http://API.example:8080/"] }"#;
+    let reordered = br#"{ "tls":null,"storage":{"options":{"token_file":"/outgoing/token","namespace":"nabedra/","ca_file":null,"base_url":"http://store:0/prefix/"},"driver":"http"},"queue_size":64,"partition_slots":4,"partition_size":"64 MiB","operation_slots":4,"listen":"[::1]:0","api_urls":["http://API.example:8080/"] }"#;
     assert_eq!(
         Template::decode(reordered).unwrap().fingerprint().unwrap(),
         original.fingerprint().unwrap()
@@ -34,7 +34,7 @@ fn round_trip_and_canonical_fingerprint_preserve_complete_outgoing_template() {
     let digest = original.fingerprint().unwrap();
     assert_eq!(
         digest,
-        "482f97cb90d2767fdd59ec23e93f29103ab92290f0ccaa87d658c459c7185c66"
+        "334e289caddcdde856c9d7e7942f59638ae71a9a96591aa817f16cc7abf26156"
     );
     assert_eq!(digest.len(), 64);
     assert!(
@@ -237,7 +237,7 @@ fn constructed_candidates_enforce_paths_capacities_and_encoded_limits() {
         o.token_file = "\u{1}".repeat(2048);
         o.ca_file = Some("\u{2}".repeat(2048));
     }
-    t.tls = Some(meshdb_server::cluster::configuration::Tls {
+    t.tls = Some(nabedra_database_server::cluster::configuration::Tls {
         cert_file: "\u{3}".repeat(2048),
         key_file: "\u{4}".repeat(2048),
         ca_file: "\u{5}".repeat(2048),
@@ -308,7 +308,8 @@ fn full_timing_defaults_and_relations_are_checked_on_decode_and_encode() {
 #[test]
 fn s3_requires_feature_and_exact_bucket_options() {
     let mut v = fixture();
-    v["storage"] = json!({"driver":"s3","options":{"bucket":"meshdb-test","namespace":"meshdb/"}});
+    v["storage"] =
+        json!({"driver":"s3","options":{"bucket":"nabedra-test","namespace":"nabedra/"}});
     #[cfg(not(feature = "s3"))]
     assert_eq!(decode(&v), Err(ConfigurationError::UnsupportedStorage));
     #[cfg(feature = "s3")]

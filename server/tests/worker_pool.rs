@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     protocol::{ErrorCode, Outcome},
     worker_pool::WorkerPool,
 };
@@ -38,7 +38,7 @@ async fn shared_threads_refill_any_free_executor_and_bound_work() {
                     let before = thread::current().id();
                     assert_eq!(
                         thread::current().name(),
-                        Some(format!("meshdb-worker-{id}").as_str())
+                        Some(format!("nabedra-worker-{id}").as_str())
                     );
                     started.send((id, before)).unwrap();
                     runtime.block_on(async {

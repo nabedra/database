@@ -1,6 +1,6 @@
 """Configured infrastructure adapters for the synchronous serve callbacks.
 
-KubernetesProvider requires an image containing Python 3 and meshdb-server,
+KubernetesProvider requires an image containing Python 3 and nabedra-database-server,
 network access from Pods to the configured API/storage URLs, and explicit RBAC
 for Pods and Secrets in one namespace. No infrastructure is created on import.
 """
@@ -45,17 +45,17 @@ class _NoRedirect(HTTPRedirectHandler):
 
 
 _POD_RUNNER = """import json, os
-with open('/meshdb/bootstrap.json') as source:
+with open('/nabedra/bootstrap.json') as source:
     bootstrap = json.load(source)
-address = os.environ['MESHDB_POD_IP']
+address = os.environ['NABEDRA_POD_IP']
 if ':' in address:
     address = '[' + address + ']'
 port = int(bootstrap['listen'].rsplit(':', 1)[1])
 bootstrap['advertise_url'] = ('https' if bootstrap['tls'] else 'http') + '://' + address + ':' + str(port)
-path = '/tmp/meshdb-worker-bootstrap.json'
+path = '/tmp/nabedra-worker-bootstrap.json'
 with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as target:
     json.dump(bootstrap, target)
-os.execvp('meshdb-server', ['meshdb-server', 'worker', '--bootstrap', path])
+os.execvp('nabedra-database-server', ['nabedra-database-server', 'worker', '--bootstrap', path])
 """
 
 
@@ -66,6 +66,8 @@ class KubernetesProvider:
     Each launch retains a Secret containing bootstrap and lifecycle evidence.
     Retained Secrets let a replacement controller reconcile a completed delete.
     The adapter never deletes a Secret automatically.
+    New launches use nabedra identities. Existing meshdb Kubernetes identities
+    remain readable with their original lifecycle annotations and Pod UID.
     """
 
     def __init__(self, *, api_url: str, token: str, namespace: str,
@@ -98,7 +100,7 @@ class KubernetesProvider:
         if (not isinstance(self._volume_mounts, list) or
                 any(not isinstance(v, dict) or v.get('name') == 'bootstrap' or
                     not isinstance(v.get('mountPath'), str) or v['mountPath'] == '/' or
-                    v['mountPath'].rstrip('/') == '/meshdb' or v['mountPath'].startswith('/meshdb/')
+                    v['mountPath'].rstrip('/') == '/nabedra' or v['mountPath'].startswith('/nabedra/')
                     for v in self._volume_mounts) or
                 not isinstance(self._pod_spec.get('volumes', []), list) or
                 any(not isinstance(v, dict) or v.get('name') == 'bootstrap' for v in self._pod_spec.get('volumes', []))):
@@ -133,22 +135,45 @@ class KubernetesProvider:
         except (OSError, URLError, ValueError):
             raise ProviderError('Kubernetes request failed') from None
 
-    def _labels(self, node, launch):
-        return {'meshdb.io/cluster': self.cluster_id, 'meshdb.io/node': node,
-                'meshdb.io/launch': launch}
+    def _labels(self, node, launch, prefix='nabedra.io'):
+        return {prefix + '/cluster': self.cluster_id, prefix + '/node': node,
+                prefix + '/launch': launch}
+
+    def _identity_prefix(self, meta):
+        # Kubernetes identities survive an SDK upgrade. Read the old namespace,
+        # but never combine its ownership or lifecycle evidence with the new one.
+        labels = meta.get('labels', {})
+        prefixes = [prefix for prefix in ('nabedra.io', 'meshdb.io')
+                    if any(key.startswith(prefix + '/') for key in labels)]
+        if len(prefixes) != 1:
+            raise ProviderError('Kubernetes resource ownership mismatch')
+        prefix = prefixes[0]
+        other = 'meshdb.io' if prefix == 'nabedra.io' else 'nabedra.io'
+        if any(key.startswith(other + '/') for key in meta.get('annotations', {})):
+            raise ProviderError('Kubernetes resource lifecycle namespace mismatch')
+        return prefix
+
+    def _annotation(self, meta, field):
+        return meta.get('annotations', {}).get(self._identity_prefix(meta) + '/' + field)
+
+    def _launch_name(self, meta, launch):
+        return ('nabedra-' if self._identity_prefix(meta) == 'nabedra.io' else 'meshdb-') + launch
 
     def _owned(self, record, *, node=None, launch=None):
         meta = record.get('metadata', {})
         labels = meta.get('labels', {})
+        prefix = self._identity_prefix(meta)
         try:
-            n, l = labels['meshdb.io/node'], labels['meshdb.io/launch']
+            n, l = labels[prefix + '/node'], labels[prefix + '/launch']
             valid = str(UUID(n)) == n and str(UUID(l)) == l
         except (KeyError, ValueError, AttributeError, TypeError):
             valid = False
         if (not valid or meta.get('namespace') != self.namespace or
-                labels.get('meshdb.io/cluster') != self.cluster_id or
+                labels.get(prefix + '/cluster') != self.cluster_id or
                 (node is not None and n != node) or (launch is not None and l != launch)):
             raise ProviderError('Kubernetes resource ownership mismatch')
+        if meta.get('name') != self._launch_name(meta, l):
+            raise ProviderError('Kubernetes resource identity mismatch')
         return meta, n, l
 
     def _secret(self, name):
@@ -161,14 +186,15 @@ class KubernetesProvider:
         meta, _, _ = self._owned(secret)
         # The resourceVersion compares the Secret version; never overwrite another writer.
         annotations = dict(meta.get('annotations', {}))
-        previous = annotations.get('meshdb.io/pod-uid')
+        prefix = self._identity_prefix(meta)
+        previous = annotations.get(prefix + '/pod-uid')
         if previous is not None and previous != uid:
             raise ProviderError('Kubernetes launch UID changed')
-        if previous == uid and (not terminated or annotations.get('meshdb.io/terminated') == 'true'):
+        if previous == uid and (not terminated or annotations.get(prefix + '/terminated') == 'true'):
             return secret
-        annotations['meshdb.io/pod-uid'] = uid
+        annotations[prefix + '/pod-uid'] = uid
         if terminated:
-            annotations['meshdb.io/terminated'] = 'true'
+            annotations[prefix + '/terminated'] = 'true'
         replacement = copy.deepcopy(secret)
         replacement['metadata']['annotations'] = annotations
         return self._request('PUT', self._secret(meta['name']), replacement)
@@ -180,7 +206,7 @@ class KubernetesProvider:
         node, launch = payload['node_id'], payload['request_id']
         if any(str(UUID(value)) != value for value in (node, launch)):
             raise ProviderError('Invalid Kubernetes launch identity')
-        name = 'meshdb-' + launch
+        name = 'nabedra-' + launch
         try:
             port = int(payload['bootstrap']['listen'].rsplit(':', 1)[1])
         except (KeyError, ValueError, IndexError, AttributeError):
@@ -191,23 +217,29 @@ class KubernetesProvider:
         digest = hashlib.sha256(bootstrap).hexdigest()
         secret_path = self._secret(name)
         secret = self._request('GET', secret_path, missing=True)
+        legacy_name = 'meshdb-' + launch
+        legacy = self._request('GET', self._secret(legacy_name), missing=True)
+        if legacy is not None:
+            if secret is not None:
+                raise ProviderError('Kubernetes launch has multiple resource identities')
+            name, secret = legacy_name, legacy
         if secret is None:
             self._request('POST', self._base + '/secrets', {
                 'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
                 'metadata': {'name': name, 'namespace': self.namespace,
                              'labels': self._labels(node, launch),
-                             'annotations': {'meshdb.io/bootstrap-sha256': digest}},
+                             'annotations': {'nabedra.io/bootstrap-sha256': digest}},
                 'data': {'bootstrap.json': base64.b64encode(bootstrap).decode()}}, conflict=True)
             secret = self._request('GET', secret_path)
         meta, _, _ = self._owned(secret, node=node, launch=launch)
-        if (meta.get('annotations', {}).get('meshdb.io/bootstrap-sha256') != digest or
+        if (self._annotation(meta, 'bootstrap-sha256') != digest or
                 secret.get('data', {}).get('bootstrap.json') != base64.b64encode(bootstrap).decode() or
-                meta.get('annotations', {}).get('meshdb.io/terminated') == 'true'):
+                self._annotation(meta, 'terminated') == 'true'):
             raise ProviderError('Kubernetes launch identity conflict')
         pod = self._request('GET', self._pod(name), missing=True)
         if pod is None:
             # A recorded UID is never reused after an uncertain or completed removal.
-            if meta.get('annotations', {}).get('meshdb.io/pod-uid'):
+            if self._annotation(meta, 'pod-uid'):
                 raise ProviderError('Kubernetes launch was already removed')
             spec = copy.deepcopy(self._pod_spec)
             extra_volumes = spec.pop('volumes', [])
@@ -215,8 +247,8 @@ class KubernetesProvider:
                         volumes=[{'name': 'bootstrap', 'secret': {'secretName': name, 'defaultMode': 256}}] + extra_volumes,
                         containers=[{'name': 'worker', 'image': self._image,
                                      'command': ['python3', '-c', _POD_RUNNER],
-                                     'env': [{'name': 'MESHDB_POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
-                                     'volumeMounts': [{'name': 'bootstrap', 'mountPath': '/meshdb', 'readOnly': True}] + copy.deepcopy(self._volume_mounts)}])
+                                     'env': [{'name': 'NABEDRA_POD_IP', 'valueFrom': {'fieldRef': {'fieldPath': 'status.podIP'}}}],
+                                     'volumeMounts': [{'name': 'bootstrap', 'mountPath': '/nabedra', 'readOnly': True}] + copy.deepcopy(self._volume_mounts)}])
             # Match Template::worker_resources for omitted explicit resources.
             resources = payload['bootstrap'].get('resources') or {
                 'max_threads': payload['bootstrap']['partition_slots'], 'memory_limit_bytes': 8 << 30}
@@ -227,7 +259,7 @@ class KubernetesProvider:
             self._request('POST', self._base + '/pods', {
                 'apiVersion': 'v1', 'kind': 'Pod',
                 'metadata': {'name': name, 'namespace': self.namespace,
-                             'labels': self._labels(node, launch)}, 'spec': spec}, conflict=True)
+                             'labels': self._labels(node, launch, self._identity_prefix(meta))}, 'spec': spec}, conflict=True)
             pod = self._request('GET', self._pod(name))
         pod_meta, _, _ = self._owned(pod, node=node, launch=launch)
         uid = pod_meta.get('uid')
@@ -242,11 +274,11 @@ class KubernetesProvider:
             namespace, name, uid = resource_id.split('/')
         except (ValueError, AttributeError):
             raise ProviderError('Invalid Kubernetes resource identity') from None
-        if namespace != self.namespace or not name.startswith('meshdb-') or not uid:
+        if namespace != self.namespace or not name.startswith(('nabedra-', 'meshdb-')) or not uid:
             raise ProviderError('Kubernetes resource ownership mismatch')
         secret = self._request('GET', self._secret(name))
         meta, node, launch = self._owned(secret)
-        if name != 'meshdb-' + launch or meta.get('annotations', {}).get('meshdb.io/pod-uid') != uid:
+        if name != self._launch_name(meta, launch) or self._annotation(meta, 'pod-uid') != uid:
             raise ProviderError('Kubernetes resource ownership mismatch')
         pod = self._request('GET', self._pod(name), missing=True)
         if pod is not None:
@@ -263,44 +295,50 @@ class KubernetesProvider:
     @_bounded_call
     def list_nodes(self) -> list[dict]:
         result = []
-        query = {'labelSelector': 'meshdb.io/cluster=' + self.cluster_id, 'limit': '64'}
-        continuations = set()
-        while True:
-            page = self._request('GET', self._base + '/secrets?' + urlencode(query))
-            if not isinstance(page.get('items'), list):
-                raise ProviderError('Invalid Kubernetes inventory')
-            for secret in page['items']:
-                meta, node, launch = self._owned(secret)
-                if meta.get('name') != 'meshdb-' + launch:
-                    raise ProviderError('Kubernetes resource identity mismatch')
-                pod = self._request('GET', self._pod(meta['name']), missing=True)
-                uid = meta.get('annotations', {}).get('meshdb.io/pod-uid')
-                if pod is not None:
-                    pod_meta, _, _ = self._owned(pod, node=node, launch=launch)
-                    if uid is not None and pod_meta.get('uid') != uid:
-                        raise ProviderError('Kubernetes Pod UID changed')
-                    uid = pod_meta['uid']
-                    phase = pod.get('status', {}).get('phase')
-                    if meta.get('annotations', {}).get('meshdb.io/terminated') == 'true' and phase not in ('Failed', 'Succeeded'):
-                        raise ProviderError('Kubernetes terminated resource reappeared')
-                    state = ('terminated' if phase in ('Failed', 'Succeeded') else
-                             'stopping' if pod_meta.get('deletionTimestamp') else
-                             'running' if phase == 'Running' else 'starting')
-                    if meta.get('annotations', {}).get('meshdb.io/pod-uid') is None:
-                        self._retain_uid(secret, uid)
-                elif uid:
-                    self._retain_uid(secret, uid, terminated=True)
-                    state = 'terminated'
-                else:
-                    continue  # Secret installation alone does not prove Pod creation.
-                result.append(dict(resource_id=self.namespace + '/' + meta['name'] + '/' + uid,
-                                   cluster_id=self.cluster_id, node_id=node, request_id=launch, state=state))
-                if len(result) > 4096:
-                    raise ProviderError('Kubernetes inventory exceeds callback limit')
-            continuation = page.get('metadata', {}).get('continue')
-            if not continuation:
-                return result
-            if continuation in continuations or len(continuations) >= 63:
-                raise ProviderError('Kubernetes inventory pagination exceeded its bound')
-            continuations.add(continuation)
-            query['continue'] = continuation
+        launches = set()
+        for prefix in ('nabedra.io', 'meshdb.io'):
+            query = {'labelSelector': prefix + '/cluster=' + self.cluster_id, 'limit': '64'}
+            continuations = set()
+            while True:
+                page = self._request('GET', self._base + '/secrets?' + urlencode(query))
+                if not isinstance(page.get('items'), list):
+                    raise ProviderError('Invalid Kubernetes inventory')
+                for secret in page['items']:
+                    meta, node, launch = self._owned(secret)
+                    if self._identity_prefix(meta) != prefix or launch in launches:
+                        raise ProviderError('Kubernetes inventory identity conflict')
+                    launches.add(launch)
+                    pod = self._request('GET', self._pod(meta['name']), missing=True)
+                    uid = self._annotation(meta, 'pod-uid')
+                    if pod is not None:
+                        pod_meta, _, _ = self._owned(pod, node=node, launch=launch)
+                        if self._identity_prefix(pod_meta) != prefix:
+                            raise ProviderError('Kubernetes resource ownership mismatch')
+                        if uid is not None and pod_meta.get('uid') != uid:
+                            raise ProviderError('Kubernetes Pod UID changed')
+                        uid = pod_meta['uid']
+                        phase = pod.get('status', {}).get('phase')
+                        if self._annotation(meta, 'terminated') == 'true' and phase not in ('Failed', 'Succeeded'):
+                            raise ProviderError('Kubernetes terminated resource reappeared')
+                        state = ('terminated' if phase in ('Failed', 'Succeeded') else
+                                 'stopping' if pod_meta.get('deletionTimestamp') else
+                                 'running' if phase == 'Running' else 'starting')
+                        if self._annotation(meta, 'pod-uid') is None:
+                            self._retain_uid(secret, uid)
+                    elif uid:
+                        self._retain_uid(secret, uid, terminated=True)
+                        state = 'terminated'
+                    else:
+                        continue  # Secret installation alone does not prove Pod creation.
+                    result.append(dict(resource_id=self.namespace + '/' + meta['name'] + '/' + uid,
+                                       cluster_id=self.cluster_id, node_id=node, request_id=launch, state=state))
+                    if len(result) > 4096:
+                        raise ProviderError('Kubernetes inventory exceeds callback limit')
+                continuation = page.get('metadata', {}).get('continue')
+                if not continuation:
+                    break
+                if continuation in continuations or len(continuations) >= 63:
+                    raise ProviderError('Kubernetes inventory pagination exceeded its bound')
+                continuations.add(continuation)
+                query['continue'] = continuation
+        return result

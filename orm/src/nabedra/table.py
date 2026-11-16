@@ -137,7 +137,7 @@ class Table:
 def _table_from_descriptor(transport: _Transport, data: object) -> Table:
     """Decode one descriptor inside transport.request's decode callback.
 
-    DB uses decode=lambda data: _table_from_descriptor(transport, data).
+    Database uses decode=lambda data: _table_from_descriptor(transport, data).
     Invalid data raises ProtocolError, ValidationError or LimitExceededError.
     """
     return Table(transport, data)

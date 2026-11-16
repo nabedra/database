@@ -127,7 +127,7 @@ impl WorkerPool {
             let (exit, exit_rx) = oneshot::channel();
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let spawned = thread::Builder::new()
-                .name(format!("meshdb-worker-{id}"))
+                .name(format!("nabedra-worker-{id}"))
                 .spawn(move || {
                     let runtime = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()

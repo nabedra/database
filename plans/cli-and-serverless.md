@@ -1,76 +1,76 @@
-MeshDB should install from this repository and let one shared cluster execute client-defined operations after a Python server endpoint adds authorized storage credentials.
+Nabedra Database should install from this repository and let one shared cluster execute client-defined operations after a Python server endpoint adds authorized storage credentials.
 
 Status: approved and implemented, 2026-11-16. Package uploads and registry releases remain deferred. The gateway is framework independent and accepts plain HTTP data. The [usage guide](../docs/cli-and-serverless.md) records the implemented interfaces; the [execution ledger](../docs/testing/cli-serverless-evidence.md) distinguishes executed assertions from remaining acceptance boundaries. Final release installation and the listed installed S3 assertions passed; remaining acceptance boundaries are recorded in the execution ledger.
 
 Use two modes: `fixed` binds compute to one database; `serverless` accepts database context supplied by a trusted server endpoint. An S3 bucket and prefix identify a database containing multiple tables. Applications A and B share compute while their catalogs and tables remain separate. Workers stay running by default; automatic scale-to-zero is outside this proposal.
 
-The original Python CLI only launched workers and needed a separately built Rust binary. This implementation extends [that entry point](../orm/src/meshdb/cli.py), preserves the [public Python supervisor](../orm/src/meshdb/serve.py), and adds S3 selection and request-scoped data grants to [distributed workers](../server/src/node/runtime.rs). Fixed mode retains operator credential discovery; serverless data access uses explicit gateway snapshots.
+The original Python CLI only launched workers and needed a separately built Rust binary. This implementation extends [that entry point](../orm/src/nabedra/cli.py), preserves the [public Python supervisor](../orm/src/nabedra/serve.py), and adds S3 selection and request-scoped data grants to [distributed workers](../server/src/node/runtime.rs). Fixed mode retains operator credential discovery; serverless data access uses explicit gateway snapshots.
 
 ---
 
-Extend the existing `meshdb` entry point. A repository installer creates an isolated environment, installs the local ORM/CLI, builds the locked Rust release binary once, and copies it into the environment's `bin` directory. Require Python 3.11+ and the repository's Rust toolchain on the build machine. Starting an installed server invokes no Cargo.
+Extend the existing `nabedra` entry point. A repository installer creates an isolated environment, installs the local ORM/CLI, builds the locked Rust release binary once, and copies it into the environment's `bin` directory. Require Python 3.11+ and the repository's Rust toolchain on the build machine. Starting an installed server invokes no Cargo.
 
 ```sh
 # Setup from the repository root:
-python3.11 scripts/install_meshdb.py --prefix .meshdb
-.meshdb/bin/meshdb --version
+python3.11 scripts/install_nabedra.py --prefix .nabedra
+.nabedra/bin/nabedra --version
 # Install the ORM and server gateway into an application's environment:
-python -m pip install '/path/to/meshdb/orm[gateway]'
+python -m pip install '/path/to/nabedra-database/orm[gateway]'
 ```
 
-Activate `.meshdb/bin/activate` to use bare `meshdb` below. Use [regular local installs](https://pip.pypa.io/en/stable/topics/local-project-installs/) for deployments and editable installs for development. Keep the core ORM standard-library-only. The local `gateway` extra supplies HTTPX for sync/async forwarding; `aws` optionally supplies Boto3 credential discovery. The gateway imports no web framework, auto-detects no framework request types and ships no framework-specific handlers. Importing the ORM or displaying help performs no network, credential resolution or process startup.
+Activate `.nabedra/bin/activate` to use bare `nabedra` below. Use [regular local installs](https://pip.pypa.io/en/stable/topics/local-project-installs/) for deployments and editable installs for development. Keep the core ORM standard-library-only. The local `gateway` extra supplies HTTPX for sync/async forwarding; `aws` optionally supplies Boto3 credential discovery. The gateway imports no web framework, auto-detects no framework request types and ships no framework-specific handlers. Importing the ORM or displaying help performs no network, credential resolution or process startup.
 
-Support server builds on Linux and macOS; defer Windows server support because the supervisor uses POSIX facilities. The ORM remains platform independent. Defer public wheels, a separate runtime package, PyPI uploads and image-registry publishing. Resolve the binary in order: explicit `MESHDB_SERVER_BINARY`, compatible environment-local executable, compatible `meshdb-server` on `PATH`. Invalid explicit overrides stay errors. Preserve existing Rust commands and Python `serve()`; report CLI, binary, config and protocol versions through `meshdb --version --json`.
+Support server builds on Linux and macOS; defer Windows server support because the supervisor uses POSIX facilities. The ORM remains platform independent. Defer public wheels, a separate runtime package, PyPI uploads and image-registry publishing. Resolve the binary in order: explicit `NABEDRA_SERVER_BINARY`, compatible environment-local executable, compatible `nabedra-database-server` on `PATH`. Invalid explicit overrides stay errors. Preserve existing Rust commands and Python `serve()`; report CLI, binary, config and protocol versions through `nabedra --version --json`.
 
 ---
 
-Fixed mode uses the configured AWS profile/workload role and existing `MESHDB_TOKEN`:
+Fixed mode uses the configured AWS profile/workload role and existing `NABEDRA_TOKEN`:
 
 ```sh
-meshdb serve --mode fixed --storage s3://app-a/meshdb/ --region eu-west-1
+nabedra database serve --mode fixed --storage s3://app-a/nabedra/ --region eu-west-1
 ```
 
-Shared compute uses the operator's control bucket and a protected MeshDB data token for trusted application gateways. The compute role accesses control storage; customer data credentials arrive from gateway middleware.
+Shared compute uses the operator's control bucket and a protected Nabedra Database data token for trusted application gateways. The compute role accesses control storage; customer data credentials arrive from gateway middleware.
 
 ```sh
-meshdb init --mode serverless --control-storage s3://meshdb-ops/production/ \
-  --region eu-west-1 --data-token-file /run/secrets/meshdb-data \
-  --output meshdb.json
-meshdb doctor --config meshdb.json
-meshdb serve --config meshdb.json --local-workers 2
+nabedra database init --mode serverless --control-storage s3://nabedra-ops/production/ \
+  --region eu-west-1 --data-token-file /run/secrets/nabedra-data \
+  --output nabedra-database.json
+nabedra database doctor --config nabedra-database.json
+nabedra database serve --config nabedra-database.json --local-workers 2
 ```
 
 `init` writes strict version 2 JSON config and protected admin credentials if none were supplied. It prints paths, never secrets, refuses overwrites and provisions nothing. Ask for missing settings interactively; `--non-interactive` requires flags. Config holds secret-file references, worker resources, execution limits and cluster identity, without customer credentials. Preserve version 1 configuration support.
 
 `serve` supervises the API and local worker processes in the foreground, forwards signals, drains owned work and preserves failure status. `--local-workers` counts processes; `--threads-per-worker` sets each process's compute ceiling. Existing Rust `serve --workers` keeps its thread meaning. Preserve explicit `--cold-start`. Local and remote workers share enrollment and execution semantics. Production replicas require separate failure domains.
 
-Provide a local Dockerfile with `docker build -t meshdb:local .`. Deployment examples mount config/secrets, configure a workload role and HTTPS, and run `serve --config /etc/meshdb/meshdb.json`; separate workers use `worker --bootstrap /run/secrets/worker.json`. No implicit cloud provisioning, daemonization or image upload.
+Provide a local Dockerfile with `docker build -t nabedra-database:local .`. Deployment examples mount config/secrets, configure a workload role and HTTPS, and run `database serve --config /etc/nabedra/nabedra-database.json`; separate workers use `database worker --bootstrap /run/secrets/worker.json`. No implicit cloud provisioning, daemonization or image upload.
 
 | Command | Behavior |
 | --- | --- |
-| `meshdb init ...` | Generate configuration and secret references. |
-| `meshdb serve [--config meshdb.json]` | Start the supervised API and local workers; default config is `./meshdb.json`. |
-| `meshdb worker --bootstrap PATH` | Preserve the existing worker launcher. |
-| `meshdb doctor --config PATH` | Check versions, config, secret permissions and storage reads without changing data; identify unverified write permissions. |
-| `meshdb cluster status --url URL --admin-token-file PATH` | Report run, workers, pending work and resources; support `--json`. |
-| `meshdb cluster scale N --url URL --admin-token-file PATH` | Call the existing admin API; provisioning requires a configured provider. |
-| `meshdb database migrate --storage URI --region REGION --cluster-id UUID --confirm-writers-stopped` | Explicitly upgrade one catalog using authorized credentials and the intended owning cluster. |
+| `nabedra database init ...` | Generate configuration and secret references. |
+| `nabedra database serve [--config nabedra-database.json]` | Start the supervised API and local workers; default config is `./nabedra-database.json`. |
+| `nabedra database worker --bootstrap PATH` | Preserve the existing worker launcher. |
+| `nabedra database doctor --config PATH` | Check versions, config, secret permissions and storage reads without changing data; identify unverified write permissions. |
+| `nabedra database cluster status --url URL --admin-token-file PATH` | Report run, workers, pending work and resources; support `--json`. |
+| `nabedra database cluster scale N --url URL --admin-token-file PATH` | Call the existing admin API; provisioning requires a configured provider. |
+| `nabedra database migrate --storage URI --region REGION --cluster-id UUID --confirm-writers-stopped` | Explicitly upgrade one catalog using authorized credentials and the intended owning cluster. |
 
 Listeners default to loopback. External traffic and worker links use verified encrypted transports. Keep admin, worker and gateway-to-compute credentials separate. CLI exit codes are `0` success, `2` invalid arguments/config and `1` runtime failure; preserve signal termination status.
 
 ---
 
-Add a server-side `Gateway` helper that accepts the HTTP method, request path, header pairs and raw body bytes from any server. The user has already selected the query/mutation in that request. Gateway parses it into a typed, read-only operation, runs registered middleware, attaches trusted storage context and forwards the original operation to compute. The server handler never reconstructs it through `DB`, `Table`, `Query` or `DB.submit()`.
+Add a server-side `Gateway` helper that accepts the HTTP method, request path, header pairs and raw body bytes from any server. The user has already selected the query/mutation in that request. Gateway parses it into a typed, read-only operation, runs registered middleware, attaches trusted storage context and forwards the original operation to compute. The server handler never reconstructs it through `Database`, `Table`, `Query` or `Database.submit()`.
 
 The client keeps its existing ORM and points it at the application's endpoint:
 
 ```python
-from meshdb import DB
-db = DB("https://app.example.com/meshdb", application_token)
+from nabedra import Database
+db = Database(url="https://app.example.com/nabedra", token=application_token)
 # Existing table/query methods create the HTTP operations on the client.
 ```
 
-That client needs no AWS credentials or new `storage=` argument. The default database comes from authenticated identity. An optional `database=` selector can set `X-MeshDB-Database`; the gateway treats it as untrusted input and authorizes it. The operation body remains the current wire envelope, for example:
+That client needs no AWS credentials or new `storage=` argument. The default database comes from authenticated identity. An optional `database=` selector can set `X-Nabedra-Database`; the gateway treats it as untrusted input and authorizes it. The operation body remains the current wire envelope, for example:
 
 ```json
 {"request_id":"11111111-1111-4111-8111-111111111111","operation":"table.get","payload":{"table_id":"22222222-2222-4222-8222-222222222222","key":"first"}}
@@ -95,12 +95,12 @@ The block above specifies signatures; the proposed server usage is:
 
 ```python
 import os
-from meshdb.gateway import Gateway, GatewayContext, S3
+from nabedra.gateway import Gateway, GatewayContext, S3
 
 gateway = Gateway(
     cluster_url="https://compute.internal",
-    token=os.environ["MESHDB_COMPUTE_TOKEN"],
-    mount_path="/meshdb",
+    token=os.environ["NABEDRA_COMPUTE_TOKEN"],
+    mount_path="/nabedra",
 )
 
 @gateway.middleware
@@ -127,11 +127,11 @@ async def handle_http(method, path, header_pairs, raw_body):
 
 Missing storage, middleware denial/exception or credential-provider failure stops before forwarding. Middleware can inspect the existing operation for authorization; operation bytes, ID and destination are immutable. `handle()` accepts synchronous middleware; `handle_async()` accepts async callbacks and bridges sync callbacks through bounded thread capacity. Async-only middleware passed to `handle()` fails before forwarding. Use `with gateway` or `async with gateway`, or explicit `close()`/`aclose()`, to manage resources inside the application's worker lifetime.
 
-The optional HTTPX dependency is an HTTP transport, independent of the hosting framework. Use [its sync/async clients](https://www.python-httpx.org/async/) with bounded connections, explicit deadlines, verified TLS, no environment proxies/redirects and `retries=0` via [transport configuration](https://www.python-httpx.org/advanced/transports/). Translate rejections into a framework-neutral MeshDB error response; the hosting server returns those bytes/status without substituting framework error envelopes.
+The optional HTTPX dependency is an HTTP transport, independent of the hosting framework. Use [its sync/async clients](https://www.python-httpx.org/async/) with bounded connections, explicit deadlines, verified TLS, no environment proxies/redirects and `retries=0` via [transport configuration](https://www.python-httpx.org/advanced/transports/). Translate rejections into a framework-neutral Nabedra Database error response; the hosting server returns those bytes/status without substituting framework error envelopes.
 
-`S3(bucket, *, region, prefix="meshdb/", credentials)` accepts `AwsCredentials` or a zero-argument credential provider. `AwsCredentials(access_key_id, secret_access_key, *, session_token=None, expires_at=None)` uses a UTC datetime when expiry is known and includes the session token for temporary credentials. A lazy optional `meshdb.aws.default_credentials(profile=None)` uses a persistent Boto3 session and consistent snapshots with [SDK refresh behavior](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html). These types belong to the server integration; the public client sends no AWS secrets.
+`S3(bucket, *, region, prefix="nabedra/", credentials)` accepts `AwsCredentials` or a zero-argument credential provider. `AwsCredentials(access_key_id, secret_access_key, *, session_token=None, expires_at=None)` uses a UTC datetime when expiry is known and includes the session token for temporary credentials. A lazy optional `nabedra.aws.default_credentials(profile=None)` uses a persistent Boto3 session and consistent snapshots with [SDK refresh behavior](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html). These types belong to the server integration; the public client sends no AWS secrets.
 
-The middleware's Redis/existing-DB lookup uses verified user/tenant identity and the authorized database selector, never the request UUID as authentication. Prefer role references and scoped temporary credentials using [STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html) with [operator-generated external IDs](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html). MeshDB has no mandatory Redis dependency or separate resolver HTTP service. Persistent per-request queue data never belongs in Redis.
+The middleware's Redis/existing-Database lookup uses verified user/tenant identity and the authorized database selector, never the request UUID as authentication. Prefer role references and scoped temporary credentials using [STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html) with [operator-generated external IDs](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html). Nabedra Database has no mandatory Redis dependency or separate resolver HTTP service. Persistent per-request queue data never belongs in Redis.
 
 ---
 
@@ -143,13 +143,13 @@ Gateway generates the internal headers below from server middleware. Reject exte
 
 ```http
 Authorization: Bearer <private-gateway-compute-token>
-X-MeshDB-Storage: <base64url-authorized-storage-context>
+X-Nabedra-Storage: <base64url-authorized-storage-context>
 ```
 
-`X-MeshDB-Storage` is unpadded base64url of strict UTF-8 JSON:
+`X-Nabedra-Storage` is unpadded base64url of strict UTF-8 JSON:
 
 ```json
-{"version":1,"bucket":"app-a","region":"eu-west-1","prefix":"meshdb/","credentials":{"access_key_id":"<access-key>","secret_access_key":"<secret-key>","session_token":"<session-token>","expires_at":"2026-11-16T20:00:00Z"}}
+{"version":1,"bucket":"app-a","region":"eu-west-1","prefix":"nabedra/","credentials":{"access_key_id":"<access-key>","secret_access_key":"<secret-key>","session_token":"<session-token>","expires_at":"2026-11-16T20:00:00Z"}}
 ```
 
 Token/expiry may be null where absent. Allow only general-purpose S3 buckets and validated regions/prefixes; no caller-controlled endpoints, credential processes or profile paths. Bound decoded context to 16 KiB, its header to 24 KiB and total headers to 32 KiB; reject duplicates/unknown fields and charge buffers. Ship matching proxy limits. Require HTTPS, suppress secrets in logs/traces/errors and use `Cache-Control: no-store`. Fixed mode rejects storage context.
@@ -217,7 +217,7 @@ The assertion matrix below defines acceptance requirements. Task completion is n
 | SL05, T01-T06, R05 | Multiple gateways/APIs reach one storage key; second-cluster ownership conflicts and catalog fences prevent duplicate/lost publication. |
 | SL06, U02 | Oversized/duplicate/truncated protocol, bad selectors/paths and middleware denial/exception produce typed errors with zero upstream submissions; sentinel secrets appear in no captured logs/history. |
 | SL07, A01-A02, B01-B02 | Compare direct/shared execution and gateway cold/warm load; record middleware/lookup latency, queue/completion percentiles, throughput, RSS, charged bytes, S3/network costs and lost/duplicate IDs. |
-| GW01, Q05, U02 | Plain HTTP inputs call ordered middleware and forward once with the same ID/body, including numeric spelling/whitespace. Run with web frameworks absent; assert no framework imports/type detection or server-side DB/Table/Query invocation. |
+| GW01, Q05, U02 | Plain HTTP inputs call ordered middleware and forward once with the same ID/body, including numeric spelling/whitespace. Run with web frameworks absent; assert no framework imports/type detection or server-side Database/Table/Query invocation. |
 | GW02, Q04-Q06, T04 | Preserve upstream statuses, data/error envelopes and receipts; uncertain mutation transport never retries or reports not_applied/success. Receipt routes reauthorize without generating a new operation. |
 | GW03, F03, M02 | Concurrent users have separate contexts; middleware/provider failures never forward; async calls do not block their event loop, and disconnect/shutdown settles transport/buffers within bounds. Assert streamed input limits in host-integration fixtures. |
 

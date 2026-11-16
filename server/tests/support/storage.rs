@@ -1,5 +1,5 @@
 //! Conditional in-memory object backend shared by storage and later commit tests.
-use meshdb_server::storage::*;
+use nabedra_database_server::storage::*;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},

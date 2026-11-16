@@ -188,7 +188,7 @@ pub(crate) async fn serve_router_with_budget(
                 let class = if path == "/internal/v1/queue" {
                     request
                         .headers()
-                        .get("x-meshdb-queue-class")
+                        .get("x-nabedra-queue-class")
                         .and_then(|v| v.to_str().ok())
                         .unwrap_or("progress")
                 } else if path == "/internal/v1/enroll" {

@@ -1,4 +1,4 @@
-use meshdb_server::cluster::{
+use nabedra_database_server::cluster::{
     configuration::{Template, Timing},
     state::{Control, ControlError, MAX_CONTROL_BYTES},
 };
@@ -8,7 +8,7 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 fn root() -> Value {
-    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
     let hash = Template::decode(&serde_json::to_vec(&template).unwrap())
         .unwrap()
         .fingerprint()
@@ -175,7 +175,7 @@ fn fleet_first_stops_preserve_reserved_capacity() {
     assert_eq!(before.admission_bytes, 17039360);
     c.check_new_admission().unwrap();
     for node in &mut c.nodes {
-        node.state = meshdb_server::cluster::member::NodeState::Draining;
+        node.state = nabedra_database_server::cluster::member::NodeState::Draining;
     }
     assert_eq!(c.capacity().unwrap(), before);
     for k in 0..1024 {
@@ -189,7 +189,7 @@ fn fleet_first_stops_preserve_reserved_capacity() {
 }
 #[test]
 fn credits_follow_retained_witnesses_instead_of_phase_or_stop_result() {
-    use meshdb_server::cluster::member::{IntentOutcome, IntentState, NodeState};
+    use nabedra_database_server::cluster::member::{IntentOutcome, IntentState, NodeState};
     let mut c = fleet(1);
     for state in [NodeState::Lost, NodeState::Stopped, NodeState::Draining] {
         c.nodes[0].state = state;
@@ -240,16 +240,16 @@ fn saturated_reservations_allow_growth_and_first_stop_but_refuse_extra_identity(
     c.intents[1].resource_id = Some(resource);
     let incarnation = id(50000);
     let n = &mut c.nodes[1];
-    n.state = meshdb_server::cluster::member::NodeState::Draining;
-    n.registration = meshdb_server::cluster::member::Registration::Registered;
+    n.state = nabedra_database_server::cluster::member::NodeState::Draining;
+    n.registration = nabedra_database_server::cluster::member::Registration::Registered;
     n.incarnation = Some(incarnation);
     n.endpoint = Some(format!("http://worker/{}", "x".repeat(2034)));
     n.retired_incarnations = (0..16).map(|k| id(60000 + k)).collect();
-    n.session = Some(meshdb_server::cluster::member::Session {
+    n.session = Some(nabedra_database_server::cluster::member::Session {
         id: id(70000),
         verifier: "f".repeat(64),
     });
-    n.drain = Some(meshdb_server::cluster::member::Drain {
+    n.drain = Some(nabedra_database_server::cluster::member::Drain {
         id: id(70001),
         requested_at_ms: u64::MAX,
         ack_seq: Some(u64::MAX),
@@ -261,7 +261,7 @@ fn saturated_reservations_allow_growth_and_first_stop_but_refuse_extra_identity(
     i.deadline_ms = u64::MAX;
     i.retry_at_ms = u64::MAX;
     i.error_code = Some("e".repeat(256));
-    i.delivery = Some(meshdb_server::cluster::member::Delivery {
+    i.delivery = Some(nabedra_database_server::cluster::member::Delivery {
         invocation_id: id(70002),
         owner_id: id(70003),
         epoch: u64::MAX,
@@ -289,16 +289,17 @@ fn cross_bindings_incarnations_external_members_and_late_recovery() {
     for k in 0..2 {
         c.nodes[k].incarnation = Some(id(80000 + k as u128));
         c.nodes[k].endpoint = Some("http://worker/".into());
-        c.nodes[k].session = Some(meshdb_server::cluster::member::Session {
+        c.nodes[k].session = Some(nabedra_database_server::cluster::member::Session {
             id: id(90000 + k as u128),
             verifier: "a".repeat(64),
         });
-        c.nodes[k].registration = meshdb_server::cluster::member::Registration::Registered;
-        c.nodes[k].state = meshdb_server::cluster::member::NodeState::Draining;
+        c.nodes[k].registration =
+            nabedra_database_server::cluster::member::Registration::Registered;
+        c.nodes[k].state = nabedra_database_server::cluster::member::NodeState::Draining;
     }
     c.nodes[0].resource_id = None;
     c.intents[0].resource_id = None;
-    c.intents[0].state = meshdb_server::cluster::member::IntentState::Reconciling;
+    c.intents[0].state = nabedra_database_server::cluster::member::IntentState::Reconciling;
     c.intents[0].outcome = None;
     Control::decode(&c.encode().unwrap()).unwrap();
     let mut bad = c.clone();
@@ -406,18 +407,18 @@ fn policy_lease_nested_strictness_and_template_hash_use_real_codecs() {
     let mut c = fleet(1);
     c.nodes[0].incarnation = Some(id(123));
     c.nodes[0].endpoint = Some("http://worker/".into());
-    c.nodes[0].registration = meshdb_server::cluster::member::Registration::Registered;
-    c.nodes[0].session = Some(meshdb_server::cluster::member::Session {
+    c.nodes[0].registration = nabedra_database_server::cluster::member::Registration::Registered;
+    c.nodes[0].session = Some(nabedra_database_server::cluster::member::Session {
         id: id(124),
         verifier: "d".repeat(64),
     });
-    c.nodes[0].drain = Some(meshdb_server::cluster::member::Drain {
+    c.nodes[0].drain = Some(nabedra_database_server::cluster::member::Drain {
         id: id(125),
         requested_at_ms: 0,
         ack_seq: None,
         confirmed_idle: false,
     });
-    c.intents[0].delivery = Some(meshdb_server::cluster::member::Delivery {
+    c.intents[0].delivery = Some(nabedra_database_server::cluster::member::Delivery {
         invocation_id: id(126),
         owner_id: id(127),
         epoch: 1,
@@ -468,10 +469,10 @@ fn generation_two_requires_worker_semantic_identity() {
     constructed.validate().unwrap();
     assert_eq!(Control::decode(&constructed.encode().unwrap()).unwrap(), c);
     let config = serde_json::to_vec(&good["config"]).unwrap();
-    let config = meshdb_server::cluster::state::Config::decode(&config).unwrap();
+    let config = nabedra_database_server::cluster::state::Config::decode(&config).unwrap();
     config.validate().unwrap();
     assert_eq!(
-        meshdb_server::cluster::state::Config::decode(&config.encode().unwrap()).unwrap(),
+        nabedra_database_server::cluster::state::Config::decode(&config.encode().unwrap()).unwrap(),
         config
     );
 

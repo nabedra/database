@@ -50,7 +50,7 @@ fn proof_for(session: u128, incarnation: u128) -> EnrollmentProof {
         id(session),
         hex(key.public_key().as_ref())
     );
-    let mut message = b"meshdb.enroll.v1\0".to_vec();
+    let mut message = b"nabedra.enroll.v1\0".to_vec();
     message.extend_from_slice(unsigned.as_bytes());
     let signed = format!(
         "{},\"proof\":\"{}\"}}",

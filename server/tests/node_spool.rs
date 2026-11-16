@@ -1,4 +1,4 @@
-use meshdb_server::node::spool::{Spool, SpoolError, SpoolLimits};
+use nabedra_database_server::node::spool::{Spool, SpoolError, SpoolLimits};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs,
@@ -10,7 +10,8 @@ use std::{
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("meshdb-spool-test-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("nabedra-spool-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }

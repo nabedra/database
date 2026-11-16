@@ -8,11 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from meshdb import _callback_protocol as protocol
+from nabedra import _callback_protocol as protocol
 from test_callback_protocol import C, I, O, R, S, TOKEN, command, wire
 
-if (Path(__file__).parents[1] / 'src/meshdb/_callback_pool.py').exists():
-    from meshdb import _callback_pool as implementation
+if (Path(__file__).parents[1] / 'src/nabedra/_callback_pool.py').exists():
+    from nabedra import _callback_pool as implementation
 else:
     implementation = None
 

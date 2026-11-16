@@ -2,9 +2,9 @@
 use crate::config::ServeOptions;
 use clap::{Parser, Subcommand};
 
-/// MeshDB server command line.
+/// Nabedra Database server command line.
 #[derive(Debug, Parser)]
-#[command(name = "meshdb-server", version, propagate_version = true)]
+#[command(name = "nabedra-database-server", version, propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -24,7 +24,7 @@ pub enum Command {
         #[command(subcommand)]
         command: DatabaseCommand,
     },
-    /// Serve the MeshDB API.
+    /// Serve the Nabedra Database API.
     Serve(ServeOptions),
     /// Run the supervised cluster API.
     Api {

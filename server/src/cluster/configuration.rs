@@ -364,6 +364,7 @@ impl Template {
     pub fn fingerprint(&self) -> Result<String, ConfigurationError> {
         let bytes = self.encode()?;
         let mut hash = Sha256::new();
+        // Existing control roots authenticate templates with this format domain.
         hash.update(b"meshdb.control-template.v1\0");
         hash.update(&bytes);
         Ok(hash

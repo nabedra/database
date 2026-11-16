@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from meshdb import _serve_guard as g, _serve_process as p
+from nabedra import _serve_guard as g, _serve_process as p
 import test_serve_process
 from test_serve_process import CHILD, HOST
 
@@ -43,9 +43,9 @@ class ServeExitTests(unittest.TestCase):
             failing.set()
         try:
             with patch.object(p._Owner, 'announce', announce), patch.object(p.subprocess.Popen, 'poll', poll):
-                with self.assertRaises(p.MeshDBError) as caught:
+                with self.assertRaises(p.NabedraError) as caught:
                     self.run_child('held', receipt)
-                with self.assertRaises(p.MeshDBError):
+                with self.assertRaises(p.NabedraError):
                     receipt._retry()
                 self.assertFalse(receipt._ready())
             self.assertEqual(caught.exception.code, 'shutdown_failed')
@@ -71,7 +71,7 @@ class ServeExitTests(unittest.TestCase):
             self.assertTrue(receipt._ready())
             reservation._finish()
             g._reserve()._finish()
-            with self.assertRaises(p.MeshDBError):
+            with self.assertRaises(p.NabedraError):
                 self.run_child('normal', receipt)
             self.assertIs(receipt._owner, owner)
         finally:
@@ -98,7 +98,7 @@ class ServeExitTests(unittest.TestCase):
         def run():
             try:
                 self.run_child('normal', receipt, prepared)
-            except p.MeshDBError:
+            except p.NabedraError:
                 pass
             except BaseException as exc:
                 errors.append(exc)
@@ -131,7 +131,7 @@ class ServeExitTests(unittest.TestCase):
         try:
             with patch.object(p.selectors, 'DefaultSelector', side_effect=OSError('SECRET selector')), \
                     patch.object(p._Owner, 'close', close):
-                with self.assertRaises(p.MeshDBError) as caught:
+                with self.assertRaises(p.NabedraError) as caught:
                     self.run_child('normal', receipt)
             self.assertNotIn('SECRET', str(caught.exception))
             self.assertTrue(receipt._exited)
@@ -154,7 +154,7 @@ class ServeExitTests(unittest.TestCase):
             raise OSError('SECRET')
         try:
             with patch.object(p._Owner, 'close', close):
-                with self.assertRaises(p.MeshDBError):
+                with self.assertRaises(p.NabedraError):
                     self.run_child('fatal', receipt)
             self.assertIsNotNone(receipt._owner.child.returncode)
             self.assertTrue(receipt._exited)
@@ -178,7 +178,7 @@ class ServeExitTests(unittest.TestCase):
                 raise OSError('SECRET late poll')
             return poll(child)
         with patch.object(p._Owner, 'shutdown', finish), patch.object(p.subprocess.Popen, 'poll', observe):
-            with self.assertRaises(p.MeshDBError) as caught:
+            with self.assertRaises(p.NabedraError) as caught:
                 self.run_child('fatal', receipt)
         self.assertEqual(caught.exception.code, 'bind_failed')
         self.assertTrue(receipt._ready())
@@ -194,7 +194,7 @@ class ServeExitTests(unittest.TestCase):
             owner.selector.close = lambda: (_ for _ in ()).throw(OSError('SECRET close'))
         try:
             with patch.object(p._Owner, 'install', install):
-                with self.assertRaises(p.MeshDBError) as caught:
+                with self.assertRaises(p.NabedraError) as caught:
                     self.run_child('fatal', receipt)
             self.assertNotIn('SECRET', str(caught.exception))
             owner = receipt._owner

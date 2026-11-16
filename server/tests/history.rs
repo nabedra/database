@@ -1,4 +1,4 @@
-use meshdb_server::storage::*;
+use nabedra_database_server::storage::*;
 #[path = "support/storage.rs"]
 mod fake;
 use fake::Fake;

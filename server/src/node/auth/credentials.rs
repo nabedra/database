@@ -50,10 +50,10 @@ enum Domain {
 }
 fn sign(pair: &Ed25519KeyPair, domain: Domain, body: &[u8]) -> Result<[u8; 64], Error> {
     let (prefix, cap): (&[u8], usize) = match domain {
-        Domain::Enrollment => (b"meshdb.enroll.v1\0", 16 * 1024),
-        Domain::Request => (b"meshdb.http-request.v1\0", 4096),
-        Domain::Response => (b"meshdb.http-response.v1\0", 4096),
-        Domain::Queue => (b"meshdb.queue-control.v1\0", 4096),
+        Domain::Enrollment => (b"nabedra.enroll.v1\0", 16 * 1024),
+        Domain::Request => (b"nabedra.http-request.v1\0", 4096),
+        Domain::Response => (b"nabedra.http-response.v1\0", 4096),
+        Domain::Queue => (b"nabedra.queue-control.v1\0", 4096),
     };
     if body.len() > cap {
         return Err(Error::Limit);
@@ -125,7 +125,7 @@ impl ApiSigningKey {
         let prk =
             hkdf::Salt::new(hkdf::HKDF_SHA256, cluster.as_bytes()).extract(admin_token.as_bytes());
         let mut seed = [0; 32];
-        prk.expand(&[b"meshdb.api-signing.v1"], Len32)
+        prk.expand(&[b"nabedra.api-signing.v1"], Len32)
             .map_err(|_| Error::Invalid)?
             .fill(&mut seed)
             .map_err(|_| Error::Invalid)?;
@@ -162,6 +162,7 @@ pub(crate) fn worker_verifier(
     public_key: &[u8; 32],
 ) -> [u8; 32] {
     let mut hash = digest::Context::new(&digest::SHA256);
+    // Session verifier digests are persisted in existing control roots.
     hash.update(b"meshdb.worker-verifier.v1\0");
     for id in [cluster, node, incarnation, session] {
         hash.update(id.as_bytes());

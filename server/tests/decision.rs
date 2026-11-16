@@ -1,4 +1,4 @@
-use meshdb_server::storage::{Catalog, ClusterCatalog};
+use nabedra_database_server::storage::{Catalog, ClusterCatalog};
 
 #[test]
 fn cluster_catalog_requires_head_and_keeps_standalone_separate() {
@@ -12,7 +12,7 @@ fn cluster_catalog_requires_head_and_keeps_standalone_separate() {
     assert!(ClusterCatalog::decode(&serde_json::to_vec(&value).unwrap()).is_err());
 }
 
-use meshdb_server::{
+use nabedra_database_server::{
     protocol::{MAX_BODY_BYTES, MAX_CATALOG_BYTES},
     storage::{Decision, MAX_DECISION_BYTES, StorageError},
 };
@@ -223,8 +223,8 @@ fn independent_bounds_and_escaping_above_control_limit() {
     for i in 0..6000u128 {
         let mut table = entry.clone();
         table.id = Uuid::from_u128(i);
-        table.data = meshdb_server::storage::TableData::Legacy {
-            snapshot: meshdb_server::storage::ObjectKey::snapshot(table.id, c.commit_id)
+        table.data = nabedra_database_server::storage::TableData::Legacy {
+            snapshot: nabedra_database_server::storage::ObjectKey::snapshot(table.id, c.commit_id)
                 .as_str()
                 .into(),
         };

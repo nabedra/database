@@ -5,8 +5,8 @@ import threading
 import types
 import unittest
 from unittest.mock import patch
-from meshdb.aws import AwsCredentials, default_credentials
-from meshdb.gateway import S3
+from nabedra.aws import AwsCredentials, default_credentials
+from nabedra.gateway import S3
 
 class AwsTests(unittest.TestCase):
     def test_expiry_and_redaction(self):

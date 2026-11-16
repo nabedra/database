@@ -7,7 +7,7 @@ from .errors import ValidationError
 from .validation import validate_identifier
 
 
-_CONFIG_FAILURE = "MESHDB_CONFIG must name an explicit readable regular file."
+_CONFIG_FAILURE = "NABEDRA_CONFIG must name an explicit readable regular file."
 
 
 def _is_async_callback(callback: object) -> bool:
@@ -66,13 +66,13 @@ def _validate_serve_args(
 
 
 def _resolve_config_path() -> str:
-    """Resolve only the explicit literal MESHDB_CONFIG path, without opening it.
+    """Resolve only the explicit literal NABEDRA_CONFIG path, without opening it.
 
     Relative paths use the current directory. No dotenv, PATH search, variable
     or tilde expansion is performed. Rust validates JSON and credential files.
     """
     try:
-        candidate = os.environ.get("MESHDB_CONFIG")
+        candidate = os.environ.get("NABEDRA_CONFIG")
         if candidate:
             path = os.path.abspath(candidate)
             if os.path.isfile(path) and os.access(path, os.R_OK):

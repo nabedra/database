@@ -175,7 +175,7 @@ def load(path):
     try:
         return validate(read_json(path))
     except (KeyError, TypeError, ValueError, AttributeError):
-        raise ConfigError('Invalid API configuration; see meshdb init --help') from None
+        raise ConfigError('Invalid API configuration; see nabedra database init --help') from None
 
 
 def protected_write(path, value):

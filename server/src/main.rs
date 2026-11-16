@@ -1,9 +1,9 @@
 #[cfg(feature = "s3")]
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
-use meshdb_server::cli::{Cli, Command};
+use nabedra_database_server::cli::{Cli, Command};
 #[cfg(feature = "s3")]
-use meshdb_server::{
+use nabedra_database_server::{
     config::Config,
     engine::Engine,
     executor::Executor,
@@ -25,7 +25,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(_) => {
-            eprintln!("meshdb-server: network runtime initialization failed");
+            eprintln!("nabedra-database-server: network runtime initialization failed");
             return ExitCode::FAILURE;
         }
     };
@@ -40,27 +40,30 @@ async fn run_cli() -> ExitCode {
                 .with_writer(io::stderr)
                 .with_ansi(false)
                 .with_filter(
-                    Targets::new().with_target("meshdb_server::api", tracing::Level::INFO),
+                    Targets::new()
+                        .with_target("nabedra_database_server::api", tracing::Level::INFO),
                 ),
         )
         .try_init()
         .is_err()
     {
-        eprintln!("meshdb-server: diagnostics initialization failed");
+        eprintln!("nabedra-database-server: diagnostics initialization failed");
         return ExitCode::FAILURE;
     }
     let result = match command {
-        Command::Doctor { config, json } => meshdb_server::maintenance::doctor(&config, json).await,
+        Command::Doctor { config, json } => {
+            nabedra_database_server::maintenance::doctor(&config, json).await
+        }
         Command::Database {
             command:
-                meshdb_server::cli::DatabaseCommand::Migrate {
+                nabedra_database_server::cli::DatabaseCommand::Migrate {
                     storage,
                     region,
                     cluster_id,
                     confirm_writers_stopped,
                 },
         } => {
-            meshdb_server::maintenance::migrate(
+            nabedra_database_server::maintenance::migrate(
                 &storage,
                 &region,
                 cluster_id,
@@ -74,15 +77,21 @@ async fn run_cli() -> ExitCode {
             cold_start,
             migrate_catalog,
         } => {
-            meshdb_server::cluster::runtime::run_api_configured(config, cold_start, migrate_catalog)
-                .await
+            nabedra_database_server::cluster::runtime::run_api_configured(
+                config,
+                cold_start,
+                migrate_catalog,
+            )
+            .await
         }
-        Command::Worker { bootstrap } => meshdb_server::node::runtime::run_worker(bootstrap).await,
+        Command::Worker { bootstrap } => {
+            nabedra_database_server::node::runtime::run_worker(bootstrap).await
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("meshdb-server: {message}");
+            eprintln!("nabedra-database-server: {message}");
             if matches!(
                 message,
                 "configuration invalid"
@@ -99,7 +108,7 @@ async fn run_cli() -> ExitCode {
 }
 
 #[cfg(feature = "s3")]
-async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
+async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = Config::from_env(options).map_err(|_| "configuration invalid")?;
     // Select the provider explicitly even if dependencies also enable ring.
     let tls = match (&config.options().tls_cert, &config.options().tls_key) {
@@ -192,9 +201,9 @@ async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'stati
 }
 
 #[cfg(not(feature = "s3"))]
-async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
-    let config =
-        meshdb_server::config::Config::from_env(options).map_err(|_| "configuration invalid")?;
+async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
+    let config = nabedra_database_server::config::Config::from_env(options)
+        .map_err(|_| "configuration invalid")?;
     if let (Some(cert), Some(key)) = (&config.options().tls_cert, &config.options().tls_key) {
         let _ = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await

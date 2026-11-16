@@ -62,14 +62,14 @@ def run_dataset(number, name, initial, config, binary=None):
         record['allocated_prefix'] = namespace.prefix
         c.label = 'server_setup'
         from server_process import ServerProcess
-        from meshdb import DB
+        from nabedra import Database
 
         server = ServerProcess(config, namespace, binary=binary)
         process_started = time.monotonic()
         c.call('process_start', server.start)
         record['process_durations_seconds']['startup'] = time.monotonic() - process_started
         c.label = 'client_setup'
-        db = DB(server.api_url, server.private_token)
+        db = Database(url=server.api_url, token=server.private_token)
         schema = {'id': int, 'text': str, 'number': int, 'value': float, 'flag': bool}
         table = c.table(db, 'latency_rows', schema, 'id')
         c.fixture(table).update(schema={'id': 'int', 'text': 'str', 'number': 'int',

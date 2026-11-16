@@ -127,7 +127,7 @@ fn verify(
     response: bool,
     nonce: Option<Uuid>,
 ) -> Result<Claims> {
-    let raw = http::one(headers, "x-meshdb-queue-auth")?;
+    let raw = http::one(headers, "x-nabedra-queue-auth")?;
     if raw.len() > 8192 || raw.len() % 2 != 0 {
         return Err(invalid());
     }
@@ -136,8 +136,8 @@ fn verify(
         bytes.push(u8::from_str_radix(&raw[index..index + 2], 16).map_err(|_| invalid())?);
     }
     let c: Claims = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if http::one(headers, "x-meshdb-queue-command")? != c.command
-        || http::one(headers, "x-meshdb-queue-class")? != c.class
+    if http::one(headers, "x-nabedra-queue-command")? != c.command
+        || http::one(headers, "x-nabedra-queue-class")? != c.class
         || (command_class(&c.command)? != c.class
             && !(c.command == "install" && c.class == "bootstrap"))
     {
@@ -161,8 +161,8 @@ fn verify(
     }
     auth::checked_worker(root, local).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
     let key = unhex::<32>(&c.public_key)?;
-    let signature = unhex::<64>(http::one(headers, "x-meshdb-queue-signature")?)?;
-    let mut input = b"meshdb.queue-control.v1\0".to_vec();
+    let signature = unhex::<64>(http::one(headers, "x-nabedra-queue-signature")?)?;
+    let mut input = b"nabedra.queue-control.v1\0".to_vec();
     input.extend_from_slice(&bytes);
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&input, &signature)
@@ -265,10 +265,10 @@ pub(super) async fn exchange_class(
         .header("connection", "close")
         .header("content-type", "application/json")
         .header("content-length", body.len())
-        .header("x-meshdb-queue-command", c.command.as_str())
-        .header("x-meshdb-queue-class", c.class.as_str())
-        .header("x-meshdb-queue-auth", a)
-        .header("x-meshdb-queue-signature", s)
+        .header("x-nabedra-queue-command", c.command.as_str())
+        .header("x-nabedra-queue-class", c.class.as_str())
+        .header("x-nabedra-queue-auth", a)
+        .header("x-nabedra-queue-signature", s)
         .body(Body::from(body))
         .map_err(|_| invalid())?;
     let end = Instant::now() + Duration::from_secs(30);
@@ -291,7 +291,7 @@ pub(super) async fn exchange_class(
     let headers = response.headers().clone();
     let len = http::framing(&headers, response_cap.min(MAX_BYTES), false)?.ok_or_else(invalid)?;
     let bytes = http::read_small(response.into_body(), len, end).await?;
-    let raw = http::one(&headers, "x-meshdb-queue-auth")?;
+    let raw = http::one(&headers, "x-nabedra-queue-auth")?;
     if raw.len() > 8192 || raw.len() % 2 != 0 {
         return Err(invalid());
     }
@@ -328,7 +328,7 @@ pub(super) async fn exchange_class(
         return Err(invalid());
     }
     let key = unhex::<32>(&c.public_key)?;
-    let signature = unhex::<64>(http::one(&headers, "x-meshdb-queue-signature")?)?;
+    let signature = unhex::<64>(http::one(&headers, "x-nabedra-queue-signature")?)?;
     let sender = auth::Sender::worker(
         node.node_id,
         node.incarnation.ok_or_else(unavailable)?,
@@ -337,7 +337,7 @@ pub(super) async fn exchange_class(
     )
     .map_err(|_| invalid())?;
     auth::checked_worker(root, &sender).map_err(|_| invalid())?;
-    let mut input = b"meshdb.queue-control.v1\0".to_vec();
+    let mut input = b"nabedra.queue-control.v1\0".to_vec();
     input.extend_from_slice(&decoded);
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&input, &signature)
@@ -352,7 +352,7 @@ pub(super) fn reply(
     nonce: Uuid,
     bytes: Vec<u8>,
 ) -> Result<Response<Body>> {
-    let raw = http::one(headers, "x-meshdb-queue-auth")?;
+    let raw = http::one(headers, "x-nabedra-queue-auth")?;
     let decoded = (0..raw.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).map_err(|_| invalid()))
@@ -384,8 +384,8 @@ pub(super) fn reply(
         .status(200)
         .header("content-type", "application/json")
         .header("content-length", bytes.len())
-        .header("x-meshdb-queue-auth", a)
-        .header("x-meshdb-queue-signature", s)
+        .header("x-nabedra-queue-auth", a)
+        .header("x-nabedra-queue-signature", s)
         .body(Body::from(bytes))
         .map_err(|_| invalid())
 }

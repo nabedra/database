@@ -31,7 +31,7 @@ fn sender(worker: bool) -> Value {
     }
 }
 fn root() -> Control {
-    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
     let fingerprint = Template::decode(&serde_json::to_vec(&template).unwrap())
         .unwrap()
         .fingerprint()
@@ -117,7 +117,7 @@ fn signed(text: &str, path: &str) -> SignedRequest {
     };
     verify_request(
         &hex(text.as_bytes()),
-        &sign(&pair(seed), b"meshdb.http-request.v1\0", text.as_bytes()),
+        &sign(&pair(seed), b"nabedra.http-request.v1\0", text.as_bytes()),
         &actual(path),
     )
     .unwrap()
@@ -164,7 +164,7 @@ fn reply(ctx: &RequestContext, body: &[u8], status: u16) -> SignedReply {
     let text = reply_text(ctx, body, status);
     verify_reply(
         &hex(text.as_bytes()),
-        &sign(&pair(2), b"meshdb.http-response.v1\0", text.as_bytes()),
+        &sign(&pair(2), b"nabedra.http-response.v1\0", text.as_bytes()),
         status,
         ctx,
     )
@@ -211,7 +211,7 @@ fn reply_correlates_sequence_status_sender_scope_target_and_domain() {
     let initial = format!(r#"{{"version":1,"challenge":"{}"}}"#, id(11)).into_bytes();
     let c = context("readiness", "/internal/v1/readiness", &initial, 1);
     let text = reply_text(&c, &body, 200);
-    let signature = sign(&pair(2), b"meshdb.http-response.v1\0", text.as_bytes());
+    let signature = sign(&pair(2), b"nabedra.http-response.v1\0", text.as_bytes());
     let s = verify_reply(&hex(text.as_bytes()), &signature, 200, &c).unwrap();
     let content = check_reply_content(&s, body.clone()).unwrap();
     assert!(Arc::ptr_eq(&content.reply, &s.reply));
@@ -235,13 +235,13 @@ fn reply_correlates_sequence_status_sender_scope_target_and_domain() {
         } else {
             pair(2)
         };
-        let sig = sign(&key, b"meshdb.http-response.v1\0", changed.as_bytes());
+        let sig = sign(&key, b"nabedra.http-response.v1\0", changed.as_bytes());
         assert!(verify_reply(&hex(changed.as_bytes()), &sig, 200, &c).is_err());
     }
     for prefix in [
-        b"meshdb.http-response.v1".as_slice(),
-        b"meshdb.http-response.v1\0\0",
-        b"meshdb.http-request.v1\0",
+        b"nabedra.http-response.v1".as_slice(),
+        b"nabedra.http-response.v1\0\0",
+        b"nabedra.http-request.v1\0",
     ] {
         assert!(
             verify_reply(
@@ -467,7 +467,7 @@ fn different_execution_contexts_use_distinct_sequences() {
     let c = context("job", path, &body, 1);
     let result=br#"{"request_id":null,"error":{"code":"overloaded","message":"DATA","outcome":"not_applied"}}"#;
     let text = reply_text(&c, result, 429);
-    let sig = sign(&pair(2), b"meshdb.http-response.v1\0", text.as_bytes());
+    let sig = sign(&pair(2), b"nabedra.http-response.v1\0", text.as_bytes());
     for field in ["operation_id", "admission_id", "attempt_id"] {
         let mut changed: Value = serde_json::from_slice(&body).unwrap();
         if field != "admission_id" {

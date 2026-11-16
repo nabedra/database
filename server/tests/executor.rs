@@ -1,4 +1,4 @@
-use meshdb_server::protocol;
+use nabedra_database_server::protocol;
 #[path = "../src/executor.rs"]
 mod executor;
 

@@ -106,7 +106,7 @@ mod tests {
             )
             .unwrap();
             let owners = PayloadOwners::from_receiver(pool, state.clone());
-            let path = std::env::temp_dir().join(format!("meshdb-c1-{}", Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!("nabedra-c1-{}", Uuid::new_v4()));
             std::fs::create_dir(&path).unwrap();
             let mut process = owners
                 .start_boot(

@@ -1,15 +1,15 @@
-//! MeshDB protocol, snapshot codec, storage, and production engine.
+//! Nabedra Database protocol, snapshot codec, storage, and production engine.
 //! Runtime admission, HTTP envelopes, and transport are integrated separately.
 #[cfg(test)]
-extern crate self as meshdb_server;
+extern crate self as nabedra_database_server;
 pub mod api;
 pub mod cli;
-pub mod maintenance;
 pub mod cluster;
 pub mod commit;
 pub mod config;
 pub mod engine;
 pub mod executor;
+pub mod maintenance;
 pub mod node;
 pub mod partition_size;
 pub mod protocol;

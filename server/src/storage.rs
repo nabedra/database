@@ -1,9 +1,9 @@
 //! Bounded object access and validated catalogs. The backend is a trusted adapter;
 //! callers use Storage so every object key stays within its namespace.
 use crate::protocol::MAX_CATALOG_BYTES;
+pub mod backend;
 pub mod context;
 pub mod registry;
-pub mod backend;
 pub use backend::RuntimeStore;
 mod control_decision;
 mod decision;

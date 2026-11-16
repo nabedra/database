@@ -1,10 +1,10 @@
-use meshdb_server::worker_pool::{WorkerPool, WorkerThreads};
-use meshdb_server::{engine::Engine, protocol, storage};
+use nabedra_database_server::worker_pool::{WorkerPool, WorkerThreads};
+use nabedra_database_server::{engine::Engine, protocol, storage};
 use std::num::NonZeroUsize;
 #[path = "support/storage.rs"]
 mod support;
 
-use meshdb_server::engine::MutationResult::{Count, Found, Null};
+use nabedra_database_server::engine::MutationResult::{Count, Found, Null};
 use protocol::*;
 use std::{
     future::Future,
@@ -74,7 +74,7 @@ async fn fixture_with_legacy(legacy: bool) -> (Engine<Fake>, TableDescriptor, Wo
         session
             .publish(
                 candidate,
-                Some(meshdb_server::snapshot::encode(&table, &rows).unwrap()),
+                Some(nabedra_database_server::snapshot::encode(&table, &rows).unwrap()),
             )
             .await
             .unwrap();
@@ -640,7 +640,7 @@ async fn mutation_workers_overlap_and_drain_without_publication_on_error() {
         assert!(
             threads
                 .iter()
-                .all(|(_, name)| !name.starts_with("meshdb-worker-"))
+                .all(|(_, name)| !name.starts_with("nabedra-worker-"))
         );
         let usage = engine.worker_pool().scheduler().usage();
         assert_eq!(usage[0].1, 0, "storage waits must release CPU capacity");

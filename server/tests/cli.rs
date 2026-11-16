@@ -1,5 +1,5 @@
 use clap::{Parser, error::ErrorKind};
-use meshdb_server::{
+use nabedra_database_server::{
     cli::{Cli, Command},
     config::{Config, ServeOptions},
 };
@@ -8,7 +8,7 @@ use meshdb_server::{
 fn partition_size_spellings_allow_default_and_explicit_workers() {
     for flag in ["--partition-size", "--partition_size"] {
         for worker_args in [vec![], vec!["--workers", "7"]] {
-            let mut args = vec!["meshdb-server", "serve", flag, "64MiB"];
+            let mut args = vec!["nabedra-database-server", "serve", flag, "64MiB"];
             let expected_workers = if worker_args.is_empty() { 4 } else { 7 };
             args.extend(worker_args);
             let parsed = Cli::try_parse_from(args);
@@ -34,12 +34,13 @@ fn partition_size_cli_rejects_invalid_values_and_shows_alias() {
             "1 GB",
             "1 B garbage",
         ] {
-            let error = Cli::try_parse_from(["meshdb-server", "serve", flag, value]).unwrap_err();
+            let error =
+                Cli::try_parse_from(["nabedra-database-server", "serve", flag, value]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation, "{flag} {value}");
             assert!(error.to_string().contains("67108864 B (64 MiB)"));
         }
     }
-    let help = Cli::try_parse_from(["meshdb-server", "serve", "--help"])
+    let help = Cli::try_parse_from(["nabedra-database-server", "serve", "--help"])
         .unwrap_err()
         .to_string();
     assert!(help.contains("--partition-size"));
@@ -49,9 +50,9 @@ fn partition_size_cli_rejects_invalid_values_and_shows_alias() {
 #[test]
 fn documented_commands_parse_into_existing_options() {
     for args in [
-        vec!["meshdb-server", "serve"],
+        vec!["nabedra-database-server", "serve"],
         vec![
-            "meshdb-server",
+            "nabedra-database-server",
             "serve",
             "--host",
             "127.0.0.1",
@@ -73,13 +74,13 @@ fn documented_commands_parse_into_existing_options() {
         assert_eq!(options.queue_size, defaults.queue_size);
         assert_eq!(
             options.partition_size.bytes(),
-            meshdb_server::partition_size::MAX_PARTITION_BYTES
+            nabedra_database_server::partition_size::MAX_PARTITION_BYTES
         );
         assert_eq!(options.tls_cert, defaults.tls_cert);
         assert_eq!(options.tls_key, defaults.tls_key);
     }
     let Command::Serve(options) = Cli::try_parse_from([
-        "meshdb-server",
+        "nabedra-database-server",
         "serve",
         "--host",
         "0.0.0.0",
@@ -115,7 +116,7 @@ fn documented_commands_parse_into_existing_options() {
 
     // Parsing performs no TLS I/O and leaves validation to Config.
     let Command::Serve(options) = Cli::try_parse_from([
-        "meshdb-server",
+        "nabedra-database-server",
         "serve",
         "--queue-size",
         "0",
@@ -138,9 +139,9 @@ fn documented_commands_parse_into_existing_options() {
 
 #[test]
 fn command_shape_typed_inputs_and_clap_controls() {
-    assert!(Cli::try_parse_from(["meshdb-server"]).is_err());
-    assert!(Cli::try_parse_from(["meshdb-server", "status"]).is_err());
-    assert!(Cli::try_parse_from(["meshdb-server", "--host", "127.0.0.1"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-database-server"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-database-server", "status"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-database-server", "--host", "127.0.0.1"]).is_err());
     for (flag, value) in [
         ("--host", "localhost"),
         ("--port", "65536"),
@@ -151,18 +152,21 @@ fn command_shape_typed_inputs_and_clap_controls() {
         ("--aws-region", "value"),
     ] {
         assert!(
-            Cli::try_parse_from(["meshdb-server", "serve", flag, value]).is_err(),
+            Cli::try_parse_from(["nabedra-database-server", "serve", flag, value]).is_err(),
             "{flag} {value}"
         );
     }
     for (args, kind) in [
-        (vec!["meshdb-server", "--help"], ErrorKind::DisplayHelp),
         (
-            vec!["meshdb-server", "serve", "--help"],
+            vec!["nabedra-database-server", "--help"],
             ErrorKind::DisplayHelp,
         ),
         (
-            vec!["meshdb-server", "--version"],
+            vec!["nabedra-database-server", "serve", "--help"],
+            ErrorKind::DisplayHelp,
+        ),
+        (
+            vec!["nabedra-database-server", "--version"],
             ErrorKind::DisplayVersion,
         ),
     ] {
