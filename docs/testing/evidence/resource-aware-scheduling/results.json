@@ -1,0 +1,462 @@
+{
+  "caps": {
+    "status": "passed",
+    "binary": "server/target/debug/meshdb-server",
+    "binary_sha256": "05664717a6e260a50bb9345806ab1396ae0182a5c6897964b407da435bfa8c40",
+    "source_tree_sha256": "5b8dbd2d105e6f833ad08f07be028d2e0e103f31248d3caa1a2409f47adb7a7b",
+    "build": {
+      "profile": "dev",
+      "optimization": "unoptimized",
+      "debug_info": "disabled",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_INCREMENTAL": "0",
+      "provenance": "explicit orchestrator build configuration; throughput is not a release-profile claim"
+    },
+    "machine": {
+      "os": "macOS-26.7.3-x86_64-i386-64bit",
+      "python": "3.11.10 (main, Sep  7 2024, 01:03:31) [Clang 15.0.0 (clang-1500.3.9.4)]",
+      "logical_cores": 8,
+      "machine_ram_bytes": "17179869184",
+      "tcp_ephemeral_port_first": "49152",
+      "tcp_ephemeral_port_last": "65535",
+      "tcp_msl_ms": "15000",
+      "cpu_quota": {
+        "cgroup_v2_cpu_max": null,
+        "cgroup_v1_quota": null,
+        "cgroup_v1_period": null,
+        "quota_cores": null,
+        "available_parallelism": 8,
+        "affinity": null,
+        "cpu_time_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "address_space_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "cgroup_memory_max": null,
+        "fixture_installs_cpu_or_memory_quota": false
+      },
+      "commit": "5f3a6176f73ce0b9d6e2ef8c65f41c7156566f7b"
+    },
+    "seed": 20261115,
+    "scope": "strict real API/worker TCP and local conditional storage; transport intervals are not compute occupancy",
+    "cases": [
+      "C01",
+      "C04",
+      "C05",
+      "C07"
+    ],
+    "caps": [
+      {
+        "resources": {
+          "1": 8589934592,
+          "2": 12884901888,
+          "4": 21474836480
+        },
+        "execution": {
+          "max_workers_per_request": 1,
+          "max_pending_requests": 1100,
+          "max_queue_bytes_per_replica": 268435456,
+          "max_retained_result_bytes_per_worker": 67108864,
+          "result_retention_ms": 300000,
+          "queue_replication": "all_ready_workers",
+          "queue_lifetime": "live_cluster",
+          "partition_size": "4 KiB"
+        },
+        "result": {
+          "cap": 1,
+          "allocation_trace": {
+            "partitions": 128,
+            "jobs": 128,
+            "peak_transport_nodes": 1,
+            "jobs_per_node": {
+              "00000000-0000-0000-0000-00000000001e": 128
+            },
+            "reduction_observed": false
+          },
+          "overlap": {
+            "small_result": 17,
+            "large_states_at_small_completion": [
+              "running",
+              "running"
+            ],
+            "causal_release_rounds": 55
+          }
+        }
+      },
+      {
+        "resources": {
+          "1": 8589934592,
+          "2": 12884901888,
+          "4": 21474836480
+        },
+        "execution": {
+          "max_workers_per_request": 2,
+          "max_pending_requests": 1100,
+          "max_queue_bytes_per_replica": 268435456,
+          "max_retained_result_bytes_per_worker": 67108864,
+          "result_retention_ms": 300000,
+          "queue_replication": "all_ready_workers",
+          "queue_lifetime": "live_cluster",
+          "partition_size": "4 KiB"
+        },
+        "result": {
+          "cap": 2,
+          "allocation_trace": {
+            "partitions": 128,
+            "jobs": 128,
+            "peak_transport_nodes": 2,
+            "jobs_per_node": {
+              "00000000-0000-0000-0000-00000000001e": 85,
+              "00000000-0000-0000-0000-000000000014": 43
+            },
+            "reduction_observed": false
+          },
+          "overlap": {
+            "small_result": 17,
+            "large_states_at_small_completion": [
+              "running",
+              "running"
+            ],
+            "causal_release_rounds": 78
+          }
+        }
+      },
+      {
+        "resources": {
+          "1": 8589934592,
+          "2": 12884901888,
+          "4": 21474836480
+        },
+        "execution": {
+          "max_workers_per_request": 3,
+          "max_pending_requests": 1100,
+          "max_queue_bytes_per_replica": 268435456,
+          "max_retained_result_bytes_per_worker": 67108864,
+          "result_retention_ms": 300000,
+          "queue_replication": "all_ready_workers",
+          "queue_lifetime": "live_cluster",
+          "partition_size": "4 KiB"
+        },
+        "result": {
+          "cap": 3,
+          "allocation_trace": {
+            "partitions": 128,
+            "jobs": 128,
+            "peak_transport_nodes": 3,
+            "jobs_per_node": {
+              "00000000-0000-0000-0000-00000000001e": 76,
+              "00000000-0000-0000-0000-000000000014": 39,
+              "00000000-0000-0000-0000-00000000000a": 13
+            },
+            "reduction_observed": false
+          },
+          "overlap": {
+            "small_result": 17,
+            "large_states_at_small_completion": [
+              "running",
+              "running"
+            ],
+            "causal_release_rounds": 115
+          }
+        }
+      }
+    ],
+    "raw_artifact": {
+      "file": "scheduler-caps-final.json.gz",
+      "json_sha256": "8a6856718081a9635e7bbd727016dfba26265018266399a8aabb1f4ae0ce9c62",
+      "compressed_sha256": "2bf72182ebbb405aa210b616a1049ca0e009ac41245be680d2925dee04cca9d1"
+    }
+  },
+  "conservation": {
+    "status": "passed",
+    "binary": "server/target/debug/meshdb-server",
+    "binary_sha256": "5fe89cb3dee1039992521f2817ba77bf19329b952c4aabecf049ade5b3eebf2a",
+    "source_tree_sha256": "9f433b73cd229b201c7ef693f4f29afe3e3545b57c759f0ee6cf9494a28189b6",
+    "build": {
+      "profile": "dev",
+      "optimization": "unoptimized",
+      "debug_info": "disabled",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_INCREMENTAL": "0",
+      "provenance": "explicit orchestrator build configuration; throughput is not a release-profile claim"
+    },
+    "machine": {
+      "os": "macOS-26.7.3-x86_64-i386-64bit",
+      "python": "3.11.10 (main, Sep  7 2024, 01:03:31) [Clang 15.0.0 (clang-1500.3.9.4)]",
+      "logical_cores": 8,
+      "machine_ram_bytes": "17179869184",
+      "tcp_ephemeral_port_first": "49152",
+      "tcp_ephemeral_port_last": "65535",
+      "tcp_msl_ms": "15000",
+      "cpu_quota": {
+        "cgroup_v2_cpu_max": null,
+        "cgroup_v1_quota": null,
+        "cgroup_v1_period": null,
+        "quota_cores": null,
+        "available_parallelism": 8,
+        "affinity": null,
+        "cpu_time_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "address_space_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "cgroup_memory_max": null,
+        "fixture_installs_cpu_or_memory_quota": false
+      },
+      "commit": "5f3a6176f73ce0b9d6e2ef8c65f41c7156566f7b"
+    },
+    "seed": 20261115,
+    "case": "Q01 real HTTP accepted identity conservation; transport gates complement actual CPU-gated router assertions",
+    "raw_artifact": {
+      "file": "scheduler-conservation-final.json.gz",
+      "json_sha256": "4d86c448713ada503203241a8e6aebf07b429582431943c0faac626a68e32ef0",
+      "compressed_sha256": "08ce17c0a02967f5d8b4de0c9f5ca9d3a22a4babd1a1e47f95564cc89262e955"
+    },
+    "execution": {
+      "max_workers_per_request": 3,
+      "max_pending_requests": 1100,
+      "max_queue_bytes_per_replica": 268435456,
+      "max_retained_result_bytes_per_worker": 67108864,
+      "result_retention_ms": 3600000,
+      "queue_replication": "all_ready_workers",
+      "queue_lifetime": "live_cluster",
+      "partition_size": "4 KiB"
+    },
+    "admission_clients": 4,
+    "receipt_poll_interval_seconds": 0.1,
+    "assertions": {
+      "submitted": 1000,
+      "accepted": 1000,
+      "terminal": 1000,
+      "missing": 0,
+      "duplicate_terminal": 0,
+      "invalid_traffic": [
+        {
+          "status": 400,
+          "code": "validation_error"
+        },
+        {
+          "status": 400,
+          "code": "validation_error"
+        },
+        {
+          "status": 400,
+          "code": "validation_error"
+        },
+        {
+          "status": 401,
+          "code": "unauthorized"
+        }
+      ],
+      "duplicate_same_receipt": true,
+      "conflicting_body_status": 409,
+      "admission_attempt_statuses": {
+        "202": 1000
+      },
+      "rejected_http_attempts": 0,
+      "uncertain_http_attempts": 0,
+      "host_transport_attempts": 0,
+      "identity_sha256": "d84aa5ab1eba06fb809b4db4865edff8f747483979451cc81e422000fd776bd7",
+      "terminal_sha256": "313751e936450b9006fdaee74dcddcf6811889a8ba2acbe7a3b76ad7713cff2a"
+    },
+    "functional_timing": {
+      "barrier_seconds": 11.121397216997138,
+      "barrier_release_at_acknowledgments": 64,
+      "elapsed_seconds": 229.98759180100024,
+      "throughput_per_second": 4.34806065913879,
+      "admission_latency_seconds": {
+        "p50": 0.8438658390005003,
+        "p95": 1.0990163089991256,
+        "p99": 1.240304663999268
+      },
+      "completion_observation_seconds": {
+        "p50": 129.91293391,
+        "p95": 215.57878087300196,
+        "p99": 222.57478258700212
+      }
+    },
+    "timing_scope": "functional correctness run, not a benchmark repetition or release throughput claim"
+  },
+  "provider": {
+    "status": "passed",
+    "binary": "server/target/debug/meshdb-server",
+    "binary_sha256": "5fe89cb3dee1039992521f2817ba77bf19329b952c4aabecf049ade5b3eebf2a",
+    "command": "python3.11 scripts/acceptance_providers.py --binary server/target/debug/meshdb-server",
+    "exit_code": 0,
+    "execution_provenance": "provisioning agent functions.exec exec_command session1834; final result supplied to root and evidence agent",
+    "stdout": "PASS A01/A02: public policies, configured callbacks, inventory failure retains 8 accepted IDs, 4 accepted IDs survive safe removal, committed row retained; explicit-zero=True",
+    "assertions": [
+      "public policy/status/auth/replay/conflict",
+      "actual 1->2->1->0->1 worker lifecycle",
+      "all 12 accepted reads succeeded with exact oracle",
+      "proof-bound idle and queue handoff before provider termination",
+      "fresh run after all workers stop",
+      "committed row retained",
+      "manual API rejects unsupported provisioning"
+    ],
+    "scope": "real callback transport and local worker processes; no live Kubernetes or AWS validation"
+  },
+  "overflow": {
+    "status": "passed",
+    "binary": "server/target/debug/meshdb-server",
+    "binary_sha256": "ed975bc30fc80739bc9c32b1cbac94c99c1d949768a8cde4492913b72ebc249b",
+    "source_tree_sha256": "41ed048bdc53fea83fbdeca5a4e445dbef67995adadb9df908770dd07fb1382a",
+    "build": {
+      "profile": "dev",
+      "optimization": "unoptimized",
+      "debug_info": "disabled",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_INCREMENTAL": "0",
+      "provenance": "explicit orchestrator build configuration; throughput is not a release-profile claim"
+    },
+    "machine": {
+      "os": "macOS-26.7.3-x86_64-i386-64bit",
+      "python": "3.11.10 (main, Sep  7 2024, 01:03:31) [Clang 15.0.0 (clang-1500.3.9.4)]",
+      "logical_cores": 8,
+      "machine_ram_bytes": "17179869184",
+      "tcp_ephemeral_port_first": "49152",
+      "tcp_ephemeral_port_last": "65535",
+      "tcp_msl_ms": "15000",
+      "cpu_quota": {
+        "cgroup_v2_cpu_max": null,
+        "cgroup_v1_quota": null,
+        "cgroup_v1_period": null,
+        "quota_cores": null,
+        "available_parallelism": 8,
+        "affinity": null,
+        "cpu_time_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "address_space_rlimit": [
+          9223372036854775807,
+          9223372036854775807
+        ],
+        "cgroup_memory_max": null,
+        "fixture_installs_cpu_or_memory_quota": false
+      },
+      "commit": "5f3a6176f73ce0b9d6e2ef8c65f41c7156566f7b"
+    },
+    "seed": 20261115,
+    "cases": [
+      "Q02",
+      "U02 JSON/duplicate/type/auth subset"
+    ],
+    "assertions": [
+      {
+        "kind": "count",
+        "accepted": 8,
+        "explicit_overload": 1,
+        "accepted_retained": true,
+        "invalid_traffic": [
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 401,
+            "code": "unauthorized"
+          }
+        ]
+      },
+      {
+        "kind": "bytes",
+        "accepted": 3,
+        "explicit_overload": 1,
+        "accepted_retained": true,
+        "invalid_traffic": [
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 400,
+            "code": "validation_error"
+          },
+          {
+            "status": 401,
+            "code": "unauthorized"
+          }
+        ]
+      }
+    ],
+    "raw_artifact": {
+      "file": "scheduler-overflow-final.json",
+      "json_sha256": "a8ee84dc3e35eaa8b0407ed7859db1d7e3e58118da90a564ab0472f521d45f60"
+    },
+    "scope": "two independent finite replica/count capacity fixtures; all eleven accepted requests compared with exact serial row/count results"
+  },
+  "recovery": {
+    "binary_sha256": "ed975bc30fc80739bc9c32b1cbac94c99c1d949768a8cde4492913b72ebc249b",
+    "passed": [
+      "C01: ready heterogeneous 1/2/4 compute pools and distinct memory ceilings",
+      "C05/C07: small query completed while both large queries remained gated, with legacy operation_slots=1",
+      "Q04: API restart retained run/accepted identity and pinned result",
+      "C03: same node restarted with 4->3 threads; exact rows and immutable partition identities/bytes preserved",
+      "Q05: two real APIs submitted the same mutation simultaneously; one receipt/decision, changed-body conflict",
+      "Q03: no acceptance before complete-copy ACK; owner SIGKILL and exact-body retry recovered one durable decision",
+      "R05: SIGSTOP owner, higher-term takeover, SIGCONT; one mutation decision and unchanged authoritative root",
+      "R01/R06: SIGKILL recovery from surviving worker, exact serial result",
+      "R03: joining worker receives outstanding request state before readiness",
+      "R02: sequential worker SIGKILL retained accepted identity/pin through one surviving queue holder",
+      "R04/T04: explicit cold fence abandoned outstanding read, retained durable mutation"
+    ],
+    "provider_evidence": false
+  },
+  "checks": {
+    "rust": {
+      "command": "CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo test --locked --no-default-features --no-fail-fast -j1 -- --test-threads=4",
+      "cwd": "server",
+      "passed": 727,
+      "failed": 0,
+      "targets": 37
+    },
+    "s3_build": {
+      "command": "CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo check --locked -j1",
+      "cwd": "server",
+      "exit_code": 0,
+      "elapsed_seconds": 19.02,
+      "scope": "S3-enabled compilation, not live AWS validation"
+    },
+    "python": {
+      "command": "PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests",
+      "passed": 127,
+      "elapsed_seconds": 59.682
+    },
+    "local_cpu_queue": {
+      "accepted_and_succeeded": 1000,
+      "memory_limit_bytes": 8589934592,
+      "compute_threads": 2,
+      "scope": "actual CPU gates held through admission; exact query rows/counts, finite overflow and malformed/auth/truncated input checks"
+    },
+    "peer_control_backpressure": {
+      "assertions": [
+        "unsigned 429 followed by authentic signed reply",
+        "same permit/op/admission across bounded attempts",
+        "finite retry exhaustion and resource conservation",
+        "unsigned success and forged signature rejected"
+      ]
+    }
+  }
+}

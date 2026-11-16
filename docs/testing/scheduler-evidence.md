@@ -1,86 +1,116 @@
-This ledger maps the 38 cases in [the scheduler test contract](scheduler-contract.md) to assertions and execution evidence. A case identifier in a test name is a coverage pointer. It does not establish that every requirement in that case has passed.
+The resource-aware scheduler was validated on implementation commit `59ffcc72907c68c7a378cd3c9f1dddce2cab1b6b`. The measured native server SHA-256 is `5a5ab2598580f76c2f083346619f343f92b9f2deecb186cb3feff514beee5247`.
 
-The process fixtures use actual API and worker TCP listeners with a local SQLite conditional object service. They do not establish AWS S3 consistency, Kubernetes behavior, or isolation from an executor process abort or OS OOM. The queue remains in worker memory. A full worker shutdown abandons pending requests while committed mutations remain durable.
+The final Rust run passed **727 tests across 37 targets**, and the Python suite passed **127 tests**. The S3-enabled build passed. The [functional results](evidence/resource-aware-scheduling/results.json) retain the exact binary hashes and execution boundaries for the separate process fixtures.
 
-## Reproduce the process assertions
+## Measured results
 
-Use Python 3.11 explicitly. Build the native server from the current source before running these commands.
+The [validated benchmark records](evidence/resource-aware-scheduling/benchmarks.json) include every measured repetition, p50/p95/p99 latency values, per-worker observations, configuration, machine, seeds and raw artifact checksums.
+
+| Workload | Executed result |
+| --- | --- |
+| B01 CPU pool | One warm-up and three measured repetitions per request cap. A separate 96-job event assertion checked 89 backlogged releases: zero feasible logical slots remained idle after the release event, and all reservations settled. CPU runs averaged 6.26–6.57 CPU core equivalents on eight available logical CPUs; mean worker slot occupancy was 89.6–92.7%. |
+| B02 pool CPU/memory/socket mix | One warm-up and three measured repetitions for every cap/arrival configuration. All accepted jobs completed; zero failed, missing or duplicate jobs. Exact arrival-to-compute-start and completion distributions, logical charges and actual socket payload bytes are retained. |
+| B02 real HTTP/storage | Caps 1/2/3, offered rates 2/8/32 requests per second, 16 requests per repetition, 64 seeded rows, and a declared 2 ms partition-read delay. All 576 requests succeeded, including 432 in the 27 measured repetitions. Zero client rejections, missing or duplicate outcomes. Twenty internal HTTP 429 responses and eleven dependency-open retries caused no failed logical requests. |
+| Q01 real HTTP | 1,000 submitted, acknowledged and terminal identities; every row/metadata result matched its serial oracle. Zero missing or duplicate outcomes, HTTP rejections, uncertain submissions or host transport errors. |
+| Q01 actual CPU gates | 1,000 queries were accepted while both compute executors remained occupied, under the default 8 GiB ceiling. Every query returned its exact count or rows after release. Malformed/auth/truncated traffic and finite overflow did not displace accepted work. |
+| C04/C05/C07 real HTTP | Each cap read 128 actual partition files. Observed concurrent transport nodes stayed within 1/2/3. A third small read completed while both large requests remained running; all final rows/counts matched the oracle. |
+| Q02 independent limits | Count eight admitted eight requests, then rejected the next. A separate 40,000-byte replica limit admitted three large valid predicates with count 100, then rejected the next. All eleven accepted requests completed correctly. |
+
+![CPU and mixed resource pool measurements](evidence/resource-aware-scheduling/pool-benchmark.svg)
+
+![Real HTTP and conditional-store measurements](evidence/resource-aware-scheduling/http-benchmark.png)
+
+These are **unoptimized development builds**, with `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_INCREMENTAL=0`. They are not release-throughput claims. HTTP throughput includes the local proxy, authentication, polling and conditional SQLite service.
+
+The HTTP workers advertise 1/2/4 compute threads and logical RAM ceilings of 8/12/20 GiB on one shared 16 GiB host. These ceilings are not a certification of physical memory capacity. No OS CPU or memory quota was installed. Actual sampled RSS is reported separately from logical charges. Each worker also has its bounded two-thread control pool.
+
+Heartbeat reservations/charges and RSS are sampled at 250 ms. HTTP queue waits are receipt-state observation bounds with 100 ms polling, including ingress. Pool job waiting is arrival to closure start; mixed socket jobs include their precompute I/O stage. Network figures count protocol bytes once per proxied RPC, including HTTP headers, rather than TCP/IP headers or retransmissions. Queue/result payload observations exclude allocator metadata and unobserved local transitions. The compact records include separate actual queue-install wire bytes.
+
+## Passing commands and reproduction
+
+Commands below run from the repository root, except the explicit `server` subshells. The full Rust and Python commands passed; the S3-enabled check finished in 19.02 seconds and Python in 59.682 seconds.
 
 ```sh
-python3.11 scripts/acceptance_scheduler.py --binary server/target/debug/meshdb-server
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --output artifacts/scheduler-load.json
-python3.11 scripts/acceptance_providers.py --binary server/target/debug/meshdb-server
-# Run measurements after other CPU-heavy validation has stopped.
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite benchmark --output artifacts/scheduler-http-benchmark.json
-python3.11 scripts/plot_scheduler_http_load.py artifacts/scheduler-http-benchmark.json --output artifacts/scheduler-http-benchmark.png
+export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
+(cd server && cargo test --locked --no-default-features --no-fail-fast -j1 -- --test-threads=4)
+(cd server && cargo check --locked -j1)
+PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests
 ```
 
-The load fixture records its binary SHA-256, source commit, machine, seed, configuration, accepted identities, raw job traces, observed network bytes, OS CPU time and sampled peak RSS. It samples actual persisted worker heartbeats for compute reservations and logical charged bytes, and records the observed heartbeat sequences. It proxies object-store TCP traffic to count real request/response bytes and catalog CAS conflicts. It counts request, pinned catalog and result payload bytes from successful signed queue record replies, excluding allocator metadata and unobserved local transitions. It creates 4 KiB partition files from seeded strings and asserts that each cap scenario reads at least 100 distinct actual files. Its transport gates prove that requests overlap and that a small read progresses while two large requests remain unfinished. It checks the entire returned row sequence or count against a serial oracle.
+Build the supplied native targets before reproducing the process and benchmark runs:
 
-The 1,000-submission fixture uses four concurrent admission clients with bounded same-identity backpressure and a finite admission count and byte budget. It uses a fresh small catalog, a finite one-hour query-result retention window and seven gated remote allocations across the 1/2/4-worker capacities. Gates release after the 64th acknowledgment, before deliberate network deadlines can expire. It retains every acknowledged identity and compares every terminal value, including metadata and row result shapes. The CPU-gated local router and the 1,000-record queue assertion provide separate CPU/state-machine evidence. The literal 1,000-query replacement passed under the default 8 GiB ceiling after deferred execution-stage charging and scheduler aggregate updates; the old eight-query run is not used for the stronger claim. Independent count and replica-byte scenarios assert pre-acceptance `429 overloaded` responses and retain the accepted requests. Malformed JSON, duplicate fields, wrong types and invalid authorization run while jobs are gated. Identical replay attaches to the original receipt and a different body conflicts.
+```sh
+(cd server && cargo build --locked --no-default-features -j1 --bin meshdb-server --example resource_scheduler_benchmark)
+python3.11 scripts/acceptance_scheduler.py --binary server/target/debug/meshdb-server
+python3.11 scripts/acceptance_providers.py --binary server/target/debug/meshdb-server
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite caps --output artifacts/scheduler-caps-final.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite conservation --output artifacts/scheduler-conservation-final.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite overflow --output artifacts/scheduler-overflow-final.json
+```
 
-Transport gates hold jobs after the coordinator reserves capacity and before the worker receives the job. Their intervals measure in-flight transport allocations, including I/O and cleanup. They do not measure occupied CPU slots or reducer reservations. OS RSS samples are separate from logical memory charges. Queue/result peaks, when present, come from actual signed queue-stat replies and remain sampling observations. Exact queue wait in the HTTP path is reported as receipt-state observation bounds, alongside submission-to-first-job transport latency. Exact scheduler queue wait and occupied compute time come from the separate resource/pool benchmark. Missing observations are listed in each artifact. A benchmark execution must complete before either B01 or B02 can be reported as passed.
+Run measurements sequentially with other CPU/TCP fixtures stopped:
 
-## Execution record
+```sh
+server/target/debug/examples/resource_scheduler_benchmark --output artifacts/scheduler-pool-benchmark.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite benchmark --output artifacts/scheduler-http-benchmark.json
+python3.11 scripts/summarize_scheduler_benchmarks.py --pool artifacts/scheduler-pool-benchmark.json --http artifacts/scheduler-http-benchmark.json --output artifacts/scheduler-benchmark-evidence.json
+python3.11 scripts/plot_resource_scheduler_benchmark.py artifacts/scheduler-pool-benchmark.json --output docs/testing/evidence/resource-aware-scheduling/pool-benchmark.svg
+python3.11 scripts/plot_scheduler_http_load.py artifacts/scheduler-http-benchmark.json --output docs/testing/evidence/resource-aware-scheduling/http-benchmark.png
+```
 
-The strict 1,000-ID, recovery and provider runs below used production binary SHA-256 `5fe89cb3dee1039992521f2817ba77bf19329b952c4aabecf049ade5b3eebf2a`. The latest resource-aggregate optimization is binary SHA-256 `05664717a6e260a50bb9345806ab1396ae0182a5c6897964b407da435bfa8c40`, which passed the strict final 128-partition cap/overlap matrix. The measured build is the unoptimized development profile with `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0` and `CARGO_INCREMENTAL=0`; results must not be described as release throughput.
+Full raw JSON is retained locally as verified `.json.gz` files under `artifacts/`, with compressed and uncompressed SHA-256 values in the committed summaries. Decompress it to replay the pool plot, or rerun the commands above. The HTTP plot and combined validator also accept gzip input. Only Matplotlib label compatibility was changed after measurement; no measured runtime, input, limit or oracle changed.
 
-| Executed evidence | Result and scope |
-| --- | --- |
-| [Full native recovery](../../artifacts/resource-aware-scheduling/recovery-process-final.json) | Passed C01/C03/C05/C07/Q03/Q04/Q05/R01-R06 and the committed-decision portion of T04. Real API/workers and conditional SQLite storage, exact request/result and publication assertions, on deferred-stage/seal-fix binary SHA `ed975bc30fc80739bc9c32b1cbac94c99c1d949768a8cde4492913b72ebc249b`. |
-| [Strict HTTP 1,000-ID conservation](../../artifacts/resource-aware-scheduling/conservation-summary.json) | Passed 1,000 submissions, 1,000 acceptance acknowledgments and 1,000 exact terminal successes; zero missing/duplicate identities, zero HTTP rejections/uncertain attempts or host transport failures. Four admission clients, finite count/byte limits and one-hour result retention. Same final production SHA above. |
-| [Independent count and byte overflow](../../artifacts/resource-aware-scheduling/overflow-summary.json) | Passed Q02 on binary SHA `ed975bc30fc80739bc9c32b1cbac94c99c1d949768a8cde4492913b72ebc249b`: eight accepted at count eight, three accepted at a 40,000-byte replica limit with count 100, then explicit overload in each case. All eleven accepted results matched exact row/count oracles; malformed/type/auth traffic failed without displacing them. |
-| [Strict provider lifecycle](../../artifacts/resource-aware-scheduling/provider-process.json) | Passed A01/A02, actual 1→2→1→0→1 workers, 12 exact accepted read results, safe drain proof, provider failure and durable row retention. No live cloud claim. |
-| [Final partition caps and overlap](../../artifacts/resource-aware-scheduling/cap-summary.json) | Passed caps 1/2/3 over 128 actual files each. Every cap completed a third small read while both large requests remained running, then compared complete results. Final aggregate-optimized binary SHA `05664717a6e260a50bb9345806ab1396ae0182a5c6897964b407da435bfa8c40`. |
-| [Rust full run](../../artifacts/resource-aware-scheduling/rust-tests.log) and [literal CPU-gated local queue](../../artifacts/resource-aware-scheduling/local-queue-final.log) | Final full log records 724 passing tests and zero failures across 37 target summaries. The literal 1,000-query CPU-gated local router and seeded queue/catalog oracle both passed, including a separate 12.18-second run. These test counts are not a substitute for the scenario-specific assertions listed here. |
+The 1,000-request TCP fixture uses four concurrent admission clients, bounded same-identity backpressure, finite count/byte budgets and one-hour result retention. Seven gated remote allocations exercise heterogeneous capacity before release at the 64th acknowledgment. Actual CPU saturation is asserted separately by the literal 1,000-query local-router test. Every acknowledged TCP identity and terminal oracle remains mandatory.
 
-Earlier failures below are retained as regressions. They do not supersede later successful assertions and are not passing benchmark evidence.
+## Case evidence
 
-The first fresh native binary process run failed before the second worker became ready. [The captured load artifact](../../artifacts/resource-aware-scheduling/load-bootstrap-failure.json) contains the failure and transport trace. The second worker repeatedly fetched an empty queue snapshot, then exited. Inspection found that `RequestQueue::snapshot_page` returned a `more` flag while every runtime caller interpreted it as `done`. The empty queue therefore never completed; a multi-page queue could stop after its first page. This failure is a regression for R03 and Q03. Do not treat earlier queue-helper tests as proof of successful process bootstrap.
+The identifiers are those in [the reusable contract](scheduler-contract.md). Unit means actual Rust assertions, including in-process routers and injected stores; TCP means native API/worker processes with conditional local storage. The boundary column states what was executed, not a claim that a test count proves every possible fault.
 
-An earlier native Rust run executed 509 library assertions successfully before integration tests stopped at an outdated configuration bound. This is library evidence only. Rust log files can be replaced by subsequent runs; assess the final test summary and executed test names in the current artifact. Earlier scheduling/request logs contain failed builds or assertions and are not passing evidence. The next native binary enrolled all three heterogeneous workers, but the first synchronous table creation failed when its receipt lookup received HTTP 413 during queue replication. [The captured control reply failure](../../artifacts/resource-aware-scheduling/load-control-reply-failure.json) records the successful install messages and rejected lookup. The queue handler reserved 80 MiB for every small reply against a shared 256 MiB control reserve. This exposed a control-progress failure under light overlap and is not a passing C07/Q04 assertion. Later successful assertions are listed above with their exact artifacts and binary hashes. Rust logs under `artifacts/resource-aware-scheduling/` may contain partial or failed runs. The terminal result in each log, plus its executed test names, determines its evidence.
-
-## Case mapping
-
-In this table, “unit” includes Rust integration tests with an injected object store or in-process HTTP router. “Process” requires real API/worker listeners and the conditional local store. A source pointer with no successful execution artifact is pending evidence.
-
-| Case | Assertions and source | Boundary and remaining observation |
+| ID | Executed assertions | Boundary/source |
 | --- | --- | --- |
-| C01 | `scheduling::tests::c01_c02_heterogeneous_limits_and_impossible_work`; `cluster::heartbeat::tests::c01_c02_availability_is_bound_to_advertised_resource_limits`; `acceptance_scheduler.py`; load `setup` | Passed unit limits and final native process signed enrollment with actual 1/2/4 pools and distinct RAM ceilings; see recovery artifact. |
-| C02 | `node::auth::verify::tests::c02_signed_capacity_and_incarnation_cannot_be_forged`; resource/configuration tests | Unit rejection of forged capacity and stale identity; malformed bootstrap process permutations require separate evidence. |
-| C03 | `scheduling::tests::c03_drain_preserves_owned_work_and_reconfigure_reuses_node` | Passed final native restart of the same node from four to three threads; exact immutable partition identities, file hashes and returned rows stayed equal. |
-| C04 | `scheduling::tests::c04_caps_include_reducers_across_hundred_jobs`; load `caps_and_overlap` and `assert_cap_trace` | Unit includes reduction; process separately checks caps 1/2/3 over at least 100 actual partitions. Reducer reservations are not exposed by the transport trace. |
-| C05 | `scheduling::tests::c05_equal_peers_progress_with_one_slot_per_fair_round`; load `caps_and_overlap` | Unit fair-round assertion; process gates two large requests and compares the small request result before releasing both. |
-| C06 | `worker_pool::scheduling_tests::c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop` | Actual worker-thread refill/error/panic test. Unequal remote job runtimes and delayed-worker trace remain separate process requirements. |
-| C07 | `scheduling::tests::c07_f03_memory_only_io_and_cancelled_grants_settle_once`; recovery/load scripts | Unit ownership plus process concurrent coordinators and a small request under gated allocation pressure. Full remote reduction resource instrumentation remains missing. |
-| M01 | `snapshot::resource_tests::m01_wide_strings_extreme_counts_and_encoded_growth_fail_before_allocation`; `engine::mutation::resource_tests::m01_update_values_are_checked_before_cloning_into_candidate`; `tests/snapshot.rs` | Unit budget preflight and real codec/file bounds. These do not certify an OS process memory ceiling. |
-| M02 | `scheduling::tests::m02_queue_results_cpu_and_memory_share_one_ceiling`; `worker_pool::scheduling_tests::m02_m03_f03_two_buffered_requests_terminate_under_memory_pressure`; load OS observer | Unit aggregate logical charges and buffered work. Process RSS is sampled separately; no container ceiling is configured by the fixture. |
-| M03 | Scheduler impossible-job, 32-grant aging, retained-growth and cycle regressions | Unit tests inspect reservation transitions and bounded bypass. Full process memory-pressure progression is not inferred from those tests. |
-| Q01 | `request_queue::tests::q01_thousand_accepted_identities_terminate_once`; load `conservation` | Passed literal 1,000-query CPU-gated local router under default 8 GiB, the 1,000-record queue model and strict real HTTP 1,000-ID/exact-terminal conservation. The HTTP gates measure remote IO/allocation pressure; the local router asserts actual compute slots remain occupied throughout admission. |
-| Q02 | `request_queue::tests::q02_count_and_bytes_are_independent_and_no_partial_install`; load `overflow` | Passed independent process count and byte budgets, explicit overload, all eleven accepted receipt identities and exact terminal row/count results; see overflow summary. |
-| Q03 | Queue acceptance/pin acknowledgment tests, snapshot pagination regression | Passed final native fully transmitted complete-copy installation with its ACK held, no early acceptance, owner SIGKILL and identical-body retry yielding one durable decision. |
-| Q04 | `tests/queued_api.rs`; `acceptance_scheduler.py` API restart | In-process ownership and process API replacement with the same accepted run/identity/result. |
-| Q05 | Queue dedup/conflict tests; `tests/queued_api.rs`; load replay checks | Passed two independent real APIs racing the same mutation, one run/receipt/decision, explicit changed-body conflict and exact terminal replay. |
-| Q06 | Queue expiration/result-cap tests; `tests/queued_api.rs::q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit` | In-process expiration, immutable terminal state and durable decision reconciliation. No unsupported query recomputation is claimed. |
-| F01 | Worker-pool overlap/error tests; `tests/engine_write.rs::mutation_workers_overlap_and_drain_without_publication_on_error` | Passed typed validation, storage, internal codec and resource errors while an unrelated executor job stayed gated; each error preserved its code/outcome and the same free executor ran subsequent work. Preparation and upload faults are covered by their engine/storage cases. |
-| F02 | Worker-pool overlap/error/panic test | Actual unwinding task boundary; does not claim abort/native-code/OOM containment. |
-| F03 | Scheduler cancellation tests; worker-pool stop/download and buffered-resource tests | Unit reservation, waiter, receiver-drop and pool shutdown settlement. Receipt/reduction/cleanup process fault boundaries need explicit traces. |
-| R01 | Queue takeover test; `acceptance_scheduler.py` coordinator SIGKILL | Helper state plus real process same-run recovery and exact query result from a surviving replica. |
-| R02 | Queue survivor/takeover test | Passed sequential actual worker SIGKILL through a single surviving queue holder; accepted identity and captured read result survived each step. |
-| R03 | Queue snapshot/join-capacity tests; recovery process join while request is gated | Queue-copy pagination and copy-before-readiness. Initial process run exposed the inverted snapshot completion flag. |
-| R04 | Queue cold-run test; `tests/fenced_requests.rs`; recovery process complete shutdown/cold start | New-run abandonment and committed mutation retention are distinct assertions. No pending replay or rollback of a committed PUT is promised. |
-| R05 | Queue stale-term test; signed incarnation tests; `tests/fenced_requests.rs` migration/fence assertions | Passed native SIGSTOP of the owner, higher-term takeover and SIGCONT; one mutation decision and the authoritative catalog root remained unchanged by stale work. |
-| R06 | Recovery process SIGKILL | Cross-node process-loss recovery. No supervised per-task executor process isolation is implemented or claimed. |
-| T01 | `tests/fenced_requests.rs::t01_t02_local_upload_failure_leaves_entire_prior_catalog_visible`; engine write sibling-failure test | Injected store and actual engine preparation. Every remote preparation stage needs its own process fault. |
-| T02 | Same upload-failure test; `tests/publication.rs` orphan/history assertions | Failed first/second immutable file upload leaves the previous root. No object-list reconstruction is used. Before-root-submission restart remains a separate process point. |
-| T03 | `tests/fenced_requests.rs` concurrent creates; `tests/publication.rs` shared-base races; `acceptance_nodes.py` competing mutations | Conditional-store race and serial outcomes. Validate the final binary process run before citing the older baseline. |
-| T04 | `tests/fenced_requests.rs::t04_t05_applied_put_before_cold_fence_survives_lost_reply`; publication lost-reply tests; `acceptance_nodes.py` exact replay/API restart | Applied root and lost response are deterministic store or TCP gates. Cold-start committed lookup alone does not prove that a response was lost. |
-| T05 | Both delayed PUT orderings in `tests/fenced_requests.rs` | Injected conditional store proves old PUT after the new fence fails and old PUT before it remains committed. This is not an AWS consistency experiment. |
-| T06 | `tests/fenced_requests.rs::t03_t06_local_identified_workflow_replay_noops_and_atomic_batch`; engine/API protocol tests | Unit operation semantics and replay. Check oversized result and stale table handles in their own executed tests. |
-| U01 | `tests/queued_api.rs`; local runtime tests; separate worker process scripts | Individual topologies are exercised. Identical operation/saturation/failure matrix in both topologies is not inferred. |
-| U02 | Protocol/auth/router tests; load `malformed_during_saturation` | Passed process JSON/duplicate/wrong-type/auth traffic during saturation; the literal CPU-gated 1,000-query local fixture also asserts malformed JSON, duplicate fields, deep predicates, wrong types, huge limits and truncated bodies create no accepted work or charge leak. Framed replay/auth cases remain lower-level typed protocol assertions. |
-| U03 | Seeded scheduler tests and `tests/queue_catalog_events.rs::u03_seeded_queue_resources_membership_and_fenced_catalog_match_serial_oracle` | Passed seeds 343687, 99112 and 20261115 over queue/resources/membership/fenced catalog events with an actual engine and serial row oracle. Pure state transitions remain distinct from real TCP process faults. |
-| A01 | `acceptance_providers.py` missing-adapter validation; ORM serve validation tests | Passed ORM validation and real manual API rejection of unsupported provisioning; no provider call was invented. |
-| A02 | `acceptance_providers.py` configured callback launches real workers, inventory failure, drain overlap | Passed strict configured callback transport and actual 1→2→1→0→1 worker processes, failed inventory, 12 retained exact read outcomes and proof before removal. AWS/Kubernetes lifecycle remains outside this local-provider evidence. |
-| B01 | `examples/resource_scheduler_benchmark.rs` and plotting script | Warm-up and three measured CPU repetitions per cap. A deterministic 96-job event check verifies that all seven feasible logical slots are allocated after registration and after every backlogged release. The benchmark measures actual pool occupied time and process CPU; execution evidence is required before claiming passage. HTTP admission/storage are measured separately. |
-| B02 | Load benchmark plus scheduler CPU/memory/socket benchmark | HTTP matrix uses caps 1/2/3, rates 2/8/32, warm-up plus three repetitions, 16 requests per repetition with seeded 64-row data and a declared 2 ms partition-read delay. Actual CPU/RSS, heartbeat reservations/charges, wire queue/result payloads, network bytes, CAS conflicts, retries/rejections and accepted-ID outcomes complement exact pool queue/compute measurements. Neither unexecuted code nor historical failure artifacts establish passage. |
+| C01 | Distinct signed 1/2/4 pools and RAM ceilings; advertised availability is bounded. | Unit, TCP recovery/load |
+| C02 | Zero/overflow/contradictory limits, forged signed capacity and stale incarnation rejection. | Configuration/auth/membership unit assertions |
+| C03 | Same node restarted from four to three threads; exact rows, partition identities and file hashes preserved. | TCP recovery |
+| C04 | Caps 1/2/3 over 128 actual files; multiple jobs per used worker. Reducer caps checked explicitly. | TCP load, scheduler reducer assertions |
+| C05 | Two large requests overlap; third small result completes while both remain running; fair-round assertions. | TCP load/recovery, scheduler |
+| C06 | A gated executor does not block refill of the other executor; heterogeneous capacities and job work. | Actual worker pool, TCP traces, measured pool |
+| C07 | Saturated coordinators/control progress; remote waits use memory without CPU grants; ordinary peer overload retries. | Scheduler/pool, TCP, signed control regression |
+| M01 | Wide/string/extreme metadata, decoder/encoder growth and update candidate limits fail before unbounded allocation. | Snapshot, mutation and codec assertions |
+| M02 | Aggregate queue/result/working charges, simultaneous buffered requests and reservation settlement; separate RSS observations. | Scheduler/pool, benchmark records |
+| M03 | Impossible work, temporary pressure, 32-grant aging, retained growth and cycle prevention. | Scheduler and buffered worker pool |
+| Q01 | Literal 1,000 CPU-gated queries, 1,000 TCP identities and exact terminal oracles; queue model conservation. | Local router, TCP, replicated queue |
+| Q02 | Independent count and replica-byte overflow; existing accepted work retained; malformed traffic rejected. | Local router, queue, TCP |
+| Q03 | Complete-copy ACK held with no early acceptance; owner killed; exact-body retry yields one decision. Empty/multipage snapshot flags checked. | TCP recovery, queue |
+| Q04 | Accepted work survives socket loss and API replacement with the same run/receipt/result. | Local router, TCP recovery |
+| Q05 | Two real APIs race identical mutation; one receipt/decision; changed-body conflict and exact replay. | TCP recovery, queue/router |
+| Q06 | Explicit result expiry/cap, immutable terminal identity and durable mutation reconciliation. | Queue and queued API |
+| F01 | Typed validation/storage/internal codec/resource errors preserve unrelated gated work and subsequent executor use. | Actual worker pool and engine fault assertions |
+| F02 | Unwinding task panic settles buffers/permits; executor and unrelated work remain usable. | Actual worker pool |
+| F03 | Cancelled waits, dropped receivers, pool stop, buffered reservations and payload cleanup settle ownership once. | Scheduler/pool/payload ownership and event tests |
+| R01 | Coordinator OS kill recovers from a surviving queue copy with the exact result. | TCP recovery |
+| R02 | Successive worker kills preserve accepted identity and captured result through one holder. | TCP recovery |
+| R03 | Join copies outstanding state before readiness; capacity failure is atomic; snapshot pagination terminates. | TCP recovery, queue |
+| R04 | All holders stop; explicit cold fence abandons old read and retains committed mutation/data. | TCP recovery, queued API, fenced catalog |
+| R05 | SIGSTOP owner, higher-term takeover, SIGCONT; no stale root publication and one decision. | TCP recovery, catalog/auth fencing |
+| R06 | SIGKILL worker retains cross-node copies and committed data. | TCP recovery; no within-node abort/OOM isolation claim |
+| T01 | Failed preparation cancels/drains siblings without publishing a partial partition set. | Engine write and fenced publication |
+| T02 | First/second upload failure preserves prior catalog; uploaded final-key orphans stay unreferenced. | Engine/storage fault assertions |
+| T03 | Shared-base mutations recompute CAS losers; concurrent tables and same-key outcomes retain serial semantics. | Publication/engine, TCP node regression |
+| T04 | Applied PUT/lost reply reconciles exact decision; API restart and cold lookup retain success. | Fenced/publication assertions, TCP |
+| T05 | Old PUT before new fence may commit; old PUT after fence fails the same conditional root update. | Deterministically gated conditional store |
+| T06 | Existing wire operations, no-ops, empty/conflicting batch, bounds and stale handles retain stable outcomes. | Engine/API/protocol/fenced replay |
+| U01 | Shared queue/transaction behavior in local router and separate workers, including saturation and recovery. | Local CPU fixture, queued API, TCP |
+| U02 | JSON/duplicates/depth/types/huge limits/auth/truncated bodies during CPU saturation; frame/replay validation. | Literal CPU-gated router, protocol/auth, TCP subset |
+| U03 | Seeds 343687/99112/20261115 check queue, resources, joins/drains/loss/retries/cancel, fences and serial rows after events. | Scheduler and queue/catalog event generators |
+| A01 | Manual API/ORM rejects unsupported provisioning without inventing a provider. | Validation and real manual API |
+| A02 | Configured callbacks drive 1→2→1→0→1 actual workers; inventory failure, 12 exact reads and proof before removal. | Real callback/TCP processes with local provider |
+| B01 | CPU repetitions and 96-job/89-release no-feasible-idle assertion; measured CPU/slot usage. | Validated pool records and chart |
+| B02 | Repeated mixed pool and real HTTP/storage matrix; all quantiles, memory/network/retry/rejection/identity observations. | Validated per-repetition records and charts |
+
+## Regression notes and limits
+
+Regression cases retain the empty/multipage queue snapshot completion bug, bounded control-message memory, deferred local execution-stage memory with 1,000 CPU-gated requests, scheduler aggregate accounting, and ordinary unsigned peer overload followed by fully authenticated success. Control retries preserve the original permit/operation/admission and owned resources; success and settlement still require signed proof.
+
+The fixtures also retain the host socket-pressure failure separately: bounded clients/backoff/polling and explicit finite retention prevent the observer from generating an unreported retry storm. Accepted terminal failures are never ignored to obtain a pass.
+
+Conditional SQLite and local callback evidence does not certify live AWS S3 or Kubernetes lifecycle behavior. No OS process quota or supervised within-node abort/OOM isolation is claimed. Committed mutations remain durable; the queue is replicated worker RAM and is abandoned after every holder stops.

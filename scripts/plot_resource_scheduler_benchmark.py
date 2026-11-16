@@ -57,7 +57,9 @@ def main():
     samples = [[value / 1e6 for run in groups[key] for value in run["job_completion_ns"]["raw"]]
                for key in keys]
     labels = [f"{case}\ncap {cap}\n{interval}us" for case, cap, interval in keys]
-    latency.boxplot(samples, labels=labels, showfliers=False)
+    latency.boxplot(samples, showfliers=False)
+    latency.set_xticks(list(range(1, len(labels) + 1)))
+    latency.set_xticklabels(labels)
     latency.set(yscale="log", ylabel="Completion latency, milliseconds, log scale",
                 title="Accepted job latency distributions, warmup excluded")
     latency.tick_params(axis="x", labelsize=8)

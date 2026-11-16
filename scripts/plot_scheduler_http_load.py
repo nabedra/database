@@ -54,7 +54,9 @@ def main():
     keys = sorted(groups)
     samples = [[(request['completed'] - request['sent']) * 1000
                 for run in groups[key] for request in run['requests'] if request['accepted']] for key in keys]
-    latency.boxplot(samples, labels=[f'Cap {cap}\n{rate}/s' for cap, rate in keys], showfliers=True)
+    latency.boxplot(samples, showfliers=True)
+    latency.set_xticks(list(range(1, len(keys) + 1)))
+    latency.set_xticklabels([f'Cap {cap}\n{rate}/s' for cap, rate in keys])
     latency.set(title='Client completion latency distributions', ylabel='Milliseconds', yscale='log')
     highest_cap = max(caps)
     nodes = sorted({node for rate in rates for run in groups[(highest_cap, rate)]
