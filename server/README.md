@@ -1,6 +1,6 @@
 # Nabedra Database v0 server
 
-The `nabedra-database-server` Rust binary serves the table and query API over HTTP or
+The `nabedra-db` Rust binary serves the table and query API over HTTP or
 native HTTPS. Durable table data uses the configured object store. `serve`
 composes one API with a local worker; `api --config PATH` and
 `worker --bootstrap PATH` run separate processes with the same request, receipt,
@@ -84,12 +84,14 @@ establish AWS or Kubernetes behavior.
 Install the native server from crates.io with Rust 1.94.1 or newer and Cargo:
 
 ```sh
-cargo install nabedra-database --version 0.1.0 --locked
-nabedra-database-server --version
+cargo install nabedra-database --version 0.1.1 --locked
+nabedra-db --version
 ```
 
-The package is named `nabedra-database`; its executable remains
-`nabedra-database-server` and its Rust library remains `nabedra_database_server`.
+The package is named `nabedra-database`; its executable is `nabedra-db`
+and its Rust library is `nabedra_database_server`.
+Version 0.1.1 renames the executable from `nabedra-database-server`.
+Update service commands and explicit `NABEDRA_SERVER_BINARY` paths when upgrading.
 The default `s3` feature includes the AWS storage backend. The Python CLI and ORM
 are separate; use the [repository installer](../scripts/install_nabedra.py) for
 both the Python tools and native server.
@@ -100,14 +102,14 @@ dependency versions in [Cargo.toml](Cargo.toml), and records resolution in
 
 ```sh
 cargo build --locked --manifest-path server/Cargo.toml
-server/target/debug/nabedra-database-server serve
+server/target/debug/nabedra-db serve
 ```
 
 For a release binary:
 
 ```sh
 cargo build --locked --release --manifest-path server/Cargo.toml
-server/target/release/nabedra-database-server serve
+server/target/release/nabedra-db serve
 ```
 
 Configure the environment before starting either binary. For example, with an
@@ -119,7 +121,7 @@ export AWS_REGION='<bucket-region>'
 export NABEDRA_S3_BUCKET='<existing-bucket>'
 export NABEDRA_S3_PREFIX='nabedra-v0/'
 : "${NABEDRA_TOKEN:?Set NABEDRA_TOKEN to your shared bearer token}"
-server/target/debug/nabedra-database-server serve
+server/target/debug/nabedra-db serve
 ```
 
 For development in this shared checkout, keep Cargo commands sequential and
@@ -154,7 +156,7 @@ and does not implicitly load dotenv files or translate `BUCKET_NAME`. Supply
 the server variables explicitly through the process environment or your service
 manager. The guarded acceptance scripts below perform their own dotenv loading.
 
-`nabedra-database-server serve` accepts exactly these application flags, plus standard
+`nabedra-db serve` accepts exactly these application flags, plus standard
 Clap help/version options:
 
 | Flag | Default | Constraint |
@@ -184,7 +186,7 @@ worker-memory request queue.
 For example:
 
 ```sh
-server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
+server/target/debug/nabedra-db serve --workers 4 --partition_size '64 KB'
 ```
 
 `--partition-size '64 KB'` is equivalent. Units are mandatory and case-insensitive:
@@ -208,7 +210,7 @@ Without TLS flags, the listener serves HTTP. To serve native HTTPS on an
 explicit nonloopback address:
 
 ```sh
-server/target/release/nabedra-database-server serve --host 0.0.0.0 --port 8443 \
+server/target/release/nabedra-db serve --host 0.0.0.0 --port 8443 \
   --workers 4 --queue-size 64 \
   --tls-cert /path/to/server-cert.pem --tls-key /path/to/server-key.pem
 ```
@@ -365,11 +367,11 @@ silently acknowledges migration of a pre-existing legacy catalog. Do not substit
 or manually replay a recorded acceptance prefix. Run the runners sequentially:
 
 ```sh
-orm/.venv/bin/python scripts/acceptance_http.py --binary server/target/debug/nabedra-database-server
-orm/.venv/bin/python scripts/acceptance_lifecycle.py --binary server/target/debug/nabedra-database-server
-orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-database-server
-orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-database-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-database-server
+orm/.venv/bin/python scripts/acceptance_http.py --binary server/target/debug/nabedra-db
+orm/.venv/bin/python scripts/acceptance_lifecycle.py --binary server/target/debug/nabedra-db
+orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-db
+orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-db
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-db
 ```
 
 The [HTTP runner](../scripts/acceptance_http.py) checks types, CRUD and queries;
@@ -407,15 +409,15 @@ Run from the repository root using the existing dependency cache:
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
-  cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin nabedra-database-server
-python3.11 scripts/acceptance_nodes.py --binary server/target/debug/nabedra-database-server
+  cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin nabedra-db
+python3.11 scripts/acceptance_nodes.py --binary server/target/debug/nabedra-db
 ```
 
 The runner needs Python 3.11+, its standard library and loopback TCP. It creates and
 removes its own SQLite store and configuration. It reads no dotenv or cloud
-profiles. Its startup exchange demonstrates `nabedra-database-server api --config PATH`
+profiles. Its startup exchange demonstrates `nabedra-db api --config PATH`
 over the inherited `NABEDRA_SUPERVISOR_FD` socket and
-`nabedra-database-server worker --bootstrap PATH`. An API requires that supervisor
+`nabedra-db worker --bootstrap PATH`. An API requires that supervisor
 exchange; it is not an unsupervised standalone command. `api` also accepts
 `--migrate-catalog` and `--cold-start` with the same migration and cold-run
 confirmation requirements described above.
@@ -443,4 +445,4 @@ The rename keeps catalog and snapshot formats unchanged. Storage identity digest
 
 The default namespace for a new legacy `serve` process is now `nabedra-v0/`. To reopen data previously written under the default namespace, set `NABEDRA_S3_PREFIX=meshdb-v0/` explicitly, or keep the existing configured namespace. Renaming a namespace selects a different database; it does not move existing objects.
 
-Environment settings now use `NABEDRA_*`, and HTTP headers use `X-Nabedra-Storage` and the internal `X-Nabedra-*` prefix. `X-Nabedra-Database` selects a database at the Python gateway. Restart the cluster with matching renamed API, worker and client versions, since peer authentication domains and headers changed. The public launcher is `nabedra database <command>`; direct Rust commands use `nabedra-database-server <command>`.
+Environment settings now use `NABEDRA_*`, and HTTP headers use `X-Nabedra-Storage` and the internal `X-Nabedra-*` prefix. `X-Nabedra-Database` selects a database at the Python gateway. Restart the cluster with matching renamed API, worker and client versions, since peer authentication domains and headers changed. The public launcher is `nabedra database <command>`; direct Rust commands use `nabedra-db <command>`.

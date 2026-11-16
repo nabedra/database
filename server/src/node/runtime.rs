@@ -807,11 +807,11 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         served
     }.await;
     let drained = owners.close_and_drain().await.map_err(|_| {
-        eprintln!("nabedra-database-server: payload shutdown failed");
+        eprintln!("nabedra-db: payload shutdown failed");
         unavailable()
     });
     let joined = partition_threads.shutdown().await.map_err(|_| {
-        eprintln!("nabedra-database-server: partition shutdown failed");
+        eprintln!("nabedra-db: partition shutdown failed");
         unavailable()
     });
     let removed = cpu(&cpu_pool, move |_| {
@@ -824,13 +824,13 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
                 }
             })
             .map_err(|_| {
-                eprintln!("nabedra-database-server: scratch cleanup failed");
+                eprintln!("nabedra-db: scratch cleanup failed");
                 unavailable()
             })
     })
     .await;
     if work.is_err() {
-        eprintln!("nabedra-database-server: worker service failed");
+        eprintln!("nabedra-db: worker service failed");
     }
     work.and(drained).and(joined).and(removed)
 }

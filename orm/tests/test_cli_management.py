@@ -108,15 +108,20 @@ class ManagementTests(unittest.TestCase):
         import sys
         envbin = self.root / 'bin'
         envbin.mkdir()
-        binary = envbin / 'nabedra-database-server'
-        binary.write_text('#!' + sys.executable + '\nprint("nabedra-database-server 0.1.0")\n')
+        binary = envbin / 'nabedra-db'
+        binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 0.1.1")\n')
         binary.chmod(0o700)
         with patch('nabedra._binary.sys.prefix', str(self.root)), patch.dict(os.environ, {}, clear=True):
             self.assertEqual(resolve_server_binary(check=True), str(binary))
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main(['--version', '--json']), 0)
+            versions = json.loads(output.getvalue())
+            self.assertEqual(versions['cli'], '0.1.0')
+            self.assertEqual(versions['binary'], '0.1.1')
             with patch.dict(os.environ, {'NABEDRA_SERVER_BINARY': 'absent'}):
                 with self.assertRaises(RuntimeError):
                     resolve_server_binary(check=True)
-            binary.write_text('#!' + sys.executable + '\nprint("nabedra-database-server 9.0.0")\n')
+            binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 9.0.0")\n')
             with self.assertRaises(RuntimeError):
                 resolve_server_binary(check=True)
 

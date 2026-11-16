@@ -49,7 +49,7 @@ server in terminal 1:
 
 ```sh
 : "${NABEDRA_TOKEN:?Set the shared bearer token in this terminal}"
-server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
+server/target/debug/nabedra-db serve --workers 4 --partition_size '64 KB'
 ```
 
 Keep this terminal open. The bucket and prefix identify the database. The
@@ -204,7 +204,7 @@ server to exit. It stops accepting work and drains admitted operations. Restart
 it in that same terminal, retaining the bucket, prefix, and token:
 
 ```sh
-server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
+server/target/debug/nabedra-db serve --workers 4 --partition_size '64 KB'
 ```
 
 Do not rerun the prefix generation command, since that would select a different

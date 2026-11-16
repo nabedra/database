@@ -1,0 +1,21 @@
+{
+  "elapsed_seconds": 54.864,
+  "profile": "dev",
+  "source": "crates.io",
+  "version": "0.1.1",
+  "installed_binaries": [
+    "nabedra-db"
+  ],
+  "version_output": "nabedra-db 0.1.1",
+  "root_serve_worker_help": "passed",
+  "product_cli_resolves_installed_binary": true,
+  "product_cli_versions": {
+    "cli": "0.1.0",
+    "binary": "0.1.1",
+    "config": 2,
+    "protocol": 1
+  },
+  "binary_sha256": "63ffd555c479fedbf889cd80eef8f5c4fa4e5a23c8d3f8d722e9ebd1d4982b77",
+  "installed_outside_checkout": true,
+  "result": "passed"
+}

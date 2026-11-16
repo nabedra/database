@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 /// Nabedra Database server command line.
 #[derive(Debug, Parser)]
-#[command(name = "nabedra-database-server", version, propagate_version = true)]
+#[command(name = "nabedra-db", version, propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

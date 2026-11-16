@@ -51,8 +51,8 @@ configuration, protected token files, shared compute and gateway middleware.
 For direct native deployment, install the S3-enabled server from crates.io:
 
 ```sh
-cargo install nabedra-database --version 0.1.0 --locked
-nabedra-database-server --version
+cargo install nabedra-database --version 0.1.1 --locked
+nabedra-db --version
 ```
 
 This installs the native server. Use the repository installer above for the
@@ -71,7 +71,7 @@ export AWS_REGION='<bucket-region>'
 export NABEDRA_S3_BUCKET='<existing-bucket>'
 export NABEDRA_S3_PREFIX='nabedra-v0/'
 : "${NABEDRA_TOKEN:?Set NABEDRA_TOKEN to your shared bearer token}"
-server/target/release/nabedra-database-server serve --host 127.0.0.1 --port 8000 \
+server/target/release/nabedra-db serve --host 127.0.0.1 --port 8000 \
   --workers 4 --queue-size 64 --partition-size '64 MiB'
 ```
 
@@ -116,8 +116,8 @@ proves they committed. For an existing format 1/2/3 catalog, stop all previous
 writers and explicitly pass `--migrate-catalog` to upgrade to format 4; keep
 old binaries stopped. Migration and cold start are separate confirmations.
 
-For separate API and worker processes, use `nabedra-database-server api --config PATH`
-and `nabedra-database-server worker --bootstrap PATH`. The API requires a supervisor
+For separate API and worker processes, use `nabedra-db api --config PATH`
+and `nabedra-db worker --bootstrap PATH`. The API requires a supervisor
 startup exchange and explicit object-storage configuration. Follow the
 [cluster process guide](server/README.md#cluster-process-acceptance) and
 [provider configuration](docs/testing/provisioning-adapters.md) for enrollment,
@@ -222,7 +222,7 @@ Atomic batches remain single operations. See the
 For example, after configuring the server environment:
 
 ```sh
-server/target/release/nabedra-database-server serve --workers 4 --partition_size '64 KB'
+server/target/release/nabedra-db serve --workers 4 --partition_size '64 KB'
 ```
 
 `--partition-size` is equivalent. `--workers N` supplies N persistent local
@@ -311,10 +311,10 @@ fixture targets and run the measurements sequentially with other load stopped:
 ```sh
 export CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features \
-  --bin nabedra-database-server --example resource_scheduler_benchmark
+  --bin nabedra-db --example resource_scheduler_benchmark
 mkdir -p artifacts
 server/target/debug/examples/resource_scheduler_benchmark --output artifacts/scheduler-pool-benchmark.json
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server \
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-db \
   --suite benchmark --output artifacts/scheduler-http-benchmark.json
 python3.11 scripts/summarize_scheduler_benchmarks.py \
   --pool artifacts/scheduler-pool-benchmark.json --http artifacts/scheduler-http-benchmark.json \
@@ -347,7 +347,7 @@ local conditional SQLite object service:
 
 ```sh
 python3.11 scripts/acceptance_nabedra.py \
-  --binary .nabedra/bin/nabedra-database-server \
+  --binary .nabedra/bin/nabedra-db \
   --cli .nabedra/bin/nabedra --python .nabedra/bin/python
 ```
 
@@ -399,11 +399,11 @@ The partition runner checks actual file sizes, routed mutations, global query
 results and a restart from two to three workers in one retained namespace.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_http.py --scenario all --binary server/target/debug/nabedra-database-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_lifecycle.py --scenario all --binary server/target/debug/nabedra-database-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-database-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-database-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_http.py --scenario all --binary server/target/debug/nabedra-db
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_lifecycle.py --scenario all --binary server/target/debug/nabedra-db
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-db
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-db
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-db
 ```
 
 Each run allocates fresh S3 folders named `test-<number>-<name>-<run-id>/` and

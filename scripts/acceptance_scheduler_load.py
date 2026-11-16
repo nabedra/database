@@ -939,7 +939,7 @@ def machine():
 
 
 def run(args):
-    evidence = dict(started_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=machine(), seed=args.seed, binary='server/target/debug/nabedra-database-server' if args.binary == Path(__file__).resolve().parents[1] / 'server/target/debug/nabedra-database-server' else args.binary.name,
+    evidence = dict(started_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=machine(), seed=args.seed, binary='server/target/debug/nabedra-db' if args.binary == Path(__file__).resolve().parents[1] / 'server/target/debug/nabedra-db' else args.binary.name,
                     build=dict(profile='dev', optimization='unoptimized', debug_info='disabled',
                                CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_INCREMENTAL='0',
                                provenance='explicit orchestrator build configuration; throughput is not a release-profile claim'),

@@ -29,9 +29,14 @@ The Python package does not bundle the Rust server. To run a server locally,
 install the published crate separately with Cargo:
 
 ```sh
-cargo install nabedra-database --version 0.1.0 --locked
-nabedra-database-server --version
+cargo install nabedra-database --version 0.1.1 --locked
+nabedra-db --version
 ```
+
+The published Python 0.1.0 CLI expects the previous server executable name.
+To use `nabedra database serve` with `nabedra-db`, install the updated CLI
+from this checkout with the [repository installer](../scripts/install_nabedra.py).
+The Python ORM can connect to the renamed server without a CLI update.
 
 For development, run `python3.11 -m pip install -e ./orm` from the repository
 root instead of installing from PyPI.
