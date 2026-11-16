@@ -16,7 +16,7 @@ use crate::{
     },
     executor::Executor,
     protocol::{ErrorCode, ProtocolError},
-    storage::{HttpStore, Namespace, Storage},
+    storage::{Namespace, RuntimeStore, Storage},
     worker_pool::WorkerPool,
 };
 use axum::{
@@ -39,9 +39,14 @@ use tokio::{sync::Semaphore, time::Instant};
 use uuid::Uuid;
 
 pub(super) struct Worker {
+    #[cfg(test)]
+    test_job_barrier: Mutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
+    #[cfg(test)]
+    pub(super) test_terminal_replication_barrier: Mutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
     initialization: Uuid,
     pub(super) ready: Arc<BootstrapReady>,
-    pub(super) storage: Arc<Storage<HttpStore>>,
+    pub(super) storage: Arc<Storage<RuntimeStore>>,
+    pub(super) registry: crate::storage::registry::DatabaseRegistry,
     pub(super) cpu: WorkerPool,
     pub(super) control_cpu: WorkerPool,
     pub(super) control_budget: crate::scheduling::ResourceScheduler,
@@ -63,6 +68,17 @@ pub(super) struct Worker {
     partition_transport: Arc<Semaphore>,
     pub(super) control_transport: Arc<Semaphore>,
     accepting: AtomicBool,
+}
+/// A grant owns its registry and physical scheduler reservation through storage clones.
+#[derive(Clone)]
+pub(super) struct DataGrant {
+    storage: Arc<Storage<RuntimeStore>>,
+    _handle: Option<crate::storage::registry::DatabaseHandle>,
+}
+impl DataGrant {
+    pub(super) fn storage(&self) -> Arc<Storage<RuntimeStore>> {
+        self.storage.clone()
+    }
 }
 struct ResponseRetention {
     body: Body,
@@ -97,6 +113,49 @@ impl hyper::body::Body for ResponseRetention {
     }
 }
 impl Worker {
+    pub(super) async fn open_database(
+        &self,
+        context: crate::storage::context::RequestContext,
+    ) -> Result<DataGrant> {
+        if self.ready.prepared.input.value.template.mode.is_fixed() {
+            return Err(http::failure(ErrorCode::Unauthorized));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| unavailable())?
+            .as_secs();
+        context
+            .validate(now)
+            .map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+        let handle = self
+            .registry
+            .open_accounted(context, now, Some(&self.cpu.scheduler()))
+            .await
+            .map_err(|e| match e {
+                crate::storage::StorageError::LimitExceeded => http::failure(ErrorCode::Overloaded),
+                _ => http::failure(ErrorCode::Unauthorized),
+            })?;
+        Ok(DataGrant {
+            storage: handle.storage().clone(),
+            _handle: Some(handle),
+        })
+    }
+    pub(super) async fn data_for_record(
+        &self,
+        record: &crate::request_queue::RequestRecord,
+    ) -> Result<DataGrant> {
+        match (
+            &record.context,
+            self.ready.prepared.input.value.template.mode.is_fixed(),
+        ) {
+            (Some(context), false) => self.open_database(context.clone()).await,
+            (None, true) => Ok(DataGrant {
+                storage: self.storage.clone(),
+                _handle: None,
+            }),
+            _ => Err(http::failure(ErrorCode::Unauthorized)),
+        }
+    }
     pub(super) async fn root(&self) -> Result<crate::cluster::state::Control> {
         http::load_root(&self.storage, &self.control_cpu).await
     }
@@ -132,9 +191,12 @@ impl Worker {
     }
     pub(super) async fn dispatch(
         self: Arc<Self>,
-        request: Request<Body>,
+        mut request: Request<Body>,
         transport: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Response<Body>> {
+        let request_key = request
+            .extensions_mut()
+            .remove::<crate::request_queue::RequestKey>();
         let deadline = Instant::now() + Duration::from_secs(30);
         let path = request.uri().path().to_owned();
         if request.uri().query().is_some() {
@@ -240,21 +302,30 @@ impl Worker {
                     return Err(http::failure(ErrorCode::Unauthorized));
                 }
                 let request_id = response_auth.operation_id().ok_or_else(invalid)?;
+                let key = request_key.ok_or_else(invalid)?;
+                if key.request_id != request_id {
+                    return Err(invalid());
+                }
+                let record = self.queue.record(key.clone())?;
+                let data = self.queue_data_for_record(&record).await?;
                 let expected = self.queue.checked_execution(
-                    request_id,
+                    key.clone(),
                     response_auth.request_digest().ok_or_else(invalid)?,
                 )?;
                 let root = self.root().await?;
+                let catalog = data
+                    .storage()
+                    .load_cluster_catalog()
+                    .await
+                    .map_err(|_| unavailable())?;
+                if !root.template.mode.is_fixed()
+                    && catalog.catalog().owner_cluster != Some(root.cluster_id)
+                {
+                    return Err(unavailable());
+                }
                 if root.scheduler.coordinator_node != self.signer.sender().node_id()
                     || root.scheduler.scheduler_term != expected.scheduler_term
-                    || self
-                        .storage
-                        .load_cluster_catalog()
-                        .await
-                        .map_err(|_| unavailable())?
-                        .catalog()
-                        .fence
-                        != Some(expected)
+                    || catalog.catalog().fence != Some(expected)
                 {
                     return Err(unavailable());
                 }
@@ -271,6 +342,8 @@ impl Worker {
                 stream.ready().await.map_err(|_| unavailable())?;
                 let result = super::coordinator::execute(
                     &self,
+                    key,
+                    data,
                     binding,
                     authority,
                     *operation,
@@ -309,14 +382,19 @@ impl Worker {
                 let job = accepted.envelope;
                 let mut lease = accepted.lease;
                 let root = self.root().await?;
-                let fence = self
-                    .storage
+                let record = self.queue.record_for_job(&job)?;
+                let data = self.queue_data_for_record(&record).await?;
+                let catalog = data
+                    .storage()
                     .load_cluster_catalog()
                     .await
-                    .map_err(|_| unavailable())?
-                    .catalog()
-                    .fence
-                    .ok_or_else(unavailable)?;
+                    .map_err(|_| unavailable())?;
+                if !root.template.mode.is_fixed()
+                    && catalog.catalog().owner_cluster != Some(root.cluster_id)
+                {
+                    return Err(unavailable());
+                }
+                let fence = catalog.catalog().fence.ok_or_else(unavailable)?;
                 if root.scheduler.scheduler_term != fence.scheduler_term
                     || root.scheduler.coordinator_node != response_auth.sender().node_id()
                 {
@@ -331,8 +409,16 @@ impl Worker {
                         .map_err(|_| unavailable())
                 })
                 .await?;
+                #[cfg(test)]
+                {
+                    let barrier = self.test_job_barrier.lock().unwrap().clone();
+                    if let Some((arrived, release)) = barrier {
+                        arrived.add_permits(1);
+                        release.acquire().await.map_err(|_| unavailable())?.forget();
+                    }
+                }
                 let Reply::Accepted(result) = lease
-                    .command(Command::ExecuteCaptured(self.storage.clone()))
+                    .command(Command::ExecuteCaptured(data.storage()))
                     .await
                     .map_err(|_| unavailable())?
                 else {
@@ -484,21 +570,57 @@ pub async fn run_worker(path: PathBuf) -> std::result::Result<(), &'static str> 
 async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let ready = Arc::new(
-        cpu(&cpu_pool, move |_| {
+        cpu(&cpu_pool, move |runtime| {
             prepare_bootstrap(&path, deadline.into_std())
-                .and_then(|p| p.connect())
+                .and_then(|p| runtime.block_on(p.connect_async()))
                 .map_err(|_| invalid())
         })
         .await?,
     );
     let input = &ready.prepared.input.value;
-    let crate::cluster::configuration::Storage::Http(options) = &input.template.storage else {
-        return Err(invalid());
+    let namespace = match &input.template.storage {
+        crate::cluster::configuration::Storage::Http(s) => &s.namespace,
+        crate::cluster::configuration::Storage::S3(s) => &s.namespace,
     };
     let storage = Arc::new(Storage::new(
         ready.backend.client.clone(),
-        Namespace::new(&options.namespace).map_err(|_| invalid())?,
+        Namespace::new(namespace).map_err(|_| invalid())?,
     ));
+    let control_key = match &input.template.storage {
+        crate::cluster::configuration::Storage::S3(options) => {
+            #[cfg(feature = "s3")]
+            {
+                let RuntimeStore::S3(client) = &ready.backend.client else {
+                    return Err(invalid());
+                };
+                Some(
+                    crate::storage::context::StorageKey::new(
+                        &options.bucket,
+                        client.region(),
+                        &options.namespace,
+                    )
+                    .map_err(|_| invalid())?,
+                )
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = options;
+                return Err(invalid());
+            }
+        }
+        _ => None,
+    };
+    let registry = crate::storage::registry::DatabaseRegistry::new(
+        (input.template.execution.max_pending_requests as usize)
+            .checked_add(super::queue_runtime::coordination_capacity(
+                &input.template,
+            )?)
+            .and_then(|n| n.checked_add(16))
+            .ok_or_else(invalid)?,
+        input.template.worker_resources().working_bytes() as usize,
+        control_key,
+    )
+    .map_err(|_| invalid())?;
     let client = http::HttpClient::new(ready.prepared.tls.as_ref())?;
     let key = Arc::new(auth::WorkerSigningKey::new().map_err(|_| invalid())?);
     let incarnation = Uuid::new_v4();
@@ -656,7 +778,7 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         let configured=super::initialization::InitializedWorker::validate(boot,initialization,ready.clone(),storage.clone(),&cpu_pool).await?;
         receiver.lock().unwrap().complete_initialization(process_ready,configured).map_err(|_|invalid())?;
         let tls=crate::runtime::retained_tls(ready.prepared.tls.as_ref())?;
-        let worker=Arc::new(Worker{ready,storage,cpu:partition_pool.clone(),control_cpu:cpu_pool.clone(),control_budget,progress_budget,coordination_slots,signer,client,initialization,owners:owners.clone(),receiver,pin,process:Arc::new(process),operations:Executor::new(coordination_slots,0)?,partitions:Executor::new(partition_slots,0)?,controls:Executor::new(8,0)?,sending:Executor::new(partition_slots,0)?,operation_transport:Arc::new(Semaphore::new(coordination_slots)),partition_transport:Arc::new(Semaphore::new(partition_slots)),control_transport:Arc::new(Semaphore::new(8)),accepting:AtomicBool::new(true),queue:super::queue_runtime::QueueRuntime::new(),remote_scheduler:super::coordinator::RemoteScheduler::new()});
+        let worker=Arc::new(Worker{#[cfg(test)] test_job_barrier:Mutex::new(None),#[cfg(test)] test_terminal_replication_barrier:Mutex::new(None),ready,storage,registry,cpu:partition_pool.clone(),control_cpu:cpu_pool.clone(),control_budget,progress_budget,coordination_slots,signer,client,initialization,owners:owners.clone(),receiver,pin,process:Arc::new(process),operations:Executor::new(coordination_slots,0)?,partitions:Executor::new(partition_slots,0)?,controls:Executor::new(8,0)?,sending:Executor::new(partition_slots,0)?,operation_transport:Arc::new(Semaphore::new(coordination_slots)),partition_transport:Arc::new(Semaphore::new(partition_slots)),control_transport:Arc::new(Semaphore::new(8)),accepting:AtomicBool::new(true),queue:super::queue_runtime::QueueRuntime::new(),remote_scheduler:super::coordinator::RemoteScheduler::new()});
         worker.initialize_queue().await?;
         let root=worker.root().await?;
         let node=root.nodes.iter().find(|n|Some(n.node_id)==worker.signer.sender().node_id()).ok_or_else(unavailable)?;
@@ -712,3 +834,6 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
     }
     work.and(drained).and(joined).and(removed)
 }
+
+#[cfg(test)]
+mod shared_tests;

@@ -317,3 +317,42 @@ fn raw_byte_depth_template_bounds_and_sanitized_diagnostics() {
         assert!(!debug.contains(ID));
     }
 }
+
+#[test]
+fn cli02_v2_mode_and_legacy_canonical_defaults() {
+    let legacy = decode_api(api().as_bytes()).unwrap();
+    let fixed = decode_api(
+        api()
+            .replace("\"version\":1", "\"version\":2,\"mode\":\"fixed\"")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy.template.encode().unwrap(),
+        fixed.template.encode().unwrap()
+    );
+    assert_eq!(
+        legacy.template.fingerprint().unwrap(),
+        fixed.template.fingerprint().unwrap()
+    );
+    let shared = decode_api(
+        api()
+            .replace("\"version\":1", "\"version\":2,\"mode\":\"serverless\"")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(!shared.template.mode.is_fixed());
+    assert_ne!(
+        shared.template.fingerprint().unwrap(),
+        fixed.template.fingerprint().unwrap()
+    );
+    bad_api(&api().replace("\"version\":1", "\"version\":1,\"mode\":\"serverless\""));
+    bad_api(&api().replace("\"version\":1", "\"version\":2,\"mode\":\"bad\""));
+    let bootstrap = decode_bootstrap(
+        bootstrap()
+            .replace("\"version\":1", "\"version\":2,\"mode\":\"serverless\"")
+            .as_bytes(),
+    )
+    .unwrap();
+    assert!(!bootstrap.template.mode.is_fixed());
+}

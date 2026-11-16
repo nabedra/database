@@ -274,7 +274,19 @@ pub(super) async fn exchange_class(
     let end = Instant::now() + Duration::from_secs(30);
     let response = client.request(request, end).await?;
     if response.status() != 200 {
-        return Err(unavailable());
+        // Do not turn a denial or malformed peer request into a retryable
+        // observation failure. Unsigned errors carry no success authority.
+        let code = match response.status().as_u16() {
+            401 | 403 => ErrorCode::Unauthorized,
+            404 => ErrorCode::NotFound,
+            409 => ErrorCode::Conflict,
+            413 => ErrorCode::LimitExceeded,
+            429 => ErrorCode::Overloaded,
+            500 => ErrorCode::InternalError,
+            502 | 503 | 504 => ErrorCode::StorageUnavailable,
+            _ => ErrorCode::ValidationError,
+        };
+        return Err(http::failure(code));
     }
     let headers = response.headers().clone();
     let len = http::framing(&headers, response_cap.min(MAX_BYTES), false)?.ok_or_else(invalid)?;
@@ -477,5 +489,59 @@ mod allocation_tests {
         assert_eq!(scheduler.usage()[0].2, 16 << 20);
         drop(actor);
         assert_eq!(scheduler.usage()[0].2, 0);
+    }
+}
+
+#[cfg(test)]
+mod observation_http_tests {
+    use super::*;
+    use axum::Router;
+    use serde_json::json;
+    #[tokio::test]
+    async fn u02_observation_http_errors_preserve_denial_and_malformed_classification() {
+        for (status, expected) in [
+            (400, ErrorCode::ValidationError),
+            (401, ErrorCode::Unauthorized),
+            (403, ErrorCode::Unauthorized),
+            (404, ErrorCode::NotFound),
+            (409, ErrorCode::Conflict),
+            (413, ErrorCode::LimitExceeded),
+            (429, ErrorCode::Overloaded),
+            (500, ErrorCode::InternalError),
+            (502, ErrorCode::StorageUnavailable),
+            (503, ErrorCode::StorageUnavailable),
+            (504, ErrorCode::StorageUnavailable),
+            (200, ErrorCode::ValidationError),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let id = |n| Uuid::from_u128(n);
+            let template = json!({"api_urls":["http://127.0.0.1:1"],"listen":"127.0.0.1:0","storage":{"driver":"http","options":{"base_url":"http://127.0.0.1:1","namespace":"fixture/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":1,"partition_slots":1,"queue_size":4,"partition_size":"4 KiB"});
+            let typed: crate::cluster::configuration::Template =
+                serde_json::from_value(template.clone()).unwrap();
+            let root:Control=serde_json::from_value(json!({"version":1,"cluster_id":id(1),"name":"Fixture","config":{"generation":2,"storage_fingerprint":"a".repeat(64),"auth_fingerprint":"b".repeat(64),"template_fingerprint":typed.fingerprint().unwrap(),"lifecycle_fingerprint":"c".repeat(64),"worker_semantic_fingerprint":"d".repeat(64),"adapter_contract":null},"provisioning":"external","template":template,"timing":crate::cluster::configuration::Timing::default(),"revision":1,"change_id":id(20),"policy":{"revision":1,"mode":"fixed","desired":1,"min_nodes":1,"max_nodes":1},"controller":{"owner_id":null,"epoch":0,"lease_state":"released","lease_until_ms":null},"scheduler":{"coordinator_node":id(3),"scheduler_term":1,"cooldown_until_ms":0,"backoff_until_ms":0,"failures":0,"low_since_ms":null},"admin_seq":0,"admin_head":null,"nodes":[{"node_id":id(3),"launch_id":null,"resource_id":format!("external:{}",id(3)),"ownership":"external","state":"ready","incarnation":id(4),"retired_incarnations":[],"endpoint":endpoint,"operation_slots":1,"partition_slots":1,"queue_size":4,"registration":"verified","session":{"id":id(5),"verifier":"a".repeat(64)},"drain":null}],"intents":[]})).unwrap();
+            let app = Router::new().fallback(move || async move {
+                Response::builder()
+                    .status(status)
+                    .header("content-length", "2")
+                    .body(Body::from("{}"))
+                    .unwrap()
+            });
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = HttpClient::new(None).unwrap();
+            let signer = Signer::api(id(1), id(2), &"A".repeat(43)).unwrap();
+            let error = exchange(
+                &client,
+                &signer,
+                &root,
+                &root.nodes[0],
+                br#"{"command":"stats"}"#.to_vec(),
+            )
+            .await
+            .unwrap_err();
+            server.abort();
+            let _ = server.await;
+            assert_eq!(error.code, expected, "HTTP {status}");
+        }
     }
 }

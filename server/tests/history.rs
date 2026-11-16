@@ -461,3 +461,234 @@ async fn unreadable_roots_and_slow_or_partial_history_fail_safely() {
     );
     assert_eq!(s.backend().fake.state.lock().unwrap().puts, 0);
 }
+
+#[tokio::test]
+async fn sl05_owner_cluster_is_conditional_and_legacy_migration_is_explicit() {
+    let s = store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let fence = CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    };
+    let first = s
+        .initialize_owned_cluster_catalog(a, fence, false, false)
+        .await
+        .unwrap();
+    assert_eq!(first.catalog().owner_cluster, Some(a));
+    assert_eq!(first.catalog().format_version, 5);
+    assert_eq!(
+        s.initialize_owned_cluster_catalog(a, fence, false, false)
+            .await
+            .unwrap(),
+        first
+    );
+    let puts = s.backend().state.lock().unwrap().puts;
+    assert_eq!(
+        s.initialize_owned_cluster_catalog(b, fence, true, true)
+            .await,
+        Err(StorageError::Conflict)
+    );
+    assert_eq!(
+        s.initialize_cluster_catalog().await,
+        Err(StorageError::Conflict)
+    );
+    assert_eq!(s.backend().state.lock().unwrap().puts, puts);
+    let other = store();
+    let legacy = other.initialize_cluster_catalog().await.unwrap();
+    assert_eq!(
+        other
+            .initialize_owned_cluster_catalog(a, fence, false, false)
+            .await,
+        Err(StorageError::UnsupportedCatalog)
+    );
+    let owned = other
+        .initialize_owned_cluster_catalog(a, fence, true, false)
+        .await
+        .unwrap();
+    assert_eq!(owned.catalog().tables, legacy.catalog().tables);
+    assert_eq!(
+        owned.catalog().decision_head,
+        legacy.catalog().decision_head
+    );
+    assert_eq!(owned.catalog().commit_id, legacy.catalog().commit_id);
+    assert_eq!(owned.catalog().owner_cluster, Some(a));
+}
+
+#[tokio::test]
+async fn sl05_t05_old_publication_cannot_cross_owned_catalog_cold_fence() {
+    let s = store();
+    let cluster = Uuid::new_v4();
+    let old = CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    };
+    let base = s
+        .initialize_owned_cluster_catalog(cluster, old, false, false)
+        .await
+        .unwrap();
+    let mut d = decision(551, base.catalog().revision, base.catalog().decision_head);
+    d.id = Uuid::new_v4();
+    assert_eq!(
+        PreparedPublication::prepare_owned(
+            base.clone(),
+            base.catalog().tables.clone(),
+            d.clone(),
+            Uuid::new_v4(),
+            old
+        )
+        .unwrap_err(),
+        StorageError::Conflict
+    );
+    assert_eq!(
+        PreparedPublication::prepare_fenced(
+            base.clone(),
+            base.catalog().tables.clone(),
+            d.clone(),
+            old
+        )
+        .unwrap_err(),
+        StorageError::Conflict
+    );
+    let candidate = PreparedPublication::prepare_owned(
+        base.clone(),
+        base.catalog().tables.clone(),
+        d,
+        cluster,
+        old,
+    )
+    .unwrap();
+    let fresh = CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    };
+    assert_eq!(
+        s.initialize_owned_cluster_catalog(cluster, fresh, false, false)
+            .await,
+        Err(StorageError::Conflict)
+    );
+    let fenced = s
+        .initialize_owned_cluster_catalog(cluster, fresh, false, true)
+        .await
+        .unwrap();
+    assert_eq!(fenced.catalog().owner_cluster, Some(cluster));
+    assert_eq!(fenced.catalog().fence, Some(fresh));
+    assert!(matches!(
+        candidate.publish(&s, budget()).await.unwrap(),
+        PublicationOutcome::NeedsRecompute
+    ));
+    let current = s.load_cluster_catalog().await.unwrap();
+    assert_eq!(current, fenced);
+    assert_eq!(
+        PreparedPublication::prepare_owned(
+            current,
+            base.catalog().tables.clone(),
+            decision(552, 0, None),
+            cluster,
+            old
+        )
+        .unwrap_err(),
+        StorageError::Conflict
+    );
+}
+
+#[tokio::test]
+async fn sl05_explicit_owned_migration_keeps_reachable_decisions() {
+    let s = store();
+    let (first, last) = chain(&s);
+    let fence = CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    };
+    let owner = Uuid::new_v4();
+    let owned = s
+        .initialize_owned_cluster_catalog(owner, fence, true, false)
+        .await
+        .unwrap();
+    assert_eq!(owned.catalog().commit_id, last.id);
+    assert_eq!(owned.catalog().decision_head, Some(last.id));
+    assert_eq!(owned.catalog().revision, last.revision);
+    assert_eq!(
+        s.lookup_decision(
+            &owned,
+            first.request_id,
+            first.request_body.as_bytes(),
+            budget()
+        )
+        .await
+        .unwrap(),
+        HistoryLookup::Found(first)
+    );
+    assert_eq!(
+        s.lookup_decision(
+            &owned,
+            last.request_id,
+            last.request_body.as_bytes(),
+            budget()
+        )
+        .await
+        .unwrap(),
+        HistoryLookup::Found(last)
+    );
+}
+
+#[derive(Default)]
+struct SelectiveGrant {
+    backend: Fake,
+    deny_tables: std::sync::atomic::AtomicBool,
+}
+impl ObjectStore for SelectiveGrant {
+    async fn get(&self, key: &str) -> Result<Download, StorageError> {
+        if key.contains("/tables/") && self.deny_tables.load(Ordering::Acquire) {
+            return Err(StorageError::Unavailable);
+        }
+        self.backend.get(key).await
+    }
+    async fn put(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        condition: WriteCondition<'_>,
+    ) -> Result<String, StorageError> {
+        self.backend.put(key, bytes, condition).await
+    }
+}
+#[tokio::test]
+async fn sl02_warm_catalog_does_not_authorize_denied_backing_objects() {
+    let s = Storage::new(SelectiveGrant::default(), Namespace::new("test").unwrap());
+    let table_id = Uuid::new_v4();
+    let object = ObjectKey::snapshot(table_id, Uuid::new_v4());
+    let entry: CatalogEntry = serde_json::from_value(serde_json::json!({"id":table_id,"schema":{"id":"int64"},"key":"id","format":"parquet","data":{"layout":"legacy","snapshot":object.as_str()},"row_count":0})).unwrap();
+    let mut catalog = Catalog::empty();
+    catalog.tables.insert("rows".into(), entry);
+    let mut catalog = ClusterCatalog::from_catalog(&catalog).unwrap();
+    catalog.format_version = 5;
+    catalog.owner_cluster = Some(Uuid::new_v4());
+    catalog.fence = Some(CatalogFence {
+        run_id: Uuid::new_v4(),
+        scheduler_term: 1,
+    });
+    s.put(
+        &ObjectKey::catalog(),
+        catalog.encode().unwrap(),
+        WriteCondition::Create,
+    )
+    .await
+    .unwrap();
+    s.put(&object, vec![1, 2, 3], WriteCondition::Create)
+        .await
+        .unwrap();
+    let warmed = s.load_cluster_catalog().await.unwrap();
+    s.authorize_catalog_objects(&warmed, Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    s.backend().deny_tables.store(true, Ordering::Release);
+    // The same grant still reads the root. Its warm root cannot authorize rows.
+    assert_eq!(s.load_cluster_catalog().await.unwrap(), warmed);
+    assert_eq!(
+        s.authorize_catalog_objects(&warmed, Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(StorageError::Unavailable)
+    );
+    assert_eq!(s.backend().backend.state.lock().unwrap().puts, 2);
+}

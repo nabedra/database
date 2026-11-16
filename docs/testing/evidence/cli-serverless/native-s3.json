@@ -1,0 +1,38 @@
+{
+  "result": "failed",
+  "phase": "cross-database-identities",
+  "assertions": [
+    "native_cli_version_help_migration_flag",
+    "real_s3_if_none_match_and_stale_if_match_preserve_winner",
+    "native_shared_api_two_enrolled_worker_processes"
+  ],
+  "cleanup": "native_children_reaped",
+  "target": "real_s3",
+  "scope": "fresh private fixture prefixes; native CLI, gateway and two worker processes",
+  "limits": [
+    "No STS rotation or IAM revocation evidence; synthetic invalid credentials test no fallback",
+    "Known expired snapshot rejected by gateway; no expiry-during-accepted-work claim",
+    "Same bucket with distinct prefixes; separate bucket and equal table UUID coverage belongs to other fixtures",
+    "Two client calls overlap; no deterministic proof of simultaneous worker compute slots",
+    "Doctor before/after object snapshot is not a server-side S3 audit log",
+    "No full scheduler-contract, failover or scale acceptance claim"
+  ],
+  "version_exit": 0,
+  "enrollment_step": "ready_workers",
+  "announcement_check": {
+    "event_matches": true,
+    "url_matches": true
+  },
+  "owned_process_count": 3,
+  "last_compute": {
+    "status": 503,
+    "error_code": "outcome_unknown"
+  },
+  "last_http": {
+    "selector": "a",
+    "status": 503,
+    "error_code": "outcome_unknown"
+  },
+  "failure_type": "CheckFailed",
+  "elapsed_s": 24.094
+}

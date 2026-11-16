@@ -1,0 +1,74 @@
+{
+  "scope": "deterministic worker queue/receipt race; trusted loopback conditional stores",
+  "cases": [
+    "SL01",
+    "SL02",
+    "Q04",
+    "Q05",
+    "T04"
+  ],
+  "before_fix": {
+    "command": "cargo test --lib --no-default-features node::runtime::shared_tests -- --nocapture",
+    "passed": 0,
+    "failed": 2,
+    "elapsed_s": 0.96,
+    "assertion": "durable terminal result must survive concurrent receipt before replication finishes"
+  },
+  "after_fix": {
+    "command": "cargo test --lib --no-default-features node::runtime::shared_tests -- --nocapture",
+    "passed": 2,
+    "failed": 0,
+    "elapsed_s": 3.22
+  },
+  "barrier": "after local terminal finish, before all-worker terminal replication; fresh-authorized receipt races retained execution",
+  "first_use": "customer catalogs asserted NotFound before Submit; create and table.list execute before equal table UUID fixture seeding",
+  "live_explicit_customer_sdk_probe": {
+    "passed": true,
+    "phases": [
+      "construct",
+      "absent-get NoSuchKey",
+      "owned-init",
+      "read-list",
+      "complete"
+    ],
+    "private_values_recorded": false
+  },
+  "after_fix_default_s3": {
+    "passed": 2,
+    "failed": 0,
+    "elapsed_s": 2.85,
+    "test_futures": "boxed at fixture async boundaries; production stack settings unchanged"
+  },
+  "focused_default_checks": {
+    "queue_runtime": {
+      "passed": 6,
+      "failed": 0
+    },
+    "request_queue": {
+      "passed": 19,
+      "failed": 0
+    }
+  },
+  "cleanup": {
+    "shared_worker_fixture_processes": 0,
+    "orphaned_shared_fixture_processes": 0
+  },
+  "production_binary": {
+    "build": "cargo build --locked --bin meshdb-server",
+    "default_s3": true,
+    "sha256": "c931cbf2438b2f09de020d351a65f2a936d9512760bd86239f42e52e9d46620e"
+  },
+  "full_native_live_s3": {
+    "passed": true,
+    "assertions": 12,
+    "artifact": "artifacts/cli-serverless/native-s3-fixed.json",
+    "binary_sha256": "c931cbf2438b2f09de020d351a65f2a936d9512760bd86239f42e52e9d46620e",
+    "confirmation": "parent relayed completed integration run; all owned services reaped",
+    "scope": "first-use create/list, independent rows and identities, replay/conflict/receipts, denied and known-expired grants, durable publication once, control secret scan, drain/doctor and migration ownership",
+    "not_claimed": [
+      "full failover contract",
+      "RSS or performance acceptance",
+      "STS rotation or IAM revocation"
+    ]
+  }
+}

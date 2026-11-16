@@ -1,0 +1,8 @@
+{
+  "orm/src/meshdb/gateway.py": "b2b87c9a98460a27be9091e003ac312166c769be749f34d44a1decbf5796ffae",
+  "orm/src/meshdb/gateway_protocol.py": "254b65e7860dfc8db39860c94223f116a0135b9ce838b54a5ccfeced0c6251a5",
+  "orm/src/meshdb/aws.py": "eca0ce44cd71b853450df3111f013afbc4fe7ac6aaf4a6040810d0d6d9a49d2c",
+  "scripts/gateway_host_fixture.py": "858ffe9d31a351e157febda699ab379d62645e02928bb6fe0e055a3184a9cf7b",
+  "scripts/acceptance_cli_serverless.py": "35c2b2b3f1f0a9e011d627b34d0aeb724d1fc97931a721bf4ad096e969a239de",
+  "artifacts/cli-serverless/gateway-http.json": "51d808480ea020695efd372b6130128af56d28e13a4dc9291a4d20ab747bea99"
+}

@@ -1,0 +1,13 @@
+{
+  "result": "passed",
+  "versions": {
+    "cli": "0.1.0",
+    "binary": "0.1.0",
+    "config": 2,
+    "protocol": 1
+  },
+  "help_exit": 0,
+  "cargo_absent_from_path": true,
+  "installed_binary_matches_final_release": true,
+  "sha256": "91b239b1c417da288c68abf295dc375b69cf58704b11192492977fd297a75a49"
+}

@@ -66,6 +66,8 @@ wire!(Worker {
     partition_size: String,
 });
 wire!(ApiWire {
+    #[serde(default)]
+    mode: Option<configuration::ComputeMode>,
     version: u64,
     #[serde(deserialize_with="uuid")]
     cluster_id: Uuid,
@@ -81,6 +83,8 @@ wire!(ApiWire {
     lifecycle: Timing,
 });
 wire!(BootstrapWire {
+    #[serde(default)]
+    mode: Option<configuration::ComputeMode>,
     #[serde(default)]
     execution: crate::config::ExecutionConfig,
     #[serde(default)]
@@ -185,8 +189,14 @@ pub(crate) fn decode_api(bytes: &[u8]) -> Result<ApiConfig, ConfigurationError> 
     configuration::input(bytes, MAX_INPUT_BYTES)?;
     let wire: ApiWire =
         serde_json::from_slice(bytes).map_err(|_| ConfigurationError::InvalidRecord)?;
-    check(wire.version == 1 && configuration::listen(&wire.bind) && literal_path(&wire.auth_file))?;
+    check(
+        ((wire.version == 1 && wire.mode.is_none_or(|mode| mode.is_fixed()))
+            || (wire.version == 2 && wire.mode.is_some()))
+            && configuration::listen(&wire.bind)
+            && literal_path(&wire.auth_file),
+    )?;
     let template = Template {
+        mode: wire.mode.unwrap_or_default(),
         execution: wire.worker.execution,
         resources: wire.worker.resources,
         api_urls: wire.api_urls,
@@ -213,7 +223,8 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<Bootstrap, ConfigurationE
     let wire: BootstrapWire =
         serde_json::from_slice(bytes).map_err(|_| ConfigurationError::InvalidRecord)?;
     check(
-        wire.version == 1
+        ((wire.version == 1 && wire.mode.is_none_or(|mode| mode.is_fixed()))
+            || (wire.version == 2 && wire.mode.is_some()))
             && (43..=4096).contains(&wire.enrollment_token.len())
             && wire
                 .enrollment_token
@@ -221,6 +232,7 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<Bootstrap, ConfigurationE
                 .all(|b| (33..=126).contains(&b)),
     )?;
     let template = Template {
+        mode: wire.mode.unwrap_or_default(),
         execution: wire.execution,
         resources: wire.resources,
         api_urls: wire.api_urls,

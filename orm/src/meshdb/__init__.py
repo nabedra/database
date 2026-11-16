@@ -30,3 +30,7 @@ __all__ = [
 from .serve import serve
 from .providers import KubernetesProvider, ProviderError
 __all__ += ["serve", "KubernetesProvider", "ProviderError"]
+
+from .aws import AwsCredentials
+from .gateway import Gateway, GatewayContext, HTTPResponse, S3
+__all__ += ["AwsCredentials", "Gateway", "GatewayContext", "HTTPResponse", "S3"]

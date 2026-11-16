@@ -1,0 +1,13 @@
+usage: meshdb [-h] [--version] [--json]
+              {worker,init,serve,doctor,cluster,database} ...
+
+Manage MeshDB. Launch a worker with worker --bootstrap PATH.
+
+positional arguments:
+  {worker,init,serve,doctor,cluster,database}
+
+options:
+  -h, --help            show this help message and exit
+  --version
+  --json
+PASS: core import, lazy provider construction and CLI help with optional dependencies blocked; no network attempted

@@ -12,6 +12,18 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Validate local configuration and perform a read-only storage probe.
+    Doctor {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicit catalog maintenance after stopping incompatible writers.
+    Database {
+        #[command(subcommand)]
+        command: DatabaseCommand,
+    },
     /// Serve the MeshDB API.
     Serve(ServeOptions),
     /// Run the supervised cluster API.
@@ -29,5 +41,19 @@ pub enum Command {
     Worker {
         #[arg(long)]
         bootstrap: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DatabaseCommand {
+    Migrate {
+        #[arg(long)]
+        storage: String,
+        #[arg(long)]
+        region: String,
+        #[arg(long)]
+        cluster_id: uuid::Uuid,
+        #[arg(long, required = true)]
+        confirm_writers_stopped: bool,
     },
 }

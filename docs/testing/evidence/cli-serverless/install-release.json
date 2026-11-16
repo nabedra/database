@@ -1,0 +1,14 @@
+{
+  "result": "interrupted_by_parent",
+  "exit": 1,
+  "elapsed_s": 96.962,
+  "prefix": "<fresh temporary prefix>",
+  "locked": true,
+  "profile": "release",
+  "jobs": 1,
+  "incremental": false,
+  "debug_symbols": false,
+  "reason": "Runtime fix required before final release build",
+  "owned_processes_reaped": 3,
+  "disk_failure": false
+}

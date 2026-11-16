@@ -1,0 +1,12 @@
+{
+  "state": "prepared_not_run",
+  "checks": {
+    "syntax": "passed",
+    "help": "passed",
+    "sanitized_exception_report_test": "passed",
+    "unsafe_namespace_before_aws_test": "passed"
+  },
+  "cloud_writes_executed": false,
+  "native_processes_launched": false,
+  "notes": "Await explicit parent release after S3-enabled native build. Read-only private preflight executed by parent, not repeated by this preparation."
+}

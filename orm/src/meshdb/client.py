@@ -86,7 +86,7 @@ class _Transport:
     """
 
     def __init__(self, api_url: str, token: str, *, timeout: float = 30.0,
-                 ca_file: str | None = None) -> None:
+                 ca_file: str | None = None, database: str | None = None) -> None:
         try:
             if (not isinstance(api_url, str) or not api_url
                     or any(ord(c) <= 32 or ord(c) >= 127 for c in api_url)
@@ -118,6 +118,9 @@ class _Transport:
                 context.load_verify_locations(cafile=ca_file)
         except (OSError, ValueError):
             raise ValidationError('Could not load TLS trust configuration') from None
+        if database is not None and (not isinstance(database, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', database) is None):
+            raise ValidationError('Invalid database selector')
+        self._database_headers = {'X-MeshDB-Database': database} if database is not None else {}
         self._url = urlunsplit((url.scheme, url.netloc, url.path.rstrip('/') + '/v1/operations', '', ''))
         self._token = token
         self._timeout = checked_timeout
@@ -150,6 +153,7 @@ class _Transport:
         if len(body) > _MAX_BODY:
             raise LimitExceededError('Encoded request exceeds 8 MiB')
         request = Request(self._url, data=body, method='POST', headers={
+            **self._database_headers,
             'Content-Type': 'application/json', 'Accept': 'application/json',
             'Authorization': 'Bearer ' + self._token,
         })
@@ -232,6 +236,7 @@ class _Transport:
                           request_id: str, *, mutation: bool, timeout: float | None = None) -> tuple[int, dict]:
         request = Request(self._url.removesuffix('/v1/operations') + suffix,
                           data=body, method=method, headers={
+                              **self._database_headers,
                               'Content-Type': 'application/json', 'Accept': 'application/json',
                               'Authorization': 'Bearer ' + self._token,
                           })
@@ -386,8 +391,8 @@ class DB:
     """Synchronous table creation and discovery through the server API."""
 
     def __init__(self, api_url: str, token: str, *, timeout: float = 30.0,
-                 ca_file: str | None = None) -> None:
-        self._transport = _Transport(api_url, token, timeout=timeout, ca_file=ca_file)
+                 ca_file: str | None = None, database: str | None = None) -> None:
+        self._transport = _Transport(api_url, token, timeout=timeout, ca_file=ca_file, database=database)
 
     def submit(self, operation: str, payload: dict, *, request_id: str | None = None) -> RequestReceipt:
         """Accept one operation and return its stable queue identity."""

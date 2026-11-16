@@ -17,7 +17,7 @@ impl InitializedWorker {
         boot: Arc<ReceiverIdentity>,
         initialization: Uuid,
         ready: Arc<crate::cluster::startup_material::composition::BootstrapReady>,
-        storage: Arc<crate::storage::Storage<crate::storage::HttpStore>>,
+        storage: Arc<crate::storage::Storage<crate::storage::RuntimeStore>>,
         pool: &crate::worker_pool::WorkerPool,
     ) -> super::http::Result<Self> {
         super::http::cpu(pool, move |runtime| {

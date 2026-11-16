@@ -13,6 +13,9 @@ import unittest
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 FIXTURE = '''import json, os, signal, sys
 from pathlib import Path
+if sys.argv[1:] == ["--version"]:
+    print("meshdb-server 0.1.0")
+    sys.exit(0)
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
 state = Path(os.environ["FIXTURE_STATE"])
 pending = state.with_suffix(".pending")
@@ -132,7 +135,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.finish(self.start(code="import meshdb.cli, meshdb._binary")),
                          (0, "", ""))
         for args in ((), ("worker",), ("worker", "--bootstrap"),
-                     ("serve",), ("worker", "--bootstrap", "missing", "--cloud"),
+                     ("worker", "--bootstrap", "missing", "--cloud"),
                      ("x" * 10000,)):
             status, out, err = self.finish(self.start(*args))
             self.assertEqual(status, 2)

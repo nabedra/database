@@ -1,0 +1,17 @@
+{
+  "python": "3.11.10 (main, Sep  7 2024, 01:03:31) [Clang 15.0.0 (clang-1500.3.9.4)]",
+  "httpx": "0.28.1",
+  "platform": "macOS-26.7.3-x86_64-i386-64bit",
+  "head": "bea9c36f22307ba7cf7274e14d44e00f08ff2b39",
+  "dirty_worktree": true,
+  "python_suite": {
+    "tests": 162,
+    "seconds": 63.553,
+    "result": "passed"
+  },
+  "native_release_install": "passed; initial release install 2097.553s, final fresh-prefix cached install 23.588s; see install-final.json",
+  "native_shared_execution": "passed final installed S3 subset, 13 assertions in 118.336s; see native-s3-final.json",
+  "real_s3": "passed listed conditional-write, isolation, denial and migration assertions against fresh private-fixture prefixes; no STS/revocation/failover claim",
+  "docker": "client installed; daemon unavailable",
+  "gateway_overhead_benchmark": "passed warm-up plus 3 measured repetitions of 100 requests per path; see gateway-http.json"
+}

@@ -67,6 +67,24 @@ impl PreparedPublication {
         }
         Self::prepare_inner(base, tables, decision)
     }
+    /// Bind the expected cluster to the same captured root/ETag as publication.
+    pub fn prepare_owned(
+        base: LoadedClusterCatalog,
+        tables: BTreeMap<String, CatalogEntry>,
+        decision: Decision,
+        cluster_id: Uuid,
+        expected: CatalogFence,
+    ) -> Result<Self, StorageError> {
+        expected.validate()?;
+        if cluster_id.is_nil()
+            || base.catalog().owner_cluster != Some(cluster_id)
+            || base.catalog().format_version != 5
+            || base.catalog().fence != Some(expected)
+        {
+            return Err(StorageError::Conflict);
+        }
+        Self::prepare_inner(base, tables, decision)
+    }
     fn prepare_inner(
         base: LoadedClusterCatalog,
         tables: BTreeMap<String, CatalogEntry>,
@@ -100,6 +118,7 @@ impl PreparedPublication {
             }
         }
         let root = ClusterCatalog {
+            owner_cluster: old.owner_cluster,
             format_version: old.format_version,
             revision: decision.revision,
             commit_id: decision.id,

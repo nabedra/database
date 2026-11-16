@@ -1,0 +1,49 @@
+{
+  "result": "passed",
+  "categories": 4,
+  "variations": 20,
+  "python": {
+    "tests": [
+      "test_gateway.AsyncGatewayTests.test_GW03_rejection_never_reparses_outside_capacity.test_GW03_rejection_never_reparses_outside_capacity",
+      "test_gateway.GatewayTests.test_GW01_raw_order_immutable_and_header_filtering.test_GW01_raw_order_immutable_and_header_filtering",
+      "test_gateway.GatewayTests.test_SL06_rejections_never_forward.test_SL06_rejections_never_forward",
+      "test_gateway.GatewayTests.test_GW02_uncertain_mutation_once.test_GW02_uncertain_mutation_once",
+      "test_gateway.GatewayTests.test_GW02_receipts_and_errors_exact.test_GW02_receipts_and_errors_exact",
+      "test_cli_supervision.SupervisionTests.test_compatible_path_binary_runs_both_api_and_worker.test_compatible_path_binary_runs_both_api_and_worker",
+      "test_cli_supervision.SupervisionTests.test_signal_drains_and_reaps_worker.test_signal_drains_and_reaps_worker",
+      "test_cli_supervision.SupervisionTests.test_worker_failure_preserves_status_and_reaps_api.test_worker_failure_preserves_status_and_reaps_api"
+    ],
+    "passed": 8,
+    "elapsed_s": 3.708
+  },
+  "rust": {
+    "tests": [
+      "cluster::runtime::receipt_observation::tests::q04_observation_deadline_cancels_slow_recovery_without_resubmission",
+      "cluster::runtime::receipt_observation::tests::q04_q06_healthy_pending_resets_streak_without_shortening_queue_wait_or_retrying_terminal_errors",
+      "cluster::runtime::receipt_observation::tests::q04_t04_transient_receipt_observation_never_resubmits",
+      "cluster::runtime::receipt_observation::tests::q04_transient_streak_has_exact_bound_backoff_and_unknown_exhaustion",
+      "cluster::runtime::receipt_observation::tests::u02_q06_nontransient_malformed_and_foreign_receipts_stop_immediately",
+      "node::queue_runtime::expiry_tests::sl03_t04_expired_reconciling_mutation_keeps_unknown_and_original_snapshot",
+      "node::queue_runtime::expiry_tests::t04_q05_terminal_reconciliation_reuses_original_version_and_rejects_mismatches",
+      "node::runtime::shared_tests::sl01_first_use_absent_catalog_two_workers_metadata_create_and_list",
+      "node::runtime::shared_tests::sl01_sl02_shared_worker_routes_independent_databases_and_reauthorizes_receipts",
+      "request_queue::tests::sl01_q05_storage_identity_and_rotation_preserve_original_snapshot",
+      "request_queue::tests::sl02_context_replacement_and_forgery_are_rejected_on_replica",
+      "storage::registry::sdk_tests::sl02_sdk_grant_is_explicit_and_storage_clone_retains_charge"
+    ],
+    "passed": 12,
+    "elapsed_s": 4.71,
+    "default_s3": true,
+    "test_threads": 1
+  },
+  "regressions_before_fix": {
+    "passed": 0,
+    "failed": 2,
+    "assertions": [
+      "overloaded gateway must not parse an unadmitted body",
+      "compatible PATH API must start and launch its worker"
+    ]
+  },
+  "full_library_suite": "interrupted after narrowing scope; not claimed as passed",
+  "scope": "Executed assertion subsets only; full scheduler, load, IAM rotation and crash recovery remain separate"
+}

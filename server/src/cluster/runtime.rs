@@ -20,7 +20,7 @@ use crate::{
         http::{self, HttpClient, Signer, cpu, failure, invalid, unavailable},
     },
     protocol::{self, ErrorCode},
-    storage::{HttpStore, Namespace, Storage, StorageError},
+    storage::{Namespace, RuntimeStore, Storage, StorageError},
     worker_pool::WorkerPool,
 };
 use axum::{
@@ -51,6 +51,8 @@ use uuid::Uuid;
 type Result<T> = http::Result<T>;
 #[path = "provider_runtime.rs"]
 mod provider_runtime;
+#[path = "receipt_observation.rs"]
+mod receipt_observation;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,7 +90,7 @@ fn deadline() -> Instant {
 struct Api {
     bridge: Option<provider_runtime::Bridge>,
     attached: AttachedConfig,
-    storage: Arc<Storage<HttpStore>>,
+    storage: Arc<Storage<RuntimeStore>>,
     pool: WorkerPool,
     client: HttpClient,
     signer: Arc<Signer>,
@@ -111,7 +113,10 @@ impl Api {
         cpu(&self.pool, move |runtime| {
             runtime
                 .block_on(storage.load_control(deadline()))
-                .map_err(|_| unavailable())
+                .map_err(|error| match error {
+                    StorageError::InvalidCatalog | StorageError::UnsupportedCatalog => invalid(),
+                    _ => unavailable(),
+                })
         })
         .await
     }
@@ -572,10 +577,31 @@ impl Api {
             other => Ok(other),
         }
     }
-    async fn submit(&self, bytes: Vec<u8>) -> Result<crate::request_queue::RequestRecord> {
+    fn request_context(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<Option<crate::storage::context::RequestContext>> {
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| unavailable())?
+            .as_secs();
+        crate::request_queue::admission::decode_context(
+            &self.attached.local().prepared.input.value.template,
+            headers,
+            now,
+        )
+    }
+    async fn submit(
+        &self,
+        bytes: Vec<u8>,
+        context: Option<crate::storage::context::RequestContext>,
+    ) -> Result<crate::request_queue::RequestRecord> {
         protocol::parse_request(&bytes)?;
         match self
-            .queue_call(crate::node::queue_runtime::Command::Submit { body: bytes })
+            .queue_call(crate::node::queue_runtime::Command::Submit {
+                body: bytes,
+                context,
+            })
             .await?
         {
             crate::node::queue_runtime::Reply::Record { record } => Ok(record),
@@ -586,9 +612,14 @@ impl Api {
         &self,
         run_id: Uuid,
         request_id: Uuid,
+        context: Option<crate::storage::context::RequestContext>,
     ) -> Result<crate::request_queue::Receipt> {
         match self
-            .queue_call(crate::node::queue_runtime::Command::Lookup { run_id, request_id })
+            .queue_call(crate::node::queue_runtime::Command::Lookup {
+                run_id,
+                request_id,
+                context,
+            })
             .await?
         {
             crate::node::queue_runtime::Reply::Receipt { receipt } => Ok(receipt),
@@ -598,39 +629,27 @@ impl Api {
     async fn route(
         &self,
         bytes: Vec<u8>,
+        context: Option<crate::storage::context::RequestContext>,
         staging: crate::scheduling::MemoryCharge,
     ) -> Result<EncodedResponse> {
-        let parsed = protocol::parse_request(&bytes)?;
-        let id = parsed.request_id;
-        let mutation = parsed.operation.is_mutation();
-        drop(parsed);
-        let record = match self.submit(bytes).await {
-            Ok(record) => record,
-            Err(error) => return Ok(route_failure(id, mutation, false, error)),
-        };
-        let run_id = record.run_id;
-        let request_id = record.request_id;
-        drop(record);
-        drop(staging);
-        loop {
-            let receipt = match self.lookup(run_id, request_id).await {
-                Ok(receipt) => receipt,
-                Err(error) => return Ok(route_failure(id, mutation, true, error)),
-            };
-            if receipt.state == crate::request_queue::RequestState::Abandoned {
-                return Ok(encode_error(Some(id), unknown()));
-            }
-            if receipt.state.terminal() {
-                return Ok(if let Some(error) = receipt.error {
-                    encode_error(Some(id), error)
-                } else {
-                    let body = serde_json::to_vec(&json!({"request_id":id,"data":receipt.result}))
-                        .map_err(|_| invalid())?;
-                    EncodedResponse { status: 200, body }
-                });
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        receipt_observation::route(self, bytes, context, staging).await
+    }
+}
+impl receipt_observation::QueueAccess for Api {
+    async fn submit(
+        &self,
+        body: Vec<u8>,
+        context: Option<crate::storage::context::RequestContext>,
+    ) -> Result<crate::request_queue::RequestRecord> {
+        Api::submit(self, body, context).await
+    }
+    async fn lookup(
+        &self,
+        run_id: Uuid,
+        request_id: Uuid,
+        context: Option<crate::storage::context::RequestContext>,
+    ) -> Result<crate::request_queue::Receipt> {
+        Api::lookup(self, run_id, request_id, context).await
     }
 }
 pub(crate) fn heartbeat_binding(root: &Control, node: &Node) -> Result<HeartbeatBinding> {
@@ -734,6 +753,14 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
     ) {
         return response(encode_error(None, failure(ErrorCode::Unauthorized)));
     }
+    let context = match api.request_context(request.headers()) {
+        Ok(context) => context,
+        Err(error) => return response(encode_error(None, error)),
+    };
+    if request.uri().query().is_some() {
+        return response(encode_error(None, invalid()));
+    }
+
     if !crate::api::json_content_type(request.headers()) {
         return response(encode_error(None, invalid()));
     }
@@ -755,7 +782,7 @@ async fn operations(State(api): State<Arc<Api>>, request: Request) -> Response {
                 Instant::now() + Duration::from_secs(30),
             )
             .await?;
-            api.route(bytes, _staging).await
+            api.route(bytes, context, _staging).await
         }
         .await;
         Ok(response(result.unwrap_or_else(|e| encode_error(None, e))))
@@ -787,6 +814,14 @@ async fn submit_request(State(api): State<Arc<Api>>, request: Request) -> Respon
     ) {
         return response(encode_error(None, failure(ErrorCode::Unauthorized)));
     }
+    let context = match api.request_context(request.headers()) {
+        Ok(context) => context,
+        Err(error) => return response(encode_error(None, error)),
+    };
+    if request.uri().query().is_some() {
+        return response(encode_error(None, invalid()));
+    }
+
     if !crate::api::json_content_type(request.headers()) {
         return response(encode_error(None, invalid()));
     }
@@ -800,7 +835,7 @@ async fn submit_request(State(api): State<Arc<Api>>, request: Request) -> Respon
         let length=http::framing(request.headers(),protocol::MAX_BODY_BYTES,false)?.ok_or_else(invalid)?;
         let bytes=http::read_small(request.into_body(),length,Instant::now()+Duration::from_secs(30)).await?;
         let parsed=protocol::parse_request(&bytes)?;let id=parsed.request_id;drop(parsed);
-        Ok(match api.submit(bytes).await{
+        Ok(match api.submit(bytes, context).await{
             Ok(record)=>EncodedResponse{status:202,body:serde_json::to_vec(&json!({"request_id":record.request_id,"run_id":record.run_id,"state":"queued"})).map_err(|_|invalid())?},
             Err(error)=>encode_error(Some(id),error),
         })
@@ -822,6 +857,14 @@ async fn receipt_request(
     ) {
         return response(encode_error(None, failure(ErrorCode::Unauthorized)));
     }
+    let context = match api.request_context(request.headers()) {
+        Ok(context) => context,
+        Err(error) => return response(encode_error(None, error)),
+    };
+    if request.uri().query().is_some() {
+        return response(encode_error(None, invalid()));
+    }
+
     let (run_id, request_id) = match (Uuid::parse_str(&run_id), Uuid::parse_str(&request_id)) {
         (Ok(run), Ok(id)) => (run, id),
         _ => return response(encode_error(None, invalid())),
@@ -829,7 +872,7 @@ async fn receipt_request(
     if request.uri().query().is_some() {
         return response(encode_error(Some(request_id), invalid()));
     }
-    response(match api.lookup(run_id, request_id).await {
+    response(match api.lookup(run_id, request_id, context).await {
         Ok(receipt) => EncodedResponse {
             status: 200,
             body: serde_json::to_vec(&receipt).unwrap(),
@@ -976,9 +1019,9 @@ async fn api_process(
         return Err(invalid());
     }
     protocol::validate_identifier(&init.name)?;
-    let local = cpu(&pool, move |_| {
+    let local = cpu(&pool, move |runtime| {
         prepare_api(&path, startup_end.into_std())
-            .and_then(|p| p.connect())
+            .and_then(|p| runtime.block_on(p.connect_async()))
             .map_err(|_| {
                 eprintln!("meshdb-server: startup material invalid");
                 invalid()
@@ -990,7 +1033,9 @@ async fn api_process(
         super::configuration::Storage::Http(h) => {
             Namespace::new(&h.namespace).map_err(|_| invalid())?
         }
-        _ => return Err(invalid()),
+        super::configuration::Storage::S3(s) => {
+            Namespace::new(&s.namespace).map_err(|_| invalid())?
+        }
     };
     let client = HttpClient::new(local.prepared.tls.as_ref())?;
     let process = Uuid::new_v4();

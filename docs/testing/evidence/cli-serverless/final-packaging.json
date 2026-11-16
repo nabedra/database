@@ -1,0 +1,29 @@
+{
+  "result": "passed",
+  "exit": 0,
+  "elapsed_s": 21.107,
+  "prefix": "<takeover-final-install-prefix>",
+  "locked": true,
+  "profile": "release",
+  "jobs": 1,
+  "incremental": false,
+  "debug_symbols": false,
+  "rust_recompiled": false,
+  "versions": {
+    "cli": "0.1.0",
+    "binary": "0.1.0",
+    "config": 2,
+    "protocol": 1
+  },
+  "help_exit": 0,
+  "cargo_absent_from_path": true,
+  "isolated_core_import": true,
+  "optional_dependencies_blocked": true,
+  "network_blocked": true,
+  "installed_python_matches_source": {
+    "orm/src/meshdb/gateway.py": "eb4323bd8e00d980f224d622cf9e7e45aaafcffa1a98983aa844f609bb06245f",
+    "orm/src/meshdb/_cli_supervise.py": "e8e6885ae599820349869d3ca303aff1ff98642285301e96e9d7e2f75f31ad2b",
+    "orm/src/meshdb/_serve_process.py": "e801381f067864e6a8b7ccc7fd4af80b353ee96f0530021075801b88401c6429"
+  },
+  "release_sha256": "91b239b1c417da288c68abf295dc375b69cf58704b11192492977fd297a75a49"
+}

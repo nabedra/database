@@ -1,0 +1,16 @@
+
+running 12 tests
+test cluster::runtime::receipt_observation::tests::q04_observation_deadline_cancels_slow_recovery_without_resubmission ... ok
+test cluster::runtime::receipt_observation::tests::q04_q06_healthy_pending_resets_streak_without_shortening_queue_wait_or_retrying_terminal_errors ... ok
+test cluster::runtime::receipt_observation::tests::q04_t04_transient_receipt_observation_never_resubmits ... ok
+test cluster::runtime::receipt_observation::tests::q04_transient_streak_has_exact_bound_backoff_and_unknown_exhaustion ... ok
+test cluster::runtime::receipt_observation::tests::u02_q06_nontransient_malformed_and_foreign_receipts_stop_immediately ... ok
+test node::queue_runtime::expiry_tests::sl03_t04_expired_reconciling_mutation_keeps_unknown_and_original_snapshot ... ok
+test node::queue_runtime::expiry_tests::t04_q05_terminal_reconciliation_reuses_original_version_and_rejects_mismatches ... ok
+test node::runtime::shared_tests::sl01_first_use_absent_catalog_two_workers_metadata_create_and_list ... ok
+test node::runtime::shared_tests::sl01_sl02_shared_worker_routes_independent_databases_and_reauthorizes_receipts ... ok
+test request_queue::tests::sl01_q05_storage_identity_and_rotation_preserve_original_snapshot ... ok
+test request_queue::tests::sl02_context_replacement_and_forgery_are_rejected_on_replica ... ok
+test storage::registry::sdk_tests::sl02_sdk_grant_is_explicit_and_storage_clone_retains_charge ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 558 filtered out; finished in 4.71s

@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "mode": "serverless",
+  "cluster_id": "1e5091bf-bc50-4667-bb76-c86c8fbca70c",
+  "bind": "127.0.0.1:8000",
+  "advertise_url": "http://127.0.0.1:8000",
+  "api_urls": [
+    "http://127.0.0.1:8000"
+  ],
+  "storage": {
+    "driver": "s3",
+    "options": {
+      "bucket": "meshdb-ops",
+      "namespace": "production/",
+      "region": "eu-west-1"
+    }
+  },
+  "auth_file": "/run/secrets/meshdb-auth.json",
+  "tls": null,
+  "worker": {
+    "listen": "127.0.0.1:0",
+    "operation_slots": 4,
+    "partition_slots": 4,
+    "queue_size": 64,
+    "partition_size": "64 MiB",
+    "resources": {
+      "max_threads": 4,
+      "memory_limit_bytes": 8589934592,
+      "task_memory_limit_bytes": 536870912,
+      "control_memory_reserve_bytes": 268435456
+    }
+  }
+}

@@ -10,7 +10,7 @@ use crate::{
         state::Control,
     },
     request_queue::{
-        QueueLimits, QueueSnapshot, Receipt, RequestQueue, RequestRecord, RequestState,
+        QueueLimits, QueueSnapshot, Receipt, RequestKey, RequestQueue, RequestRecord, RequestState,
     },
     storage::{CatalogFence, ClusterCatalog, LoadedClusterCatalog},
 };
@@ -30,15 +30,34 @@ use uuid::Uuid;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Command {
-    Submit { body: Vec<u8> },
+    Submit {
+        body: Vec<u8>,
+        #[serde(default)]
+        context: Option<crate::storage::context::RequestContext>,
+    },
     Stats,
     Seal,
-    Lookup { run_id: Uuid, request_id: Uuid },
-    Install { record: RequestRecord },
-    Snapshot { after: Option<u64> },
-    Bootstrap { snapshot: QueueSnapshot },
-    Join { node_id: Uuid },
-    Unseal { token: Uuid },
+    Lookup {
+        run_id: Uuid,
+        request_id: Uuid,
+        #[serde(default)]
+        context: Option<crate::storage::context::RequestContext>,
+    },
+    Install {
+        record: RequestRecord,
+    },
+    Snapshot {
+        after: Option<u64>,
+    },
+    Bootstrap {
+        snapshot: QueueSnapshot,
+    },
+    Join {
+        node_id: Uuid,
+    },
+    Unseal {
+        token: Uuid,
+    },
 }
 impl Command {
     fn name(&self) -> &'static str {
@@ -54,6 +73,93 @@ impl Command {
             Self::Unseal { .. } => "unseal",
         }
     }
+}
+fn decision_receipt(
+    run_id: Uuid,
+    request_id: Uuid,
+    decision: &crate::storage::Decision,
+) -> Result<Receipt> {
+    let value: serde_json::Value =
+        serde_json::from_str(&decision.response_body).map_err(|_| invalid())?;
+    Ok(Receipt {
+        run_id,
+        request_id,
+        state: if decision.response_status == 200 {
+            RequestState::Succeeded
+        } else {
+            RequestState::Failed
+        },
+        result: value.get("data").filter(|v| !v.is_null()).cloned(),
+        error: value
+            .get("error")
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()
+            .map_err(|_| invalid())?,
+    })
+}
+fn reconcile_attempt_error(
+    reconcile_mutation: bool,
+    error: crate::protocol::ProtocolError,
+) -> crate::protocol::ProtocolError {
+    if reconcile_mutation && error.outcome == crate::protocol::Outcome::NotApplied {
+        crate::protocol::ProtocolError::new(
+            crate::protocol::ErrorCode::OutcomeUnknown,
+            "accepted mutation requires durable reconciliation",
+            crate::protocol::Outcome::Unknown,
+        )
+    } else {
+        error
+    }
+}
+/// Durable reconciliation may race terminal replication or another lookup.
+/// Preserve an identical terminal version and its original completion time/ACKs.
+fn settle_reconciled_decision(
+    queue: &mut RequestQueue,
+    observed: &RequestRecord,
+    decision: &crate::storage::Decision,
+    now: u64,
+) -> std::result::Result<RequestRecord, crate::request_queue::QueueError> {
+    use crate::request_queue::QueueError;
+    let key = observed.identity();
+    let current = queue.record(key.clone()).ok_or(QueueError::NotFound)?;
+    if !observed.accepted
+        || !current.accepted
+        || current.identity() != key
+        || current.run_id != observed.run_id
+        || current.scheduler_term != observed.scheduler_term
+        || current.membership_revision != observed.membership_revision
+        || current.sequence != observed.sequence
+        || current.body != observed.body
+        || current.digest != observed.digest
+        || current.context != observed.context
+        || decision.request_id != current.request_id
+        || http::digest(decision.request_body.as_bytes()) != current.digest
+    {
+        return Err(QueueError::Conflict);
+    }
+    if current.state.terminal() {
+        if current.response_status != Some(decision.response_status)
+            || current.response_body.as_deref() != Some(decision.response_body.as_bytes())
+            || current.result_expired
+        {
+            return Err(QueueError::Conflict);
+        }
+        return Ok(current.clone());
+    }
+    queue.finish(
+        key,
+        decision.response_status,
+        decision.response_body.as_bytes().to_vec(),
+        now,
+    )
+}
+
+fn validate_context_mode(
+    root: &Control,
+    context: Option<&crate::storage::context::RequestContext>,
+    now: u64,
+) -> Result<()> {
+    crate::request_queue::admission::validate_context(&root.template, context, now)
 }
 fn validate_command_class(command: &Command, expected: &str, class: &str) -> Result<()> {
     if command.name() != expected
@@ -94,13 +200,14 @@ pub(crate) enum Reply {
 }
 pub(super) struct QueueRuntime {
     queue: Mutex<Option<RequestQueue>>,
+    retained_data: Mutex<BTreeMap<RequestKey, super::runtime::DataGrant>>,
     seen: Mutex<BTreeMap<Uuid, u64>>,
-    active: Mutex<BTreeSet<Uuid>>,
+    active: Mutex<BTreeSet<RequestKey>>,
     changes: Arc<tokio::sync::Mutex<()>>,
     seals: Mutex<BTreeMap<Uuid, (tokio::time::Instant, tokio::sync::OwnedMutexGuard<()>)>>,
     changed: tokio::sync::Notify,
-    retries: Mutex<BTreeMap<Uuid, (u32, tokio::time::Instant)>>,
-    first_seen: Mutex<BTreeMap<Uuid, u64>>,
+    retries: Mutex<BTreeMap<RequestKey, (u32, tokio::time::Instant)>>,
+    first_seen: Mutex<BTreeMap<RequestKey, u64>>,
     ingress: Arc<tokio::sync::Semaphore>,
     receipts: Arc<tokio::sync::Semaphore>,
     replicas: Arc<tokio::sync::Semaphore>,
@@ -111,6 +218,7 @@ impl QueueRuntime {
     pub(super) fn new() -> Self {
         Self {
             queue: Mutex::new(None),
+            retained_data: Mutex::new(BTreeMap::new()),
             seen: Mutex::new(BTreeMap::new()),
             active: Mutex::new(BTreeSet::new()),
             changes: Arc::new(tokio::sync::Mutex::new(())),
@@ -124,6 +232,10 @@ impl QueueRuntime {
             bootstrap: Arc::new(tokio::sync::Semaphore::new(4)),
             progress: Arc::new(tokio::sync::Semaphore::new(8)),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn install_fixture_queue(&self, queue: RequestQueue) {
+        *self.queue.lock().unwrap() = Some(queue);
     }
     async fn lock_changes(&self) -> tokio::sync::OwnedMutexGuard<()> {
         loop {
@@ -163,10 +275,15 @@ impl QueueRuntime {
         .try_acquire_owned()
         .map_err(|_| http::failure(crate::protocol::ErrorCode::Overloaded))
     }
-    pub(super) fn checked_execution(&self, id: Uuid, digest: &str) -> Result<CatalogFence> {
+    pub(super) fn checked_execution(
+        &self,
+        id: impl Into<RequestKey>,
+        digest: &str,
+    ) -> Result<CatalogFence> {
+        let id = id.into();
         let lock = self.queue.lock().unwrap();
         let q = lock.as_ref().ok_or_else(unavailable)?;
-        let record = q.record(id).ok_or_else(unavailable)?;
+        let record = q.record(id.clone()).ok_or_else(unavailable)?;
         if !record.accepted
             || record.state != RequestState::Running
             || record.digest != digest
@@ -179,34 +296,70 @@ impl QueueRuntime {
             scheduler_term: record.scheduler_term,
         })
     }
-    pub(super) fn current_binding(&self, id: Uuid) -> Result<super::job::QueueBinding> {
+    pub(super) fn current_binding(
+        &self,
+        id: impl Into<RequestKey>,
+    ) -> Result<super::job::QueueBinding> {
+        let id = id.into();
         let lock = self.queue.lock().unwrap();
         let q = lock.as_ref().ok_or_else(unavailable)?;
-        let record = q.record(id).ok_or_else(unavailable)?;
+        let record = q.record(id.clone()).ok_or_else(unavailable)?;
         if !record.accepted || record.state != RequestState::Running || !q.ready(id) {
             return Err(unavailable());
         }
+        let (storage_digest, grant_digest) = record.binding_digests().map_err(|_| invalid())?;
         Ok(super::job::QueueBinding {
+            storage_digest,
+            grant_digest,
             run_id: record.run_id,
             scheduler_term: record.scheduler_term,
             membership_revision: record.membership_revision,
             sequence: record.sequence,
         })
     }
+    pub(super) fn record(&self, id: impl Into<RequestKey>) -> Result<RequestRecord> {
+        self.queue
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .record(id)
+            .cloned()
+            .ok_or_else(unavailable)
+    }
+    pub(super) fn record_for_job(&self, job: &super::job::JobEnvelope) -> Result<RequestRecord> {
+        let lock = self.queue.lock().unwrap();
+        let q = lock.as_ref().ok_or_else(unavailable)?;
+        let binding = job.queue_binding.ok_or_else(unavailable)?;
+        let record = q
+            .records()
+            .find(|record| {
+                record.request_id == job.operation_id
+                    && record.binding_digests().is_ok_and(|(storage, grant)| {
+                        storage == binding.storage_digest && grant == binding.grant_digest
+                    })
+            })
+            .ok_or_else(unavailable)?;
+        let fence = CatalogFence {
+            run_id: q.run_id(),
+            scheduler_term: q.scheduler_term(),
+        };
+        if !q.ready(record.identity()) {
+            return Err(unavailable());
+        }
+        super::job::validate_queue_binding(job, record, fence).map_err(|_| unavailable())?;
+        Ok(record.clone())
+    }
     pub(super) fn validate_job(
         &self,
         job: &super::job::JobEnvelope,
         fence: CatalogFence,
     ) -> Result<()> {
-        let lock = self.queue.lock().unwrap();
-        let q = lock.as_ref().ok_or_else(unavailable)?;
-        let record = q.record(job.operation_id).ok_or_else(unavailable)?;
-        if !q.ready(job.operation_id) {
-            return Err(unavailable());
-        }
-        super::job::validate_queue_binding(job, record, fence).map_err(|_| unavailable())
+        let record = self.record_for_job(job)?;
+        super::job::validate_queue_binding(job, &record, fence).map_err(|_| unavailable())
     }
-    pub(super) fn request_sequence(&self, id: Uuid) -> Option<u64> {
+    pub(super) fn request_sequence(&self, id: impl Into<RequestKey>) -> Option<u64> {
+        let id = id.into();
         self.queue
             .lock()
             .unwrap()
@@ -214,7 +367,8 @@ impl QueueRuntime {
             .record(id)
             .map(|r| r.sequence)
     }
-    pub(super) fn pinned(&self, id: Uuid) -> Option<LoadedClusterCatalog> {
+    pub(super) fn pinned(&self, id: impl Into<RequestKey>) -> Option<LoadedClusterCatalog> {
+        let id = id.into();
         self.queue
             .lock()
             .unwrap()
@@ -408,6 +562,65 @@ fn limits(worker: &Worker) -> QueueLimits {
     }
 }
 impl Worker {
+    /// Preserve the original accepted grant until actual terminal settlement.
+    /// Polling credentials never enter this map. Expiry is checked even when a
+    /// client was retained, so a fresh receipt cannot renew queued work.
+    pub(super) async fn queue_data_for_record(
+        &self,
+        record: &RequestRecord,
+    ) -> Result<super::runtime::DataGrant> {
+        if let Some(context) = &record.context {
+            context
+                .validate(now_ms() / 1000)
+                .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+        }
+        if let Some(grant) = self
+            .queue
+            .retained_data
+            .lock()
+            .unwrap()
+            .get(&record.identity())
+            .cloned()
+        {
+            return Ok(grant);
+        }
+        let grant = self.data_for_record(record).await?;
+        if record.state.terminal() {
+            return Ok(grant);
+        }
+        let mut grants = self.queue.retained_data.lock().unwrap();
+        Ok(grants.entry(record.identity()).or_insert(grant).clone())
+    }
+    async fn owned_catalog(
+        &self,
+        root: &Control,
+        grant: &super::runtime::DataGrant,
+    ) -> Result<LoadedClusterCatalog> {
+        let storage = grant.storage();
+        if root.template.mode.is_fixed() {
+            return storage
+                .load_cluster_catalog()
+                .await
+                .map_err(|_| unavailable());
+        }
+        let fence = self.queue.fence()?;
+        let cold = match storage.load_cluster_catalog().await {
+            Ok(loaded)
+                if loaded
+                    .catalog()
+                    .fence
+                    .is_some_and(|old| old.run_id != fence.run_id) =>
+            {
+                self.initialization_authorized(fence).await?
+            }
+            Ok(_) | Err(crate::storage::StorageError::NotFound) => false,
+            Err(_) => return Err(unavailable()),
+        };
+        storage
+            .initialize_owned_cluster_catalog(root.cluster_id, fence, false, cold)
+            .await
+            .map_err(|_| unavailable())
+    }
     pub(super) async fn initialize_queue(&self) -> Result<()> {
         let root = self.root().await?;
         let local = self.signer.sender().node_id().ok_or_else(invalid)?;
@@ -550,13 +763,14 @@ impl Worker {
         }
         Ok(false)
     }
-    pub(super) async fn mark_reconciling(&self, id: Uuid) -> Result<()> {
+    pub(super) async fn mark_reconciling(&self, id: impl Into<RequestKey>) -> Result<()> {
+        let id = id.into();
         let _change = self.queue.lock_changes().await;
         let root = self.root().await?;
         let record = {
             let mut lock = self.queue.queue.lock().unwrap();
             let q = lock.as_mut().ok_or_else(unavailable)?;
-            match q.record(id) {
+            match q.record(id.clone()) {
                 Some(record) if record.state.terminal() => return Ok(()),
                 Some(record) if record.state == RequestState::Reconciling => record.clone(),
                 Some(_) => q
@@ -586,11 +800,19 @@ impl Worker {
     ) -> Result<Reply> {
         let logical = match command {
             Command::Install { record } => {
-                record.body.len()
+                record
+                    .body
+                    .len()
+                    .saturating_add(record.context_bytes().unwrap_or(usize::MAX))
                     + record.pinned_catalog.as_ref().map_or(0, Vec::len)
                     + record.response_body.as_ref().map_or(0, Vec::len)
             }
-            Command::Submit { body } => body.len(),
+            Command::Submit { body, context } => body.len().saturating_add(
+                context
+                    .as_ref()
+                    .and_then(|c| serde_json::to_vec(c).ok())
+                    .map_or(0, |v| v.len()),
+            ),
             _ => 0,
         };
         let class = class.unwrap_or(queue_transport::command_class(command.name())?);
@@ -678,6 +900,18 @@ impl Worker {
         mut record: RequestRecord,
         bootstrap: bool,
     ) -> Result<RequestRecord> {
+        #[cfg(test)]
+        if record.state.terminal() {
+            let barrier = self
+                .test_terminal_replication_barrier
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((arrived, release)) = barrier {
+                arrived.add_permits(1);
+                release.acquire().await.map_err(|_| unavailable())?.forget();
+            }
+        }
         let fresh = self.root().await?;
         let root = &fresh;
         if root.scheduler.scheduler_term != record.scheduler_term
@@ -715,7 +949,9 @@ impl Worker {
                     .await?
                 {
                     Reply::Record { record: installed }
-                        if installed.request_id == record.request_id
+                        if installed.identity() == record.identity()
+                            && installed.context == record.context
+                            && installed.digest == record.digest
                             && installed.version == record.version => {}
                     Reply::Error { error } => return Err(error),
                     _ => return Err(invalid()),
@@ -728,7 +964,7 @@ impl Worker {
                 .unwrap()
                 .as_mut()
                 .ok_or_else(unavailable)?
-                .acknowledge_version(record.request_id, record.version, id)
+                .acknowledge_version(record.identity(), record.version, id)
                 .map_err(|e| e.protocol())?;
         }
         // Replicate acceptance evidence as well as complete payload bytes.
@@ -748,10 +984,21 @@ impl Worker {
                 )
                 .await?
             {
-                Reply::Record { .. } => {}
+                Reply::Record { record: installed }
+                    if installed.identity() == record.identity()
+                        && installed.context == record.context
+                        && installed.digest == record.digest
+                        && installed.version == record.version => {}
                 Reply::Error { error } => return Err(error),
                 _ => return Err(invalid()),
             }
+        }
+        if record.state.terminal() {
+            self.queue
+                .retained_data
+                .lock()
+                .unwrap()
+                .remove(&record.identity());
         }
         Ok(record)
     }
@@ -759,19 +1006,36 @@ impl Worker {
         let record_bytes = |r: &RequestRecord| {
             r.body
                 .len()
+                .saturating_add(r.context_bytes().unwrap_or(usize::MAX))
                 .saturating_add(r.pinned_catalog.as_ref().map_or(0, Vec::len))
                 .saturating_add(r.response_body.as_ref().map_or(0, Vec::len))
         };
         let bytes = match command {
             Command::Install { record } => record_bytes(record).saturating_mul(2),
-            Command::Submit { body } => body.len().saturating_mul(32),
-            Command::Lookup { request_id, .. } => self
+            Command::Submit { body, context } => body
+                .len()
+                .saturating_add(
+                    context
+                        .as_ref()
+                        .and_then(|c| serde_json::to_vec(c).ok())
+                        .map_or(0, |v| v.len()),
+                )
+                .saturating_mul(32),
+            Command::Lookup {
+                request_id,
+                context,
+                ..
+            } => self
                 .queue
                 .queue
                 .lock()
                 .unwrap()
                 .as_ref()
-                .and_then(|q| q.record(*request_id))
+                .and_then(|q| {
+                    RequestKey::new(*request_id, context.as_ref())
+                        .ok()
+                        .and_then(|key| q.record(key))
+                })
                 .and_then(|r| r.response_body.as_ref())
                 .map_or(0, |body| body.len().saturating_mul(32)),
             Command::Snapshot { after } => self
@@ -790,7 +1054,7 @@ impl Worker {
         };
         (bytes as u64).saturating_add(64 << 10)
     }
-    async fn queue_command(
+    pub(super) async fn queue_command(
         self: &Arc<Self>,
         root: &Control,
         sender: Option<Uuid>,
@@ -804,10 +1068,10 @@ impl Worker {
                 let mut first = self.queue.first_seen.lock().unwrap();
                 let mut oldest = 0;
                 for record in q.records().filter(|r| r.accepted && !r.state.terminal()) {
-                    let seen = first.entry(record.request_id).or_insert(now);
+                    let seen = first.entry(record.identity()).or_insert(now);
                     oldest = oldest.max(now.saturating_sub(*seen));
                 }
-                first.retain(|id, _| q.record(*id).is_some_and(|r| !r.state.terminal()));
+                first.retain(|id, _| q.record(id.clone()).is_some_and(|r| !r.state.terminal()));
                 let (queue_bytes, result_bytes) = q.charged_bytes();
                 Ok(Reply::Stats {
                     pending: q.pending() as u64,
@@ -952,6 +1216,9 @@ impl Worker {
                 Ok(Reply::Joined { token })
             }
             Command::Bootstrap { snapshot } => {
+                for record in &snapshot.records {
+                    validate_context_mode(root, record.context.as_ref(), 0)?;
+                }
                 if !snapshot.records.is_empty() {
                     return Err(invalid());
                 }
@@ -987,6 +1254,7 @@ impl Worker {
                 Ok(Reply::Snapshot { snapshot, done })
             }
             Command::Install { record } => {
+                validate_context_mode(root, record.context.as_ref(), 0)?;
                 if sender != Some(scheduler(root)?.node_id) {
                     return Err(http::failure(crate::protocol::ErrorCode::Unauthorized));
                 }
@@ -1022,11 +1290,52 @@ impl Worker {
                         .map_err(|e| e.protocol())?;
                     }
                 }
+                // Preflight count/bytes/immutable identity before reserving a
+                // registry client. An invalid record cannot grow the grant map.
+                self.queue
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .ok_or_else(unavailable)?
+                    .install(record.clone())
+                    .map_err(|e| e.protocol())?;
+                if !record.state.terminal() && !record.accepted {
+                    let authorized = async {
+                        let grant = self.queue_data_for_record(&record).await?;
+                        self.owned_catalog(root, &grant).await?;
+                        Ok::<(), crate::protocol::ProtocolError>(())
+                    }
+                    .await;
+                    if let Err(error) = authorized {
+                        let _ = self
+                            .queue
+                            .queue
+                            .lock()
+                            .unwrap()
+                            .as_mut()
+                            .ok_or_else(unavailable)?
+                            .discard_unaccepted(record.identity(), record.version);
+                        self.queue
+                            .retained_data
+                            .lock()
+                            .unwrap()
+                            .remove(&record.identity());
+                        return Err(error);
+                    }
+                }
+                if record.state.terminal() {
+                    self.queue
+                        .retained_data
+                        .lock()
+                        .unwrap()
+                        .remove(&record.identity());
+                }
                 self.queue
                     .first_seen
                     .lock()
                     .unwrap()
-                    .entry(record.request_id)
+                    .entry(record.identity())
                     .or_insert(now_ms());
                 self.queue
                     .queue
@@ -1038,7 +1347,11 @@ impl Worker {
                     .map_err(|e| e.protocol())?;
                 Ok(Reply::Record { record })
             }
-            Command::Submit { body } => {
+            Command::Submit { body, context } => {
+                // Validate the exact original operation before touching customer
+                // storage, including on a forged trusted-peer submission.
+                crate::protocol::parse_request(&body)?;
+                validate_context_mode(root, context.as_ref(), now_ms() / 1000)?;
                 if sender.is_some()
                     || Some(scheduler(root)?.node_id) != self.signer.sender().node_id()
                 {
@@ -1049,8 +1362,25 @@ impl Worker {
                     .lock()
                     .unwrap()
                     .retain(|_, (until, _)| *until > tokio::time::Instant::now());
+                let fresh_grant = if let Some(context) = context.as_ref() {
+                    let grant = self.open_database(context.clone()).await?;
+                    let loaded = self.owned_catalog(root, &grant).await?;
+                    grant
+                        .storage()
+                        .authorize_catalog_objects(
+                            &loaded,
+                            tokio::time::Instant::now() + Duration::from_secs(30),
+                        )
+                        .await
+                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                    Some(grant)
+                } else {
+                    None
+                };
+                // Customer I/O cannot hold the global admission/join seal.
                 let _serial = self.queue.lock_changes().await;
                 self.refresh_queue(root).await?;
+                let fresh_context = context.clone();
                 let record = self
                     .queue
                     .queue
@@ -1058,25 +1388,84 @@ impl Worker {
                     .unwrap()
                     .as_mut()
                     .ok_or_else(unavailable)?
-                    .propose(body, now_ms())
+                    .propose_with_context(body, context, now_ms())
                     .map_err(|e| e.protocol())?;
+                if !record.state.terminal() {
+                    if let Some(grant) = fresh_grant {
+                        let existing = self
+                            .queue
+                            .retained_data
+                            .lock()
+                            .unwrap()
+                            .contains_key(&record.identity());
+                        if !existing && record.context == fresh_context {
+                            self.queue
+                                .retained_data
+                                .lock()
+                                .unwrap()
+                                .insert(record.identity(), grant);
+                        } else {
+                            // Free the transient fresh authorization client
+                            // before recreating an original accepted snapshot.
+                            drop(grant);
+                            if !existing {
+                                self.queue_data_for_record(&record).await?;
+                            }
+                        }
+                    }
+                }
                 self.queue
                     .first_seen
                     .lock()
                     .unwrap()
-                    .entry(record.request_id)
+                    .entry(record.identity())
                     .or_insert(now_ms());
                 let record = self.replicate_record(root, record).await.map_err(|_|crate::protocol::ProtocolError::new(crate::protocol::ErrorCode::OutcomeUnknown,"request replication outcome is uncertain; retry the same identity and body",crate::protocol::Outcome::Unknown))?;
                 self.queue.changed.notify_waiters();
                 Ok(Reply::Record { record })
             }
-            Command::Lookup { run_id, request_id } => {
+            Command::Lookup {
+                run_id,
+                request_id,
+                context,
+            } => {
+                validate_context_mode(root, context.as_ref(), now_ms() / 1000)?;
+                let key = RequestKey::new(request_id, context.as_ref()).map_err(|_| invalid())?;
+                let fresh_grant = match context {
+                    Some(context) => Some(self.open_database(context).await?),
+                    None => None,
+                };
+                let storage = fresh_grant
+                    .as_ref()
+                    .map(|g| g.storage())
+                    .unwrap_or_else(|| self.storage.clone());
+                let loaded = storage
+                    .load_cluster_catalog()
+                    .await
+                    .map_err(|_| unavailable())?;
+                if !root.template.mode.is_fixed() {
+                    if loaded.catalog().owner_cluster != Some(root.cluster_id) {
+                        return Err(http::failure(crate::protocol::ErrorCode::Unauthorized));
+                    }
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                    storage
+                        .authorize_catalog_objects(&loaded, deadline)
+                        .await
+                        .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                    if let Some(pinned) = self.queue.pinned(key.clone()) {
+                        storage
+                            .authorize_catalog_objects(&pinned, deadline)
+                            .await
+                            .map_err(|_| http::failure(crate::protocol::ErrorCode::Unauthorized))?;
+                    }
+                }
                 let result = {
                     let q = self.queue.queue.lock().unwrap();
                     let q = q.as_ref().ok_or_else(unavailable)?;
                     if run_id == q.run_id()
-                        && q.record(request_id).is_some_and(|r| r.state.terminal())
-                        && !q.ready(request_id)
+                        && q.record(key.clone())
+                            .is_some_and(|r| r.state.terminal() && !r.result_expired)
+                        && !q.ready(key.clone())
                     {
                         Ok(Receipt {
                             run_id,
@@ -1086,9 +1475,44 @@ impl Worker {
                             error: None,
                         })
                     } else {
-                        q.lookup(run_id, request_id, now_ms())
+                        q.lookup(run_id, key.clone(), now_ms())
                     }
                 };
+                // Fresh receipt grants can reconcile a commit even when the
+                // immutable accepted snapshot expired and attempts have paused.
+                if result.as_ref().is_ok_and(|receipt| {
+                    matches!(
+                        receipt.state,
+                        RequestState::Reconciling | RequestState::Committing
+                    )
+                }) {
+                    let observed = self.queue.record(key.clone())?;
+                    let budget = crate::storage::HistoryBudget::new(
+                        4096,
+                        64 << 20,
+                        tokio::time::Instant::now() + Duration::from_secs(30),
+                    )
+                    .map_err(|_| unavailable())?;
+                    if let Some(decision) = storage
+                        .lookup_decision_by_id(&loaded, request_id, budget)
+                        .await
+                        .map_err(|_| unavailable())?
+                    {
+                        let receipt = decision_receipt(run_id, request_id, &decision)?;
+                        let finished = {
+                            let mut lock = self.queue.queue.lock().unwrap();
+                            settle_reconciled_decision(
+                                lock.as_mut().ok_or_else(unavailable)?,
+                                &observed,
+                                &decision,
+                                now_ms(),
+                            )
+                            .map_err(|e| e.protocol())?
+                        };
+                        self.replicate_record(root, finished).await?;
+                        return Ok(Reply::Receipt { receipt });
+                    }
+                }
                 match result {
                     Ok(receipt) => Ok(Reply::Receipt { receipt }),
                     Err(error)
@@ -1098,19 +1522,13 @@ impl Worker {
                                 | crate::request_queue::QueueError::NotFound
                         ) =>
                     {
-                        let loaded = self
-                            .storage
-                            .load_cluster_catalog()
-                            .await
-                            .map_err(|_| unavailable())?;
                         let budget = crate::storage::HistoryBudget::new(
                             4096,
                             64 << 20,
                             tokio::time::Instant::now() + Duration::from_secs(30),
                         )
                         .map_err(|_| unavailable())?;
-                        if let Some(d) = self
-                            .storage
+                        if let Some(d) = storage
                             .lookup_decision_by_id(&loaded, request_id, budget)
                             .await
                             .map_err(|_| unavailable())?
@@ -1181,14 +1599,15 @@ impl Worker {
                             q.records()
                                 .filter(|r| {
                                     r.accepted
-                                        && (!r.state.terminal() || !q.ready(r.request_id))
-                                        && !active.contains(&r.request_id)
+                                        && (!r.state.terminal() || !q.ready(r.identity()))
+                                        && !active.contains(&r.identity())
                                 })
                                 .filter_map(|record| {
                                     let bytes = record
                                         .body
                                         .len()
                                         .checked_mul(2)?
+                                        .checked_add(record.context_bytes().ok()?.checked_mul(2)?)?
                                         .checked_add(
                                             record.pinned_catalog.as_ref().map_or(0, Vec::len),
                                         )?
@@ -1213,7 +1632,7 @@ impl Worker {
                         .retries
                         .lock()
                         .unwrap()
-                        .get(&record.request_id)
+                        .get(&record.identity())
                         .is_some_and(|(count, until)| {
                             *count >= 3 || *until > tokio::time::Instant::now()
                         })
@@ -1224,25 +1643,30 @@ impl Worker {
                     if active.len() >= self.coordination_slots {
                         break;
                     }
-                    if !active.insert(record.request_id) {
+                    if !active.insert(record.identity()) {
                         continue;
                     }
                     drop(active);
                     let owner = self.clone();
                     let root = root.clone();
-                    let id = record.request_id;
+                    let id = record.identity();
                     tasks.spawn(async move {
                         let _active = ActiveRequest {
                             owner: owner.clone(),
-                            id,
+                            id: id.clone(),
                             _charge: charge,
                         };
-                        if let Err(error) = owner.run_queued(root.clone(), record).await {
+                        // Once admitted, any failed mutation attempt may have
+                        // reached publication before its error was delivered.
+                        let reconcile_mutation = crate::protocol::parse_request(&record.body)
+                            .is_ok_and(|request| request.operation.is_mutation());
+                        if let Err(mut error) = owner.run_queued(root.clone(), record).await {
+                            error = reconcile_attempt_error(reconcile_mutation, error);
                             let attempts = {
                                 let mut retry = owner.queue.retries.lock().unwrap();
                                 let count = retry.get(&id).map_or(1, |(n, _)| n + 1);
                                 retry.insert(
-                                    id,
+                                    id.clone(),
                                     (
                                         count,
                                         tokio::time::Instant::now()
@@ -1254,20 +1678,27 @@ impl Worker {
                             let record = {
                                 let mut lock = owner.queue.queue.lock().unwrap();
                                 let q = lock.as_mut().ok_or_else(unavailable)?;
-                                if q.record(id).is_some_and(|r| r.state.terminal()) {
+                                if q.record(id.clone()).is_some_and(|r| r.state.terminal()) {
                                     None
                                 } else if error.outcome == crate::protocol::Outcome::NotApplied
                                     && attempts >= 3
                                 {
-                                    let encoded =
-                                        crate::api::response::encode_error(Some(id), error);
+                                    let encoded = crate::api::response::encode_error(
+                                        Some(id.request_id),
+                                        error,
+                                    );
                                     Some(
-                                        q.finish(id, encoded.status, encoded.body, now_ms())
-                                            .map_err(|e| e.protocol())?,
+                                        q.finish(
+                                            id.clone(),
+                                            encoded.status,
+                                            encoded.body,
+                                            now_ms(),
+                                        )
+                                        .map_err(|e| e.protocol())?,
                                     )
                                 } else {
                                     Some(
-                                        q.transition(id, RequestState::Reconciling)
+                                        q.transition(id.clone(), RequestState::Reconciling)
                                             .map_err(|e| e.protocol())?,
                                     )
                                 }
@@ -1287,12 +1718,21 @@ impl Worker {
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
-    async fn run_queued(self: &Arc<Self>, root: Control, record: RequestRecord) -> Result<()> {
-        let id = record.request_id;
+    pub(super) async fn run_queued(
+        self: &Arc<Self>,
+        root: Control,
+        record: RequestRecord,
+    ) -> Result<()> {
+        let id = record.identity();
         let record = self.replicate_record(&root, record).await?;
         if record.state.terminal() {
             return Ok(());
         }
+        // Authorize/fence this database before taking the global queue seal.
+        // An inaccessible target must not block unrelated database admission.
+        let grant = self.queue_data_for_record(&record).await?;
+        let storage = grant.storage();
+        let loaded = self.owned_catalog(&root, &grant).await?;
         // A join seal must cover the first recoverable read snapshot as well as
         // new identities. No compute permit exists while this handshake waits.
         let starting = self.queue.lock_changes().await;
@@ -1305,18 +1745,13 @@ impl Worker {
             .unwrap()
             .as_ref()
             .ok_or_else(unavailable)?
-            .record(id)
+            .record(id.clone())
             .ok_or_else(unavailable)?
             .clone();
         let record = if matches!(
             record.state,
             RequestState::Queued | RequestState::Reconciling
         ) {
-            let loaded = self
-                .storage
-                .load_cluster_catalog()
-                .await
-                .map_err(|_| unavailable())?;
             let mutation = crate::protocol::parse_request(&record.body)?
                 .operation
                 .is_mutation();
@@ -1332,7 +1767,7 @@ impl Worker {
                 .unwrap()
                 .as_mut()
                 .ok_or_else(unavailable)?
-                .start(id, pin)
+                .start(id.clone(), pin)
                 .map_err(|e| e.protocol())?;
             self.replicate_record(&root, started).await?
         } else {
@@ -1361,12 +1796,13 @@ impl Worker {
             ids,
             record.body,
         )?;
-        let request = self.signer.request(
+        let mut request = self.signer.request(
             node.endpoint.as_ref().ok_or_else(unavailable)?,
             &context,
             Body::from(context.initial_bytes().to_vec()),
             false,
         )?;
+        request.extensions_mut().insert(id.clone());
         let transport = self
             .operation_transport
             .clone()
@@ -1401,8 +1837,7 @@ impl Worker {
             }
         }
         if self.queue.fence()? != attempt_fence
-            || self
-                .storage
+            || storage
                 .load_cluster_catalog()
                 .await
                 .map_err(|_| unavailable())?
@@ -1419,7 +1854,7 @@ impl Worker {
             .unwrap()
             .as_mut()
             .ok_or_else(unavailable)?
-            .finish(id, status, body, now_ms())
+            .finish(id.clone(), status, body, now_ms())
             .map_err(|e| e.protocol())?;
         self.replicate_record(&root, finished).await?;
         Ok(())
@@ -1427,7 +1862,7 @@ impl Worker {
 }
 struct ActiveRequest {
     owner: Arc<Worker>,
-    id: Uuid,
+    id: RequestKey,
     _charge: crate::scheduling::MemoryCharge,
 }
 impl Drop for ActiveRequest {
@@ -1638,15 +2073,25 @@ mod class_capacity_tests {
         );
         assert!(
             validate_command_class(
-                &Command::Submit { body: Vec::new() },
+                &Command::Submit {
+                    body: Vec::new(),
+                    context: None
+                },
                 "snapshot",
                 "bootstrap"
             )
             .is_err()
         );
         assert!(
-            validate_command_class(&Command::Submit { body: Vec::new() }, "submit", "bootstrap")
-                .is_err()
+            validate_command_class(
+                &Command::Submit {
+                    body: Vec::new(),
+                    context: None
+                },
+                "submit",
+                "bootstrap"
+            )
+            .is_err()
         );
         drop((ingress, replicas, receipts, bootstrap, progress));
         assert!(queue.transport("ingress").is_ok());
@@ -1718,5 +2163,142 @@ mod class_capacity_tests {
         drop((full, actors, progress, bootstrap));
         assert_eq!(data.usage()[0].2, 0);
         assert_eq!(controls.usage()[0].2, 0);
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use crate::storage::context::RequestContext;
+    #[test]
+    fn t04_q05_terminal_reconciliation_reuses_original_version_and_rejects_mismatches() {
+        let member = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let context:RequestContext=serde_json::from_value(serde_json::json!({"version":1,"bucket":"tenant-data","region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"original","secret_access_key":"original-secret","session_token":null,"expires_at":null}})).unwrap();
+        let body=serde_json::to_vec(&serde_json::json!({"request_id":id,"operation":"table.drop","payload":{"table_id":Uuid::new_v4()}})).unwrap();
+        let response =
+            serde_json::to_vec(&serde_json::json!({"request_id":id,"data":null})).unwrap();
+        let mut queue = RequestQueue::new(
+            Uuid::new_v4(),
+            1,
+            1,
+            QueueLimits {
+                max_pending_requests: 4,
+                max_queue_bytes_per_replica: 1 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                result_retention_ms: 1000,
+            },
+            [member].into(),
+        )
+        .unwrap();
+        let proposed = queue
+            .propose_with_context(body.clone(), Some(context.clone()), 0)
+            .unwrap();
+        let key = proposed.identity();
+        let observed = queue.acknowledge(key.clone(), member).unwrap();
+        let decision = crate::storage::Decision {
+            version: 1,
+            id: Uuid::new_v4(),
+            parent: None,
+            base_revision: 0,
+            revision: 1,
+            request_id: id,
+            request_body: String::from_utf8(body).unwrap(),
+            response_status: 200,
+            response_body: String::from_utf8(response.clone()).unwrap(),
+        };
+        let terminal = queue.finish(key.clone(), 200, response, 10).unwrap();
+        assert!(!queue.ready(key.clone()));
+        let reused = settle_reconciled_decision(&mut queue, &observed, &decision, 20).unwrap();
+        assert_eq!(reused, terminal);
+        assert_eq!(reused.completed_at_ms, Some(10));
+        assert_eq!(reused.context, Some(context));
+        for field in 0..9 {
+            let mut changed = observed.clone();
+            let mut d = decision.clone();
+            match field {
+                0 => d.request_id = Uuid::new_v4(),
+                1 => d.request_body.push(' '),
+                2 => d.response_status = 409,
+                3 => d.response_body.push(' '),
+                4 => changed.scheduler_term += 1,
+                5 => changed.membership_revision += 1,
+                6 => changed.sequence += 1,
+                7 => {
+                    let mut c = serde_json::to_value(changed.context.as_ref().unwrap()).unwrap();
+                    c["credentials"]["secret_access_key"] = serde_json::json!("rotated");
+                    changed.context = Some(serde_json::from_value(c).unwrap());
+                }
+                8 => {
+                    let mut c = serde_json::to_value(changed.context.as_ref().unwrap()).unwrap();
+                    c["bucket"] = serde_json::json!("foreign-data");
+                    changed.context = Some(serde_json::from_value(c).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                settle_reconciled_decision(&mut queue, &changed, &d, 30).is_err(),
+                "mismatched accepted record or decision field {field}"
+            );
+            assert_eq!(queue.record(key.clone()), Some(&terminal));
+        }
+        queue.acknowledge(key.clone(), member).unwrap();
+        assert!(queue.ready(key));
+    }
+
+    #[test]
+    fn sl03_t04_expired_reconciling_mutation_keeps_unknown_and_original_snapshot() {
+        let member = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        let context: RequestContext = serde_json::from_value(serde_json::json!({"version":1,"bucket":"tenant-data","region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"original-access","secret_access_key":"original-secret","session_token":null,"expires_at":"2026-11-16T20:00:00Z"}})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"request_id":request_id,"operation":"table.drop","payload":{"table_id":Uuid::new_v4()}})).unwrap();
+        let mut queue = RequestQueue::new(
+            run,
+            1,
+            1,
+            QueueLimits {
+                max_pending_requests: 4,
+                max_queue_bytes_per_replica: 1 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                result_retention_ms: 1000,
+            },
+            [member].into(),
+        )
+        .unwrap();
+        let record = queue
+            .propose_with_context(body.clone(), Some(context.clone()), 0)
+            .unwrap();
+        let key = record.identity();
+        queue.acknowledge(key.clone(), member).unwrap();
+        queue
+            .transition(key.clone(), RequestState::Reconciling)
+            .unwrap();
+        queue.acknowledge(key.clone(), member).unwrap();
+        assert!(context.validate(u64::MAX).is_err());
+        let record = queue.record(key.clone()).unwrap();
+        let mutation = crate::protocol::parse_request(&record.body)
+            .unwrap()
+            .operation
+            .is_mutation();
+        let expired = http::failure(crate::protocol::ErrorCode::Unauthorized);
+        let error =
+            reconcile_attempt_error(record.state != RequestState::Queued && mutation, expired);
+        assert_eq!(error.code, crate::protocol::ErrorCode::OutcomeUnknown);
+        assert_eq!(error.outcome, crate::protocol::Outcome::Unknown);
+        assert_eq!(
+            queue.lookup(run, key.clone(), 1).unwrap().state,
+            RequestState::Reconciling
+        );
+        // Fresh credentials attach to the existing identity and cannot renew it.
+        let mut fresh = serde_json::to_value(&context).unwrap();
+        fresh["credentials"]["expires_at"] = serde_json::Value::Null;
+        fresh["credentials"]["secret_access_key"] = serde_json::json!("fresh-secret");
+        let replay = queue
+            .propose_with_context(body, Some(serde_json::from_value(fresh).unwrap()), 1)
+            .unwrap();
+        assert_eq!(replay.context, Some(context));
+        assert_eq!(replay.state, RequestState::Reconciling);
+        assert_eq!(queue.pending(), 1);
     }
 }

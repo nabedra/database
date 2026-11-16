@@ -61,7 +61,21 @@ macro_rules! record {
         }
     }
 }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputeMode {
+    #[default]
+    Fixed,
+    Serverless,
+}
+impl ComputeMode {
+    pub fn is_fixed(&self) -> bool {
+        *self == Self::Fixed
+    }
+}
 record!(Template {
+    #[serde(default, skip_serializing_if="ComputeMode::is_fixed")]
+    mode: ComputeMode,
     #[serde(default, skip_serializing_if="crate::config::ExecutionConfig::is_default")]
     execution: crate::config::ExecutionConfig,
     #[serde(default, skip_serializing_if="Option::is_none")]
@@ -89,6 +103,8 @@ record!(HttpOptions {
     token_file: String,
 });
 record!(S3Options {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    region: Option<String>,
     bucket: String,
     namespace: String
 });
@@ -331,7 +347,14 @@ impl Template {
                     return Err(ConfigurationError::UnsupportedStorage);
                 }
                 #[cfg(feature = "s3")]
-                check(o.bucket.len() <= 1024 && bucket(&o.bucket) && namespace(&o.namespace))?;
+                check(
+                    o.bucket.len() <= 1024
+                        && bucket(&o.bucket)
+                        && namespace(&o.namespace)
+                        && o.region
+                            .as_deref()
+                            .is_none_or(crate::storage::context::valid_region),
+                )?;
             }
         }
         Ok(())

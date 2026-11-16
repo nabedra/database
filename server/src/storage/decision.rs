@@ -32,6 +32,8 @@ impl CatalogFence {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClusterCatalog {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_cluster: Option<Uuid>,
     pub format_version: u32,
     pub revision: u64,
     pub commit_id: Uuid,
@@ -45,6 +47,7 @@ impl ClusterCatalog {
     pub fn from_catalog(catalog: &Catalog) -> Result<Self, StorageError> {
         catalog.validate()?;
         Ok(Self {
+            owner_cluster: None,
             format_version: 3,
             revision: catalog.revision,
             commit_id: catalog.commit_id,
@@ -56,9 +59,14 @@ impl ClusterCatalog {
     pub fn validate(&self) -> Result<(), StorageError> {
         match (self.format_version, self.fence) {
             (3, None) => {}
-            (4, Some(fence)) => fence.validate()?,
-            (3 | 4, _) => return Err(StorageError::InvalidCatalog),
+            (4 | 5, Some(fence)) => fence.validate()?,
+            (3 | 4 | 5, _) => return Err(StorageError::InvalidCatalog),
             _ => return Err(StorageError::UnsupportedCatalog),
+        }
+        if (self.format_version == 5) != self.owner_cluster.is_some()
+            || self.owner_cluster.is_some_and(|id| id.is_nil())
+        {
+            return Err(StorageError::InvalidCatalog);
         }
         Catalog {
             format_version: 2,
@@ -72,6 +80,8 @@ impl ClusterCatalog {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
+            #[serde(default)]
+            owner_cluster: Option<Uuid>,
             format_version: u32,
             revision: u64,
             commit_id: Uuid,
@@ -82,7 +92,7 @@ impl ClusterCatalog {
             fence: Option<CatalogFence>,
         }
         let wire: Wire = object(bytes, MAX_CATALOG_BYTES)?;
-        if !matches!(wire.format_version, 3 | 4) {
+        if !matches!(wire.format_version, 3 | 4 | 5) {
             return Err(StorageError::UnsupportedCatalog);
         }
         // Keep raw tables through the legacy decoder, which owns object shape,
@@ -105,6 +115,7 @@ impl ClusterCatalog {
         )?;
         let catalog = Catalog::decode(&bytes)?;
         let decoded = Self {
+            owner_cluster: wire.owner_cluster,
             format_version: wire.format_version,
             revision: catalog.revision,
             commit_id: catalog.commit_id,

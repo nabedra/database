@@ -1,0 +1,125 @@
+"""Focused CLI01/CLI02 checks; runtime acceptance is separate."""
+import contextlib
+import copy
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+from meshdb import cli
+from meshdb._binary import resolve_server_binary
+from meshdb._cli_config import ConfigError, load, protected_write, validate
+
+
+class ManagementTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / 'meshdb.json'
+
+    def run_cli(self, *args):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            status = cli.main(list(args))
+        return status, out.getvalue(), err.getvalue()
+
+    def init(self):
+        return self.run_cli('init', '--mode', 'serverless', '--control-storage', 's3://test-bucket/prod/', '--region', 'eu-west-1', '--output', str(self.config), '--non-interactive')
+
+    def test_init_secrets_and_overwrite(self):
+        status, out, err = self.init()
+        self.assertEqual((status, err), (0, ''))
+        config = load(self.config)
+        self.assertEqual((config['version'], config['mode']), (2, 'serverless'))
+        auth = Path(config['auth_file'])
+        self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+        tokens = json.loads(auth.read_text())
+        self.assertEqual(len(set(tokens.values())), 3)
+        for token in tokens.values():
+            self.assertNotIn(token, out)
+        before = auth.read_bytes(), self.config.read_bytes()
+        self.assertEqual(self.init()[0], 2)
+        self.assertEqual(before, (auth.read_bytes(), self.config.read_bytes()))
+
+    def test_missing_and_conflicting_settings(self):
+        for args in (('init', '--non-interactive'), ('init', '--mode', 'fixed', '--control-storage', 's3://test-bucket/db/', '--region', 'eu-west-1')):
+            self.assertEqual(self.run_cli(*args)[0], 2)
+        self.assertFalse(self.config.exists())
+
+    def test_strict_config_tls_and_v1(self):
+        self.init()
+        original = load(self.config)
+        for mutate in (lambda c: c.update(extra=1), lambda c: c.update(mode='bad'), lambda c: c.update(bind='0.0.0.0:8000'), lambda c: c['worker'].update(extra=1)):
+            config = copy.deepcopy(original)
+            mutate(config)
+            with self.assertRaises(ValueError):
+                validate(config)
+        self.config.write_text('{"version":2,"version":2}')
+        with self.assertRaises(ConfigError):
+            load(self.config)
+        original['version'] = 1
+        del original['mode']
+        validate(original)
+
+    def test_doctor_read_only_and_secret_permissions(self):
+        self.init()
+        before = self.config.read_bytes()
+        with patch('meshdb.cli.resolve_server_binary', return_value='/binary'), patch('os.execv') as execute:
+            self.run_cli('doctor', '--config', str(self.config), '--json')
+            self.assertEqual(execute.call_args.args[1], ['/binary', 'doctor', '--config', str(self.config), '--json'])
+        self.assertEqual(self.config.read_bytes(), before)
+        Path(load(self.config)['auth_file']).chmod(0o644)
+        with patch('os.execv') as execute:
+            self.assertEqual(self.run_cli('doctor', '--config', str(self.config))[0], 2)
+            execute.assert_not_called()
+
+    def test_admin_uses_single_attempt_transport_and_tls(self):
+        token = self.root / 'admin'
+        protected_write(token, b'A' * 43)
+        with patch('meshdb._control_transport._ControlTransport') as transport:
+            transport.return_value.request.return_value = ('id', {'desired': 2})
+            self.assertEqual(self.run_cli('cluster', 'scale', '2', '--url', 'https://compute.example', '--admin-token-file', str(token), '--json')[0], 0)
+            self.assertEqual(transport.return_value.request.call_args.args, ('cluster.scale', {'nodes': 2}))
+        self.assertEqual(self.run_cli('cluster', 'status', '--url', 'http://compute.example', '--admin-token-file', str(token))[0], 2)
+
+    def test_generated_auth_file_can_administer_cluster(self):
+        self.init()
+        config = load(self.config)
+        with patch('meshdb._control_transport._ControlTransport') as transport:
+            transport.return_value.request.return_value = ('id', {})
+            self.assertEqual(self.run_cli('cluster', 'status', '--url', 'https://compute.example', '--admin-token-file', config['auth_file'], '--json')[0], 0)
+            expected = json.loads(Path(config['auth_file']).read_text())['admin_token']
+            self.assertEqual(transport.call_args.args[1], expected)
+
+    def test_migration_delegates_confirmed_command(self):
+        with self.assertRaises(SystemExit) as error:
+            self.run_cli('database', 'migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1')
+        self.assertEqual(error.exception.code, 2)
+        with patch('meshdb.cli.resolve_server_binary', return_value='/binary'), patch('os.execv') as execute:
+            self.run_cli('database', 'migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1', '--cluster-id', '11111111-1111-4111-8111-111111111111', '--confirm-writers-stopped')
+            self.assertEqual(execute.call_args.args[1][-3:], ['--cluster-id', '11111111-1111-4111-8111-111111111111', '--confirm-writers-stopped'])
+            execute.reset_mock()
+            self.assertEqual(self.run_cli('database', 'migrate', '--storage', 's3://test-bucket/db/', '--region', 'eu-west-1', '--cluster-id', 'invalid', '--confirm-writers-stopped')[0], 2)
+            execute.assert_not_called()
+
+    def test_environment_binary_precedes_path_and_override_is_final(self):
+        import sys
+        envbin = self.root / 'bin'
+        envbin.mkdir()
+        binary = envbin / 'meshdb-server'
+        binary.write_text('#!' + sys.executable + '\nprint("meshdb-server 0.1.0")\n')
+        binary.chmod(0o700)
+        with patch('meshdb._binary.sys.prefix', str(self.root)), patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_server_binary(check=True), str(binary))
+            with patch.dict(os.environ, {'MESHDB_SERVER_BINARY': 'absent'}):
+                with self.assertRaises(RuntimeError):
+                    resolve_server_binary(check=True)
+            binary.write_text('#!' + sys.executable + '\nprint("meshdb-server 9.0.0")\n')
+            with self.assertRaises(RuntimeError):
+                resolve_server_binary(check=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -4,6 +4,7 @@
 extern crate self as meshdb_server;
 pub mod api;
 pub mod cli;
+pub mod maintenance;
 pub mod cluster;
 pub mod commit;
 pub mod config;

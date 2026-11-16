@@ -1,6 +1,8 @@
 //! Replicated request records live only in worker RAM. Transport owns authenticated
 //! installation and must replicate each returned record before exposing its state.
+pub(crate) mod admission;
 use crate::protocol::{self, ErrorCode, Outcome, ProtocolError};
+use crate::storage::context::{RequestContext, StorageKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,9 +43,37 @@ impl RequestState {
         matches!(self, Self::Succeeded | Self::Failed | Self::Abandoned)
     }
 }
+/// Internal identity leaves the public operation UUID and exact bytes intact.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestKey {
+    pub storage: Option<StorageKey>,
+    pub request_id: Uuid,
+}
+impl RequestKey {
+    pub fn new(
+        request_id: Uuid,
+        context: Option<&RequestContext>,
+    ) -> Result<Self, crate::storage::StorageError> {
+        Ok(Self {
+            request_id,
+            storage: context.map(RequestContext::storage_key).transpose()?,
+        })
+    }
+}
+impl From<Uuid> for RequestKey {
+    fn from(request_id: Uuid) -> Self {
+        Self {
+            storage: None,
+            request_id,
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<RequestContext>,
     pub run_id: Uuid,
     pub scheduler_term: u64,
     pub membership_revision: u64,
@@ -62,11 +92,31 @@ pub struct RequestRecord {
     pub replicas: BTreeSet<Uuid>,
 }
 impl RequestRecord {
+    pub fn identity(&self) -> RequestKey {
+        RequestKey {
+            storage: self.context.as_ref().and_then(|c| c.storage_key().ok()),
+            request_id: self.request_id,
+        }
+    }
+    pub(crate) fn context_bytes(&self) -> Result<usize, QueueError> {
+        self.context
+            .as_ref()
+            .map(|c| {
+                serde_json::to_vec(c)
+                    .map(|v| v.len())
+                    .map_err(|_| QueueError::Invalid)
+            })
+            .transpose()
+            .map(|n| n.unwrap_or(0))
+    }
+
     fn queue_bytes(&self) -> Result<usize, QueueError> {
         // Include allocator/tree/record metadata, all request and pinned snapshot
-        // bytes, and bounded UUID replication evidence. Results have their own cap.
+        // bytes, the serialized context plus its separate composite-key copy,
+        // and bounded UUID replication evidence. Results have their own cap.
         1024usize
             .checked_add(self.body.len())
+            .and_then(|n| n.checked_add(self.context_bytes().ok()?.checked_mul(2)?))
             .and_then(|n| n.checked_add(self.pinned_catalog.as_ref().map_or(0, Vec::len)))
             .and_then(|n| {
                 self.replicas
@@ -75,6 +125,21 @@ impl RequestRecord {
                     .and_then(|m| n.checked_add(m))
             })
             .ok_or(QueueError::Overloaded)
+    }
+    pub(crate) fn binding_digests(
+        &self,
+    ) -> Result<(Option<[u8; 32]>, Option<[u8; 32]>), QueueError> {
+        match &self.context {
+            None => Ok((None, None)),
+            Some(c) => {
+                let key = c.storage_key().map_err(|_| QueueError::Invalid)?;
+                let bytes = serde_json::to_vec(c).map_err(|_| QueueError::Invalid)?;
+                Ok((
+                    Some(Sha256::digest(key.digest().as_bytes()).into()),
+                    Some(Sha256::digest(&bytes).into()),
+                ))
+            }
+        }
     }
     fn result_bytes(&self) -> usize {
         self.response_body.as_ref().map_or(0, Vec::len)
@@ -153,7 +218,7 @@ pub struct RequestQueue {
     members: BTreeSet<Uuid>,
     limits: QueueLimits,
     next_sequence: u64,
-    records: BTreeMap<Uuid, RequestRecord>,
+    records: BTreeMap<RequestKey, RequestRecord>,
 }
 impl RequestQueue {
     pub fn new(
@@ -193,12 +258,18 @@ impl RequestQueue {
     pub fn members(&self) -> &BTreeSet<Uuid> {
         &self.members
     }
-    pub fn record(&self, id: Uuid) -> Option<&RequestRecord> {
+    pub fn record(&self, id: impl Into<RequestKey>) -> Option<&RequestRecord> {
+        let id = id.into();
         self.records.get(&id)
     }
     /// Roll back only an exact proposal that has never been accepted. Accepted
     /// records retain their logical identity through every execution outcome.
-    pub(crate) fn discard_unaccepted(&mut self, id: Uuid, version: u64) -> Result<(), QueueError> {
+    pub(crate) fn discard_unaccepted(
+        &mut self,
+        id: impl Into<RequestKey>,
+        version: u64,
+    ) -> Result<(), QueueError> {
+        let id = id.into();
         let record = self.records.get(&id).ok_or(QueueError::NotFound)?;
         if record.accepted || record.version != version || record.state != RequestState::Queued {
             return Err(QueueError::Conflict);
@@ -221,8 +292,26 @@ impl RequestQueue {
         })
     }
     pub fn propose(&mut self, body: Vec<u8>, now_ms: u64) -> Result<RequestRecord, QueueError> {
+        self.propose_with_context(body, None, now_ms)
+    }
+    pub fn propose_with_context(
+        &mut self,
+        body: Vec<u8>,
+        context: Option<RequestContext>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        if let Some(c) = &context {
+            c.validate(now_ms / 1000).map_err(|_| QueueError::Invalid)?;
+        }
         let request = protocol::parse_request(&body).map_err(|_| QueueError::Invalid)?;
-        if let Some(record) = self.records.get(&request.request_id) {
+        if let Some(record) = self.records.get(&RequestKey {
+            storage: context
+                .as_ref()
+                .map(|c| c.storage_key())
+                .transpose()
+                .map_err(|_| QueueError::Invalid)?,
+            request_id: request.request_id,
+        }) {
             return if record.digest == digest(&body)
                 && (record.body.is_empty() || record.body == body)
             {
@@ -235,6 +324,7 @@ impl RequestQueue {
         let sequence = self.next_sequence;
         let next = sequence.checked_add(1).ok_or(QueueError::Overloaded)?;
         let record = RequestRecord {
+            context,
             run_id: self.run_id,
             scheduler_term: self.scheduler_term,
             membership_revision: self.membership_revision,
@@ -257,6 +347,14 @@ impl RequestQueue {
         Ok(record)
     }
     fn validate_record(&self, record: &RequestRecord) -> Result<(), QueueError> {
+        // Expiry is checked at admission/execution, not on replica recovery.
+        // A valid accepted snapshot remains recoverable after credentials expire.
+        if let Some(c) = &record.context {
+            c.validate(0).map_err(|_| QueueError::Invalid)?;
+            if record.context_bytes()? > crate::storage::context::MAX_CONTEXT_BYTES {
+                return Err(QueueError::Invalid);
+            }
+        }
         if record.run_id != self.run_id
             || record.scheduler_term != self.scheduler_term
             || record.membership_revision != self.membership_revision
@@ -310,8 +408,9 @@ impl RequestQueue {
     }
     pub fn install(&mut self, record: RequestRecord) -> Result<(), QueueError> {
         self.validate_record(&record)?;
-        if let Some(old) = self.records.get(&record.request_id) {
-            if old.digest != record.digest
+        if let Some(old) = self.records.get(&record.identity()) {
+            if old.context != record.context
+                || old.digest != record.digest
                 || (!old.body.is_empty() && !record.body.is_empty() && old.body != record.body)
                 || old.sequence != record.sequence
             {
@@ -330,7 +429,7 @@ impl RequestQueue {
                 }
                 // Replication evidence is bounded by membership.
                 self.check_capacity(&merged)?;
-                self.records.insert(record.request_id, merged);
+                self.records.insert(record.identity(), merged);
                 return Ok(());
             }
             if old.accepted && !record.accepted
@@ -355,7 +454,7 @@ impl RequestQueue {
                 .checked_add(1)
                 .ok_or(QueueError::Overloaded)?,
         );
-        self.records.insert(record.request_id, record);
+        self.records.insert(record.identity(), record);
         Ok(())
     }
     fn check_capacity(&self, incoming: &RequestRecord) -> Result<(), QueueError> {
@@ -372,12 +471,17 @@ impl RequestQueue {
                     .ok_or(QueueError::Overloaded)?,
             )
             .ok_or(QueueError::Overloaded)?;
+        let scope = incoming.identity().storage;
+        let mut scope_pending = usize::from(!incoming.state.terminal());
         let mut results = incoming.result_bytes();
         for old in self
             .records
             .values()
-            .filter(|r| r.request_id != incoming.request_id)
+            .filter(|r| r.identity() != incoming.identity())
         {
+            if scope.is_some() && scope == old.identity().storage && !old.state.terminal() {
+                scope_pending = scope_pending.checked_add(1).ok_or(QueueError::Overloaded)?;
+            }
             pending = pending
                 .checked_add(usize::from(!old.state.terminal()))
                 .ok_or(QueueError::Overloaded)?;
@@ -396,7 +500,13 @@ impl RequestQueue {
                 .checked_add(old.result_bytes())
                 .ok_or(QueueError::Overloaded)?;
         }
-        if pending > self.limits.max_pending_requests
+        // The configured authenticated data bearer has one stable quota scope
+        // per storage target. Credential/expiry rotation cannot create capacity.
+        // Application middleware owns finer user quotas. All scopes still share
+        // this physical worker's global byte/count limits.
+        let per_scope = self.limits.max_pending_requests.div_ceil(4).max(1);
+        if scope.is_some() && scope_pending > per_scope
+            || pending > self.limits.max_pending_requests
             || bytes > self.limits.max_queue_bytes_per_replica
             || results > self.limits.max_retained_result_bytes_per_worker
         {
@@ -405,16 +515,22 @@ impl RequestQueue {
         Ok(())
     }
     /// Call only after this member authenticated installation of this exact version.
-    pub fn acknowledge(&mut self, id: Uuid, member: Uuid) -> Result<RequestRecord, QueueError> {
+    pub fn acknowledge(
+        &mut self,
+        id: impl Into<RequestKey>,
+        member: Uuid,
+    ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
         let version = self.records.get(&id).ok_or(QueueError::NotFound)?.version;
         self.acknowledge_version(id, version, member)
     }
     pub fn acknowledge_version(
         &mut self,
-        id: Uuid,
+        id: impl Into<RequestKey>,
         version: u64,
         member: Uuid,
     ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
         if !self.members.contains(&member)
             || self.records.get(&id).is_none_or(|r| r.version != version)
         {
@@ -430,17 +546,19 @@ impl RequestQueue {
         self.records.insert(id, record.clone());
         Ok(record)
     }
-    pub fn ready(&self, id: Uuid) -> bool {
+    pub fn ready(&self, id: impl Into<RequestKey>) -> bool {
+        let id = id.into();
         self.records
             .get(&id)
             .is_some_and(|r| r.accepted && r.replicas == self.members)
     }
     pub fn start(
         &mut self,
-        id: Uuid,
+        id: impl Into<RequestKey>,
         pinned_catalog: Option<Vec<u8>>,
     ) -> Result<RequestRecord, QueueError> {
-        if !self.ready(id) {
+        let id = id.into();
+        if !self.ready(id.clone()) {
             return Err(QueueError::Unavailable);
         }
         let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
@@ -478,9 +596,10 @@ impl RequestQueue {
     }
     pub fn transition(
         &mut self,
-        id: Uuid,
+        id: impl Into<RequestKey>,
         state: RequestState,
     ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
         let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
         if !record.accepted
             || record.state.terminal()
@@ -493,17 +612,18 @@ impl RequestQueue {
     }
     pub fn finish(
         &mut self,
-        id: Uuid,
+        id: impl Into<RequestKey>,
         status: u16,
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
         self.expire(now_ms);
         let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
         if !record.accepted || record.state.terminal() || !(200..600).contains(&status) {
             return Err(QueueError::Conflict);
         }
-        validate_response(id, status, &body)?;
+        validate_response(id.request_id, status, &body)?;
         record.state = if status == 200 {
             RequestState::Succeeded
         } else {
@@ -523,7 +643,13 @@ impl RequestQueue {
         }
         self.changed(record)
     }
-    pub fn lookup(&self, run_id: Uuid, id: Uuid, now_ms: u64) -> Result<Receipt, QueueError> {
+    pub fn lookup(
+        &self,
+        run_id: Uuid,
+        id: impl Into<RequestKey>,
+        now_ms: u64,
+    ) -> Result<Receipt, QueueError> {
+        let id = id.into();
         if run_id != self.run_id {
             return Err(QueueError::Abandoned);
         }
@@ -556,7 +682,7 @@ impl RequestQueue {
             .map(|v| serde_json::from_value(v.clone()).map_err(|_| QueueError::Invalid))
             .transpose()?;
         Ok(Receipt {
-            request_id: id,
+            request_id: id.request_id,
             run_id,
             state: record.state,
             result,
@@ -632,7 +758,7 @@ impl RequestQueue {
         for old in self.records.values() {
             let incoming = replacement
                 .records
-                .get(&old.request_id)
+                .get(&old.identity())
                 .ok_or(QueueError::Conflict)?;
             if incoming.version < old.version
                 || incoming.digest != old.digest

@@ -1,0 +1,81 @@
+{
+  "scope": "bounded synchronous API receipt observation recovery; operation submission remains once-only",
+  "cases": [
+    "Q04",
+    "Q05",
+    "Q06",
+    "T04",
+    "U02"
+  ],
+  "historical_installed_failure": {
+    "artifact": "artifacts/cli-serverless/native-s3-installed.json",
+    "elapsed_s": 40.492,
+    "exact_underlying_error": "unexplained; this correction does not diagnose that event"
+  },
+  "before_fix": {
+    "command": "cargo test --lib cluster::runtime::receipt_observation -- --nocapture",
+    "passed": 0,
+    "failed": 1,
+    "assertion": "transient observation returned503 instead of subsequent original terminal200"
+  },
+  "policy": {
+    "max_consecutive_transient_failures": 3,
+    "max_retries_per_streak": 2,
+    "backoff_ms": [
+      50,
+      100
+    ],
+    "recovery_window_ms": 5000,
+    "healthy_pending_receipt_resets_streak": true,
+    "transient_codes": [
+      "storage_unavailable",
+      "overloaded",
+      "outcome_unknown"
+    ],
+    "submit_count": 1,
+    "fresh_authority_per_lookup": true
+  },
+  "deterministic_evidence": {
+    "clock": "injected Tokio paused clock",
+    "route_helper_cases": 5,
+    "loopback_http_denial_malformed_case": 1,
+    "covered": [
+      "read and mutation recovery preserving identity/body/context/result",
+      "exact failure and backoff bounds",
+      "deadline cancellation releases observation ownership",
+      "healthy pending wait exceeds recovery window",
+      "nontransient and foreign/malformed receipt rejection",
+      "terminal operation error is never observation-retried"
+    ]
+  },
+  "other_focused_passes": {
+    "queue_runtime": 6,
+    "actual_worker_fixtures": 2,
+    "api_integration": 4,
+    "queued_api_integration": 5,
+    "fenced_requests_integration": 8
+  },
+  "builds": {
+    "debug": {
+      "locked": true,
+      "passed": true,
+      "sha256": "0112361247a88bc25c54834bef3e0806d1503bfc849d22b37ba5d4711b38a049",
+      "elapsed_s": 83
+    },
+    "release": {
+      "locked": true,
+      "passed": true,
+      "sha256": "91b239b1c417da288c68abf295dc375b69cf58704b11192492977fd297a75a49",
+      "elapsed_s": 537,
+      "dependencies": "shared cached release dependencies; changed meshdb-server crate compiled"
+    },
+    "version": "0.1.0",
+    "original_installed_binary_preserved_sha256": "f22c26538bdc94811429d90425f188d19578ddbc1796b286a30d31f1c7bc9aa4"
+  },
+  "final_installed_verification": {
+    "installer": "install-final.json",
+    "installed_commands": "installed-final-commands.json",
+    "runtime": "native-s3-final.json",
+    "passed_assertions": 13
+  }
+}

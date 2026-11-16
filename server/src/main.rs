@@ -50,6 +50,24 @@ async fn run_cli() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let result = match command {
+        Command::Doctor { config, json } => meshdb_server::maintenance::doctor(&config, json).await,
+        Command::Database {
+            command:
+                meshdb_server::cli::DatabaseCommand::Migrate {
+                    storage,
+                    region,
+                    cluster_id,
+                    confirm_writers_stopped,
+                },
+        } => {
+            meshdb_server::maintenance::migrate(
+                &storage,
+                &region,
+                cluster_id,
+                confirm_writers_stopped,
+            )
+            .await
+        }
         Command::Serve(options) => run(options).await,
         Command::Api {
             config,
@@ -65,7 +83,17 @@ async fn run_cli() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("meshdb-server: {message}");
-            ExitCode::FAILURE
+            if matches!(
+                message,
+                "configuration invalid"
+                    | "storage URI invalid"
+                    | "namespace invalid"
+                    | "--confirm-writers-stopped is required"
+            ) {
+                ExitCode::from(2)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

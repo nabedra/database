@@ -1,0 +1,13 @@
+.git
+.meshdb
+**/.venv
+**/__pycache__
+**/*.egg-info
+**/target
+artifacts
+.env
+**/*.key
+**/*.pem
+meshdb.json
+meshdb.auth.json
+**/*.auth.json

@@ -1,0 +1,13 @@
+{
+  "result": "passed",
+  "exit": 0,
+  "elapsed_s": 2097.553,
+  "prefix": "<fresh-install-prefix>",
+  "locked": true,
+  "profile": "release",
+  "jobs": 1,
+  "incremental": false,
+  "debug_symbols": false,
+  "free_bytes_before": 2181136384,
+  "free_bytes_after": 1361883136
+}

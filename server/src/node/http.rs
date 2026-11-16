@@ -9,7 +9,7 @@ use crate::{
         state::Control,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
-    storage::{HttpStore, Storage},
+    storage::{RuntimeStore, Storage},
     worker_pool::WorkerPool,
 };
 use axum::{
@@ -160,7 +160,7 @@ where
         .await
 }
 pub(crate) async fn load_root(
-    storage: &Arc<Storage<HttpStore>>,
+    storage: &Arc<Storage<RuntimeStore>>,
     pool: &WorkerPool,
 ) -> Result<Control> {
     let storage = storage.clone();
@@ -458,7 +458,7 @@ pub(crate) async fn small_exchange(
     signer: &Signer,
     context: RequestContext,
     endpoint: &str,
-    storage: &Arc<Storage<HttpStore>>,
+    storage: &Arc<Storage<RuntimeStore>>,
     pool: &WorkerPool,
 ) -> Result<auth::ReplyHandoff> {
     let deadline = Instant::now() + Duration::from_secs(30);
