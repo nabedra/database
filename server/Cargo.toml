@@ -1,9 +1,23 @@
 [package]
-name = "nabedra-database-server"
+name = "nabedra-database"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.94.1"
-publish = false
+description = "S3-backed database with immutable Parquet snapshots, an HTTP API, and distributed workers"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+readme = "README.md"
+keywords = ["database", "s3", "parquet", "distributed", "storage"]
+categories = ["database", "command-line-utilities"]
+publish = ["crates-io"]
+include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICENSE*"]
+
+[lib]
+name = "nabedra_database_server"
+
+[[bin]]
+name = "nabedra-database-server"
+path = "src/main.rs"
 
 [features]
 default = ["s3"]
@@ -13,7 +27,7 @@ s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 ring = "=0.17.14"
 sha2 = "=0.11.1"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
-axum-server = { version = "=0.9.1", default-features = false, features = ["tls-rustls"] }
+axum-server = { version = "=0.9.2", default-features = false, features = ["tls-rustls"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
 http-body-util = "=0.1.5"
