@@ -20,7 +20,7 @@ import sys
 import time
 import tracemalloc
 import uuid
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'python' / 'src'))
 import httpx
 from nabedra.gateway import Gateway, S3, AwsCredentials
 from gateway_host_fixture import endpoint

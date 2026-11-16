@@ -5,7 +5,7 @@ contracts](../../plans/distributed-contracts.md) are authoritative; use accepted
 [A05](DN-A05.md), [A07](DN-A07.md), and only [A10's](DN-A10.md) startup obligations.
 [A03](../../scripts/notes/DN-A03.md) supplies historical bootstrap shapes, with
 one `storage` backend and autoscale minimum 1 replacing its older proposals.
-[A04](../../orm/notes/DN-A04.md) and the current `_serve_args.py` /
+[A04](../../orm/python/notes/DN-A04.md) and the current `_serve_args.py` /
 `_serve_process.py` supply private startup records. This note designs bounded
 Rust loading and comparison, without listeners, IPC implementation, worker
 execution, controller loops, a new public API, or a generic config framework.

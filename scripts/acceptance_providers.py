@@ -19,7 +19,7 @@ import uuid
 
 from acceptance_nodes import FrontDoor, announcement, call, receive, send, target, write
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/python/src'))
 from nabedra._callback_bridge import _CallbackBridge
 from nabedra import ValidationError, Cluster, NabedraError
 from nabedra._serve_args import _validate_serve_args

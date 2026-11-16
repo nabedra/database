@@ -39,7 +39,7 @@ Commands below run from the repository root, except the explicit `server` subshe
 export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 (cd server && cargo test --locked --no-default-features --no-fail-fast -j1 -- --test-threads=4)
 (cd server && cargo check --locked -j1)
-PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests
+PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests
 ```
 
 Build the supplied native targets before reproducing the process and benchmark runs:

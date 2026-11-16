@@ -315,7 +315,7 @@ For the Python syntax/discovery check, use Python 3.11+ with the gateway extra
 installed, from the repository root. This imports tests but does not run them:
 
 ```sh
-PYTHONPATH=orm/src:scripts python3.11 -B - <<'PY'
+PYTHONPATH=orm/python/src:scripts python3.11 -B - <<'PY'
 from collections import Counter
 from pathlib import Path
 import subprocess
@@ -331,7 +331,7 @@ def cases(suite):
         else:
             yield test
 
-for directory in ('orm/tests', 'scripts'):
+for directory in ('orm/python/tests', 'scripts'):
     found = list(cases(unittest.TestLoader().discover(directory, pattern='test_*.py')))
     ids = [test.id() for test in found]
     failed = [test for test in found if isinstance(test, unittest.loader._FailedTest)]

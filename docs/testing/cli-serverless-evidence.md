@@ -56,7 +56,7 @@ The [SVG](evidence/cli-serverless/gateway-http.svg) and [source hashes](evidence
 
 ## Reproduce
 
-The core manifest lists the selected test names. With Python 3.11+, HTTPX and the local ORM available, invoke its eight names through `python -m unittest -v`, with `PYTHONPATH=orm/src:orm/tests`. Build the locked default-feature Rust lib test binary once with `cargo test --locked --lib --no-run`, then pass the manifest's 12 names to that executable with `--exact --test-threads=1`. Use one build job and a shared Cargo target on resource-constrained hosts.
+The core manifest lists the selected test names. With Python 3.11+, HTTPX and the local ORM available, invoke its eight names through `python -m unittest -v`, with `PYTHONPATH=orm/python/src:orm/python/tests`. Build the locked default-feature Rust lib test binary once with `cargo test --locked --lib --no-run`, then pass the manifest's 12 names to that executable with `--exact --test-threads=1`. Use one build job and a shared Cargo target on resource-constrained hosts.
 
 ```sh
 CARGO_BUILD_JOBS=1 python3.11 scripts/install_nabedra.py --prefix /tmp/nabedra-clean-install

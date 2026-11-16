@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/python/src'))
 from nabedra import Database, StorageError, TransportError, UnknownOutcomeError
 from nabedra._cli_config import example, protected_write
 from nabedra._control_transport import _ControlTransport
@@ -109,7 +109,7 @@ def run(args, report):
     env = {'PATH': os.path.dirname(python) + os.pathsep + os.defpath,
            'PYTHONDONTWRITEBYTECODE': '1', 'NABEDRA_SERVER_BINARY': binary}
     if not args.python:
-        env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1] / 'orm/src')
+        env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1] / 'orm/python/src')
     else:
         env['NABEDRA_CHECK_INSTALLED'] = '1'
 
@@ -229,7 +229,7 @@ def run(args, report):
             result = command([python, '-c', CLIENT, url, auth['data_token'], 'create'])
             report['client'] = json.loads(result.stdout)
             expected_sources = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-                for p in (Path(__file__).resolve().parents[1] / 'orm/src/nabedra').glob('*.py')}
+                for p in (Path(__file__).resolve().parents[1] / 'orm/python/src/nabedra').glob('*.py')}
             check(report['client']['source_sha256'] == expected_sources,
                   'installed package differs from the current source tree')
             passed('U01 subset OLTP exact insert/get/filter for 10, 100 and 1000 rows')

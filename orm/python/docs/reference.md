@@ -6,7 +6,7 @@ builds queries for a separately running Nabedra Database v0 server. It requires 
 does not start the server or need AWS credentials; the server owns S3 access.
 
 For shared compute, point this client at your application's endpoint. The
-[framework-independent gateway](https://github.com/zPy52/nabedra-database/blob/main/docs/cli-and-serverless.md#host-an-application-endpoint)
+[framework-independent gateway](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
 lets that endpoint authorize and forward the existing operation with storage
 credentials supplied by server middleware.
 
@@ -35,10 +35,10 @@ nabedra-db --version
 
 The published Python 0.1.0 CLI expects the previous server executable name.
 To use `nabedra database serve` with `nabedra-db`, install the updated CLI
-from this checkout with the [repository installer](../scripts/install_nabedra.py).
+from this checkout with the [repository installer](../../../scripts/install_nabedra.py).
 The Python ORM can connect to the renamed server without a CLI update.
 
-For development, run `python3.11 -m pip install -e ./orm` from the repository
+For development, run `python3.11 -m pip install -e ./orm/python` from the repository
 root instead of installing from PyPI.
 
 Replace the token placeholder in your environment. The example below assumes
@@ -349,8 +349,7 @@ The API provides no general transactions across calls, joins, import/export,
 schema migrations, model decorators, relationships, indexes, or
 data-frame adapters. The atomic batch remains a single operation.
 
-See the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/README.md#configuration) for size syntax and
-worker configuration, and the [partition workers rubric](https://github.com/zPy52/nabedra-database/blob/main/plans/partition-workers.md)
-for current storage contracts. The [ORM contract](https://github.com/zPy52/nabedra-database/blob/main/plan-v0/orm.md) and
-[server contract](https://github.com/zPy52/nabedra-database/blob/main/plan-v0/server.md) are historical v0 baselines; their
-single-file storage and request-only worker descriptions predate partition workers.
+See the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/docs/reference.md#configuration)
+for size syntax and worker configuration, and the
+[execution and recovery plan](https://github.com/zPy52/nabedra-database/blob/main/plans/resource-aware-scheduling.md)
+for storage and worker requirements.

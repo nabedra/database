@@ -28,9 +28,9 @@ information disabled and incremental compilation disabled.
 cargo fmt --manifest-path server/Cargo.toml --all -- --check
 cargo test --manifest-path server/Cargo.toml --locked \
   --test cli --test startup --test rename_compatibility
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/src \
-  python3.11 -m unittest discover -s orm/tests -v
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/src \
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/python/src \
+  python3.11 -m unittest discover -s orm/python/tests -v
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/python/src \
   python3.11 -m unittest discover -s scripts -p test_server_process.py -v
 cargo publish --manifest-path server/Cargo.toml --registry crates-io \
   --locked --dry-run --allow-dirty

@@ -4,7 +4,7 @@ Adopted design handoff, 2026-11-11, after independent reconciliation found no es
 
 ## Sources and actual boundaries
 
-[Shared contracts](../../plans/distributed-contracts.md) and the [rubric](../../plans/distributed-nodes.md) govern. Apply accepted [A05](DN-A05.md), [A08](DN-A08.md), [A10](DN-A10.md), [A11](DN-A11.md), [A14](DN-A14.md), [A16](DN-A16.md), historical [A03](../../scripts/notes/DN-A03.md), and [A04](../../orm/notes/DN-A04.md) including its accepted completed-cache removal override. Do not adopt A03's superseded deadlines, compaction, split storage or zero-minimum autoscale proposals.
+[Shared contracts](../../plans/distributed-contracts.md) and the [rubric](../../plans/distributed-nodes.md) govern. Apply accepted [A05](DN-A05.md), [A08](DN-A08.md), [A10](DN-A10.md), [A11](DN-A11.md), [A14](DN-A14.md), [A16](DN-A16.md), historical [A03](../../scripts/notes/DN-A03.md), and [A04](../../orm/python/notes/DN-A04.md) including its accepted completed-cache removal override. Do not adopt A03's superseded deadlines, compaction, split storage or zero-minimum autoscale proposals.
 
 Actual `member.rs` exposes `Node`, `Intent`, `Delivery` and their fields, with strict bounded `decode/encode/validate`. `state.rs` exposes `Control`, generation-2 `Config`, `capacity()` and `check_new_admission()`. Capacity derives first-stop credits from exact retained starts/stops and terminal witnesses. Decoding validates structure, not the history or truth of those witnesses. No schema or public SDK amendment is needed here.
 

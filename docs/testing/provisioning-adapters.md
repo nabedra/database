@@ -69,8 +69,8 @@ The admin endpoint stores exact request identities and policy decisions through 
 Run local protocol and lifecycle evidence with:
 
 ```sh
-PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests -p test_providers.py
-PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests -p test_serve_public.py
+PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests -p test_providers.py
+PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests -p test_serve_public.py
 python3.11 scripts/acceptance_providers.py --binary server/target/debug/nabedra-db
 ```
 

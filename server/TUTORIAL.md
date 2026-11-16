@@ -15,8 +15,8 @@ You need Python 3.11 or newer, Rust 1.94.1 or newer with Cargo, and access to an
 existing S3 general purpose bucket. There is no local disk storage mode in v0.
 
 ```sh
-python3.11 -m venv orm/.venv
-orm/.venv/bin/python -m pip install -e ./orm
+python3.11 -m venv orm/python/.venv
+orm/python/.venv/bin/python -m pip install -e ./orm/python
 
 export CARGO_BUILD_JOBS=2
 export CARGO_PROFILE_DEV_DEBUG=0
@@ -40,7 +40,7 @@ project rename:
 export AWS_PROFILE='<your-configured-profile>'
 export AWS_REGION='us-east-1'
 export NABEDRA_S3_BUCKET='meshdb-testing'
-export NABEDRA_S3_PREFIX="test-001-tutorial-$(orm/.venv/bin/python -c 'import uuid; print(uuid.uuid4().hex)')/"
+export NABEDRA_S3_PREFIX="test-001-tutorial-$(orm/python/.venv/bin/python -c 'import uuid; print(uuid.uuid4().hex)')/"
 ```
 
 Replace the profile placeholder. Supply `NABEDRA_TOKEN` privately in both
@@ -61,12 +61,12 @@ case-insensitive: `B`, `KB`, `MB`, `KiB`, `MiB`. Whitespace is optional, and the
 quantity must be a positive integer. `64kb`, `'64 Kb'` and `64KiB` are valid.
 SI units use 1000 and IEC units use 1024. The default and hard maximum are
 64 MiB, or 67,108,864 bytes; `64MiB` and `67108864B` are accepted. See the
-[server guide](server/README.md#configuration) for worker dispatch details.
+[server guide](docs/reference.md#configuration) for worker dispatch details.
 
 The server does not load the repository `.env` automatically. That file uses
 `BUCKET_NAME`, while the server requires `NABEDRA_S3_BUCKET`. Do not source or
 print the supplied credential file. See the [server configuration
-guide](server/README.md#configuration) for other deployment settings.
+guide](docs/reference.md#configuration) for other deployment settings.
 
 In terminal 2, check that the server can answer requests and read its catalog:
 
@@ -84,7 +84,7 @@ In terminal 2, confirm that the same token is set and open Python:
 
 ```sh
 : "${NABEDRA_TOKEN:?Set the same bearer token as the server}"
-orm/.venv/bin/python
+orm/python/.venv/bin/python
 ```
 
 Paste the following Python blocks into this same session, in order:
@@ -256,7 +256,7 @@ may still commit. Inspect and reconcile the intended change before deciding
 whether to write again. An immediate read showing old data does not prove
 rollback. The client never retries automatically, and request IDs do not
 deduplicate writes. See [errors and uncertain
-writes](orm/README.md#errors-and-uncertain-writes).
+writes](../orm/python/docs/reference.md#errors-and-uncertain-writes).
 
 Keyed operations route to one partition. Queries scan partitions on the workers
 and combine results with global ordering, key tie-breaking, limit, projection
@@ -291,8 +291,8 @@ Drop retains the Parquet snapshots in S3. There is no garbage collection in v0.
 After a drop, existing handles raise `NotFoundError`. Recreating the same name
 produces a new table ID, so obtain a new handle before using it.
 
-For a remote deployment, configure [native HTTPS](server/README.md#configuration)
+For a remote deployment, configure [native HTTPS](docs/reference.md#configuration)
 and connect with an `https://` URL. The client verifies certificates and
 hostnames; a private CA can be supplied with `Database(url=..., ca_file="/path/to/ca.pem")`.
-The [Python API guide](orm/README.md) covers the full method contracts, and the
-[server guide](server/README.md) covers deployment and operation settings.
+The [Python API guide](../orm/python/docs/reference.md) covers the full method contracts, and the
+[server guide](docs/reference.md) covers deployment and operation settings.

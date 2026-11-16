@@ -32,7 +32,7 @@ def main(argv=None):
             target = root / 'server' / target
         binary = target / 'release' / 'nabedra-db'
         venv.EnvBuilder(with_pip=True).create(prefix)
-        subprocess.run([str(prefix / 'bin' / 'python'), '-m', 'pip', 'install', str(root / 'orm')], check=True)
+        subprocess.run([str(prefix / 'bin' / 'python'), '-m', 'pip', 'install', str(root / 'orm' / 'python')], check=True)
         shutil.copy2(binary, prefix / 'bin' / 'nabedra-db')
         subprocess.run([str(prefix / 'bin' / 'nabedra'), '--version', '--json'], check=True)
     except (OSError, subprocess.CalledProcessError):

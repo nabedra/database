@@ -1,10 +1,10 @@
 Nabedra Database should install from this repository and let one shared cluster execute client-defined operations after a Python server endpoint adds authorized storage credentials.
 
-Status: approved and implemented, 2026-11-16. Package uploads and registry releases remain deferred. The gateway is framework independent and accepts plain HTTP data. The [usage guide](../docs/cli-and-serverless.md) records the implemented interfaces; the [execution ledger](../docs/testing/cli-serverless-evidence.md) distinguishes executed assertions from remaining acceptance boundaries. Final release installation and the listed installed S3 assertions passed; remaining acceptance boundaries are recorded in the execution ledger.
+Status: approved and implemented, 2026-11-16. Package uploads and registry releases remain deferred. The gateway is framework independent and accepts plain HTTP data. The [usage guide](../server/docs/cli-and-serverless.md) records the implemented interfaces; the [execution ledger](../docs/testing/cli-serverless-evidence.md) distinguishes executed assertions from remaining acceptance boundaries. Final release installation and the listed installed S3 assertions passed; remaining acceptance boundaries are recorded in the execution ledger.
 
 Use two modes: `fixed` binds compute to one database; `serverless` accepts database context supplied by a trusted server endpoint. An S3 bucket and prefix identify a database containing multiple tables. Applications A and B share compute while their catalogs and tables remain separate. Workers stay running by default; automatic scale-to-zero is outside this proposal.
 
-The original Python CLI only launched workers and needed a separately built Rust binary. This implementation extends [that entry point](../orm/src/nabedra/cli.py), preserves the [public Python supervisor](../orm/src/nabedra/serve.py), and adds S3 selection and request-scoped data grants to [distributed workers](../server/src/node/runtime.rs). Fixed mode retains operator credential discovery; serverless data access uses explicit gateway snapshots.
+The original Python CLI only launched workers and needed a separately built Rust binary. This implementation extends [that entry point](../orm/python/src/nabedra/cli.py), preserves the [public Python supervisor](../orm/python/src/nabedra/serve.py), and adds S3 selection and request-scoped data grants to [distributed workers](../server/src/node/runtime.rs). Fixed mode retains operator credential discovery; serverless data access uses explicit gateway snapshots.
 
 ---
 
@@ -15,7 +15,7 @@ Extend the existing `nabedra` entry point. A repository installer creates an iso
 python3.11 scripts/install_nabedra.py --prefix .nabedra
 .nabedra/bin/nabedra --version
 # Install the ORM and server gateway into an application's environment:
-python -m pip install '/path/to/nabedra-database/orm[gateway]'
+python -m pip install '/path/to/nabedra-database/orm/python[gateway]'
 ```
 
 Activate `.nabedra/bin/activate` to use bare `nabedra` below. Use [regular local installs](https://pip.pypa.io/en/stable/topics/local-project-installs/) for deployments and editable installs for development. Keep the core ORM standard-library-only. The local `gateway` extra supplies HTTPX for sync/async forwarding; `aws` optionally supplies Boto3 credential discovery. The gateway imports no web framework, auto-detects no framework request types and ships no framework-specific handlers. Importing the ORM or displaying help performs no network, credential resolution or process startup.

@@ -10,7 +10,7 @@ python3.11 scripts/install_nabedra.py --prefix .nabedra
 
 The installer runs a locked release build and copies the executable into the isolated environment. It honors `CARGO_TARGET_DIR`. Startup resolves `NABEDRA_SERVER_BINARY`, the environment-local executable, then `PATH`; it never invokes Cargo. An invalid explicit override is an error. No package or image upload is required.
 
-Activate `.nabedra/bin/activate` for the commands below. Install the server integration into an application environment with `python -m pip install '/path/to/nabedra-database/orm[gateway]'`. Add `[aws]` when using Boto3 discovery. Core ORM imports and CLI help require neither dependency and resolve no credentials.
+Activate `.nabedra/bin/activate` for the commands below. Install the server integration into an application environment with `python -m pip install '/path/to/nabedra-database/orm/python[gateway]'`. Add `[aws]` when using Boto3 discovery. Core ORM imports and CLI help require neither dependency and resolve no credentials.
 
 ## Configure and run
 
@@ -124,4 +124,4 @@ docker run --rm -p 8000:8000 \
 
 Put the config and protected secret files under the mounted directory with container-readable paths. Configure a workload role for control storage, verified TLS for external API/worker links, and an explicit reachable bind/advertise address. Listeners default to loopback. Separate workers use `database worker --bootstrap /run/secrets/worker.json`. No daemonization, cloud provisioning or registry upload occurs automatically.
 
-The final release passed fresh-prefix installation and all 13 installed S3 assertions, including two enrolled workers, database isolation, replay/conflict handling, receipt authorization, signal drain and catalog migration. See the [execution ledger](testing/cli-serverless-evidence.md) for commands, failure regressions and scope. Live STS rotation, IAM revocation, worker crash recovery and full scheduler/load acceptance remain separate. The local Docker image was not built because the Docker daemon was unavailable.
+The final release passed fresh-prefix installation and all 13 installed S3 assertions, including two enrolled workers, database isolation, replay/conflict handling, receipt authorization, signal drain and catalog migration. See the [execution ledger](../../docs/testing/cli-serverless-evidence.md) for commands, failure regressions and scope. Live STS rotation, IAM revocation, worker crash recovery and full scheduler/load acceptance remain separate. The local Docker image was not built because the Docker daemon was unavailable.

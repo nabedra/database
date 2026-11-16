@@ -21,7 +21,7 @@ classifiers = [
 
 [project.urls]
 Repository = "https://github.com/zPy52/nabedra-database"
-Documentation = "https://github.com/zPy52/nabedra-database/blob/main/orm/README.md"
+Documentation = "https://github.com/zPy52/nabedra-database/blob/main/orm/python/README.md"
 Issues = "https://github.com/zPy52/nabedra-database/issues"
 
 [project.optional-dependencies]

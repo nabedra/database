@@ -19,7 +19,7 @@ from nabedra.errors import TransportError, UnknownOutcomeError
 
 def _create_test_tls(directory):
     # Resolve the repository helper independently of cwd and installed packages.
-    helper = Path(__file__).resolve().parents[2] / 'scripts' / 'test_tls_material.py'
+    helper = Path(__file__).resolve().parents[3] / 'scripts' / 'test_tls_material.py'
     name = '_nabedra_control_tls_fixture'
     spec = importlib.util.spec_from_file_location(name, helper)
     module = importlib.util.module_from_spec(spec)

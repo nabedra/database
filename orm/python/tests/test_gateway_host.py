@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest.mock import patch
 import httpx
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'scripts'))
 from gateway_host_fixture import endpoint, collect, BodyLimit, MAX_BODY
 from nabedra.gateway import Gateway, S3, AwsCredentials
 
