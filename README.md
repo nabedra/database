@@ -125,11 +125,11 @@ heterogeneous workers, drain and optional autoscaling.
 
 ## Use the Python ORM
 
-Install the client from the repository root:
+Install the client from PyPI with Python 3.11+:
 
 ```sh
 python3.11 -m venv orm/.venv
-orm/.venv/bin/python -m pip install -e ./orm
+orm/.venv/bin/python -m pip install "nabedra[database]"
 ```
 
 With the server at `http://127.0.0.1:8000`, supply its bearer token privately in
@@ -154,7 +154,9 @@ rows = users.where(col("age") >= 18).select("id", "age").collect()
 assert rows == [{"id": "alice", "age": 24}]
 ```
 
-The Python distribution is `nabedra-database`; import it as `nabedra`.
+The Python distribution is `nabedra`; import it as `nabedra`. The `database`
+extra selects the dependency-free ORM. For development, install the checkout
+with `orm/.venv/bin/python -m pip install -e ./orm`.
 `Database(url=..., mode="oltp")` also accepts `mode="olap"`. The mode is a
 validated client workload preference; both modes currently use the same engine.
 Pass `token=...` explicitly or let the client read `NABEDRA_TOKEN`. Construction

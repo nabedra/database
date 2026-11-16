@@ -70,7 +70,7 @@ class PackageCommandTests(unittest.TestCase):
     def test_distribution_and_console_entrypoint(self):
         manifest = Path(__file__).resolve().parents[1] / 'pyproject.toml'
         project = tomllib.loads(manifest.read_text())['project']
-        self.assertEqual(project['name'], 'nabedra-database')
+        self.assertEqual(project['name'], 'nabedra')
         self.assertEqual(project['scripts'], {'nabedra': 'nabedra.cli:main'})
         self.assertTrue(callable(cli.main))
 

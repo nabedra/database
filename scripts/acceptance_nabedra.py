@@ -37,7 +37,7 @@ import nabedra
 
 url, token, phase = sys.argv[1:]
 installed = bool(os.environ.get('NABEDRA_CHECK_INSTALLED'))
-version = importlib.metadata.version('nabedra-database') if installed else 'source checkout'
+version = importlib.metadata.version('nabedra') if installed else 'source checkout'
 if installed:
     assert version
     assert Path(nabedra.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
@@ -68,7 +68,7 @@ if phase == 'create':
 olap = Database(url=url, mode='olap', token=token, timeout=10)
 for size, rows in rows_by_size.items():
     assert olap.table('smoke_' + str(size)).query().collect() == rows
-print(json.dumps({'phase': phase, 'distribution': 'nabedra-database',
+print(json.dumps({'phase': phase, 'distribution': 'nabedra',
                   'import': 'nabedra', 'package_version': version,
                   'python_version': sys.version.split()[0],
                   'installed_prefix_verified': installed, 'row_counts': list(rows_by_size),
