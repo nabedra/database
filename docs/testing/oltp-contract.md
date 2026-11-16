@@ -45,6 +45,8 @@ O05/F03 native-cancellation regression: pause a native operation after dispatch,
 
 O11/O16 snapshot-activation regression: corrupt the incoming header's applied position or membership relative to its staged body, and attempt stale activation during a state transition. Reject before changing the active generation. Existing rows, unrelated group keys and the prior snapshot remain intact. Check under the same ownership boundary that commits activation.
 
+O10/O29 unreadable-proof regression: commit an identified mutation, then make its stored decision encoding or namespace unreadable. Lookup and same-identity replay must report an unknown outcome, without changing the write sequence, recomputing the operation or generating another table UUID. Keep ordinary pre-publication validation certainty separate. Label corrupted-encoding models separately from actual native storage fault injection.
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |

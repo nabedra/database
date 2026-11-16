@@ -67,9 +67,13 @@ O22/C07's deterministic writer test holds only asynchronous writer ownership whi
 
 The initial OLAP run found an inaccessible tuple field after extracting shared storage types, which was corrected to use the existing accessor. Its startup assertion then required the intentional new engine suffix in `--version`. The corrected startup target and remaining storage/worker-pool targets passed, and the later full matrix supersedes that earlier composite evidence. The ignored live-S3 fixture remains unexecuted. [Initial output](evidence/oltp/packaging/default-initial.log), [corrected targets](evidence/oltp/packaging/default-final-targets.log), and [feature guard output](evidence/oltp/packaging/feature-compile-guards.log) retain the observed failures and passes.
 
-## Pending evidence
+## Decision-proof correction
 
-Known follow-up at this measured snapshot: native read/namespace errors or corrupt JSON while looking up an existing mutation decision already prevent recomputation, but currently classify proof unavailability as `not_applied`. O10/O29 require `unknown` for those paths. A narrow correction and corrupt-decision regression are queued immediately after the immutable checkpoint; the current results do not establish that case. Ordinary pre-publication schema/row validation certainty is a different path.
+The follow-up correction returns `OutcomeUnknown/Unknown` when an existing mutation's namespace, native read or stored decision JSON cannot be read. The O10/O29 regression commits a table, corrupts the persisted proof encoding, then verifies lookup and replay remain unknown without another write, another UUID or changed table metadata. It also checks corrupt namespace lookup. Pure-read errors retain their separate certainty path. This models invalid proof encoding, not native fsync or SST checksum failure.
+
+The [follow-up library run](evidence/oltp/decision-proof-fix/library.log) passed 78 assertions in 18.82 seconds, including the new regression and in-progress identity/proof helper tests. Its [provenance](evidence/oltp/decision-proof-fix/library-provenance.json) verifies unchanged source SHA-256 `1e8acef80ae5f69fb742ecd808145f9348a5ecfeb396a0b68ba27059e5a98e9e` during execution and records the corrected module's hash. The [scope notes](evidence/oltp/decision-proof-fix/README.md) distinguish this working tree from the isolated fix commit and earlier checkpoint. Identity-stage Clippy passed before later private proof helpers were added; those unfinished helpers are not represented as a current whole-tree lint pass.
+
+## Pending evidence
 
 The single-group consensus dependency spike still logs deterministic application operations. Its local ordered-fence tests do not establish the target rule that cold start applies only prepared committed state without reevaluating abandoned user operations. P4/P5's typed prepare/decision/resolution implementation and its multi-shard/cold-start assertions remain required before production remote execution.
 

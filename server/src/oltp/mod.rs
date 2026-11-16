@@ -589,10 +589,10 @@ impl OltpEngine {
         let engine = self.clone();
         self.blocking(move || {
             let snapshot = engine.inner.db.snapshot();
-            let namespace = active_namespace(&snapshot)?;
+            let namespace = active_namespace(&snapshot).map_err(|_| decision_unknown())?;
             let bytes = snapshot
                 .get(namespace.decision(id))
-                .map_err(storage_error)?;
+                .map_err(|_| decision_unknown())?;
             engine.observed_decision(bytes)
         })
         .await
@@ -672,13 +672,19 @@ impl OltpEngine {
         }
         let _guard = self.writer();
         let snapshot = self.inner.db.snapshot();
-        let namespace = active_namespace(&snapshot)?;
+        let namespace = active_namespace(&snapshot).map_err(|error| {
+            if identity.is_some() {
+                decision_unknown()
+            } else {
+                error
+            }
+        })?;
         if let Some((id, digest, _)) = &identity
             && let Some(bytes) = self
                 .inner
                 .db
                 .get(namespace.decision(*id))
-                .map_err(storage_error)?
+                .map_err(|_| decision_unknown())?
         {
             let decision = decode_decision(&bytes)?;
             return if &decision.digest == digest {
@@ -1067,8 +1073,7 @@ fn resolve(
 }
 
 fn decode_decision(bytes: &[u8]) -> Result<DurableDecision, ProtocolError> {
-    serde_json::from_slice(bytes)
-        .map_err(|_| failure(ErrorCode::StorageUnavailable, "invalid durable decision"))
+    serde_json::from_slice(bytes).map_err(|_| decision_unknown())
 }
 
 fn encode(value: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
@@ -1243,6 +1248,14 @@ fn recovery_unknown() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::OutcomeUnknown,
         "OLTP storage requires reopening after an uncertain native write",
+        Outcome::Unknown,
+    )
+}
+
+fn decision_unknown() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "durable mutation decision cannot be read; outcome requires reconciliation",
         Outcome::Unknown,
     )
 }
@@ -1890,5 +1903,89 @@ mod tests {
             "C01 native capacity: configured_foreground={JOBS}, entered={entered}, unique_thread_ids={}, active_before_release={active_at_barrier}",
             threads.len()
         );
+    }
+
+    #[tokio::test]
+    async fn o10_o29_unreadable_decision_proof_remains_unknown_without_reapplying() {
+        let dir = TestDir::new();
+        let engine = OltpEngine::open(&dir.0, OltpResources::default()).unwrap();
+        let request = Request {
+            request_id: Uuid::new_v4(),
+            operation: operation(
+                "table.create",
+                json!({"name":"committed","schema":{"id":"int64"},"key":"id","format":"parquet"}),
+            ),
+        };
+        let digest = "a".repeat(64);
+        let run = Uuid::new_v4();
+        let committed = engine
+            .execute_identified(request.clone(), digest.clone(), run)
+            .await
+            .unwrap();
+        let namespace = active_namespace(&engine.inner.db.snapshot()).unwrap();
+        // Model invalid persisted proof encoding. This does not inject an SST
+        // checksum failure or claim a native disk-corruption fault fixture.
+        engine
+            .inner
+            .db
+            .put_opt(
+                namespace.decision(request.request_id),
+                b"invalid decision JSON",
+                &sync_options(),
+            )
+            .unwrap();
+        let sequence = engine.inner.db.latest_sequence_number();
+        for error in [
+            engine
+                .lookup_decision(request.request_id)
+                .await
+                .unwrap_err(),
+            engine
+                .execute_identified(request.clone(), digest.clone(), run)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+            assert_eq!(error.outcome, Outcome::Unknown);
+        }
+        assert_eq!(engine.inner.db.latest_sequence_number(), sequence);
+        assert_eq!(
+            engine
+                .execute(operation("table.describe", json!({"name":"committed"})))
+                .await
+                .unwrap(),
+            committed
+        );
+        // An unreadable namespace also makes an old decision unavailable. It
+        // must not turn replay uncertainty into a not_applied classification.
+        engine
+            .inner
+            .db
+            .put_opt(codec::ACTIVE, [0_u8], &sync_options())
+            .unwrap();
+        let sequence = engine.inner.db.latest_sequence_number();
+        assert_eq!(
+            engine
+                .lookup_decision(request.request_id)
+                .await
+                .unwrap_err()
+                .outcome,
+            Outcome::Unknown
+        );
+        assert_eq!(
+            engine
+                .execute_identified(request, digest, run)
+                .await
+                .unwrap_err()
+                .outcome,
+            Outcome::Unknown
+        );
+        let read_error = engine
+            .execute(operation("table.list", json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(read_error.code, ErrorCode::StorageUnavailable);
+        assert_eq!(read_error.outcome, Outcome::NotApplied);
+        assert_eq!(engine.inner.db.latest_sequence_number(), sequence);
     }
 }

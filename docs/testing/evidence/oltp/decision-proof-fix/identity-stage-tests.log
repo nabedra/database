@@ -1,0 +1,11 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 24.10s
+     Running unittests src/lib.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/nabedra_database_server-78a7c74a9dd6b50c)
+
+running 3 tests
+test oltp_replication::types::tests::o06_permanent_membership_excludes_duplicate_physical_voters ... ok
+test oltp_replication::types::tests::u02_digest_has_one_canonical_fixed_size_representation ... ok
+test oltp_replication::types::tests::u02_fields_and_pages_reject_excess_before_decoding_more_items ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 0.00s
+
