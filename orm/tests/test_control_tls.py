@@ -12,15 +12,15 @@ import unittest
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from meshdb._control_transport import _ControlTransport
-from meshdb.client import _Transport
-from meshdb.errors import TransportError, UnknownOutcomeError
+from nabedra._control_transport import _ControlTransport
+from nabedra.client import _Transport
+from nabedra.errors import TransportError, UnknownOutcomeError
 
 
 def _create_test_tls(directory):
     # Resolve the repository helper independently of cwd and installed packages.
     helper = Path(__file__).resolve().parents[2] / 'scripts' / 'test_tls_material.py'
-    name = '_meshdb_control_tls_fixture'
+    name = '_nabedra_control_tls_fixture'
     spec = importlib.util.spec_from_file_location(name, helper)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -57,7 +57,7 @@ class _TLSServer(HTTPServer):
 
 class TransportTLSTests(unittest.TestCase):
     def test_data_transport_trust_is_private_and_untrusted_calls_deliver_nothing(self):
-        with tempfile.TemporaryDirectory(prefix='meshdb-data-tls-') as directory:
+        with tempfile.TemporaryDirectory(prefix='nabedra-data-tls-') as directory:
             material = _create_test_tls(Path(directory) / 'tls')
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(material.server_cert, material.server_key)
@@ -77,7 +77,7 @@ class TransportTLSTests(unittest.TestCase):
                     pass
 
             server = _TLSServer(context, Handler)
-            thread = threading.Thread(target=server.serve_forever, name='meshdb-test-data-https')
+            thread = threading.Thread(target=server.serve_forever, name='nabedra-test-data-https')
             thread.start()
             try:
                 url = f'https://127.0.0.1:{server.server_port}/data/'
@@ -107,7 +107,7 @@ class TransportTLSTests(unittest.TestCase):
                 server.server_close()
 
     def test_verified_policy_then_untrusted_handshake_is_pre_send(self):
-        temporary = tempfile.TemporaryDirectory(prefix='meshdb-control-tls-')
+        temporary = tempfile.TemporaryDirectory(prefix='nabedra-control-tls-')
         self.addCleanup(temporary.cleanup)
         material = _create_test_tls(Path(temporary.name) / 'tls')
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -133,7 +133,7 @@ class TransportTLSTests(unittest.TestCase):
 
         server = _TLSServer(context, Handler)
         self.addCleanup(server.server_close)
-        thread = threading.Thread(target=server.serve_forever, name='meshdb-test-https')
+        thread = threading.Thread(target=server.serve_forever, name='nabedra-test-https')
         thread.start()
 
         def stop_server():

@@ -68,8 +68,8 @@ class _CallbackBridge:
             self.url = f'http://127.0.0.1:{port}/private/v1/callback'
             _CallbackPool(callbacks, authorize_token, _register_owner=self._retain_pool)
             for index in range(8):
-                self._start(self._run, f'meshdb-callback-http-{index}')
-            self._start(self._accept, 'meshdb-callback-accept')
+                self._start(self._run, f'nabedra-callback-http-{index}')
+            self._start(self._accept, 'nabedra-callback-accept')
         except BaseException:
             failed = True
         if failed:

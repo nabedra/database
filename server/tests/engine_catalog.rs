@@ -1,5 +1,5 @@
-use meshdb_server::{engine::Engine, protocol, snapshot, storage};
-use meshdb_server::{
+use nabedra_database_server::{engine::Engine, protocol, snapshot, storage};
+use nabedra_database_server::{
     partition_size::PartitionSize,
     worker_pool::{WorkerPool, WorkerThreads},
 };

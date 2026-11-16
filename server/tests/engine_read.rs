@@ -1,5 +1,5 @@
-use meshdb_server::{engine::Engine, protocol, snapshot, storage};
-use meshdb_server::{
+use nabedra_database_server::{engine::Engine, protocol, snapshot, storage};
+use nabedra_database_server::{
     partition_size::PartitionSize,
     worker_pool::{WorkerPool, WorkerThreads},
 };
@@ -118,7 +118,7 @@ async fn publish(engine: &Engine<Backend>, table: &TableDescriptor, rows: &[Row]
         .unwrap();
 }
 async fn publish_partitioned(engine: &Engine<Backend>, table: &TableDescriptor, rows: &[Row]) {
-    use meshdb_server::{
+    use nabedra_database_server::{
         commit::PendingObject,
         storage::{KeyRange, PartitionFile, TableData},
     };
@@ -241,7 +241,7 @@ async fn mixed_get_composed_query_count_and_metadata_explain() {
             .last()
             .unwrap()
             .2
-            .starts_with("meshdb-worker-")
+            .starts_with("nabedra-worker-")
     );
     let mut payload = all(&table);
     payload.query = serde_json::from_value(serde_json::json!({
@@ -585,7 +585,7 @@ async fn partition_workers_capture_across_drop_and_drain_after_error() {
         assert!(
             threads
                 .iter()
-                .all(|(_, _, name)| !name.starts_with("meshdb-worker-"))
+                .all(|(_, _, name)| !name.starts_with("nabedra-worker-"))
         );
         let usage = engine.worker_pool().scheduler().usage();
         assert_eq!(usage[0].1, 0, "downloads must not consume CPU slots");

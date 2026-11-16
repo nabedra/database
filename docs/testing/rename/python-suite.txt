@@ -1,0 +1,9 @@
+Final renamed Python package suite
+Python 3.11.10
+Command: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests -q
+
+Executing <Task pending name='Task-2' coro=<AsyncGatewayTests.test_GW03_context_isolation_sync_bridge_and_cancel() running at $CHECKOUT/orm/tests/test_gateway.py:203> wait_for=<Future pending cb=[Task.task_wakeup()] created at /usr/local/Cellar/python@3.11/3.11.10/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py:428> cb=[_run_until_complete_cb() at /usr/local/Cellar/python@3.11/3.11.10/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/base_events.py:181] created at /usr/local/Cellar/python@3.11/3.11.10/Frameworks/Python.framework/Versions/3.11/lib/python3.11/asyncio/runners.py:100> took 0.237 seconds
+----------------------------------------------------------------------
+Ran 177 tests in 70.012s
+
+OK

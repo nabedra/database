@@ -85,7 +85,7 @@ impl Spool {
     pub fn new(parent: impl AsRef<Path>, limits: SpoolLimits) -> Result<Self, SpoolError> {
         let path = parent
             .as_ref()
-            .join(format!("meshdb-spool-{}", Uuid::new_v4()));
+            .join(format!("nabedra-spool-{}", Uuid::new_v4()));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn write_error_keeps_attempted_bytes_charged_and_poisons_until_drop() {
-        let parent = std::env::temp_dir().join(format!("meshdb-spool-fault-{}", Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("nabedra-spool-fault-{}", Uuid::new_v4()));
         fs::create_dir(&parent).unwrap();
         let limits = SpoolLimits::new(5, 2).unwrap();
         let spool = Spool::new(&parent, limits).unwrap();

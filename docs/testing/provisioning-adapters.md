@@ -20,20 +20,20 @@ The public Python entry point accepts synchronous callbacks:
 
 ```python
 from pathlib import Path
-from meshdb import KubernetesProvider, serve
+from nabedra import KubernetesProvider, serve
 
 provider = KubernetesProvider(
     api_url="https://kubernetes.example:6443",
     token=Path("/run/secrets/kubernetes-token").read_text().strip(),
     ca_file="/run/secrets/kubernetes-ca.pem",
-    namespace="meshdb-workers",
+    namespace="nabedra-workers",
     cluster_id="12345678-1234-4234-8234-123456789abc",
-    image="registry.example/meshdb-worker:tested-version",
+    image="registry.example/nabedra-worker:tested-version",
     pod_spec={
-        "serviceAccountName": "meshdb-worker",
-        "volumes": [{"name": "credentials", "secret": {"secretName": "meshdb-storage-auth"}}],
+        "serviceAccountName": "nabedra-worker",
+        "volumes": [{"name": "credentials", "secret": {"secretName": "nabedra-storage-auth"}}],
     },
-    volume_mounts=[{"name": "credentials", "mountPath": "/run/meshdb-auth", "readOnly": True}],
+    volume_mounts=[{"name": "credentials", "mountPath": "/run/nabedra-auth", "readOnly": True}],
 )
 serve(
     "Production",
@@ -44,7 +44,7 @@ serve(
 )
 ```
 
-`MESHDB_CONFIG` names an explicit API configuration file, and `MESHDB_SERVER_BINARY` can name its separately built executable. The cluster UUID must match that configuration. The worker template must listen on a nonzero Pod-reachable port, for example `0.0.0.0:8001`. The image needs `python3` and `meshdb-server` on PATH. The adapter mounts a bootstrap Secret read-only and uses the Pod IP from Kubernetes' downward API to produce the worker's advertised address. API and object-store URLs must be reachable from Pods. Token and TLS file paths in the worker template must exist in the image or configured Pod mounts. The adapter reserves its worker container and bootstrap volume. Additional credential volumes and mounts are explicit constructor inputs.
+`NABEDRA_CONFIG` names an explicit API configuration file, and `NABEDRA_SERVER_BINARY` can name its separately built executable. The cluster UUID must match that configuration. The worker template must listen on a nonzero Pod-reachable port, for example `0.0.0.0:8001`. The image needs `python3` and `nabedra-database-server` on PATH. The adapter mounts a bootstrap Secret read-only and uses the Pod IP from Kubernetes' downward API to produce the worker's advertised address. API and object-store URLs must be reachable from Pods. Token and TLS file paths in the worker template must exist in the image or configured Pod mounts. The adapter reserves its worker container and bootstrap volume. Additional credential volumes and mounts are explicit constructor inputs.
 
 `nodes=3` maintains three provider workers. `nodes=(1, 4)` allows a desired count between those bounds. Sustained outstanding request age raises desired capacity by one; an empty queue must remain idle for the configured stabilization interval before it lowers desired capacity by one. Cooldown and provider failure backoff suppress repeated actions. Queue age is conservatively measured from the current queue holder's first observation, so recovery can delay a scale-up. Explicit fixed/manual operation has no callback bridge and rejects autoscaling without an adapter, preserving A01.
 
@@ -57,8 +57,8 @@ The adapter requires namespace-scoped permission to get/list/create/update Secre
 Cluster administration uses the separate admin credential:
 
 ```python
-from meshdb import Cluster
-cluster = Cluster("https://meshdb-api.example", admin_token)
+from nabedra import Cluster
+cluster = Cluster("https://nabedra-api.example", admin_token)
 status = cluster.status()
 cluster.scale(3, wait=True)
 cluster.autoscale(min_nodes=1, max_nodes=4)
@@ -71,7 +71,7 @@ Run local protocol and lifecycle evidence with:
 ```sh
 PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests -p test_providers.py
 PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests -p test_serve_public.py
-python3.11 scripts/acceptance_providers.py --binary server/target/debug/meshdb-server
+python3.11 scripts/acceptance_providers.py --binary server/target/debug/nabedra-database-server
 ```
 
 The process fixture exercises A01/A02 using real API and worker TCP processes and the configured callback bridge. It gates execution, raises capacity from one to two workers, injects an inventory failure, accepts new work while a proof-authorized stop waits, removes its worker, and checks all accepted identities and committed data. It also exercises the public admin policy/status API, request replay/conflict/authentication, explicit scale-to-zero and fresh-run restart, and a fixed/manual API that rejects autoscaling. The provider unit fixture separately exercises Kubernetes object versions, idempotent launch, lost creation replies, ownership mismatches, UID replacement and asynchronous deletion. These local assertions do not establish Kubernetes networking, RBAC, certificate mounting or lifecycle behavior in real infrastructure. No live Kubernetes or AWS acceptance has been executed by this change; AWS has no bundled adapter.

@@ -27,9 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'src'))
 from acceptance_support import load_config
 from acceptance_nodes import announcement
 from gateway_host_fixture import endpoint
-from meshdb.gateway import Gateway, S3, AwsCredentials
-from meshdb._cli_config import example, protected_write
-from meshdb._control_transport import _ControlTransport
+from nabedra.gateway import Gateway, S3, AwsCredentials
+from nabedra._cli_config import example, protected_write
+from nabedra._control_transport import _ControlTransport
 import httpx
 
 
@@ -134,7 +134,7 @@ class S3Probe:
 class NativeCluster:
     def __init__(self, args, config, namespace, root):
         self.root, self.process = root, None
-        self.cli = [args.cli] if args.cli else [sys.executable, '-m', 'meshdb.cli']
+        self.cli = [args.cli] if args.cli else [sys.executable, '-m', 'nabedra.cli']
         self.binary = str(Path(args.binary).resolve())
         self.auth = {name: secrets.token_urlsafe(32) for name in ('admin_token','data_token','enrollment_token')}
         auth = root / 'auth.json'; protected_write(auth, self.auth)
@@ -155,7 +155,7 @@ class NativeCluster:
         cargo.write_text('#!'+sys.executable+'\nfrom pathlib import Path\nPath('+repr(str(self.marker))+').touch()\nraise SystemExit(99)\n')
         cargo.chmod(0o700)
         self.env = config.server_env(namespace)
-        self.env.update(PATH=str(trap)+os.pathsep+os.defpath, MESHDB_SERVER_BINARY=self.binary)
+        self.env.update(PATH=str(trap)+os.pathsep+os.defpath, NABEDRA_SERVER_BINARY=self.binary)
         if not args.cli:
             self.env['PYTHONPATH']=str(Path(__file__).resolve().parents[1] / 'orm' / 'src')
         self.pids = []
@@ -172,13 +172,13 @@ class NativeCluster:
                 if len(parts:=line.split())==2 and int(parts[1])==self.process.pid]
 
     def start(self, report):
-        self.process = subprocess.Popen([*self.cli,'serve','--config',str(self.path),
+        self.process = subprocess.Popen([*self.cli,'database','serve','--config',str(self.path),
             '--local-workers','2','--threads-per-worker','2'], env=self.env,
             stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
         report['enrollment_step']='announcement'
         message=announcement(self.process)
-        report['announcement_check']={'event_matches':message.get('event')=='meshdb.serve.launched','url_matches':message.get('bound_url')==self.url}
-        check(message.get('event')=='meshdb.serve.launched' and message.get('bound_url')==self.url)
+        report['announcement_check']={'event_matches':message.get('event')=='nabedra.serve.launched','url_matches':message.get('bound_url')==self.url}
+        check(message.get('event')=='nabedra.serve.launched' and message.get('bound_url')==self.url)
         self.pids=self.children()
         report['enrollment_step']='owned_process_count'
         report['owned_process_count']=len(self.pids)
@@ -282,7 +282,7 @@ def run(args, report):
     credentials=AwsCredentials(private['AWS_ACCESS_KEY_ID'],private['AWS_SECRET_ACCESS_KEY'],
         session_token=private.get('AWS_SESSION_TOKEN'))
     forbidden=[v.encode() for k,v in private.items() if k in ('AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_SESSION_TOKEN')]
-    with tempfile.TemporaryDirectory(prefix='meshdb-serverless-s3-') as directory:
+    with tempfile.TemporaryDirectory(prefix='nabedra-database-serverless-s3-') as directory:
         root=Path(directory); probe=S3Probe(config,namespace,root)
         cluster=NativeCluster(args,config,namespace,root)
         phase('native-cli-versions')
@@ -303,10 +303,10 @@ from pathlib import Path
 def blocked(*args,**kwargs): raise AssertionError('network forbidden during import')
 socket.socket.connect=blocked
 socket.getaddrinfo=blocked
-import meshdb
-from meshdb.aws import default_credentials
+import nabedra
+from nabedra.aws import default_credentials
 assert callable(default_credentials())
-assert Path(meshdb.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+assert Path(nabedra.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 assert all(importlib.util.find_spec(name) is None for name in ('httpx','boto3','flask','django','fastapi','starlette'))
 print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent':True,'network_blocked':True}))
 """
@@ -318,7 +318,7 @@ print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent
         if args.smoke_only:
             phase('native-smoke-doctor')
             before=probe.snapshot('control')
-            doctor=cluster.command(['doctor','--config',str(cluster.path),'--json'])
+            doctor=cluster.command(['database','doctor','--config',str(cluster.path),'--json'])
             check(doctor.returncode==0 and json.loads(doctor.stdout)['storage_write']=='unverified')
             check(before==probe.snapshot('control') and not cluster.marker.exists())
             passed('native_s3_doctor_fresh_control_no_observed_changes_no_cargo')
@@ -357,7 +357,7 @@ print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent
             contexts.append(selector)
         try:
             cluster.start(report); passed('native_shared_api_two_enrolled_worker_processes')
-            with Gateway(cluster_url=cluster.url,token=cluster.auth['data_token'],mount_path='/meshdb',timeout=60,_transport=ObservedTransport(report)) as gateway:
+            with Gateway(cluster_url=cluster.url,token=cluster.auth['data_token'],mount_path='/nabedra',timeout=60,_transport=ObservedTransport(report)) as gateway:
                 gateway.middleware(attach)
                 def host(method,path,headers,body):
                     response=gateway.handle(method=method,path=path,headers=headers,body=body)
@@ -369,8 +369,8 @@ print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent
                             parsed=json.loads(body)
                             request_ids.add(parsed['request_id'])
                             report['last_operation']=parsed['operation']
-                        response=client.request('GET' if body is None else 'POST',public+'/meshdb'+path,
-                            headers={'Authorization':'Bearer fixture-app','X-MeshDB-Database':db,'Content-Type':'application/json'},content=body)
+                        response=client.request('GET' if body is None else 'POST',public+'/nabedra'+path,
+                            headers={'Authorization':'Bearer fixture-app','X-Nabedra-Database':db,'Content-Type':'application/json'},content=body)
                         check(len(response.content)<=8*1024*1024)
                         value=json.loads(response.content)
                         code=(value.get('error') or {}).get('code') if isinstance(value,dict) else None
@@ -473,7 +473,7 @@ print(json.dumps({'isolated_installed_import':True,'optional_dependencies_absent
         passed('native_cli_signal_drain_reap_no_cargo_startup')
         phase('doctor-read-only')
         before=probe.snapshot('control')
-        doctor=cluster.command(['doctor','--config',str(cluster.path),'--json'])
+        doctor=cluster.command(['database','doctor','--config',str(cluster.path),'--json'])
         check(doctor.returncode==0 and json.loads(doctor.stdout)['storage_write']=='unverified')
         check(before==probe.snapshot('control'))
         passed('native_s3_doctor_no_observed_object_changes_write_permission_unverified')
@@ -498,7 +498,7 @@ def main():
     parser.add_argument('--env-file',required=True,help='explicit private dotenv path; never printed')
     parser.add_argument('--binary',required=True)
     parser.add_argument('--smoke-only',action='store_true',help='version/help/read-only doctor only; no native services or S3 writes')
-    parser.add_argument('--cli',help='optional installed meshdb executable')
+    parser.add_argument('--cli',help='optional installed nabedra executable')
     parser.add_argument('--output',default='artifacts/cli-serverless/native-s3.json')
     args=parser.parse_args()
     report=dict(result='not_completed',phase='setup',assertions=[],cleanup='not_started',

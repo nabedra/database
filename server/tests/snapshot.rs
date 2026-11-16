@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     partition_size::MAX_PARTITION_BYTES, protocol::*, snapshot::*, storage::KeyRange,
 };
 use uuid::Uuid;

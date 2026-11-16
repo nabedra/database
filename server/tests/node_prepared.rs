@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     node::{
         job::{JobEnvelope, PartMeta, ResultEnvelope},
         payload::{PreparedReceiver, PreparedResult, ValidatedPart},
@@ -29,7 +29,8 @@ struct Scratch {
 }
 impl Scratch {
     fn new() -> Self {
-        let parent = std::env::temp_dir().join(format!("meshdb-prepared-{}", uuid::Uuid::new_v4()));
+        let parent =
+            std::env::temp_dir().join(format!("nabedra-prepared-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&parent).unwrap();
         Self {
             spool: Some(
@@ -42,7 +43,7 @@ impl Scratch {
         &self,
         bytes: u64,
         files: u64,
-    ) -> std::sync::Arc<meshdb_server::node::spool::SpoolOperation> {
+    ) -> std::sync::Arc<nabedra_database_server::node::spool::SpoolOperation> {
         std::sync::Arc::new(
             self.spool
                 .as_ref()
@@ -150,9 +151,10 @@ fn independent_file_validation_failures_poison_receiver() {
             1 => meta.content_digest = "0".repeat(64),
             2 => {
                 let mut other = j.table.clone();
-                other
-                    .schema
-                    .insert("other".into(), meshdb_server::protocol::ColumnType::Int64);
+                other.schema.insert(
+                    "other".into(),
+                    nabedra_database_server::protocol::ColumnType::Int64,
+                );
                 let rows = vec![serde_json::from_value(json!({"id":1,"other":2})).unwrap()];
                 bytes = snapshot::encode(&other, &rows).unwrap();
                 meta.row_count = 1;
@@ -168,7 +170,7 @@ fn independent_file_validation_failures_poison_receiver() {
         let mut job = j.clone();
         if case == 5 {
             meta.range.lower = Some(Key::Int64(2));
-            if let meshdb_server::node::job::Task::Prepare { range, .. } = &mut job.task {
+            if let nabedra_database_server::node::job::Task::Prepare { range, .. } = &mut job.task {
                 *range = meta.range.clone();
             }
         }
@@ -261,7 +263,7 @@ fn transitions_counts_caps_and_quota_fail_closed_and_cleanup() {
 
 #[test]
 fn construction_metadata_admission_and_abandoned_attempts() {
-    use meshdb_server::node::job::{JobResult, PreparationValidator};
+    use nabedra_database_server::node::job::{JobResult, PreparationValidator};
     fn send<T: Send + 'static>() {}
     send::<PreparationValidator>();
     let s = Scratch::new();
@@ -291,7 +293,7 @@ fn construction_metadata_admission_and_abandoned_attempts() {
     }
     let mut wrong = r.clone();
     wrong.result = JobResult::Error {
-        code: meshdb_server::protocol::ErrorCode::ValidationError,
+        code: nabedra_database_server::protocol::ErrorCode::ValidationError,
         message: "safe".into(),
     };
     assert!(PreparedReceiver::new(op.clone(), &wrong, &j).is_err());

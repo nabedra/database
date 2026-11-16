@@ -1,14 +1,14 @@
 FROM rust:1.94.1-bookworm AS build
 WORKDIR /src
 COPY server/ ./server/
-RUN cargo build --manifest-path server/Cargo.toml --locked --release --bin meshdb-server
+RUN cargo build --manifest-path server/Cargo.toml --locked --release --bin nabedra-database-server
 
 FROM python:3.11-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY orm/ /opt/meshdb/orm/
-RUN python -m pip install --no-cache-dir /opt/meshdb/orm && useradd --create-home meshdb
-COPY --from=build /src/server/target/release/meshdb-server /usr/local/bin/meshdb-server
-USER meshdb
-WORKDIR /home/meshdb
-ENTRYPOINT ["meshdb"]
-CMD ["serve", "--config", "/etc/meshdb/meshdb.json"]
+COPY orm/ /opt/nabedra/orm/
+RUN python -m pip install --no-cache-dir /opt/nabedra/orm && useradd --create-home nabedra
+COPY --from=build /src/server/target/release/nabedra-database-server /usr/local/bin/nabedra-database-server
+USER nabedra
+WORKDIR /home/nabedra
+ENTRYPOINT ["nabedra"]
+CMD ["database", "serve", "--config", "/etc/nabedra/nabedra-database.json"]

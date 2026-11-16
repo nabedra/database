@@ -59,7 +59,7 @@ class _CallbackPool:
         try:
             for index in range(4):
                 thread = threading.Thread(target=self._run, args=(index,),
-                                          name=f'meshdb-callback-{index}', daemon=True)
+                                          name=f'nabedra-callback-{index}', daemon=True)
                 self._threads.append(thread)
                 thread.start()
         except BaseException:

@@ -656,8 +656,8 @@ impl Api {
         )?;
         let response = self.client.request(request, end).await?;
         let status = response.status().as_u16();
-        let signed_auth = http::one(response.headers(), "x-meshdb-auth")?.to_owned();
-        let signature = http::one(response.headers(), "x-meshdb-signature")?.to_owned();
+        let signed_auth = http::one(response.headers(), "x-nabedra-auth")?.to_owned();
+        let signature = http::one(response.headers(), "x-nabedra-signature")?.to_owned();
         let length = http::framing(response.headers(), 1024 * 1024, false)?.ok_or_else(invalid)?;
         let bytes = http::read_small(response.into_body(), length, end).await?;
         let signed = auth::verify_reply(

@@ -775,7 +775,7 @@ mod ownership_tests {
     impl Fixture {
         pub(super) fn new() -> Self {
             let key = WorkerSigningKey::new().unwrap();
-            let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+            let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/synthetic","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
             let fingerprint = Template::decode(&serde_json::to_vec(&template).unwrap())
                 .unwrap()
                 .fingerprint()
@@ -1435,7 +1435,7 @@ mod ownership_tests {
             id(5),
             "a".repeat(64)
         );
-        let mut message = b"meshdb.http-request.v1\0".to_vec();
+        let mut message = b"nabedra.http-request.v1\0".to_vec();
         message.extend_from_slice(text.as_bytes());
         let signed = verify_request(
             &hex(text.as_bytes()),

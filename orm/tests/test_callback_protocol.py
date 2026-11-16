@@ -8,9 +8,9 @@ import time
 import unittest
 from pathlib import Path
 
-_MODULE = Path(__file__).parents[1] / 'src/meshdb/_callback_protocol.py'
+_MODULE = Path(__file__).parents[1] / 'src/nabedra/_callback_protocol.py'
 if _MODULE.exists():
-    from meshdb import _callback_protocol as p
+    from nabedra import _callback_protocol as p
 else:
     p = None
 

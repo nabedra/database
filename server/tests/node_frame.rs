@@ -1,4 +1,4 @@
-use meshdb_server::node::{
+use nabedra_database_server::node::{
     frame::{FrameError, FrameKind as K, FrameReader, FrameWriter, MAX_DATA_BYTES},
     job::MAX_CONTROL_BYTES,
 };

@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     node::{
         job::{JobEnvelope, ResultEnvelope},
         payload::{decode_rows, encode_rows},
@@ -13,7 +13,7 @@ struct Scratch {
 }
 impl Scratch {
     fn new() -> Self {
-        let parent = std::env::temp_dir().join(format!("meshdb-rows-{}", uuid::Uuid::new_v4()));
+        let parent = std::env::temp_dir().join(format!("nabedra-rows-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&parent).unwrap();
         let spool = Spool::new(&parent, SpoolLimits::new(100 * 1024 * 1024, 8).unwrap()).unwrap();
         Self {
@@ -169,7 +169,8 @@ fn collect_checks_local_order_filter_keys_counts_and_constructed_controls() {
     bad_job.table.key = "missing".into();
     assert!(decode_rows(&raw(&op, text), &r, &bad_job).is_err());
     let mut bad_result = r.clone();
-    if let meshdb_server::node::job::JobResult::Collect { source_rows, .. } = &mut bad_result.result
+    if let nabedra_database_server::node::job::JobResult::Collect { source_rows, .. } =
+        &mut bad_result.result
     {
         *source_rows = 2;
     }
@@ -179,7 +180,7 @@ fn collect_checks_local_order_filter_keys_counts_and_constructed_controls() {
     let (get, mut result) = controls(false, 1, exact);
     let text = r#"[{"ok":true,"text":"","score":-0.0,"\u0069d":1}]"#;
     assert!(decode_rows(&raw(&op, text), &result, &get).is_ok());
-    if let meshdb_server::node::job::JobResult::Get {
+    if let nabedra_database_server::node::job::JobResult::Get {
         source_payload_bytes,
         ..
     } = &mut result.result
@@ -191,7 +192,7 @@ fn collect_checks_local_order_filter_keys_counts_and_constructed_controls() {
 
 #[test]
 fn empty_source_scalar_edges_and_scratch_capacity() {
-    use meshdb_server::node::job::{FileInput, JobResult, Task};
+    use nabedra_database_server::node::job::{FileInput, JobResult, Task};
     let scratch = Scratch::new();
     let op = scratch.op();
     let (mut job, mut result) = controls(true, 0, 0);

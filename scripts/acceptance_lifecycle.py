@@ -30,11 +30,11 @@ def start_server(config, namespace, binary, c, servers, label, **tls):
 
 
 def restart(config, namespace, binary, c, servers, resources):
-    from meshdb import DB
+    from nabedra import Database
 
     server = start_server(config, namespace, binary, c, servers, 'first_process_start')
     c.label = 'first_client_setup'
-    db = DB(server.api_url, server.private_token)
+    db = Database(url=server.api_url, token=server.private_token)
     table = c.table(db, 'restart_rows', {'id': str, 'value': int, 'active': bool}, 'id')
     metadata = (table.id, table.name, table.schema, table.key, table.format)
     c.equal('insert_single', lambda: table.insert(
@@ -59,7 +59,7 @@ def restart(config, namespace, binary, c, servers, resources):
     # A new process and client discover persisted state without replaying setup.
     second = start_server(config, namespace, binary, c, servers, 'second_process_start')
     c.label = 'second_client_setup'
-    fresh_db = DB(second.api_url, second.private_token)
+    fresh_db = Database(url=second.api_url, token=second.private_token)
     recovered = c.call('discover_after_restart', lambda: fresh_db.table('restart_rows'))
     c.equal('metadata_after_restart', lambda: (
         recovered.id, recovered.name, recovered.schema, recovered.key, recovered.format), metadata)
@@ -75,19 +75,19 @@ def restart(config, namespace, binary, c, servers, resources):
 
 
 def https(config, namespace, binary, c, servers, resources):
-    from meshdb import DB, TransportError
+    from nabedra import Database, TransportError
     from test_tls_material import create_test_tls
 
     c.label = 'temporary_tls_directory'
     # Explicit cleanup has no GC finalizer: retain files if exit is unconfirmed.
-    root = mkdtemp(prefix='meshdb-https-')
+    root = mkdtemp(prefix='nabedra-https-')
     resources.callback(shutil.rmtree, root)
     tls = c.call('create_test_tls', lambda: create_test_tls(Path(root) / 'tls'))
     server = start_server(config, namespace, binary, c, servers, 'https_process_start',
                           tls_cert=tls.server_cert, tls_key=tls.server_key, test_ca=tls.ca_cert)
     c.call('native_https_url', lambda: require(server.api_url.startswith('https://')))
-    db = c.call('trusted_client_with_test_ca', lambda: DB(
-        server.api_url, server.private_token, ca_file=str(tls.ca_cert)))
+    db = c.call('trusted_client_with_test_ca', lambda: Database(
+        url=server.api_url, token=server.private_token, ca_file=str(tls.ca_cert)))
     table = c.table(db, 'https_rows', {'id': str, 'value': int}, 'id')
     rows = [{'id': 'alpha', 'value': 11}, {'id': 'beta', 'value': 22}]
     c.equal('trusted_insert', lambda: table.insert_many(rows), len(rows))
@@ -96,7 +96,7 @@ def https(config, namespace, binary, c, servers, resources):
 
     def default_trust_read_fails():
         # Constructor sends nothing. Only this discovery READ may fail.
-        untrusted = DB(server.api_url, server.private_token)
+        untrusted = Database(url=server.api_url, token=server.private_token)
         try:
             untrusted.table('https_rows')
         except TransportError as error:

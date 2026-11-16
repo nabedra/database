@@ -22,7 +22,7 @@ import tracemalloc
 import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'src'))
 import httpx
-from meshdb.gateway import Gateway, S3, AwsCredentials
+from nabedra.gateway import Gateway, S3, AwsCredentials
 from gateway_host_fixture import endpoint
 
 
@@ -43,7 +43,7 @@ def benchmark(args):
     tracemalloc.start()
     with endpoint(upstream) as compute:
         # The actual upstream address is allocated by the fixture, never a caller header.
-        with Gateway(cluster_url=compute,token='fixture-compute',mount_path='/meshdb',max_concurrency=4) as gateway:
+        with Gateway(cluster_url=compute,token='fixture-compute',mount_path='/nabedra',max_concurrency=4) as gateway:
             @gateway.middleware
             def auth(ctx):
                 started=time.perf_counter()
@@ -58,7 +58,7 @@ def benchmark(args):
                     modes=['direct-http','gateway-http']; rng.shuffle(modes)
                     for mode in modes:
                         expected=[]; latencies=[]; before=len(seen); mid_before=len(middleware_ms)
-                        url=compute+'/v1/operations' if mode=='direct-http' else public+'/meshdb/v1/operations'
+                        url=compute+'/v1/operations' if mode=='direct-http' else public+'/nabedra/v1/operations'
                         count=args.warmup if rep==-1 else args.requests
                         started=time.perf_counter(); cpu=time.process_time()
                         for _ in range(count):

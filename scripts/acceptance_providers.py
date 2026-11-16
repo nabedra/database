@@ -20,9 +20,9 @@ import uuid
 from acceptance_nodes import FrontDoor, announcement, call, receive, send, target, write
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/src'))
-from meshdb._callback_bridge import _CallbackBridge
-from meshdb import ValidationError, Cluster, MeshDBError
-from meshdb._serve_args import _validate_serve_args
+from nabedra._callback_bridge import _CallbackBridge
+from nabedra import ValidationError, Cluster, NabedraError
+from nabedra._serve_args import _validate_serve_args
 
 
 class GatedForward(socketserver.BaseRequestHandler):
@@ -89,10 +89,10 @@ def run(binary, skip_zero=False):
         pass
     children, doors, channels = [], [], []
     bridge = None
-    with tempfile.TemporaryDirectory(prefix='meshdb-provider-') as directory:
+    with tempfile.TemporaryDirectory(prefix='nabedra-provider-') as directory:
         root = Path(directory)
         diagnostics = (root / 'diagnostics').open('wb')
-        env = {'PATH': os.defpath, 'MESHDB_STORE_TOKEN': 'fixture-store-token'}
+        env = {'PATH': os.defpath, 'NABEDRA_STORE_TOKEN': 'fixture-store-token'}
         release_stop = threading.Event()
         stop_entered = threading.Event()
         stopped = threading.Event()
@@ -194,7 +194,7 @@ def run(binary, skip_zero=False):
             channel.settimeout(30)
             channels.append(channel)
             api = subprocess.Popen([str(binary), 'api', '--config', str(root / 'api.json')],
-                                   env=dict(env, MESHDB_SUPERVISOR_FD=str(peer.fileno())), pass_fds=(peer.fileno(),),
+                                   env=dict(env, NABEDRA_SUPERVISOR_FD=str(peer.fileno())), pass_fds=(peer.fileno(),),
                                    stdout=diagnostics, stderr=diagnostics)
             children.append(api)
             peer.close()
@@ -316,7 +316,7 @@ def run(binary, skip_zero=False):
             manual_channel.settimeout(30)
             channels.append(manual_channel)
             manual = subprocess.Popen([str(binary), 'api', '--config', str(root / 'manual-api.json')],
-                env=dict(env, MESHDB_SUPERVISOR_FD=str(manual_peer.fileno())), pass_fds=(manual_peer.fileno(),),
+                env=dict(env, NABEDRA_SUPERVISOR_FD=str(manual_peer.fileno())), pass_fds=(manual_peer.fileno(),),
                 stdout=diagnostics, stderr=diagnostics)
             children.append(manual)
             manual_peer.close()
@@ -332,7 +332,7 @@ def run(binary, skip_zero=False):
             try:
                 manual_client.autoscale(min_nodes=1,max_nodes=2)
                 raise AssertionError('A01 real manual API invented autoscaling')
-            except MeshDBError as error:
+            except NabedraError as error:
                 assert error.code=='unsupported_capability' and error.outcome=='not_applied'
             assert manual_client.status()['counts']==dict(ready=0,starting=0,draining=0,lost=0)
             print('PASS A01/A02: public policies, configured callbacks, inventory failure retains 8 accepted IDs, 4 accepted IDs survive safe removal, committed row retained; explicit-zero=' + str(not skip_zero))
@@ -375,7 +375,7 @@ def run(binary, skip_zero=False):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'server/target/debug/meshdb-server')
+    parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'server/target/debug/nabedra-database-server')
     parser.add_argument('--skip-zero',action='store_true',help='Run the up/down provider contract without the explicit full-shutdown extension')
     args=parser.parse_args()
     run(args.binary.resolve(),skip_zero=args.skip_zero)

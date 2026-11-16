@@ -14,7 +14,7 @@ def serve(name: str, nodes: int | tuple[int, int] = 1, *, start_node=None,
           migrate_catalog: bool = False) -> None:
     """Block while the configured API runs; signals stop its owned process.
 
-    Set MESHDB_CONFIG to the explicit API config file and MESHDB_SERVER_BINARY
+    Set NABEDRA_CONFIG to the explicit API config file and NABEDRA_SERVER_BINARY
     when the executable is not on PATH. A tuple enables bounded autoscaling
     only with all three synchronous provider callbacks. cold_start abandons
     old outstanding work after fencing its run. migrate_catalog confirms the

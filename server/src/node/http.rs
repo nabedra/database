@@ -319,10 +319,10 @@ impl Signer {
             ))
             .header(header::CONNECTION, "close")
             .header(
-                "x-meshdb-auth",
+                "x-nabedra-auth",
                 hex(&a.canonical_bytes().map_err(|_| invalid())?),
             )
-            .header("x-meshdb-signature", hex(&signature));
+            .header("x-nabedra-signature", hex(&signature));
         if chunked {
             request = request
                 .header(header::TRANSFER_ENCODING, "chunked")
@@ -333,7 +333,7 @@ impl Signer {
                 .header(header::CONTENT_TYPE, "application/json");
         }
         if let Some(dependency) = a.dependency_id() {
-            request = request.header("x-meshdb-dependency", dependency.to_string());
+            request = request.header("x-nabedra-dependency", dependency.to_string());
         }
         request.body(body).map_err(|_| invalid())
     }
@@ -355,10 +355,10 @@ impl Signer {
             .status(status)
             .header(header::CONNECTION, "close")
             .header(
-                "x-meshdb-auth",
+                "x-nabedra-auth",
                 hex(&auth.canonical_bytes().map_err(|_| invalid())?),
             )
-            .header("x-meshdb-signature", hex(&signature));
+            .header("x-nabedra-signature", hex(&signature));
         if chunked {
             response = response
                 .header(header::TRANSFER_ENCODING, "chunked")
@@ -431,8 +431,8 @@ where
 fn small_response_headers(response: &Response<Body>) -> Result<(u16, String, String, usize)> {
     let status = response.status().as_u16();
     checked_status(status)?;
-    let a = one(response.headers(), "x-meshdb-auth")?.to_owned();
-    let signature = one(response.headers(), "x-meshdb-signature")?.to_owned();
+    let a = one(response.headers(), "x-nabedra-auth")?.to_owned();
+    let signature = one(response.headers(), "x-nabedra-signature")?.to_owned();
     let length =
         framing(response.headers(), crate::protocol::MAX_BODY_BYTES, false)?.ok_or_else(invalid)?;
     Ok((status, a, signature, length))

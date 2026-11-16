@@ -4,14 +4,14 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use meshdb_server::{
+use nabedra_database_server::{
     api,
     engine::Engine,
     executor::Executor,
     protocol::MAX_BODY_BYTES,
     storage::{Namespace, Storage},
 };
-use meshdb_server::{
+use nabedra_database_server::{
     partition_size::PartitionSize,
     worker_pool::{WorkerPool, WorkerThreads},
 };
@@ -160,7 +160,7 @@ async fn framing_protocol_errors_and_strict_request_ids() {
             json!(ID),
         ),
     ] {
-        let expected = meshdb_server::protocol::parse_request(body.as_bytes()).err();
+        let expected = nabedra_database_server::protocol::parse_request(body.as_bytes()).err();
         let (status, value) = json_request(app.clone(), body).await;
         assert_eq!(status.as_u16(), if code == "not_found" { 404 } else { 400 });
         error(&value, code, id);
@@ -358,7 +358,7 @@ async fn cancelled_handler_retains_mutation_and_drain_until_completion() {
             .lookup_decision_by_id(
                 &loaded,
                 uuid::Uuid::parse_str(ID).unwrap(),
-                meshdb_server::storage::HistoryBudget::new(
+                nabedra_database_server::storage::HistoryBudget::new(
                     8,
                     64 * 1024,
                     tokio::time::Instant::now() + std::time::Duration::from_secs(5),

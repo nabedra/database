@@ -221,10 +221,10 @@ impl Worker {
         {
             return Err(invalid());
         }
-        let a = http::one(request.headers(), "x-meshdb-auth")?.to_owned();
-        let signature = http::one(request.headers(), "x-meshdb-signature")?.to_owned();
-        let dependency = if request.headers().contains_key("x-meshdb-dependency") {
-            Some(http::one(request.headers(), "x-meshdb-dependency")?.to_owned())
+        let a = http::one(request.headers(), "x-nabedra-auth")?.to_owned();
+        let signature = http::one(request.headers(), "x-nabedra-signature")?.to_owned();
+        let dependency = if request.headers().contains_key("x-nabedra-dependency") {
+            Some(http::one(request.headers(), "x-nabedra-dependency")?.to_owned())
         } else {
             None
         };
@@ -770,7 +770,7 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         receiver.clone(),
         super::queue_runtime::outgoing_capacity(&input.template)?,
     ));
-    let scratch = std::env::temp_dir().join(format!("meshdb-worker-{incarnation}"));
+    let scratch = std::env::temp_dir().join(format!("nabedra-worker-{incarnation}"));
     let work=async {
         let path=scratch.clone();cpu(&cpu_pool,move |_|std::fs::create_dir(&path).map_err(|_|unavailable())).await?;
         let mut process=owners.start_boot(&boot,initialization,scratch.clone(),SpoolLimits::new(2*1024*1024*1024,220_000).map_err(|_|invalid())?).map_err(|_|unavailable())?;
@@ -807,11 +807,11 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
         served
     }.await;
     let drained = owners.close_and_drain().await.map_err(|_| {
-        eprintln!("meshdb-server: payload shutdown failed");
+        eprintln!("nabedra-database-server: payload shutdown failed");
         unavailable()
     });
     let joined = partition_threads.shutdown().await.map_err(|_| {
-        eprintln!("meshdb-server: partition shutdown failed");
+        eprintln!("nabedra-database-server: partition shutdown failed");
         unavailable()
     });
     let removed = cpu(&cpu_pool, move |_| {
@@ -824,13 +824,13 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
                 }
             })
             .map_err(|_| {
-                eprintln!("meshdb-server: scratch cleanup failed");
+                eprintln!("nabedra-database-server: scratch cleanup failed");
                 unavailable()
             })
     })
     .await;
     if work.is_err() {
-        eprintln!("meshdb-server: worker service failed");
+        eprintln!("nabedra-database-server: worker service failed");
     }
     work.and(drained).and(joined).and(removed)
 }

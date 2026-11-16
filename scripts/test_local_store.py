@@ -25,7 +25,7 @@ class StoreProcess:
     def start(self):
         self.process = subprocess.Popen(
             [sys.executable, str(SCRIPT), '--database', str(self.database), '--port', '0'],
-            env={**os.environ, 'MESHDB_STORE_TOKEN': TOKEN},
+            env={**os.environ, 'NABEDRA_STORE_TOKEN': TOKEN},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         if not select.select([self.process.stdout], [], [], 5)[0]:
@@ -98,7 +98,7 @@ class LocalStoreTests(unittest.TestCase):
         self.assertEqual(store.request('GET', headers={'Authorization': 'Bearer wrong'})[0], 401)
         self.assertEqual(store.request('PUT', body=b'x', headers={'Authorization': ''})[0], 401)
         self.assertEqual(store.request('GET')[0], 404)
-        no_token = {k: v for k, v in os.environ.items() if k != 'MESHDB_STORE_TOKEN'}
+        no_token = {k: v for k, v in os.environ.items() if k != 'NABEDRA_STORE_TOKEN'}
         refused = subprocess.run(
             [sys.executable, str(SCRIPT), '--database', str(store.database), '--port', '0'],
             env=no_token, capture_output=True, timeout=5,

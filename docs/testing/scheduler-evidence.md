@@ -1,3 +1,8 @@
+The results below predate the Nabedra Database rename. Recorded measurements,
+commit hashes, source hashes and raw artifacts retain their original provenance.
+Reproduction commands use the current names; these historical assertions were
+not rerun for the rename. See [the archive policy](evidence/README.md).
+
 The resource-aware scheduler was validated on implementation commit `59ffcc72907c68c7a378cd3c9f1dddce2cab1b6b`. The measured native server SHA-256 is `5a5ab2598580f76c2f083346619f343f92b9f2deecb186cb3feff514beee5247`.
 
 The final Rust run passed **727 tests across 37 targets**, and the Python suite passed **127 tests**. The S3-enabled build passed. The [functional results](evidence/resource-aware-scheduling/results.json) retain the exact binary hashes and execution boundaries for the separate process fixtures.
@@ -40,19 +45,19 @@ PYTHONPATH=orm/src python3.11 -m unittest discover -s orm/tests
 Build the supplied native targets before reproducing the process and benchmark runs:
 
 ```sh
-(cd server && cargo build --locked --no-default-features -j1 --bin meshdb-server --example resource_scheduler_benchmark)
-python3.11 scripts/acceptance_scheduler.py --binary server/target/debug/meshdb-server
-python3.11 scripts/acceptance_providers.py --binary server/target/debug/meshdb-server
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite caps --output artifacts/scheduler-caps-final.json
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite conservation --output artifacts/scheduler-conservation-final.json
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite overflow --output artifacts/scheduler-overflow-final.json
+(cd server && cargo build --locked --no-default-features -j1 --bin nabedra-database-server --example resource_scheduler_benchmark)
+python3.11 scripts/acceptance_scheduler.py --binary server/target/debug/nabedra-database-server
+python3.11 scripts/acceptance_providers.py --binary server/target/debug/nabedra-database-server
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server --suite caps --output artifacts/scheduler-caps-final.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server --suite conservation --output artifacts/scheduler-conservation-final.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server --suite overflow --output artifacts/scheduler-overflow-final.json
 ```
 
 Run measurements sequentially with other CPU/TCP fixtures stopped:
 
 ```sh
 server/target/debug/examples/resource_scheduler_benchmark --output artifacts/scheduler-pool-benchmark.json
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server --suite benchmark --output artifacts/scheduler-http-benchmark.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server --suite benchmark --output artifacts/scheduler-http-benchmark.json
 python3.11 scripts/summarize_scheduler_benchmarks.py --pool artifacts/scheduler-pool-benchmark.json --http artifacts/scheduler-http-benchmark.json --output artifacts/scheduler-benchmark-evidence.json
 python3.11 scripts/plot_resource_scheduler_benchmark.py artifacts/scheduler-pool-benchmark.json --output docs/testing/evidence/resource-aware-scheduling/pool-benchmark.svg
 python3.11 scripts/plot_scheduler_http_load.py artifacts/scheduler-http-benchmark.json --output docs/testing/evidence/resource-aware-scheduling/http-benchmark.png

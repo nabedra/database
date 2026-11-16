@@ -129,7 +129,7 @@ class AcceptanceConfig:
         if not self._token:
             object.__setattr__(self, "_token", secrets.token_urlsafe(32))
         env = self._aws_env()
-        env.update(MESHDB_S3_BUCKET=self.bucket, MESHDB_S3_PREFIX=namespace.prefix, MESHDB_TOKEN=self._token)
+        env.update(NABEDRA_S3_BUCKET=self.bucket, NABEDRA_S3_PREFIX=namespace.prefix, NABEDRA_TOKEN=self._token)
         return env
 
     def preflight(self):
@@ -162,7 +162,7 @@ def load_config(dotenv_path=None):
 
     Supports export, whitespace, single/double quotes and trailing comments.
     No expansion, multiline assignments or shell commands. BUCKET_NAME wins;
-    ambient AWS settings and dotenv MESHDB_* overrides are ignored.
+    ambient AWS settings and dotenv NABEDRA_* overrides are ignored.
     """
     path = Path(dotenv_path) if dotenv_path is not None else Path(__file__).resolve().parents[1] / ".env"
     try:

@@ -933,7 +933,7 @@ async fn send(stream: &mut UnixStream, value: serde_json::Value, end: Instant) -
 }
 fn supervisor() -> Result<UnixStream> {
     use std::os::fd::FromRawFd;
-    let fd: i32 = std::env::var("MESHDB_SUPERVISOR_FD")
+    let fd: i32 = std::env::var("NABEDRA_SUPERVISOR_FD")
         .map_err(|_| invalid())?
         .parse()
         .map_err(|_| invalid())?;
@@ -1023,7 +1023,7 @@ async fn api_process(
         prepare_api(&path, startup_end.into_std())
             .and_then(|p| runtime.block_on(p.connect_async()))
             .map_err(|_| {
-                eprintln!("meshdb-server: startup material invalid");
+                eprintln!("nabedra-database-server: startup material invalid");
                 invalid()
             })
     })
@@ -1117,17 +1117,17 @@ async fn api_process(
                     false,
                 ))
                 .map_err(|e| {
-                    eprintln!("meshdb-server: catalog initialization {e}");
+                    eprintln!("nabedra-database-server: catalog initialization {e}");
                     unavailable()
                 })?;
             let loaded = runtime
                 .block_on(storage.initialize_control(&initial, startup_end))
                 .map_err(|e| {
-                    eprintln!("meshdb-server: control initialization {e}");
+                    eprintln!("nabedra-database-server: control initialization {e}");
                     unavailable()
                 })?;
             let attached = check_attach(loaded, local, &init.name, provisioning).map_err(|e| {
-                eprintln!("meshdb-server: attachment {e}");
+                eprintln!("nabedra-database-server: attachment {e}");
                 invalid()
             })?;
             Ok((attached, catalog.catalog().fence == Some(proposed_fence)))

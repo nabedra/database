@@ -1,9 +1,9 @@
-"""MeshDB public types, errors, table handles and query builders."""
+"""Nabedra Database public types, errors, table handles and query builders."""
 from .errors import (
     AuthenticationError,
     ConflictError,
     LimitExceededError,
-    MeshDBError,
+    NabedraError,
     NotFoundError,
     OverloadedError,
     ProtocolError,
@@ -16,13 +16,13 @@ from .validation import Key, Row, Scalar, Schema
 from .expr import Expr, col
 from .query import Query
 from .table import Table
-from .client import DB, RequestReceipt
+from .client import Database, DB, RequestReceipt
 from .cluster import Cluster
 
 __all__ = [
     "Scalar", "Key", "Row", "Schema",
-    "DB", "RequestReceipt", "Cluster", "Expr", "col", "Query", "Table",
-    "MeshDBError", "ValidationError", "AuthenticationError", "NotFoundError",
+    "Database", "DB", "RequestReceipt", "Cluster", "Expr", "col", "Query", "Table",
+    "NabedraError", "ValidationError", "AuthenticationError", "NotFoundError",
     "ConflictError", "LimitExceededError", "OverloadedError", "StorageError",
     "TransportError", "ProtocolError", "UnknownOutcomeError",
 ]

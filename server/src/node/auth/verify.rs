@@ -99,8 +99,8 @@ enum Domain {
 }
 fn verify(public: [u8; 32], signature: [u8; 64], domain: Domain, body: &[u8]) -> Result<(), Error> {
     let (prefix, cap): (&[u8], usize) = match domain {
-        Domain::Enrollment => (b"meshdb.enroll.v1\0", 16 * 1024),
-        Domain::Request => (b"meshdb.http-request.v1\0", 4096),
+        Domain::Enrollment => (b"nabedra.enroll.v1\0", 16 * 1024),
+        Domain::Request => (b"nabedra.http-request.v1\0", 4096),
     };
     if body.len() > cap {
         return Err(Error::Limit);
@@ -199,7 +199,7 @@ fn verify_response(public: [u8; 32], signature: [u8; 64], body: &[u8]) -> Result
         return Err(Error::Limit);
     }
     let mut input = Vec::with_capacity(24 + body.len());
-    input.extend_from_slice(b"meshdb.http-response.v1\0");
+    input.extend_from_slice(b"nabedra.http-response.v1\0");
     input.extend_from_slice(body);
     UnparsedPublicKey::new(&ED25519, public)
         .verify(&input, &signature)

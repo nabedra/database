@@ -1,6 +1,6 @@
-# MeshDB v0
+# Nabedra Database v0
 
-MeshDB stores tables as immutable Parquet snapshots in S3. The Rust server
+Nabedra Database stores tables as immutable Parquet snapshots in S3. The Rust server
 exposes HTTP or native HTTPS, and a synchronous Python ORM builds and sends
 operations. Run the API and a local worker together with `serve`, or use
 supervised API and worker processes for a cluster. The ORM requires Python 3.11+
@@ -38,9 +38,9 @@ under your database prefix. The server does not create buckets.
 Install the CLI and native server into an isolated environment:
 
 ```sh
-python3.11 scripts/install_meshdb.py --prefix .meshdb
-.meshdb/bin/meshdb --version --json
-.meshdb/bin/meshdb serve --mode fixed --storage s3://your-bucket/meshdb/ \
+python3.11 scripts/install_nabedra.py --prefix .nabedra
+.nabedra/bin/nabedra --version --json
+.nabedra/bin/nabedra database serve --mode fixed --storage s3://your-bucket/nabedra/ \
   --region eu-west-1
 ```
 
@@ -55,22 +55,22 @@ CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path server/Cargo.t
 ```
 
 Configure the server environment. Replace the profile, region and bucket with
-your own values, and supply a shared bearer token privately in `MESHDB_TOKEN`:
+your own values, and supply a shared bearer token privately in `NABEDRA_TOKEN`:
 
 ```sh
 export AWS_PROFILE='<configured-profile>'
 export AWS_REGION='<bucket-region>'
-export MESHDB_S3_BUCKET='<existing-bucket>'
-export MESHDB_S3_PREFIX='meshdb-v0/'
-: "${MESHDB_TOKEN:?Set MESHDB_TOKEN to your shared bearer token}"
-server/target/release/meshdb-server serve --host 127.0.0.1 --port 8000 \
+export NABEDRA_S3_BUCKET='<existing-bucket>'
+export NABEDRA_S3_PREFIX='nabedra-v0/'
+: "${NABEDRA_TOKEN:?Set NABEDRA_TOKEN to your shared bearer token}"
+server/target/release/nabedra-database-server serve --host 127.0.0.1 --port 8000 \
   --workers 4 --queue-size 64 --partition-size '64 MiB'
 ```
 
 The AWS SDK also supports environment credentials and roles; omit `AWS_PROFILE`
 when using those. AWS credentials belong on the server. Clients need only its
 URL and bearer token. The server does not load `.env` or translate `BUCKET_NAME`
-to `MESHDB_S3_BUCKET`.
+to `NABEDRA_S3_BUCKET`.
 
 The command starts one API and one local worker with four shared compute
 threads. `--workers` controls compute threads, not partition count or OS process
@@ -79,13 +79,13 @@ resource JSON files provide explicit count, byte, retention, CPU and memory
 limits. See [server configuration](server/README.md#configuration).
 
 In a second terminal, check readiness and send a direct HTTP request. Supply the
-same `MESHDB_TOKEN` there:
+same `NABEDRA_TOKEN` there:
 
 ```sh
 curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
 request_id="$(python3.11 -c 'import uuid; print(uuid.uuid4())')"
 curl --fail-with-body --silent --show-error \
-  -H "Authorization: Bearer ${MESHDB_TOKEN}" \
+  -H "Authorization: Bearer ${NABEDRA_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data "{\"request_id\":\"${request_id}\",\"operation\":\"table.list\",\"payload\":{}}" \
   http://127.0.0.1:8000/v1/operations
@@ -108,8 +108,8 @@ proves they committed. For an existing format 1/2/3 catalog, stop all previous
 writers and explicitly pass `--migrate-catalog` to upgrade to format 4; keep
 old binaries stopped. Migration and cold start are separate confirmations.
 
-For separate API and worker processes, use `meshdb-server api --config PATH`
-and `meshdb-server worker --bootstrap PATH`. The API requires a supervisor
+For separate API and worker processes, use `nabedra-database-server api --config PATH`
+and `nabedra-database-server worker --bootstrap PATH`. The API requires a supervisor
 startup exchange and explicit object-storage configuration. Follow the
 [cluster process guide](server/README.md#cluster-process-acceptance) and
 [provider configuration](docs/testing/provisioning-adapters.md) for enrollment,
@@ -125,15 +125,14 @@ orm/.venv/bin/python -m pip install -e ./orm
 ```
 
 With the server at `http://127.0.0.1:8000`, supply its bearer token privately in
-`MESHDB_TOKEN` and run this example with `orm/.venv/bin/python`. It uses a fresh
+`NABEDRA_TOKEN` and run this example with `orm/.venv/bin/python`. It uses a fresh
 table name on each run and retains the table:
 
 ```python
-import os
 import uuid
-from meshdb import DB, col
+from nabedra import Database, col
 
-db = DB("http://127.0.0.1:8000", os.environ["MESHDB_TOKEN"])
+db = Database(url="http://127.0.0.1:8000", mode="oltp")
 users = db.create_table(
     "guide_users_" + uuid.uuid4().hex,
     {"id": str, "age": int, "active": bool},
@@ -146,6 +145,13 @@ users.insert_many([
 rows = users.where(col("age") >= 18).select("id", "age").collect()
 assert rows == [{"id": "alice", "age": 24}]
 ```
+
+The Python distribution is `nabedra-database`; import it as `nabedra`.
+`Database(url=..., mode="oltp")` also accepts `mode="olap"`. The mode is a
+validated client workload preference; both modes currently use the same engine.
+Pass `token=...` explicitly or let the client read `NABEDRA_TOKEN`. Construction
+requires no network access; an operation without a token raises
+`AuthenticationError` locally.
 
 For HTTPS, the client verifies certificates and hostnames; use `ca_file` for a
 private CA as described in the [ORM connection guide](orm/README.md#install-and-connect).
@@ -206,7 +212,7 @@ Atomic batches remain single operations. See the
 For example, after configuring the server environment:
 
 ```sh
-server/target/release/meshdb-server serve --workers 4 --partition_size '64 KB'
+server/target/release/nabedra-database-server serve --workers 4 --partition_size '64 KB'
 ```
 
 `--partition-size` is equivalent. `--workers N` supplies N persistent local
@@ -295,10 +301,10 @@ fixture targets and run the measurements sequentially with other load stopped:
 ```sh
 export CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features \
-  --bin meshdb-server --example resource_scheduler_benchmark
+  --bin nabedra-database-server --example resource_scheduler_benchmark
 mkdir -p artifacts
 server/target/debug/examples/resource_scheduler_benchmark --output artifacts/scheduler-pool-benchmark.json
-python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server \
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/nabedra-database-server \
   --suite benchmark --output artifacts/scheduler-http-benchmark.json
 python3.11 scripts/summarize_scheduler_benchmarks.py \
   --pool artifacts/scheduler-pool-benchmark.json --http artifacts/scheduler-http-benchmark.json \
@@ -312,6 +318,9 @@ for this README change.
 
 ## Local verification
 
+The [project rename evidence](docs/testing/rename-evidence.md) records checks for
+the `nabedra` Python package, CLI and native server.
+
 After the editable install, these commands run the ORM tests and local script
 guards without using the supplied `.env` or AWS. The guard suite includes local
 subprocess/loopback and TLS fixture cleanup checks. OpenSSL is required
@@ -322,6 +331,20 @@ is a dependency of normal ORM use.
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python -m unittest discover -s orm/tests -v
 PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python -m unittest discover -s scripts -p 'test_*.py' -v
 ```
+
+After installing into `.nabedra`, exercise the installed CLI and client with a
+local conditional SQLite object service:
+
+```sh
+python3.11 scripts/acceptance_nabedra.py \
+  --binary .nabedra/bin/nabedra-database-server \
+  --cli .nabedra/bin/nabedra --python .nabedra/bin/python
+```
+
+The runner checks 10, 100 and 1,000 rows, both client modes, token behavior,
+graceful child cleanup and committed rows after a cold restart. It records its
+assertions in `artifacts/rename/integration.json`. This is a local smoke subset
+of C01/U01/F03/R04; it performs no AWS requests or full scheduler acceptance.
 
 Run Cargo checks sequentially from the repository root, using `server/target`
 and the checkout's disk-saving settings. These checks do not run live S3
@@ -345,12 +368,13 @@ OpenSSL. To build the debug binary, use the Cargo settings above:
 cargo build --locked --manifest-path server/Cargo.toml
 ```
 
-The sole allowed acceptance bucket is `meshdb-testing` in `us-east-1`. The
+The sole allowed acceptance bucket is `meshdb-testing` in `us-east-1`. This is
+an existing AWS resource name, retained across the project rename. The
 prepared runners load the supplied repository `.env` through
 [private configuration helpers](scripts/acceptance_support.py). They require
 `BUCKET_NAME`, `AWS_REGION`, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
 plus `AWS_SESSION_TOKEN` for temporary credentials. Helpers map `BUCKET_NAME`
-to `MESHDB_S3_BUCKET` in private child environments and supply a bearer token.
+to `NABEDRA_S3_BUCKET` in private child environments and supply a bearer token.
 Do not source, print or commit the dotenv file or credentials.
 
 This strict acceptance configuration ignores ambient AWS profiles. The generic
@@ -365,11 +389,11 @@ The partition runner checks actual file sizes, routed mutations, global query
 results and a restart from two to three workers in one retained namespace.
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_http.py --scenario all --binary server/target/debug/meshdb-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_lifecycle.py --scenario all --binary server/target/debug/meshdb-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/meshdb-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/meshdb-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/meshdb-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_http.py --scenario all --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_lifecycle.py --scenario all --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-database-server
 ```
 
 Each run allocates fresh S3 folders named `test-<number>-<name>-<run-id>/` and

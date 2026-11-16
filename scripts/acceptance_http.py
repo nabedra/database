@@ -2,7 +2,7 @@
 """Live Rust HTTP acceptance. Fixtures remain in the guarded S3 namespace.
 
 Import and --help do not load configuration or start a process. Live execution
-requires the installed local ORM and a built meshdb-server binary.
+requires the installed local ORM and a built nabedra-database-server binary.
 """
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class Checks:
 
     def error(self, label, action, error_type, code, status):
         def verify():
-            from meshdb import UnknownOutcomeError
+            from nabedra import UnknownOutcomeError
             try:
                 action()
             except UnknownOutcomeError:
@@ -106,7 +106,7 @@ def scalar_types(db, c, server):
 
 
 def orm_api(db, c, server):
-    from meshdb import col
+    from nabedra import col
     users = c.table(db, 'guide_users', {'id': str, 'age': int, 'active': bool}, 'id')
     c.equal('insert_alice', lambda: users.insert({'id': 'alice', 'age': 24, 'active': True}), None)
     c.equal('insert_generator', lambda: users.insert_many(
@@ -155,7 +155,7 @@ def require(condition):
 
 def unsupported(transport):
     """Bypass only the operation-name guard, retaining the ORM's HTTP opener."""
-    from meshdb import MeshDBError
+    from nabedra import NabedraError
     request_id = str(uuid.uuid4())
     body = json.dumps({'request_id': request_id, 'operation': 'acceptance.unsupported',
                        'payload': {}}).encode('utf-8')
@@ -178,13 +178,13 @@ def unsupported(transport):
     require(type(error) is dict and set(error) == {'code', 'message', 'outcome'})
     require(error['code'] == 'unsupported_operation' and error['outcome'] == 'not_applied'
             and type(error['message']) is str)
-    raise MeshDBError('Unsupported operation probe', code='unsupported_operation',
+    raise NabedraError('Unsupported operation probe', code='unsupported_operation',
                       status_code=status, outcome='not_applied')
 
 
 def atomic_errors(db, c, server):
-    from meshdb import AuthenticationError, ConflictError, MeshDBError, NotFoundError, ValidationError
-    from meshdb.client import _Transport
+    from nabedra import AuthenticationError, ConflictError, NabedraError, NotFoundError, ValidationError
+    from nabedra.client import _Transport
     table = c.table(db, 'atomic_rows', {'id': str, 'value': int}, 'id')
     original = {'id': 'original', 'value': 7}
     c.equal('seed_original', lambda: table.insert(original), None)
@@ -216,7 +216,7 @@ def atomic_errors(db, c, server):
                                      {'id': 'bad_batch', 'value': False}]}),
         ValidationError, 'validation_error', 400)
     unchanged('malformed_batch', ['valid_early', 'bad_batch'])
-    c.error('unsupported_operation', lambda: unsupported(transport), MeshDBError, 'unsupported_operation', 400)
+    c.error('unsupported_operation', lambda: unsupported(transport), NabedraError, 'unsupported_operation', 400)
     wrong = _Transport(server.api_url, server.private_token + '-wrong')
     c.error('wrong_token', lambda: wrong.request('table.list', {}), AuthenticationError, 'unauthorized', 401)
     c.error('missing_table', lambda: db.table('absent_table'), NotFoundError, 'not_found', 404)
@@ -242,7 +242,7 @@ def safe_failure(error):
     allowed = {'CheckFailure', 'ConfigError', 'ServerProcessError', 'ValidationError',
                'AuthenticationError', 'NotFoundError', 'ConflictError', 'LimitExceededError',
                'OverloadedError', 'StorageError', 'TransportError', 'ProtocolError',
-               'UnknownOutcomeError', 'MeshDBError', 'KeyboardInterrupt', 'ModuleNotFoundError'}
+               'UnknownOutcomeError', 'NabedraError', 'KeyboardInterrupt', 'ModuleNotFoundError'}
     name = type(error).__name__
     return name if name in allowed else 'UnexpectedFailure'
 
@@ -255,7 +255,7 @@ def run_scenario(name, config, binary):
     c = Checks(record)
     server = None
     try:
-        from meshdb import DB
+        from nabedra import Database
         from server_process import ServerProcess
         number, prefix_name, scenario = SCENARIOS[name]
         namespace = config.allocate_prefix(number, prefix_name)
@@ -263,7 +263,7 @@ def run_scenario(name, config, binary):
         c.label = 'process_setup'
         server = ServerProcess(config, namespace, binary=binary)
         c.call('process_start', server.start)
-        db = DB(server.api_url, server.private_token)
+        db = Database(url=server.api_url, token=server.private_token)
         scenario(db, c, server)
         record['status'] = 'passed'
     except BaseException as error:

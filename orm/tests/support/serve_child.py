@@ -22,7 +22,7 @@ def caught(signum, frame):
         sys.exit(0)
 signal.signal(signal.SIGINT, caught)
 signal.signal(signal.SIGTERM, caught)
-s = socket.socket(fileno=int(os.environ['MESHDB_SUPERVISOR_FD']))
+s = socket.socket(fileno=int(os.environ['NABEDRA_SUPERVISOR_FD']))
 def receive():
     def exact(n):
         data = b''

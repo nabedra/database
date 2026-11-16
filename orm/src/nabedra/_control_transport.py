@@ -18,7 +18,7 @@ from .client import (
     _invalid_constant, _finite_float,
 )
 from .errors import (
-    LimitExceededError, MeshDBError, ProtocolError, TransportError,
+    LimitExceededError, NabedraError, ProtocolError, TransportError,
     UnknownOutcomeError, ValidationError,
 )
 
@@ -84,7 +84,7 @@ class _Deadline:
         if deadline is not None:
             _remaining(deadline, float('inf'))
             self.timer = threading.Thread(target=self._wait)
-            self.timer.name = 'meshdb-control-deadline'
+            self.timer.name = 'nabedra-control-deadline'
             self.timer.daemon = True
             self.timer.start()
 
@@ -131,6 +131,8 @@ class _ControlTransport(_Transport):
 
     def __init__(self, api_url: str, admin_token: str, *, timeout: float = 30.0,
                  ca_file: str | None = None) -> None:
+        if admin_token is None:
+            raise ValidationError('Token must be a nonempty safe bearer token')
         super().__init__(api_url, admin_token, timeout=timeout, ca_file=ca_file)
         self._url = self._url[:-len('/v1/operations')] + '/v1/cluster/operations'
         self._context = next(h._context for h in self._opener.handlers
@@ -283,7 +285,7 @@ class _ControlTransport(_Transport):
         if ((expected_status is not None and status != expected_status)
                 or (code == 'outcome_unknown' and outcome != 'unknown')):
             raise failure('Control error code/status/outcome mismatch')
-        error_type = UnknownOutcomeError if outcome == 'unknown' else _ERROR_TYPES.get(code, MeshDBError)
+        error_type = UnknownOutcomeError if outcome == 'unknown' else _ERROR_TYPES.get(code, NabedraError)
         # Error messages are untrusted and may echo credentials or request data.
         raise error_type('Control operation rejected', code=code, request_id=request_id,
                          status_code=status, outcome=outcome)

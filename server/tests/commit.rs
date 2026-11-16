@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     commit::{Coordinator, PendingObject},
     protocol::{ColumnType, ErrorCode, Key, Outcome, TableFormat},
     storage::*,
@@ -23,7 +23,7 @@ fn create(candidate: &mut Catalog) {
             schema: BTreeMap::from([("id".into(), ColumnType::Utf8)]),
             key: "id".into(),
             format: TableFormat::Parquet,
-            data: meshdb_server::storage::TableData::Legacy {
+            data: nabedra_database_server::storage::TableData::Legacy {
                 snapshot: ObjectKey::snapshot(id, candidate.commit_id).as_str().into(),
             },
             row_count: 0,
@@ -39,7 +39,11 @@ fn fault(c: &Coordinator<Fake>, key: &str, error: StorageError, apply: bool) {
         .put_faults
         .insert(format!("test/{key}"), (error, apply));
 }
-fn assert_error(e: meshdb_server::protocol::ProtocolError, code: ErrorCode, outcome: Outcome) {
+fn assert_error(
+    e: nabedra_database_server::protocol::ProtocolError,
+    code: ErrorCode,
+    outcome: Outcome,
+) {
     assert_eq!((e.code, e.outcome), (code, outcome));
 }
 #[tokio::test]
@@ -70,7 +74,7 @@ async fn snapshot_then_catalog_and_drop_use_fresh_revision_and_uuid() {
     let mut updated = session.candidate();
     let entry = updated.tables.get_mut("users").unwrap();
     entry.row_count = 1;
-    entry.data = meshdb_server::storage::TableData::Legacy {
+    entry.data = nabedra_database_server::storage::TableData::Legacy {
         snapshot: ObjectKey::snapshot(entry.id, updated.commit_id)
             .as_str()
             .into(),
@@ -238,7 +242,7 @@ async fn malformed_candidates_and_overflow_never_write() {
             0 => candidate.revision = 10,
             1 => {
                 candidate.tables.get_mut("users").unwrap().data =
-                    meshdb_server::storage::TableData::Legacy {
+                    nabedra_database_server::storage::TableData::Legacy {
                         snapshot: ObjectKey::snapshot(Uuid::from_u128(42), Uuid::nil())
                             .as_str()
                             .into(),
@@ -247,7 +251,7 @@ async fn malformed_candidates_and_overflow_never_write() {
             2 => {
                 let mut second = candidate.tables["users"].clone();
                 second.id = Uuid::from_u128(43);
-                second.data = meshdb_server::storage::TableData::Legacy {
+                second.data = nabedra_database_server::storage::TableData::Legacy {
                     snapshot: ObjectKey::snapshot(second.id, candidate.commit_id)
                         .as_str()
                         .into(),
@@ -273,7 +277,8 @@ async fn malformed_candidates_and_overflow_never_write() {
                 candidate,
                 Some(vec![
                     0;
-                    meshdb_server::commit::MAX_ENCODED_SNAPSHOT_BYTES + 1
+                    nabedra_database_server::commit::MAX_ENCODED_SNAPSHOT_BYTES
+                        + 1
                 ]),
             )
             .await
@@ -432,7 +437,7 @@ async fn partition_references_and_complete_catalog_are_validated_before_any_uplo
                     unreachable!()
                 };
                 files[1].byte_size =
-                    (meshdb_server::partition_size::MAX_PARTITION_BYTES + 1) as u64;
+                    (nabedra_database_server::partition_size::MAX_PARTITION_BYTES + 1) as u64;
             }
             _ => {
                 let TableData::Partitioned { files } =

@@ -1,11 +1,11 @@
-"""Public DB and terminal queries through a local HTTP fixture."""
+"""Public Database and terminal queries through a local HTTP fixture."""
 import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import meshdb
-from meshdb import errors
+import nabedra
+from nabedra import errors
 
 TABLE_ID = '12345678-1234-4234-8234-123456789abc'
 SCHEMA = {'id': str, 'age': int, 'active': bool, 'score': float}
@@ -46,7 +46,7 @@ class ClientAPITests(unittest.TestCase):
     def setUp(self):
         type(self).seen = []
         self.reply(descriptor())
-        self.db = meshdb.DB(f'http://127.0.0.1:{self.server.server_port}/', 'test', timeout=5)
+        self.db = nabedra.Database(f'http://127.0.0.1:{self.server.server_port}/', 'test', timeout=5)
 
     def reply(self, result, status=200):
         type(self).result, type(self).status = result, status
@@ -56,7 +56,7 @@ class ClientAPITests(unittest.TestCase):
         for kwargs in [dict(api_url='relative', token='test'), dict(api_url='http://localhost', token=''),
                        dict(api_url='http://localhost', token='test', timeout=0)]:
             with self.assertRaises(errors.ValidationError):
-                meshdb.DB(**kwargs)
+                nabedra.Database(**kwargs)
         for args, kwargs in [(('bad-name', SCHEMA, 'id'), {}), (('users', {'id': bytes}, 'id'), {}),
                              (('users', SCHEMA, None), {}), (('users', SCHEMA, 'active'), {}),
                              (('users', SCHEMA, 'id'), {'format': 'csv'})]:
@@ -68,7 +68,7 @@ class ClientAPITests(unittest.TestCase):
 
     def test_create_discover_list_and_fixed_handles(self):
         created = self.db.create_table('users', SCHEMA, 'id')
-        self.assertIsInstance(created, meshdb.Table)
+        self.assertIsInstance(created, nabedra.Table)
         self.assertEqual(created.schema, SCHEMA)
         self.assertEqual(self.seen[-1]['payload'], {k: v for k, v in descriptor().items() if k != 'id'})
         self.assertEqual(self.seen[-1]['operation'], 'table.create')

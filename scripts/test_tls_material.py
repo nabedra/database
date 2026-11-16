@@ -86,7 +86,7 @@ def create_test_tls(directory: Path) -> TLSMaterial:
         raise TLSMaterialError("Cannot write test TLS fixture files.") from None
 
     _run(openssl, "req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes",
-         "-sha256", "-days", "2", "-subj", "/CN=meshdb disposable test CA",
+         "-sha256", "-days", "2", "-subj", "/CN=nabedra disposable test CA",
          "-config", str(config), "-extensions", "ca_ext",
          "-keyout", str(ca_key), "-out", str(ca_cert))
     _run(openssl, "req", "-new", "-newkey", "rsa:2048", "-nodes", "-sha256",

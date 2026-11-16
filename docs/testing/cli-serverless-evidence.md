@@ -1,5 +1,10 @@
 # CLI and serverless execution evidence
 
+The results below predate the Nabedra Database rename. Recorded measurements,
+commit hashes, source hashes and raw artifacts retain their original provenance.
+Reproduction commands use the current names; these historical assertions were
+not rerun for the rename. See [the archive policy](evidence/README.md).
+
 The final release passed fresh-prefix installation and the installed real-S3 acceptance subset on 2026-11-16. The final review then fixed two Python issues and passed the 20 core variations below. The [implementation plan](../../plans/cli-and-serverless.md) and [scheduler contract](scheduler-contract.md) retain the complete requirements. Scenario IDs identify exercised assertions, not a claim that every assertion in each scenario passed.
 
 ## Final core review
@@ -54,13 +59,13 @@ The [SVG](evidence/cli-serverless/gateway-http.svg) and [source hashes](evidence
 The core manifest lists the selected test names. With Python 3.11+, HTTPX and the local ORM available, invoke its eight names through `python -m unittest -v`, with `PYTHONPATH=orm/src:orm/tests`. Build the locked default-feature Rust lib test binary once with `cargo test --locked --lib --no-run`, then pass the manifest's 12 names to that executable with `--exact --test-threads=1`. Use one build job and a shared Cargo target on resource-constrained hosts.
 
 ```sh
-CARGO_BUILD_JOBS=1 python3.11 scripts/install_meshdb.py --prefix /tmp/meshdb-clean-install
-/tmp/meshdb-clean-install/bin/meshdb --version --json
-/tmp/meshdb-clean-install/bin/meshdb --help
+CARGO_BUILD_JOBS=1 python3.11 scripts/install_nabedra.py --prefix /tmp/nabedra-clean-install
+/tmp/nabedra-clean-install/bin/nabedra --version --json
+/tmp/nabedra-clean-install/bin/nabedra --help
 python3.11 scripts/acceptance_serverless_s3.py \
   --env-file /path/to/private/acceptance.env \
-  --binary /tmp/meshdb-clean-install/bin/meshdb-server \
-  --cli /tmp/meshdb-clean-install/bin/meshdb \
+  --binary /tmp/nabedra-clean-install/bin/nabedra-database-server \
+  --cli /tmp/nabedra-clean-install/bin/nabedra \
   --output artifacts/cli-serverless/native-s3.json
 ```
 

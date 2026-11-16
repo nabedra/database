@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from meshdb import ValidationError
+from nabedra import ValidationError
 
-module = importlib.import_module('meshdb.serve')
+module = importlib.import_module('nabedra.serve')
 C = '00000000-0000-4000-8000-000000000001'
 
 
@@ -34,7 +34,7 @@ class PublicServeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.json'
             path.write_text('{}')
-            with patch.dict('os.environ', {'MESHDB_CONFIG': str(path)}), patch.object(module, 'run_process', side_effect=run):
+            with patch.dict('os.environ', {'NABEDRA_CONFIG': str(path)}), patch.object(module, 'run_process', side_effect=run):
                 # Repeated ownership after cleanup proves the first bridge stopped.
                 for _ in range(2):
                     module.serve('cluster', (1, 3), start_node=callbacks[0], stop_node=callbacks[1],

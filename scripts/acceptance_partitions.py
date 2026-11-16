@@ -27,7 +27,7 @@ def _row(key):
 
 
 def _results(table, expected, c, phase):
-    from meshdb import col
+    from nabedra import col
     ordered = sorted(expected.values(), key=lambda row: row['id'])
     c.equal(phase + '_all_rows', lambda: table.query().order_by('id').collect(), ordered)
     query = table.where(col('id') >= 0).order_by('score', desc=True).limit(17).select('text', 'flag')
@@ -75,8 +75,8 @@ def _storage(reader, table, count, c, record, phase):
 
 
 def _scenario(server, reader, c, record):
-    from meshdb import DB, ConflictError
-    db = DB(server.api_url, server.private_token)
+    from nabedra import Database, ConflictError
+    db = Database(url=server.api_url, token=server.private_token)
     table = c.table(db, 'partition_rows', {'id': int, 'text': str, 'score': float, 'flag': bool}, 'id')
     _storage(reader, table, 0, c, record, 'empty')
     expected = {key: _row(key) for key in range(96)}
@@ -137,7 +137,7 @@ def run_scenario(config, binary=None):
         namespace = config.allocate_prefix(10, 'partition-workers')
         record['allocated_prefix'] = namespace.prefix
         c.label = 'private_local_directory'
-        resources = TemporaryDirectory(prefix='meshdb-partitions-')
+        resources = TemporaryDirectory(prefix='nabedra-partitions-')
         reader = _SnapshotReader(config, namespace, resources.name, scenario="partition-workers")
         c.label = 'process_setup'
         server = ServerProcess(config, namespace, binary=binary, workers=2, partition_size="64 KB")
@@ -149,8 +149,8 @@ def run_scenario(config, binary=None):
         server = ServerProcess(config, namespace, binary=binary, workers=3, partition_size="64 KB")
         servers.append(server)
         c.call('restart_three_workers', server.start)
-        from meshdb import DB
-        restored = c.call('rediscover_table', lambda: DB(server.api_url, server.private_token).table(table.name))
+        from nabedra import Database
+        restored = c.call('rediscover_table', lambda: Database(url=server.api_url, token=server.private_token).table(table.name))
         c.equal('restart_identity', lambda: (restored.id, restored.name, restored.schema, restored.key),
                 (table.id, table.name, table.schema, table.key))
         _results(restored, expected, c, 'restarted')

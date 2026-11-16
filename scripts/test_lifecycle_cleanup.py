@@ -45,7 +45,7 @@ class CleanupTest(unittest.TestCase):
                     with patch.dict('sys.modules', {
                         'server_process': SimpleNamespace(ServerProcess=Process),
                         'test_tls_material': SimpleNamespace(create_test_tls=material),
-                    }), patch('meshdb.DB', no_client):
+                    }), patch('nabedra.Database', no_client):
                         record = acceptance_lifecycle.run_scenario('https', config, None)
                     gc.collect()
                     self.assertEqual(len(roots), 1)

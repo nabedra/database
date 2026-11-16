@@ -1,0 +1,12 @@
+test_environment_auth_and_explicit_override_reach_new_selector_header (test_public_package.DatabaseInterfaceTests.test_environment_auth_and_explicit_override_reach_new_selector_header) ... ok
+test_invalid_modes_and_duplicate_urls_fail_locally (test_public_package.DatabaseInterfaceTests.test_invalid_modes_and_duplicate_urls_fail_locally) ... ok
+test_missing_auth_fails_before_reads_mutations_and_receipt_io (test_public_package.DatabaseInterfaceTests.test_missing_auth_fails_before_reads_mutations_and_receipt_io) ... ok
+test_modes_are_read_only_and_construction_is_inert (test_public_package.DatabaseInterfaceTests.test_modes_are_read_only_and_construction_is_inert) ... ok
+test_database_routes_are_grouped_once (test_public_package.PackageCommandTests.test_database_routes_are_grouped_once) ... ok
+test_distribution_and_console_entrypoint (test_public_package.PackageCommandTests.test_distribution_and_console_entrypoint) ... ok
+test_root_and_database_versions (test_public_package.PackageCommandTests.test_root_and_database_versions) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.207s
+
+OK

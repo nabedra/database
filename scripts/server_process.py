@@ -21,7 +21,7 @@ class ServerProcessError(RuntimeError):
 
 
 class ServerProcess:
-    """Launch meshdb-server, wait for readiness, and reap it on context exit.
+    """Launch nabedra-database-server, wait for readiness, and reap it on context exit.
 
     Defaults match the acceptance launch contract. TLS requires all three paths;
     test_ca must trust the server certificate for the IP address 127.0.0.1.
@@ -48,7 +48,7 @@ class ServerProcess:
         self._env = config.server_env(namespace)
         self._namespace = namespace
         self._binary = Path(binary if binary is not None else
-                            Path(__file__).resolve().parents[1] / "server/target/debug/meshdb-server").resolve()
+                            Path(__file__).resolve().parents[1] / "server/target/debug/nabedra-database-server").resolve()
         self._startup_timeout = startup_timeout
         self._shutdown_timeout = shutdown_timeout
         self._log_path = log_path
@@ -85,7 +85,7 @@ class ServerProcess:
     @property
     def private_token(self):
         """Bearer token for ORM setup. Keep this value out of diagnostics."""
-        return self._env["MESHDB_TOKEN"]
+        return self._env["NABEDRA_TOKEN"]
 
     @property
     def pid(self):

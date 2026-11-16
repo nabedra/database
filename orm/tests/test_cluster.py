@@ -6,7 +6,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from meshdb import errors
+from nabedra import errors
 
 CLUSTER_ID = '00000000-0000-0000-0000-000000000001'
 NODE_ID = '00000000-0000-0000-0000-000000000002'
@@ -72,7 +72,7 @@ class ClusterTests(unittest.TestCase):
         type(self).drop = False
 
     def client(self):
-        from meshdb.cluster import Cluster
+        from nabedra.cluster import Cluster
         return Cluster(self.url, 'private-token')
 
     def test_operations_use_control_endpoint_and_exact_payloads(self):
@@ -192,7 +192,7 @@ if __name__ == '__main__':
 
 class ResourceCapacityTests(unittest.TestCase):
     def test_c01_capacity_reports_keep_heterogeneous_limits(self):
-        from meshdb.cluster import _node
+        from nabedra.cluster import _node
         for threads in (1, 2, 4):
             node = status()['nodes'][0]
             node.update(partition_slots=threads,
@@ -204,7 +204,7 @@ class ResourceCapacityTests(unittest.TestCase):
             self.assertEqual(_node(node), node)
 
     def test_c02_capacity_overstatement_and_incomplete_reports_fail(self):
-        from meshdb.cluster import _node
+        from nabedra.cluster import _node
         node = status()['nodes'][0]
         node.update(resources=dict(max_threads=4, memory_limit_bytes=4000,
                                    task_memory_limit_bytes=2000, control_memory_reserve_bytes=400),

@@ -59,14 +59,14 @@ pub fn decode_context(
             .checked_add(name.as_str().len())
             .and_then(|n| n.checked_add(value.as_bytes().len() + 4))
             .ok_or_else(invalid)?;
-        if name.as_str().starts_with("x-meshdb-") && name != "x-meshdb-storage" {
+        if name.as_str().starts_with("x-nabedra-") && name != "x-nabedra-storage" {
             return Err(denied());
         }
     }
     if total > MAX_HEADERS {
         return Err(invalid());
     }
-    let mut values = headers.get_all("x-meshdb-storage").iter();
+    let mut values = headers.get_all("x-nabedra-storage").iter();
     let value = values.next();
     if values.next().is_some() {
         return Err(invalid());
@@ -125,28 +125,28 @@ mod tests {
                 .is_none()
         );
         assert!(decode_context(&template(true), &headers, 0).is_err());
-        headers.insert("x-meshdb-storage", encode(&value()));
+        headers.insert("x-nabedra-storage", encode(&value()));
         assert!(decode_context(&template(false), &headers, 0).is_err());
         let accepted = decode_context(&template(true), &headers, 0)
             .unwrap()
             .unwrap();
         assert_eq!(accepted.bucket(), "customer-bucket");
         assert!(validate_context(&template(false), Some(&accepted), 0).is_err());
-        headers.append("x-meshdb-storage", encode(&value()));
+        headers.append("x-nabedra-storage", encode(&value()));
         assert!(decode_context(&template(true), &headers, 0).is_err());
-        headers.remove("x-meshdb-storage");
+        headers.remove("x-nabedra-storage");
         let mut bad = value();
         bad["credentials"]["expires_at"] = serde_json::json!("2026-11-16T20:00:00Z");
-        headers.insert("x-meshdb-storage", encode(&bad));
+        headers.insert("x-nabedra-storage", encode(&bad));
         assert!(decode_context(&template(true), &headers, u64::MAX).is_err());
         bad = value();
         bad["endpoint"] = serde_json::json!("http://attacker");
-        headers.insert("x-meshdb-storage", encode(&bad));
+        headers.insert("x-nabedra-storage", encode(&bad));
         assert!(decode_context(&template(true), &headers, 0).is_err());
-        headers.insert("x-meshdb-storage", encode(&value()));
-        headers.insert("x-meshdb-principal", HeaderValue::from_static("forged"));
+        headers.insert("x-nabedra-storage", encode(&value()));
+        headers.insert("x-nabedra-principal", HeaderValue::from_static("forged"));
         assert!(decode_context(&template(true), &headers, 0).is_err());
-        headers.remove("x-meshdb-principal");
+        headers.remove("x-nabedra-principal");
         headers.insert(
             "padding",
             HeaderValue::from_str(&"x".repeat(MAX_HEADERS)).unwrap(),
@@ -154,7 +154,7 @@ mod tests {
         assert!(decode_context(&template(true), &headers, 0).is_err());
         headers.remove("padding");
         headers.insert(
-            "x-meshdb-storage",
+            "x-nabedra-storage",
             HeaderValue::from_str(&"x".repeat(24 * 1024 + 1)).unwrap(),
         );
         assert!(decode_context(&template(true), &headers, 0).is_err());
@@ -172,7 +172,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             let header = encode(&overlapping);
             let context = RequestContext::decode_header(header.to_str().unwrap(), 0).unwrap();
-            headers.insert("x-meshdb-storage", header);
+            headers.insert("x-nabedra-storage", header);
             assert!(decode_context(&template, &headers, 0).is_err());
             assert!(validate_context(&template, Some(&context), 0).is_err());
         }
@@ -180,7 +180,7 @@ mod tests {
         separate["bucket"] = serde_json::json!("operator-bucket");
         separate["prefix"] = serde_json::json!("other/");
         let mut headers = HeaderMap::new();
-        headers.insert("x-meshdb-storage", encode(&separate));
+        headers.insert("x-nabedra-storage", encode(&separate));
         assert!(decode_context(&template, &headers, 0).unwrap().is_some());
     }
 }

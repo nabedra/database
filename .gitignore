@@ -1,4 +1,7 @@
 .env
+.nabedra/
+nabedra-database.json
+# Keep pre-rename local installations and configuration private.
 .meshdb/
 meshdb.json
 *.auth.json

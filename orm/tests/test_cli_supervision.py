@@ -11,12 +11,12 @@ import sys
 import tempfile
 import time
 import unittest
-from meshdb._cli_config import example, protected_write, s3_storage
+from nabedra._cli_config import example, protected_write, s3_storage
 
-FIXTURE = '''import json, os, signal, socket, struct, sys
+FIXTURE = '''import json, os, re, signal, socket, struct, sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
-    print('meshdb-server 0.1.0')
+    print('nabedra-database-server 0.1.0')
     sys.exit(0)
 if sys.argv[1] == 'worker':
     b=json.loads(Path(sys.argv[3]).read_text())
@@ -24,7 +24,7 @@ if sys.argv[1] == 'worker':
     if os.environ.get('FAIL') == '1':
         sys.exit(23)
     while True: signal.pause()
-s=socket.socket(fileno=int(os.environ['MESHDB_SUPERVISOR_FD']))
+s=socket.socket(fileno=int(os.environ['NABEDRA_SUPERVISOR_FD']))
 def receive():
     h=s.recv(4)
     if len(h)!=4: sys.exit(1)
@@ -33,7 +33,10 @@ def receive():
     return json.loads(d)
 def send(value):
     d=json.dumps(value).encode(); s.sendall(struct.pack('!I',len(d))+d)
-receive()
+init=receive()
+if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,63}', init.get('name', '')) is None:
+    sys.exit(24)
+Path(os.environ['STATE']).with_suffix('.init').write_text(json.dumps(init))
 r={'version':1,'type':'prepared','cluster_id':'11111111-1111-4111-8111-111111111111','bound_url':'http://127.0.0.1:8000','authorize_url':None}
 send(r); receive(); del r['authorize_url']; r['type']='ready'; send(r)
 receive()
@@ -46,7 +49,7 @@ class SupervisionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        binary = self.root / 'meshdb-server'
+        binary = self.root / 'nabedra-database-server'
         binary.write_text('#!' + sys.executable + '\n' + FIXTURE)
         binary.chmod(0o700)
         auth = self.root / 'auth.json'
@@ -56,12 +59,15 @@ class SupervisionTests(unittest.TestCase):
         self.config = self.root / 'config.json'
         protected_write(self.config, config)
         self.state = self.root / 'worker.json'
-        self.env = dict(os.environ, MESHDB_SERVER_BINARY=str(binary), STATE=str(self.state),
+        self.env = dict(os.environ, NABEDRA_SERVER_BINARY=str(binary), STATE=str(self.state),
                         PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src'))
 
-    def start(self, fail=False):
+    def start(self, fail=False, cluster_name=None):
         env = dict(self.env, FAIL='1' if fail else '0')
-        child = subprocess.Popen([sys.executable, '-m', 'meshdb.cli', 'serve', '--config', str(self.config), '--threads-per-worker', '2', '--local-workers', '1', '--cold-start'],
+        command = [sys.executable, '-m', 'nabedra.cli', 'database', 'serve', '--config', str(self.config), '--threads-per-worker', '2', '--local-workers', '1', '--cold-start']
+        if cluster_name is not None:
+            command += ['--cluster-name', cluster_name]
+        child = subprocess.Popen(command,
                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup, child)
         return child
@@ -75,12 +81,29 @@ class SupervisionTests(unittest.TestCase):
         child = self.start(True)
         out, err = child.communicate(timeout=8)
         self.assertEqual(child.returncode, 23, (out, err))
-        self.assertIn(b'meshdb.serve.launched', out)
+        self.assertIn(b'nabedra.serve.launched', out)
+        self.assertEqual(json.loads(self.state.with_suffix('.init').read_text())['name'], 'Nabedra')
         record = json.loads(self.state.read_text())
         self.assertEqual(record['bootstrap']['resources']['max_threads'], 2)
         self.assertEqual(record['bootstrap']['mode'], 'fixed')
         with self.assertRaises(ProcessLookupError):
             os.kill(record['pid'], 0)
+
+    def test_existing_cluster_name_is_sent_without_renaming(self):
+        child = self.start(True, cluster_name='MeshDB')
+        out, err = child.communicate(timeout=8)
+        self.assertEqual(child.returncode, 23, (out, err))
+        self.assertEqual(json.loads(self.state.with_suffix('.init').read_text())['name'], 'MeshDB')
+
+    def test_invalid_cluster_name_is_rejected_before_startup(self):
+        for name in ('Nabedra Database', 'bad-name', 'a' * 65):
+            with self.subTest(name=name):
+                child = self.start(cluster_name=name)
+                out, err = child.communicate(timeout=8)
+                self.assertEqual(child.returncode, 2, (out, err))
+                self.assertIn(b'usage:', err)
+                self.assertFalse(self.state.with_suffix('.init').exists())
+                self.assertFalse(self.state.exists())
 
     def test_signal_drains_and_reaps_worker(self):
         child = self.start()
@@ -98,14 +121,14 @@ class SupervisionTests(unittest.TestCase):
     def test_compatible_path_binary_runs_both_api_and_worker(self):
         prefix = self.root / 'incompatible-env'
         (prefix / 'bin').mkdir(parents=True)
-        incompatible = prefix / 'bin' / 'meshdb-server'
+        incompatible = prefix / 'bin' / 'nabedra-database-server'
         incompatible.write_text('#!' + sys.executable + '\nimport sys\n'
-                                'print("meshdb-server 9.0.0")\nsys.exit(42)\n')
+                                'print("nabedra-database-server 9.0.0")\nsys.exit(42)\n')
         incompatible.chmod(0o700)
         env = dict(self.env, PATH=str(self.root) + os.pathsep + os.environ.get('PATH', ''))
-        env.pop('MESHDB_SERVER_BINARY')
-        script = 'import sys; sys.prefix=sys.argv.pop(1); from meshdb.cli import main; raise SystemExit(main())'
-        child = subprocess.Popen([sys.executable, '-c', script, str(prefix), 'serve', '--config', str(self.config),
+        env.pop('NABEDRA_SERVER_BINARY')
+        script = 'import sys; sys.prefix=sys.argv.pop(1); from nabedra.cli import main; raise SystemExit(main())'
+        child = subprocess.Popen([sys.executable, '-c', script, str(prefix), 'database', 'serve', '--config', str(self.config),
                                   '--local-workers', '1'], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup, child)
         deadline = time.monotonic() + 5
@@ -116,7 +139,7 @@ class SupervisionTests(unittest.TestCase):
         child.terminate()
         out, err = child.communicate(timeout=8)
         self.assertEqual(child.returncode, -signal.SIGTERM, (out, err))
-        self.assertIn(b'meshdb.serve.launched', out)
+        self.assertIn(b'nabedra.serve.launched', out)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 

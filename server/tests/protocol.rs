@@ -1,4 +1,4 @@
-use meshdb_server::protocol::*;
+use nabedra_database_server::protocol::*;
 use serde_json::{Value, json};
 
 const ID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";

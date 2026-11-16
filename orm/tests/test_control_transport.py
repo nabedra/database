@@ -8,7 +8,7 @@ import unittest
 import uuid
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from meshdb import errors
+from nabedra import errors
 
 LIMIT = 1024 * 1024
 
@@ -40,7 +40,7 @@ class ControlTransportTests(unittest.TestCase):
         self.set_reply(lambda r: {'request_id': r['request_id'], 'data': {'revision': 3}})
 
     def transport(self, **kwargs):
-        from meshdb._control_transport import _ControlTransport
+        from nabedra._control_transport import _ControlTransport
         return _ControlTransport(self.url, 'private-token', **kwargs)
 
     def set_reply(self, envelope, status=200, truncate=0):
@@ -90,7 +90,7 @@ class ControlTransportTests(unittest.TestCase):
             self.assertEqual(auth, 'Bearer private-token')
             self.assertEqual(set(request), {'request_id', 'operation', 'payload'})
         for code, status, expected in [('conflict', 409, errors.ConflictError),
-                                       ('unsupported_capability', 400, errors.MeshDBError)]:
+                                       ('unsupported_capability', 400, errors.NabedraError)]:
             self.set_reply(lambda r: {'request_id': r['request_id'], 'error': {
                 'code': code, 'message': 'rejected', 'outcome': 'not_applied'}}, status)
             with self.assertRaises(expected) as caught:
@@ -121,11 +121,12 @@ class ControlTransportTests(unittest.TestCase):
         self.assertEqual(len(self.seen), 2 * len(cases))
 
     def test_local_validation_and_refused_connection_are_not_unknown(self):
-        from meshdb._control_transport import _ControlTransport
+        from nabedra._control_transport import _ControlTransport
         for api_url, token, kwargs in [('http://user:pass@localhost', 'token', {}),
+                                       (self.url, None, {}),
                                        (self.url, 'unsafe\r\ntoken', {}),
                                        (self.url, 'token', {'timeout': True}),
-                                       (self.url, 'token', {'ca_file': '/missing/meshdb-test-ca.pem'})]:
+                                       (self.url, 'token', {'ca_file': '/missing/nabedra-test-ca.pem'})]:
             with self.assertRaises(errors.ValidationError):
                 _ControlTransport(api_url, token, **kwargs)
         tls = _ControlTransport('https://localhost', 'token')
@@ -147,22 +148,22 @@ class ControlTransportTests(unittest.TestCase):
         # The socket is bound but never listens: connect fails before any send.
         with socket.socket() as refused:
             refused.bind(('127.0.0.1', 0))
-            from meshdb._control_transport import _ControlTransport
+            from nabedra._control_transport import _ControlTransport
             transport = _ControlTransport(f'http://127.0.0.1:{refused.getsockname()[1]}', 'token')
             with self.assertRaises(errors.TransportError):
                 transport.request('cluster.scale', {})
 
     def test_hostname_deadline_uses_reaped_resolver_and_returns_success(self):
-        from meshdb._control_transport import _ControlTransport
+        from nabedra._control_transport import _ControlTransport
         transport = _ControlTransport(self.url.replace('127.0.0.1', 'localhost'), 'token')
         request_id, data = transport.request('cluster.status', {}, deadline=time.monotonic() + 2)
         self.assertEqual(data, {'revision': 3})
         self.assertEqual(request_id, self.seen[0][2]['request_id'])
-        self.assertFalse(any(t.name.startswith('meshdb-control-deadline')
+        self.assertFalse(any(t.name.startswith('nabedra-control-deadline')
                              for t in threading.enumerate()))
 
     def test_deadline_interrupt_preserves_tls_state(self):
-        from meshdb._control_transport import _Deadline
+        from nabedra._control_transport import _Deadline
         raw, peer = socket.socketpair()
         with raw, peer:
             with ssl.create_default_context().wrap_socket(
@@ -211,7 +212,7 @@ class ControlTransportTests(unittest.TestCase):
             finally:
                 release.set()
                 self.assertTrue(finished.wait(2))
-            self.assertFalse(any(t.name.startswith('meshdb-control-deadline')
+            self.assertFalse(any(t.name.startswith('nabedra-control-deadline')
                                  and t.ident not in baseline for t in threading.enumerate()))
 
 

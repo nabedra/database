@@ -3,7 +3,7 @@ use std::{fs, time::Duration};
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("meshdb-material-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-material-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&path)?;
         Ok(Self(path))
     }

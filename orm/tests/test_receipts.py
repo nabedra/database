@@ -6,7 +6,7 @@ import uuid
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from meshdb import (DB, RequestReceipt, ConflictError, NotFoundError, ProtocolError,
+from nabedra import (Database, RequestReceipt, ConflictError, NotFoundError, ProtocolError,
                     ValidationError, AuthenticationError, TransportError, UnknownOutcomeError)
 
 
@@ -75,11 +75,11 @@ class ReceiptsTests(unittest.TestCase):
         type(self).receipt_gate = None
 
     def test_q04_reconnect_uses_receipt_without_resubmission(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         self.assertIsInstance(receipt, RequestReceipt)
         self.assertFalse(receipt.terminal)
         type(self).state, type(self).result = 'succeeded', [{'name': 'test'}]
-        another_api = DB(self.url, 'scope-token')
+        another_api = Database(self.url, 'scope-token')
         terminal = another_api.receipt(receipt.run_id, receipt.request_id)
         self.assertEqual(terminal.result, [{'name': 'test'}])
         self.assertTrue(terminal.terminal)
@@ -87,7 +87,7 @@ class ReceiptsTests(unittest.TestCase):
         self.assertTrue(all(auth == 'Bearer scope-token' for _, auth, _ in self.seen))
 
     def test_q05_same_identity_and_body_attach_conflicting_body_fails(self):
-        client = DB(self.url, 'scope-token')
+        client = Database(self.url, 'scope-token')
         identity = str(uuid.uuid4())
         first = client.submit('table.list', {}, request_id=identity)
         duplicate = client.submit('table.list', {}, request_id=identity)
@@ -98,7 +98,7 @@ class ReceiptsTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
 
     def test_q06_expiration_is_explicit_and_never_resubmits(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         type(self).expired = True
         with self.assertRaises(NotFoundError) as caught:
             receipt.poll()
@@ -106,7 +106,7 @@ class ReceiptsTests(unittest.TestCase):
         self.assertEqual(sum(body is not None for _, _, body in self.seen), 1)
 
     def test_wait_polls_same_identity(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         type(self).state, type(self).result = 'succeeded', []
         terminal = receipt.wait(timeout=1, poll_interval=0.001)
         self.assertEqual(terminal.result, [])
@@ -114,19 +114,19 @@ class ReceiptsTests(unittest.TestCase):
         self.assertEqual(len(self.seen), 2)
 
     def test_reject_result_in_nonterminal_state(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         type(self).result = 'fabricated'
         with self.assertRaises(ProtocolError):
             receipt.poll()
 
     def test_receipt_scope_is_authenticated_on_reconnect(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         with self.assertRaises(AuthenticationError):
-            DB(self.url, 'other-token').receipt(receipt.run_id, receipt.request_id)
+            Database(self.url, 'other-token').receipt(receipt.run_id, receipt.request_id)
         self.assertEqual(len(self.requests), 1)
 
     def test_invalid_identity_or_payload_creates_no_submission(self):
-        client = DB(self.url, 'scope-token')
+        client = Database(self.url, 'scope-token')
         for identity in ('not-a-uuid', str(uuid.uuid4()).upper(), 1):
             with self.subTest(identity=identity), self.assertRaises(ValidationError):
                 client.submit('table.list', {}, request_id=identity)
@@ -142,12 +142,12 @@ class ReceiptsTests(unittest.TestCase):
     def test_mutation_acceptance_without_run_is_unknown_and_never_retried(self):
         type(self).malformed_acceptance = True
         with self.assertRaises(UnknownOutcomeError) as caught:
-            DB(self.url, 'scope-token').submit('table.insert', {})
+            Database(self.url, 'scope-token').submit('table.insert', {})
         self.assertIsNotNone(caught.exception.request_id)
         self.assertEqual(len(self.seen), 1)
 
     def test_wait_deadline_bounds_receipt_http_io_without_cancelling_work(self):
-        receipt = DB(self.url, 'scope-token', timeout=5).submit('table.list', {})
+        receipt = Database(self.url, 'scope-token', timeout=5).submit('table.list', {})
         gate = threading.Event()
         type(self).receipt_gate = gate
         started = time.monotonic()
@@ -160,7 +160,7 @@ class ReceiptsTests(unittest.TestCase):
             gate.set()
 
     def test_wait_rejects_invalid_or_overflowing_durations(self):
-        receipt = DB(self.url, 'scope-token').submit('table.list', {})
+        receipt = Database(self.url, 'scope-token').submit('table.list', {})
         before = len(self.seen)
         for duration in (0, -1, True, float('nan'), float('inf'), 10 ** 1000):
             with self.subTest(duration=type(duration).__name__), self.assertRaises(ValidationError):

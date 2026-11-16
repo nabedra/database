@@ -84,7 +84,7 @@ impl S3Store {
             &c.secret_access_key,
             c.session_token.clone(),
             None,
-            "meshdb-gateway-snapshot",
+            "nabedra-gateway-snapshot",
         );
         // Starting from an empty SDK builder deliberately excludes operator
         // identity, profile/process resolution and endpoint environment settings.
@@ -250,13 +250,13 @@ mod live_context_probe {
     #[ignore = "requires explicitly authorized fresh live S3 fixture"]
     async fn explicit_context_first_use() {
         assert_eq!(
-            std::env::var("MESHDB_LIVE_CONTEXT_PROBE").ok().as_deref(),
+            std::env::var("NABEDRA_LIVE_CONTEXT_PROBE").ok().as_deref(),
             Some("1")
         );
         let context: super::super::context::RequestContext = serde_json::from_value(serde_json::json!({
-            "version":1,"bucket":std::env::var("MESHDB_S3_BUCKET").unwrap(),
+            "version":1,"bucket":std::env::var("NABEDRA_S3_BUCKET").unwrap(),
             "region":std::env::var("AWS_REGION").or_else(|_|std::env::var("AWS_DEFAULT_REGION")).unwrap(),
-            "prefix":std::env::var("MESHDB_S3_PREFIX").unwrap(),
+            "prefix":std::env::var("NABEDRA_S3_PREFIX").unwrap(),
             "credentials":{"access_key_id":std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
             "secret_access_key":std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
             "session_token":std::env::var("AWS_SESSION_TOKEN").ok(),"expires_at":null}

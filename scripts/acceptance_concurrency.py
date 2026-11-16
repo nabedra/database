@@ -212,7 +212,7 @@ class _SnapshotReader:
 
 
 def _concurrent_insert(server, table, c, record):
-    from meshdb import DB
+    from nabedra import Database
 
     barrier = Barrier(_CLIENTS, timeout=_BARRIER_TIMEOUT)
     cancelled = Event()
@@ -225,7 +225,7 @@ def _concurrent_insert(server, table, c, record):
 
     def worker(index):
         try:
-            client = DB(server.api_url, server.private_token, timeout=30)
+            client = Database(url=server.api_url, token=server.private_token, timeout=30)
             own_table = client.table(table.name)
             require(own_table.id == table.id)
             rows = [{'id': f'client_{index}_{i}', 'value': index * _BATCH + i}
@@ -269,9 +269,9 @@ def _concurrent_insert(server, table, c, record):
 
 
 def _scenario(server, reader, c, record):
-    from meshdb import DB, NotFoundError
+    from nabedra import Database, NotFoundError
 
-    db = DB(server.api_url, server.private_token)
+    db = Database(url=server.api_url, token=server.private_token)
     schema = {'id': str, 'value': int}
     main = c.table(db, 'concurrent_rows', schema, 'id')
     seed = {'id': 'seed', 'value': -1}
@@ -350,7 +350,7 @@ def run_scenario(config, binary=None):
         namespace = config.allocate_prefix(6, 'concurrency')
         record['allocated_prefix'] = namespace.prefix
         c.label = 'private_local_directory'
-        resources = TemporaryDirectory(prefix='meshdb-concurrency-')
+        resources = TemporaryDirectory(prefix='nabedra-concurrency-')
         reader = _SnapshotReader(config, namespace, resources.name)
         c.label = 'process_setup'
         server = ServerProcess(config, namespace, binary=binary)

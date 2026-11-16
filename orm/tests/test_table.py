@@ -5,9 +5,9 @@ import unittest
 from dataclasses import FrozenInstanceError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import meshdb
-from meshdb import errors
-from meshdb.client import _Transport
+import nabedra
+from nabedra import errors
+from nabedra.client import _Transport
 
 LIMIT = 8 * 1024 * 1024
 TABLE_ID = '12345678-1234-4234-8234-123456789ABC'
@@ -56,13 +56,13 @@ class TableTests(unittest.TestCase):
         type(self).result, type(self).status = result, status
 
     def table(self, data=None):
-        from meshdb.table import _table_from_descriptor
+        from nabedra.table import _table_from_descriptor
         return _table_from_descriptor(self.transport, descriptor() if data is None else data)
 
     def test_handle_owns_metadata_and_query_construction_is_local(self):
         source = descriptor()
         table = self.table(source)
-        self.assertIsInstance(table, meshdb.Table)
+        self.assertIsInstance(table, nabedra.Table)
         source['schema']['age'] = 'utf8'
         source['id'] = 'changed'
         schema = table.schema
@@ -75,7 +75,7 @@ class TableTests(unittest.TestCase):
         self.assertIs(query._table, table)
         self.assertEqual(query._to_wire()['filter'], {'op': 'eq', 'column': 'age', 'value': 18})
         self.assertEqual(self.seen, [])
-        from meshdb.table import _table_from_descriptor
+        from nabedra.table import _table_from_descriptor
         self.reply(descriptor())
         decoded = self.transport.request('table.describe', {'name': 'users'},
                                          decode=lambda data: _table_from_descriptor(self.transport, data))
@@ -91,7 +91,7 @@ class TableTests(unittest.TestCase):
                {**descriptor(), 'key': 'active'}, {**descriptor(), 'format': 'csv'}]
         for data in bad:
             with self.subTest(data=data), self.assertRaises((errors.ValidationError, errors.ProtocolError)):
-                from meshdb.table import _table_from_descriptor
+                from nabedra.table import _table_from_descriptor
                 _table_from_descriptor(self.transport, data)
 
     def test_crud_payloads_and_server_results(self):

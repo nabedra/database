@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CHILD = Path(__file__).parent / 'support' / 'serve_child.py'
 HOST = r'''
 import json, os, signal, socket, sys
-from meshdb import _serve_process as p
+from nabedra import _serve_process as p
 p._STARTUP_SECONDS = 2.0
 p._EXIT_SECONDS = .3
 p._FRAME_SECONDS = .15
@@ -95,10 +95,10 @@ class ServeProcessTests(unittest.TestCase):
         record = Path(temp.name) / 'child.jsonl'
         config.write_text(json.dumps(dict(mode=mode, record=str(record))))
         env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT') if k in os.environ}
-        env.update(PYTHONPATH=str(ROOT / 'src'), MESHDB_SERVER_BINARY=str(CHILD),
-                   MESHDB_SUPERVISOR_FD='discard-me')
+        env.update(PYTHONPATH=str(ROOT / 'src'), NABEDRA_SERVER_BINARY=str(CHILD),
+                   NABEDRA_SUPERVISOR_FD='discard-me')
         if mode == 'missing_binary':
-            env['MESHDB_SERVER_BINARY'] = str(config.parent / 'absent')
+            env['NABEDRA_SERVER_BINARY'] = str(config.parent / 'absent')
         host = subprocess.Popen([sys.executable, '-c', HOST, str(config)], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         def cleanup():
@@ -125,7 +125,7 @@ class ServeProcessTests(unittest.TestCase):
         if not line:
             self.fail(host.stderr.read().decode() or 'host exited before ready')
         value = json.loads(line)
-        self.assertEqual(value['event'], 'meshdb.serve.ready')
+        self.assertEqual(value['event'], 'nabedra.serve.ready')
         self.assertNotIn(':0', value['bound_url'])
 
     def finish(self, host, config, record):
@@ -172,7 +172,7 @@ class ServeProcessTests(unittest.TestCase):
 
     def test_failed_spawn_closes_both_socket_ends(self):
         from unittest.mock import patch
-        from meshdb import _serve_process as p
+        from nabedra import _serve_process as p
         observed = []
         original = p._Owner.close
         def closed(owner):
@@ -182,7 +182,7 @@ class ServeProcessTests(unittest.TestCase):
         with patch.object(p, 'resolve_server_binary', return_value=str(CHILD)), \
                 patch.object(p.subprocess, 'Popen', side_effect=OSError('SECRET')), \
                 patch.object(p._Owner, 'close', closed):
-            with self.assertRaises(p.MeshDBError) as caught:
+            with self.assertRaises(p.NabedraError) as caught:
                 p.run_process('/already/validated', dict(version=1, type='init',
                     name='test', initial_policy=dict(mode='fixed', desired=0,
                     min_nodes=0, max_nodes=0), provisioning='external', bridge=None),
@@ -202,10 +202,10 @@ class ServeProcessTests(unittest.TestCase):
 
     def test_selector_failure_stops_admission_and_sanitizes(self):
         from unittest.mock import patch
-        from meshdb import _serve_process as p
+        from nabedra import _serve_process as p
         stopped = []
         with patch.object(p.selectors, 'DefaultSelector', side_effect=OSError('SECRET')):
-            with self.assertRaises(p.MeshDBError) as caught:
+            with self.assertRaises(p.NabedraError) as caught:
                 p.run_process('/already/validated', {}, prepared=lambda _: None,
                               stop=lambda: stopped.append(True))
         self.assertEqual(stopped, [True])

@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from ._binary import resolve_server_binary
-from .errors import MeshDBError
+from .errors import NabedraError
 
 _STARTUP_SECONDS = 30.0
 _FRAME_SECONDS = 2.0
@@ -30,7 +30,7 @@ _FATAL = {'invalid_config', 'incompatible_cluster', 'storage_unavailable',
 
 
 def _failure(code='protocol_error'):
-    return MeshDBError('MeshDB API process failed.', code=code)
+    return NabedraError('Nabedra Database API process failed.', code=code)
 
 
 def _object(pairs):
@@ -186,8 +186,8 @@ class _Owner:
         self.channel, self.peer = socket.socketpair()
         self.channel.setblocking(False)
         env = os.environ.copy()
-        env.pop('MESHDB_SUPERVISOR_FD', None)
-        env['MESHDB_SUPERVISOR_FD'] = str(self.peer.fileno())
+        env.pop('NABEDRA_SUPERVISOR_FD', None)
+        env['NABEDRA_SUPERVISOR_FD'] = str(self.peer.fileno())
         self.child = subprocess.Popen(
             [binary if binary is not None else resolve_server_binary(), 'api', '--config', os.path.abspath(config)]
             + (['--cold-start'] if cold_start else []) + (['--migrate-catalog'] if migrate_catalog else []),
@@ -276,7 +276,7 @@ class _Owner:
                 raise _failure('child_exited')
             self.pump(effective)
 
-    def announce(self, url, deadline, *, event="meshdb.serve.ready"):
+    def announce(self, url, deadline, *, event="nabedra.serve.ready"):
         data = memoryview((json.dumps({'event': event, 'bound_url': url},
                                      separators=(',', ':')) + '\n').encode())
         fd = sys.stdout.fileno()
@@ -449,7 +449,7 @@ def run_process(config_path, startup, *, prepared, stop, _receipt=None, cold_sta
         raise _failure()
     except _Interrupted:
         pass
-    except MeshDBError as error:
+    except NabedraError as error:
         failure = _failure(error.code if error.code in _FATAL | {
             'startup_timeout', 'child_exited', 'announcement_failed'} else 'startup_failed')
     except (KeyboardInterrupt, SystemExit) as error:

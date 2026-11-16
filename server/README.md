@@ -1,6 +1,6 @@
-# MeshDB v0 server
+# Nabedra Database v0 server
 
-The `meshdb-server` Rust binary serves the table and query API over HTTP or
+The `nabedra-database-server` Rust binary serves the table and query API over HTTP or
 native HTTPS. Durable table data uses the configured object store. `serve`
 composes one API with a local worker; `api --config PATH` and
 `worker --bootstrap PATH` run separate processes with the same request, receipt,
@@ -87,14 +87,14 @@ dependency versions in [Cargo.toml](Cargo.toml), and records resolution in
 
 ```sh
 cargo build --locked --manifest-path server/Cargo.toml
-server/target/debug/meshdb-server serve
+server/target/debug/nabedra-database-server serve
 ```
 
 For a release binary:
 
 ```sh
 cargo build --locked --release --manifest-path server/Cargo.toml
-server/target/release/meshdb-server serve
+server/target/release/nabedra-database-server serve
 ```
 
 Configure the environment before starting either binary. For example, with an
@@ -103,10 +103,10 @@ already configured AWS profile and a token supplied in the environment:
 ```sh
 export AWS_PROFILE='<configured-profile>'
 export AWS_REGION='<bucket-region>'
-export MESHDB_S3_BUCKET='<existing-bucket>'
-export MESHDB_S3_PREFIX='meshdb-v0/'
-: "${MESHDB_TOKEN:?Set MESHDB_TOKEN to your shared bearer token}"
-server/target/debug/meshdb-server serve
+export NABEDRA_S3_BUCKET='<existing-bucket>'
+export NABEDRA_S3_PREFIX='nabedra-v0/'
+: "${NABEDRA_TOKEN:?Set NABEDRA_TOKEN to your shared bearer token}"
+server/target/debug/nabedra-database-server serve
 ```
 
 For development in this shared checkout, keep Cargo commands sequential and
@@ -122,9 +122,9 @@ explicit HTTP-backend, authentication and worker configuration files; see
 
 | Environment variable | Requirement and meaning |
 | --- | --- |
-| `MESHDB_S3_BUCKET` | Required, nonempty existing S3 general purpose bucket. The server does not create buckets. |
-| `MESHDB_TOKEN` | Required, nonempty shared bearer token for operations. Use a header-safe token shared with clients. |
-| `MESHDB_S3_PREFIX` | Optional database namespace, default `meshdb-v0/`. An explicit empty prefix is invalid. Trailing slashes normalize to one; absolute paths, traversal, empty internal components and unsafe escaped paths are rejected. |
+| `NABEDRA_S3_BUCKET` | Required, nonempty existing S3 general purpose bucket. The server does not create buckets. |
+| `NABEDRA_TOKEN` | Required, nonempty shared bearer token for operations. Use a header-safe token shared with clients. |
+| `NABEDRA_S3_PREFIX` | Optional database namespace, default `nabedra-v0/`. An explicit empty prefix is invalid. Trailing slashes normalize to one; absolute paths, traversal, empty internal components and unsafe escaped paths are rejected. |
 | `AWS_REGION` | Bucket region, required unless resolved by the standard AWS region chain. |
 | `AWS_PROFILE` | Optional named shared AWS profile. Profiles and role-based credentials are valid server configurations. |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Optional environment credentials for the standard AWS credential chain; unnecessary when another provider supplies credentials. |
@@ -136,12 +136,12 @@ shared profiles and roles. AWS credentials stay on the server; clients need only
 the API URL and bearer token. The configured identity needs access to read and
 conditionally write objects beneath the database prefix.
 
-The supplied `.env` uses `BUCKET_NAME`. The server requires `MESHDB_S3_BUCKET`
+The supplied `.env` uses `BUCKET_NAME`. The server requires `NABEDRA_S3_BUCKET`
 and does not implicitly load dotenv files or translate `BUCKET_NAME`. Supply
 the server variables explicitly through the process environment or your service
 manager. The guarded acceptance scripts below perform their own dotenv loading.
 
-`meshdb-server serve` accepts exactly these application flags, plus standard
+`nabedra-database-server serve` accepts exactly these application flags, plus standard
 Clap help/version options:
 
 | Flag | Default | Constraint |
@@ -171,7 +171,7 @@ worker-memory request queue.
 For example:
 
 ```sh
-server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
 ```
 
 `--partition-size '64 KB'` is equivalent. Units are mandatory and case-insensitive:
@@ -195,7 +195,7 @@ Without TLS flags, the listener serves HTTP. To serve native HTTPS on an
 explicit nonloopback address:
 
 ```sh
-server/target/release/meshdb-server serve --host 0.0.0.0 --port 8443 \
+server/target/release/nabedra-database-server serve --host 0.0.0.0 --port 8443 \
   --workers 4 --queue-size 64 \
   --tls-cert /path/to/server-cert.pem --tls-key /path/to/server-key.pem
 ```
@@ -221,7 +221,7 @@ operation admission, return empty bodies and expose no configuration.
 
 ```sh
 curl --fail-with-body --silent --show-error \
-  -H "Authorization: Bearer ${MESHDB_TOKEN}" \
+  -H "Authorization: Bearer ${NABEDRA_TOKEN}" \
   -H 'Content-Type: application/json' \
   --data '{"request_id":"00000000-0000-4000-8000-000000000001","operation":"table.list","payload":{}}' \
   http://127.0.0.1:8000/v1/operations
@@ -352,11 +352,11 @@ silently acknowledges migration of a pre-existing legacy catalog. Do not substit
 or manually replay a recorded acceptance prefix. Run the runners sequentially:
 
 ```sh
-orm/.venv/bin/python scripts/acceptance_http.py --binary server/target/debug/meshdb-server
-orm/.venv/bin/python scripts/acceptance_lifecycle.py --binary server/target/debug/meshdb-server
-orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/meshdb-server
-orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/meshdb-server
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/meshdb-server
+orm/.venv/bin/python scripts/acceptance_http.py --binary server/target/debug/nabedra-database-server
+orm/.venv/bin/python scripts/acceptance_lifecycle.py --binary server/target/debug/nabedra-database-server
+orm/.venv/bin/python scripts/acceptance_concurrency.py --binary server/target/debug/nabedra-database-server
+orm/.venv/bin/python scripts/acceptance_latency.py --binary server/target/debug/nabedra-database-server
+PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_partitions.py --binary server/target/debug/nabedra-database-server
 ```
 
 The [HTTP runner](../scripts/acceptance_http.py) checks types, CRUD and queries;
@@ -394,15 +394,15 @@ Run from the repository root using the existing dependency cache:
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
-  cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin meshdb-server
-python3.11 scripts/acceptance_nodes.py --binary server/target/debug/meshdb-server
+  cargo build --manifest-path server/Cargo.toml --locked --offline --no-default-features --bin nabedra-database-server
+python3.11 scripts/acceptance_nodes.py --binary server/target/debug/nabedra-database-server
 ```
 
 The runner needs Python 3.11+, its standard library and loopback TCP. It creates and
 removes its own SQLite store and configuration. It reads no dotenv or cloud
-profiles. Its startup exchange demonstrates `meshdb-server api --config PATH`
-over the inherited `MESHDB_SUPERVISOR_FD` socket and
-`meshdb-server worker --bootstrap PATH`. An API requires that supervisor
+profiles. Its startup exchange demonstrates `nabedra-database-server api --config PATH`
+over the inherited `NABEDRA_SUPERVISOR_FD` socket and
+`nabedra-database-server worker --bootstrap PATH`. An API requires that supervisor
 exchange; it is not an unsupervised standalone command. `api` also accepts
 `--migrate-catalog` and `--cold-start` with the same migration and cold-run
 confirmation requirements described above.
@@ -422,3 +422,12 @@ See [provider configuration](../docs/testing/provisioning-adapters.md) for manag
 workers and the live-infrastructure verification boundary. Signal shutdown drains
 owned local work; provider termination additionally requires a distributed idle
 proof.
+
+
+## Existing storage and cluster compatibility
+
+The rename keeps catalog and snapshot formats unchanged. Storage identity digests, configuration and template fingerprint domains, persisted worker verifier domains, and the stored `meshdb.callbacks.v1` callback adapter contract retain their original values. Existing committed data does not need a format migration for the rename. The real acceptance bucket `meshdb-testing` also retains its infrastructure name.
+
+The default namespace for a new legacy `serve` process is now `nabedra-v0/`. To reopen data previously written under the default namespace, set `NABEDRA_S3_PREFIX=meshdb-v0/` explicitly, or keep the existing configured namespace. Renaming a namespace selects a different database; it does not move existing objects.
+
+Environment settings now use `NABEDRA_*`, and HTTP headers use `X-Nabedra-Storage` and the internal `X-Nabedra-*` prefix. `X-Nabedra-Database` selects a database at the Python gateway. Restart the cluster with matching renamed API, worker and client versions, since peer authentication domains and headers changed. The public launcher is `nabedra database <command>`; direct Rust commands use `nabedra-database-server <command>`.

@@ -1,4 +1,4 @@
-use meshdb_server::storage::*;
+use nabedra_database_server::storage::*;
 
 #[test]
 fn canonical_metadata_allowlist() {
@@ -43,7 +43,7 @@ impl Service {
                 .arg(directory.join("store.sqlite"));
         }
         let mut child = command
-            .env("MESHDB_STORE_TOKEN", "disposable-test-token")
+            .env("NABEDRA_STORE_TOKEN", "disposable-test-token")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -92,7 +92,9 @@ impl Drop for Service {
 async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicity() {
     use axum::{Router, body::Body, http::Request};
     use http_body_util::BodyExt;
-    use meshdb_server::{api, engine::Engine, executor::Executor, worker_pool::WorkerPool};
+    use nabedra_database_server::{
+        api, engine::Engine, executor::Executor, worker_pool::WorkerPool,
+    };
     use serde_json::{Value, json};
     use std::num::NonZeroUsize;
     use tower::ServiceExt;
@@ -122,7 +124,7 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
     }
 
     let directory =
-        std::env::temp_dir().join(format!("meshdb-engine-http-{}", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("nabedra-engine-http-{}", uuid::Uuid::new_v4()));
     let mut service = Service::start(directory.clone());
     let storage = service.storage();
     storage.initialize_catalog().await.unwrap();
@@ -233,7 +235,7 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
         .lookup_decision_by_id(
             &after,
             uuid::Uuid::parse_str(result["request_id"].as_str().unwrap()).unwrap(),
-            meshdb_server::storage::HistoryBudget::new(
+            nabedra_database_server::storage::HistoryBudget::new(
                 8,
                 64 * 1024,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -284,7 +286,7 @@ async fn api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicit
 
 #[tokio::test]
 async fn actual_service_cas_restart_bounds_and_guards() {
-    let directory = std::env::temp_dir().join(format!("meshdb-http-{}", uuid::Uuid::new_v4()));
+    let directory = std::env::temp_dir().join(format!("nabedra-http-{}", uuid::Uuid::new_v4()));
     let mut service = Service::start(directory.clone());
     let store = service.storage();
     let key = ObjectKey::catalog();
@@ -581,7 +583,7 @@ async fn incomplete_and_malformed_responses_never_claim_success_or_retry() {
 #[tokio::test]
 async fn tls_requires_trusted_ca_and_retains_verification() {
     let service = Service::launch(
-        std::env::temp_dir().join(format!("meshdb-http-tls-{}", uuid::Uuid::new_v4())),
+        std::env::temp_dir().join(format!("nabedra-http-tls-{}", uuid::Uuid::new_v4())),
         true,
     );
     let pem = std::fs::read(service.directory.join("tls/ca.crt")).unwrap();

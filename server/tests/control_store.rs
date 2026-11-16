@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     cluster::{
         configuration::{Template, Timing},
         state::{Control, MAX_CONTROL_BYTES, PolicyMode},
@@ -28,7 +28,7 @@ fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 fn root() -> Value {
-    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
     let hash = Template::decode(&serde_json::to_vec(&template).unwrap())
         .unwrap()
         .fingerprint()
@@ -538,7 +538,7 @@ async fn retained_root_without_new_admission_room_still_loads_unchanged() {
     let c = Control::decode(&serde_json::to_vec(&v).unwrap()).unwrap();
     assert_eq!(
         c.check_new_admission(),
-        Err(meshdb_server::cluster::state::ControlError::LimitExceeded)
+        Err(nabedra_database_server::cluster::state::ControlError::LimitExceeded)
     );
     let s = store(Backend::default());
     let bytes = c.encode().unwrap();

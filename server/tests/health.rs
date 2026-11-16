@@ -1,11 +1,11 @@
 use axum::{Router, body::Body, http::Request};
 use http_body_util::BodyExt;
-use meshdb_server::{
+use nabedra_database_server::{
     api::health,
     engine::Engine,
     storage::{Catalog, Namespace, Storage},
 };
-use meshdb_server::{
+use nabedra_database_server::{
     partition_size::PartitionSize,
     worker_pool::{WorkerPool, WorkerThreads},
 };
@@ -79,10 +79,10 @@ async fn readiness_reads_fresh_validated_catalogs_without_writes() {
     let mut legacy: serde_json::Value = serde_json::from_slice(&valid).unwrap();
     legacy["format_version"] = 1.into();
     let mut cluster =
-        meshdb_server::storage::ClusterCatalog::from_catalog(&Catalog::empty()).unwrap();
+        nabedra_database_server::storage::ClusterCatalog::from_catalog(&Catalog::empty()).unwrap();
     let v3 = cluster.encode().unwrap();
     cluster.format_version = 4;
-    cluster.fence = Some(meshdb_server::storage::CatalogFence {
+    cluster.fence = Some(nabedra_database_server::storage::CatalogFence {
         run_id: uuid::Uuid::new_v4(),
         scheduler_term: 1,
     });

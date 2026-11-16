@@ -21,7 +21,7 @@ FIELDS = {
 
 def require(ok):
     if not ok:
-        raise ValueError('Invalid MeshDB protocol')
+        raise ValueError('Invalid Nabedra Database protocol')
 
 def identity(value):
     require(type(value) is str and str(uuid.UUID(value)) == value)

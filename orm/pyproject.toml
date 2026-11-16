@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meshdb"
+name = "nabedra-database"
 version = "0.1.0"
-description = "Pure Python client for the MeshDB HTTP API"
+description = "Pure Python client for the Nabedra Database HTTP API"
 requires-python = ">=3.11"
 dependencies = []
 
@@ -14,7 +14,7 @@ gateway = ["httpx>=0.27,<1"]
 aws = ["boto3>=1.34,<2"]
 
 [project.scripts]
-meshdb = "meshdb.cli:main"
+nabedra = "nabedra.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

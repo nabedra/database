@@ -7,8 +7,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-from meshdb import errors
-from meshdb.client import _Transport
+from nabedra import errors
+from nabedra.client import _Transport
 
 LIMIT = 8 * 1024 * 1024
 
@@ -78,11 +78,11 @@ class TransportTests(unittest.TestCase):
         self.assertNotEqual(*ids)
 
     def test_server_error_mapping_and_diagnostics(self):
-        cases = [('validation_error', 400, errors.ValidationError), ('unsupported_operation', 400, errors.MeshDBError),
+        cases = [('validation_error', 400, errors.ValidationError), ('unsupported_operation', 400, errors.NabedraError),
                  ('unauthorized', 401, errors.AuthenticationError), ('not_found', 404, errors.NotFoundError),
                  ('conflict', 409, errors.ConflictError), ('limit_exceeded', 413, errors.LimitExceededError),
                  ('overloaded', 429, errors.OverloadedError), ('storage_unavailable', 503, errors.StorageError),
-                 ('internal_error', 500, errors.MeshDBError)]
+                 ('internal_error', 500, errors.NabedraError)]
         for code, status, expected in cases:
             with self.subTest(code=code):
                 self.set_reply({'request_id': None, 'error': {'code': code, 'message': 'failed', 'outcome': 'not_applied'}}, status)

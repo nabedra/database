@@ -107,9 +107,9 @@ class TraceForward(socketserver.BaseRequestHandler):
             lines = header.split(b'\r\n')
             path = lines[0].split(b' ')[1].decode('ascii')
             headers = dict((k.lower(), v.strip()) for k, v in (line.split(b':', 1) for line in lines[1:]))
-            auth = json.loads(bytes.fromhex(headers[b'x-meshdb-auth'].decode())) if b'x-meshdb-auth' in headers else {}
+            auth = json.loads(bytes.fromhex(headers[b'x-nabedra-auth'].decode())) if b'x-nabedra-auth' in headers else {}
             operation = auth.get('operation_id')
-            queue_auth = json.loads(bytes.fromhex(headers[b'x-meshdb-queue-auth'].decode())) if b'x-meshdb-queue-auth' in headers else {}
+            queue_auth = json.loads(bytes.fromhex(headers[b'x-nabedra-queue-auth'].decode())) if b'x-nabedra-queue-auth' in headers else {}
             record = dict(method=lines[0].split(b' ')[0].decode('ascii'), path=path, operation_id=operation, node=auth.get('receiver', {}).get('node_id'),
                           sender=auth.get('sender', {}).get('node_id'), admission_id=auth.get('admission_id'),
                           dependency_id=auth.get('dependency_id'), job_id=auth.get('job_id'),
@@ -939,7 +939,7 @@ def machine():
 
 
 def run(args):
-    evidence = dict(started_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=machine(), seed=args.seed, binary='server/target/debug/meshdb-server' if args.binary == Path(__file__).resolve().parents[1] / 'server/target/debug/meshdb-server' else args.binary.name,
+    evidence = dict(started_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), machine=machine(), seed=args.seed, binary='server/target/debug/nabedra-database-server' if args.binary == Path(__file__).resolve().parents[1] / 'server/target/debug/nabedra-database-server' else args.binary.name,
                     build=dict(profile='dev', optimization='unoptimized', debug_info='disabled',
                                CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', CARGO_INCREMENTAL='0',
                                provenance='explicit orchestrator build configuration; throughput is not a release-profile claim'),
@@ -955,7 +955,7 @@ def run(args):
         if args.suite in ('all', 'caps', 'load', 'benchmark'):
             caps = tuple(args.benchmark_caps) if args.suite == 'benchmark' else (1, 2, 3) if args.suite != 'load' else (3,)
             for cap in caps:
-                with tempfile.TemporaryDirectory(prefix='meshdb-load-') as directory:
+                with tempfile.TemporaryDirectory(prefix='nabedra-load-') as directory:
                     cluster = LoadCluster(args.binary, directory, execution(cap=cap), args.receipt_poll_interval)
                     observer = None
                     try:
@@ -984,7 +984,7 @@ def run(args):
                         cluster.close()
                         save()
         if args.suite in ('all', 'load', 'conservation'):
-            with tempfile.TemporaryDirectory(prefix='meshdb-conservation-') as directory:
+            with tempfile.TemporaryDirectory(prefix='nabedra-conservation-') as directory:
                 cluster = LoadCluster(args.binary, directory, execution(retention_ms=3600000), args.receipt_poll_interval)
                 observer = None
                 try:
@@ -1006,7 +1006,7 @@ def run(args):
                     save()
         if args.suite in ('all', 'overflow'):
             for kind, limits in (('count', execution(pending=8)), ('bytes', execution(pending=100, queue_bytes=40000))):
-                with tempfile.TemporaryDirectory(prefix='meshdb-overflow-') as directory:
+                with tempfile.TemporaryDirectory(prefix='nabedra-overflow-') as directory:
                     cluster = LoadCluster(args.binary, directory, limits, args.receipt_poll_interval)
                     try:
                         table, rows, _, _ = setup(cluster, args.seed, many=False)

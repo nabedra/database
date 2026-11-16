@@ -17,7 +17,7 @@ struct StoreProcess {
 }
 impl StoreProcess {
     fn start() -> Self {
-        let path = std::env::temp_dir().join(format!("meshdb-shared-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-shared-{}", Uuid::new_v4()));
         std::fs::create_dir(&path).unwrap();
         let mut child = std::process::Command::new("python3.11")
             .args([
@@ -28,7 +28,7 @@ impl StoreProcess {
                 "--database",
             ])
             .arg(path.join("objects.sqlite"))
-            .env("MESHDB_STORE_TOKEN", "test-secret")
+            .env("NABEDRA_STORE_TOKEN", "test-secret")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()

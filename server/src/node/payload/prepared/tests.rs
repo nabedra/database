@@ -25,7 +25,8 @@ struct Scratch {
 }
 impl Scratch {
     fn new() -> Self {
-        let parent = std::env::temp_dir().join(format!("meshdb-prepared-{}", uuid::Uuid::new_v4()));
+        let parent =
+            std::env::temp_dir().join(format!("nabedra-prepared-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&parent).unwrap();
         Self {
             spool: Some(
@@ -38,7 +39,7 @@ impl Scratch {
         &self,
         bytes: u64,
         files: u64,
-    ) -> std::sync::Arc<meshdb_server::node::spool::SpoolOperation> {
+    ) -> std::sync::Arc<nabedra_database_server::node::spool::SpoolOperation> {
         std::sync::Arc::new(
             self.spool
                 .as_ref()

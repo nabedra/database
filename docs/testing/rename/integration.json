@@ -1,0 +1,114 @@
+{
+  "timestamp": "2026-11-16T14:43:48.596312+00:00",
+  "assertions": [
+    "CLI01 installed CLI and compatible native binary versions",
+    "U01/C01 subset actual CLI API and one two-thread worker enrolled",
+    "U01 subset OLTP exact insert/get/filter for 10, 100 and 1000 rows",
+    "U01 subset OLAP reads the same 1110 committed rows",
+    "invalid mode rejected locally; NABEDRA_TOKEN fallback; absent token rejected",
+    "F03 subset graceful SIGTERM reaps API and worker",
+    "R04 subset cold restart retains all 1110 committed rows",
+    "F03 subset restarted CLI reaps API and worker"
+  ],
+  "scope": "local conditional SQLite service; no AWS or full scheduler acceptance",
+  "result": "passed",
+  "binary_sha256": "2790afac37bf79561b239742cb39a47ba7be4204c6289e8a9d141cd464c7acb4",
+  "version": {
+    "cli": "0.1.0",
+    "binary": "0.1.0",
+    "config": 2,
+    "protocol": 1
+  },
+  "phase": "complete",
+  "enrollment": {
+    "ready": 1,
+    "newly_enrolled": 1
+  },
+  "readiness_probe_attempts": [
+    1,
+    1
+  ],
+  "client": {
+    "phase": "create",
+    "distribution": "nabedra-database",
+    "import": "nabedra",
+    "package_version": "0.1.0",
+    "python_version": "3.11.10",
+    "installed_prefix_verified": true,
+    "row_counts": [
+      10,
+      100,
+      1000
+    ],
+    "total_rows": 1110,
+    "source_sha256": {
+      "_serve_process.py": "737527145359687e318eff4262409651dbd6aa2b4d27dd99f128e308ce2c5093",
+      "gateway.py": "2bb85ad16f895a1175125ece9b8ec4dc86727dab07a80c5ef6097099e2528554",
+      "_control_transport.py": "bace1c535ad7deee0334b88c23e7234cf006a9cb48fa2dbdec25ca1796ed2ba0",
+      "_cli_supervise.py": "10688e5fdd7d1887741051d7cb43769a5823e79b1873d1eff8f5e2e7a58bddcf",
+      "_callback_pool.py": "6dc4322d894b1c7b876a2604e437fff0f1433c44578ddd7ab85d3915b8fdd8a1",
+      "query.py": "5cb1dd00d5552929a851f4be4814705e0b5ea72680ff6386b3f6292a22a901f7",
+      "_cli_config.py": "63ab5443f472199d70ccf4624c00ae8b1a2492247bbe897d569b6ae77ae6ace0",
+      "client.py": "c2887768f2e9b7d97f68d0dcbe35dc62238a7f440c3368d819eb824a7ffd1d28",
+      "_callback_bridge.py": "ea5b8d470464bb295d2536eb5779b79f0d5598303caab094e8075edc092bf4a6",
+      "__init__.py": "8d91799f587cd216b47025386bd4f74295737e532c7cf840bc54cc18ac30bc5a",
+      "serve.py": "bff87707c150c9768b24a436a6e67266dca8503733d510db0eac43833f85b40d",
+      "gateway_protocol.py": "2da3e956739b2e28b5f204e1b7877e68b414f4800e47f0308831ffa65fb8b2d9",
+      "aws.py": "eca0ce44cd71b853450df3111f013afbc4fe7ac6aaf4a6040810d0d6d9a49d2c",
+      "providers.py": "197a0500acca81a85f9da24a5c45e14080f31a213343ec2acd804fbdcc6f1e79",
+      "cli.py": "becc9015e3975ff641591a83e0ee231e09ffda1a2b0caa5c38f1f5e4d9e94f51",
+      "cluster.py": "94ae6088fdf87def3086d3febab85b9c9ad9ff34f72ba6d16fffeea34e36484d",
+      "_callback_protocol.py": "713ab243e39f76e4b54751551498a0d2fd27607abe9df761298b3847876b9ee7",
+      "table.py": "b5a122611819f8414f50b59e57a6981051505cea07104684d4a9bc3144ad75db",
+      "errors.py": "a4c93aceb6c652fc7e9259a5cc898f540498964f9ef63700ebe6b04035bd8bca",
+      "_serve_guard.py": "5a26b6f0bdbf10a05ef86c8ba87b2716f80b16a6f1db2a61d77ac385d75a3ef6",
+      "_binary.py": "97f36c62384c16d4a283bf22f241f2fbf33acf6bc2083812c519343165840c70",
+      "__main__.py": "c4c03c52b11be342209bb77337d806693bef9675404873c17d88d2fc72d33646",
+      "_serve_args.py": "78f2e0f43e4616a113d6161b518265a377a46d946789900ceca86ac2266ff3f1",
+      "expr.py": "576fccd75fc0de63baba35cda46eadd8abdeba41820509fe5a8ad9e3cd69c7a4",
+      "validation.py": "6275f6cab973ca5511db5729827efb21261a75becaa63a0e6c5fe8e3e98e7d98"
+    }
+  },
+  "restart": {
+    "phase": "reopen",
+    "distribution": "nabedra-database",
+    "import": "nabedra",
+    "package_version": "0.1.0",
+    "python_version": "3.11.10",
+    "installed_prefix_verified": true,
+    "row_counts": [
+      10,
+      100,
+      1000
+    ],
+    "total_rows": 1110,
+    "source_sha256": {
+      "_serve_process.py": "737527145359687e318eff4262409651dbd6aa2b4d27dd99f128e308ce2c5093",
+      "gateway.py": "2bb85ad16f895a1175125ece9b8ec4dc86727dab07a80c5ef6097099e2528554",
+      "_control_transport.py": "bace1c535ad7deee0334b88c23e7234cf006a9cb48fa2dbdec25ca1796ed2ba0",
+      "_cli_supervise.py": "10688e5fdd7d1887741051d7cb43769a5823e79b1873d1eff8f5e2e7a58bddcf",
+      "_callback_pool.py": "6dc4322d894b1c7b876a2604e437fff0f1433c44578ddd7ab85d3915b8fdd8a1",
+      "query.py": "5cb1dd00d5552929a851f4be4814705e0b5ea72680ff6386b3f6292a22a901f7",
+      "_cli_config.py": "63ab5443f472199d70ccf4624c00ae8b1a2492247bbe897d569b6ae77ae6ace0",
+      "client.py": "c2887768f2e9b7d97f68d0dcbe35dc62238a7f440c3368d819eb824a7ffd1d28",
+      "_callback_bridge.py": "ea5b8d470464bb295d2536eb5779b79f0d5598303caab094e8075edc092bf4a6",
+      "__init__.py": "8d91799f587cd216b47025386bd4f74295737e532c7cf840bc54cc18ac30bc5a",
+      "serve.py": "bff87707c150c9768b24a436a6e67266dca8503733d510db0eac43833f85b40d",
+      "gateway_protocol.py": "2da3e956739b2e28b5f204e1b7877e68b414f4800e47f0308831ffa65fb8b2d9",
+      "aws.py": "eca0ce44cd71b853450df3111f013afbc4fe7ac6aaf4a6040810d0d6d9a49d2c",
+      "providers.py": "197a0500acca81a85f9da24a5c45e14080f31a213343ec2acd804fbdcc6f1e79",
+      "cli.py": "becc9015e3975ff641591a83e0ee231e09ffda1a2b0caa5c38f1f5e4d9e94f51",
+      "cluster.py": "94ae6088fdf87def3086d3febab85b9c9ad9ff34f72ba6d16fffeea34e36484d",
+      "_callback_protocol.py": "713ab243e39f76e4b54751551498a0d2fd27607abe9df761298b3847876b9ee7",
+      "table.py": "b5a122611819f8414f50b59e57a6981051505cea07104684d4a9bc3144ad75db",
+      "errors.py": "a4c93aceb6c652fc7e9259a5cc898f540498964f9ef63700ebe6b04035bd8bca",
+      "_serve_guard.py": "5a26b6f0bdbf10a05ef86c8ba87b2716f80b16a6f1db2a61d77ac385d75a3ef6",
+      "_binary.py": "97f36c62384c16d4a283bf22f241f2fbf33acf6bc2083812c519343165840c70",
+      "__main__.py": "c4c03c52b11be342209bb77337d806693bef9675404873c17d88d2fc72d33646",
+      "_serve_args.py": "78f2e0f43e4616a113d6161b518265a377a46d946789900ceca86ac2266ff3f1",
+      "expr.py": "576fccd75fc0de63baba35cda46eadd8abdeba41820509fe5a8ad9e3cd69c7a4",
+      "validation.py": "6275f6cab973ca5511db5729827efb21261a75becaa63a0e6c5fe8e3e98e7d98"
+    }
+  },
+  "elapsed_seconds": 32.689
+}

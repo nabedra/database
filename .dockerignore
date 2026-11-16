@@ -1,4 +1,6 @@
 .git
+.nabedra
+# Exclude pre-rename local installations and configuration too.
 .meshdb
 **/.venv
 **/__pycache__
@@ -8,6 +10,8 @@ artifacts
 .env
 **/*.key
 **/*.pem
+nabedra-database.json
+nabedra-database.auth.json
 meshdb.json
 meshdb.auth.json
 **/*.auth.json

@@ -15,7 +15,7 @@ const KEY: &str = "test/cluster/control.json";
 pub(in crate::cluster) struct Fixture(pub(in crate::cluster) PathBuf);
 impl Fixture {
     pub(in crate::cluster) fn new() -> Self {
-        let f = Self(std::env::temp_dir().join(format!("meshdb-attach-{}", uuid::Uuid::new_v4())));
+        let f = Self(std::env::temp_dir().join(format!("nabedra-attach-{}", uuid::Uuid::new_v4())));
         fs::create_dir(&f.0).unwrap();
         f.write("auth", serde_json::to_vec(&json!({"admin_token":"A".repeat(43),"data_token":"D".repeat(43),"enrollment_token":"E".repeat(43)})).unwrap());
         f.write("token", b"owned-token\n");

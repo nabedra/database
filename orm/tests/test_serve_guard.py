@@ -5,13 +5,13 @@ import time
 import unittest
 from unittest.mock import patch
 
-from meshdb import _callback_bridge as bridge_module
-from meshdb import _callback_pool as pool_module
+from nabedra import _callback_bridge as bridge_module
+from nabedra import _callback_pool as pool_module
 from test_callback_bridge import CALLBACK_TOKEN
 from test_callback_pool import Authority, C, TOKEN, parsed
 
-if (Path(__file__).parents[1] / 'src/meshdb/_serve_guard.py').exists():
-    from meshdb import _serve_guard as guard
+if (Path(__file__).parents[1] / 'src/nabedra/_serve_guard.py').exists():
+    from nabedra import _serve_guard as guard
 else:
     guard = None
 

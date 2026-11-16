@@ -1,7 +1,7 @@
-# MeshDB Python ORM
+# Nabedra Database Python ORM
 
-MeshDB's synchronous Python client creates tables, reads and writes rows, and
-builds queries for a separately running MeshDB v0 server. It requires Python
+Nabedra Database's synchronous Python client creates tables, reads and writes rows, and
+builds queries for a separately running Nabedra Database v0 server. It requires Python
 3.11+ and has no runtime dependencies beyond the standard library. The client
 does not start the server or need AWS credentials; the server owns S3 access.
 
@@ -17,7 +17,7 @@ Run this from the repository root with a Python 3.11+ interpreter:
 ```sh
 python3 -m venv orm/.venv
 orm/.venv/bin/python -m pip install -e ./orm
-export MESHDB_TOKEN='<same-token-configured-on-your-server>'
+export NABEDRA_TOKEN='<same-token-configured-on-your-server>'
 ```
 
 Replace the token placeholder in your environment. The example below assumes
@@ -26,10 +26,9 @@ URL if different. Start with an unused table name; creating an existing name
 raises `ConflictError`.
 
 ```python
-import os
-from meshdb import DB, col
+from nabedra import Database, col
 
-db = DB("http://127.0.0.1:8000", os.environ["MESHDB_TOKEN"])
+db = Database(url="http://127.0.0.1:8000", mode="olap")
 users = db.create_table(
     "guide_users", {"id": str, "age": int, "active": bool}, key="id"
 )
@@ -55,10 +54,18 @@ tables = db.tables()  # handles sorted by name
 deleted = users.delete("bob")  # True; a second delete returns False
 ```
 
-`DB(api_url, token, *, timeout=30.0, ca_file=None, database=None)` validates configuration
+`Database(url, token=None, *, mode="oltp", timeout=30.0, ca_file=None, database=None)` validates configuration
 without sending a request. Supply an absolute HTTP or HTTPS base URL without
 embedded credentials, query or fragment. The client appends `/v1/operations` to
-its base path. The bearer token must be a nonempty safe token string.
+its base path. If omitted, `token` comes from `NABEDRA_TOKEN`. Construction is
+allowed without a token, but an operation raises `AuthenticationError` locally
+until credentials are supplied through a new client. An explicit token must be
+a nonempty safe bearer token string.
+
+`mode` accepts `"olap"` and `"oltp"` and defaults to `"oltp"`. The read-only
+`db.mode` property records this workload preference. Both modes currently use
+the same server API and execution engine. `DB` remains a convenience alias for
+`Database` within `nabedra`.
 An optional `database` selector accompanies operations and receipt polling.
 The application gateway treats it as untrusted input and authorizes access;
 the selector itself grants no storage permissions.
@@ -68,13 +75,14 @@ private CA, supply an additional PEM CA file:
 
 ```python
 import os
-from meshdb import DB
+from nabedra import Database
 
-db = DB(
-    "https://meshdb.example.com",
-    os.environ["MESHDB_TOKEN"],
+db = Database(
+    url="https://nabedra.example.com",
+    token=os.environ["NABEDRA_TOKEN"],
+    mode="oltp",
     timeout=10.0,
-    ca_file="/path/to/meshdb-ca.pem",
+    ca_file="/path/to/nabedra-ca.pem",
 )
 ```
 
@@ -83,6 +91,38 @@ db = DB(
 and defaults to 30 seconds. It applies to blocking socket I/O, not a whole
 operation deadline, cancellation or a server transaction deadline. The client
 follows no redirects and performs no automatic retries.
+
+## Command line
+
+The installed console command groups database administration under `database`:
+
+```sh
+nabedra database init --help
+nabedra database serve --config nabedra-database.json
+nabedra database doctor --config nabedra-database.json
+nabedra database cluster --help
+nabedra database migrate --help
+nabedra --version
+```
+
+`python -m nabedra database <command>` uses the same command parser.
+
+The CLI uses `Nabedra` as the persisted cluster identifier for new clusters.
+To attach to a cluster created by the earlier CLI, preserve its existing name
+with `nabedra database serve --config nabedra-database.json --cluster-name MeshDB`.
+Use `--cluster-name` for any other existing identifier too. Names must match
+`[A-Za-z_][A-Za-z0-9_]{0,63}`. This flag selects the expected durable identity;
+it does not rename or migrate stored cluster records. Keep the existing cluster
+ID, credentials, storage and compatible configuration when attaching.
+
+Kubernetes provider upgrades retain infrastructure ownership. New launches use
+`nabedra.io/*` labels and `nabedra-<launch>` resource names. The provider also
+reads existing `meshdb.io/*` labels, lifecycle annotations and
+`meshdb-<launch>` resource names so running workers remain in inventory.
+Retries reconcile the original launch, and deletion still requires its recorded
+Pod UID. Mixed identity namespaces and duplicate launch identities fail rather
+than report an empty inventory. Keep retained Secrets until the original workers
+have completed their lifecycle.
 
 ## Tables and rows
 
@@ -102,7 +142,7 @@ Columns are nonnullable. Full rows must contain every schema column, with no
 unknown columns or `None` values. The primary key must name a `str` or `int`
 column and must be unique. Only `format="parquet"` is supported.
 
-Obtain `Table` handles through `DB`, rather than constructing them directly.
+Obtain `Table` handles through `Database`, rather than constructing them directly.
 Each handle has immutable `id`, `name`, `key` and `format` metadata and retains
 its original schema. Input mappings are copied, and each access to
 `table.schema` returns a fresh dictionary. Changing that dictionary does not
@@ -186,12 +226,12 @@ results are not available in v0.
 
 ## Errors and uncertain writes
 
-All client errors below derive from `MeshDBError`, exported by `meshdb`.
+All client errors below derive from `NabedraError`, exported by `nabedra`.
 
 | Exception | Meaning |
 | --- | --- |
 | `ValidationError` | Invalid local input or server validation failure. |
-| `AuthenticationError` | Server rejected authentication. |
+| `AuthenticationError` | Credentials are missing locally or the server rejected authentication. |
 | `NotFoundError` | Table does not exist, including a stale table ID. |
 | `ConflictError` | Duplicate table/key or a server commit conflict. |
 | `LimitExceededError` | Local input or a valid server error exceeds a limit. |
@@ -200,7 +240,7 @@ All client errors below derive from `MeshDBError`, exported by `meshdb`.
 | `TransportError` | Read-side network failure. |
 | `ProtocolError` | Malformed or invalid read response, including an oversized response. |
 | `UnknownOutcomeError` | Mutation may have committed despite an unknown server outcome or a lost/invalid response. |
-| `MeshDBError` | Other valid server error. |
+| `NabedraError` | Other valid server error. |
 
 Errors expose `code`, `request_id`, `status_code` and `outcome`. Local errors may
 have no request ID or HTTP status. Server errors preserve their diagnostics;
@@ -220,9 +260,9 @@ worker queue as the receipt interface. Acceptance returns a queue identity and
 does not mean a mutation has committed.
 
 ```python
-from meshdb import DB
+from nabedra import Database
 
-client = DB("http://127.0.0.1:8000", "data-token")
+client = Database(url="http://127.0.0.1:8000", token="data-token", mode="olap")
 receipt = client.submit("query.count", {
     "table_id": table.id,
     "query": {"select": None, "filter": None, "order_by": None, "limit": None},

@@ -41,6 +41,7 @@ impl StorageKey {
     }
     pub fn digest(&self) -> String {
         let mut h = Sha256::new();
+        // Persisted storage identities retain their original format domain.
         h.update(b"meshdb.storage.v1\0");
         for value in [&self.partition, &self.bucket, &self.prefix] {
             h.update(value.as_bytes());
@@ -406,11 +407,11 @@ pub fn from_headers(
         if bytes > MAX_HEADERS {
             return Err(StorageError::LimitExceeded);
         }
-        if name.as_str().starts_with("x-meshdb-") && name.as_str() != "x-meshdb-storage" {
+        if name.as_str().starts_with("x-nabedra-") && name.as_str() != "x-nabedra-storage" {
             return Err(StorageError::Configuration);
         }
     }
-    let mut contexts = headers.get_all("x-meshdb-storage").iter();
+    let mut contexts = headers.get_all("x-nabedra-storage").iter();
     let context = contexts.next();
     if contexts.next().is_some() || (!serverless && context.is_some()) {
         return Err(StorageError::Configuration);
@@ -436,17 +437,17 @@ mod header_tests {
         assert!(from_headers(&headers, true, 0).is_err());
         assert!(from_headers(&headers, false, 0).unwrap().is_none());
         headers.insert(
-            "x-meshdb-principal",
+            "x-nabedra-principal",
             hyper::header::HeaderValue::from_static("forged"),
         );
         assert!(from_headers(&headers, false, 0).is_err());
         headers.clear();
         headers.append(
-            "x-meshdb-storage",
+            "x-nabedra-storage",
             hyper::header::HeaderValue::from_static("e30"),
         );
         headers.append(
-            "x-meshdb-storage",
+            "x-nabedra-storage",
             hyper::header::HeaderValue::from_static("e30"),
         );
         assert!(from_headers(&headers, true, 0).is_err());

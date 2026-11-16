@@ -1,10 +1,10 @@
-# Using MeshDB v0
+# Using Nabedra Database v0
 
 Build a small task tracker with the current implementation. You will start the
 server, create a table through Python, write and query rows, and verify that the
 data survives a server restart. Run shell commands from the repository root.
 
-MeshDB v0 has a synchronous Python client, a Rust server, and S3 storage. Python
+Nabedra Database v0 has a synchronous Python client, a Rust server, and S3 storage. Python
 validates inputs and sends JSON operations to the server. The server reads and
 writes immutable Parquet files in S3. Only the server needs AWS credentials;
 your Python application needs its URL and shared bearer token.
@@ -33,22 +33,23 @@ Use two terminals. In terminal 1, configure an AWS profile that can read and
 conditionally write objects in the bucket. The server also supports the normal
 AWS SDK credential chain, including environment credentials and roles.
 
-For this checkout's testing bucket:
+For this checkout's existing testing bucket, whose AWS name is unchanged by the
+project rename:
 
 ```sh
 export AWS_PROFILE='<your-configured-profile>'
 export AWS_REGION='us-east-1'
-export MESHDB_S3_BUCKET='meshdb-testing'
-export MESHDB_S3_PREFIX="test-001-tutorial-$(orm/.venv/bin/python -c 'import uuid; print(uuid.uuid4().hex)')/"
+export NABEDRA_S3_BUCKET='meshdb-testing'
+export NABEDRA_S3_PREFIX="test-001-tutorial-$(orm/.venv/bin/python -c 'import uuid; print(uuid.uuid4().hex)')/"
 ```
 
-Replace the profile placeholder. Supply `MESHDB_TOKEN` privately in both
+Replace the profile placeholder. Supply `NABEDRA_TOKEN` privately in both
 terminals, using the same nonempty, header-safe bearer token. Then start the
 server in terminal 1:
 
 ```sh
-: "${MESHDB_TOKEN:?Set the shared bearer token in this terminal}"
-server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+: "${NABEDRA_TOKEN:?Set the shared bearer token in this terminal}"
+server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
 ```
 
 Keep this terminal open. The bucket and prefix identify the database. The
@@ -63,7 +64,7 @@ SI units use 1000 and IEC units use 1024. The default and hard maximum are
 [server guide](server/README.md#configuration) for worker dispatch details.
 
 The server does not load the repository `.env` automatically. That file uses
-`BUCKET_NAME`, while the server requires `MESHDB_S3_BUCKET`. Do not source or
+`BUCKET_NAME`, while the server requires `NABEDRA_S3_BUCKET`. Do not source or
 print the supplied credential file. See the [server configuration
 guide](server/README.md#configuration) for other deployment settings.
 
@@ -82,18 +83,17 @@ catalog; it does not scan table files or verify write permission.
 In terminal 2, confirm that the same token is set and open Python:
 
 ```sh
-: "${MESHDB_TOKEN:?Set the same bearer token as the server}"
+: "${NABEDRA_TOKEN:?Set the same bearer token as the server}"
 orm/.venv/bin/python
 ```
 
 Paste the following Python blocks into this same session, in order:
 
 ```python
-import os
 import uuid
-from meshdb import DB, col
+from nabedra import Database, col
 
-db = DB("http://127.0.0.1:8000", os.environ["MESHDB_TOKEN"])
+db = Database(url="http://127.0.0.1:8000", mode="oltp")
 table_name = "tutorial_tasks_" + uuid.uuid4().hex
 tasks = db.create_table(
     table_name,
@@ -104,7 +104,10 @@ print(tasks.name)
 print(tasks.schema)
 ```
 
-`DB(...)` validates the connection settings without contacting the server.
+`Database(url=...)` validates the connection settings without contacting the server.
+It reads `NABEDRA_TOKEN` when `token=` is omitted. You can use `mode="oltp"`
+or `mode="olap"` as a client workload preference; both currently share the
+same execution engine.
 `create_table(...)` sends a request and returns a table handle. Each run uses a
 fresh table name, so it can coexist with an earlier run.
 
@@ -201,7 +204,7 @@ server to exit. It stops accepting work and drains admitted operations. Restart
 it in that same terminal, retaining the bucket, prefix, and token:
 
 ```sh
-server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+server/target/debug/nabedra-database-server serve --workers 4 --partition_size '64 KB'
 ```
 
 Do not rerun the prefix generation command, since that would select a different
@@ -236,7 +239,7 @@ Version 2 catalogs can mix both layouts, and old binaries reject version 2.
 For example, trying to insert the same key again raises `ConflictError`:
 
 ```python
-from meshdb import ConflictError
+from nabedra import ConflictError
 
 try:
     reopened.insert({"id": "t2", "title": "Duplicate", "priority": 1, "done": False})
@@ -290,6 +293,6 @@ produces a new table ID, so obtain a new handle before using it.
 
 For a remote deployment, configure [native HTTPS](server/README.md#configuration)
 and connect with an `https://` URL. The client verifies certificates and
-hostnames; a private CA can be supplied with `DB(..., ca_file="/path/to/ca.pem")`.
+hostnames; a private CA can be supplied with `Database(url=..., ca_file="/path/to/ca.pem")`.
 The [Python API guide](orm/README.md) covers the full method contracts, and the
 [server guide](server/README.md) covers deployment and operation settings.

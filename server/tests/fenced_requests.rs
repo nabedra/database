@@ -1,5 +1,5 @@
 //! S4 regressions exercise actual conditional root updates and local execution.
-use meshdb_server::{
+use nabedra_database_server::{
     engine::Engine,
     partition_size::PartitionSize,
     protocol::ErrorCode,

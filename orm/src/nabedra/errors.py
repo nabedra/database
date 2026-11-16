@@ -1,4 +1,4 @@
-"""MeshDB failures and request diagnostics.
+"""Nabedra Database failures and request diagnostics.
 
 An unknown outcome means a mutation may have committed. Inspect current data
 before deciding whether to submit another write.
@@ -6,10 +6,10 @@ before deciding whether to submit another write.
 from __future__ import annotations
 
 
-class MeshDBError(Exception):
+class NabedraError(Exception):
     """Base failure; local errors can lack request and HTTP status information."""
 
-    code = "meshdb_error"
+    code = "nabedra_error"
     _default_outcome: str | None = None
 
     def __init__(
@@ -28,49 +28,49 @@ class MeshDBError(Exception):
         self.outcome = self._default_outcome if outcome is None else outcome
 
 
-class ValidationError(MeshDBError):
+class ValidationError(NabedraError):
     code = "validation_error"
     _default_outcome = "not_applied"
 
 
-class AuthenticationError(MeshDBError):
+class AuthenticationError(NabedraError):
     code = "unauthorized"
     _default_outcome = "not_applied"
 
 
-class NotFoundError(MeshDBError):
+class NotFoundError(NabedraError):
     code = "not_found"
     _default_outcome = "not_applied"
 
 
-class ConflictError(MeshDBError):
+class ConflictError(NabedraError):
     code = "conflict"
     _default_outcome = "not_applied"
 
 
-class LimitExceededError(MeshDBError):
+class LimitExceededError(NabedraError):
     code = "limit_exceeded"
     _default_outcome = "not_applied"
 
 
-class OverloadedError(MeshDBError):
+class OverloadedError(NabedraError):
     code = "overloaded"
     _default_outcome = "not_applied"
 
 
-class StorageError(MeshDBError):
+class StorageError(NabedraError):
     code = "storage_unavailable"
     _default_outcome = "not_applied"
 
 
-class TransportError(MeshDBError):
+class TransportError(NabedraError):
     code = "transport_error"
 
 
-class ProtocolError(MeshDBError):
+class ProtocolError(NabedraError):
     code = "protocol_error"
 
 
-class UnknownOutcomeError(MeshDBError):
+class UnknownOutcomeError(NabedraError):
     code = "outcome_unknown"
     _default_outcome = "unknown"

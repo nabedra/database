@@ -31,7 +31,7 @@ pub(super) fn fixture_workers(
         tokio::runtime::Handle::current(),
     )
     .unwrap();
-    let parent = std::env::temp_dir().join(format!("meshdb-owner-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!("nabedra-owner-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&parent).unwrap();
     let guard = Arc::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap());
     (

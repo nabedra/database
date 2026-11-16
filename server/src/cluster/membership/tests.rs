@@ -57,7 +57,7 @@ fn proof(v: &Value) -> EnrollmentProof {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let mut message = b"meshdb.enroll.v1\0".to_vec();
+    let mut message = b"nabedra.enroll.v1\0".to_vec();
     message.extend_from_slice(unsigned.as_bytes());
     let signed = format!(
         "{},\"proof\":\"{}\"}}",
@@ -67,7 +67,7 @@ fn proof(v: &Value) -> EnrollmentProof {
     verify_enrollment(signed.as_bytes()).unwrap()
 }
 fn root(external: bool) -> Control {
-    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"meshdb/","token_file":"/synthetic-token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
+    let template = json!({"api_urls":["http://api/"],"listen":"worker:0","storage":{"driver":"http","options":{"base_url":"http://store/","namespace":"nabedra/","token_file":"/synthetic-token","ca_file":null}},"tls":null,"operation_slots":4,"partition_slots":4,"queue_size":64,"partition_size":"64 MiB"});
     let hash = Template::decode(&serde_json::to_vec(&template).unwrap())
         .unwrap()
         .fingerprint()

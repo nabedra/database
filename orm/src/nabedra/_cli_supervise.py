@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ._cli_config import protected_write, read_json
 from ._serve_process import _Owner, _Interrupted, _message, _STARTUP_SECONDS
+from .validation import validate_identifier
 
 
 class _Children(_Owner):
@@ -62,18 +63,19 @@ def _port():
         return sock.getsockname()[1]
 
 
-def supervise(binary, config, count, *, cold_start=False):
+def supervise(binary, config, count, *, cold_start=False, cluster_name='Nabedra'):
+    cluster_name = validate_identifier(cluster_name)
     owner = _Children()
     failure = None
     status = 0
-    with tempfile.TemporaryDirectory(prefix='meshdb-') as directory:
+    with tempfile.TemporaryDirectory(prefix='nabedra-') as directory:
         path = Path(directory) / 'api.json'
         protected_write(path, config)
         try:
             owner.install()
             owner.spawn(str(path), cold_start=cold_start, binary=binary)
             deadline = time.monotonic() + _STARTUP_SECONDS
-            startup = dict(version=1, type='init', name='MeshDB',
+            startup = dict(version=1, type='init', name=cluster_name,
                            initial_policy=dict(mode='fixed', desired=count, min_nodes=count, max_nodes=count),
                            provisioning='external', bridge=None)
             owner.send(startup, deadline)
@@ -101,7 +103,7 @@ def supervise(binary, config, count, *, cold_start=False):
                 protected_write(worker_path, bootstrap)
                 owner.start_worker(binary, worker_path)
             # API is ready, but process launch does not prove worker enrollment.
-            owner.announce(ready['bound_url'], deadline, event='meshdb.serve.launched')
+            owner.announce(ready['bound_url'], deadline, event='nabedra.serve.launched')
             record = owner.receive(None)
             _message(record, 'fatal', False)
             raise RuntimeError('Unexpected API message')

@@ -1,4 +1,4 @@
-use meshdb_server::{
+use nabedra_database_server::{
     engine::Engine,
     executor::Executor,
     runtime,
@@ -206,7 +206,7 @@ async fn u01_startup_initializes_the_same_local_run_before_readiness() {
         for cold in [false, true] {
             let storage = Storage::new(Fake::default(), Namespace::new("eager-startup/").unwrap());
             let previous = if cold {
-                let fence = meshdb_server::storage::CatalogFence {
+                let fence = nabedra_database_server::storage::CatalogFence {
                     run_id: uuid::Uuid::new_v4(),
                     scheduler_term: 1,
                 };
@@ -281,7 +281,7 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
             } else {
                 storage
                     .initialize_fenced_cluster_catalog(
-                        meshdb_server::storage::CatalogFence {
+                        nabedra_database_server::storage::CatalogFence {
                             run_id: uuid::Uuid::new_v4(),
                             scheduler_term: 1,
                         },
@@ -293,8 +293,8 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
             }
             let before = storage
                 .read(
-                    &meshdb_server::storage::ObjectKey::catalog(),
-                    meshdb_server::protocol::MAX_CATALOG_BYTES,
+                    &nabedra_database_server::storage::ObjectKey::catalog(),
+                    nabedra_database_server::protocol::MAX_CATALOG_BYTES,
                 )
                 .await
                 .unwrap()
@@ -330,8 +330,8 @@ async fn r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingr
                 engine
                     .storage()
                     .read(
-                        &meshdb_server::storage::ObjectKey::catalog(),
-                        meshdb_server::protocol::MAX_CATALOG_BYTES
+                        &nabedra_database_server::storage::ObjectKey::catalog(),
+                        nabedra_database_server::protocol::MAX_CATALOG_BYTES
                     )
                     .await
                     .unwrap()

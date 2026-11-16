@@ -7,7 +7,7 @@ worker and close it at shutdown. For integration fixtures only, ``_transport`` a
 leave both unset. For example::
 
     gateway = Gateway(cluster_url="https://compute.internal", token=private_token,
-                      mount_path="/meshdb")
+                      mount_path="/nabedra")
     @gateway.middleware
     def authorize(ctx):
         ctx.principal = authenticated_user_id
@@ -51,7 +51,7 @@ class HTTPResponse:
 class S3:
     bucket: str
     region: str = field(kw_only=True)
-    prefix: str = field(default='meshdb/', kw_only=True)
+    prefix: str = field(default='nabedra/', kw_only=True)
     credentials: object = field(kw_only=True, repr=False)
 
     def __post_init__(self):
@@ -196,7 +196,7 @@ class Gateway:
         self._async_client = httpx.AsyncClient(transport=_async_transport if _async_transport is not None else httpx.AsyncHTTPTransport(retries=0, limits=limits, trust_env=False), timeout=timeout, limits=limits, trust_env=False, follow_redirects=False)
         self._slots = threading.BoundedSemaphore(max_concurrency)
         self._thread_slots = threading.BoundedSemaphore(max_concurrency)
-        self._executor = ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix='meshdb-gateway')
+        self._executor = ThreadPoolExecutor(max_workers=max_concurrency, thread_name_prefix='nabedra-gateway')
         self._callbacks = []
         self._closed = False
         self._started = False
@@ -229,15 +229,15 @@ class Gateway:
                 raise _Rejected('limit_exceeded', 'Request headers exceed 32 KiB')
             key = k.lower()
             names[key] = names.get(key, 0) + 1
-            if key.startswith('x-meshdb-') and key != 'x-meshdb-database':
+            if key.startswith('x-nabedra-') and key != 'x-nabedra-database':
                 raise _Rejected('unauthorized', 'Untrusted internal header')
         h = Headers(headers)
-        wire.require(all(names.get(k, 0) <= 1 for k in ('authorization', 'x-meshdb-database', 'content-type', 'content-length', 'transfer-encoding')))
+        wire.require(all(names.get(k, 0) <= 1 for k in ('authorization', 'x-nabedra-database', 'content-type', 'content-length', 'transfer-encoding')))
         wire.require('transfer-encoding' not in names)
         if 'content-length' in names:
             length = h['content-length']
             wire.require(length.isascii() and length.isdecimal() and int(length) == len(body))
-        database = _selector(h['x-meshdb-database']) if 'x-meshdb-database' in names else None
+        database = _selector(h['x-nabedra-database']) if 'x-nabedra-database' in names else None
         op = receipt = None
         if method == 'POST' and path in ('/v1/operations', '/v1/requests'):
             wire.require(h.get('content-type', '').split(';')[0].strip().lower() == 'application/json')
@@ -278,7 +278,7 @@ class Gateway:
         return ctx.storage._header()
 
     def _headers(self, storage):
-        return {'Authorization': 'Bearer ' + self._token, 'X-MeshDB-Storage': storage,
+        return {'Authorization': 'Bearer ' + self._token, 'X-Nabedra-Storage': storage,
                 'Content-Type': 'application/json', 'Accept': 'application/json', 'Accept-Encoding': 'identity'}
 
     def _response(self, ctx, status, headers, raw):
