@@ -25,7 +25,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(_) => {
-            eprintln!("nabedra-database-server: network runtime initialization failed");
+            eprintln!("nabedra-db: network runtime initialization failed");
             return ExitCode::FAILURE;
         }
     };
@@ -47,7 +47,7 @@ async fn run_cli() -> ExitCode {
         .try_init()
         .is_err()
     {
-        eprintln!("nabedra-database-server: diagnostics initialization failed");
+        eprintln!("nabedra-db: diagnostics initialization failed");
         return ExitCode::FAILURE;
     }
     let result = match command {
@@ -91,7 +91,7 @@ async fn run_cli() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("nabedra-database-server: {message}");
+            eprintln!("nabedra-db: {message}");
             if matches!(
                 message,
                 "configuration invalid"

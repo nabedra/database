@@ -25,15 +25,15 @@ def main(argv=None):
         parser.error('Install the repository Rust toolchain with Cargo and rustc first')
     try:
         # Cargo resolves any repository toolchain override from the server directory.
-        subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-database-server'],
+        subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db'],
                        cwd=root / 'server', check=True)
         target = Path(os.environ.get('CARGO_TARGET_DIR', str(root / 'server' / 'target')))
         if not target.is_absolute():
             target = root / 'server' / target
-        binary = target / 'release' / 'nabedra-database-server'
+        binary = target / 'release' / 'nabedra-db'
         venv.EnvBuilder(with_pip=True).create(prefix)
         subprocess.run([str(prefix / 'bin' / 'python'), '-m', 'pip', 'install', str(root / 'orm')], check=True)
-        shutil.copy2(binary, prefix / 'bin' / 'nabedra-database-server')
+        shutil.copy2(binary, prefix / 'bin' / 'nabedra-db')
         subprocess.run([str(prefix / 'bin' / 'nabedra'), '--version', '--json'], check=True)
     except (OSError, subprocess.CalledProcessError):
         print('Installation failed. Check build tools and preceding diagnostics; remove the incomplete prefix before retrying.', file=sys.stderr)

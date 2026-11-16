@@ -1,6 +1,6 @@
 """Configured infrastructure adapters for the synchronous serve callbacks.
 
-KubernetesProvider requires an image containing Python 3 and nabedra-database-server,
+KubernetesProvider requires an image containing Python 3 and nabedra-db,
 network access from Pods to the configured API/storage URLs, and explicit RBAC
 for Pods and Secrets in one namespace. No infrastructure is created on import.
 """
@@ -55,7 +55,7 @@ bootstrap['advertise_url'] = ('https' if bootstrap['tls'] else 'http') + '://' +
 path = '/tmp/nabedra-worker-bootstrap.json'
 with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as target:
     json.dump(bootstrap, target)
-os.execvp('nabedra-database-server', ['nabedra-database-server', 'worker', '--bootstrap', path])
+os.execvp('nabedra-db', ['nabedra-db', 'worker', '--bootstrap', path])
 """
 
 

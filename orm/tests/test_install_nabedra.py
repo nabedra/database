@@ -20,12 +20,12 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(installer.main(['--prefix', str(prefix)]), 0)
                 calls = [call.args[0] for call in run.call_args_list]
                 cargo = [call for call in calls if call[0] == 'cargo']
-                self.assertEqual(cargo, [['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-database-server']])
+                self.assertEqual(cargo, [['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db']])
                 self.assertEqual(calls[1][1:4], ['-m', 'pip', 'install'])
                 self.assertEqual(calls[2][1:], ['--version', '--json'])
                 self.assertEqual(calls[2][0], str(prefix / 'bin' / 'nabedra'))
                 create.assert_called_once_with(prefix)
-                self.assertEqual(copy.call_args.args[1], prefix / 'bin' / 'nabedra-database-server')
+                self.assertEqual(copy.call_args.args[1], prefix / 'bin' / 'nabedra-db')
 
     def test_custom_target_directory_selects_matching_cargo_output(self):
         import os
@@ -37,7 +37,7 @@ class InstallerTests(unittest.TestCase):
                     expected = Path(target)
                     if not expected.is_absolute():
                         expected = Path(installer.__file__).resolve().parents[1] / 'server' / expected
-                    self.assertEqual(copy.call_args.args[0], expected / 'release' / 'nabedra-database-server')
+                    self.assertEqual(copy.call_args.args[0], expected / 'release' / 'nabedra-db')
 
     def test_missing_tools_fails_before_environment_creation(self):
         with tempfile.TemporaryDirectory() as temporary, patch.object(installer.shutil, 'which', return_value=None), patch.object(installer.venv.EnvBuilder, 'create') as create, contextlib.redirect_stderr(io.StringIO()) as error:

@@ -8,7 +8,7 @@ use nabedra_database_server::{
 fn partition_size_spellings_allow_default_and_explicit_workers() {
     for flag in ["--partition-size", "--partition_size"] {
         for worker_args in [vec![], vec!["--workers", "7"]] {
-            let mut args = vec!["nabedra-database-server", "serve", flag, "64MiB"];
+            let mut args = vec!["nabedra-db", "serve", flag, "64MiB"];
             let expected_workers = if worker_args.is_empty() { 4 } else { 7 };
             args.extend(worker_args);
             let parsed = Cli::try_parse_from(args);
@@ -34,13 +34,12 @@ fn partition_size_cli_rejects_invalid_values_and_shows_alias() {
             "1 GB",
             "1 B garbage",
         ] {
-            let error =
-                Cli::try_parse_from(["nabedra-database-server", "serve", flag, value]).unwrap_err();
+            let error = Cli::try_parse_from(["nabedra-db", "serve", flag, value]).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::ValueValidation, "{flag} {value}");
             assert!(error.to_string().contains("67108864 B (64 MiB)"));
         }
     }
-    let help = Cli::try_parse_from(["nabedra-database-server", "serve", "--help"])
+    let help = Cli::try_parse_from(["nabedra-db", "serve", "--help"])
         .unwrap_err()
         .to_string();
     assert!(help.contains("--partition-size"));
@@ -50,9 +49,9 @@ fn partition_size_cli_rejects_invalid_values_and_shows_alias() {
 #[test]
 fn documented_commands_parse_into_existing_options() {
     for args in [
-        vec!["nabedra-database-server", "serve"],
+        vec!["nabedra-db", "serve"],
         vec![
-            "nabedra-database-server",
+            "nabedra-db",
             "serve",
             "--host",
             "127.0.0.1",
@@ -80,7 +79,7 @@ fn documented_commands_parse_into_existing_options() {
         assert_eq!(options.tls_key, defaults.tls_key);
     }
     let Command::Serve(options) = Cli::try_parse_from([
-        "nabedra-database-server",
+        "nabedra-db",
         "serve",
         "--host",
         "0.0.0.0",
@@ -116,7 +115,7 @@ fn documented_commands_parse_into_existing_options() {
 
     // Parsing performs no TLS I/O and leaves validation to Config.
     let Command::Serve(options) = Cli::try_parse_from([
-        "nabedra-database-server",
+        "nabedra-db",
         "serve",
         "--queue-size",
         "0",
@@ -139,9 +138,9 @@ fn documented_commands_parse_into_existing_options() {
 
 #[test]
 fn command_shape_typed_inputs_and_clap_controls() {
-    assert!(Cli::try_parse_from(["nabedra-database-server"]).is_err());
-    assert!(Cli::try_parse_from(["nabedra-database-server", "status"]).is_err());
-    assert!(Cli::try_parse_from(["nabedra-database-server", "--host", "127.0.0.1"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-db"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-db", "status"]).is_err());
+    assert!(Cli::try_parse_from(["nabedra-db", "--host", "127.0.0.1"]).is_err());
     for (flag, value) in [
         ("--host", "localhost"),
         ("--port", "65536"),
@@ -152,23 +151,17 @@ fn command_shape_typed_inputs_and_clap_controls() {
         ("--aws-region", "value"),
     ] {
         assert!(
-            Cli::try_parse_from(["nabedra-database-server", "serve", flag, value]).is_err(),
+            Cli::try_parse_from(["nabedra-db", "serve", flag, value]).is_err(),
             "{flag} {value}"
         );
     }
     for (args, kind) in [
+        (vec!["nabedra-db", "--help"], ErrorKind::DisplayHelp),
         (
-            vec!["nabedra-database-server", "--help"],
+            vec!["nabedra-db", "serve", "--help"],
             ErrorKind::DisplayHelp,
         ),
-        (
-            vec!["nabedra-database-server", "serve", "--help"],
-            ErrorKind::DisplayHelp,
-        ),
-        (
-            vec!["nabedra-database-server", "--version"],
-            ErrorKind::DisplayVersion,
-        ),
+        (vec!["nabedra-db", "--version"], ErrorKind::DisplayVersion),
     ] {
         assert_eq!(Cli::try_parse_from(args).unwrap_err().kind(), kind);
     }

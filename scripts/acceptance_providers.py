@@ -375,7 +375,7 @@ def run(binary, skip_zero=False):
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'server/target/debug/nabedra-database-server')
+    parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'server/target/debug/nabedra-db')
     parser.add_argument('--skip-zero',action='store_true',help='Run the up/down provider contract without the explicit full-shutdown extension')
     args=parser.parse_args()
     run(args.binary.resolve(),skip_zero=args.skip_zero)

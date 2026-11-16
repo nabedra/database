@@ -1,6 +1,6 @@
 """Deterministic real TCP worker queue/recovery assertions against the local CAS store.
 
-Requires Python 3.11 and a supplied nabedra-database-server binary. No AWS/provider claim.
+Requires Python 3.11 and a supplied nabedra-db binary. No AWS/provider claim.
 """
 import argparse
 import concurrent.futures

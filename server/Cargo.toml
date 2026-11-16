@@ -1,6 +1,6 @@
 [package]
 name = "nabedra-database"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94.1"
 description = "S3-backed database with immutable Parquet snapshots, an HTTP API, and distributed workers"
@@ -16,7 +16,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 name = "nabedra_database_server"
 
 [[bin]]
-name = "nabedra-database-server"
+name = "nabedra-db"
 path = "src/main.rs"
 
 [features]

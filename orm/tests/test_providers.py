@@ -181,7 +181,7 @@ class KubernetesProviderTests(unittest.TestCase):
         self.assertEqual(len(creates), 2)  # one Secret and one Pod across both attempts
         pod = next(c[2] for c in creates if c[1].endswith('/pods'))
         self.assertEqual(pod['spec']['containers'][0]['command'][:2], ['python3', '-c'])
-        self.assertIn("['nabedra-database-server', 'worker', '--bootstrap', path]", pod['spec']['containers'][0]['command'][2])
+        self.assertIn("['nabedra-db', 'worker', '--bootstrap', path]", pod['spec']['containers'][0]['command'][2])
         self.assertEqual(pod['spec']['volumes'][0]['secret']['defaultMode'], 0o400)
         changed = payload()
         changed['bootstrap']['api_urls'] = ['https://different.example']

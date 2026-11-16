@@ -385,5 +385,5 @@ def run(binary):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "server/target/debug/nabedra-database-server")
+    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "server/target/debug/nabedra-db")
     run(parser.parse_args().binary.resolve())

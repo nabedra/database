@@ -16,7 +16,7 @@ from nabedra._cli_config import example, protected_write, s3_storage
 FIXTURE = '''import json, os, re, signal, socket, struct, sys
 from pathlib import Path
 if sys.argv[1:] == ['--version']:
-    print('nabedra-database-server 0.1.0')
+    print('nabedra-db 0.1.1')
     sys.exit(0)
 if sys.argv[1] == 'worker':
     b=json.loads(Path(sys.argv[3]).read_text())
@@ -49,7 +49,7 @@ class SupervisionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        binary = self.root / 'nabedra-database-server'
+        binary = self.root / 'nabedra-db'
         binary.write_text('#!' + sys.executable + '\n' + FIXTURE)
         binary.chmod(0o700)
         auth = self.root / 'auth.json'
@@ -121,9 +121,9 @@ class SupervisionTests(unittest.TestCase):
     def test_compatible_path_binary_runs_both_api_and_worker(self):
         prefix = self.root / 'incompatible-env'
         (prefix / 'bin').mkdir(parents=True)
-        incompatible = prefix / 'bin' / 'nabedra-database-server'
+        incompatible = prefix / 'bin' / 'nabedra-db'
         incompatible.write_text('#!' + sys.executable + '\nimport sys\n'
-                                'print("nabedra-database-server 9.0.0")\nsys.exit(42)\n')
+                                'print("nabedra-db 9.0.0")\nsys.exit(42)\n')
         incompatible.chmod(0o700)
         env = dict(self.env, PATH=str(self.root) + os.pathsep + os.environ.get('PATH', ''))
         env.pop('NABEDRA_SERVER_BINARY')

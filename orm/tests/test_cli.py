@@ -14,7 +14,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "src"
 FIXTURE = '''import json, os, signal, sys
 from pathlib import Path
 if sys.argv[1:] == ["--version"]:
-    print("nabedra-database-server 0.1.0")
+    print("nabedra-db 0.1.1")
     sys.exit(0)
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
 state = Path(os.environ["FIXTURE_STATE"])
@@ -41,7 +41,7 @@ class CliTests(unittest.TestCase):
         # Deliberately do not inherit credentials, dotenv settings or host PATH.
         self.env = {"PATH": str(self.bin), "PYTHONPATH": str(SOURCE),
                     "PYTHONDONTWRITEBYTECODE": "1", "FIXTURE_STATE": str(self.state)}
-        self.path_binary = self.executable(self.bin / "nabedra-database-server")
+        self.path_binary = self.executable(self.bin / "nabedra-db")
 
     def executable(self, path, body=FIXTURE):
         path.write_text(f"#!{sys.executable}\n" + body)

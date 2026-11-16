@@ -2,7 +2,7 @@
 """Live Rust HTTP acceptance. Fixtures remain in the guarded S3 namespace.
 
 Import and --help do not load configuration or start a process. Live execution
-requires the installed local ORM and a built nabedra-database-server binary.
+requires the installed local ORM and a built nabedra-db binary.
 """
 from __future__ import annotations
 
