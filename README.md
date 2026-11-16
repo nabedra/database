@@ -1,10 +1,13 @@
 # MeshDB v0
 
-MeshDB stores tables as immutable Parquet snapshots in S3. A single Rust server
-process exposes HTTP or native HTTPS, and a synchronous Python ORM builds and
-sends operations. The ORM requires Python 3.11+ and only the Python standard
-library at runtime. It needs the server URL and bearer token, not AWS credentials.
-S3 is the server's only durable store. Run one server process per bucket/prefix.
+MeshDB stores tables as immutable Parquet snapshots in S3. The Rust server
+exposes HTTP or native HTTPS, and a synchronous Python ORM builds and sends
+operations. Run the API and a local worker together with `serve`, or use
+supervised API and worker processes for a cluster. The ORM requires Python 3.11+
+and only the Python standard library at runtime. It needs the server URL and bearer token, not AWS credentials.
+Standalone `serve` uses S3 for durable storage. The supervised cluster uses an
+HTTP object backend with conditional writes. Run only one standalone `serve`
+process per bucket/prefix; use the cluster deployment for multiple APIs/workers.
 
 ## Start here
 
@@ -14,32 +17,94 @@ S3 is the server's only durable store. Run one server process per bucket/prefix.
   table operations, queries and errors.
 - [Server guide](server/README.md): build and serve, environment configuration,
   HTTP requests, native TLS, health and shutdown.
-- [Partition workers rubric](plans/partition-workers.md): current partition
-  contracts, task evidence and acceptance tracking.
-- [ORM v0 specification](plan-v0/orm.md), [server v0 specification](plan-v0/server.md)
-  and [v0 implementation rubric](plan-v0/implementation.md): historical baseline
-  documents. Their single-file storage and request-only worker descriptions
-  predate partition workers. The older [design documents](plan/) describe
-  broader ideas outside v0.
+- [Execution and recovery contract](plans/resource-aware-scheduling.md): worker
+  resources, replicated requests, mutation publication and recovery.
+- [Scheduler test contract](docs/testing/scheduler-contract.md) and
+  [executed evidence](docs/testing/scheduler-evidence.md): acceptance cases,
+  recorded results and verification boundaries.
 
-## Install and use
+## Run the server
 
-Run commands from the repository root. Use Python 3.11 or a newer interpreter
-in the first command:
+Run commands from the repository root. The server requires Rust 1.94.1 or newer
+and Cargo. Python clients require Python 3.11+. You also need an existing S3
+bucket and an AWS identity allowed to read and conditionally write objects
+under your database prefix. The server does not create buckets.
+
+Build the S3-enabled release binary:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path server/Cargo.toml
+```
+
+Configure the server environment. Replace the profile, region and bucket with
+your own values, and supply a shared bearer token privately in `MESHDB_TOKEN`:
+
+```sh
+export AWS_PROFILE='<configured-profile>'
+export AWS_REGION='<bucket-region>'
+export MESHDB_S3_BUCKET='<existing-bucket>'
+export MESHDB_S3_PREFIX='meshdb-v0/'
+: "${MESHDB_TOKEN:?Set MESHDB_TOKEN to your shared bearer token}"
+server/target/release/meshdb-server serve --host 127.0.0.1 --port 8000 \
+  --workers 4 --queue-size 64 --partition-size '64 MiB'
+```
+
+The AWS SDK also supports environment credentials and roles; omit `AWS_PROFILE`
+when using those. AWS credentials belong on the server. Clients need only its
+URL and bearer token. The server does not load `.env` or translate `BUCKET_NAME`
+to `MESHDB_S3_BUCKET`.
+
+The command starts one API and one local worker with four shared compute
+threads. `--workers` controls compute threads, not partition count or OS process
+count. `--queue-size` supplies a legacy pending-request default; execution and
+resource JSON files provide explicit count, byte, retention, CPU and memory
+limits. See [server configuration](server/README.md#configuration).
+
+In a second terminal, check readiness and send a direct HTTP request. Supply the
+same `MESHDB_TOKEN` there:
+
+```sh
+curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
+request_id="$(python3.11 -c 'import uuid; print(uuid.uuid4())')"
+curl --fail-with-body --silent --show-error \
+  -H "Authorization: Bearer ${MESHDB_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data "{\"request_id\":\"${request_id}\",\"operation\":\"table.list\",\"payload\":{}}" \
+  http://127.0.0.1:8000/v1/operations
+```
+
+An empty database returns `{"request_id":"<your UUID>","data":[]}`. The
+unauthenticated `/health/live` route checks process responsiveness;
+`/health/ready` checks a fresh catalog read. Readiness does not prove write access.
+
+For native HTTPS, add `--tls-cert /path/to/server-cert.pem` and
+`--tls-key /path/to/server-key.pem`. Bind a nonloopback address explicitly with
+`--host` when serving other machines. Clients must trust the certificate's CA
+and verify its hostname.
+
+Stop with Ctrl-C or SIGTERM to stop admission and drain admitted work. After
+that local worker exits, restart the same bucket/prefix with `--cold-start` to
+fence the old run and open committed data with a new empty request queue.
+Outstanding old requests are abandoned unless a durable mutation decision
+proves they committed. For an existing format 1/2/3 catalog, stop all previous
+writers and explicitly pass `--migrate-catalog` to upgrade to format 4; keep
+old binaries stopped. Migration and cold start are separate confirmations.
+
+For separate API and worker processes, use `meshdb-server api --config PATH`
+and `meshdb-server worker --bootstrap PATH`. The API requires a supervisor
+startup exchange and an explicit HTTP object-backend configuration. Follow the
+[cluster process guide](server/README.md#cluster-process-acceptance) and
+[provider configuration](docs/testing/provisioning-adapters.md) for enrollment,
+heterogeneous workers, drain and optional autoscaling.
+
+## Use the Python ORM
+
+Install the client from the repository root:
 
 ```sh
 python3.11 -m venv orm/.venv
 orm/.venv/bin/python -m pip install -e ./orm
 ```
-
-The server requires Rust 1.94.1 or newer, as declared in
-[Cargo.toml](server/Cargo.toml), with dependencies resolved in
-[Cargo.lock](server/Cargo.lock). Follow the
-[build and start instructions](server/README.md#build-and-start) to configure
-S3 access and run `meshdb-server serve`. See the
-[configuration guide](server/README.md#configuration) for HTTP binding and
-native HTTPS with `--tls-cert` and `--tls-key`, and the
-[HTTP example](server/README.md#health-requests-and-shutdown) for direct requests.
 
 With the server at `http://127.0.0.1:8000`, supply its bearer token privately in
 `MESHDB_TOKEN` and run this example with `orm/.venv/bin/python`. It uses a fresh
@@ -66,6 +131,31 @@ assert rows == [{"id": "alice", "age": 24}]
 
 For HTTPS, the client verifies certificates and hostnames; use `ca_file` for a
 private CA as described in the [ORM connection guide](orm/README.md#install-and-connect).
+
+### Submit work and observe receipts
+
+Table and query methods wait for their terminal response. To release the
+connection while work runs, submit an operation and retain its receipt:
+
+```python
+receipt = db.submit("query.count", {
+    "table_id": users.id,
+    "query": {"select": None, "filter": None, "order_by": None, "limit": None},
+})
+print(receipt.run_id, receipt.request_id)
+terminal = receipt.wait(timeout=30)
+assert terminal.state == "succeeded", terminal.error
+print(terminal.result)
+
+# Recover the receipt later using the recorded identity.
+reconnected = db.receipt(receipt.run_id, receipt.request_id)
+```
+
+The HTTP equivalents are `POST /v1/requests` with the same operation envelope
+and `GET /v1/requests/{run_id}/{request_id}`. HTTP 202 confirms queue replication,
+not mutation commit. Waiting or disconnecting does not cancel accepted work.
+Query results expire after configured retention; durable mutation decisions
+remain reconcilable. See [ORM receipts](orm/README.md#queue-receipts).
 
 ## Supported behavior and limits
 
@@ -98,11 +188,12 @@ Atomic batches remain single operations. See the
 For example, after configuring the server environment:
 
 ```sh
-server/target/debug/meshdb-server serve --workers 4 --partition_size '64 KB'
+server/target/release/meshdb-server serve --workers 4 --partition_size '64 KB'
 ```
 
-`--partition-size` is equivalent. `--workers N` starts exactly N persistent local
-OS worker threads, independent of storage partition count. Size inputs require
+`--partition-size` is equivalent. `--workers N` supplies N persistent local
+compute threads unless a resources file overrides it. Concurrent requests share
+that ceiling, independently of storage partition count. Size inputs require
 a positive integer and a case-insensitive `B`, `KB`, `MB`, `KiB` or `MiB` unit,
 with optional whitespace. SI units use 1000; IEC units use 1024. `64kb`,
 `'64 Kb'` and `64KiB` are valid. The default target and hard maximum are 64 MiB,
@@ -111,10 +202,10 @@ A singleton may exceed a smaller target but never the hard cap. An impossible
 file fails the whole mutation. Empty tables have `files: []`. A new size applies
 to new or rewritten ranges; unchanged files are not automatically repacked.
 
-Version 1 catalogs remain readable. New publications use version 2, which can
-mix Legacy and Partitioned tables. Reads and no-ops do not migrate legacy data;
-an actual data change migrates that table. Old binaries reject version 2.
-See [storage and worker details](server/README.md#storage-behavior-and-limits).
+Current publications use fenced catalog format 4. Legacy table layouts remain
+readable after the explicit catalog migration described above. Reads and no-ops
+do not rewrite legacy table data; an actual data change migrates that table to
+partitions. See [storage and worker details](server/README.md#storage-behavior-and-limits).
 There is no SQL, joins, indexes, general transactions across calls, garbage
 collection or remote execution. Dropping a table retains historical files and
 orphan objects.
@@ -126,11 +217,80 @@ Partitions do not multiply these limits. Oversized results fail rather than
 truncate. There is no pagination or streaming.
 
 The ORM never retries automatically. An uncertain write may have committed even
-if the caller saw a timeout or `UnknownOutcomeError`. Request IDs do not provide
-idempotency. Inspect and reconcile before deciding on another write; an immediate
-old read does not prove rollback. See
-[uncertain-write handling](orm/README.md#errors-and-uncertain-writes) and
-[server storage semantics](server/README.md#storage-behavior-and-limits).
+if the caller saw a timeout or `UnknownOutcomeError`. Preserve its request UUID
+and exact operation body. Repeating that identity attaches to the same logical
+request; a different body conflicts. Reconcile through its receipt or durable
+mutation decision before issuing a new logical write. An immediate old read
+does not prove rollback. See
+[uncertain-write handling](orm/README.md#errors-and-uncertain-writes).
+
+Accepted requests live in replicated worker RAM. Individual API/worker failures
+can recover while another complete request copy survives. A one-worker `serve`
+deployment has only one copy. Stopping every worker abandons outstanding work;
+committed rows and mutation decisions remain durable. The queue is never replayed
+from object storage after a complete shutdown.
+
+## Benchmarks and performance expectations
+
+Use the recorded results below as a baseline for reproducing the supplied
+workloads. There is no published release-build or AWS S3 throughput/latency
+SLA, and adding workers has no promised linear speedup. Partition count, payload
+size, storage latency, queue replication and concurrent requests affect results.
+Batching rows into `insert_many` performs one atomic operation rather than one
+publication per row, within the batch and byte limits above.
+
+The [recorded B01/B02 measurements](docs/testing/evidence/resource-aware-scheduling/benchmarks.json)
+were taken at commit `59ffcc7` on macOS x86-64 with eight logical CPUs and
+16 GiB RAM, using unoptimized development builds. Each configuration had one
+warm-up and three measured repetitions. The HTTP fixture used real API/worker
+TCP and a local conditional SQLite object store, 64 seeded rows, 16 requests per
+repetition and a 2 ms partition-read delay. Workers advertised 1/2/4 compute
+threads and logical RAM ceilings of 8/12/20 GiB on the shared host. No OS CPU or
+memory quota was installed; those logical ceilings do not certify physical RAM.
+
+| Workload | Recorded result |
+| --- | --- |
+| B01 CPU pool, request node caps 1/2/3 | 498–586 jobs/s; 6.26–6.57 CPU core equivalents; mean worker slot occupancy 89.6–92.7%. |
+| B02 mixed CPU/memory/socket pool, caps 1/2/3 and arrival intervals 0/250/1,000 microseconds | 783–875 jobs/s across measured configurations. |
+| B02 HTTP, offered 2 requests/s, caps 1/2/3 | 1.98–2.01 completed requests/s; mean per-run p95 completion 1.23–1.42 s. |
+| B02 HTTP, offered 8 requests/s, caps 1/2/3 | 2.15–2.21 completed requests/s; mean per-run p95 completion 2.00–2.06 s. |
+| B02 HTTP, offered 32 requests/s, caps 1/2/3 | 2.24–2.33 completed requests/s; mean per-run p95 completion 2.00–2.11 s. |
+
+These ranges span configurations and are not confidence intervals. HTTP
+throughput includes authentication, the local proxy, polling and storage.
+All 432 measured HTTP requests completed with zero client rejections, missing
+or duplicate outcomes in the recorded run. Internal retries are reported
+separately in the evidence. The small sample sizes limit tail-latency estimates.
+
+![Recorded HTTP throughput, latency and resource measurements](docs/testing/evidence/resource-aware-scheduling/http-benchmark.png)
+
+The [evidence ledger](docs/testing/scheduler-evidence.md) includes CPU utilization
+plots, p50/p95/p99 distributions, queue-wait bounds, sampled RSS versus charged
+memory, network bytes and retry counts. The [test contract](docs/testing/scheduler-contract.md)
+defines B01/B02 and the Q01/Q02 saturation assertions. Expected behavior is to
+retain every accepted identity, respect CPU/memory caps, dispatch eligible work
+when capacity frees and reject excess work explicitly before acceptance.
+
+To reproduce the local benchmarks without AWS credentials, build the native
+fixture targets and run the measurements sequentially with other load stopped:
+
+```sh
+export CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0
+cargo build --locked --manifest-path server/Cargo.toml --no-default-features \
+  --bin meshdb-server --example resource_scheduler_benchmark
+mkdir -p artifacts
+server/target/debug/examples/resource_scheduler_benchmark --output artifacts/scheduler-pool-benchmark.json
+python3.11 scripts/acceptance_scheduler_load.py --binary server/target/debug/meshdb-server \
+  --suite benchmark --output artifacts/scheduler-http-benchmark.json
+python3.11 scripts/summarize_scheduler_benchmarks.py \
+  --pool artifacts/scheduler-pool-benchmark.json --http artifacts/scheduler-http-benchmark.json \
+  --output artifacts/scheduler-benchmark-evidence.json
+```
+
+Use fresh output paths on subsequent runs. These commands measure the local
+fixtures; the S3 latency runner below samples the configured cloud backend
+separately. The figures above are historical evidence, not a new benchmark run
+for this README change.
 
 ## Local verification
 
@@ -207,7 +367,7 @@ credentials. Latency samples provide no throughput or scaling guarantee.
 
 Recorded live evidence is available for [HTTP/S3 acceptance](scripts/notes/E02.md)
 and [restart/native HTTPS acceptance](scripts/notes/E03.md). Consult the
-[partition workers rubric](plans/partition-workers.md) for current evidence and
-final audit status. The [partition acceptance run](scripts/notes/PW-E02.md)
+[scheduler evidence ledger](docs/testing/scheduler-evidence.md) for current
+execution and recovery evidence. The [partition acceptance run](scripts/notes/PW-E02.md)
 passed all 53 checks, including actual file sizes and restart with a different
 worker count.
