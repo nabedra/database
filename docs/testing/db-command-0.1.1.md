@@ -77,6 +77,33 @@ optimization profile were not exercised by these checks.
 
 ## Publication
 
-The validated source will be committed before the authenticated upload so the
-published archive records a clean release commit. Registry and installed-package
-verification will be recorded after publication.
+Published [nabedra-database 0.1.1](https://crates.io/crates/nabedra-database/0.1.1)
+on 2026-11-16 with the existing Cargo credential. The authenticated upload
+rebuilt the extracted crate in 50.37 seconds, and Cargo confirmed registry
+availability. The archive records clean commit
+`1b6caa34eded82ea22559dad276d51ee95646b3f`, tagged
+`nabedra-database-v0.1.1`.
+
+The 700,629-byte upload and subsequent registry download have the same SHA-256:
+
+```text
+02ad18b87ad3535b56daf1342cd7b507c57a50a91480ecfd83cd166ef3a9ce8b
+```
+
+The [publication record](db-command-0.1.1/publication.json) captures the archive
+identity. A fresh installation ran from a temporary directory outside the
+checkout, used crates.io as its source, and reused the shared dev-profile
+build cache to limit disk usage:
+
+```sh
+cargo install nabedra-database --version 0.1.1 --registry crates-io \
+  --locked --debug --root "$FRESH_PREFIX"
+"$FRESH_PREFIX/bin/nabedra-db" --version
+# nabedra-db 0.1.1
+```
+
+The [installation report](db-command-0.1.1/registry-install.json) confirms that
+`bin/` contains only `nabedra-db`. Root, serve and worker help succeeded with
+the new name. The source Python CLI discovered the installed binary and
+reported native version 0.1.1 while retaining product CLI version 0.1.0.
+No globally installed executable was replaced.

@@ -1,0 +1,11 @@
+{
+  "package": "nabedra-database",
+  "version": "0.1.1",
+  "binary": "nabedra-db",
+  "archive_bytes": 700629,
+  "archive_sha256": "02ad18b87ad3535b56daf1342cd7b507c57a50a91480ecfd83cd166ef3a9ce8b",
+  "source_commit": "1b6caa34eded82ea22559dad276d51ee95646b3f",
+  "source_dirty": false,
+  "tag": "nabedra-database-v0.1.1",
+  "registry_download_matches_upload": true
+}
