@@ -1,12 +1,14 @@
 //! Observation of the actual constructed adapter, compiled only for unit tests.
-use super::*;
 pub(crate) fn assert_material(
-    store: &HttpStore,
+    backend: &crate::storage::RuntimeStore,
     base: &str,
     namespace: &str,
     token: &str,
     ca: Option<&[u8]>,
 ) {
+    let crate::storage::RuntimeStore::Http(store) = backend else {
+        panic!("expected HTTP fixture")
+    };
     assert!(store.base == base);
     assert!(store.namespace.as_str() == namespace);
     assert!(store.authorization.as_bytes() == format!("Bearer {token}").as_bytes());

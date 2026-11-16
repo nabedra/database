@@ -45,6 +45,8 @@ record!(Target {
     #[serde(deserialize_with="member::nullable_uuid")] incarnation_id: Option<Uuid>,
 });
 record!(Bootstrap {
+    #[serde(default, skip_serializing_if="crate::cluster::configuration::ComputeMode::is_fixed")]
+    mode: crate::cluster::configuration::ComputeMode,
     #[serde(default, skip_serializing_if="crate::config::ExecutionConfig::is_default")]
     execution:crate::config::ExecutionConfig,
     #[serde(default, skip_serializing_if="Option::is_none")]
@@ -289,9 +291,10 @@ fn expected_start(
             request_id: intent.launch_id,
             node_id: intent.node_id,
             bootstrap: Bootstrap {
+                mode: t.mode,
                 execution: t.execution.clone(),
                 resources: t.resources,
-                version: 1,
+                version: if t.mode.is_fixed() { 1 } else { 2 },
                 cluster_id: root.cluster_id,
                 node_id: intent.node_id,
                 request_id: intent.launch_id,

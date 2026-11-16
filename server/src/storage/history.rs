@@ -104,7 +104,7 @@ fn decode_root(object: Object) -> Result<Root, StorageError> {
     }
     let version: Version =
         serde_json::from_slice(&object.bytes).map_err(|_| StorageError::InvalidCatalog)?;
-    if matches!(version.format_version, 3 | 4) {
+    if matches!(version.format_version, 3 | 4 | 5) {
         Ok(Root::Cluster(LoadedClusterCatalog::new(
             ClusterCatalog::decode(&object.bytes)?,
             object.etag,
@@ -126,6 +126,124 @@ pub enum FenceTransition {
     ColdStart,
 }
 impl<B: ObjectStore> Storage<B> {
+    /// Reauthorize all backing objects before exposing a retained result through
+    /// a fresh grant. A successful GET establishes object permission; the body
+    /// is immediately dropped rather than downloaded into a shared cache.
+    pub async fn authorize_catalog_objects(
+        &self,
+        loaded: &LoadedClusterCatalog,
+        deadline: Instant,
+    ) -> Result<(), StorageError> {
+        loaded.catalog.validate()?;
+        for entry in loaded.catalog.tables.values() {
+            match &entry.data {
+                super::TableData::Legacy { snapshot } => {
+                    let key = ObjectKey::parse_snapshot(snapshot, entry.id)?;
+                    timeout_at(
+                        deadline,
+                        self.backend
+                            .get(&format!("{}{}", self.namespace.as_str(), key.as_str())),
+                    )
+                    .await
+                    .map_err(|_| StorageError::Unavailable)??;
+                }
+                super::TableData::Partitioned { files } => {
+                    for file in files {
+                        let key = ObjectKey::parse_partition(&file.object, entry.id)?;
+                        timeout_at(
+                            deadline,
+                            self.backend.get(&format!(
+                                "{}{}",
+                                self.namespace.as_str(),
+                                key.as_str()
+                            )),
+                        )
+                        .await
+                        .map_err(|_| StorageError::Unavailable)??;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Initialize a customer catalog or explicitly migrate after old writers stop.
+    /// Ownership, run and term are published in the same conditional root write.
+    /// Attaching with fresh credentials never changes the run or cluster owner.
+    pub async fn initialize_owned_cluster_catalog(
+        &self,
+        cluster_id: Uuid,
+        fence: CatalogFence,
+        migration_allowed: bool,
+        cold: bool,
+    ) -> Result<LoadedClusterCatalog, StorageError> {
+        fence.validate()?;
+        if cluster_id.is_nil() {
+            return Err(StorageError::InvalidCatalog);
+        }
+        let (mut catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
+            Ok(object) => match decode_root(object)? {
+                Root::Cluster(loaded) if loaded.catalog.owner_cluster.is_some() => {
+                    if loaded.catalog.owner_cluster != Some(cluster_id) {
+                        return Err(StorageError::Conflict);
+                    }
+                    if loaded.catalog.fence == Some(fence) {
+                        return Ok(loaded);
+                    }
+                    let old = loaded.catalog.fence.ok_or(StorageError::InvalidCatalog)?;
+                    let transition = if old.run_id == fence.run_id {
+                        FenceTransition::Takeover
+                    } else if cold {
+                        FenceTransition::ColdStart
+                    } else {
+                        return Err(StorageError::Conflict);
+                    };
+                    return self.fence_cluster_catalog(&loaded, fence, transition).await;
+                }
+                Root::Cluster(loaded) => {
+                    if loaded.catalog.owner_cluster.is_some() {
+                        return Err(StorageError::Conflict);
+                    }
+                    if !migration_allowed {
+                        return Err(StorageError::UnsupportedCatalog);
+                    }
+                    (loaded.catalog, Some(loaded.etag))
+                }
+                Root::Legacy(catalog, token) => {
+                    if !migration_allowed {
+                        return Err(StorageError::UnsupportedCatalog);
+                    }
+                    (ClusterCatalog::from_catalog(&catalog)?, Some(token))
+                }
+            },
+            Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
+            Err(error) => return Err(error),
+        };
+        catalog.format_version = 5;
+        catalog.owner_cluster = Some(cluster_id);
+        catalog.fence = Some(fence);
+        let condition = token
+            .as_deref()
+            .map_or(WriteCondition::Create, WriteCondition::Match);
+        match self
+            .put(&ObjectKey::catalog(), catalog.encode()?, condition)
+            .await
+        {
+            Ok(etag) if !etag.is_empty() => LoadedClusterCatalog::new(catalog, etag),
+            Ok(_) | Err(StorageError::Ambiguous) => {
+                let current = self.load_cluster_catalog().await?;
+                if current.catalog.owner_cluster == Some(cluster_id)
+                    && current.catalog.fence == Some(fence)
+                {
+                    Ok(current)
+                } else {
+                    Err(StorageError::Ambiguous)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Load v3/v4 with bounded complete reads and root/head validation.
     pub async fn load_cluster_catalog(&self) -> Result<LoadedClusterCatalog, StorageError> {
         let object = self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await?;
@@ -138,7 +256,12 @@ impl<B: ObjectStore> Storage<B> {
     pub async fn initialize_cluster_catalog(&self) -> Result<LoadedClusterCatalog, StorageError> {
         let (catalog, token) = match self.read(&ObjectKey::catalog(), MAX_CATALOG_BYTES).await {
             Ok(object) => match decode_root(object)? {
-                Root::Cluster(loaded) => return Ok(loaded),
+                Root::Cluster(loaded) => {
+                    if loaded.catalog.owner_cluster.is_some() {
+                        return Err(StorageError::Conflict);
+                    }
+                    return Ok(loaded);
+                }
                 Root::Legacy(catalog, token) => {
                     (ClusterCatalog::from_catalog(&catalog)?, Some(token))
                 }
@@ -196,6 +319,9 @@ impl<B: ObjectStore> Storage<B> {
                     return Ok(loaded);
                 }
                 Root::Cluster(loaded) => {
+                    if loaded.catalog.owner_cluster.is_some() {
+                        return Err(StorageError::Conflict);
+                    }
                     if !migration_allowed {
                         return Err(StorageError::UnsupportedCatalog);
                     }
@@ -211,7 +337,11 @@ impl<B: ObjectStore> Storage<B> {
             Err(StorageError::NotFound) => (ClusterCatalog::from_catalog(&Catalog::empty())?, None),
             Err(error) => return Err(error),
         };
-        catalog.format_version = 4;
+        catalog.format_version = if catalog.owner_cluster.is_some() {
+            5
+        } else {
+            4
+        };
         catalog.fence = Some(fence);
         let condition = token
             .as_deref()
@@ -259,7 +389,11 @@ impl<B: ObjectStore> Storage<B> {
             _ => return Err(StorageError::Conflict),
         }
         let mut catalog = base.catalog.clone();
-        catalog.format_version = 4;
+        catalog.format_version = if catalog.owner_cluster.is_some() {
+            5
+        } else {
+            4
+        };
         catalog.fence = Some(fence);
         let result = self
             .put(

@@ -51,10 +51,11 @@ struct HttpMaterial {
     namespace: Namespace,
     token: HttpToken,
     ca: Option<CaMaterial>,
+    s3: Option<crate::cluster::configuration::S3Options>,
 }
 #[allow(dead_code)]
 pub(crate) struct ConnectedHttp {
-    pub(crate) client: HttpStore,
+    pub(crate) client: crate::storage::RuntimeStore,
     pub(crate) storage: Fingerprint,
     pub(crate) worker: Fingerprint,
 }
@@ -83,6 +84,14 @@ impl ApiReady {
     /// Compare outgoing hints to the exact retained HTTP adapter declaration.
     /// Credential/CA paths are never resolved or opened here.
     pub(crate) fn matches_backend(&self, template: &Template) -> bool {
+        if let Storage::S3(options) = &template.storage {
+            return self.prepared.backend.s3.as_ref().is_some_and(|s| {
+                s.bucket == options.bucket
+                    && s.region == options.region
+                    && Namespace::new(&options.namespace)
+                        .is_ok_and(|n| n.as_str() == self.prepared.backend.namespace.as_str())
+            });
+        }
         let Storage::Http(options) = &template.storage else {
             return false;
         };
@@ -139,9 +148,20 @@ fn bootstrap(reader: &mut Reader) -> Result<BootstrapPrepared, StartupError> {
 }
 fn material(reader: &mut Reader, template: &Template) -> Result<HttpMaterial, StartupError> {
     let Storage::Http(options) = &template.storage else {
-        // C08b2c must establish provider policy and region before S3 construction.
-        // This HTTP slice refuses S3 even in a feature-enabled build.
-        return Err(StartupError::InvalidConfig);
+        let Storage::S3(options) = &template.storage else {
+            unreachable!()
+        };
+        return Ok(HttpMaterial {
+            base: String::new(),
+            namespace: Namespace::new(&options.namespace)
+                .map_err(|_| StartupError::InvalidConfig)?,
+            token: HttpToken {
+                bytes: std::sync::Arc::from(&b""[..]),
+                value: String::new(),
+            },
+            ca: None,
+            s3: Some(options.clone()),
+        });
     };
     let namespace = Namespace::new(&options.namespace).map_err(|_| StartupError::InvalidConfig)?;
     let token = reader.http_token(&options.token_file)?;
@@ -155,9 +175,42 @@ fn material(reader: &mut Reader, template: &Template) -> Result<HttpMaterial, St
         namespace,
         token,
         ca,
+        s3: None,
     })
 }
 impl HttpMaterial {
+    async fn connect_async(
+        &self,
+        template: &Template,
+        tls: Option<&TlsMaterial>,
+    ) -> Result<ConnectedHttp, StartupError> {
+        if let Some(options) = &self.s3 {
+            #[cfg(feature = "s3")]
+            {
+                let client = crate::storage::S3Store::connect_region(
+                    &options.bucket,
+                    self.namespace.clone(),
+                    options.region.as_deref(),
+                )
+                .await
+                .map_err(|_| StartupError::StorageUnavailable)?;
+                let storage = identity::s3(&options.bucket, &self.namespace, client.region())?;
+                let worker = identity::worker(template, &storage, tls)?;
+                return Ok(ConnectedHttp {
+                    client: crate::storage::RuntimeStore::S3(client),
+                    storage,
+                    worker,
+                });
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = options;
+                return Err(StartupError::InvalidConfig);
+            }
+        }
+        self.connect(template, tls)
+    }
+
     fn connect(
         &self,
         template: &Template,
@@ -173,7 +226,7 @@ impl HttpMaterial {
         let storage = identity::http(&self.base, &self.namespace, &self.token, self.ca.as_ref())?;
         let worker = identity::worker(template, &storage, tls)?;
         Ok(ConnectedHttp {
-            client,
+            client: crate::storage::RuntimeStore::Http(client),
             storage,
             worker,
         })
@@ -181,6 +234,21 @@ impl HttpMaterial {
 }
 #[allow(dead_code)]
 impl ApiPrepared {
+    pub(crate) async fn connect_async(self) -> Result<ApiReady, StartupError> {
+        let backend = self
+            .backend
+            .connect_async(&self.input.value.template, self.tls.as_ref())
+            .await?;
+        let authentication = identity::authentication(self.input.value.cluster_id, &self.auth)?;
+        let lifecycle = identity::lifecycle(&self.input.value.lifecycle)?;
+        Ok(ApiReady {
+            prepared: self,
+            backend,
+            authentication,
+            lifecycle,
+        })
+    }
+
     pub(crate) fn connect(self) -> Result<ApiReady, StartupError> {
         let backend = self
             .backend
@@ -197,6 +265,17 @@ impl ApiPrepared {
 }
 #[allow(dead_code)]
 impl BootstrapPrepared {
+    pub(crate) async fn connect_async(self) -> Result<BootstrapReady, StartupError> {
+        let backend = self
+            .backend
+            .connect_async(&self.input.value.template, self.tls.as_ref())
+            .await?;
+        Ok(BootstrapReady {
+            prepared: self,
+            backend,
+        })
+    }
+
     pub(crate) fn connect(self) -> Result<BootstrapReady, StartupError> {
         let backend = self
             .backend

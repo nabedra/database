@@ -1,0 +1,21 @@
+{
+  "result": "passed",
+  "phase": "complete",
+  "assertions": [
+    "native_cli_version_help_migration_flag",
+    "native_s3_doctor_fresh_control_no_observed_changes_no_cargo"
+  ],
+  "cleanup": "no_native_services_started",
+  "target": "real_s3",
+  "scope": "CLI version/help/read-only doctor only",
+  "limits": [
+    "No STS rotation or IAM revocation evidence; synthetic invalid credentials test no fallback",
+    "Known expired snapshot rejected by gateway; no expiry-during-accepted-work claim",
+    "Same bucket with distinct prefixes; separate bucket and equal table UUID coverage belongs to other fixtures",
+    "Two client calls overlap; no deterministic proof of simultaneous worker compute slots",
+    "Doctor before/after object snapshot is not a server-side S3 audit log",
+    "No full scheduler-contract, failover or scale acceptance claim"
+  ],
+  "version_exit": 0,
+  "elapsed_s": 7.631
+}

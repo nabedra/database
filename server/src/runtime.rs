@@ -260,7 +260,7 @@ pub(crate) async fn serve_router_with_budget(
         .http1()
         .keep_alive(false)
         .max_headers(32)
-        .max_buf_size(16384)
+        .max_buf_size(32768)
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(5));
     let total = std::sync::Arc::new(tokio::sync::Semaphore::new(

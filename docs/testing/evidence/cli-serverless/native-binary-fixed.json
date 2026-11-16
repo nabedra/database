@@ -1,0 +1,7 @@
+{
+  "profile": "debug",
+  "features": "default production S3",
+  "version": "0.1.0",
+  "sha256": "c931cbf2438b2f09de020d351a65f2a936d9512760bd86239f42e52e9d46620e",
+  "supersedes": "7b1356c91a4cc5f444443c058ab8291308c79539598c827b312f340847d4cc2a"
+}

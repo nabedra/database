@@ -234,6 +234,10 @@ tagged!(Task {
     Prepare => "prepare" { #[serde(deserialize_with="nullable")] file:Option<FileInput>, #[serde(deserialize_with="range")] range:KeyRange, mutation:RowMutation, target_bytes:u64 }
 });
 record!(QueueBinding {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    storage_digest: Option<[u8;32]>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    grant_digest: Option<[u8;32]>,
     run_id: Uuid,
     scheduler_term: u64,
     membership_revision: u64,
@@ -442,8 +446,11 @@ pub fn validate_queue_binding(
             && binding.membership_revision > 0
             && binding.sequence > 0,
     )?;
+    let (storage_digest, grant_digest) = record.binding_digests().map_err(|_| invalid())?;
     check(
-        record.accepted
+        binding.storage_digest == storage_digest
+            && binding.grant_digest == grant_digest
+            && record.accepted
             && !record.state.terminal()
             && binding.run_id == record.run_id
             && binding.run_id == fence.run_id
@@ -876,6 +883,8 @@ mod queue_binding_tests {
         let table:TableDescriptor=serde_json::from_value(serde_json::json!({"id":Uuid::from_u128(4),"name":"items","schema":{"id":"int64"},"key":"id","format":"parquet"})).unwrap();
         let job = JobEnvelope {
             queue_binding: Some(QueueBinding {
+                storage_digest: None,
+                grant_digest: None,
                 run_id: run,
                 scheduler_term: 2,
                 membership_revision: 3,
@@ -915,6 +924,24 @@ mod queue_binding_tests {
             },
         )
     }
+    #[test]
+    fn sl02_signed_binding_rejects_other_database_or_rotated_grant() {
+        let (mut job, mut record, fence) = fixture();
+        let context = |bucket: &str, access: &str| {
+            serde_json::from_value(serde_json::json!({"version":1,"bucket":bucket,"region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":access,"secret_access_key":"secret","session_token":null,"expires_at":null}})).unwrap()
+        };
+        record.context = Some(context("tenant-one", "accepted"));
+        let (storage, grant) = record.binding_digests().unwrap();
+        let binding = job.queue_binding.as_mut().unwrap();
+        binding.storage_digest = storage;
+        binding.grant_digest = grant;
+        validate_queue_binding(&job, &record, fence).unwrap();
+        record.context = Some(context("tenant-two", "accepted"));
+        assert!(validate_queue_binding(&job, &record, fence).is_err());
+        record.context = Some(context("tenant-one", "rotated"));
+        assert!(validate_queue_binding(&job, &record, fence).is_err());
+    }
+
     #[test]
     fn r05_native_jobs_reject_missing_stale_and_cross_bound_queue_identity() {
         let (job, record, fence) = fixture();

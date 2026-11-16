@@ -265,3 +265,159 @@ fn r03_paged_copy_reports_completion_for_empty_and_final_pages() {
     assert!(done);
     assert!(end.records.is_empty());
 }
+
+fn customer(bucket: &str, secret: &str, expiry: Option<&str>) -> RequestContext {
+    serde_json::from_value(serde_json::json!({"version":1,"bucket":bucket,"region":"eu-west-1","prefix":"db/","credentials":{"access_key_id":"gateway-key","secret_access_key":secret,"session_token":null,"expires_at":expiry}})).unwrap()
+}
+#[test]
+fn sl01_q05_storage_identity_and_rotation_preserve_original_snapshot() {
+    let mut q = queue(&[2, 3]);
+    let raw = body(77);
+    let a = q
+        .propose_with_context(raw.clone(), Some(customer("database-a", "first", None)), 0)
+        .unwrap();
+    let b = q
+        .propose_with_context(raw.clone(), Some(customer("database-b", "second", None)), 0)
+        .unwrap();
+    assert_ne!(a.identity(), b.identity());
+    assert_eq!(q.pending(), 2);
+    let replay = q
+        .propose_with_context(
+            raw.clone(),
+            Some(customer("database-a", "rotated", None)),
+            0,
+        )
+        .unwrap();
+    assert_eq!(a, replay);
+    assert_eq!(a.body, raw);
+    assert!(q.record(id(77)).is_none());
+    let changed = String::from_utf8(body(77))
+        .unwrap()
+        .replace("{}", "{ }")
+        .into_bytes();
+    assert_eq!(
+        q.propose_with_context(changed, Some(customer("database-a", "rotated", None)), 0),
+        Err(QueueError::Conflict)
+    );
+    for record in [&a, &b] {
+        for member in [id(2), id(3)] {
+            q.acknowledge(record.identity(), member).unwrap();
+        }
+        q.start(record.identity(), Some(b"{}".to_vec())).unwrap();
+        for member in [id(2), id(3)] {
+            q.acknowledge(record.identity(), member).unwrap();
+        }
+        q.finish(record.identity(), 200, success(id(77)), 1)
+            .unwrap();
+        assert_eq!(
+            q.lookup(id(1), record.identity(), 1).unwrap().state,
+            RequestState::Succeeded
+        );
+    }
+    assert_eq!(q.pending(), 0);
+}
+#[test]
+fn sl03_q03_r03_complete_context_recovers_after_expiry_without_renewal() {
+    let mut q = queue(&[2, 3]);
+    let a = q
+        .propose_with_context(
+            body(77),
+            Some(customer(
+                "database-a",
+                "original",
+                Some("2026-11-16T20:00:00Z"),
+            )),
+            0,
+        )
+        .unwrap();
+    q.acknowledge(a.identity(), id(2)).unwrap();
+    assert!(!q.ready(a.identity()));
+    let wire = serde_json::to_vec(&q.snapshot()).unwrap();
+    let mut survivor = queue(&[2, 3]);
+    survivor
+        .install_snapshot(serde_json::from_slice(&wire).unwrap())
+        .unwrap();
+    assert_eq!(survivor.record(a.identity()).unwrap().context, a.context);
+    assert!(!survivor.ready(a.identity()));
+    survivor.acknowledge(a.identity(), id(3)).unwrap();
+    assert!(survivor.ready(a.identity()));
+    // Recovery retains expired credentials. Admission with that expiry fails.
+    assert_eq!(
+        survivor.propose_with_context(body(78), a.context.clone(), u64::MAX / 2),
+        Err(QueueError::Invalid)
+    );
+    let snapshot = survivor.takeover(2, 2, [id(3)].into()).unwrap();
+    let recovered = &snapshot.records[0];
+    assert_eq!(recovered.context, a.context);
+    assert_eq!(recovered.digest, a.digest);
+    assert_eq!(recovered.body, a.body);
+    assert!(recovered.accepted);
+}
+#[test]
+fn sl02_context_replacement_and_forgery_are_rejected_on_replica() {
+    let mut q = queue(&[2]);
+    let a = q
+        .propose_with_context(body(77), Some(customer("database-a", "original", None)), 0)
+        .unwrap();
+    let mut forged = a.clone();
+    forged.context = Some(customer("database-a", "replacement", None));
+    forged.version += 1;
+    assert_eq!(q.install(forged), Err(QueueError::Conflict));
+    let mut value = serde_json::to_value(&a).unwrap();
+    value["context"]["credentials"]["secret_access_key"] = serde_json::json!("");
+    assert_eq!(
+        q.install(serde_json::from_value(value).unwrap()),
+        Err(QueueError::Invalid)
+    );
+    assert_eq!(q.record(a.identity()).unwrap(), &a);
+    let debug = format!("{a:?}");
+    assert!(!debug.contains("original"));
+    assert!(!debug.contains("gateway-key"));
+}
+#[test]
+fn sl04_q02_context_bytes_and_stable_scope_count_share_global_queue_budget() {
+    let mut q = queue(&[2]);
+    q.limits.max_pending_requests = 4;
+    let a = q
+        .propose_with_context(body(77), Some(customer("database-a", "first", None)), 0)
+        .unwrap();
+    assert!(q.charged_bytes().0 >= a.body.len() + a.context_bytes().unwrap() + 1024);
+    assert_eq!(
+        q.propose_with_context(body(78), a.context.clone(), 0),
+        Err(QueueError::Overloaded)
+    );
+    // New request IDs with rotated credentials AND expiry cannot bypass the
+    // target's quota. The accepted immutable snapshot digest still differs.
+    let rotated = customer("database-a", "rotated-secret", Some("2026-11-16T20:00:00Z"));
+    assert_ne!(a.binding_digests().unwrap().1, {
+        let mut other = a.clone();
+        other.context = Some(rotated.clone());
+        other.binding_digests().unwrap().1
+    });
+    assert_eq!(
+        q.propose_with_context(body(82), Some(rotated), 0),
+        Err(QueueError::Overloaded)
+    );
+    let mut new_keys = serde_json::to_value(customer("database-a", "new-secret", None)).unwrap();
+    new_keys["credentials"]["access_key_id"] = serde_json::json!("new-access");
+    new_keys["credentials"]["session_token"] = serde_json::json!("new-session");
+    assert_eq!(
+        q.propose_with_context(body(83), Some(serde_json::from_value(new_keys).unwrap()), 0),
+        Err(QueueError::Overloaded)
+    );
+    assert_eq!(q.pending(), 1);
+    // Another database can progress while this stable target scope is full.
+    q.propose_with_context(body(78), Some(customer("database-b", "second", None)), 0)
+        .unwrap();
+    q.propose(body(79), 0).unwrap();
+    q.propose(body(80), 0).unwrap();
+    assert_eq!(q.propose(body(81), 0), Err(QueueError::Overloaded));
+    assert_eq!(q.pending(), 4);
+    let before = q.charged_bytes();
+    q.limits.max_queue_bytes_per_replica = before.0;
+    assert_eq!(
+        q.propose_with_context(body(82), Some(customer("database-c", "third", None)), 0),
+        Err(QueueError::Overloaded)
+    );
+    assert_eq!(q.charged_bytes(), before);
+}

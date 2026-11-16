@@ -36,6 +36,8 @@ fn terminal(d: Decision) -> EncodedResponse {
 }
 struct Peers<'a> {
     worker: &'a Worker,
+    key: crate::request_queue::RequestKey,
+    data: super::runtime::DataGrant,
     binding: Binding,
     authority: StartSubject,
     digest: String,
@@ -53,12 +55,7 @@ impl Peers<'_> {
     }
     async fn current(&self) -> Result<()> {
         let root = self.worker.root().await?;
-        if self
-            .worker
-            .queue
-            .current_binding(self.binding.operation_id())?
-            != self.queue_binding
-        {
+        if self.worker.queue.current_binding(self.key.clone())? != self.queue_binding {
             return Err(unavailable());
         }
         if root.scheduler.scheduler_term != self.fence.scheduler_term
@@ -68,12 +65,15 @@ impl Peers<'_> {
         }
         let fence = self.fence;
         let catalog = self
-            .worker
-            .storage
+            .data
+            .storage()
             .load_cluster_catalog()
             .await
             .map_err(|_| unavailable())?;
-        if catalog.catalog().fence != Some(fence) {
+        if (!root.template.mode.is_fixed()
+            && catalog.catalog().owner_cluster != Some(root.cluster_id))
+            || catalog.catalog().fence != Some(fence)
+        {
             return Err(unavailable());
         }
         let pin = self.worker.pin;
@@ -159,7 +159,7 @@ impl Peers<'_> {
         target: &crate::cluster::member::Node,
         permit: Uuid,
     ) -> settlement::Evidence {
-        if let Ok(catalog) = self.worker.storage.load_cluster_catalog().await {
+        if let Ok(catalog) = self.data.storage().load_cluster_catalog().await {
             if catalog
                 .catalog()
                 .fence
@@ -372,10 +372,7 @@ impl Peers<'_> {
                 // The queue actor remains the single owner while uncertain
                 // children settle; stop dependent dispatch without inventing a
                 // terminal result or changing this attempt's captured identity.
-                let _ = self
-                    .worker
-                    .mark_reconciling(self.binding.operation_id())
-                    .await;
+                let _ = self.worker.mark_reconciling(self.key.clone()).await;
                 self.settle_dependency(&member, permit, grant, child).await
             }
         } else {
@@ -394,6 +391,8 @@ impl Peers<'_> {
 
 pub(super) async fn execute(
     worker: &Worker,
+    key: crate::request_queue::RequestKey,
+    data: super::runtime::DataGrant,
     binding: Binding,
     authority: StartSubject,
     request: Request,
@@ -401,9 +400,11 @@ pub(super) async fn execute(
     lease: &mut PayloadLease,
 ) -> Result<EncodedResponse> {
     let mutation = request.operation.is_mutation();
-    let queue_binding = worker.queue.current_binding(request.request_id)?;
+    let queue_binding = worker.queue.current_binding(key.clone())?;
     let mut peers = Peers {
         worker,
+        key: key.clone(),
+        data,
         binding,
         authority,
         digest: http::digest(&bytes),
@@ -413,10 +414,7 @@ pub(super) async fn execute(
             scheduler_term: queue_binding.scheduler_term,
         },
         queue_binding,
-        sequence: worker
-            .queue
-            .request_sequence(request.request_id)
-            .ok_or_else(unavailable)?,
+        sequence: worker.queue.request_sequence(key).ok_or_else(unavailable)?,
         cap: worker
             .ready
             .prepared
@@ -452,13 +450,13 @@ async fn execute_inner(
     let deadline = Instant::now() + Duration::from_secs(60);
     let budget = HistoryBudget::new(4096, 64 * 1024 * 1024, deadline).map_err(|_| unavailable())?;
     for _ in 0..3 {
-        let storage = peers.worker.storage.clone();
+        let storage = peers.data.storage();
         let original = bytes.clone();
         let id = request.request_id;
         let pinned = if is_mutation {
             None
         } else {
-            peers.worker.queue.pinned(id)
+            peers.worker.queue.pinned(peers.key.clone())
         };
         let expected_fence = peers.fence;
         let loaded = if let Some(pinned) = pinned {
@@ -469,6 +467,20 @@ async fn execute_inner(
                 .await
                 .map_err(|_| unavailable())?
         };
+        if !peers
+            .worker
+            .ready
+            .prepared
+            .input
+            .value
+            .template
+            .mode
+            .is_fixed()
+            && loaded.catalog().owner_cluster
+                != Some(peers.worker.ready.prepared.input.value.cluster_id)
+        {
+            return Err(unavailable());
+        }
         if is_mutation && loaded.catalog().fence != Some(expected_fence) {
             return Err(unavailable());
         }
@@ -535,6 +547,11 @@ async fn execute_inner(
         let original = bytes.clone();
         let status = encoded.status;
         let body = encoded.body.clone();
+        let owner = peers
+            .key
+            .storage
+            .as_ref()
+            .map(|_| peers.worker.ready.prepared.input.value.cluster_id);
         let candidate = cpu(&peers.worker.cpu, move |_| {
             let base = loaded.catalog();
             let decision = Decision {
@@ -557,13 +574,24 @@ async fn execute_inner(
             } else {
                 base.tables.clone()
             };
-            PreparedPublication::prepare_fenced(loaded, tables, decision, expected_fence)
-                .map_err(|_| error(ErrorCode::LimitExceeded))
+            match owner {
+                Some(cluster) => PreparedPublication::prepare_owned(
+                    loaded,
+                    tables,
+                    decision,
+                    cluster,
+                    expected_fence,
+                ),
+                None => {
+                    PreparedPublication::prepare_fenced(loaded, tables, decision, expected_fence)
+                }
+            }
+            .map_err(|_| error(ErrorCode::LimitExceeded))
         })
         .await?;
         if encoded.status == 200 {
             lease
-                .command(Command::UploadStaged(peers.worker.storage.clone()))
+                .command(Command::UploadStaged(peers.data.storage()))
                 .await
                 .map_err(|_| unavailable())?;
         } else {
@@ -573,7 +601,7 @@ async fn execute_inner(
                 .map_err(|_| unavailable())?;
         }
         peers.current().await?;
-        let storage = peers.worker.storage.clone();
+        let storage = peers.data.storage();
         let outcome = candidate
             .publish(&storage, budget)
             .await

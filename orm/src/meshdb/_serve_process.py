@@ -182,14 +182,14 @@ class _Owner:
                 self.saved[signum] = signal.getsignal(signum)
                 signal.signal(signum, handler)
 
-    def spawn(self, config, *, cold_start=False, migrate_catalog=False):
+    def spawn(self, config, *, cold_start=False, migrate_catalog=False, binary=None):
         self.channel, self.peer = socket.socketpair()
         self.channel.setblocking(False)
         env = os.environ.copy()
         env.pop('MESHDB_SUPERVISOR_FD', None)
         env['MESHDB_SUPERVISOR_FD'] = str(self.peer.fileno())
         self.child = subprocess.Popen(
-            [resolve_server_binary(), 'api', '--config', os.path.abspath(config)]
+            [binary if binary is not None else resolve_server_binary(), 'api', '--config', os.path.abspath(config)]
             + (['--cold-start'] if cold_start else []) + (['--migrate-catalog'] if migrate_catalog else []),
             env=env, pass_fds=(self.peer.fileno(),), close_fds=True,
             start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -276,8 +276,8 @@ class _Owner:
                 raise _failure('child_exited')
             self.pump(effective)
 
-    def announce(self, url, deadline):
-        data = memoryview((json.dumps({'event': 'meshdb.serve.ready', 'bound_url': url},
+    def announce(self, url, deadline, *, event="meshdb.serve.ready"):
+        data = memoryview((json.dumps({'event': event, 'bound_url': url},
                                      separators=(',', ':')) + '\n').encode())
         fd = sys.stdout.fileno()
         blocking = os.get_blocking(fd)

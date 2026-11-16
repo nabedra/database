@@ -81,6 +81,7 @@ fn fixed_canonical_vectors() {
     );
     wire(
         &Worker {
+            mode: Default::default(),
             execution: Default::default(),
             resources: None,
             api_urls: &["http://a".into(), "http://b".into()],
@@ -98,6 +99,7 @@ fn fixed_canonical_vectors() {
     );
     wire(
         &Worker {
+            mode: Default::default(),
             execution: Default::default(),
             resources: None,
             api_urls: &["http://a".into(), "http://b".into()],
@@ -134,6 +136,7 @@ fn bounded_identity_includes_json_syntax() {
 
 fn template() -> Template {
     Template {
+        mode: Default::default(),
         execution: Default::default(),
         resources: None,
         api_urls: vec!["http://a".into(), "http://b".into()],

@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 1.28s
+Processing ./orm
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: meshdb
+  Building wheel for meshdb (pyproject.toml): started
+  Building wheel for meshdb (pyproject.toml): finished with status 'done'
+  Created wheel for meshdb: filename=meshdb-0.1.0-py3-none-any.whl size=68958 sha256=0919e84703796e2a8ad675558b0bcf9fc6ed4ddbe44363cc5d59d10757e77229
+  Stored in directory: /private/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/pip-ephem-wheel-cache-c3kaltvw/wheels/a8/a5/3a/8d125367a68527ccb50923db1258dcf80e6b74bb7e0e0c25f7
+Successfully built meshdb
+Installing collected packages: meshdb
+Successfully installed meshdb-0.1.0
+
+[notice] A new release of pip is available: 23.2.1 -> 26.3
+[notice] To update, run: /private<takeover-final-install-prefix>/bin/python -m pip install --upgrade pip
+{"cli": "0.1.0", "binary": "0.1.0", "config": 2, "protocol": 1}
+Installed MeshDB in <takeover-final-install-prefix>

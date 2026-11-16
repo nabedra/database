@@ -5,9 +5,11 @@ exposes HTTP or native HTTPS, and a synchronous Python ORM builds and sends
 operations. Run the API and a local worker together with `serve`, or use
 supervised API and worker processes for a cluster. The ORM requires Python 3.11+
 and only the Python standard library at runtime. It needs the server URL and bearer token, not AWS credentials.
-Standalone `serve` uses S3 for durable storage. The supervised cluster uses an
-HTTP object backend with conditional writes. Run only one standalone `serve`
-process per bucket/prefix; use the cluster deployment for multiple APIs/workers.
+Standalone and supervised deployments support S3 with conditional writes. An
+HTTP object backend supports local fixtures. Fixed mode binds data to one
+database; serverless mode accepts authorized data-storage context from an
+application server gateway. Run only one standalone `serve` process per
+bucket/prefix; use the cluster deployment for multiple APIs/workers.
 
 ## Start here
 
@@ -15,6 +17,9 @@ process per bucket/prefix; use the cluster deployment for multiple APIs/workers.
   query data and reopen it after a restart.
 - [Python ORM guide](orm/README.md): installation, connection, verified TLS,
   table operations, queries and errors.
+- [Repository CLI and server gateway](docs/cli-and-serverless.md): install once,
+  supervise local workers, and attach authorized storage in a framework-independent
+  application endpoint.
 - [Server guide](server/README.md): build and serve, environment configuration,
   HTTP requests, native TLS, health and shutdown.
 - [Execution and recovery contract](plans/resource-aware-scheduling.md): worker
@@ -25,12 +30,25 @@ process per bucket/prefix; use the cluster deployment for multiple APIs/workers.
 
 ## Run the server
 
-Run commands from the repository root. The server requires Rust 1.94.1 or newer
+Run commands from the repository root. Installation requires Rust 1.94.1 or newer
 and Cargo. Python clients require Python 3.11+. You also need an existing S3
 bucket and an AWS identity allowed to read and conditionally write objects
 under your database prefix. The server does not create buckets.
 
-Build the S3-enabled release binary:
+Install the CLI and native server into an isolated environment:
+
+```sh
+python3.11 scripts/install_meshdb.py --prefix .meshdb
+.meshdb/bin/meshdb --version --json
+.meshdb/bin/meshdb serve --mode fixed --storage s3://your-bucket/meshdb/ \
+  --region eu-west-1
+```
+
+The installer builds the locked release binary once. Starting an installed
+server invokes no Cargo. See the [CLI guide](docs/cli-and-serverless.md) for
+configuration, protected token files, shared compute and gateway middleware.
+
+For direct native deployment, build the S3-enabled release binary:
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path server/Cargo.toml
@@ -92,7 +110,7 @@ old binaries stopped. Migration and cold start are separate confirmations.
 
 For separate API and worker processes, use `meshdb-server api --config PATH`
 and `meshdb-server worker --bootstrap PATH`. The API requires a supervisor
-startup exchange and an explicit HTTP object-backend configuration. Follow the
+startup exchange and explicit object-storage configuration. Follow the
 [cluster process guide](server/README.md#cluster-process-acceptance) and
 [provider configuration](docs/testing/provisioning-adapters.md) for enrollment,
 heterogeneous workers, drain and optional autoscaling.

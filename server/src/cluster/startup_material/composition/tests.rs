@@ -256,12 +256,10 @@ fn constructor_rejection_and_unimplemented_s3_are_sanitized() {
     let mut template = reader.bootstrap().unwrap().value.template;
     template.storage = Storage::S3(crate::cluster::configuration::S3Options {
         bucket: "synthetic-bucket".into(),
+        region: None,
         namespace: "owned".into(),
     });
-    assert_eq!(
-        material(&mut reader, &template).unwrap_err(),
-        StartupError::InvalidConfig
-    );
+    assert!(material(&mut reader, &template).unwrap().s3.is_some());
     template.storage = Storage::Http(crate::cluster::configuration::HttpOptions {
         base_url: "http://store.invalid/".into(),
         namespace: "../invalid".into(),

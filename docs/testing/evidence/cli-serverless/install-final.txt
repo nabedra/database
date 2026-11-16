@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 3.09s
+Processing ./orm
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: meshdb
+  Building wheel for meshdb (pyproject.toml): started
+  Building wheel for meshdb (pyproject.toml): finished with status 'done'
+  Created wheel for meshdb: filename=meshdb-0.1.0-py3-none-any.whl size=68935 sha256=8d5615b1f9208b0136a978d0766ff7155231cd11d7812705ba3d833f07ac4ea9
+  Stored in directory: <temporary-build-directory>
+Successfully built meshdb
+Installing collected packages: meshdb
+Successfully installed meshdb-0.1.0
+
+[notice] A new release of pip is available: 24.2 -> 26.3
+[notice] To update, run: <fresh-final-install-prefix>/bin/python -m pip install --upgrade pip
+{"cli": "0.1.0", "binary": "0.1.0", "config": 2, "protocol": 1}
+Installed MeshDB in <fresh-final-install-prefix>

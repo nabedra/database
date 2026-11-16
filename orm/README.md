@@ -5,6 +5,11 @@ builds queries for a separately running MeshDB v0 server. It requires Python
 3.11+ and has no runtime dependencies beyond the standard library. The client
 does not start the server or need AWS credentials; the server owns S3 access.
 
+For shared compute, point this client at your application's endpoint. The
+[framework-independent gateway](../docs/cli-and-serverless.md#host-an-application-endpoint)
+lets that endpoint authorize and forward the existing operation with storage
+credentials supplied by server middleware.
+
 ## Install and connect
 
 Run this from the repository root with a Python 3.11+ interpreter:
@@ -50,10 +55,13 @@ tables = db.tables()  # handles sorted by name
 deleted = users.delete("bob")  # True; a second delete returns False
 ```
 
-`DB(api_url, token, *, timeout=30.0, ca_file=None)` validates configuration
+`DB(api_url, token, *, timeout=30.0, ca_file=None, database=None)` validates configuration
 without sending a request. Supply an absolute HTTP or HTTPS base URL without
 embedded credentials, query or fragment. The client appends `/v1/operations` to
 its base path. The bearer token must be a nonempty safe token string.
+An optional `database` selector accompanies operations and receipt polling.
+The application gateway treats it as untrusted input and authorizes access;
+the selector itself grants no storage permissions.
 
 HTTPS verifies certificates and hostnames using the system trust roots. For a
 private CA, supply an additional PEM CA file:

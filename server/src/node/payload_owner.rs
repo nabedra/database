@@ -70,14 +70,14 @@ pub(crate) enum Command {
         result: Box<ResultEnvelope>,
         expected: Box<JobEnvelope>,
     },
-    ExecuteCaptured(Arc<crate::storage::Storage<crate::storage::HttpStore>>),
+    ExecuteCaptured(Arc<crate::storage::Storage<crate::storage::RuntimeStore>>),
     ExecutePrepared(crate::engine::CapturedInput),
     StagePrepared {
         table: uuid::Uuid,
         commit: uuid::Uuid,
         ordinal: u32,
     },
-    UploadStaged(Arc<crate::storage::Storage<crate::storage::HttpStore>>),
+    UploadStaged(Arc<crate::storage::Storage<crate::storage::RuntimeStore>>),
     BeginResult {
         bytes: Vec<u8>,
         expected: Box<JobEnvelope>,
@@ -1568,7 +1568,7 @@ async fn run(pool: &WorkerPool, slot: &Arc<Slot>, work: Work) -> Result<Reply> {
 async fn upload_staged(
     pool: &WorkerPool,
     slot: &Arc<Slot>,
-    storage: Arc<crate::storage::Storage<crate::storage::HttpStore>>,
+    storage: Arc<crate::storage::Storage<crate::storage::RuntimeStore>>,
 ) -> Result<Reply> {
     let uploads = {
         let mut disk = slot.disk.lock().map_err(|_| OwnerError::Invalid)?;

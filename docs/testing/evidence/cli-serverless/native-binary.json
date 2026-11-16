@@ -1,0 +1,9 @@
+{
+  "profile": "debug",
+  "features": "default production S3",
+  "version": "0.1.0",
+  "sha256": "7b1356c91a4cc5f444443c058ab8291308c79539598c827b312f340847d4cc2a",
+  "boto3": "1.44.3",
+  "botocore": "1.44.3",
+  "aws_cli": "2.19.2"
+}

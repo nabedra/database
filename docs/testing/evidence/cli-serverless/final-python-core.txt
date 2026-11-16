@@ -1,0 +1,13 @@
+test_GW03_rejection_never_reparses_outside_capacity (test_gateway.AsyncGatewayTests.test_GW03_rejection_never_reparses_outside_capacity) ... ok
+test_GW01_raw_order_immutable_and_header_filtering (test_gateway.GatewayTests.test_GW01_raw_order_immutable_and_header_filtering) ... ok
+test_SL06_rejections_never_forward (test_gateway.GatewayTests.test_SL06_rejections_never_forward) ... ok
+test_GW02_uncertain_mutation_once (test_gateway.GatewayTests.test_GW02_uncertain_mutation_once) ... ok
+test_GW02_receipts_and_errors_exact (test_gateway.GatewayTests.test_GW02_receipts_and_errors_exact) ... ok
+test_compatible_path_binary_runs_both_api_and_worker (test_cli_supervision.SupervisionTests.test_compatible_path_binary_runs_both_api_and_worker) ... ok
+test_signal_drains_and_reaps_worker (test_cli_supervision.SupervisionTests.test_signal_drains_and_reaps_worker) ... ok
+test_worker_failure_preserves_status_and_reaps_api (test_cli_supervision.SupervisionTests.test_worker_failure_preserves_status_and_reaps_api) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 3.708s
+
+OK
