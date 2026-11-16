@@ -4,5 +4,5 @@ These notes preserve the commands, file paths, API names and test evidence recor
 when each change ran. Historical project names are intentional. They do not
 describe the current package or command names.
 
-Use the [Python client guide](../README.md) for `nabedra-database`,
+Use the [Python client guide](../docs/reference.md) for `nabedra-database`,
 `from nabedra import Database`, and `nabedra database <command>`.

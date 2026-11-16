@@ -9,14 +9,14 @@ Rust server for local execution. No ORM runtime source changed.
 Validation ran on 2026-11-16 with Python 3.11.10 on macOS x86_64.
 
 ```sh
-python3.11 -m venv orm/.venv
-orm/.venv/bin/python -m pip install build twine \
+python3.11 -m venv orm/python/.venv
+orm/python/.venv/bin/python -m pip install build twine \
   'httpx>=0.27,<1' 'boto3>=1.34,<2'
-orm/.venv/bin/python -m build orm
-orm/.venv/bin/python -m twine check --strict orm/dist/*
-orm/.venv/bin/python -m pip install --no-deps \
-  orm/dist/nabedra-0.1.0-py3-none-any.whl
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python -m unittest discover -s orm/tests
+orm/python/.venv/bin/python -m build orm/python
+orm/python/.venv/bin/python -m twine check --strict orm/python/dist/*
+orm/python/.venv/bin/python -m pip install --no-deps \
+  orm/python/dist/nabedra-0.1.0-py3-none-any.whl
+PYTHONDONTWRITEBYTECODE=1 orm/python/.venv/bin/python -m unittest discover -s orm/python/tests
 ```
 
 Both artifacts passed strict Twine checks. All 177 ORM tests passed in 73.418
@@ -26,7 +26,7 @@ may explicitly select checkout source; the separate integration below verifies
 the installed package in actual CLI and client processes.
 
 A separate temporary virtual environment installed `nabedra[database]==0.1.0`
-from the wheel with `--no-index --find-links orm/dist`. Imports, inert client
+from the wheel with `--no-index --find-links orm/python/dist`. Imports, inert client
 construction, installed metadata, `nabedra database --help`,
 `python -m nabedra database --help`, and `pip check` passed without HTTPX or
 Boto3 installed. Environment creation, installation and smoke checks took
@@ -45,9 +45,9 @@ checksums are recorded in [artifacts.json](python-release/artifacts.json).
 ## Installed CLI and client integration
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 orm/.venv/bin/python scripts/acceptance_nabedra.py \
+PYTHONDONTWRITEBYTECODE=1 orm/python/.venv/bin/python scripts/acceptance_nabedra.py \
   --binary /path/to/nabedra-database-server \
-  --cli orm/.venv/bin/nabedra --python orm/.venv/bin/python \
+  --cli orm/python/.venv/bin/nabedra --python orm/python/.venv/bin/python \
   --output artifacts/python-release/integration.json
 ```
 
@@ -68,9 +68,9 @@ After verification, upload the exact checked files using a PyPI API token
 supplied privately through `TWINE_PASSWORD`:
 
 ```sh
-orm/.venv/bin/python -m twine upload --non-interactive \
+orm/python/.venv/bin/python -m twine upload --non-interactive \
   --repository-url https://upload.pypi.org/legacy/ \
-  orm/dist/nabedra-0.1.0-py3-none-any.whl orm/dist/nabedra-0.1.0.tar.gz
+  orm/python/dist/nabedra-0.1.0-py3-none-any.whl orm/python/dist/nabedra-0.1.0.tar.gz
 ```
 
 Never put tokens in command arguments, tracked files, or release evidence.

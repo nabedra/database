@@ -23,7 +23,7 @@ import tempfile
 import time
 import uuid
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm' / 'python' / 'src'))
 from acceptance_support import load_config
 from acceptance_nodes import announcement
 from gateway_host_fixture import endpoint
@@ -157,7 +157,7 @@ class NativeCluster:
         self.env = config.server_env(namespace)
         self.env.update(PATH=str(trap)+os.pathsep+os.defpath, NABEDRA_SERVER_BINARY=self.binary)
         if not args.cli:
-            self.env['PYTHONPATH']=str(Path(__file__).resolve().parents[1] / 'orm' / 'src')
+            self.env['PYTHONPATH']=str(Path(__file__).resolve().parents[1] / 'orm' / 'python' / 'src')
         self.pids = []
 
     def command(self, args, timeout=40):

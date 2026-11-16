@@ -70,7 +70,7 @@ Current examples, imports, executable paths, configuration names, environment
 variables, HTTP headers and deployment labels use the new names. Persisted
 identity domains and the existing callback adapter contract retain their format
 values so committed data and control records remain readable. See
-[server compatibility](../../server/README.md#existing-storage-and-cluster-compatibility).
+[server compatibility](../../server/docs/reference.md#existing-storage-and-cluster-compatibility).
 Existing namespaces must stay configured explicitly when reopening old data.
 All cluster processes must use matching renamed versions.
 

@@ -15,3 +15,11 @@ nabedra-database.auth.json
 meshdb.json
 meshdb.auth.json
 **/*.auth.json
+# Local environment variants and credentials
+.env.*
+.envrc
+**/.pypirc
+# Generated packages and dependencies at any component depth
+**/build
+**/dist
+**/node_modules

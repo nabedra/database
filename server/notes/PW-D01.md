@@ -7,15 +7,15 @@ tests were left untouched. Applied the unslop skill.
 
 ## Changed files
 
-- [README.md](../../README.md): current partition behavior, exact serve command,
+- [README.md](../docs/overview.md): current partition behavior, exact serve command,
   size syntax and limits, local workers, compatibility, prepared acceptance
   command and current rubric link.
-- [server/README.md](../README.md): CLI defaults and aliases, persistent worker
+- [server/README.md](../docs/reference.md): CLI defaults and aliases, persistent worker
   routing and bounded queues, partition paths and metadata, changed-file writes,
   sequential uploads and atomic publication, lazy legacy migration and retention.
-- [TUTORIAL.md](../../TUTORIAL.md): existing start/restart commands use four workers
+- [TUTORIAL.md](../TUTORIAL.md): existing start/restart commands use four workers
   and a 64 KB target; storage and limit explanations match the implementation.
-- [orm/README.md](../../orm/README.md): replace full-table scan/rewrite claims with
+- [orm/README.md](../../orm/python/docs/reference.md): replace full-table scan/rewrite claims with
   routed keyed operations, global query semantics and unchanged aggregate limits.
 - [server/notes/PW-D01.md](PW-D01.md): this evidence record.
 

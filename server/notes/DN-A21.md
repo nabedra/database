@@ -2,7 +2,7 @@
 
 Adopted design after an independent re-check passed the claim-continuation and heartbeat-ownership corrections. Refine remaining C06/F11 into four sequential `gpt-6.1-sol` assignments with `reasoningEffort=high`. Each needs specification review followed by independent quality review. The parent owns shared declarations and Rust/Cargo scheduling. R04a retains exclusive Rust/Cargo ownership at adoption; its mini-1 scope is unchanged. No implementation or runtime acceptance follows from this note.
 
-Use [distributed-contracts.md](../../plans/distributed-contracts.md), [C06/F11 and orchestration/testing policy](../../plans/distributed-nodes.md), adopted [A05](DN-A05.md), [A07](DN-A07.md), [A08](DN-A08.md), [A10](DN-A10.md), [A16](DN-A16.md), [A17](DN-A17.md), [A18](DN-A18.md), [A19](DN-A19.md), [A20](DN-A20.md), and [A04 callback authorization](../../orm/notes/DN-A04.md). A04's completed-result cache is superseded. Preserve the current protocol, schema, public APIs and separate API/worker roles.
+Use [distributed-contracts.md](../../plans/distributed-contracts.md), [C06/F11 and orchestration/testing policy](../../plans/distributed-nodes.md), adopted [A05](DN-A05.md), [A07](DN-A07.md), [A08](DN-A08.md), [A10](DN-A10.md), [A16](DN-A16.md), [A17](DN-A17.md), [A18](DN-A18.md), [A19](DN-A19.md), [A20](DN-A20.md), and [A04 callback authorization](../../orm/python/notes/DN-A04.md). A04's completed-result cache is superseded. Preserve the current protocol, schema, public APIs and separate API/worker roles.
 
 ## Inspected boundaries and prerequisite order
 

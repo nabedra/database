@@ -5,8 +5,8 @@ RUN cargo build --manifest-path server/Cargo.toml --locked --release --bin nabed
 
 FROM python:3.11-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY orm/ /opt/nabedra/orm/
-RUN python -m pip install --no-cache-dir /opt/nabedra/orm && useradd --create-home nabedra
+COPY orm/python/ /opt/nabedra/orm/python/
+RUN python -m pip install --no-cache-dir /opt/nabedra/orm/python && useradd --create-home nabedra
 COPY --from=build /src/server/target/release/nabedra-db /usr/local/bin/nabedra-db
 USER nabedra
 WORKDIR /home/nabedra

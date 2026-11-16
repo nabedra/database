@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location('install_nabedra', Path(__file__).resolve().parents[2] / 'scripts' / 'install_nabedra.py')
+SPEC = importlib.util.spec_from_file_location('install_nabedra', Path(__file__).resolve().parents[3] / 'scripts' / 'install_nabedra.py')
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
 
@@ -22,6 +22,7 @@ class InstallerTests(unittest.TestCase):
                 cargo = [call for call in calls if call[0] == 'cargo']
                 self.assertEqual(cargo, [['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db']])
                 self.assertEqual(calls[1][1:4], ['-m', 'pip', 'install'])
+                self.assertEqual(calls[1][4], str(Path(installer.__file__).resolve().parents[1] / 'orm' / 'python'))
                 self.assertEqual(calls[2][1:], ['--version', '--json'])
                 self.assertEqual(calls[2][0], str(prefix / 'bin' / 'nabedra'))
                 create.assert_called_once_with(prefix)
