@@ -6,19 +6,35 @@ builds queries for a separately running Nabedra Database v0 server. It requires 
 does not start the server or need AWS credentials; the server owns S3 access.
 
 For shared compute, point this client at your application's endpoint. The
-[framework-independent gateway](../docs/cli-and-serverless.md#host-an-application-endpoint)
+[framework-independent gateway](https://github.com/zPy52/nabedra-database/blob/main/docs/cli-and-serverless.md#host-an-application-endpoint)
 lets that endpoint authorize and forward the existing operation with storage
 credentials supplied by server middleware.
 
 ## Install and connect
 
-Run this from the repository root with a Python 3.11+ interpreter:
+Install from PyPI with Python 3.11+:
 
 ```sh
-python3 -m venv orm/.venv
-orm/.venv/bin/python -m pip install -e ./orm
+python3.11 -m pip install "nabedra[database]"
 export NABEDRA_TOKEN='<same-token-configured-on-your-server>'
 ```
+
+The distribution is named `nabedra`; Python imports also use `nabedra`.
+The `database` extra adds no dependencies because the ORM uses the standard
+library. `pip install nabedra` includes the same ORM and CLI. Optional
+`nabedra[gateway]` and `nabedra[aws]` installs add HTTPX and Boto3 respectively;
+use `nabedra[database,gateway,aws]` when you need both integrations.
+
+The Python package does not bundle the Rust server. To run a server locally,
+install the published crate separately with Cargo:
+
+```sh
+cargo install nabedra-database --version 0.1.0 --locked
+nabedra-database-server --version
+```
+
+For development, run `python3.11 -m pip install -e ./orm` from the repository
+root instead of installing from PyPI.
 
 Replace the token placeholder in your environment. The example below assumes
 the server is already listening at `http://127.0.0.1:8000`. Use its actual base
@@ -328,8 +344,8 @@ The API provides no general transactions across calls, joins, import/export,
 schema migrations, model decorators, relationships, indexes, or
 data-frame adapters. The atomic batch remains a single operation.
 
-See the [server guide](../server/README.md#configuration) for size syntax and
-worker configuration, and the [partition workers rubric](../plans/partition-workers.md)
-for current storage contracts. The [ORM contract](../plan-v0/orm.md) and
-[server contract](../plan-v0/server.md) are historical v0 baselines; their
+See the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/README.md#configuration) for size syntax and
+worker configuration, and the [partition workers rubric](https://github.com/zPy52/nabedra-database/blob/main/plans/partition-workers.md)
+for current storage contracts. The [ORM contract](https://github.com/zPy52/nabedra-database/blob/main/plan-v0/orm.md) and
+[server contract](https://github.com/zPy52/nabedra-database/blob/main/plan-v0/server.md) are historical v0 baselines; their
 single-file storage and request-only worker descriptions predate partition workers.
