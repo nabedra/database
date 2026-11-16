@@ -38,9 +38,22 @@ change. This evidence makes no new runtime, cloud, load, or scaling claim.
 
 ## Publication status
 
-The authenticated `cargo publish --locked --registry crates-io` attempt built
-and verified the committed package in 59.24 seconds. crates.io rejected the
-upload with HTTP 400 because the publishing account needs a verified email
-address. No version was published and no release tag was created. Set and
-verify the account email at <https://crates.io/settings/profile>, then retry
-the upload from the release commit.
+Published [nabedra-database 0.1.0](https://crates.io/crates/nabedra-database/0.1.0)
+on 2026-11-16 under MIT. The authenticated upload rebuilt the extracted package
+with default S3 support in 1 minute 6 seconds, and Cargo confirmed registry
+availability. The registry reports the version as available and not yanked.
+
+The registry SHA-256 matches the local uploaded archive of 700,457 bytes:
+
+```text
+80a1f43e07bbb01d91f49c4e9a809b8eb214d51a30847125bd27550c4342494f
+```
+
+The archive's `.cargo_vcs_info.json` records source commit
+`5ad87f47961dcc6ba31e92fd03aa9a8fbaf1e983`, tagged
+`nabedra-database-v0.1.0`.
+
+```sh
+cargo install nabedra-database --version 0.1.0 --locked
+nabedra-database-server --version
+```
