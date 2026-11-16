@@ -76,3 +76,17 @@ orm/.venv/bin/python -m twine upload --non-interactive \
 Never put tokens in command arguments, tracked files, or release evidence.
 After upload, verify both registry file hashes and install
 `nabedra[database]==0.1.0` from PyPI in a fresh environment outside the checkout.
+
+## Publication result
+
+Published [nabedra 0.1.0](https://pypi.org/project/nabedra/0.1.0/) on
+2026-11-16 under MIT. Both the wheel and source distribution were uploaded.
+The [registry verification](python-release/pypi.json) confirms that both file
+sizes and SHA-256 checksums match the tested artifacts, with Python 3.11+ and
+the `database`, `gateway` and `aws` extras declared.
+
+A fresh temporary environment outside the checkout installed
+`nabedra[database]==0.1.0` from `https://pypi.org/simple/` with caching disabled.
+Version, import path, client construction, absence of optional dependencies,
+both CLI help entry points, and `pip check` passed. The environment setup,
+download, installation and smoke checks took 12.677 seconds locally.
