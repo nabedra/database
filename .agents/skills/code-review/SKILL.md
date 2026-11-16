@@ -30,10 +30,13 @@ Always use a testing yet realistic environment. E.g., if you are creating a prog
 
 NOTE: if you use paid tools such as AWS S3 for the tests, it is even more important to make them high-value and limited in cost. Always try to minimize costs when using paid tools and do not over do the testing, e.g. by running thousands of EC2 instances running for hours. The tests should be very respectful with costs.
 
+# Number of tests
+Aim for 3-10 big essential tests/categories max per functionality/use case category and then do some variations of each, 3-5 per category. Each essential test should amount to a big use or edge case that needs to be tested. Use `references/example.md` as a reference: there we have 5 big use case categories, 2-3 essential tests/categories, then in the implementation YOU should make variations of each of those bulleted-points essential tests. E.g., to check that the queue doesn't break under scaling (one possible essential test for the scaling use case) you'd check with 3-5 different configurations (request size, number of parallel requests, when they burst...) 
+
 # Rubric-style reviewing
 
 When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, assume you shall use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
 
 Try to spawn as many subagents as possible without interfering with the tests of each other. E.g., if Test 2a has to wait for Test 1a to be done, then don't run a subagent for Test 2a until Test 1a is done; but if Test 1a and Test 1b, and 1c and 1d... can be done in parallel, spawn a subagent for each.
 
-On the [references/human.md](references/human.md) you shall find developer test prompts as example lists of relevant tests grouped by use case. Consult the matching use case when choosing tests for a review
+On `references/example.md` you shall find developer test prompts as example lists of relevant tests grouped by use case. Consult the matching use case when choosing tests for a review
