@@ -1,0 +1,323 @@
+[
+  {
+    "path": "scripts/acceptance_http.py",
+    "line": 89,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "types/scalar-types",
+      "api/orm-api",
+      "atomic/atomic-errors"
+    ],
+    "categories": [
+      "Public operations and wire types",
+      "Atomic publication and replay"
+    ],
+    "contract_ids": [
+      "T06",
+      "U01",
+      "U02"
+    ],
+    "assertion_boundaries": "Public installed ORM against a real S3-backed native serve process. Exact scalar type/value/sign-zero round trips, CRUD/query composition/immutability, metadata/discovery, stale handles, duplicate/late-batch validation preserving rows, auth and unsupported-operation errors. Three separate fresh prefixes/processes.",
+    "gaps": "No deterministic fault, multiworker placement, full request conservation, performance or memory assertions. CRUD/get/collect/count and stale handles overlap concurrency, partitions, installed smoke and serverless S3. Keep type extremes and exact atomic error/outcome variations.",
+    "execution_lane": "manual cloud integration after local checks",
+    "replacement": "One S3 integration entry point with types, operations and atomicity scenario profiles; retain named subcases and fresh namespaces"
+  },
+  {
+    "path": "scripts/acceptance_lifecycle.py",
+    "line": 37,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "restart",
+      "https"
+    ],
+    "categories": [
+      "Installed lifecycle and topology",
+      "Real transport/security"
+    ],
+    "contract_ids": [
+      "R04",
+      "F03",
+      "U01"
+    ],
+    "assertion_boundaries": "Real S3 native serve and fresh client discover exact metadata/rows after full graceful stop plus explicit cold-start, then write again. HTTPS uses real generated CA/certificate, successful trusted operations and failed default-trust READ, followed by trusted read. Checks graceful exits/TLS file ownership.",
+    "gaps": "R04 subset checks committed rows only, with no outstanding receipt abandonment. TLS is useful and distinct from mocked CA loading, but local real HTTPS transport tests can cover trust mechanics before cloud cost. Restart rows overlap partition and installed smoke.",
+    "execution_lane": "manual cloud integration, HTTPS when TLS/server startup changes",
+    "replacement": "Keep HTTPS scenario and restart durability assertions within shared S3 runner, avoiding a second general CRUD setup"
+  },
+  {
+    "path": "scripts/acceptance_concurrency.py",
+    "line": 275,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "concurrency, four clients x five rows",
+      "drop/recreate stale handle",
+      "retained snapshot/catalog/Parquet inspection"
+    ],
+    "categories": [
+      "Atomic publication and replay",
+      "Immutable partition storage"
+    ],
+    "contract_ids": [
+      "T03",
+      "T06",
+      "U01"
+    ],
+    "assertion_boundaries": "Four independent real clients synchronize submissions and assert complete exact rows/keys. Drop/recreate gets new table UUID and old get/query/update fail without touching replacement. S3 list/range reads inspect retained previous references and current/historical Parquet magic.",
+    "gaps": "Client barrier does not prove same-base catalog race or simultaneous compute; nodes runner has deterministic catalog barrier. Current _catalog_references only accepts v1/v2 and listing forbids durable decisions, whereas current native serve writes v4 catalog plus decisions. This runner currently cannot certify current storage. Retain storage retention assertions while updating oracle.",
+    "execution_lane": "manual cloud integration after oracle correction",
+    "replacement": "Merge actual cloud concurrency/retention variations into S3 storage profile; preserve local deterministic same-base CAS scenario in acceptance_nodes"
+  },
+  {
+    "path": "scripts/acceptance_latency.py",
+    "line": 55,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "latency-1",
+      "latency-100",
+      "latency-1000; insert/batch10/collect once each"
+    ],
+    "categories": [
+      "Performance measurements"
+    ],
+    "contract_ids": [
+      "B02"
+    ],
+    "assertion_boundaries": "Real S3 end-to-end ORM calls at1/100/1000 initial rows; exact insert/count/collect results and final initial+11 rows. Records one sample for each operation, startup/shutdown and fixture metadata.",
+    "gaps": "No throughput, scaling invariant, percentile, warm-up, repetition or latency budget assertion. Correctness repeats existing CRUD/scale smoke. A failed count/oracle remains meaningful, but elapsed milliseconds are diagnostics rather than B02 acceptance.",
+    "execution_lane": "opt-in cloud latency diagnostic, excluded from routine acceptance",
+    "replacement": "Move one-sample measurements behind a diagnostic flag of S3 data profile, or retain standalone script as explicitly optional; do not delete correctness before retained scenario covers three scales"
+  },
+  {
+    "path": "scripts/acceptance_partitions.py",
+    "line": 81,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "partition-workers;96 wide rows",
+      "mutate low/mid/high ranges",
+      "global tie sort/limit/projection",
+      "restart2to3 workers"
+    ],
+    "categories": [
+      "Immutable partition storage",
+      "Atomic publication and replay"
+    ],
+    "contract_ids": [
+      "C03",
+      "M01",
+      "T06",
+      "U01"
+    ],
+    "assertion_boundaries": "Real S3 native serve, configured64KB partitions, expected>=5 actual Parquet files with bounded size/payload/row totals, global results and ties, range get/update/upsert/delete, untouched immutable references, duplicate-batch atomicity and restart to3 worker threads with exact rows.",
+    "gaps": "Inspector expects v1/v2 and explicitly format2, forbids decisions, and requires entire catalog/object inventory unchanged after conflict/no-op and cold restart. Current identified mutations persist a decision and increment revision even for no-op/rejected outcomes; cold fence changes root. These invariants are stale. Compare table state/reference/file hashes, allow decision/fence updates, assert stable once-only decisions separately. No proof of worker placement/cap or process RAM ceiling.",
+    "execution_lane": "manual cloud integration after oracle correction",
+    "replacement": "One S3 immutable-partition profile retains these unique storage observations; consolidate repeated CRUD/restart setup with concurrency/lifecycle"
+  },
+  {
+    "path": "scripts/acceptance_nodes.py",
+    "line": 184,
+    "action": "KEEP",
+    "scenario_names": [
+      "two separate workers/self+peer TCP",
+      "same-base concurrent inserts",
+      "committed response loss/exact replay/API restart",
+      "stalled-header shutdown"
+    ],
+    "categories": [
+      "Atomic publication and replay",
+      "Real transport/security",
+      "Installed lifecycle and topology"
+    ],
+    "contract_ids": [
+      "T03",
+      "T04",
+      "Q04",
+      "Q05",
+      "F03",
+      "U01"
+    ],
+    "assertion_boundaries": "Real native API/two worker processes over loopback conditional SQLite storage. Deterministic store catalog-read barrier forces same-base competing writes. Drops complete committed public response and compares exact semantic envelope replay before/after API restart. Asserts both workers plus self/peer RPCs and zero exits with stalled headers.",
+    "gaps": "Does not emulate S3/provider. Generic create/get/collect/count overlap scheduler/smoke; deterministic CAS conflict, response EOF and shutdown regressions remain unique. Structured JSON equality is checked, not raw response byte-for-byte equality despite ledger wording.",
+    "execution_lane": "bounded local process integration",
+    "replacement": "Could share orchestration with scheduler recovery runner only if deterministic same-base and stalled-header shutdown subcases remain independently selectable"
+  },
+  {
+    "path": "scripts/acceptance_scheduler.py",
+    "line": 425,
+    "action": "KEEP",
+    "scenario_names": [
+      "C01 heterogeneous1/2/4 pools",
+      "C05/C07 two gated large plus small",
+      "Q04 API restart",
+      "C03 capacity4to3",
+      "Q05 two APIs duplicate/conflict",
+      "Q03 withheld installed-copy ACK",
+      "R05 pause/takeover/resume",
+      "R01/R06 SIGKILL",
+      "R03 join outstanding",
+      "R02 one surviving holder",
+      "R04 all workers stop/cold fence"
+    ],
+    "categories": [
+      "Admission and identity conservation",
+      "Scheduling and bounded resources",
+      "Recovery and fencing"
+    ],
+    "contract_ids": [
+      "C01",
+      "C03",
+      "C05",
+      "C07",
+      "Q03",
+      "Q04",
+      "Q05",
+      "R01",
+      "R02",
+      "R03",
+      "R04",
+      "R05",
+      "R06",
+      "T04"
+    ],
+    "assertion_boundaries": "Actual process/TCP gates and local conditional storage. Proves accepted identity/result survives API/owner failures and sequential holder reduction, one durable mutation decision under duplicate/ACK/pause races, immutable partition hashes on capacity change, and abandoned old read vs durable committed mutation/count1001 after all holders stop.",
+    "gaps": "C01 label says distinct memory ceilings but this runner only asserts threads; load.setup does assert distinct RAM. R03 starts ready joiner while old holders still retain work, then releases original gates and checks result; it does not directly demonstrate complete copy before readiness or remove old holders. Q04 restarts API without explicitly closing original submitting client midflight. R04 label T04 is durable decision recovery, not lost catalog PUT response. No within-node abort/OOM isolation.",
+    "execution_lane": "bounded local process recovery suite"
+  },
+  {
+    "path": "scripts/acceptance_scheduler_load.py",
+    "line": 941,
+    "action": "KEEP",
+    "scenario_names": [
+      "caps1/2/3 and overlap",
+      "conservation1000",
+      "independent count/byte overflow",
+      "benchmark caps1/2/3 x rates2/8/32 x warmup+3"
+    ],
+    "categories": [
+      "Scheduling and bounded resources",
+      "Admission and identity conservation",
+      "Performance measurements"
+    ],
+    "contract_ids": [
+      "C01",
+      "C04",
+      "C05",
+      "C07",
+      "Q01",
+      "Q02",
+      "Q05",
+      "U02",
+      "M02",
+      "B02"
+    ],
+    "assertion_boundaries": "Real API/workers/local conditional store, >100 actual partition files, conservative in-flight TCP node-cap trace, exact large rows/count and small progress, 1000 acknowledged identities with matching terminal oracles, count8/byte40000 independent overload retaining prior IDs. Benchmark adds rate matrix, bounded clients/receipt polling, serial oracles, actual TCP byte traces and sampled RSS/CPU/heartbeat charges.",
+    "gaps": "Transport intervals are not exact compute occupancy; reducer resource use excluded by explicit flag. Observer samples and logical ceilings cannot establish total physical RSS bound. Q01 mixes describe/list/get only, not mutations, and holds remote IO allocations; actual CPU-gated1000 test is separate Rust. Current default all excludes benchmark but still builds three large cap clusters,1000 request cluster,two overflow clusters. Use selected profiles, not all as default quick check.",
+    "execution_lane": "select caps/overflow for change scope; conservation1000 for admission/scheduler changes; benchmark opt-in quiet sequential run"
+  },
+  {
+    "path": "scripts/acceptance_providers.py",
+    "line": 89,
+    "action": "KEEP",
+    "scenario_names": [
+      "A01 validation plus real manual API unsupported",
+      "managed callbacks1to2to1",
+      "inventory failure with8 accepted IDs",
+      "4 IDs overlap safe stop",
+      "explicit fixed0to1 fresh run"
+    ],
+    "categories": [
+      "Provider lifecycle"
+    ],
+    "contract_ids": [
+      "A01",
+      "A02",
+      "Q01",
+      "R04"
+    ],
+    "assertion_boundaries": "Actual native API/workers and Python callback bridge, local conditional store. Gates jobs, observes scale-up, forces provider inventory failure, retains8 exact receipts, checks signed idle/drain/stop proof before removal, completes4 new accepted IDs overlapping removal, verifies committed row, policy replay/conflict/auth, zero workers then new run.",
+    "gaps": "Local callback provider is not Kubernetes/AWS networking/RBAC/cert/lifecycle evidence. Inventory failure is exercised, not every start/stop failure stage. Explicit-zero occurs after work settles and tests new run/data, not pending request abandonment.",
+    "execution_lane": "bounded local integration for provisioning/control/drain changes; real Kubernetes opt-in separately"
+  },
+  {
+    "path": "scripts/acceptance_nabedra.py",
+    "line": 103,
+    "action": "KEEP",
+    "scenario_names": [
+      "installed CLI/native versions",
+      "one API+two-thread worker",
+      "10/100/1000 exact OLTP/OLAP rows",
+      "token/mode checks",
+      "signal cleanup",
+      "cold reopen1110 committed rows"
+    ],
+    "categories": [
+      "Installed lifecycle and topology",
+      "Public operations and wire types"
+    ],
+    "contract_ids": [
+      "C01",
+      "U01",
+      "F03",
+      "R04"
+    ],
+    "assertion_boundaries": "Starts actual CLI-managed API/worker with local conditional SQLite service, validates installed client import path and source hashes when --python supplied, inserts/queries exact3 scales, mode and token semantics, actual child count/reap and new worker identity on cold restart with all1110 rows.",
+    "gaps": "Without --python/--cli it can use checkout source and is not an installed-package test. Modes share one engine, so duplicate mode read is public routing compatibility only. C01 one worker subset, R04 committed-data subset only. Default output overwrites artifact path unless caller chooses fresh output.",
+    "execution_lane": "installed release/package/lifecycle smoke, one combined case with scale variants"
+  },
+  {
+    "path": "scripts/acceptance_cli_serverless.py",
+    "line": 35,
+    "action": "CONSOLIDATE",
+    "scenario_names": [
+      "direct-http vs gateway-http sequential100",
+      "warmup20 plus3 reps",
+      "exact ID/body digest forwarding"
+    ],
+    "categories": [
+      "Performance measurements"
+    ],
+    "contract_ids": [
+      "GW01",
+      "GW02",
+      "SL07"
+    ],
+    "assertion_boundaries": "Real loopback HTTP host and Gateway with fake compute responder, compares one HTTP hop vs two hops+middleware; asserts200 exact envelope and multiset ID/body digest equality. Records timing/tracemalloc/process CPU/RSS.",
+    "gaps": "No native compute, scheduler, tenant load, AWS or provider; one outstanding request, no concurrency-cap saturation despite configured4. Functional forwarding already exercised by ORM gateway/host tests. Measurements are opt-in diagnostics, not app acceptance or full SL07.",
+    "execution_lane": "opt-in quiet gateway performance diagnostic, excluded from default suites",
+    "replacement": "Keep benchmark under explicit performance command, consolidate functional digest variants with existing gateway acceptance category"
+  },
+  {
+    "path": "scripts/acceptance_serverless_s3.py",
+    "line": 271,
+    "action": "KEEP",
+    "scenario_names": [
+      "CLI version/help/doctor smoke",
+      "real S3 conditional writes",
+      "shared API/two native workers",
+      "two database prefixes same request bytes/IDs",
+      "overlapping writes/replay/conflict",
+      "warm data+receipt invalid/expired grants",
+      "once-only durable decisions/control privacy",
+      "signal cleanup",
+      "explicit legacy migration"
+    ],
+    "categories": [
+      "Shared database isolation and grants",
+      "Provider-specific storage integration",
+      "Installed lifecycle and topology"
+    ],
+    "contract_ids": [
+      "SL01",
+      "SL02",
+      "SL03",
+      "SL06",
+      "Q05",
+      "T04",
+      "T06",
+      "U02",
+      "F03"
+    ],
+    "assertion_boundaries": "Real native CLI, S3, gateway HTTP host and two workers in a fresh guarded namespace. Explicit S3 create/staleCAS probes; exact cross-prefix rows/ID isolation, replay/conflict, exact decision counts, grant rejection with no operator fallback, secret/pending-ID scan of fresh control namespace, child reap, doctor unchanged snapshot and owner migration rejection.",
+    "gaps": "No STS rotation/live revocation/accepted-work expiry, cross-bucket/equal-tableUUID proof, worker failover/scale/full scheduler, or simultaneous compute assertion. --smoke-only does not start services/write S3. Requires explicit fixture, S3-capable binary and optional dependencies. Preserve separate live integration because local mock storage cannot replace it.",
+    "execution_lane": "manual gated cloud integration on storage/grants/migration/release changes"
+  }
+]

@@ -1,0 +1,512 @@
+{
+  "base": "62516527dda3f02f7615488938eba5ded0c8a9af",
+  "started_utc": "2026-11-16T17:04:50.552864+00:00",
+  "completed_utc": "2026-11-16T17:19:12.431385+00:00",
+  "toolchain": {
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "installed": "stable-x86_64-apple-darwin (active, default)",
+    "manifest_rust_version": "1.94.1",
+    "minimum_version_verified": false
+  },
+  "clippy_diagnostics": [
+    {
+      "message": "large size difference between variants",
+      "location": "src/cluster/heartbeat.rs:73:1"
+    },
+    {
+      "message": "unnecessary closure used with `bool::then`",
+      "location": "src/cluster/provider_runtime.rs:279:31"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/cluster/provider_runtime.rs:419:9"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/cluster/provider_runtime.rs:420:13"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/cluster/provider_runtime.rs:1142:13"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/cluster/runtime.rs:1185:9"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/cluster/runtime.rs:1186:13"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/node/coordinator.rs:162:9"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/node/coordinator.rs:171:9"
+    },
+    {
+      "message": "this function has too many arguments (8/7)",
+      "location": "src/node/coordinator.rs:392:1"
+    },
+    {
+      "message": "the function `execute_inner` doesn't need a mutable reference",
+      "location": "src/node/coordinator.rs:428:32"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/node/coordinator.rs:879:17"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/node/coordinator.rs:1047:17"
+    },
+    {
+      "message": "large size difference between variants",
+      "location": "src/node/runtime.rs:88:1"
+    },
+    {
+      "message": "this expression creates a reference which is immediately dereferenced by the compiler",
+      "location": "src/node/runtime.rs:132:48"
+    },
+    {
+      "message": "large size difference between variants",
+      "location": "src/node/queue_runtime.rs:176:1"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/node/queue_runtime.rs:1393:17"
+    },
+    {
+      "message": "this OR pattern can be rewritten using a range",
+      "location": "src/node/queue_transport.rs:286:13"
+    },
+    {
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "location": "src/request_queue.rs:131:10"
+    },
+    {
+      "message": "this function has too many arguments (9/7)",
+      "location": "src/runtime.rs:323:1"
+    },
+    {
+      "message": "this function has too many arguments (9/7)",
+      "location": "src/scheduling.rs:319:5"
+    },
+    {
+      "message": "this `if` statement can be collapsed",
+      "location": "src/scheduling.rs:349:13"
+    },
+    {
+      "message": "large size difference between variants",
+      "location": "src/storage/backend.rs:4:1"
+    },
+    {
+      "message": "this OR pattern can be rewritten using a range",
+      "location": "src/storage/decision.rs:63:14"
+    },
+    {
+      "message": "this OR pattern can be rewritten using a range",
+      "location": "src/storage/decision.rs:95:43"
+    },
+    {
+      "message": "this OR pattern can be rewritten using a range",
+      "location": "src/storage/history.rs:107:41"
+    },
+    {
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "location": "src/cluster/receipt_observation.rs:146:23"
+    },
+    {
+      "message": "items after a test module",
+      "location": "src/partition_size.rs:73:1"
+    },
+    {
+      "message": "very complex type used. Consider factoring parts into `type` definitions",
+      "location": "src/request_queue.rs:131:10"
+    }
+  ],
+  "clippy_reported_target_errors": {
+    "lib": 26,
+    "lib_test": 27,
+    "note": "These reports overlap and must not be added as independent error counts."
+  },
+  "no_default_features_warnings": [
+    "unused import CatalogFence at src/maintenance.rs:4:15",
+    "unused method RequestContext::credentials at src/storage/context.rs:134:19"
+  ],
+  "scope": "Fundamental checks only; existing unittest/Rust test bodies, scheduler contract scenarios, cloud acceptance and benchmarks were not executed.",
+  "budget": "User selected up to 4 CPU cores and 8 GB RAM. Two Cargo build jobs and two Tokio/Rayon workers configured; no aggregate OS memory/CPU quota installed or certified.",
+  "environment": {
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "TOKIO_WORKER_THREADS": "2",
+    "RAYON_NUM_THREADS": "2",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+  "target_cache": "Reused existing main checkout server/target cache; not a fresh dependency build.",
+  "checks": [
+    {
+      "name": "python",
+      "exit_code": 0,
+      "elapsed_seconds": 1.215,
+      "cwd": "repository root",
+      "command": "In-memory compile of all tracked .py files and unittest discovery; see the reproduction snippet in the audit.",
+      "base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca"
+    },
+    {
+      "name": "fmt",
+      "exit_code": 0,
+      "elapsed_seconds": 3.752,
+      "cwd": "server",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca"
+    },
+    {
+      "name": "clippy",
+      "exit_code": 101,
+      "elapsed_seconds": 104.904,
+      "cwd": "server",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--offline",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca"
+    },
+    {
+      "name": "no-default-features",
+      "exit_code": 0,
+      "elapsed_seconds": 55.198,
+      "cwd": "server",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--all-targets",
+        "--no-default-features"
+      ],
+      "base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca"
+    },
+    {
+      "name": "default-features",
+      "exit_code": 0,
+      "elapsed_seconds": 48.247,
+      "reason": "Verify all default-feature targets compile independently of the failed warnings-as-errors Clippy check.",
+      "cwd": "server",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--all-targets"
+      ],
+      "base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca"
+    }
+  ],
+  "python": {
+    "version": "3.11.7 (v3.11.7:fa7a6f2303, Dec  4 2023, 15:22:56) [Clang 13.0.0 (clang-1300.0.29.30)]",
+    "compiled_count": 81,
+    "executed_test_bodies": 0,
+    "discovery": {
+      "orm": {
+        "count": 177,
+        "ids": [
+          "test_aws.AwsTests.test_expiry_and_redaction",
+          "test_aws.AwsTests.test_expiry_wire_has_canonical_seconds",
+          "test_aws.AwsTests.test_lazy_persistent_session_consistent_refresh_snapshots",
+          "test_aws.AwsTests.test_provider_error_does_not_expose_exception",
+          "test_aws.AwsTests.test_storage_normalization_and_partition_regions",
+          "test_aws.AwsTests.test_storage_restrictions",
+          "test_aws.AwsTests.test_wire_field_byte_limits_before_forwarding",
+          "test_callback_bridge.CallbackBridgeTests.test_absolute_header_body_budgets_include_queued_time",
+          "test_callback_bridge.CallbackBridgeTests.test_actual_url_inactive_and_authentication_before_held_body",
+          "test_callback_bridge.CallbackBridgeTests.test_blocked_response_write_has_fresh_absolute_budget",
+          "test_callback_bridge.CallbackBridgeTests.test_fixed_ingress_queue_saturation_and_terminal_socket_cleanup",
+          "test_callback_bridge.CallbackBridgeTests.test_original_bytes_authority_gate_and_ownership_denial",
+          "test_callback_bridge.CallbackBridgeTests.test_partial_startup_failure_reaps_idle_owners_and_sanitizes",
+          "test_callback_bridge.CallbackBridgeTests.test_strict_framing_bounds_and_single_request_without_eof",
+          "test_callback_bridge.CallbackBridgeTests.test_three_entered_actions_inventory_disconnect_and_live_close",
+          "test_callback_pool.CallbackPoolTests.test_active_identity_mutation_isolation_and_fresh_provider_replay",
+          "test_callback_pool.CallbackPoolTests.test_admission_fresh_authorization_and_denial_before_entry",
+          "test_callback_pool.CallbackPoolTests.test_authorization_deadline_and_stop_prevent_late_entry",
+          "test_callback_pool.CallbackPoolTests.test_caller_mutation_cannot_change_authorized_arguments",
+          "test_callback_pool.CallbackPoolTests.test_entered_late_effect_and_hung_inventory_are_not_cancelled",
+          "test_callback_pool.CallbackPoolTests.test_json_identity_preserves_types_and_ignores_dictionary_order",
+          "test_callback_pool.CallbackPoolTests.test_partial_thread_start_failure_joins_original_idle_workers",
+          "test_callback_pool.CallbackPoolTests.test_sanitized_failures_and_exact_callback_signatures",
+          "test_callback_pool.CallbackPoolTests.test_three_hung_actions_reserve_inventory_and_keep_original_threads",
+          "test_callback_protocol.CallbackProtocolTests.test_authority_denials_and_bad_framing_never_retry",
+          "test_callback_protocol.CallbackProtocolTests.test_authority_lost_and_absolute_deadline_release_owned_connection",
+          "test_callback_protocol.CallbackProtocolTests.test_authorization_binds_original_bytes_and_bearer",
+          "test_callback_protocol.CallbackProtocolTests.test_commands_preserve_bytes_and_correlate_identities",
+          "test_callback_protocol.CallbackProtocolTests.test_results_complete_strict_and_unique_without_custom_execution",
+          "test_callback_protocol.CallbackProtocolTests.test_strict_json_depth_size_and_generic_bootstrap",
+          "test_callback_protocol.ResourceBootstrapTests.test_optional_resource_execution_limits_survive_managed_bridge",
+          "test_cli.CliTests.test_help_import_and_bad_arguments_are_inert_and_bounded",
+          "test_cli.CliTests.test_literal_arguments_override_pid_and_exit_status",
+          "test_cli.CliTests.test_path_selection_and_invalid_override_never_falls_back",
+          "test_cli.CliTests.test_sigterm_reaches_replacement_without_orphan",
+          "test_cli_management.ManagementTests.test_admin_uses_single_attempt_transport_and_tls",
+          "test_cli_management.ManagementTests.test_doctor_read_only_and_secret_permissions",
+          "test_cli_management.ManagementTests.test_environment_binary_precedes_path_and_override_is_final",
+          "test_cli_management.ManagementTests.test_generated_auth_file_can_administer_cluster",
+          "test_cli_management.ManagementTests.test_init_secrets_and_overwrite",
+          "test_cli_management.ManagementTests.test_migration_delegates_confirmed_command",
+          "test_cli_management.ManagementTests.test_missing_and_conflicting_settings",
+          "test_cli_management.ManagementTests.test_strict_config_tls_and_v1",
+          "test_cli_supervision.SupervisionTests.test_compatible_path_binary_runs_both_api_and_worker",
+          "test_cli_supervision.SupervisionTests.test_existing_cluster_name_is_sent_without_renaming",
+          "test_cli_supervision.SupervisionTests.test_invalid_cluster_name_is_rejected_before_startup",
+          "test_cli_supervision.SupervisionTests.test_signal_drains_and_reaps_worker",
+          "test_cli_supervision.SupervisionTests.test_worker_failure_preserves_status_and_reaps_api",
+          "test_client_api.ClientAPITests.test_config_and_invalid_inputs_are_local",
+          "test_client_api.ClientAPITests.test_create_discover_list_and_fixed_handles",
+          "test_client_api.ClientAPITests.test_malformed_discovery_and_mutation_ambiguity",
+          "test_client_api.ClientAPITests.test_terminal_result_validation",
+          "test_client_api.ClientAPITests.test_terminals_are_fresh_and_projected_rows_can_omit_key",
+          "test_cluster.ClusterTests.test_existing_rejections_and_lost_reply_propagate_without_retry",
+          "test_cluster.ClusterTests.test_invalid_arguments_never_send_and_boundaries_are_accepted",
+          "test_cluster.ClusterTests.test_malformed_or_mismatched_acceptance_is_unknown_without_retry",
+          "test_cluster.ClusterTests.test_operations_use_control_endpoint_and_exact_payloads",
+          "test_cluster.ClusterTests.test_status_normalizes_identity_order_and_allows_retained_intents_and_stopped_nodes",
+          "test_cluster.ClusterTests.test_status_validation_rejects_shape_type_identity_and_count_errors",
+          "test_cluster.ResourceCapacityTests.test_c01_capacity_reports_keep_heterogeneous_limits",
+          "test_cluster.ResourceCapacityTests.test_c02_capacity_overstatement_and_incomplete_reports_fail",
+          "test_cluster_wait.ClusterWaitTests.test_a02_zero_waits_for_draining_member_before_stop_intent_exists",
+          "test_cluster_wait.ClusterWaitTests.test_invalid_inputs_no_io_and_pre_ack_failures_keep_classification",
+          "test_cluster_wait.ClusterWaitTests.test_large_finite_wait_bounds_native_waits_and_rechecks_deadline",
+          "test_cluster_wait.ClusterWaitTests.test_scripted_progression_supersession_and_whole_call_budget",
+          "test_cluster_wait.ClusterWaitTests.test_tcp_pending_intent_requires_another_poll_and_returns_acceptance",
+          "test_cluster_wait.ClusterWaitTests.test_tcp_stalled_poll_expires_after_one_accepted_mutation",
+          "test_control_tls.TransportTLSTests.test_data_transport_trust_is_private_and_untrusted_calls_deliver_nothing",
+          "test_control_tls.TransportTLSTests.test_verified_policy_then_untrusted_handshake_is_pre_send",
+          "test_control_transport.ControlTransportTests.test_deadline_caps_header_and_trickling_body_and_cleans_up",
+          "test_control_transport.ControlTransportTests.test_deadline_interrupt_preserves_tls_state",
+          "test_control_transport.ControlTransportTests.test_hostname_deadline_uses_reaped_resolver_and_returns_success",
+          "test_control_transport.ControlTransportTests.test_local_validation_and_refused_connection_are_not_unknown",
+          "test_control_transport.ControlTransportTests.test_policy_lost_reply_is_unknown_and_not_retried",
+          "test_control_transport.ControlTransportTests.test_untrusted_envelopes_and_redirect_do_not_succeed",
+          "test_control_transport.ControlTransportTests.test_wire_success_ids_and_rejection",
+          "test_gateway.AsyncGatewayTests.test_GW03_context_isolation_sync_bridge_and_cancel",
+          "test_gateway.AsyncGatewayTests.test_GW03_rejection_never_reparses_outside_capacity",
+          "test_gateway.AsyncGatewayTests.test_deadline_capacity_and_close",
+          "test_gateway.GatewayIntegrationTests.test_client_selector_on_operations_submit_and_poll",
+          "test_gateway.GatewayIntegrationTests.test_core_import_with_optional_dependencies_and_frameworks_absent",
+          "test_gateway.GatewayIntegrationTests.test_running_callback_stays_charged_after_deadline_and_close_returns",
+          "test_gateway.GatewayTests.test_GW01_raw_order_immutable_and_header_filtering",
+          "test_gateway.GatewayTests.test_GW02_receipts_and_errors_exact",
+          "test_gateway.GatewayTests.test_GW02_uncertain_mutation_once",
+          "test_gateway.GatewayTests.test_SL06_rejections_never_forward",
+          "test_gateway.GatewayTests.test_all_payload_schemas",
+          "test_gateway.GatewayTests.test_missing_denied_failing_provider_redacted",
+          "test_gateway.GatewayTests.test_sync_rejects_async_before_callbacks",
+          "test_gateway_host.HostTests.test_GW01_GW02_real_http_bytes_receipts_and_secret_logs",
+          "test_gateway_host.HostTests.test_GW03_stream_is_bounded_before_gateway",
+          "test_install_nabedra.InstallerTests.test_build_once_locked_local_install_and_copy",
+          "test_install_nabedra.InstallerTests.test_custom_target_directory_selects_matching_cargo_output",
+          "test_install_nabedra.InstallerTests.test_existing_prefix_refused",
+          "test_install_nabedra.InstallerTests.test_missing_tools_fails_before_environment_creation",
+          "test_providers.KubernetesProviderTests.test_a02_delete_ack_is_not_disappearance_and_evidence_survives_restart",
+          "test_providers.KubernetesProviderTests.test_a02_delete_requires_ownership_and_exact_uid",
+          "test_providers.KubernetesProviderTests.test_a02_inventory_failure_does_not_invent_absence",
+          "test_providers.KubernetesProviderTests.test_a02_launch_retry_uses_same_identity_and_bootstrap",
+          "test_providers.KubernetesProviderTests.test_a02_legacy_inventory_retry_and_exact_uid_delete_survive_upgrade",
+          "test_providers.KubernetesProviderTests.test_a02_legacy_lost_create_retains_uid_in_original_namespace",
+          "test_providers.KubernetesProviderTests.test_a02_legacy_selector_failure_never_returns_empty_inventory",
+          "test_providers.KubernetesProviderTests.test_a02_lost_create_reply_reconciles_without_second_pod",
+          "test_providers.KubernetesProviderTests.test_a02_mixed_identity_namespaces_and_duplicate_launches_fail_closed",
+          "test_providers.KubernetesProviderTests.test_explicit_provider_configuration",
+          "test_providers.KubernetesProviderTests.test_inventory_pagination_must_advance",
+          "test_providers.KubernetesProviderTests.test_nonzero_worker_port_is_required_before_creating_resources",
+          "test_providers.KubernetesProviderTests.test_worker_resource_limits_and_explicit_credential_mounts",
+          "test_public_package.DatabaseInterfaceTests.test_environment_auth_and_explicit_override_reach_new_selector_header",
+          "test_public_package.DatabaseInterfaceTests.test_invalid_modes_and_duplicate_urls_fail_locally",
+          "test_public_package.DatabaseInterfaceTests.test_missing_auth_fails_before_reads_mutations_and_receipt_io",
+          "test_public_package.DatabaseInterfaceTests.test_modes_are_read_only_and_construction_is_inert",
+          "test_public_package.PackageCommandTests.test_database_routes_are_grouped_once",
+          "test_public_package.PackageCommandTests.test_distribution_and_console_entrypoint",
+          "test_public_package.PackageCommandTests.test_root_and_database_versions",
+          "test_query.QueryTests.test_branching_replacement_and_where_combination",
+          "test_query.QueryTests.test_example_and_detached_wire_data",
+          "test_query.QueryTests.test_predicate_depth_boundary_and_combined_where",
+          "test_query.QueryTests.test_python_boolean_and_unsupported_operands",
+          "test_query.QueryTests.test_schema_and_exact_value_validation",
+          "test_receipts.ReceiptsTests.test_invalid_identity_or_payload_creates_no_submission",
+          "test_receipts.ReceiptsTests.test_mutation_acceptance_without_run_is_unknown_and_never_retried",
+          "test_receipts.ReceiptsTests.test_q04_reconnect_uses_receipt_without_resubmission",
+          "test_receipts.ReceiptsTests.test_q05_same_identity_and_body_attach_conflicting_body_fails",
+          "test_receipts.ReceiptsTests.test_q06_expiration_is_explicit_and_never_resubmits",
+          "test_receipts.ReceiptsTests.test_receipt_scope_is_authenticated_on_reconnect",
+          "test_receipts.ReceiptsTests.test_reject_result_in_nonterminal_state",
+          "test_receipts.ReceiptsTests.test_wait_deadline_bounds_receipt_http_io_without_cancelling_work",
+          "test_receipts.ReceiptsTests.test_wait_polls_same_identity",
+          "test_receipts.ReceiptsTests.test_wait_rejects_invalid_or_overflowing_durations",
+          "test_serve_args.ServeArgsTests.test_explicit_literal_config_paths_and_sanitized_failures",
+          "test_serve_args.ServeArgsTests.test_invalid_names_counts_and_callback_combinations",
+          "test_serve_args.ServeArgsTests.test_policy_normalization_and_callback_identity_without_invocation",
+          "test_serve_exit.ServeExitTests.test_attached_unused_receipt_requires_explicit_no_spawn_completion",
+          "test_serve_exit.ServeExitTests.test_dead_child_cannot_finish_active_run",
+          "test_serve_exit.ServeExitTests.test_no_spawn_cleanup_failure_and_exit_are_distinct",
+          "test_serve_exit.ServeExitTests.test_real_startup_failure_exit_with_close_failure",
+          "test_serve_exit.ServeExitTests.test_reaped_returncode_is_exit_proof_even_if_later_poll_fails",
+          "test_serve_exit.ServeExitTests.test_resource_close_failure_still_closes_other_resources_and_restores",
+          "test_serve_exit.ServeExitTests.test_saved_handler_still_owns_active_run",
+          "test_serve_exit.ServeExitTests.test_signal_receipt_confirms_exit_and_cleanup",
+          "test_serve_exit.ServeExitTests.test_unknown_exit_retains_exact_live_owner_and_recovers",
+          "test_serve_guard.ServeGuardTests.test_concurrent_external_reservation_reentrant_rejection_and_stale_finish",
+          "test_serve_guard.ServeGuardTests.test_failure_before_resources_and_dead_bridge_still_require_finish",
+          "test_serve_guard.ServeGuardTests.test_held_real_callback_survives_finish_until_original_threads_exit",
+          "test_serve_guard.ServeGuardTests.test_partial_constructors_retain_real_original_threads",
+          "test_serve_guard.ServeGuardTests.test_unknown_owner_exit_fails_closed",
+          "test_serve_process.ServeProcessTests.test_failed_spawn_closes_both_socket_ends",
+          "test_serve_process.ServeProcessTests.test_held_shutdown_forces_failure",
+          "test_serve_process.ServeProcessTests.test_invalid_explicit_binary_has_no_fallback_or_child",
+          "test_serve_process.ServeProcessTests.test_second_signal_expedites_owned_kill",
+          "test_serve_process.ServeProcessTests.test_selector_failure_stops_admission_and_sanitizes",
+          "test_serve_process.ServeProcessTests.test_signal_arriving_during_failure_shutdown_is_forwarded",
+          "test_serve_process.ServeProcessTests.test_signal_handshake_flood_and_reap",
+          "test_serve_process.ServeProcessTests.test_startup_and_lifetime_failures_cleanup",
+          "test_serve_process.ServeProcessTests.test_startup_signal_closes_admission_before_activate",
+          "test_serve_process.ServeProcessTests.test_stop_interrupt_still_reaps",
+          "test_serve_public.PublicServeTests.test_a01_no_adapter_rejects_autoscaling_before_start",
+          "test_serve_public.PublicServeTests.test_a02_callbacks_reach_active_bridge_and_flags_reach_child",
+          "test_serve_public.PublicServeTests.test_callback_declaration_failure_does_not_launch",
+          "test_table.TableTests.test_atomic_bounded_batch_and_exact_utf8_envelope_limit",
+          "test_table.TableTests.test_crud_payloads_and_server_results",
+          "test_table.TableTests.test_handle_owns_metadata_and_query_construction_is_local",
+          "test_table.TableTests.test_local_validation_and_result_uncertainty",
+          "test_transport.TransportTests.test_bounded_reads_close_success_http_error_and_read_failure",
+          "test_transport.TransportTests.test_exact_wire_and_fresh_ids_and_decoder",
+          "test_transport.TransportTests.test_invalid_responses_respect_mutation_boundary",
+          "test_transport.TransportTests.test_local_preflight_never_opens_connection",
+          "test_transport.TransportTests.test_malformed_http_differs_from_disconnects",
+          "test_transport.TransportTests.test_redirect_is_not_followed",
+          "test_transport.TransportTests.test_server_error_mapping_and_diagnostics",
+          "test_transport.TransportTests.test_strict_json_rejects_ambiguous_and_nonfinite_successes",
+          "test_transport.TransportTests.test_truncated_response_and_decoder_failure",
+          "test_validation.ValidationTests.test_exact_values_int64_and_key_validation",
+          "test_validation.ValidationTests.test_full_and_partial_rows",
+          "test_validation.ValidationTests.test_invalid_schema_name_key_and_format",
+          "test_validation.ValidationTests.test_schema_round_trip_and_mapping_ownership"
+        ],
+        "duplicate_ids": {},
+        "import_errors": [],
+        "failed_ids": []
+      },
+      "scripts": {
+        "count": 16,
+        "ids": [
+          "test_acceptance_cancellation.CancellationTest.test_interrupt_stops_scheduling_and_saves_report",
+          "test_acceptance_cancellation.CancellationTest.test_report_setup_interrupt_saves_without_starting_work",
+          "test_acceptance_serverless_s3.PrivacyTests.test_catalog_diagnosis_exports_only_presence_and_counts",
+          "test_acceptance_serverless_s3.PrivacyTests.test_error_message_classification_is_allowlisted_and_preserves_bytes",
+          "test_acceptance_serverless_s3.PrivacyTests.test_failure_report_never_stringifies_exception_or_private_config",
+          "test_acceptance_serverless_s3.PrivacyTests.test_owned_child_observer_uses_portable_numeric_process_columns",
+          "test_acceptance_serverless_s3.PrivacyTests.test_prefix_guard_rejects_foreign_or_unsafe_key_before_aws",
+          "test_acceptance_serverless_s3.PrivacyTests.test_receipt_observer_preserves_terminal_error_null",
+          "test_acceptance_support.CatalogShapeGuard.test_current_references_across_catalog_versions",
+          "test_acceptance_support.ConfigurationGuard.test_dotenv_and_namespace_stay_inside_configured_bucket",
+          "test_lifecycle_cleanup.CleanupTest.test_tls_cleanup_depends_on_observed_exit",
+          "test_local_store.LocalStoreTests.test_conditional_tcp_storage_and_restart",
+          "test_local_store.LocalStoreTests.test_post_commit_response_loss_is_recovered_by_get",
+          "test_server_process.ProcessGuard.test_local_process_restart_and_failed_start_cleanup",
+          "test_server_process.ProcessGuard.test_r04_unconfirmed_child_exit_cannot_authorize_a_replacement",
+          "test_server_process.ProcessGuard.test_uncooperative_server_is_killed_reaped_and_reported_as_failure"
+        ],
+        "duplicate_ids": {},
+        "import_errors": [],
+        "failed_ids": []
+      }
+    }
+  },
+  "pure_helper_diagnostic": "acceptance_concurrency._catalog_references accepted a v2 empty catalog and rejected otherwise-identical v4 and v5. This is not S3/runtime acceptance.",
+  "initial_base": "9b63ed528dd4e570a387c3bab24dff1bbfabdbca",
+  "initial_completed_utc": "2026-11-16T17:09:03.249798+00:00",
+  "revision_note": "Initial complete review at9b63ed5; final delta review at6251652 included the nabedra-db rename and one new real executable startup test. Ordinary fundamentals refreshed. Strict Clippy was executed only at the initial revision.",
+  "refresh": {
+    "base": "62516527dda3f02f7615488938eba5ded0c8a9af",
+    "started_utc": "2026-11-16T17:17:51.962070+00:00",
+    "completed_utc": "2026-11-16T17:19:12.431385+00:00",
+    "clippy_rerun": false,
+    "checks": [
+      {
+        "name": "python",
+        "exit_code": 0,
+        "elapsed_seconds": 1.334,
+        "cwd": "repository root",
+        "command": "In-memory compile of all tracked .py files and unittest discovery; see the audit reproduction snippet."
+      },
+      {
+        "name": "fmt",
+        "exit_code": 0,
+        "elapsed_seconds": 3.656,
+        "cwd": "server",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ]
+      },
+      {
+        "name": "default-features",
+        "exit_code": 0,
+        "elapsed_seconds": 40.078,
+        "cwd": "server",
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "--offline",
+          "--all-targets"
+        ]
+      },
+      {
+        "name": "no-default-features",
+        "exit_code": 0,
+        "elapsed_seconds": 35.346,
+        "cwd": "server",
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "--offline",
+          "--all-targets",
+          "--no-default-features"
+        ]
+      }
+    ],
+    "no_default_features_warnings": [
+      "unused CatalogFence import at src/maintenance.rs:4:15",
+      "unused RequestContext::credentials at src/storage/context.rs:134:19"
+    ]
+  },
+  "inventory": {
+    "source_definitions": 952,
+    "rust": 759,
+    "python_orm": 177,
+    "python_script_guards": 16,
+    "test_files": 143,
+    "keep": 876,
+    "consolidate_or_replace": 68,
+    "remove": 8,
+    "acceptance_runners_separate": 12
+  }
+}
