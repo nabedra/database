@@ -35,3 +35,12 @@ package does not enable.
 
 No scheduler acceptance scenarios were rerun for this metadata and packaging
 change. This evidence makes no new runtime, cloud, load, or scaling claim.
+
+## Publication status
+
+The authenticated `cargo publish --locked --registry crates-io` attempt built
+and verified the committed package in 59.24 seconds. crates.io rejected the
+upload with HTTP 400 because the publishing account needs a verified email
+address. No version was published and no release tag was created. Set and
+verify the account email at <https://crates.io/settings/profile>, then retry
+the upload from the release commit.
