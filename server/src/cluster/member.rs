@@ -88,7 +88,7 @@ string_enum!(IntentOutcome { ResourceKnown => "resource_known", Terminated => "t
 macro_rules! record {
     ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone, PartialEq, Eq, Serialize)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_struct(stringify!($name)).finish_non_exhaustive() }
         }
@@ -124,6 +124,8 @@ record!(Delivery {
     command_sha256: String,
 });
 record!(Node {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    resources:Option<crate::config::WorkerResources>,
     #[serde(deserialize_with="uuid")]
     node_id: Uuid,
     #[serde(deserialize_with="nullable_uuid")]
@@ -174,6 +176,12 @@ record!(Intent {
     outcome: Option<IntentOutcome>,
 });
 record!(Heartbeat {
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    available_threads:Option<u64>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    available_memory_bytes:Option<u64>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    resources:Option<crate::config::WorkerResources>,
     version: u64,
     #[serde(deserialize_with="uuid")]
     cluster_id: Uuid,
@@ -209,7 +217,7 @@ fn code(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
 }
 fn capacities(operation: u64, partition: u64, queue: u64) -> Result<(), MemberError> {
-    check((1..=256).contains(&operation) && (1..=256).contains(&partition) && queue <= 4096)
+    check((1..=256).contains(&operation) && (1..=1024).contains(&partition) && queue <= 4096)
 }
 pub(crate) fn endpoint(s: &str) -> bool {
     if s.len() > 2048
@@ -269,6 +277,11 @@ pub(crate) fn endpoint(s: &str) -> bool {
 impl Node {
     fn validate_fields(&self) -> Result<(), MemberError> {
         capacities(self.operation_slots, self.partition_slots, self.queue_size)?;
+        check(self.resources.is_some() || self.partition_slots <= 256)?;
+        check(
+            self.resources
+                .is_none_or(|r| r.validate().is_ok() && r.max_threads <= self.partition_slots),
+        )?;
         check(
             self.resource_id.as_deref().is_none_or(resource)
                 && self.endpoint.as_deref().is_none_or(endpoint),
@@ -358,6 +371,24 @@ impl Intent {
 impl Heartbeat {
     fn validate_fields(&self) -> Result<(), MemberError> {
         capacities(self.operation_slots, self.partition_slots, self.queue_size)?;
+        check(self.resources.is_some() || self.partition_slots <= 256)?;
+        check(
+            self.resources
+                .is_none_or(|r| r.validate().is_ok() && r.max_threads <= self.partition_slots),
+        )?;
+        check(
+            match (
+                self.available_threads,
+                self.available_memory_bytes,
+                self.resources,
+            ) {
+                (None, None, _) => true,
+                (Some(threads), Some(bytes), Some(resources)) => {
+                    threads <= resources.max_threads && bytes <= resources.working_bytes()
+                }
+                _ => false,
+            },
+        )?;
         check(
             self.version == 1
                 && self.sequence > 0

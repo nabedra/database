@@ -559,22 +559,26 @@ async fn pending_submit_rejected_by_real_stop_retains_disk_and_guards() {
         .pool
         .submit(0, move |_, _| {
             let _ = started.send(());
-            let _ = gate.recv();
+            gate.recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
             Ok(())
         })
         .await
         .unwrap();
     running.await.unwrap();
-    let queued = owners.shared.pool.submit(0, |_, _| Ok(())).await.unwrap();
+    // The one compute slot is already occupied. Reservation admission now
+    // leaves the command itself pending, before any executor-queue insertion.
     let (pending, observed) = oneshot::channel();
     slot.hooks.lock().unwrap().submit_pending = Some(pending);
     let task = tokio::spawn(async move { lease.command(Command::Append(b"[]".to_vec())).await });
-    observed.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+        .await
+        .unwrap()
+        .unwrap();
     let stopped = threads.shutdown();
     release.send(()).unwrap();
     assert_eq!(task.await.unwrap().unwrap_err(), OwnerError::FailedDrain);
     running_job.receive().await.unwrap();
-    queued.receive().await.unwrap();
     stopped.await.unwrap();
     assert_eq!(owners.close_and_drain().await, Err(OwnerError::FailedDrain));
     assert!(slot.hooks.lock().unwrap().disposed.is_empty());

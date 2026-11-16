@@ -55,6 +55,10 @@ macro_rules! wire {
     }
 }
 wire!(Worker {
+    #[serde(default)]
+    execution: crate::config::ExecutionConfig,
+    #[serde(default)]
+    resources: Option<crate::config::WorkerResources>,
     listen: String,
     operation_slots: u64,
     partition_slots: u64,
@@ -77,6 +81,10 @@ wire!(ApiWire {
     lifecycle: Timing,
 });
 wire!(BootstrapWire {
+    #[serde(default)]
+    execution: crate::config::ExecutionConfig,
+    #[serde(default)]
+    resources: Option<crate::config::WorkerResources>,
     version: u64,
     #[serde(deserialize_with="uuid")]
     cluster_id: Uuid,
@@ -179,6 +187,8 @@ pub(crate) fn decode_api(bytes: &[u8]) -> Result<ApiConfig, ConfigurationError> 
         serde_json::from_slice(bytes).map_err(|_| ConfigurationError::InvalidRecord)?;
     check(wire.version == 1 && configuration::listen(&wire.bind) && literal_path(&wire.auth_file))?;
     let template = Template {
+        execution: wire.worker.execution,
+        resources: wire.worker.resources,
         api_urls: wire.api_urls,
         listen: wire.worker.listen,
         operation_slots: wire.worker.operation_slots,
@@ -211,6 +221,8 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<Bootstrap, ConfigurationE
                 .all(|b| (33..=126).contains(&b)),
     )?;
     let template = Template {
+        execution: wire.execution,
+        resources: wire.resources,
         api_urls: wire.api_urls,
         listen: wire.listen,
         operation_slots: wire.operation_slots,

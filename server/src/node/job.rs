@@ -66,7 +66,7 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Opti
 macro_rules! record {
     ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Debug, Clone, PartialEq, Serialize)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(d:D)->Result<Self,D::Error>{
                 #[derive(Deserialize)]
@@ -233,7 +233,16 @@ tagged!(Task {
     Count => "count" { file:FileInput, #[serde(deserialize_with="protocol::deserialize_object")] query:Query },
     Prepare => "prepare" { #[serde(deserialize_with="nullable")] file:Option<FileInput>, #[serde(deserialize_with="range")] range:KeyRange, mutation:RowMutation, target_bytes:u64 }
 });
+record!(QueueBinding {
+    run_id: Uuid,
+    scheduler_term: u64,
+    membership_revision: u64,
+    sequence: u64
+});
+impl Copy for QueueBinding {}
 record!(JobEnvelope {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    queue_binding:Option<QueueBinding>,
     version: u32,
     cluster_id: Uuid,
     operation_id: Uuid,
@@ -327,7 +336,28 @@ impl From<PartitionFile> for FileInput {
     }
 }
 impl JobEnvelope {
+    /// Native jobs use their accepted queue sequence. The full UUID hash is a
+    /// compatibility key only for direct, non-native codec/unit callers.
+    pub fn scheduler_request_id(&self) -> u64 {
+        self.queue_binding.map_or_else(
+            || {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                self.operation_id.hash(&mut hash);
+                hash.finish()
+            },
+            |binding| binding.sequence,
+        )
+    }
     pub fn validate(&self) -> Result<(), JobError> {
+        if let Some(binding) = self.queue_binding {
+            check(
+                !binding.run_id.is_nil()
+                    && binding.scheduler_term > 0
+                    && binding.membership_revision > 0
+                    && binding.sequence > 0,
+            )?;
+        }
         check(
             self.version == 1
                 && digest(&self.request_digest)
@@ -395,6 +425,35 @@ impl JobEnvelope {
             Task::Prepare { file, .. } => file.as_ref(),
         }
     }
+}
+
+/// Production dispatch calls this with its locally replicated complete request
+/// record and the current catalog fence before installing/executing the job.
+/// Membership/lease authority and attempt replay checks remain with dispatch.
+pub fn validate_queue_binding(
+    job: &JobEnvelope,
+    record: &crate::request_queue::RequestRecord,
+    fence: crate::storage::CatalogFence,
+) -> Result<(), JobError> {
+    let binding = job.queue_binding.ok_or_else(invalid)?;
+    check(
+        !binding.run_id.is_nil()
+            && binding.scheduler_term > 0
+            && binding.membership_revision > 0
+            && binding.sequence > 0,
+    )?;
+    check(
+        record.accepted
+            && !record.state.terminal()
+            && binding.run_id == record.run_id
+            && binding.run_id == fence.run_id
+            && binding.scheduler_term == record.scheduler_term
+            && binding.scheduler_term == fence.scheduler_term
+            && binding.membership_revision == record.membership_revision
+            && binding.sequence == record.sequence
+            && job.operation_id == record.request_id
+            && job.request_digest == record.digest,
+    )
 }
 impl ResultEnvelope {
     /// Validates CONTROL only. Get rows and Prepared metadata/Parquet remain unverified.
@@ -776,4 +835,183 @@ fn counted_size<T: Serialize + ?Sized>(value: &T, limit: usize) -> Result<usize,
     let mut counter = Counter { size: 0, limit };
     serde_json::to_writer(&mut counter, value).map_err(|_| invalid())?;
     Ok(counter.size)
+}
+
+#[cfg(test)]
+mod queue_binding_tests {
+    use super::*;
+    use crate::{
+        request_queue::{QueueLimits, RequestQueue},
+        storage::CatalogFence,
+    };
+    fn fixture() -> (
+        JobEnvelope,
+        crate::request_queue::RequestRecord,
+        CatalogFence,
+    ) {
+        let member = Uuid::from_u128(10);
+        let run = Uuid::from_u128(20);
+        let id = Uuid::from_u128(1);
+        let body = serde_json::to_vec(
+            &serde_json::json!({"request_id":id,"operation":"table.list","payload":{}}),
+        )
+        .unwrap();
+        let mut queue = RequestQueue::new(
+            run,
+            2,
+            3,
+            QueueLimits {
+                max_pending_requests: 10,
+                max_queue_bytes_per_replica: 1 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                result_retention_ms: 1000,
+            },
+            [member].into_iter().collect(),
+        )
+        .unwrap();
+        let proposed = queue.propose(body, 0).unwrap();
+        let record = queue
+            .acknowledge_version(id, proposed.version, member)
+            .unwrap();
+        let table:TableDescriptor=serde_json::from_value(serde_json::json!({"id":Uuid::from_u128(4),"name":"items","schema":{"id":"int64"},"key":"id","format":"parquet"})).unwrap();
+        let job = JobEnvelope {
+            queue_binding: Some(QueueBinding {
+                run_id: run,
+                scheduler_term: 2,
+                membership_revision: 3,
+                sequence: record.sequence,
+            }),
+            version: 1,
+            cluster_id: Uuid::from_u128(5),
+            operation_id: id,
+            job_id: Uuid::from_u128(6),
+            attempt_id: Uuid::from_u128(7),
+            request_digest: record.digest.clone(),
+            snapshot: Snapshot {
+                catalog_revision: 1,
+                catalog_commit_id: Uuid::from_u128(8),
+                catalog_etag: "token".into(),
+            },
+            ordinal: 0,
+            table,
+            task: Task::Get {
+                file: FileInput::Legacy {
+                    object: format!(
+                        "tables/{}/{}.parquet",
+                        Uuid::from_u128(4),
+                        Uuid::from_u128(9)
+                    ),
+                    row_count: 1,
+                },
+                key: Key::Int64(1),
+            },
+        };
+        (
+            job,
+            record,
+            CatalogFence {
+                run_id: run,
+                scheduler_term: 2,
+            },
+        )
+    }
+    #[test]
+    fn r05_native_jobs_reject_missing_stale_and_cross_bound_queue_identity() {
+        let (job, record, fence) = fixture();
+        validate_queue_binding(&job, &record, fence).unwrap();
+        let mut missing = job.clone();
+        missing.queue_binding = None;
+        assert!(validate_queue_binding(&missing, &record, fence).is_err());
+        assert!(
+            !String::from_utf8(encode_job(&missing).unwrap())
+                .unwrap()
+                .contains("queue_binding"),
+            "direct legacy codec bytes omit the optional extension"
+        );
+        for index in 0..7 {
+            let mut changed = job.clone();
+            let binding = changed.queue_binding.as_mut().unwrap();
+            match index {
+                0 => binding.run_id = Uuid::from_u128(99),
+                1 => binding.scheduler_term += 1,
+                2 => binding.membership_revision += 1,
+                3 => binding.sequence += 1,
+                4 => changed.request_digest = "a".repeat(64),
+                5 => changed.operation_id = Uuid::from_u128(99),
+                6 => binding.sequence = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_queue_binding(&changed, &record, fence).is_err(),
+                "changed field {index}"
+            );
+        }
+        assert!(
+            validate_queue_binding(
+                &job,
+                &record,
+                CatalogFence {
+                    run_id: fence.run_id,
+                    scheduler_term: fence.scheduler_term + 1
+                }
+            )
+            .is_err()
+        );
+        let mut unaccepted = record.clone();
+        unaccepted.accepted = false;
+        assert!(validate_queue_binding(&job, &unaccepted, fence).is_err());
+        let mut terminal = record;
+        terminal.state = crate::request_queue::RequestState::Succeeded;
+        assert!(validate_queue_binding(&job, &terminal, fence).is_err());
+        let roundtrip = parse_job(&encode_job(&job).unwrap()).unwrap();
+        assert_eq!(roundtrip.queue_binding, job.queue_binding);
+    }
+    #[tokio::test]
+    async fn c05_same_uuid_prefix_uses_distinct_native_request_shares() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let (mut first, _, _) = fixture();
+        let mut second = first.clone();
+        second.operation_id = Uuid::from_u128(2);
+        first.queue_binding.as_mut().unwrap().sequence = 41;
+        second.queue_binding.as_mut().unwrap().sequence = 42;
+        assert_eq!(
+            &first.operation_id.as_bytes()[..8],
+            &second.operation_id.as_bytes()[..8]
+        );
+        assert_ne!(first.scheduler_request_id(), second.scheduler_request_id());
+        let scheduler = crate::scheduling::ResourceScheduler::new(vec![(
+            0,
+            crate::config::WorkerResources {
+                max_threads: 1,
+                memory_limit_bytes: 1000,
+                task_memory_limit_bytes: 900,
+                control_memory_reserve_bytes: 100,
+            },
+        )])
+        .unwrap();
+        let active = scheduler
+            .reserve(first.scheduler_request_id(), 1, 100)
+            .await
+            .unwrap();
+        let mut retry = Box::pin(scheduler.reserve(first.scheduler_request_id(), 1, 100));
+        let mut peer = Box::pin(scheduler.reserve(second.scheduler_request_id(), 1, 100));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(retry.as_mut().poll(&mut cx).is_pending());
+        assert!(peer.as_mut().poll(&mut cx).is_pending());
+        drop(active);
+        assert!(retry.as_mut().poll(&mut cx).is_pending());
+        let peer = match peer.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(grant)) => grant,
+            _ => panic!("same-prefix peer must receive its fair turn"),
+        };
+        drop(peer);
+        drop(retry.await.unwrap());
+        assert_eq!(scheduler.usage(), vec![(0, 0, 0)]);
+        first.queue_binding = None;
+        second.queue_binding = None;
+        assert_ne!(first.scheduler_request_id(), second.scheduler_request_id());
+    }
 }

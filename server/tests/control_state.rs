@@ -307,8 +307,13 @@ fn cross_bindings_incarnations_external_members_and_late_recovery() {
     let mut bad = c.clone();
     bad.nodes[0].incarnation = c.nodes[1].incarnation;
     assert!(bad.encode().is_err());
-    let mut bad = c.clone();
-    bad.nodes[1].operation_slots = 5;
+    let mut heterogeneous = c.clone();
+    heterogeneous.nodes[1].operation_slots = 5;
+    Control::decode(&heterogeneous.encode().unwrap()).unwrap();
+    let mut bad = heterogeneous.clone();
+    bad.nodes[1].operation_slots = 0;
+    assert!(bad.encode().is_err());
+    bad.nodes[1].operation_slots = 257;
     assert!(bad.encode().is_err());
     stop(&mut c, 1, 20000);
     c.intents.last_mut().unwrap().incarnation_id = c.nodes[1].incarnation;

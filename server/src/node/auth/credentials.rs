@@ -46,12 +46,14 @@ enum Domain {
     Enrollment,
     Request,
     Response,
+    Queue,
 }
 fn sign(pair: &Ed25519KeyPair, domain: Domain, body: &[u8]) -> Result<[u8; 64], Error> {
     let (prefix, cap): (&[u8], usize) = match domain {
         Domain::Enrollment => (b"meshdb.enroll.v1\0", 16 * 1024),
         Domain::Request => (b"meshdb.http-request.v1\0", 4096),
         Domain::Response => (b"meshdb.http-response.v1\0", 4096),
+        Domain::Queue => (b"meshdb.queue-control.v1\0", 4096),
     };
     if body.len() > cap {
         return Err(Error::Limit);
@@ -75,6 +77,9 @@ impl WorkerSigningKey {
     #[cfg(test)]
     fn from_test_seed(seed: [u8; 32]) -> Result<Self, Error> {
         Ok(Self { pair: pair(&seed)? })
+    }
+    pub(crate) fn sign_queue(&self, body: &[u8]) -> Result<[u8; 64], Error> {
+        sign(&self.pair, Domain::Queue, body)
     }
     pub(crate) fn public_key(&self) -> [u8; 32] {
         public(&self.pair)
@@ -128,6 +133,9 @@ impl ApiSigningKey {
             cluster,
             pair: pair(&seed)?,
         })
+    }
+    pub(crate) fn sign_queue(&self, body: &[u8]) -> Result<[u8; 64], Error> {
+        sign(&self.pair, Domain::Queue, body)
     }
     pub(crate) fn public_key(&self) -> [u8; 32] {
         public(&self.pair)

@@ -17,7 +17,20 @@ pub fn router<B: ObjectStore + 'static>(engine: Engine<B>) -> Router {
 }
 
 async fn ready<B: ObjectStore + 'static>(State(engine): State<Engine<B>>) -> StatusCode {
-    match tokio::time::timeout(Duration::from_secs(5), engine.storage().load_catalog()).await {
+    match tokio::time::timeout(Duration::from_secs(5), async {
+        let object = engine
+            .storage()
+            .read(
+                &crate::storage::ObjectKey::catalog(),
+                crate::protocol::MAX_CATALOG_BYTES,
+            )
+            .await?;
+        crate::storage::Catalog::decode(&object.bytes)
+            .map(|_| ())
+            .or_else(|_| crate::storage::ClusterCatalog::decode(&object.bytes).map(|_| ()))
+    })
+    .await
+    {
         Ok(Ok(_)) => StatusCode::OK,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     }

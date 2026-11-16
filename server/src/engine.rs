@@ -3,8 +3,9 @@
 //! No table or row cache.
 //! The executor must await admitted mutations through completion, including all
 //! blocking work, even if the client disconnects. This module owns no runtime.
+mod identified;
 mod job;
-pub(crate) use job::run_captured;
+pub(crate) use job::{CapturedInput, prepare_captured, run_captured, run_prepared};
 mod mutation;
 mod partition;
 mod query;

@@ -71,6 +71,21 @@ class ClusterWaitTests(unittest.TestCase):
             self.assertEqual([r['operation'] for r in seen],
                              ['cluster.scale', 'cluster.status', 'cluster.status'])
 
+    def test_a02_zero_waits_for_draining_member_before_stop_intent_exists(self):
+        def respond(request, count, release):
+            if count == 1:
+                return policy(0)
+            data = status()
+            data.update(policy(0))
+            data['nodes'][0]['state'] = 'draining' if count == 2 else 'stopped'
+            data['counts'].update(ready=0, starting=0, draining=1 if count == 2 else 0)
+            data['intents'] = []
+            return data
+        with peer(respond) as (client, seen):
+            self.assertEqual(client.scale(0, wait=True, timeout=2), policy(0))
+            self.assertEqual([r['operation'] for r in seen],
+                             ['cluster.scale', 'cluster.status', 'cluster.status'])
+
     def test_tcp_stalled_poll_expires_after_one_accepted_mutation(self):
         polled = threading.Event()
         def respond(request, count, release):

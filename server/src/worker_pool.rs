@@ -9,6 +9,7 @@
 //! alive through teardown; explicit shutdown is the normal lifecycle path.
 
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
+use crate::{config::WorkerResources, scheduling::ResourceScheduler};
 use std::{
     fmt,
     future::Future,
@@ -28,7 +29,10 @@ type Work = Box<dyn FnOnce(WorkerId, &Runtime) + Send + 'static>;
 struct Shared {
     // Taking this option is the stop boundary. Sending a reserved job uses the
     // same lock, so no job can be admitted after that boundary.
-    senders: Mutex<Option<Vec<mpsc::Sender<Work>>>>,
+    senders: Mutex<Option<mpsc::Sender<Work>>>,
+    scheduler: ResourceScheduler,
+    resources: WorkerResources,
+    next_request: std::sync::atomic::AtomicU64,
     stopped: watch::Sender<bool>,
     count: usize,
 }
@@ -37,6 +41,7 @@ impl Shared {
     fn stop(&self) {
         let mut senders = self.senders.lock().unwrap();
         senders.take();
+        self.scheduler.close();
         self.stopped.send_replace(true);
     }
 }
@@ -91,14 +96,33 @@ impl WorkerPool {
         count: NonZeroUsize,
         coordinator_runtime: Handle,
     ) -> Result<(Self, WorkerThreads), PoolStartError> {
+        let resources = WorkerResources {
+            max_threads: count.get() as u64,
+            ..WorkerResources::default()
+        };
+        Self::start_with_resources(resources, coordinator_runtime)
+    }
+
+    pub fn start_with_resources(
+        resources: WorkerResources,
+        coordinator_runtime: Handle,
+    ) -> Result<(Self, WorkerThreads), PoolStartError> {
+        resources
+            .validate()
+            .map_err(|_| PoolStartError { worker_index: 0 })?;
+        let count = NonZeroUsize::new(resources.max_threads as usize)
+            .ok_or(PoolStartError { worker_index: 0 })?;
+        let scheduler = ResourceScheduler::new(vec![(0, resources)])
+            .map_err(|_| PoolStartError { worker_index: 0 })?;
         // Grow only as threads actually start, never allocate from the requested
         // count eagerly. A failed startup closes and joins all partial workers.
         let (stopped, _) = watch::channel(false);
-        let mut senders = Vec::new();
+        let (sender, receiver) = mpsc::channel::<Work>(count.get());
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         let mut workers: Vec<Worker> = Vec::new();
         for id in 0..count.get() {
             let mut worker_stop = stopped.subscribe();
-            let (sender, mut receiver) = mpsc::channel::<Work>(1);
+            let receiver = receiver.clone();
             let (drained_tx, drained) = oneshot::channel();
             let (exit, exit_rx) = oneshot::channel();
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -116,19 +140,13 @@ impl WorkerPool {
                         }
                     };
                     let _ = ready_tx.send(true);
-                    let mut queue_closed = false;
                     while let Some(work) = runtime.block_on(async {
-                        if !queue_closed {
-                            tokio::select! {
-                                biased;
-                                _ = worker_stop.changed() => {
-                                    receiver.close();
-                                    queue_closed = true;
-                                }
-                                work = receiver.recv() => return work,
-                            }
+                        let mut receiver = receiver.lock().await;
+                        tokio::select! {
+                            biased;
+                            _ = worker_stop.changed() => {receiver.close(); receiver.recv().await}
+                            work = receiver.recv() => work,
                         }
-                        receiver.recv().await
                     }) {
                         // The typed envelope catches job panics and sends an error.
                         // This outer guard also protects the loop against envelope
@@ -141,7 +159,6 @@ impl WorkerPool {
                     let _ = runtime.block_on(exit_rx);
                 });
             if let Ok(thread) = spawned {
-                senders.push(sender);
                 workers.push(Worker {
                     thread,
                     drained,
@@ -152,7 +169,7 @@ impl WorkerPool {
                 }
             }
             stopped.send_replace(true);
-            drop(senders);
+            drop(sender);
             // Dropped exit gates allow partially started workers to leave after
             // draining. Join every thread even if one unexpectedly panicked.
             for worker in workers {
@@ -162,7 +179,10 @@ impl WorkerPool {
             return Err(PoolStartError { worker_index: id });
         }
         let shared = Arc::new(Shared {
-            senders: Mutex::new(Some(senders)),
+            senders: Mutex::new(Some(sender)),
+            scheduler,
+            resources,
+            next_request: std::sync::atomic::AtomicU64::new(1),
             stopped,
             count: count.get(),
         });
@@ -182,11 +202,42 @@ impl WorkerPool {
         NonZeroUsize::new(self.shared.count).unwrap()
     }
 
-    /// Routes the original partition index modulo the fixed worker count.
-    /// At most one executing and one queued job per worker are accepted.
+    pub fn resources(&self) -> WorkerResources {
+        self.shared.resources
+    }
+    pub fn scheduler(&self) -> &ResourceScheduler {
+        &self.shared.scheduler
+    }
+    pub fn request_id(&self) -> u64 {
+        self.shared
+            .next_request
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Jobs use whichever executor becomes free; partition identity never selects a thread.
     pub async fn submit<T, F>(
         &self,
-        partition_index: usize,
+        _partition_index: usize,
+        work: F,
+    ) -> Result<Job<T>, ProtocolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+    {
+        self.submit_request(
+            self.request_id(),
+            1,
+            self.shared.resources.task_memory_limit_bytes,
+            work,
+        )
+        .await
+    }
+
+    pub async fn submit_request<T, F>(
+        &self,
+        request_id: u64,
+        max_workers: usize,
+        bytes: u64,
         work: F,
     ) -> Result<Job<T>, ProtocolError>
     where
@@ -195,18 +246,73 @@ impl WorkerPool {
     {
         let (sender, mut stopped) = {
             let senders = self.shared.senders.lock().unwrap();
-            let senders = senders.as_ref().ok_or_else(stopping)?;
             (
-                senders[partition_index % self.shared.count].clone(),
+                senders.as_ref().ok_or_else(stopping)?.clone(),
                 self.shared.stopped.subscribe(),
             )
         };
-        // No lock is held while waiting for capacity. Stop also wakes pending
-        // reservations, dropping their sender clones so receivers can drain.
+        let reservation = tokio::select! {
+            biased;
+            _=stopped.changed()=>return Err(stopping()),
+            grant=self.shared.scheduler.reserve(request_id,max_workers,bytes)=>grant?,
+        };
+        self.enqueue_reserved(reservation, sender, stopped, work)
+            .await
+    }
+    pub async fn submit_precharged<T, F>(
+        &self,
+        request_id: u64,
+        max_workers: usize,
+        charge: crate::scheduling::MemoryCharge,
+        work: F,
+    ) -> Result<Job<T>, ProtocolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+    {
+        let (sender, mut stopped) = {
+            let senders = self.shared.senders.lock().unwrap();
+            (
+                senders.as_ref().ok_or_else(stopping)?.clone(),
+                self.shared.stopped.subscribe(),
+            )
+        };
+        let reservation = tokio::select! {
+            biased;
+            _=stopped.changed()=>return Err(stopping()),
+            grant=self.shared.scheduler.reserve_precharged(request_id,max_workers,charge)=>grant?,
+        };
+        self.enqueue_reserved(reservation, sender, stopped, work)
+            .await
+    }
+    pub async fn submit_buffered<T, F>(
+        &self,
+        request_id: u64,
+        max_workers: usize,
+        charges: Vec<crate::scheduling::MemoryCharge>,
+        budget: u64,
+        work: F,
+    ) -> Result<Job<(T, crate::scheduling::MemoryCharge)>, ProtocolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+    {
+        let (sender, mut stopped) = {
+            let senders = self.shared.senders.lock().unwrap();
+            (
+                senders.as_ref().ok_or_else(stopping)?.clone(),
+                self.shared.stopped.subscribe(),
+            )
+        };
+        let reservation = tokio::select! {
+            biased;
+            _=stopped.changed()=>return Err(stopping()),
+            grant=self.shared.scheduler.reserve_with_memories(request_id,max_workers,charges,budget)=>grant?,
+        };
         let permit = tokio::select! {
             biased;
-            _ = stopped.changed() => return Err(stopping()),
-            permit = sender.reserve_owned() => permit.map_err(|_| internal("Worker queue unavailable"))?,
+            _=stopped.changed()=>return Err(stopping()),
+            permit=sender.reserve_owned()=>permit.map_err(|_|stopping())?,
         };
         let senders = self.shared.senders.lock().unwrap();
         if senders.is_none() {
@@ -214,8 +320,49 @@ impl WorkerPool {
         }
         let (result_tx, result) = oneshot::channel();
         permit.send(Box::new(move |id, runtime| {
-            let result = catch_unwind(AssertUnwindSafe(|| work(id, runtime)))
-                .unwrap_or_else(|_| Err(internal("Worker job panicked")));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                crate::scheduling::with_task_limit(budget, || work(id, runtime))
+            }))
+            .unwrap_or_else(|_| Err(internal("Worker job panicked")));
+            let result = match result {
+                Ok(value) => Ok((value, reservation.into_memory())),
+                Err(error) => {
+                    drop(reservation);
+                    Err(error)
+                }
+            };
+            let _ = result_tx.send(result);
+        }));
+        Ok(Job { result })
+    }
+    async fn enqueue_reserved<T, F>(
+        &self,
+        reservation: crate::scheduling::Reservation,
+        sender: mpsc::Sender<Work>,
+        mut stopped: watch::Receiver<bool>,
+        work: F,
+    ) -> Result<Job<T>, ProtocolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(WorkerId, &Runtime) -> Result<T, ProtocolError> + Send + 'static,
+    {
+        let bytes = reservation.bytes();
+        let permit = tokio::select! {
+            biased;
+            _=stopped.changed()=>return Err(stopping()),
+            permit=sender.reserve_owned()=>permit.map_err(|_|stopping())?,
+        };
+        let senders = self.shared.senders.lock().unwrap();
+        if senders.is_none() {
+            return Err(stopping());
+        }
+        let (result_tx, result) = oneshot::channel();
+        permit.send(Box::new(move |id, runtime| {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                crate::scheduling::with_task_limit(bytes, || work(id, runtime))
+            }))
+            .unwrap_or_else(|_| Err(internal("Worker job panicked")));
+            drop(reservation);
             let _ = result_tx.send(result);
         }));
         Ok(Job { result })
@@ -279,4 +426,175 @@ fn internal(message: &'static str) -> ProtocolError {
 }
 fn stopping() -> ProtocolError {
     internal("Worker pool is stopping")
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    fn poll_once<F: Future + ?Sized>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        std::pin::pin!(tokio::task::unconstrained(future))
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn m02_m03_f03_two_buffered_requests_terminate_under_memory_pressure() {
+        let resources = WorkerResources {
+            max_threads: 2,
+            memory_limit_bytes: 1000,
+            task_memory_limit_bytes: 800,
+            control_memory_reserve_bytes: 100,
+        };
+        let (pool, threads) =
+            WorkerPool::start_with_resources(resources, Handle::current()).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let mut release = Vec::new();
+        let mut jobs = Vec::new();
+        for request in 1..=2 {
+            let charge = pool
+                .scheduler()
+                .reserve_memory(request, 0, 400)
+                .await
+                .unwrap();
+            let entered = entered_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            release.push(release_tx);
+            jobs.push(
+                pool.submit_buffered(request, 1, vec![charge], 400, move |id, _| {
+                    entered.send(id).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(vec![0u8; 100])
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        // Both real executors must enter before either bounded barrier opens.
+        let first = entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_ne!(first, second);
+        for release in release {
+            release.send(()).unwrap();
+        }
+        let mut retained = Vec::new();
+        for job in jobs {
+            retained.push(job.receive().await.unwrap());
+        }
+        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 800)]);
+        for request in 1..=2 {
+            assert!(
+                pool.scheduler()
+                    .reserve_memory(request, 0, 800)
+                    .await
+                    .is_err()
+            );
+        }
+        let (value, charge) = retained.pop().unwrap();
+        drop(value);
+        assert!(
+            pool.submit_buffered(3, 1, vec![charge], 800, |_, _| Ok(()))
+                .await
+                .is_err()
+        );
+        drop(retained);
+        let subsequent = pool.submit_request(4, 1, 800, |_, _| Ok(42)).await.unwrap();
+        assert_eq!(subsequent.receive().await.unwrap(), 42);
+        threads.shutdown().await.unwrap();
+        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn f03_pool_stop_wakes_download_memory_waiter() {
+        let resources = WorkerResources {
+            max_threads: 1,
+            memory_limit_bytes: 1000,
+            task_memory_limit_bytes: 900,
+            control_memory_reserve_bytes: 100,
+        };
+        let (pool, threads) =
+            WorkerPool::start_with_resources(resources, Handle::current()).unwrap();
+        let held = pool.scheduler().reserve_memory(1, 0, 900).await.unwrap();
+        let mut waiter = Box::pin(pool.scheduler().reserve_memory(2, 0, 100));
+        assert!(poll_once(waiter.as_mut()).is_pending());
+        let shutdown = threads.shutdown();
+        assert!(waiter.await.is_err());
+        drop(held);
+        shutdown.await.unwrap();
+        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop() {
+        let (pool, threads) =
+            WorkerPool::start(NonZeroUsize::new(2).unwrap(), Handle::current()).unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let slow = pool
+            .submit(0, move |id, _| {
+                entered_tx.send(id).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(10)
+            })
+            .await
+            .unwrap();
+        let slow_id = entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let fast = pool
+            .submit(0, move |id, _| Ok(id))
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
+        assert_ne!(slow_id, fast);
+        // Same original index can refill the free executor while the first is gated.
+        let next = pool
+            .submit(0, move |id, _| Ok(id))
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
+        assert_eq!(next, fast);
+        for code in [
+            ErrorCode::ValidationError,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::InternalError,
+            ErrorCode::LimitExceeded,
+        ] {
+            let failed: Job<()> = pool
+                .submit(0, move |_, _| {
+                    Err(ProtocolError::new(
+                        code,
+                        "injected ordinary task failure",
+                        Outcome::NotApplied,
+                    ))
+                })
+                .await
+                .unwrap();
+            let error = failed.receive().await.unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.outcome, Outcome::NotApplied);
+            let subsequent = pool.submit(0, |id, _| Ok(id)).await.unwrap();
+            assert_eq!(subsequent.receive().await.unwrap(), fast);
+        }
+        let panic: Job<()> = pool
+            .submit(0, |_, _| panic!("injected unwind"))
+            .await
+            .unwrap();
+        assert!(panic.receive().await.is_err());
+        let (done_tx, done_rx) = mpsc::channel();
+        let abandoned = pool
+            .submit(0, move |_, _| {
+                done_tx.send(()).unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(abandoned);
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(slow.receive().await.unwrap(), 10);
+        let final_job = pool.submit(0, |_, _| Ok(99)).await.unwrap();
+        assert_eq!(final_job.receive().await.unwrap(), 99);
+        threads.shutdown().await.unwrap();
+        assert_eq!(pool.scheduler().usage(), vec![(0, 0, 0)]);
+    }
 }

@@ -82,7 +82,7 @@ macro_rules! string_enum {
 macro_rules! record {
     ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone, PartialEq, Eq, Serialize)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_struct(stringify!($name)).finish_non_exhaustive() }
         }
@@ -117,7 +117,13 @@ record!(Controller {
  epoch:u64, lease_state:LeaseState,
  #[serde(deserialize_with="nullable")] lease_until_ms:Option<u64>,
 });
-record!(Scheduler { cooldown_until_ms:u64, backoff_until_ms:u64, failures:u64,
+fn zero(value: &u64) -> bool {
+    *value == 0
+}
+record!(Scheduler {
+ #[serde(default,skip_serializing_if="zero")] scheduler_term:u64,
+ #[serde(default, deserialize_with="nullable_uuid", skip_serializing_if="Option::is_none")] coordinator_node:Option<Uuid>,
+ cooldown_until_ms:u64, backoff_until_ms:u64, failures:u64,
  #[serde(deserialize_with="nullable")] low_since_ms:Option<u64>,
 });
 record!(Control {
@@ -307,9 +313,8 @@ impl Control {
             if let Some(l) = node.launch_id {
                 check(launches.insert(l))?;
                 check(
-                    node.operation_slots == self.template.operation_slots
-                        && node.partition_slots == self.template.partition_slots
-                        && node.queue_size == self.template.queue_size,
+                    node.resources
+                        .is_none_or(|r| r.validate_execution(&self.template.execution).is_ok()),
                 )?;
             }
         }

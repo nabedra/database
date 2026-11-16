@@ -18,6 +18,12 @@ pub enum Command {
     Api {
         #[arg(long)]
         config: std::path::PathBuf,
+        /// Fence prior workers and begin a fresh in-memory request run.
+        #[arg(long)]
+        cold_start: bool,
+        /// Confirm all old writers are stopped before upgrading a legacy catalog.
+        #[arg(long)]
+        migrate_catalog: bool,
     },
     /// Enroll and run a manually provisioned worker.
     Worker {

@@ -112,6 +112,51 @@ fn enrollment_rejects_signature_domain_and_changed_claims() {
     assert!(verify_enrollment(&enrollment(&changed, &sig)).is_ok());
 }
 #[test]
+fn c02_signed_capacity_and_incarnation_cannot_be_forged() {
+    let resources = r#""resources":{"max_threads":2,"memory_limit_bytes":1000,"task_memory_limit_bytes":800,"control_memory_reserve_bytes":100},"#;
+    let unsigned = ENROLL.replace("\"partition_slots\":256", "\"partition_slots\":2");
+    let unsigned = format!("{{{resources}{}", &unsigned[1..]);
+    let signature = sign(SEED, b"meshdb.enroll.v1\0", unsigned.as_bytes());
+    let valid = verify_enrollment(&enrollment(&unsigned, &signature)).unwrap();
+    assert_eq!(valid.claims().resources().unwrap().max_threads, 2);
+    for changed in [
+        unsigned.replace("\"memory_limit_bytes\":1000", "\"memory_limit_bytes\":2000"),
+        unsigned.replace(
+            "\"task_memory_limit_bytes\":800",
+            "\"task_memory_limit_bytes\":700",
+        ),
+        unsigned
+            .replace("\"max_threads\":2", "\"max_threads\":3")
+            .replace("\"partition_slots\":2", "\"partition_slots\":3"),
+        unsigned.replace(
+            &Uuid::from_u128(4).to_string(),
+            &Uuid::from_u128(40).to_string(),
+        ),
+    ] {
+        // Each changed claim is structurally valid. The old signature itself fails.
+        Enrollment::decode(&enrollment(&changed, &signature)).unwrap();
+        assert!(matches!(
+            verify_enrollment(&enrollment(&changed, &signature)),
+            Err(Error::Invalid)
+        ));
+    }
+    for changed in [
+        unsigned.replace("\"max_threads\":2", "\"max_threads\":0"),
+        unsigned.replace("\"max_threads\":2", "\"max_threads\":18446744073709551615"),
+        unsigned.replace(
+            "\"task_memory_limit_bytes\":800",
+            "\"task_memory_limit_bytes\":901",
+        ),
+        unsigned.replace("\"partition_slots\":2", "\"partition_slots\":1025"),
+    ] {
+        let signed = sign(SEED, b"meshdb.enroll.v1\0", changed.as_bytes());
+        assert!(verify_enrollment(&enrollment(&changed, &signed)).is_err());
+    }
+    let prefetch = unsigned.replace("\"partition_slots\":2", "\"partition_slots\":3");
+    let signature = sign(SEED, b"meshdb.enroll.v1\0", prefetch.as_bytes());
+    assert!(verify_enrollment(&enrollment(&prefetch, &signature)).is_ok());
+}
+#[test]
 fn enrollment_verifier_tracks_each_checked_identity_and_key() {
     let baseline = verify_enrollment(&enrollment(ENROLL, ENROLL_SIG)).unwrap();
     for n in [1, 3, 4, 5] {

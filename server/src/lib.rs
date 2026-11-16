@@ -12,7 +12,9 @@ pub mod executor;
 pub mod node;
 pub mod partition_size;
 pub mod protocol;
+pub mod request_queue;
 pub mod runtime;
+pub mod scheduling;
 pub mod snapshot;
 pub mod storage;
 #[cfg(test)]

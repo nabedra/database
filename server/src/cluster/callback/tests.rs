@@ -553,3 +553,44 @@ fn delivery_records_have_no_serialization_constructor() {
     let _ = <StartCommand as AmbiguousIfSerialize<_>>::marker;
     let _ = <ReplyContext as AmbiguousIfSerialize<_>>::marker;
 }
+
+#[tokio::test]
+async fn a02_fresh_authorization_requires_exact_retained_claim_and_owner() {
+    let f = Fixture::new();
+    let root = launched(held(&f));
+    let s = store(Some(&root));
+    let attached = check_attach(
+        s.load_control(deadline()).await.unwrap(),
+        f.ready(&f.input()),
+        "Fleet_1",
+        Provisioning::Managed,
+    )
+    .unwrap();
+    let command = StartCommand::build(&root, owner(), id(21), id(30), &attached).unwrap();
+    assert!(authorize_command(command.bytes(), &root, &attached).is_err());
+    let mut claimed = root.clone();
+    claimed.intents[0].state = member::IntentState::InProgress;
+    claimed.intents[0].attempts = 1;
+    claimed.intents[0].delivery = Some(member::Delivery {
+        invocation_id: id(30),
+        owner_id: owner().process_id,
+        epoch: owner().epoch,
+        command_sha256: command.digest().into(),
+    });
+    assert!(authorize_command(command.bytes(), &claimed, &attached).is_ok());
+    let mut superseded = claimed.clone();
+    superseded.controller.epoch += 1;
+    assert!(authorize_command(command.bytes(), &superseded, &attached).is_err());
+    // Even equivalent JSON must retain the exact bytes committed in the claim.
+    let value: Value = serde_json::from_slice(command.bytes()).unwrap();
+    assert!(
+        authorize_command(
+            &serde_json::to_vec_pretty(&value).unwrap(),
+            &claimed,
+            &attached
+        )
+        .is_err()
+    );
+    claimed.intents[0].state = member::IntentState::Reconciling;
+    assert!(authorize_command(command.bytes(), &claimed, &attached).is_err());
+}

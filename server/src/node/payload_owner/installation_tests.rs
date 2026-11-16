@@ -995,7 +995,7 @@ async fn configured_stream_role_bound_and_operation_cleanup_leave_job_and_contro
             && matches!(at_return, Ok(Ok(())))
             && matches!(survived, Ok(Ok(())))
     );
-    assert_eq!(bounds, (1 + 17 + 4096 + 32, 17 + 1 + 64));
+    assert_eq!(bounds, (1 + 17 + 4096 + 48, 17 + 1 + 64));
     assert_eq!((counts.0, counts.2), (16, 1));
     assert_eq!(transport.available_permits(), 17);
     assert_eq!(jobs.available_permits(), 1);
@@ -1202,7 +1202,7 @@ async fn tentative_local_conflict_rolls_back_both_parent_claims_and_positions() 
             None,
         )
         .unwrap();
-    let mut original_positions = vec![None; 1 + 2 + 4096 + 32];
+    let mut original_positions = vec![None; 1 + 2 + 4096 + 48];
     let (refused, unchanged) = {
         let mut state = owners.shared.state.lock().unwrap();
         let (r, l) = state.parts();
@@ -1301,7 +1301,7 @@ async fn accepted_record_exhaustion_retains_refused_original_preparation() {
     drop(first_control);
     finish_distributed(owners, threads, path).await;
     assert!(same_state);
-    assert_eq!(production_bounds, (1 + 1 + 4096 + 32, 1 + 1 + 64));
+    assert_eq!(production_bounds, (1 + 1 + 4096 + 48, 1 + 1 + 64));
     assert!(refused && same);
     assert_eq!(charged, 0);
     assert_eq!(transport.available_permits(), 2);
@@ -6458,4 +6458,323 @@ async fn self_dependency_account_reaps_while_original_operation_response_is_reta
     assert_eq!(charged_transport, 1);
     assert!(matches!(drained, Ok(Ok(()))) && matches!(joined, Ok(Ok(()))) && empty);
     assert_eq!(transport.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn c06_f03_parallel_outbound_streams_retain_one_operation_and_transfer_staging() {
+    use super::super::admission::{AcceptedRoute, OperationCandidates, PreparedRoute};
+    let (f, owners, threads, path, process) = signed_booted().await;
+    let boot = owners.shared.state.lock().unwrap().local().unwrap().boot();
+    let transport = Arc::new(Semaphore::new(1));
+    let mut prepared = PreparedRoute::Operation(
+        owners
+            .prepare_pair(
+                Role::Operation,
+                transport.try_acquire_owned().unwrap(),
+                None,
+            )
+            .unwrap(),
+        OperationCandidates::new(),
+    );
+    let (view, content) = f.request("operation", 1, boot);
+    let AcceptedRoute::Operation(mut accepted) = owners
+        .accept(view, content, &mut prepared, &process)
+        .unwrap()
+    else {
+        panic!("operation");
+    };
+    let checked = accepted.start.check(&f.root, &f.pin()).unwrap();
+    owners
+        .shared
+        .state
+        .lock()
+        .unwrap()
+        .start_locked(checked)
+        .unwrap();
+    let mut account = accepted.owners.account.take().unwrap();
+    account.ready().await.unwrap();
+    let request = account.take_request().unwrap();
+    let mut main = accepted.owners.stream;
+    main.ready().await.unwrap();
+    let source = owners.fork_source(&main).unwrap();
+    let mut first = owners
+        .fork_stream(&source, Instant::now() + WATCHDOG)
+        .await
+        .unwrap();
+    let mut second = owners
+        .fork_stream(&source, Instant::now() + WATCHDOG)
+        .await
+        .unwrap();
+    first.ready().await.unwrap();
+    second.ready().await.unwrap();
+    assert_ne!(first.slot.id, second.slot.id);
+    assert_eq!(*account.slot.children.lock().unwrap(), 3);
+    assert_eq!(owners.shared.outgoing.available_permits(), 14);
+    let (mut expected, mut result) = tests::controls();
+    expected.operation_id = id(6);
+    result.operation_id = id(6);
+    expected.task = super::super::job::Task::Prepare {
+        file: None,
+        range: crate::storage::KeyRange {
+            lower: None,
+            upper: None,
+        },
+        mutation: super::super::job::RowMutation::InsertMany(crate::protocol::BatchPayload {
+            table_id: expected.table.id,
+            rows: Vec::new(),
+        }),
+        target_bytes: 4096,
+    };
+    result.result = JobResult::Prepared {
+        effect: super::super::job::Effect::Count { value: 0 },
+        replacement_count: None,
+    };
+    let bytes = encode_result(&result, &expected).unwrap();
+    first
+        .command(Command::BeginResult { bytes, expected })
+        .await
+        .unwrap();
+    first.command(Command::CompletePrepared).await.unwrap();
+    first.command(Command::CommitEof).await.unwrap();
+    first
+        .command(Command::StagePrepared {
+            table: id(16),
+            commit: id(50),
+            ordinal: 0,
+        })
+        .await
+        .unwrap();
+    first.transfer_staged_to(&mut main).await.unwrap();
+    assert_eq!(
+        first
+            .slot
+            .disk
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .uploads
+            .len(),
+        0
+    );
+    assert_eq!(
+        main.slot
+            .disk
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .uploads
+            .len(),
+        1
+    );
+    first.dispose().await.unwrap();
+    second.dispose().await.unwrap();
+    assert_eq!(owners.shared.outgoing.available_permits(), 16);
+    assert_eq!(*account.slot.children.lock().unwrap(), 1);
+    main.command(Command::ClearStaged).await.unwrap();
+    main.dispose().await.unwrap();
+    drop(request);
+    account.dispose().await.unwrap();
+    process.dispose().await.unwrap();
+    drop(prepared);
+    finish_distributed(owners, threads, path).await;
+}
+
+#[tokio::test]
+async fn a02_ordinary_heartbeat_and_drain_proof_share_one_sequence_writer() {
+    use super::super::admission::BarrierPreparation;
+    use crate::{
+        cluster::heartbeat::{HeartbeatWriteResult, HeartbeatWriter},
+        storage::{Namespace, Storage},
+        test_storage::Fake,
+    };
+    let (mut f, owners, threads, path, process) = signed_booted().await;
+    let (observer, ready) = classifier_observer(&mut f, &owners, &process).await;
+    let storage = Arc::new(Storage::new(
+        Fake::default(),
+        Namespace::new("shared-heartbeat").unwrap(),
+    ));
+    let mut observed = None;
+    if let Some(observer) = &observer {
+        let boot = owners.shared.state.lock().unwrap().local().unwrap().boot();
+        let prepared = BarrierPreparation::prepare(&f.root, boot).unwrap();
+        let sample = owners
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .sample_barrier(prepared, id(30), observer.owner.key())
+            .unwrap();
+        let ordinary = sample.heartbeat().clone();
+        let writer = owners.heartbeat_writer();
+        assert!(Arc::ptr_eq(&writer, &owners.heartbeat_writer()));
+        *writer.lock().await = Some(HeartbeatWriter::new(sample.binding().clone()).unwrap());
+        for expected in 1..=2 {
+            let result = writer
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .publish(&storage, ordinary.clone(), Instant::now() + WATCHDOG)
+                .await
+                .unwrap();
+            assert!(
+                matches!(result,HeartbeatWriteResult::Acknowledged(ack) if ack.sequence()==expected)
+            );
+        }
+        let ticket = owners
+            .publish_proof(sample, storage.clone(), Instant::now() + WATCHDOG)
+            .unwrap();
+        owners.wait_proof(&ticket).await.unwrap();
+        let proof = owners.take_proof(&ticket, &observer.owner.key()).unwrap();
+        drop(ticket);
+        let observation = owners.finish_drain(proof).unwrap();
+        observed = Some((observation.idle(), observation.sequence()));
+        drop(observation);
+        let result = writer
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .publish(&storage, ordinary, Instant::now() + WATCHDOG)
+            .await
+            .unwrap();
+        assert!(matches!(result,HeartbeatWriteResult::Acknowledged(ack) if ack.sequence()==4));
+    }
+    drop(observer);
+    drop(process);
+    finish_distributed(owners, threads, path).await;
+    assert!(ready);
+    assert_eq!(observed, Some((true, 3)));
+}
+
+#[tokio::test]
+async fn c05_f03_signed_receiver_accepts_reordered_jobs_once_and_fences_close_before_open() {
+    use super::super::admission::{AcceptedRoute, Close, ControlResult, PreparedRoute};
+    let (f, owners, threads, path, process) = signed_booted_with_queue(2).await;
+    let boot = owners.shared.state.lock().unwrap().local().unwrap().boot();
+    let transport = Arc::new(Semaphore::new(8));
+    let mut open = PreparedRoute::Control(
+        owners
+            .prepare_control(transport.clone().try_acquire_owned().unwrap())
+            .unwrap(),
+    );
+    let (e, c) = f.request("dependency_open", 1, boot.clone());
+    let opened = owners.accept(e, c, &mut open, &process).unwrap();
+    let mut jobs = Vec::new();
+    let mut routes = Vec::new();
+    for sequence in [3, 2] {
+        let mut route = PreparedRoute::Job(
+            owners
+                .prepare_pair(
+                    Role::Dependency,
+                    transport.clone().try_acquire_owned().unwrap(),
+                    None,
+                )
+                .unwrap(),
+        );
+        let (e, c) = f.request("job", sequence, boot.clone());
+        let AcceptedRoute::Job(mut accepted) = owners.accept(e, c, &mut route, &process).unwrap()
+        else {
+            panic!("job");
+        };
+        accepted.owners.stream.ready().await.unwrap();
+        jobs.push(accepted);
+        routes.push(route);
+    }
+    let mut duplicate = PreparedRoute::Job(
+        owners
+            .prepare_pair(
+                Role::Dependency,
+                transport.clone().try_acquire_owned().unwrap(),
+                None,
+            )
+            .unwrap(),
+    );
+    let (e, c) = f.request("job", 2, boot.clone());
+    assert!(owners.accept(e, c, &mut duplicate, &process).is_err());
+    drop(duplicate);
+    for job in jobs {
+        job.owners.stream.dispose().await.unwrap();
+    }
+    drop(routes);
+    drop(opened);
+    drop(open);
+    let mut close = PreparedRoute::Control(
+        owners
+            .prepare_control(transport.clone().try_acquire_owned().unwrap())
+            .unwrap(),
+    );
+    let (e, c) = f.request("dependency_close", 5, boot.clone());
+    let closed = owners.accept(e, c, &mut close, &process).unwrap();
+    assert!(
+        matches!(closed,AcceptedRoute::Close(ref reply)if matches!(reply.result,ControlResult::Close(Close::Closed|Close::Pending)))
+    );
+    let mut delayed = PreparedRoute::Control(
+        owners
+            .prepare_control(transport.clone().try_acquire_owned().unwrap())
+            .unwrap(),
+    );
+    let (e, c) = f.request("dependency_open", 4, boot.clone());
+    assert!(owners.accept(e, c, &mut delayed, &process).is_err());
+    let mut delayed_job = PreparedRoute::Job(
+        owners
+            .prepare_pair(
+                Role::Dependency,
+                transport.try_acquire_owned().unwrap(),
+                None,
+            )
+            .unwrap(),
+    );
+    let (e, c) = f.request("job", 4, boot);
+    assert!(owners.accept(e, c, &mut delayed_job, &process).is_err());
+    drop(closed);
+    drop(close);
+    drop(delayed);
+    drop(delayed_job);
+    drop(process);
+    finish_distributed(owners, threads, path).await;
+}
+
+#[tokio::test]
+async fn f03_c04_signed_closed_true_fences_an_older_never_installed_open() {
+    use super::super::admission::{AcceptedRoute, Close, ControlResult, PreparedRoute};
+    let (f, owners, threads, path, process) = signed_booted().await;
+    let boot = owners.shared.state.lock().unwrap().local().unwrap().boot();
+    let transport = Arc::new(Semaphore::new(3));
+    let mut close = PreparedRoute::Control(
+        owners
+            .prepare_control(transport.clone().try_acquire_owned().unwrap())
+            .unwrap(),
+    );
+    let (e, c) = f.request("dependency_close", 2, boot.clone());
+    let closed = owners.accept(e, c, &mut close, &process).unwrap();
+    assert!(
+        matches!(&closed,AcceptedRoute::Close(reply)if matches!(reply.result,ControlResult::Close(Close::Closed)))
+    );
+    let mut delayed = PreparedRoute::Control(
+        owners
+            .prepare_control(transport.clone().try_acquire_owned().unwrap())
+            .unwrap(),
+    );
+    let (e, c) = f.request("dependency_open", 1, boot.clone());
+    assert!(owners.accept(e, c, &mut delayed, &process).is_err());
+    let mut job = PreparedRoute::Job(
+        owners
+            .prepare_pair(
+                Role::Dependency,
+                transport.try_acquire_owned().unwrap(),
+                None,
+            )
+            .unwrap(),
+    );
+    let (e, c) = f.request("job", 1, boot);
+    assert!(owners.accept(e, c, &mut job, &process).is_err());
+    drop(closed);
+    drop(close);
+    drop(delayed);
+    drop(job);
+    drop(process);
+    finish_distributed(owners, threads, path).await;
 }

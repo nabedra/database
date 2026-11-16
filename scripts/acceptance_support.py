@@ -64,6 +64,9 @@ def _segment(value):
 class TestNamespace:
     prefix: str
     _owner: object = field(repr=False)
+    # A process receipt belongs to this allocated namespace, including when a
+    # restart constructs a new ServerProcess with different worker settings.
+    _server_process: object = field(default=None, repr=False, compare=False)
 
     def key(self, relative_path):
         """Return a key beneath this prefix; never accepts an absolute S3 key."""

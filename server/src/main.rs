@@ -11,13 +11,28 @@ use meshdb_server::{
     storage::{S3Store, Storage},
     worker_pool::WorkerPool,
 };
-use std::{io, process::ExitCode};
 #[cfg(feature = "s3")]
-use std::{net::SocketAddr, num::NonZeroUsize};
+use std::net::SocketAddr;
+use std::{io, process::ExitCode};
 use tracing_subscriber::{filter::Targets, prelude::*};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(4)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("meshdb-server: network runtime initialization failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(run_cli())
+}
+
+async fn run_cli() -> ExitCode {
     let command = Cli::parse().command;
     if tracing_subscriber::registry()
         .with(
@@ -36,7 +51,14 @@ async fn main() -> ExitCode {
     }
     let result = match command {
         Command::Serve(options) => run(options).await,
-        Command::Api { config } => meshdb_server::cluster::runtime::run_api(config).await,
+        Command::Api {
+            config,
+            cold_start,
+            migrate_catalog,
+        } => {
+            meshdb_server::cluster::runtime::run_api_configured(config, cold_start, migrate_catalog)
+                .await
+        }
         Command::Worker { bootstrap } => meshdb_server::node::runtime::run_worker(bootstrap).await,
     };
     match result {
@@ -88,17 +110,19 @@ async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'stati
     let storage = Storage::<S3Store>::connect(config.bucket(), config.namespace().clone())
         .await
         .map_err(|_| "storage initialization failed")?;
-    storage
-        .initialize_catalog()
-        .await
-        .map_err(|_| "catalog initialization failed")?;
-    let executor = Executor::new(config.options().workers, config.options().queue_size)
+    let coordination_slots = config
+        .execution()
+        .max_pending_requests
+        .min((config.resources().control_memory_reserve_bytes / 4).min(16 << 20) / (64 << 10))
+        .min(256) as usize;
+    if coordination_slots == 0 {
+        return Err("control memory cannot support request coordination");
+    }
+    let executor = Executor::new(coordination_slots, config.options().queue_size)
         .map_err(|_| "executor initialization failed")?;
-    let (pool, workers) = WorkerPool::start(
-        NonZeroUsize::new(config.options().workers).ok_or("configuration invalid")?,
-        tokio::runtime::Handle::current(),
-    )
-    .map_err(|_| "worker initialization failed")?;
+    let (pool, workers) =
+        WorkerPool::start_with_resources(config.resources(), tokio::runtime::Handle::current())
+            .map_err(|_| "worker initialization failed")?;
     let engine = Engine::new(storage, pool, config.options().partition_size);
     // Keep the owner and coordinator runtime alive through every serve exit.
     // Errors inside this block cannot bypass the awaited worker shutdown below.
@@ -115,13 +139,16 @@ async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'stati
                 return Err("listener failed");
             }
         };
-        runtime::serve(
+        runtime::serve_configured(
             listener,
             engine,
             executor,
             config.token().to_owned(),
             tls,
             shutdown,
+            config.execution(),
+            config.options().cold_start,
+            config.options().migrate_catalog,
         )
         .await
         .map_err(|_| "listener failed")
@@ -137,6 +164,13 @@ async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'stati
 }
 
 #[cfg(not(feature = "s3"))]
-async fn run(_: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
+async fn run(options: meshdb_server::config::ServeOptions) -> Result<(), &'static str> {
+    let config =
+        meshdb_server::config::Config::from_env(options).map_err(|_| "configuration invalid")?;
+    if let (Some(cert), Some(key)) = (&config.options().tls_cert, &config.options().tls_key) {
+        let _ = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+            .await
+            .map_err(|_| "TLS configuration invalid")?;
+    }
     Err("unsupported configuration: legacy serve requires the s3 feature")
 }

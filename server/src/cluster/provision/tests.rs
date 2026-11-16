@@ -65,6 +65,7 @@ fn initial_fields_sorted_and_unrelated_preserved() {
     assert_eq!(
         node,
         &Node {
+            resources: Some(c.template.worker_resources()),
             node_id: id(20),
             launch_id: Some(id(25)),
             resource_id: None,
@@ -73,8 +74,10 @@ fn initial_fields_sorted_and_unrelated_preserved() {
             incarnation: None,
             retired_incarnations: vec![],
             endpoint: None,
-            operation_slots: c.template.operation_slots,
-            partition_slots: c.template.partition_slots,
+            operation_slots: crate::node::queue_runtime::coordination_capacity(&c.template).unwrap()
+                as u64,
+            partition_slots: crate::node::queue_runtime::job_coordination_capacity(&c.template)
+                .unwrap() as u64,
             queue_size: c.template.queue_size,
             registration: Registration::Unregistered,
             session: None,
@@ -323,4 +326,100 @@ fn full_augmented_admission_refuses_new_pair() {
         Err(StorageError::LimitExceeded)
     ));
     assert_eq!(c, saved);
+}
+
+#[test]
+fn a02_demand_respects_age_bounds_cooldown_and_idle_stabilization() {
+    let mut c = root();
+    c.policy.mode = PolicyMode::Autoscale;
+    c.policy.min_nodes = 1;
+    c.policy.max_nodes = 4;
+    c.policy.desired = 2;
+    let delay = c.timing.stabilization_ms;
+    assert!(
+        demand_candidate(&c, owner(), 3, 2, delay - 1, 100_000, id(100))
+            .unwrap()
+            .is_none()
+    );
+    let grown = demand_candidate(&c, owner(), 3, 2, delay, 100_000, id(101))
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(grown.policy.desired, 3);
+    assert_eq!(grown.policy.revision, c.policy.revision + 1);
+    assert_eq!(
+        grown.scheduler.cooldown_until_ms,
+        100_000 + c.timing.cooldown_ms
+    );
+    assert!(
+        demand_candidate(&grown, owner(), 4, 3, delay, 100_001, id(102))
+            .unwrap()
+            .is_none()
+    );
+    let anchored = demand_candidate(&grown, owner(), 0, 0, 0, 200_000, id(103))
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(anchored.policy.desired, 3);
+    assert_eq!(anchored.scheduler.low_since_ms, Some(200_000));
+    assert!(
+        demand_candidate(&anchored, owner(), 0, 0, 0, 200_000 + delay - 1, id(104))
+            .unwrap()
+            .is_none()
+    );
+    let shrunk = demand_candidate(&anchored, owner(), 0, 0, 0, 200_000 + delay, id(105))
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(shrunk.policy.desired, 2);
+    assert_eq!(shrunk.scheduler.low_since_ms, None);
+    let reset = demand_candidate(&anchored, owner(), 1, 1, 0, 200_001, id(106))
+        .unwrap()
+        .unwrap()
+        .into_parts()
+        .2;
+    assert_eq!(reset.scheduler.low_since_ms, None);
+    assert_eq!(reset.policy.desired, 3);
+    c.policy.desired = 4;
+    assert!(
+        demand_candidate(&c, owner(), 10, 4, delay, 100_000, id(107))
+            .unwrap()
+            .is_none()
+    );
+    c.policy.desired = 1;
+    assert!(
+        demand_candidate(&c, owner(), 0, 0, 0, 100_000, id(108))
+            .unwrap()
+            .is_none()
+    );
+    c.scheduler.backoff_until_ms = 200_000;
+    assert!(
+        demand_candidate(&c, owner(), 10, 1, delay, 100_000, id(109))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn c01_c07_pending_managed_capacity_uses_effective_resources_and_job_frontier() {
+    let mut c = root();
+    c.template.resources = Some(crate::config::WorkerResources {
+        max_threads: 4,
+        ..Default::default()
+    });
+    c.template.partition_slots = 2;
+    c.config.template_fingerprint = c.template.fingerprint().unwrap();
+    let candidate = allocate_start(&c, owner(), id(30), id(40), 10, id(50))
+        .unwrap()
+        .into_parts()
+        .2;
+    candidate.validate().unwrap();
+    let node = &candidate.nodes[0];
+    assert_eq!(node.resources.unwrap().max_threads, 4);
+    assert!(node.operation_slots >= 4);
+    assert!(node.partition_slots >= 10);
+    assert_ne!(node.partition_slots, c.template.partition_slots);
 }

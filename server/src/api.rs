@@ -1,6 +1,8 @@
 //! POST operations transport. Body polling, parsing, execution, encoding and
 //! completion diagnostics all run inside the executor's owned operation.
+mod control;
 pub mod health;
+mod queue;
 pub mod response;
 
 use crate::{
@@ -12,13 +14,13 @@ use crate::{
 use axum::{
     Router,
     body::Body,
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
 use http_body_util::BodyExt;
-use response::{EncodedResponse, encode_error, encode_success};
+use response::{EncodedResponse, encode_error};
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
 use std::{collections::BTreeSet, fmt, sync::Arc, time::Instant};
 use uuid::Uuid;
@@ -27,6 +29,7 @@ struct ApiState<B: ObjectStore> {
     engine: Engine<B>,
     executor: Executor,
     token: String,
+    queue: Arc<queue::LocalQueue>,
 }
 
 /// Build only `POST /v1/operations` over an already initialized engine.
@@ -40,13 +43,71 @@ pub fn router<B: ObjectStore + 'static>(
     executor: Executor,
     token: String,
 ) -> Router {
-    Router::new()
-        .route("/v1/operations", post(operations::<B>))
-        .with_state(Arc::new(ApiState {
-            engine,
-            executor,
-            token,
-        }))
+    router_configured(
+        engine,
+        executor,
+        token,
+        crate::config::ExecutionConfig::default(),
+        false,
+    )
+    .expect("validated local queue configuration")
+    .0
+}
+pub fn router_configured<B: ObjectStore + 'static>(
+    engine: Engine<B>,
+    executor: Executor,
+    token: String,
+    execution: crate::config::ExecutionConfig,
+    cold_start: bool,
+) -> Result<(Router, Executor), ProtocolError> {
+    router_with_migration(engine, executor, token, execution, cold_start, false)
+}
+pub fn router_with_migration<B: ObjectStore + 'static>(
+    engine: Engine<B>,
+    executor: Executor,
+    token: String,
+    execution: crate::config::ExecutionConfig,
+    cold_start: bool,
+    migration_allowed: bool,
+) -> Result<(Router, Executor), ProtocolError> {
+    let (router, tasks, _queue) = router_with_queue_startup(
+        engine,
+        executor,
+        token,
+        execution,
+        cold_start,
+        migration_allowed,
+    )?;
+    Ok((router, tasks))
+}
+pub(crate) fn router_with_queue_startup<B: ObjectStore + 'static>(
+    engine: Engine<B>,
+    executor: Executor,
+    token: String,
+    execution: crate::config::ExecutionConfig,
+    cold_start: bool,
+    migration_allowed: bool,
+) -> Result<(Router, Executor, Arc<queue::LocalQueue>), ProtocolError> {
+    let queue = queue::LocalQueue::new(&engine, execution, cold_start, migration_allowed)?;
+    let tasks = queue.executor();
+    Ok((
+        Router::new()
+            .route("/v1/operations", post(operations::<B>))
+            .route("/v1/cluster/operations", post(control::unsupported::<B>))
+            .route("/v1/requests", post(submit_request::<B>))
+            .route(
+                "/v1/requests/{run_id}/{request_id}",
+                get(receipt_request::<B>),
+            )
+            .with_state(Arc::new(ApiState {
+                engine,
+                executor,
+                token,
+                queue: queue.clone(),
+            })),
+        tasks,
+        queue,
+    ))
 }
 
 async fn operations<B: ObjectStore + 'static>(
@@ -68,9 +129,9 @@ async fn operations<B: ObjectStore + 'static>(
     };
     // No body extractor or preconstructed body future: even construction of work
     // is deferred until the executor has acquired an execution permit.
-    let operation = match admission.spawn(move || async move {
-        Ok(execute_request(state.engine.clone(), request, started).await)
-    }) {
+    let operation = match admission
+        .spawn(move || async move { Ok(execute_request(state, request, started).await) })
+    {
         Ok(operation) => operation,
         Err(error) => return failure(None, None, started, error),
     };
@@ -99,7 +160,7 @@ fn authenticated(headers: &HeaderMap, token: &str) -> bool {
         })
 }
 
-fn json_content_type(headers: &HeaderMap) -> bool {
+pub(crate) fn json_content_type(headers: &HeaderMap) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     let Some(value) = values.next() else {
         return false;
@@ -119,7 +180,7 @@ fn json_content_type(headers: &HeaderMap) -> bool {
 }
 
 async fn execute_request<B: ObjectStore + 'static>(
-    engine: Engine<B>,
+    state: Arc<ApiState<B>>,
     request: Request,
     started: Instant,
 ) -> Response {
@@ -134,6 +195,13 @@ async fn execute_request<B: ObjectStore + 'static>(
             ),
         );
     }
+    let _staging = match state.engine.worker_pool().scheduler().charge_memory(
+        0,
+        (3 * protocol::MAX_BODY_BYTES + protocol::MAX_DECODED_PAYLOAD_BYTES) as u64,
+    ) {
+        Ok(charge) => charge,
+        Err(error) => return failure(None, None, started, error),
+    };
     let bytes = match read_body(request.into_body()).await {
         Ok(bytes) => bytes,
         Err(error) => return failure(None, None, started, error),
@@ -147,22 +215,132 @@ async fn execute_request<B: ObjectStore + 'static>(
     };
     let request_id = Some(parsed.request_id);
     let name = Some(parsed.operation.name());
-    let mutation = parsed.operation.is_mutation();
-    match engine.execute(parsed.operation).await {
-        Ok(data) => complete(
-            encode_success(parsed.request_id, &data, mutation),
-            request_id,
-            name,
+    drop(parsed);
+    let mut record = match state.queue.submit(state.engine.clone(), bytes).await {
+        Ok(r) => r,
+        Err(error) => return failure(request_id, name, started, error),
+    };
+    record.body = Vec::new();
+    record.pinned_catalog = None;
+    record.response_body = None;
+    drop(_staging);
+    match state.queue.wait(&state.engine, &record).await {
+        Ok(encoded) => complete(encoded, request_id, name, started, None),
+        Err(error) => failure(request_id, name, started, error),
+    }
+}
+
+async fn submit_request<B: ObjectStore + 'static>(
+    State(state): State<Arc<ApiState<B>>>,
+    request: Request,
+) -> Response {
+    let started = Instant::now();
+    if !authenticated(request.headers(), &state.token) {
+        return failure(
+            None,
+            None,
+            started,
+            not_applied(ErrorCode::Unauthorized, "unauthorized"),
+        );
+    }
+    if !json_content_type(request.headers()) {
+        return failure(
+            None,
+            None,
+            started,
+            not_applied(
+                ErrorCode::ValidationError,
+                "Content-Type must be application/json",
+            ),
+        );
+    }
+    let admitted = match state.executor.try_admit() {
+        Ok(admitted) => admitted,
+        Err(error) => return failure(None, None, started, error),
+    };
+    let operation=admitted.spawn(move||async move{
+        let _staging=state.engine.worker_pool().scheduler().charge_memory(0,(3*protocol::MAX_BODY_BYTES+protocol::MAX_DECODED_PAYLOAD_BYTES) as u64)?;
+        let bytes=read_body(request.into_body()).await?;let id=scan_request_id(&bytes);
+        if let Err(error)=protocol::parse_request(&bytes){return Ok(failure(id,None,started,error));}
+        Ok(match state.queue.submit(state.engine.clone(),bytes).await{
+            Ok(record)=>complete(EncodedResponse{status:202,body:serde_json::to_vec(&serde_json::json!({"request_id":record.request_id,"run_id":record.run_id,"state":"queued"})).unwrap()},Some(record.request_id),None,started,None),
+            Err(error)=>failure(id,None,started,error),
+        })
+    });
+    match operation {
+        Ok(operation) => operation
+            .receive()
+            .await
+            .unwrap_or_else(|e| failure(None, None, started, e)),
+        Err(e) => failure(None, None, started, e),
+    }
+}
+async fn receipt_request<B: ObjectStore + 'static>(
+    State(state): State<Arc<ApiState<B>>>,
+    Path((run_id, id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let started = Instant::now();
+    if !authenticated(request.headers(), &state.token) {
+        return failure(
+            None,
+            None,
+            started,
+            not_applied(ErrorCode::Unauthorized, "unauthorized"),
+        );
+    }
+    let (run_id, id) = match (Uuid::parse_str(&run_id), Uuid::parse_str(&id)) {
+        (Ok(run_id), Ok(id)) => (run_id, id),
+        _ => {
+            return failure(
+                None,
+                None,
+                started,
+                not_applied(
+                    ErrorCode::ValidationError,
+                    "receipt identities must be UUIDs",
+                ),
+            );
+        }
+    };
+    if request.uri().query().is_some() {
+        return failure(
+            Some(id),
+            None,
+            started,
+            not_applied(
+                ErrorCode::ValidationError,
+                "receipt query parameters are unsupported",
+            ),
+        );
+    }
+    match state.queue.receipt(&state.engine, run_id, id).await {
+        Ok(receipt) => complete(
+            EncodedResponse {
+                status: 200,
+                body: serde_json::to_vec(&receipt).unwrap(),
+            },
+            Some(id),
+            None,
             started,
             None,
         ),
-        Err(error) => failure(request_id, name, started, error),
+        Err(error) => failure(Some(id), None, started, error),
     }
 }
 
 async fn read_body(mut body: Body) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
+        .await
+        .map_err(|_| {
+            not_applied(
+                ErrorCode::ValidationError,
+                "request body read deadline exceeded",
+            )
+        })?
+    {
         let frame = frame.map_err(|_| {
             not_applied(ErrorCode::ValidationError, "request body could not be read")
         })?;

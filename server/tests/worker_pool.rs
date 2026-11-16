@@ -21,7 +21,7 @@ thread_local! {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fixed_threads_route_and_bound_work() {
+async fn shared_threads_refill_any_free_executor_and_bound_work() {
     timeout(Duration::from_secs(15), async {
         let (pool, owner) =
             WorkerPool::start(NonZeroUsize::new(3).unwrap(), Handle::current()).unwrap();
@@ -60,31 +60,27 @@ async fn fixed_threads_route_and_bound_work() {
         assert_ne!(ids[0], ids[1]);
         assert_ne!(ids[0], ids[2]);
         assert_ne!(ids[1], ids[2]);
-        for index in 3..6 {
-            jobs.push(
-                pool.submit(index, |id, _| Ok((id, thread::current().id())))
-                    .await
-                    .unwrap(),
-            );
-        }
-        let seventh = pool.submit(6, |id, _| Ok((id, thread::current().id())));
-        tokio::pin!(seventh);
+        assert_eq!(pool.scheduler().usage()[0].1, 3);
+        let next = pool.submit(0, |id, _| Ok((id, thread::current().id())));
+        tokio::pin!(next);
         assert!(
-            std::future::poll_fn(|cx| std::task::Poll::Ready(
-                seventh.as_mut().poll(cx).is_pending()
-            ))
-            .await
+            std::future::poll_fn(|cx| std::task::Poll::Ready(next.as_mut().poll(cx).is_pending()))
+                .await
         );
-        gates.remove(0).send(()).unwrap();
-        jobs.push(seventh.await.unwrap());
+        // Partition index zero can use whichever real executor becomes free.
+        gates.remove(1).send(()).unwrap();
+        let (released_id, released_thread) = jobs.remove(1).receive().await.unwrap();
+        let (next_id, next_thread) = next.await.unwrap().receive().await.unwrap();
+        assert_eq!((next_id, next_thread), (released_id, released_thread));
+        assert_eq!(Some(next_thread), ids[next_id]);
         for gate in gates {
             gate.send(()).unwrap();
         }
-        for (index, job) in jobs.into_iter().enumerate() {
+        for job in jobs {
             let (id, tid) = job.receive().await.unwrap();
-            assert_eq!(id, index % 3);
             assert_eq!(Some(tid), ids[id]);
         }
+        assert_eq!(pool.scheduler().usage()[0].1, 0);
         owner.shutdown().await.unwrap();
     })
     .await
@@ -115,7 +111,7 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
                     runtime.block_on(async {
                         gate.await.unwrap();
                     });
-                    if id == 1 {
+                    if index == 1 {
                         panic!("private panic payload");
                     }
                     completed.lock().unwrap().push(index);
@@ -130,20 +126,54 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
             let (id, tid) = starts.recv().await.unwrap();
             original_ids[id] = Some(tid);
         }
-        let mut successors = Vec::new();
-        for index in 3..6 {
-            let completed = completed.clone();
-            successors.push(
-                pool.submit(index, move |_, _| {
-                    completed.lock().unwrap().push(index);
-                    Ok(thread::current().id())
-                })
-                .await
-                .unwrap(),
-            );
-        }
-        drop(jobs.remove(0)); // Receiving is optional, execution is not.
-        drop(successors.remove(0));
+        // Free only the executor assigned the panicking logical job. Its
+        // identity is observed rather than inferred from a partition index.
+        let mut jobs: Vec<_> = jobs.into_iter().map(Some).collect();
+        let mut gates: Vec<_> = gates.into_iter().map(Some).collect();
+        gates[1].take().unwrap().send(()).unwrap();
+        let panic_error = jobs[1].take().unwrap().receive().await.unwrap_err();
+        assert_eq!(panic_error.code, ErrorCode::InternalError);
+        assert_eq!(panic_error.outcome, Outcome::NotApplied);
+        assert!(!panic_error.message.contains("private"));
+        let completed_copy = completed.clone();
+        let recovered = pool
+            .submit(0, move |id, _| {
+                completed_copy.lock().unwrap().push(3);
+                Ok((id, thread::current().id()))
+            })
+            .await
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
+        assert_eq!(Some(recovered.1), original_ids[recovered.0]);
+        let completed_copy = completed.clone();
+        let (done, done_rx) = oneshot::channel();
+        let abandoned = pool
+            .submit(0, move |_, _| {
+                completed_copy.lock().unwrap().push(4);
+                let _ = done.send(());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(abandoned);
+        done_rx.await.unwrap();
+        let (started_last, last_started) = oneshot::channel();
+        let (release_last, last_gate) = oneshot::channel();
+        let completed_copy = completed.clone();
+        let accepted = pool
+            .submit(0, move |_, runtime| {
+                let _ = started_last.send(());
+                runtime.block_on(last_gate).unwrap();
+                completed_copy.lock().unwrap().push(5);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        last_started.await.unwrap();
+        drop(accepted);
+        drop(jobs[0].take());
         let blocked = pool.submit(6, |_, _| Ok(()));
         tokio::pin!(blocked);
         assert!(
@@ -152,7 +182,7 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
             ))
             .await
         );
-        let shutdown = owner.shutdown(); // Must stop synchronously, before polling.
+        let shutdown = owner.shutdown();
         assert!(pool.submit(0, |_, _| Ok(())).await.is_err());
         tokio::pin!(shutdown);
         assert!(
@@ -161,23 +191,11 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
             ))
             .await
         );
-        for gate in gates {
-            gate.send(()).unwrap();
-        }
-        let panic_error = jobs.remove(0).receive().await.unwrap_err();
-        assert_eq!(panic_error.code, ErrorCode::InternalError);
-        assert_eq!(panic_error.outcome, Outcome::NotApplied);
-        assert!(!panic_error.message.contains("private"));
-        let original_thread = jobs.remove(0).receive().await.unwrap();
-        assert_eq!(
-            Some(successors.remove(0).receive().await.unwrap()),
-            original_ids[1]
-        );
-        assert_eq!(
-            successors.remove(0).receive().await.unwrap(),
-            original_thread
-        );
-        shutdown.await.unwrap(); // Also ignores unpolled, unaccepted reservations.
+        gates[0].take().unwrap().send(()).unwrap();
+        gates[2].take().unwrap().send(()).unwrap();
+        release_last.send(()).unwrap();
+        jobs[2].take().unwrap().receive().await.unwrap();
+        shutdown.await.unwrap();
         assert!(blocked.await.is_err());
         for mut exit in exits {
             assert_eq!(exit.try_recv(), Err(oneshot::error::TryRecvError::Closed));
@@ -191,22 +209,24 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
             WorkerPool::start(NonZeroUsize::new(2).unwrap(), Handle::current()).unwrap();
         let (io_go, io_gate) = oneshot::channel();
         let (io_done, io_result) = oneshot::channel();
-        pool.submit(0, move |_, runtime| {
-            runtime.spawn(async move {
-                io_gate.await.unwrap();
-                io_done.send(()).unwrap();
-            });
-            Ok(())
-        })
-        .await
-        .unwrap()
-        .receive()
-        .await
-        .unwrap();
+        let (finish_first, first_gate) = oneshot::channel();
+        let first = pool
+            .submit(0, move |_, runtime| {
+                runtime.spawn(async move {
+                    io_gate.await.unwrap();
+                    io_done.send(()).unwrap();
+                });
+                runtime.block_on(first_gate).unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
         let (release, gate) = oneshot::channel();
+        let (second_started, second_entered) = oneshot::channel();
         let last_dispatch = Arc::new(pool.clone());
         let job = pool
             .submit(1, move |_, runtime| {
+                second_started.send(()).unwrap();
                 runtime.block_on(async {
                     gate.await.unwrap();
                     io_go.send(()).unwrap();
@@ -217,6 +237,9 @@ async fn shutdown_drains_abandoned_and_panicking_jobs_and_joins() {
             })
             .await
             .unwrap();
+        second_entered.await.unwrap();
+        finish_first.send(()).unwrap();
+        first.receive().await.unwrap();
         drop(pool);
         let shutdown = owner.shutdown();
         release.send(()).unwrap();

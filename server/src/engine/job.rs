@@ -88,6 +88,119 @@ pub(crate) fn run_captured<B: ObjectStore>(
             partition::load_file(runtime, storage, &job.table, &file).map_err(|e| failure(e.code))
         })
         .transpose()?;
+    run_loaded(job, loaded, output)
+}
+
+pub(crate) struct CapturedInput {
+    file: Option<ReadFile>,
+    bytes: Vec<u8>,
+}
+fn captured_file(job: &JobEnvelope) -> Option<ReadFile> {
+    let file = match &job.task {
+        Task::Get { file, .. } | Task::Collect { file, .. } | Task::Count { file, .. } => {
+            Some(file)
+        }
+        Task::Prepare { file, .. } => file.as_ref(),
+    };
+    file.map(|file| match file {
+        FileInput::Legacy { object, row_count } => ReadFile::Legacy {
+            object: object.clone(),
+            row_count: *row_count,
+        },
+        FileInput::Partition {
+            object,
+            range,
+            row_count,
+            byte_size,
+            payload_bytes,
+        } => ReadFile::Partition(PartitionFile {
+            object: object.clone(),
+            range: range.clone(),
+            row_count: *row_count,
+            byte_size: *byte_size,
+            payload_bytes: *payload_bytes,
+        }),
+    })
+}
+pub(crate) async fn prepare_captured<B: ObjectStore>(
+    storage: &Storage<B>,
+    pool: &crate::worker_pool::WorkerPool,
+    job: &JobEnvelope,
+) -> Result<(CapturedInput, crate::scheduling::MemoryCharge), JobError> {
+    encode_job(job)?;
+    let request = job.scheduler_request_id();
+    if let Some(file) = captured_file(job) {
+        let prepared = partition::download_file(storage, pool, request, &job.table, file)
+            .await
+            .map_err(|e| failure(e.code))?;
+        let (file, bytes, charge) = prepared.into_parts();
+        Ok((
+            CapturedInput {
+                file: Some(file),
+                bytes,
+            },
+            charge,
+        ))
+    } else {
+        let charge = pool
+            .scheduler()
+            .reserve_memory(request, 0, pool.resources().task_memory_limit_bytes)
+            .await
+            .map_err(|e| failure(e.code))?;
+        Ok((
+            CapturedInput {
+                file: None,
+                bytes: Vec::new(),
+            },
+            charge,
+        ))
+    }
+}
+pub(crate) fn run_prepared(
+    job: &JobEnvelope,
+    input: CapturedInput,
+    output: &mut LocalOutput<'_>,
+) -> Result<ResultEnvelope, JobError> {
+    encode_job(job)?;
+    output.check(job)?;
+    if captured_file(job).is_some() != input.file.is_some() {
+        return Err(failure(ErrorCode::ValidationError));
+    }
+    if let Task::Prepare {
+        range, mutation, ..
+    } = &job.task
+    {
+        let contains =
+            |key: &Key| range.contains(key, job.table.schema[&job.table.key]).ok() == Some(true);
+        let valid = match mutation {
+            RowMutation::Insert(p) | RowMutation::Upsert(p) => {
+                contains(&partition::row_key(&job.table, &p.row))
+            }
+            RowMutation::InsertMany(p) => p
+                .rows
+                .iter()
+                .all(|r| contains(&partition::row_key(&job.table, r))),
+            RowMutation::Update(p) => contains(&p.key),
+            RowMutation::Delete(p) => contains(&p.key),
+        };
+        if !valid {
+            return Err(failure(ErrorCode::ValidationError));
+        }
+    }
+    let loaded = input
+        .file
+        .map(|file| {
+            partition::decode_downloaded(&job.table, &file, input.bytes)
+                .map_err(|e| failure(e.code))
+        })
+        .transpose()?;
+    run_loaded(job, loaded, output)
+}
+fn run_loaded(
+    job: &JobEnvelope,
+    loaded: Option<partition::LoadedRows>,
+    output: &mut LocalOutput<'_>,
+) -> Result<ResultEnvelope, JobError> {
     let (rows, source_payload_bytes) =
         loaded.map_or((Vec::new(), 0), |v| (v.rows, v.payload_bytes as u64));
     let source_rows = rows.len() as u64;

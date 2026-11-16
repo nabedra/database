@@ -85,6 +85,7 @@ fn binding(root: &Control, n: &Node) -> Option<HeartbeatBinding> {
     }
     let session = n.session.as_ref()?;
     Some(HeartbeatBinding {
+        resources: n.resources,
         cluster_id: root.cluster_id,
         node_id: n.node_id,
         incarnation: n.incarnation?,
@@ -187,7 +188,11 @@ impl Observations {
             return Ok(());
         }
         self.autoscale_reconcile(root)?;
-        let controller_changed = self.controller.as_ref() != Some(&root.controller);
+        let controller_changed = self.controller.as_ref().is_none_or(|old| {
+            old.owner_id != root.controller.owner_id
+                || old.epoch != root.controller.epoch
+                || old.lease_state != root.controller.lease_state
+        });
         self.bump()?;
         let mut previous = std::mem::take(&mut self.entries);
         for node in &root.nodes {
@@ -794,5 +799,26 @@ impl Observations {
                     && c.epoch == snapshot.owner.epoch
                     && c.lease_state == LeaseState::Held
             }))
+    }
+}
+
+impl Observations {
+    /// Status reports only an advancing, authenticated heartbeat that remains
+    /// within its original freshness interval. Reads never refresh its age.
+    pub(crate) fn status_heartbeat(
+        &mut self,
+        binding: &HeartbeatBinding,
+        now: Instant,
+        expiry: Duration,
+    ) -> Result<Option<(Heartbeat, Duration)>, StorageError> {
+        if !self.fresh(binding, now, expiry)? {
+            return Ok(None);
+        }
+        let entry = &self.entries[self.index(binding)?];
+        Ok(entry
+            .heartbeat
+            .clone()
+            .zip(entry.advance)
+            .map(|(h, at)| (h, now.saturating_duration_since(at))))
     }
 }

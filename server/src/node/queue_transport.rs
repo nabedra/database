@@ -1,0 +1,481 @@
+//! Signed, bounded queue control traffic uses its own cryptographic domain.
+use super::{
+    auth,
+    http::{self, HttpClient, Result, Signer, invalid, unavailable},
+};
+use crate::{
+    cluster::{member::Node, state::Control},
+    protocol::ErrorCode,
+};
+use axum::{
+    body::Body,
+    http::{HeaderMap, Request, Response},
+};
+use ring::signature::{ED25519, UnparsedPublicKey};
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, time::Duration};
+use tokio::time::Instant;
+use uuid::Uuid;
+
+pub(super) const PATH: &str = "/internal/v1/queue";
+pub(super) const MAX_BYTES: usize = 128 * 1024 * 1024;
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claims {
+    version: u8,
+    command: String,
+    class: String,
+    cluster: Uuid,
+    scheduler_term: u64,
+    membership_revision: u64,
+    receiver: Uuid,
+    receiver_incarnation: Uuid,
+    receiver_session: Uuid,
+    sender_node: Option<Uuid>,
+    sender_process: Uuid,
+    sender_incarnation: Option<Uuid>,
+    sender_session: Option<Uuid>,
+    public_key: String,
+    nonce: Uuid,
+    response: bool,
+    expires_at_ms: u64,
+    digest: String,
+}
+fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
+    if s.len() != N * 2
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid());
+    }
+    let mut out = [0; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| invalid())?;
+    }
+    Ok(out)
+}
+pub(crate) fn command_class(command: &str) -> Result<&'static str> {
+    Ok(match command {
+        "submit" => "ingress",
+        "lookup" => "receipt",
+        "install" => "replica",
+        "snapshot" | "bootstrap" => "bootstrap",
+        "stats" | "seal" | "unseal" | "join" => "progress",
+        _ => return Err(invalid()),
+    })
+}
+fn wire_command(bytes: &[u8]) -> Result<&'static str> {
+    for command in [
+        "submit",
+        "lookup",
+        "install",
+        "snapshot",
+        "bootstrap",
+        "stats",
+        "seal",
+        "unseal",
+        "join",
+    ] {
+        let prefix = format!("{{\"command\":\"{command}\"");
+        if bytes.starts_with(prefix.as_bytes()) {
+            return Ok(command);
+        }
+    }
+    Err(invalid())
+}
+fn claims(
+    signer: &Signer,
+    root: &Control,
+    receiver: &Node,
+    nonce: Uuid,
+    response: bool,
+    bytes: &[u8],
+) -> Result<Claims> {
+    let sender = signer.sender();
+    Ok(Claims {
+        version: 1,
+        command: wire_command(bytes)?.into(),
+        class: command_class(wire_command(bytes)?)?.into(),
+        cluster: root.cluster_id,
+        scheduler_term: root.scheduler.scheduler_term,
+        membership_revision: root.revision,
+        receiver: receiver.node_id,
+        receiver_incarnation: receiver.incarnation.ok_or_else(unavailable)?,
+        receiver_session: receiver.session.as_ref().ok_or_else(unavailable)?.id,
+        sender_node: sender.node_id(),
+        sender_process: sender.process_id(),
+        sender_incarnation: sender.incarnation(),
+        sender_session: sender.session_id(),
+        public_key: http::hex(&signer.public_key()),
+        nonce,
+        response,
+        expires_at_ms: super::queue_runtime::now_ms().saturating_add(30000),
+        digest: http::digest(bytes),
+    })
+}
+fn signed(signer: &Signer, claims: &Claims) -> Result<(String, String)> {
+    let bytes = serde_json::to_vec(claims).map_err(|_| invalid())?;
+    Ok((http::hex(&bytes), http::hex(&signer.sign_queue(&bytes)?)))
+}
+fn verify(
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+    root: &Control,
+    local: &auth::Sender,
+    pinned: &[u8; 32],
+    response: bool,
+    nonce: Option<Uuid>,
+) -> Result<Claims> {
+    let raw = http::one(headers, "x-meshdb-queue-auth")?;
+    if raw.len() > 8192 || raw.len() % 2 != 0 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::with_capacity(raw.len() / 2);
+    for index in (0..raw.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&raw[index..index + 2], 16).map_err(|_| invalid())?);
+    }
+    let c: Claims = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if http::one(headers, "x-meshdb-queue-command")? != c.command
+        || http::one(headers, "x-meshdb-queue-class")? != c.class
+        || (command_class(&c.command)? != c.class
+            && !(c.command == "install" && c.class == "bootstrap"))
+    {
+        return Err(invalid());
+    }
+    if c.version != 1
+        || c.cluster != root.cluster_id
+        || c.scheduler_term != root.scheduler.scheduler_term
+        || c.membership_revision > root.revision
+        || c.response != response
+        || body.is_some_and(|body| c.digest != http::digest(body))
+        || nonce.is_some_and(|n| n != c.nonce)
+    {
+        return Err(invalid());
+    }
+    if Some(c.receiver) != local.node_id()
+        || Some(c.receiver_incarnation) != local.incarnation()
+        || Some(c.receiver_session) != local.session_id()
+    {
+        return Err(invalid());
+    }
+    auth::checked_worker(root, local).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+    let key = unhex::<32>(&c.public_key)?;
+    let signature = unhex::<64>(http::one(headers, "x-meshdb-queue-signature")?)?;
+    let mut input = b"meshdb.queue-control.v1\0".to_vec();
+    input.extend_from_slice(&bytes);
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&input, &signature)
+        .map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+    if let Some(node) = c.sender_node {
+        let sender = auth::Sender::worker(
+            node,
+            c.sender_incarnation.ok_or_else(invalid)?,
+            c.sender_session.ok_or_else(invalid)?,
+            c.public_key.clone(),
+        )
+        .map_err(|_| invalid())?;
+        if sender.process_id() != c.sender_process {
+            return Err(invalid());
+        }
+        auth::checked_worker(root, &sender).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+    } else if response
+        || c.sender_incarnation.is_some()
+        || c.sender_session.is_some()
+        || &key != pinned
+    {
+        return Err(http::failure(ErrorCode::Unauthorized));
+    }
+    Ok(c)
+}
+pub(super) fn preauthenticate(
+    headers: &HeaderMap,
+    root: &Control,
+    local: &auth::Sender,
+    pinned: &[u8; 32],
+    seen: &mut BTreeMap<Uuid, u64>,
+) -> Result<(Uuid, Option<Uuid>, String, String, String)> {
+    let c = verify(headers, None, root, local, pinned, false, None)?;
+    let now = super::queue_runtime::now_ms();
+    if c.expires_at_ms < now || c.expires_at_ms > now.saturating_add(30000) {
+        return Err(invalid());
+    }
+    seen.retain(|_, expiry| *expiry >= now);
+    if seen.len() >= 8192 {
+        return Err(http::failure(ErrorCode::Overloaded));
+    }
+    if seen.insert(c.nonce, c.expires_at_ms).is_some() {
+        return Err(http::failure(ErrorCode::Conflict));
+    }
+    Ok((c.nonce, c.sender_node, c.digest, c.command, c.class))
+}
+// API replies target the API's ephemeral process, so response authenticity is
+// checked against the exact worker and request nonce instead of a member receiver.
+pub(crate) async fn exchange(
+    client: &HttpClient,
+    signer: &Signer,
+    root: &Control,
+    node: &Node,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    exchange_bounded(client, signer, root, node, body, MAX_BYTES).await
+}
+pub(super) async fn exchange_bounded(
+    client: &HttpClient,
+    signer: &Signer,
+    root: &Control,
+    node: &Node,
+    body: Vec<u8>,
+    response_cap: usize,
+) -> Result<Vec<u8>> {
+    exchange_class(client, signer, root, node, body, response_cap, None).await
+}
+pub(super) async fn exchange_class(
+    client: &HttpClient,
+    signer: &Signer,
+    root: &Control,
+    node: &Node,
+    body: Vec<u8>,
+    response_cap: usize,
+    class: Option<&str>,
+) -> Result<Vec<u8>> {
+    if body.len() > MAX_BYTES {
+        return Err(http::failure(ErrorCode::LimitExceeded));
+    }
+    let nonce = Uuid::new_v4();
+    let mut c = claims(signer, root, node, nonce, false, &body)?;
+    if let Some(class) = class {
+        c.class = class.into();
+    }
+    if command_class(&c.command)? != c.class && !(c.command == "install" && c.class == "bootstrap")
+    {
+        return Err(invalid());
+    }
+    let (a, s) = signed(signer, &c)?;
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "{}{}",
+            node.endpoint
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .trim_end_matches('/'),
+            PATH
+        ))
+        .header("connection", "close")
+        .header("content-type", "application/json")
+        .header("content-length", body.len())
+        .header("x-meshdb-queue-command", c.command.as_str())
+        .header("x-meshdb-queue-class", c.class.as_str())
+        .header("x-meshdb-queue-auth", a)
+        .header("x-meshdb-queue-signature", s)
+        .body(Body::from(body))
+        .map_err(|_| invalid())?;
+    let end = Instant::now() + Duration::from_secs(30);
+    let response = client.request(request, end).await?;
+    if response.status() != 200 {
+        return Err(unavailable());
+    }
+    let headers = response.headers().clone();
+    let len = http::framing(&headers, response_cap.min(MAX_BYTES), false)?.ok_or_else(invalid)?;
+    let bytes = http::read_small(response.into_body(), len, end).await?;
+    let raw = http::one(&headers, "x-meshdb-queue-auth")?;
+    if raw.len() > 8192 || raw.len() % 2 != 0 {
+        return Err(invalid());
+    }
+    let decoded = (0..raw.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).map_err(|_| invalid()))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_command = c.command;
+    let expected_class = c.class;
+    let c: Claims = serde_json::from_slice(&decoded).map_err(|_| invalid())?;
+    let session = node.session.as_ref().ok_or_else(unavailable)?;
+    if c.command != expected_command || c.class != expected_class {
+        return Err(invalid());
+    }
+    if c.version != 1
+        || c.cluster != root.cluster_id
+        || c.scheduler_term != root.scheduler.scheduler_term
+        || c.membership_revision > root.revision
+        || !c.response
+        || c.nonce != nonce
+        || c.sender_node != Some(node.node_id)
+        || c.sender_incarnation != node.incarnation
+        || c.sender_session != Some(session.id)
+        || c.digest != http::digest(&bytes)
+    {
+        return Err(invalid());
+    }
+    let local = signer.sender();
+    if c.receiver != local.node_id().unwrap_or(local.process_id())
+        || c.receiver_incarnation != local.incarnation().unwrap_or(local.process_id())
+        || c.receiver_session != local.session_id().unwrap_or(local.process_id())
+        || c.sender_process != node.incarnation.ok_or_else(unavailable)?
+    {
+        return Err(invalid());
+    }
+    let key = unhex::<32>(&c.public_key)?;
+    let signature = unhex::<64>(http::one(&headers, "x-meshdb-queue-signature")?)?;
+    let sender = auth::Sender::worker(
+        node.node_id,
+        node.incarnation.ok_or_else(unavailable)?,
+        session.id,
+        c.public_key,
+    )
+    .map_err(|_| invalid())?;
+    auth::checked_worker(root, &sender).map_err(|_| invalid())?;
+    let mut input = b"meshdb.queue-control.v1\0".to_vec();
+    input.extend_from_slice(&decoded);
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&input, &signature)
+        .map_err(|_| invalid())?;
+    Ok(bytes)
+}
+/// Echo receiver identity for API replies without exposing a reusable credential.
+pub(super) fn reply(
+    signer: &Signer,
+    root: &Control,
+    headers: &HeaderMap,
+    nonce: Uuid,
+    bytes: Vec<u8>,
+) -> Result<Response<Body>> {
+    let raw = http::one(headers, "x-meshdb-queue-auth")?;
+    let decoded = (0..raw.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).map_err(|_| invalid()))
+        .collect::<Result<Vec<_>>>()?;
+    let request: Claims = serde_json::from_slice(&decoded).map_err(|_| invalid())?;
+    let sender = signer.sender();
+    let c = Claims {
+        version: 1,
+        command: request.command,
+        class: request.class,
+        cluster: root.cluster_id,
+        scheduler_term: root.scheduler.scheduler_term,
+        membership_revision: request.membership_revision,
+        receiver: request.sender_node.unwrap_or(request.sender_process),
+        receiver_incarnation: request.sender_incarnation.unwrap_or(request.sender_process),
+        receiver_session: request.sender_session.unwrap_or(request.sender_process),
+        sender_node: sender.node_id(),
+        sender_process: sender.process_id(),
+        sender_incarnation: sender.incarnation(),
+        sender_session: sender.session_id(),
+        public_key: http::hex(&signer.public_key()),
+        nonce,
+        response: true,
+        expires_at_ms: super::queue_runtime::now_ms().saturating_add(30000),
+        digest: http::digest(&bytes),
+    };
+    let (a, s) = signed(signer, &c)?;
+    Response::builder()
+        .status(200)
+        .header("content-type", "application/json")
+        .header("content-length", bytes.len())
+        .header("x-meshdb-queue-auth", a)
+        .header("x-meshdb-queue-signature", s)
+        .body(Body::from(bytes))
+        .map_err(|_| invalid())
+}
+
+/// Count without allocating a wire buffer; reserve the exact encoded output next.
+pub(super) fn encoded_len(value: &impl Serialize, cap: usize) -> Result<usize> {
+    struct Counter {
+        len: usize,
+        cap: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.len = self
+                .len
+                .checked_add(bytes.len())
+                .filter(|len| *len <= self.cap)
+                .ok_or_else(|| std::io::Error::other("queue wire limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { len: 0, cap };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| http::failure(ErrorCode::LimitExceeded))?;
+    Ok(counter.len)
+}
+pub(super) fn encode_exact(value: &impl Serialize, len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| http::failure(ErrorCode::LimitExceeded))?;
+    serde_json::to_writer(&mut bytes, value).map_err(|_| invalid())?;
+    if bytes.len() != len {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn u02_exact_wire_charge_counts_empty_and_non_ascii_payloads_before_allocation() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"data":[0,255,17],"text":"é\nquoted\""}),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(encoded_len(&value, bytes.len()).unwrap(), bytes.len());
+            assert_eq!(encode_exact(&value, bytes.len()).unwrap(), bytes);
+            assert_eq!(
+                encoded_len(&value, bytes.len() - 1).unwrap_err().code,
+                ErrorCode::LimitExceeded
+            );
+        }
+    }
+    #[test]
+    fn c07_tiny_install_and_lookup_share_control_memory_concurrently() {
+        use crate::{config::WorkerResources, scheduling::ResourceScheduler};
+        let scheduler = ResourceScheduler::new(vec![(
+            0,
+            WorkerResources {
+                max_threads: 2,
+                memory_limit_bytes: 256 << 20,
+                task_memory_limit_bytes: 255 << 20,
+                control_memory_reserve_bytes: 1 << 20,
+            },
+        )])
+        .unwrap();
+        let actor = scheduler.charge_memory(0, 16 << 20).unwrap();
+        let install = serde_json::json!({"command":"install","body":vec![255u8;1024]});
+        let install_bytes = encoded_len(&install, MAX_BYTES).unwrap();
+        let lookup =
+            serde_json::json!({"kind":"receipt","state":"succeeded","result":{"name":"items"}});
+        let lookup_bytes = encoded_len(&lookup, MAX_BYTES).unwrap();
+        let entered = std::sync::Barrier::new(3);
+        let release = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _charge = scheduler
+                    .charge_memory(0, (2 * install_bytes + 2 * 1024 + 128 * 1024) as u64)
+                    .unwrap();
+                entered.wait();
+                release.wait();
+            });
+            scope.spawn(|| {
+                let _charge = scheduler
+                    .charge_memory(0, (64 * 1024 + lookup_bytes + 4096) as u64)
+                    .unwrap();
+                entered.wait();
+                release.wait();
+            });
+            entered.wait();
+            let (_, threads, bytes) = scheduler.usage()[0];
+            assert_eq!(threads, 0);
+            assert!(bytes > 16 << 20 && bytes < 17 << 20);
+            release.wait();
+        });
+        assert_eq!(scheduler.usage()[0].2, 16 << 20);
+        drop(actor);
+        assert_eq!(scheduler.usage()[0].2, 0);
+    }
+}

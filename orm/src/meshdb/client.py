@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 import uuid
+import time
+from dataclasses import dataclass, field
 
 from .errors import (
     AuthenticationError, ConflictError, LimitExceededError, MeshDBError,
@@ -129,7 +131,7 @@ class _Transport:
         LimitExceededError or ProtocolError for invalid results. Those failures
         become ProtocolError for reads and UnknownOutcomeError for mutations.
         Other decoder exceptions propagate as programming errors. Never retry;
-        request IDs are diagnostic and provide no replay/deduplication guarantee.
+        request IDs identify one queued operation and are never automatically resubmitted.
         All raised transport/server failures retain the client's request ID and
         HTTP status when available. Successful results are returned unwrapped.
         """
@@ -226,6 +228,159 @@ class _Transport:
         raise error_type(error['message'], code=code, request_id=request_id,
                          status_code=status, outcome=outcome)
 
+    def _receipt_exchange(self, method: str, suffix: str, body: bytes | None,
+                          request_id: str, *, mutation: bool, timeout: float | None = None) -> tuple[int, dict]:
+        request = Request(self._url.removesuffix('/v1/operations') + suffix,
+                          data=body, method=method, headers={
+                              'Content-Type': 'application/json', 'Accept': 'application/json',
+                              'Authorization': 'Bearer ' + self._token,
+                          })
+        status = None
+        def failure(message, *, network=False):
+            kind = UnknownOutcomeError if mutation else (TransportError if network else ProtocolError)
+            return kind(message, request_id=request_id, status_code=status)
+        try:
+            try:
+                response = self._opener.open(request, timeout=self._timeout if timeout is None else min(timeout, self._timeout))
+            except HTTPError as error:
+                response = error
+            try:
+                status = response.status
+                raw = response.read(_MAX_BODY + 1)
+                content_type = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+                length = response.headers.get('Content-Length')
+            finally:
+                response.close()
+        except (OSError, URLError, IncompleteRead):
+            raise failure('Response lost during HTTP I/O', network=True) from None
+        except HTTPException:
+            raise failure('Malformed HTTP response') from None
+        if len(raw) > _MAX_BODY or content_type != 'application/json':
+            raise failure('Invalid receipt response body')
+        if length is not None and (not length.isascii() or not length.isdecimal() or int(length) != len(raw)):
+            raise failure('Incomplete receipt response body', network=True)
+        try:
+            value = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object,
+                               parse_constant=_invalid_constant, parse_float=_finite_float)
+        except (ValueError, UnicodeError, RecursionError):
+            raise failure('Malformed receipt response JSON') from None
+        if not isinstance(value, dict):
+            raise failure('Invalid receipt envelope')
+        if status in (200, 202):
+            return status, value
+        if (type(status) is not int or not 400 <= status <= 599
+                or set(value) != {'request_id', 'error'}
+                or value['request_id'] not in (None, request_id)):
+            raise failure('Invalid receipt error envelope')
+        error = value['error']
+        if (not isinstance(error, dict) or set(error) != {'code', 'message', 'outcome'}
+                or not isinstance(error['code'], str) or not isinstance(error['message'], str)
+                or error['outcome'] not in ('not_applied', 'unknown')
+                or _ERROR_STATUS.get(error['code'], 500) != status
+                or error['code'] == 'outcome_unknown' and error['outcome'] != 'unknown'):
+            raise failure('Invalid receipt error details')
+        kind = UnknownOutcomeError if error['outcome'] == 'unknown' else _ERROR_TYPES.get(error['code'], MeshDBError)
+        raise kind(error['message'], code=error['code'], outcome=error['outcome'],
+                   request_id=request_id, status_code=status)
+
+    def submit(self, operation: str, payload: dict, *, request_id: str | None = None) -> RequestReceipt:
+        if not isinstance(operation, str) or operation not in _READS | _MUTATIONS:
+            raise ValidationError('Unsupported operation')
+        if not isinstance(payload, dict):
+            raise ValidationError('Operation payload must be a dictionary')
+        request_id = _receipt_uuid(request_id) if request_id is not None else str(uuid.uuid4())
+        try:
+            body = json.dumps({'request_id': request_id, 'operation': operation, 'payload': payload},
+                              ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise ValidationError('Operation payload must encode as finite UTF-8 JSON') from None
+        if len(body) > _MAX_BODY:
+            raise LimitExceededError('Encoded request exceeds 8 MiB')
+        status, value = self._receipt_exchange('POST', '/v1/requests', body, request_id,
+                                               mutation=operation in _MUTATIONS)
+        if status != 202 or set(value) != {'request_id', 'run_id', 'state'} or value['request_id'] != request_id or value['state'] != 'queued':
+            kind = UnknownOutcomeError if operation in _MUTATIONS else ProtocolError
+            raise kind('Invalid acceptance receipt', request_id=request_id, status_code=status)
+        try:
+            run_id = _receipt_uuid(value['run_id'], protocol=True)
+        except ProtocolError:
+            kind = UnknownOutcomeError if operation in _MUTATIONS else ProtocolError
+            raise kind('Invalid acceptance run identity', request_id=request_id, status_code=status) from None
+        return RequestReceipt(request_id, run_id, 'queued', None, None, self)
+
+    def receipt(self, run_id: str, request_id: str, *, timeout: float | None = None) -> RequestReceipt:
+        run_id, request_id = _receipt_uuid(run_id), _receipt_uuid(request_id)
+        status, value = self._receipt_exchange('GET', f'/v1/requests/{run_id}/{request_id}', None,
+                                               request_id, mutation=False, timeout=timeout)
+        if (status != 200 or set(value) != {'request_id', 'run_id', 'state', 'result', 'error'}
+                or value['request_id'] != request_id or value['run_id'] != run_id
+                or value['state'] not in {'queued', 'running', 'committing', 'reconciling', 'succeeded', 'failed', 'abandoned'}):
+            raise ProtocolError('Invalid request receipt', request_id=request_id, status_code=status)
+        error = value['error']
+        if error is not None and (not isinstance(error, dict) or set(error) != {'code', 'message', 'outcome'}
+                                  or not isinstance(error['code'], str) or not isinstance(error['message'], str)
+                                  or error['outcome'] not in ('not_applied', 'unknown')):
+            raise ProtocolError('Invalid receipt error', request_id=request_id, status_code=status)
+        if (value['state'] == 'failed' and error is None
+                or value['state'] in {'queued', 'running', 'committing', 'reconciling', 'abandoned'}
+                and (value['result'] is not None or error is not None)
+                or value['state'] == 'succeeded' and error is not None):
+            raise ProtocolError('Invalid receipt state', request_id=request_id, status_code=status)
+        return RequestReceipt(request_id, run_id, value['state'], value['result'], error, self)
+
+
+def _receipt_uuid(value, *, protocol=False):
+    kind = ProtocolError if protocol else ValidationError
+    if not isinstance(value, str):
+        raise kind('Receipt identity must be a UUID')
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        raise kind('Receipt identity must be a UUID') from None
+    if str(parsed) != value:
+        raise kind('Receipt identity must be a canonical UUID')
+    return value
+
+
+@dataclass(frozen=True)
+class RequestReceipt:
+    """A recoverable queue identity. Polling never submits an operation again."""
+    request_id: str
+    run_id: str
+    state: str
+    result: object
+    error: dict | None
+    _transport: _Transport = field(repr=False, compare=False)
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in {'succeeded', 'failed', 'abandoned'}
+
+    def poll(self) -> RequestReceipt:
+        return self._transport.receipt(self.run_id, self.request_id)
+
+    def wait(self, *, timeout: float = 30.0, poll_interval: float = 0.05) -> RequestReceipt:
+        if type(timeout) not in (int, float) or type(poll_interval) not in (int, float):
+            raise ValidationError('Receipt wait durations must be positive and finite')
+        try:
+            timeout, poll_interval = float(timeout), float(poll_interval)
+        except OverflowError:
+            raise ValidationError('Receipt wait durations must be positive and finite') from None
+        if not math.isfinite(timeout) or timeout <= 0 or not math.isfinite(poll_interval) or poll_interval <= 0:
+            raise ValidationError('Receipt wait durations must be positive and finite')
+        deadline = time.monotonic() + timeout
+        receipt = self
+        while not receipt.terminal:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransportError('Receipt wait timed out; work remains queued', request_id=self.request_id)
+            time.sleep(min(poll_interval, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TransportError('Receipt wait timed out; work remains queued', request_id=self.request_id)
+            receipt = self._transport.receipt(self.run_id, self.request_id, timeout=remaining)
+        return receipt
+
 
 class DB:
     """Synchronous table creation and discovery through the server API."""
@@ -233,6 +388,14 @@ class DB:
     def __init__(self, api_url: str, token: str, *, timeout: float = 30.0,
                  ca_file: str | None = None) -> None:
         self._transport = _Transport(api_url, token, timeout=timeout, ca_file=ca_file)
+
+    def submit(self, operation: str, payload: dict, *, request_id: str | None = None) -> RequestReceipt:
+        """Accept one operation and return its stable queue identity."""
+        return self._transport.submit(operation, payload, request_id=request_id)
+
+    def receipt(self, run_id: str, request_id: str) -> RequestReceipt:
+        """Reconnect to an accepted request using the same database credentials."""
+        return self._transport.receipt(run_id, request_id)
 
     def create_table(self, name: str, schema: Schema, key: str, *,
                      format: Literal['parquet'] = 'parquet') -> Table:

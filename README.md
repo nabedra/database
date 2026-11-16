@@ -85,11 +85,15 @@ handles remain stale. See the [ORM guide](orm/README.md) for full API behavior.
 
 Tables use immutable Parquet partitions ordered by primary-key range. Keyed
 operations route to one partition; changed mutations rewrite only affected
-files. Queries scan partitions on local workers and combine results with global
+files. Queries scan partitions on workers and combine results with global
 ordering, primary-key tie-breaking, limit, projection and count semantics.
-Mutations serialize under one coordinator while their partitions prepare in
-parallel. Object uploads are currently sequential, followed by one conditional
-catalog publication. Atomic batches remain single operations.
+Requests share bounded compute and memory reservations. A replicated queue
+retains accepted work while a worker keeps its copy. Mutations prepare private
+replacement files and publish one conditional catalog update with a durable
+request decision. A conflicting publication recomputes against the newer catalog.
+Atomic batches remain single operations. See the
+[execution and recovery contract](plans/resource-aware-scheduling.md) and
+[verification evidence](docs/testing/scheduler-evidence.md).
 
 For example, after configuring the server environment:
 

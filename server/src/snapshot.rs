@@ -57,7 +57,7 @@ fn stored_validation(e: ProtocolError) -> ProtocolError {
 /// Payload accounting: 8 bytes per row, plus 8 + UTF-8 column-name length
 /// per cell, plus value bytes (UTF-8 length, 8 for int/float, 1 for bool).
 /// This deterministic logical size is not a bound on Rust allocator overhead.
-fn row_payload(row: &Row) -> usize {
+pub(crate) fn row_payload(row: &Row) -> usize {
     8 + row
         .iter()
         .map(|(name, value)| {
@@ -78,6 +78,7 @@ pub fn validate_rows(table: &TableDescriptor, rows: &[Row]) -> Result<usize, Pro
     if rows.len() > MAX_TABLE_ROWS {
         return Err(limit());
     }
+    check_rows_memory(table, rows, 0)?;
     let mut keys = BTreeSet::new();
     let mut payload = 0usize;
     for row in rows {
@@ -101,6 +102,42 @@ pub fn validate_rows(table: &TableDescriptor, rows: &[Row]) -> Result<usize, Pro
         }
     }
     Ok(payload)
+}
+/// Conservative simultaneous charge: encoded input/output and codec scratch,
+/// BTree nodes, cloned names/scalars, candidate rows, Arrow buffers and sorting.
+/// This logical bound is separate from allocator RSS; allocation failure remains fallible where supported.
+pub(crate) fn memory_shape(
+    table: &TableDescriptor,
+    count: usize,
+    payload: usize,
+    encoded: usize,
+) -> Result<u64, ProtocolError> {
+    let cells = count.checked_mul(table.schema.len()).ok_or_else(limit)?;
+    let bytes = cells
+        .checked_mul(768)
+        .and_then(|n| count.checked_mul(256).and_then(|v| n.checked_add(v)))
+        .and_then(|n| payload.checked_mul(4).and_then(|v| n.checked_add(v)))
+        .and_then(|n| encoded.checked_mul(4).and_then(|v| n.checked_add(v)))
+        .ok_or_else(limit)?;
+    Ok(bytes as u64)
+}
+pub(crate) fn check_memory_shape(
+    table: &TableDescriptor,
+    count: usize,
+    payload: usize,
+    encoded: usize,
+) -> Result<(), ProtocolError> {
+    crate::scheduling::check_task_memory(memory_shape(table, count, payload, encoded)?)
+}
+pub(crate) fn check_rows_memory(
+    table: &TableDescriptor,
+    rows: &[Row],
+    encoded: usize,
+) -> Result<(), ProtocolError> {
+    let payload = rows.iter().try_fold(0usize, |sum, row| {
+        sum.checked_add(row_payload(row)).ok_or_else(limit)
+    })?;
+    check_memory_shape(table, rows.len(), payload, encoded)
 }
 fn schema(table: &TableDescriptor) -> Schema {
     Schema::new(
@@ -156,8 +193,17 @@ fn array(name: &str, ty: ColumnType, rows: &[Row]) -> ArrayRef {
 /// Validate before constructing Arrow arrays. Return only a closed Parquet file.
 pub fn encode(table: &TableDescriptor, rows: &[Row]) -> Result<Vec<u8>, ProtocolError> {
     validate_rows(table, rows)?;
-    let mut bytes = Vec::new();
-    encode_into(table, rows, &mut bytes)?;
+    let mut sink = SnapshotSink {
+        bytes: Vec::new(),
+        exceeded: false,
+        working_bytes: memory_shape(table, rows.len(), rows.iter().map(row_payload).sum(), 0)?,
+    };
+    let encoded = encode_into(table, rows, &mut sink);
+    if sink.exceeded {
+        return Err(limit());
+    }
+    encoded?;
+    let bytes = sink.bytes;
     if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES {
         return Err(limit());
     }
@@ -169,6 +215,11 @@ fn encode_into<W: std::io::Write + Send>(
     rows: &[Row],
     sink: W,
 ) -> Result<(), ProtocolError> {
+    check_rows_memory(
+        table,
+        rows,
+        MAX_ENCODED_SNAPSHOT_BYTES.min(rows.iter().map(row_payload).sum::<usize>()),
+    )?;
     let schema = Arc::new(schema(table));
     let arrays = table
         .schema
@@ -200,12 +251,8 @@ pub fn decode(
     expected_rows: Option<u64>,
 ) -> Result<Vec<Row>, ProtocolError> {
     table.validate().map_err(stored_validation)?;
-    // Some malformed Parquet headers cause dependency panics. Keep them at the
-    // stored-data boundary; no raw parser errors or row values reach clients.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        decode_inner(table, bytes, expected_rows)
-    }))
-    .map_err(|_| stored())?
+    // Expected codec failures use Result. The worker's outer job boundary contains unwinding panics.
+    decode_inner(table, bytes, expected_rows)
 }
 fn check_envelope(bytes: &[u8]) -> Result<&[u8], ProtocolError> {
     if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES {
@@ -234,6 +281,7 @@ fn decode_inner(
 ) -> Result<Vec<Row>, ProtocolError> {
     // Check raw schema declarations before either reader constructs schema
     // types. A capped footer alone cannot bound num_children allocations.
+    crate::scheduling::check_task_memory((bytes.len() as u64).checked_mul(4).ok_or_else(limit)?)?;
     footer::validate(check_envelope(&bytes)?, table.schema.len())?;
     let file = SerializedFileReader::new(bytes.clone()).map_err(|_| stored())?;
     let metadata = file.metadata();
@@ -246,6 +294,7 @@ fn decode_inner(
     }
     let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
     let encoded_len = bytes.len() as u64;
+    check_memory_shape(table, count, 0, bytes.len())?;
     let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)
         .map_err(|_| stored())?;
     if builder.schema().as_ref() != &schema(table) {
@@ -273,6 +322,7 @@ fn decode_inner(
     preflight(&file, table, count, encoded_len)?;
     let reader = builder.with_batch_size(1).build().map_err(|_| stored())?;
     let mut rows = Vec::new();
+    rows.try_reserve_exact(count).map_err(|_| limit())?;
     let mut payload = 0usize;
     for batch in reader {
         let batch = batch.map_err(|_| stored())?;
@@ -303,13 +353,17 @@ fn decode_inner(
 }
 fn scalar(arr: &ArrayRef, ty: ColumnType, i: usize) -> Result<Scalar, ProtocolError> {
     Ok(match ty {
-        ColumnType::Utf8 => Scalar::Utf8(
-            arr.as_any()
+        ColumnType::Utf8 => {
+            let value = arr
+                .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(stored)?
-                .value(i)
-                .into(),
-        ),
+                .value(i);
+            let mut owned = String::new();
+            owned.try_reserve_exact(value.len()).map_err(|_| limit())?;
+            owned.push_str(value);
+            Scalar::Utf8(owned)
+        }
         ColumnType::Int64 => Scalar::Int64(
             arr.as_any()
                 .downcast_ref::<Int64Array>()
@@ -410,6 +464,7 @@ fn preflight(
     if total_rows != count {
         return Err(stored());
     }
+    check_memory_shape(table, count, payload, encoded_len as usize)?;
     Ok(())
 }
 fn plain_payload(mut buf: &[u8], ty: ColumnType, n: usize) -> Result<usize, ProtocolError> {
@@ -457,5 +512,97 @@ fn plain_payload(mut buf: &[u8], ty: ColumnType, n: usize) -> Result<usize, Prot
             }
             Ok(n)
         }
+    }
+}
+
+struct SnapshotSink {
+    bytes: Vec<u8>,
+    exceeded: bool,
+    working_bytes: u64,
+}
+impl std::io::Write for SnapshotSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_ENCODED_SNAPSHOT_BYTES - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::other("snapshot byte limit"));
+        }
+        let charged = (self.bytes.len() as u64)
+            .checked_add(bytes.len() as u64)
+            .and_then(|encoded| encoded.checked_mul(4))
+            .and_then(|encoded| encoded.checked_add(self.working_bytes));
+        if charged.is_none_or(|charged| crate::scheduling::check_task_memory(charged).is_err()) {
+            self.exceeded = true;
+            return Err(std::io::Error::other("snapshot working memory limit"));
+        }
+        self.bytes
+            .try_reserve_exact(bytes.len())
+            .map_err(std::io::Error::other)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use crate::protocol::TableFormat;
+    fn table() -> TableDescriptor {
+        TableDescriptor {
+            id: uuid::Uuid::nil(),
+            name: "memory".into(),
+            key: "id".into(),
+            format: TableFormat::Parquet,
+            schema: [
+                ("id".into(), ColumnType::Int64),
+                ("text".into(), ColumnType::Utf8),
+            ]
+            .into(),
+        }
+    }
+    fn row(text: String) -> Row {
+        [
+            ("id".into(), Scalar::Int64(1)),
+            ("text".into(), Scalar::Utf8(text)),
+        ]
+        .into()
+    }
+    #[test]
+    fn m01_wide_strings_extreme_counts_and_encoded_growth_fail_before_allocation() {
+        let table = table();
+        let rows = vec![row("x".repeat(16 * 1024))];
+        let bytes = encode(&table, &rows).unwrap();
+        crate::scheduling::with_task_limit(1024, || {
+            assert_eq!(
+                encode(&table, &rows).unwrap_err().code,
+                ErrorCode::LimitExceeded
+            );
+            assert_eq!(
+                decode(&table, bytes.clone().into(), Some(1))
+                    .unwrap_err()
+                    .code,
+                ErrorCode::LimitExceeded
+            );
+            assert!(check_memory_shape(&table, usize::MAX, usize::MAX, usize::MAX).is_err());
+            let mut sink = SnapshotSink {
+                bytes: Vec::new(),
+                exceeded: false,
+                working_bytes: 1000,
+            };
+            assert!(std::io::Write::write(&mut sink, &[0; 8]).is_err());
+            assert!(sink.bytes.is_empty());
+        });
+        // Task-local limits leave subsequent codec work usable.
+        assert_eq!(decode(&table, bytes.into(), Some(1)).unwrap(), rows);
+        let mut wide = table.clone();
+        for index in 0..62 {
+            wide.schema
+                .insert(format!("column{index}"), ColumnType::Int64);
+        }
+        crate::scheduling::with_task_limit(4096, || {
+            assert!(check_memory_shape(&wide, 1, 0, 0).is_err());
+        });
     }
 }

@@ -1,7 +1,6 @@
-use meshdb_server::protocol;
+use super as query;
+use crate::protocol;
 use protocol::*;
-#[path = "../src/engine/query.rs"]
-mod query;
 
 fn table() -> TableDescriptor {
     serde_json::from_str(r#"{"id":"00000000-0000-0000-0000-000000000001","name":"people","schema":{"id":"int64","name":"utf8","age":"int64","score":"float64","active":"bool"},"key":"id","format":"parquet"}"#).unwrap()

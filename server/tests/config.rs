@@ -100,6 +100,7 @@ fn required_environment_and_prefix_errors_are_sanitized_and_debug_redacts_token(
 fn worker_and_admission_bounds_allow_zero_queue() {
     for (workers, queue_size) in [
         (0, 64),
+        (257, 0),
         (usize::MAX, 1),
         (1, usize::MAX),
         (tokio::sync::Semaphore::MAX_PERMITS, 1),
@@ -116,7 +117,7 @@ fn worker_and_admission_bounds_allow_zero_queue() {
             .is_err()
         );
     }
-    for workers in [1, tokio::sync::Semaphore::MAX_PERMITS] {
+    for workers in [1, 256] {
         let config = configured(
             ServeOptions {
                 workers,

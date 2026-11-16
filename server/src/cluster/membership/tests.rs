@@ -82,6 +82,7 @@ fn root(external: bool) -> Control {
 fn managed() -> Control {
     let mut c = root(false);
     c.nodes.push(Node {
+        resources: None,
         node_id: id(3),
         launch_id: Some(id(6)),
         resource_id: None,
@@ -218,7 +219,7 @@ fn managed_eligibility_and_exact_retry_conflicts() {
         registration_plan(&out, owner(), &p, id(11)),
         Ok(RegistrationPlan::Existing(_))
     ));
-    for kind in 0..4 {
+    for kind in 0..3 {
         let mut c = managed();
         match kind {
             0 => {
@@ -231,25 +232,23 @@ fn managed_eligibility_and_exact_retry_conflicts() {
                 c.intents[0].state = IntentState::Failed;
                 c.intents[0].outcome = Some(IntentOutcome::NotInvoked)
             }
-            _ => {
-                c.template.queue_size = 65;
-                c.nodes[0].queue_size = 65;
-                c.config.template_fingerprint = c.template.fingerprint().unwrap();
-                c.intents[0].template_fingerprint = Some(c.config.template_fingerprint.clone());
-            }
+            _ => unreachable!(),
         }
         c.validate().unwrap();
         assert!(registration_plan(&c, owner(), &p, id(10)).is_err());
     }
-    for (field, value) in [
-        ("request_id", json!(id(66))),
-        ("operation_slots", json!(5)),
-        ("cluster_id", json!(id(66))),
-    ] {
+    for (field, value) in [("request_id", json!(id(66))), ("cluster_id", json!(id(66)))] {
         let mut v = claims(Some(id(6)));
         v[field] = value;
         assert!(registration_plan(&managed(), owner(), &proof(&v), id(10)).is_err());
     }
+    let mut heterogeneous = claims(Some(id(6)));
+    heterogeneous["operation_slots"] = json!(5);
+    heterogeneous["queue_size"] = json!(65);
+    let out =
+        change(registration_plan(&managed(), owner(), &proof(&heterogeneous), id(10)).unwrap());
+    assert_eq!(out.nodes[0].operation_slots, 5);
+    assert_eq!(out.nodes[0].queue_size, 65);
     let mut c = registered();
     c.nodes[0].resource_id = Some("resource".into());
     c.nodes[0].registration = Registration::Verified;

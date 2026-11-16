@@ -2,13 +2,14 @@
 
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from acceptance_support import AcceptanceConfig
 from server_process import ServerProcess, ServerProcessError
@@ -58,6 +59,25 @@ class ProcessGuard(unittest.TestCase):
                     server._process.wait(timeout=2)
                 server.stop()
 
+    def test_r04_unconfirmed_child_exit_cannot_authorize_a_replacement(self):
+        config = AcceptanceConfig("meshdb-testing", "us-east-1", {})
+        namespace = config.allocate_prefix(2, "unconfirmed", run_id="local")
+        child = Mock()
+        child.poll.return_value = None
+        child.returncode = None
+        child.wait.side_effect = subprocess.TimeoutExpired("fixture", .01)
+        owner = ServerProcess(config, namespace, startup_timeout=.1, shutdown_timeout=.01)
+        with patch('server_process.subprocess.Popen', return_value=child) as spawn, patch.object(owner, '_ready', return_value=True):
+            owner.start()
+            self.assertNotIn('--cold-start', spawn.call_args.args[0])
+            self.assertNotIn('--migrate-catalog', spawn.call_args.args[0])
+            with self.assertRaises(ServerProcessError):
+                owner.stop()
+            replacement = ServerProcess(config, namespace, startup_timeout=.1, shutdown_timeout=.01)
+            with self.assertRaises(ServerProcessError):
+                replacement.start()
+            self.assertEqual(spawn.call_count, 1)
+
     def test_local_process_restart_and_failed_start_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -75,7 +95,12 @@ class ProcessGuard(unittest.TestCase):
                 parser.add_argument("--workers", type=int)
                 parser.add_argument("--queue-size", type=int)
                 parser.add_argument("--partition_size")
+                parser.add_argument("--cold-start", action="store_true")
+                parser.add_argument("--migrate-catalog", action="store_true")
                 args = parser.parse_args()
+                assert not args.migrate_catalog
+                if args.workers in (2, 3):
+                    assert args.cold_start
                 assert args.host == "127.0.0.1"
                 assert args.queue_size == 64
                 assert (args.workers, args.partition_size) in ((4, None), (2, "64 KB"), (3, "64 KB"))
@@ -100,7 +125,7 @@ class ProcessGuard(unittest.TestCase):
                         pass
 
                 with HTTPServer((args.host, args.port), Health) as server:
-                    print("START", os.getpid(), os.environ["MESHDB_S3_PREFIX"], flush=True)
+                    print("START", os.getpid(), os.environ["MESHDB_S3_PREFIX"], "COLD", args.cold_start, flush=True)
                     server.serve_forever()
                 '''), encoding="utf-8")
             binary.chmod(0o700)
@@ -147,6 +172,9 @@ class ProcessGuard(unittest.TestCase):
                 self.assertIn(f"STOP {failed.pid}", failed_log.read_text())
                 self.assertEqual(log.read_text().count(namespace.prefix), 2)
                 self.assertEqual(log.read_text().count("STOP"), 2)
+                launches = [line for line in log.read_text().splitlines() if line.startswith("START ")]
+                self.assertTrue(launches[0].endswith("COLD False"))
+                self.assertTrue(launches[1].endswith("COLD True"))
 
                 for workers in (2, 3):
                     with ServerProcess(config, namespace, binary=binary, workers=workers,

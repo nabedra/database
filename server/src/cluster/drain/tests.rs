@@ -83,6 +83,7 @@ fn root(external: bool) -> Control {
 fn managed() -> Control {
     let mut c = root(false);
     c.nodes.push(Node {
+        resources: None,
         node_id: id(3),
         launch_id: Some(id(6)),
         resource_id: None,

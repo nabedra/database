@@ -44,7 +44,7 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Opti
 macro_rules! record {
     ($name:ident { $($(#[$attr:meta])* $field:ident : $ty:ty),* $(,)? }) => {
         #[derive(Clone, PartialEq, Eq, Serialize)]
-        pub struct $name { $(pub $field: $ty),* }
+        pub struct $name { $($(#[$attr])* pub $field: $ty),* }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.debug_struct(stringify!($name)).finish_non_exhaustive()
@@ -62,6 +62,10 @@ macro_rules! record {
     }
 }
 record!(Template {
+    #[serde(default, skip_serializing_if="crate::config::ExecutionConfig::is_default")]
+    execution: crate::config::ExecutionConfig,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    resources: Option<crate::config::WorkerResources>,
     api_urls: Vec<String>,
     listen: String,
     operation_slots: u64,
@@ -271,7 +275,26 @@ fn bucket(s: &str) -> bool {
         && s.parse::<std::net::Ipv4Addr>().is_err()
 }
 impl Template {
+    pub fn worker_resources(&self) -> crate::config::WorkerResources {
+        self.resources.unwrap_or(crate::config::WorkerResources {
+            max_threads: self.partition_slots,
+            ..Default::default()
+        })
+    }
+
     fn validate_fields(&self) -> Result<(), ConfigurationError> {
+        self.execution
+            .validate()
+            .map_err(|_| ConfigurationError::InvalidRecord)?;
+        check(
+            self.execution.is_default()
+                || self.partition_size.parse::<PartitionSize>().ok()
+                    == Some(self.execution.partition_size),
+        )?;
+        self.worker_resources()
+            .validate_execution(&self.execution)
+            .map_err(|_| ConfigurationError::InvalidRecord)?;
+
         check(
             (1..=16).contains(&self.api_urls.len())
                 && self.api_urls.iter().all(|s| api_url(s))

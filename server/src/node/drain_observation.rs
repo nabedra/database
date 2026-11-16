@@ -140,6 +140,9 @@ impl Drop for ReapedProof {
     }
 }
 impl ProofSlot {
+    pub(super) fn heartbeat_writer(&self) -> Arc<tokio::sync::Mutex<Option<HeartbeatWriter>>> {
+        self.writer.clone()
+    }
     /// Only the original successfully polled handle and live transferred result qualify.
     pub(super) fn matches_reaped(&self, proof: &ReapedProof) -> bool {
         self.cycle.as_ref().is_some_and(|r| {
