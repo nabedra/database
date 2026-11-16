@@ -48,7 +48,15 @@ The installer builds the locked release binary once. Starting an installed
 server invokes no Cargo. See the [CLI guide](docs/cli-and-serverless.md) for
 configuration, protected token files, shared compute and gateway middleware.
 
-For direct native deployment, build the S3-enabled release binary:
+For direct native deployment, install the S3-enabled server from crates.io:
+
+```sh
+cargo install nabedra-database --version 0.1.0 --locked
+nabedra-database-server --version
+```
+
+This installs the native server. Use the repository installer above for the
+Python CLI and ORM as well. To build the native server from this checkout:
 
 ```sh
 CARGO_BUILD_JOBS=2 cargo build --locked --release --manifest-path server/Cargo.toml

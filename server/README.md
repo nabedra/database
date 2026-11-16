@@ -81,7 +81,20 @@ establish AWS or Kubernetes behavior.
 
 ## Build and start
 
-Use Rust 1.94.1 or newer with Cargo. The crate uses edition 2024, pins direct
+Install the native server from crates.io with Rust 1.94.1 or newer and Cargo:
+
+```sh
+cargo install nabedra-database --version 0.1.0 --locked
+nabedra-database-server --version
+```
+
+The package is named `nabedra-database`; its executable remains
+`nabedra-database-server` and its Rust library remains `nabedra_database_server`.
+The default `s3` feature includes the AWS storage backend. The Python CLI and ORM
+are separate; use the [repository installer](../scripts/install_nabedra.py) for
+both the Python tools and native server.
+
+The crate uses edition 2024, pins direct
 dependency versions in [Cargo.toml](Cargo.toml), and records resolution in
 [Cargo.lock](Cargo.lock). Run these commands from the repository root:
 
