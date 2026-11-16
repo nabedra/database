@@ -1,0 +1,9 @@
+{
+  "features": [
+    "oltp",
+    "s3"
+  ],
+  "version": "nabedra-db 0.1.1 oltp",
+  "binary_sha256": "f09b26b40fc7c98448bccee1a6f3b2ad71db79a2678b923ac465e051385f9e51",
+  "backup_implemented": false
+}

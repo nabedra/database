@@ -33,6 +33,18 @@ Use deterministic barriers, a controllable timestamp allocator, a serial operati
 | O27 | Expand a volume/PVC, attach another, and exhaust host attachment or I/O headroom while injecting provisioning failures/lost replies | Growth is idempotent and advertised only after actual filesystem/pool readiness. On EKS, distinct-PVC additions use a controlled worker replacement while other queue holders and shard quorums survive. Host limits cause eligible placement on new workers; enforce cross-AZ replica capacity before writing. Failed/unauthorized growth does not lose accepted work or fabricate capacity, and no adapter remains A01. |
 | O28 | Grow a table's routing/index/backup metadata beyond one catalog/control-message limit while splitting, taking snapshots and restarting scans | Paged metadata covers every range exactly once at the pinned epoch with bounded caches and authenticated continuations. No fixed manifest-byte or shard-count table ceiling appears. Interrupt/retry pagination without missing or duplicate rows, lost snapshot pins or stale-route publication. Exercise count aggregation beyond previous decoder limits and checked arithmetic without loading the entire table or routing map. |
 
+## Additional recovery regressions
+
+| ID | Scenario | Required assertions |
+| --- | --- | --- |
+| O29 | A native write returns an ambiguous error after WAL persistence but before the corresponding live decision is visible; retry through the same and another pool handle | Absence from the live view cannot authorize recomputation, a regenerated table UUID, another logical decision, or a successful strong read from uncertain state. Every alias of that physical pool shares its recovery-required state. An already authoritative exact decision remains reconcilable. Reopen through storage recovery before resuming execution; replay committed state, never a pending application request. Unrelated healthy pools remain usable. Label deterministic fault-model evidence separately from actual native fsync/power-loss injection. |
+
+O22/C07 writer-wait regression: hold only the engine's asynchronous writer ownership, submit two real mutations, and wait until both are blocked on that ownership. Neither may own a scheduler CPU grant or a native execution slot needed by an unrelated read. Complete an exact read and authorized receipt before releasing the writer, then assert both mutations apply once and all temporary charges settle.
+
+O05/F03 native-cancellation regression: pause a native operation after dispatch, abort the awaiting future, and assert its CPU/memory and native execution ownership remain charged while native work is still live. Release and join it, verify the exact durable result or explicit uncertainty, and assert every charge returns to baseline once.
+
+O11/O16 snapshot-activation regression: corrupt the incoming header's applied position or membership relative to its staged body, and attempt stale activation during a state transition. Reject before changing the active generation. Existing rows, unrelated group keys and the prior snapshot remain intact. Check under the same ownership boundary that commits activation.
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |

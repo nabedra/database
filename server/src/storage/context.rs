@@ -85,7 +85,7 @@ impl RequestContext {
             return Err(StorageError::LimitExceeded);
         }
         let bytes = decode_base64url(header)?;
-        crate::cluster::configuration::input(&bytes, MAX_CONTEXT_BYTES)
+        crate::protocol::json_input(&bytes, MAX_CONTEXT_BYTES)
             .map_err(|_| StorageError::Configuration)?;
         let value: Self =
             serde_json::from_slice(&bytes).map_err(|_| StorageError::Configuration)?;
@@ -131,6 +131,7 @@ impl RequestContext {
     pub fn namespace(&self) -> Result<Namespace, StorageError> {
         Namespace::new(&self.prefix)
     }
+    #[cfg(any(all(feature = "olap", feature = "s3"), test))]
     pub(crate) fn credentials(&self) -> &AwsCredentials {
         &self.credentials
     }

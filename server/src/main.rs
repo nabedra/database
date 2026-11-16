@@ -1,8 +1,8 @@
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use nabedra_database_server::cli::{Cli, Command};
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use nabedra_database_server::{
     config::Config,
     engine::Engine,
@@ -11,18 +11,21 @@ use nabedra_database_server::{
     storage::{S3Store, Storage},
     worker_pool::WorkerPool,
 };
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use std::net::SocketAddr;
 use std::{io, process::ExitCode};
 use tracing_subscriber::{filter::Targets, prelude::*};
 
 fn main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    #[cfg(feature = "oltp")]
+    let runtime = nabedra_database_server::oltp_runtime::standalone_network_runtime();
+    #[cfg(feature = "olap")]
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(4)
         .enable_all()
-        .build()
-    {
+        .build();
+    let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(_) => {
             eprintln!("nabedra-db: network runtime initialization failed");
@@ -51,9 +54,11 @@ async fn run_cli() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let result = match command {
+        #[cfg(feature = "olap")]
         Command::Doctor { config, json } => {
             nabedra_database_server::maintenance::doctor(&config, json).await
         }
+        #[cfg(feature = "olap")]
         Command::Database {
             command:
                 nabedra_database_server::cli::DatabaseCommand::Migrate {
@@ -71,7 +76,18 @@ async fn run_cli() -> ExitCode {
             )
             .await
         }
+        #[cfg(feature = "olap")]
         Command::Serve(options) => run(options).await,
+        #[cfg(feature = "oltp")]
+        Command::Serve(options) => nabedra_database_server::oltp_runtime::run(options).await,
+        #[cfg(feature = "oltp")]
+        Command::Doctor { .. }
+        | Command::Database { .. }
+        | Command::Api { .. }
+        | Command::Worker { .. } => {
+            Err("unsupported configuration: OLTP currently supports standalone serve only")
+        }
+        #[cfg(feature = "olap")]
         Command::Api {
             config,
             cold_start,
@@ -84,6 +100,7 @@ async fn run_cli() -> ExitCode {
             )
             .await
         }
+        #[cfg(feature = "olap")]
         Command::Worker { bootstrap } => {
             nabedra_database_server::node::runtime::run_worker(bootstrap).await
         }
@@ -107,7 +124,7 @@ async fn run_cli() -> ExitCode {
     }
 }
 
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = Config::from_env(options).map_err(|_| "configuration invalid")?;
     // Select the provider explicitly even if dependencies also enable ring.
@@ -200,7 +217,7 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
     result.and(shutdown)
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(all(feature = "olap", not(feature = "s3")))]
 async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = nabedra_database_server::config::Config::from_env(options)
         .map_err(|_| "configuration invalid")?;

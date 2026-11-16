@@ -1,0 +1,61 @@
+{
+  "command": "python3.11 scripts/check_engine_features.py",
+  "environment": {
+    "CARGO_TARGET_DIR": "/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "TOKIO_WORKER_THREADS": "2",
+    "RUST_TEST_THREADS": "1"
+  },
+  "exit_code": 0,
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+  "script_sha256": "d28096ebde8f32cfc4d2917cc6e614fdaf2ce6284735480496029bba43b6b6d6",
+  "cases": [
+    {
+      "selection": "default",
+      "targets": 39,
+      "passed": 759,
+      "failed": 0,
+      "ignored": 1,
+      "tests_passed": true,
+      "version_passed": true
+    },
+    {
+      "selection": "olap",
+      "targets": 39,
+      "passed": 757,
+      "failed": 0,
+      "ignored": 0,
+      "tests_passed": true,
+      "version_passed": true
+    },
+    {
+      "selection": "oltp",
+      "targets": 7,
+      "passed": 97,
+      "failed": 0,
+      "ignored": 1,
+      "tests_passed": true,
+      "version_passed": true
+    },
+    {
+      "selection": "oltp-s3",
+      "targets": 7,
+      "passed": 97,
+      "failed": 0,
+      "ignored": 1,
+      "tests_passed": true,
+      "version_passed": true
+    }
+  ],
+  "invalid_guards": {
+    "neither": true,
+    "both": true
+  },
+  "log_sha256": "faf2e47d566ab51fab4a1601a2c9c7849722b112fab09dd7d713612b59084fba",
+  "source_tree_sha256_at_end": "f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff",
+  "matches_quiet_capture_source_tree": true
+}

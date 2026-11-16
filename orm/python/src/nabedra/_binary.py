@@ -24,7 +24,7 @@ def binary_version(path):
                                     stdout=output, stderr=subprocess.DEVNULL, timeout=5)
             output.seek(0)
             data = output.read(257)
-        match = re.fullmatch(rb'nabedra-db (0\.1\.\d+)\s*', data)
+        match = re.fullmatch(rb'nabedra-db (0\.1\.\d+)(?: (?:olap|oltp))?\s*', data)
         if result.returncode == 0 and match:
             return match[1].decode('ascii')
     except (OSError, ValueError, subprocess.TimeoutExpired):

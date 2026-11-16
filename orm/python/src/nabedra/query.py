@@ -119,9 +119,9 @@ class Query:
     def count(self) -> int:
         """Count a fresh snapshot after applying the explicit query limit."""
         def count_result(data: object) -> int:
-            if (type(data) is not int or not 0 <= data <= 100_000
+            if (type(data) is not int or data < 0
                     or (self._limit is not None and data > self._limit)):
-                raise ProtocolError('Count must be a nonnegative integer within table and query limits')
+                raise ProtocolError('Count must be a nonnegative integer within the query limit')
             return data
 
         return self._table._transport.request(

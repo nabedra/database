@@ -1,0 +1,2 @@
+Command: /opt/local/bin/python3.12 server/tests/oltp_process.py --binary /tmp/nabedra-oltp-rf1-546a02fed39b10e0 --evidence-dir docs/testing/evidence/oltp
+{"result": "passed", "engine": "oltp", "topology": "standalone_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": true, "elapsed_seconds": 4.223}

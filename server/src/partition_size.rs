@@ -69,6 +69,18 @@ impl fmt::Display for PartitionSize {
     }
 }
 
+impl serde::Serialize for PartitionSize {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_string())
+    }
+}
+impl<'de> serde::Deserialize<'de> for PartitionSize {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(d)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MAX_PARTITION_BYTES, PartitionSize};
@@ -125,17 +137,5 @@ mod tests {
         ] {
             assert!(input.parse::<PartitionSize>().is_err(), "{input:?}");
         }
-    }
-}
-
-impl serde::Serialize for PartitionSize {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.to_string())
-    }
-}
-impl<'de> serde::Deserialize<'de> for PartitionSize {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = <String as serde::Deserialize>::deserialize(d)?;
-        value.parse().map_err(serde::de::Error::custom)
     }
 }

@@ -1,10 +1,13 @@
-//! Command parsing only. Bootstrap must pass serve options to Config::from_env.
+//! Command parsing only. Bootstrap validates options for the selected engine.
+#[cfg(feature = "olap")]
 use crate::config::ServeOptions;
+#[cfg(feature = "oltp")]
+use crate::oltp_runtime::ServeOptions;
 use clap::{Parser, Subcommand};
 
 /// Nabedra Database server command line.
 #[derive(Debug, Parser)]
-#[command(name = "nabedra-db", version, propagate_version = true)]
+#[command(name = "nabedra-db", version = engine_version(), propagate_version = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -56,4 +59,12 @@ pub enum DatabaseCommand {
         #[arg(long, required = true)]
         confirm_writers_stopped: bool,
     },
+}
+
+fn engine_version() -> &'static str {
+    if cfg!(feature = "oltp") {
+        concat!(env!("CARGO_PKG_VERSION"), " oltp")
+    } else {
+        concat!(env!("CARGO_PKG_VERSION"), " olap")
+    }
 }

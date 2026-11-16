@@ -1,0 +1,61 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+warning: method `binding_digests` is never used
+   --> src/request_queue.rs:130:19
+    |
+ 95 | impl RequestRecord {
+    | ------------------ method in this implementation
+...
+130 |     pub(crate) fn binding_digests(
+    |                   ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `reserve_coordinator_memory` is never used
+   --> src/scheduling.rs:261:25
+    |
+174 | impl ResourceScheduler {
+    | ---------------------- method in this implementation
+...
+261 |     pub(crate) async fn reserve_coordinator_memory(
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `check_task_memory` is never used
+   --> src/scheduling.rs:848:15
+    |
+848 | pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `task_memory_limit` is never used
+   --> src/scheduling.rs:855:15
+    |
+855 | pub(crate) fn task_memory_limit() -> Option<u64> {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: method `credentials` is never used
+   --> src/storage/context.rs:134:19
+    |
+ 82 | impl RequestContext {
+    | ------------------- method in this implementation
+...
+134 |     pub(crate) fn credentials(&self) -> &AwsCredentials {
+    |                   ^^^^^^^^^^^
+
+warning: `nabedra-database` (lib) generated 5 warnings
+    Finished `test` profile [unoptimized] target(s) in 14.76s
+     Running tests/oltp_storage.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_storage-42f9b5e6c0419ccd)
+
+running 8 tests
+test o11_process_crash_child ... ignored
+test o03_utf8_key_order_and_primary_range_boundaries ... ok
+test o02_foreign_nonempty_directory_manifest_and_resource_limits_are_rejected ... ok
+test o01_o03_o04_thirteen_operations_order_types_and_stale_handles ... ok
+test o07_o08_o10_atomic_conflicts_stable_replays_and_database_binding ... ok
+
+running 1 test
+test o11_process_kill_preserves_acknowledged_batch_and_exact_decision ... ok
+test o04_seeded_scan_and_top_k_match_serial_oracle ... ok
+O21 standalone growth: rows=110001, raw_text_bytes=84480768, insertion_ms=21798
+test o21_growth_past_old_row_and_byte_limits_is_streamed_and_survives_reopen ... ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 30.07s
+

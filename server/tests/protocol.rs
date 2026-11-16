@@ -514,3 +514,27 @@ fn wire_enums_require_strings() {
         assert!(serde_json::from_value::<ComparisonOp>(json!({name:null})).is_err());
     }
 }
+
+/// O01/O21: request limits and scalar counts do not inherit OLAP table caps.
+#[test]
+fn count_requests_and_results_have_no_legacy_table_ceiling() {
+    for n in [100_001_u64, 1 << 40, u64::MAX] {
+        let request = request(
+            "query.count",
+            json!({"table_id": ID, "query": query(Value::Null, json!(n))}),
+        )
+        .unwrap();
+        request.operation.validate_for_table(&table()).unwrap();
+        let Operation::Count(payload) = request.operation else {
+            panic!("count operation")
+        };
+        assert_eq!(payload.query.limit, Some(n));
+        let response = SuccessResponse {
+            request_id: uuid::Uuid::parse_str(ID).unwrap(),
+            data: n,
+        };
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let decoded: SuccessResponse<u64> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.data, n);
+    }
+}

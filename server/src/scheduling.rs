@@ -258,6 +258,7 @@ impl ResourceScheduler {
     }
     /// Coordinator metadata/encoding stages use working RAM, outside the
     /// per-partition task limit. Leave headroom for ingress and child progress.
+    #[cfg(any(feature = "olap", test))]
     pub(crate) async fn reserve_coordinator_memory(
         &self,
         request: u64,
@@ -316,6 +317,10 @@ impl ResourceScheduler {
         reservation.charged = vec![charge];
         Ok(reservation)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "admission checks these independent resource and placement bounds together"
+    )]
     async fn reserve_kind(
         &self,
         request: u64,
@@ -346,13 +351,11 @@ impl ResourceScheduler {
             // A bounded operator may retain earlier output while requesting its next
             // input. Waiting for more memory then permits cycles between operators.
             // Reject that growth, while a fresh request may still wait and age normally.
-            if !compute {
-                if let Some(node_id) = fixed_node {
-                    // An available buffer cannot form a retained-memory cycle.
-                    // Avoid scanning every queue/body owner on the common path.
-                    if state.check_available_memory(node_id, bytes).is_err() {
-                        state.check_buffered_growth(request, node_id, bytes)?;
-                    }
+            if !compute && let Some(node_id) = fixed_node {
+                // An available buffer cannot form a retained-memory cycle.
+                // Avoid scanning every queue/body owner on the common path.
+                if state.check_available_memory(node_id, bytes).is_err() {
+                    state.check_buffered_growth(request, node_id, bytes)?;
                 }
             }
             if buffered_growth {
@@ -845,6 +848,7 @@ pub(crate) fn with_task_limit<T>(bytes: u64, work: impl FnOnce() -> T) -> T {
     drop(reset);
     result
 }
+#[cfg(feature = "olap")]
 pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
     if TASK_LIMIT.with(|limit| limit.get().is_some_and(|limit| bytes > limit)) {
         Err(resource())
@@ -852,6 +856,7 @@ pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
         Ok(())
     }
 }
+#[cfg(feature = "olap")]
 pub(crate) fn task_memory_limit() -> Option<u64> {
     TASK_LIMIT.with(std::cell::Cell::get)
 }

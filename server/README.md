@@ -69,6 +69,60 @@ python3.11 scripts/install_nabedra.py --prefix .nabedra
 The [CLI and application gateway guide](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md) describes
 installed commands, configuration files and shared compute.
 
+## Choose a build engine
+
+This checkout has mutually exclusive `olap` and `oltp` Cargo features. The
+published 0.1.1 release predates this choice. Defaults remain `olap,s3`.
+Select exactly one engine when building without defaults:
+
+```sh
+cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap
+cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features oltp
+```
+
+OLTP uses RocksDB on an attached filesystem and does not need an S3 bucket or
+AWS credentials. Native compilation needs a C++ compiler, CMake and libclang.
+On Debian, install `build-essential cmake clang libclang-dev`; on macOS, install
+the Xcode command line tools and make libclang available to bindgen. The lockfile
+pins RocksDB's Rust binding to 0.25.0 and its native library to 11.8.1.
+`nabedra-db --version` identifies the compiled engine.
+
+The current OLTP topology is one standalone worker and one data directory.
+Distributed consensus, multi-worker transactions, automatic shard/volume growth,
+and S3 backup are still required by [the implementation plan](../plans/oltp-engine.md).
+Enabling `s3` with `oltp` only includes the optional transport dependencies; it
+does not implement a backup or enable the OLAP engine.
+
+```sh
+mkdir -p /path/to/attached-volume/nabedra
+export NABEDRA_TOKEN='<your-private-bearer-token>'
+server/target/debug/nabedra-db serve --data-dir /path/to/attached-volume/nabedra
+python3.11 scripts/install_nabedra.py --prefix .nabedra-oltp --engine oltp
+```
+
+The installer keeps OLAP's S3 default and omits AWS dependencies for OLTP unless
+`--with-s3` is explicit. `--without-s3` also works for OLAP. It verifies the built
+binary's engine before creating the installation prefix. Existing prefixes are
+refused so selecting another engine cannot silently replace an installation.
+
+Docker uses the same choices. The OLAP image retains its existing Python CLI
+entrypoint; the OLTP image invokes `nabedra-db` directly:
+
+```sh
+docker build --build-arg NABEDRA_ENGINE=oltp -t nabedra:oltp .
+docker run --rm -e NABEDRA_TOKEN -v /path/to/attached-volume:/data nabedra:oltp serve --data-dir /data --host 0.0.0.0
+```
+
+`NABEDRA_S3=auto` defaults to S3 for OLAP and no S3 for OLTP. Set it to `true`
+or `false` to override that dependency choice. Tag release images/artifacts with
+the engine so deployment changes remain explicit.
+
+Run `python3.11 scripts/check_engine_features.py` for O02's four dependency,
+build/test and binary-identity checks plus both invalid feature combinations.
+Use `--dependencies-only` when inspecting graphs; that option does not execute
+builds or establish runtime acceptance. Never use `--all-features` for this
+mutually exclusive engine matrix.
+
 ## More documentation
 
 - [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)

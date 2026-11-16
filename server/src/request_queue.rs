@@ -1,5 +1,6 @@
 //! Replicated request records live only in worker RAM. Transport owns authenticated
 //! installation and must replicate each returned record before exposing its state.
+#[cfg(feature = "olap")]
 pub(crate) mod admission;
 use crate::protocol::{self, ErrorCode, Outcome, ProtocolError};
 use crate::storage::context::{RequestContext, StorageKey};
@@ -91,6 +92,9 @@ pub struct RequestRecord {
     pub result_expired: bool,
     pub replicas: BTreeSet<Uuid>,
 }
+#[cfg(any(feature = "olap", test))]
+type BindingDigests = (Option<[u8; 32]>, Option<[u8; 32]>);
+
 impl RequestRecord {
     pub fn identity(&self) -> RequestKey {
         RequestKey {
@@ -126,9 +130,8 @@ impl RequestRecord {
             })
             .ok_or(QueueError::Overloaded)
     }
-    pub(crate) fn binding_digests(
-        &self,
-    ) -> Result<(Option<[u8; 32]>, Option<[u8; 32]>), QueueError> {
+    #[cfg(any(feature = "olap", test))]
+    pub(crate) fn binding_digests(&self) -> Result<BindingDigests, QueueError> {
         match &self.context {
             None => Ok((None, None)),
             Some(c) => {

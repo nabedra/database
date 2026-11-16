@@ -112,18 +112,22 @@ class ManagementTests(unittest.TestCase):
         binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 0.1.1")\n')
         binary.chmod(0o700)
         with patch('nabedra._binary.sys.prefix', str(self.root)), patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_server_binary(check=True), str(binary))
-            with contextlib.redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(cli.main(['--version', '--json']), 0)
-            versions = json.loads(output.getvalue())
-            self.assertEqual(versions['cli'], '0.1.0')
-            self.assertEqual(versions['binary'], '0.1.1')
+            for suffix in ('', ' olap', ' oltp'):
+                with self.subTest(engine=suffix):
+                    binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 0.1.1' + suffix + '")\n')
+                    self.assertEqual(resolve_server_binary(check=True), str(binary))
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(cli.main(['--version', '--json']), 0)
+                    versions = json.loads(output.getvalue())
+                    self.assertEqual(versions['cli'], '0.1.0')
+                    self.assertEqual(versions['binary'], '0.1.1')
             with patch.dict(os.environ, {'NABEDRA_SERVER_BINARY': 'absent'}):
                 with self.assertRaises(RuntimeError):
                     resolve_server_binary(check=True)
-            binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 9.0.0")\n')
-            with self.assertRaises(RuntimeError):
-                resolve_server_binary(check=True)
+            for invalid in ('nabedra-db 9.0.0', 'nabedra-db 0.1.1 hybrid'):
+                binary.write_text('#!' + sys.executable + '\nprint("' + invalid + '")\n')
+                with self.assertRaises(RuntimeError):
+                    resolve_server_binary(check=True)
 
 
 if __name__ == '__main__':

@@ -3,11 +3,11 @@ name = "nabedra-database"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.94.1"
-description = "S3-backed database with immutable Parquet snapshots, an HTTP API, and distributed workers"
+description = "Database with mutually exclusive Parquet OLAP and indexed OLTP server builds"
 license = "MIT"
 repository = "https://github.com/zPy52/nabedra-database"
 readme = "README.md"
-keywords = ["database", "s3", "parquet", "distributed", "storage"]
+keywords = ["database", "olap", "oltp", "distributed", "storage"]
 categories = ["database", "command-line-utilities"]
 publish = ["crates-io"]
 include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICENSE*"]
@@ -20,7 +20,9 @@ name = "nabedra-db"
 path = "src/main.rs"
 
 [features]
-default = ["s3"]
+default = ["olap", "s3"]
+olap = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
@@ -41,9 +43,12 @@ aws-config = { version = "=1.13.1", optional = true }
 aws-sdk-s3 = { version = "=1.158.0", optional = true }
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "io-util"] }
 
-arrow-array = "=60.1.0"
-arrow-schema = "=60.1.0"
-parquet = { version = "=60.1.0", default-features = false, features = ["arrow"] }
+arrow-array = { version = "=60.1.0", optional = true }
+arrow-schema = { version = "=60.1.0", optional = true }
+parquet = { version = "=60.1.0", optional = true, default-features = false, features = ["arrow"] }
+openraft = { version = "=0.10.0", optional = true, default-features = false, features = ["tokio-rt", "serde"] }
+tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["tls12", "aws_lc_rs"] }
+rocksdb = { version = "=0.25.0", optional = true, default-features = false, features = ["bindgen-runtime"] }
 bytes = "=1.12.1"
 
 # Cached HTTP transport; explicit TLS, no proxy or retry middleware.
@@ -61,3 +66,135 @@ libc = "=0.2.191"
 tokio = { version = "=1.54.1", features = ["test-util"] }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body = "=1.1.0"
+
+[[test]]
+name = "api"
+required-features = ["olap"]
+
+[[test]]
+name = "cli"
+required-features = ["olap"]
+
+[[test]]
+name = "commit"
+required-features = ["olap"]
+
+[[test]]
+name = "config"
+required-features = ["olap"]
+
+[[test]]
+name = "control_configuration"
+required-features = ["olap"]
+
+[[test]]
+name = "control_decision"
+required-features = ["olap"]
+
+[[test]]
+name = "control_member"
+required-features = ["olap"]
+
+[[test]]
+name = "control_state"
+required-features = ["olap"]
+
+[[test]]
+name = "control_store"
+required-features = ["olap"]
+
+[[test]]
+name = "decision"
+required-features = ["olap"]
+
+[[test]]
+name = "engine_catalog"
+required-features = ["olap"]
+
+[[test]]
+name = "engine_dispatch"
+required-features = ["olap"]
+
+[[test]]
+name = "engine_read"
+required-features = ["olap"]
+
+[[test]]
+name = "engine_write"
+required-features = ["olap"]
+
+[[test]]
+name = "fenced_requests"
+required-features = ["olap"]
+
+[[test]]
+name = "health"
+required-features = ["olap"]
+
+[[test]]
+name = "history"
+required-features = ["olap"]
+
+[[test]]
+name = "http_store"
+required-features = ["olap"]
+
+[[test]]
+name = "node_frame"
+required-features = ["olap"]
+
+[[test]]
+name = "node_job"
+required-features = ["olap"]
+
+[[test]]
+name = "node_prepared"
+required-features = ["olap"]
+
+[[test]]
+name = "node_rows"
+required-features = ["olap"]
+
+[[test]]
+name = "node_spool"
+required-features = ["olap"]
+
+[[test]]
+name = "publication"
+required-features = ["olap"]
+
+[[test]]
+name = "queue_catalog_events"
+required-features = ["olap"]
+
+[[test]]
+name = "queued_api"
+required-features = ["olap"]
+
+[[test]]
+name = "rename_compatibility"
+required-features = ["olap"]
+
+[[test]]
+name = "response"
+required-features = ["olap"]
+
+[[test]]
+name = "runtime"
+required-features = ["olap"]
+
+[[test]]
+name = "snapshot"
+required-features = ["olap"]
+
+[[test]]
+name = "startup"
+required-features = ["olap"]
+
+[[test]]
+name = "storage"
+required-features = ["olap"]
+
+[[example]]
+name = "resource_scheduler_benchmark"
+required-features = ["olap"]
