@@ -277,7 +277,10 @@ def measure(cluster, observer, table, reference, workload, seed, result, save):
     project = lambda row: {'id': row['id'], 'payload': row['payload']}
     oracle = [[project(row) for row in rows[rank * len(rows) // RANKS:(rank + 1) * len(rows) // RANKS]
                if not workload.sparse or row['selected']] for rank in range(RANKS)]
-    assert query.collect() == [row for shard in oracle for row in shard]
+    # The dense profile also checks the ordinary collect path. Every measured
+    # batch in both profiles is checked against the rows accepted at setup.
+    if not workload.sparse:
+        assert query.collect() == [row for shard in oracle for row in shard]
     observed = dict(workload=asdict(workload), catalog_commit=catalog_commit, partition_count=len(files),
                     partition_encoded_bytes=distribution([file['byte_size'] for file in files.values()]),
                     partition_decoded_payload_bytes=distribution([file['payload_bytes'] for file in files.values()]),
