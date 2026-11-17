@@ -33,6 +33,7 @@ pub struct SharedResourceConfig {
     pub query_reply_bytes: usize,
     pub control_reply_bytes: usize,
     pub reply_decode_bytes: usize,
+    pub data_apply_reply_bytes: usize,
     pub max_open_pools: usize,
     pub max_group_handles: usize,
     pub max_resident_groups: usize,
@@ -45,13 +46,15 @@ impl Default for SharedResourceConfig {
             background_threads: 2,
             cache_bytes: 16 << 20,
             write_buffer_bytes: 16 << 20,
-            control_bytes: 32 << 20,
+            // One32MiB fixed payload may coexist with its encoded frame.
+            control_bytes: 69 << 20,
             progress_bytes: 4 << 20,
             //32MiB encoding +32MiB native copy, plus bounded key/marker framing.
             apply_bytes_per_slot: 65 << 20,
             query_reply_bytes: 8 << 20,
             control_reply_bytes: 1 << 20,
             reply_decode_bytes: 1 << 20,
+            data_apply_reply_bytes: 1 << 20,
             max_open_pools: 8,
             max_group_handles: 128,
             max_resident_groups: 64,
@@ -69,6 +72,7 @@ pub struct WorkerSharedResources {
     pub(super) pool_slots: Arc<Semaphore>,
     pub(super) handle_slots: Arc<Semaphore>,
     resident_slots: Arc<Semaphore>,
+    replica_slots: Arc<Semaphore>,
     scheduler: ResourceScheduler,
     scheduler_node_id: u64,
     task_memory_limit_bytes: usize,
@@ -85,6 +89,7 @@ pub struct WorkerSharedResources {
     reply_query: Arc<ByteArena>,
     reply_control: Arc<ByteArena>,
     reply_decode: Arc<ByteArena>,
+    reply_apply: Arc<ByteArena>,
     queue_claim: Arc<AtomicBool>,
     _native_charge: MemoryCharge,
     leases: Mutex<LeaseState>,
@@ -121,6 +126,7 @@ impl WorkerSharedResources {
             || config.query_reply_bytes == 0
             || config.control_reply_bytes == 0
             || config.reply_decode_bytes == 0
+            || config.data_apply_reply_bytes == 0
             || config.progress_bytes == 0
             || config.progress_bytes >= config.control_bytes
             || config.control_bytes as u64 > limits.task_memory_limit_bytes
@@ -181,6 +187,7 @@ impl WorkerSharedResources {
         let reply_query = make_arena(config.query_reply_bytes)?;
         let reply_control = make_arena(config.control_reply_bytes)?;
         let reply_decode = make_arena(config.reply_decode_bytes)?;
+        let reply_apply = make_arena(config.data_apply_reply_bytes)?;
         let env = super::super::native_environment(config.background_threads)?;
         let owner = Arc::new(Self {
             cache: Cache::new_lru_cache(config.cache_bytes),
@@ -193,6 +200,7 @@ impl WorkerSharedResources {
             pool_slots: Arc::new(Semaphore::new(config.max_open_pools)),
             handle_slots: Arc::new(Semaphore::new(config.max_group_handles)),
             resident_slots: Arc::new(Semaphore::new(config.max_resident_groups)),
+            replica_slots: Arc::new(Semaphore::new(config.max_resident_groups)),
             scheduler,
             scheduler_node_id,
             task_memory_limit_bytes: limits.task_memory_limit_bytes as usize,
@@ -209,6 +217,7 @@ impl WorkerSharedResources {
             reply_query,
             reply_control,
             reply_decode,
+            reply_apply,
             queue_claim: Arc::new(AtomicBool::new(false)),
             _native_charge: native_charge,
             leases: Mutex::new(LeaseState {
@@ -227,6 +236,7 @@ impl WorkerSharedResources {
             &owner.reply_query,
             &owner.reply_control,
             &owner.reply_decode,
+            &owner.reply_apply,
         ] {
             let _ = arena.worker.set(weak.clone());
         }
@@ -303,6 +313,7 @@ impl WorkerSharedResources {
             &self.reply_query,
             &self.reply_control,
             &self.reply_decode,
+            &self.reply_apply,
         ]
         .iter()
         .map(|arena| arena.used.load(Ordering::Acquire))
@@ -318,6 +329,15 @@ impl WorkerSharedResources {
             .map_err(|_| capacity())
     }
 
+    /// Actual live Raft task owners are bounded separately from registered
+    /// endpoint groups. A relocation learner may share the logical group ID,
+    /// but it still consumes its own task capacity until joined shutdown.
+    pub fn reserve_replica_residency(&self) -> Result<OwnedSemaphorePermit, ProtocolError> {
+        self.replica_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| capacity())
+    }
     pub fn buffer_bytes_used(&self, class: ByteClass) -> usize {
         self.arena_for(class).used.load(Ordering::Acquire)
     }
@@ -354,7 +374,7 @@ impl WorkerSharedResources {
                     .charge_memory(self.scheduler_node_id, bytes as u64)?;
                 self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
                 ScratchBacking::Working {
-                    charge,
+                    charge: Mutex::new(charge),
                     counter: self.decode_bytes.clone(),
                 }
             }
@@ -363,6 +383,26 @@ impl WorkerSharedResources {
             backing,
             _owner: self.owner()?,
         })
+    }
+    /// Planning may retain bounded derived keys/maps beyond the decoded body.
+    /// Add only the missing working charge before those copies are allocated.
+    pub(crate) fn ensure_scratch_budget(
+        &self,
+        current: Arc<ScratchLease>,
+        required: usize,
+    ) -> Result<Arc<ScratchLease>, ProtocolError> {
+        if !Arc::ptr_eq(&current._owner, &self.owner()?) || required > self.task_memory_limit_bytes
+        {
+            return Err(capacity());
+        }
+        if current.bytes() >= required {
+            return Ok(current);
+        }
+        let extra = Arc::new(self.reserve_scratch(ByteClass::Data, required - current.bytes())?);
+        Ok(Arc::new(ScratchLease {
+            _owner: self.owner()?,
+            backing: ScratchBacking::Combined([current, extra]),
+        }))
     }
     pub fn working_decode_bytes(&self) -> usize {
         self.decode_bytes.load(Ordering::Acquire)
@@ -420,6 +460,15 @@ impl WorkerSharedResources {
     /// reserved ceiling retains decoded DTOs through responders and clones.
     /// Acquire it before native codec execution, and bound the lexical/DTO
     /// allocation estimate before deserializing.
+    pub(super) async fn data_apply_reply_budget(
+        &self,
+        bytes: usize,
+    ) -> Result<ByteReservation, ProtocolError> {
+        self.reply_apply.reserve_wait(bytes).await
+    }
+    pub fn data_apply_reply_bytes_used(&self) -> usize {
+        self.reply_apply.used.load(Ordering::Acquire)
+    }
     pub async fn reserve_reply_decode(&self, bytes: usize) -> Result<ScratchLease, ProtocolError> {
         Ok(ScratchLease {
             backing: ScratchBacking::Arena(self.reply_decode.reserve_wait(bytes).await?),
@@ -451,7 +500,7 @@ impl WorkerSharedResources {
                 self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
                 Ok(ScratchLease {
                     backing: ScratchBacking::Working {
-                        charge,
+                        charge: Mutex::new(charge),
                         counter: self.decode_bytes.clone(),
                     },
                     _owner: self.owner()?,
@@ -481,6 +530,7 @@ impl WorkerSharedResources {
                 &self.reply_query,
                 &self.reply_control,
                 &self.reply_decode,
+                &self.reply_apply,
             ]
             .iter()
             .map(|arena| arena._charge.bytes())
@@ -525,6 +575,7 @@ impl WorkerSharedResources {
             self.reply_query.close();
             self.reply_control.close();
             self.reply_decode.close();
+            self.reply_apply.close();
         }
         loop {
             let notified = self.settled.notified();
@@ -596,23 +647,43 @@ pub struct ScratchLease {
 }
 enum ScratchBacking {
     Arena(ByteReservation),
+    Combined([Arc<ScratchLease>; 2]),
     Working {
-        charge: MemoryCharge,
+        charge: Mutex<MemoryCharge>,
         counter: Arc<AtomicUsize>,
     },
 }
 impl ScratchLease {
+    /// Only a codec with a checked aggregate retained-heap bound may release
+    /// unused decode scratch. Every clone observes the same smaller charge.
+    pub(crate) fn shrink_unused(&self, bytes: usize) -> Result<(), ProtocolError> {
+        let ScratchBacking::Working { charge, counter } = &self.backing else {
+            return Err(capacity());
+        };
+        let mut charge = charge.lock().map_err(|_| capacity())?;
+        let old = charge.bytes() as usize;
+        charge.shrink_to(bytes as u64)?;
+        counter.fetch_sub(old - bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
     pub fn bytes(&self) -> usize {
         match &self.backing {
             ScratchBacking::Arena(charge) => charge.remaining,
-            ScratchBacking::Working { charge, .. } => charge.bytes() as usize,
+            ScratchBacking::Combined(owners) => owners.iter().map(|o| o.bytes()).sum(),
+            ScratchBacking::Working { charge, .. } => {
+                charge.lock().expect("scratch charge").bytes() as usize
+            }
         }
     }
 }
 impl Drop for ScratchLease {
     fn drop(&mut self) {
-        if let ScratchBacking::Working { charge, counter } = &self.backing {
-            counter.fetch_sub(charge.bytes() as usize, Ordering::AcqRel);
+        if let ScratchBacking::Working { charge, counter } = &mut self.backing {
+            counter.fetch_sub(
+                charge.get_mut().expect("scratch charge").bytes() as usize,
+                Ordering::AcqRel,
+            );
         }
     }
 }
@@ -938,6 +1009,33 @@ pub(super) struct ByteReservation {
     remaining: usize,
 }
 impl ByteReservation {
+    pub(super) fn allocate(&mut self, len: usize) -> Result<ChargedBuffer, ProtocolError> {
+        let charge = self.split(len)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len).map_err(|_| capacity())?;
+        data.resize(len, 0);
+        Ok(ChargedBuffer { data, charge })
+    }
+    pub(super) fn reclaim_buffer(&mut self, buffer: ChargedBuffer) -> Result<(), ProtocolError> {
+        let ChargedBuffer { data, mut charge } = buffer;
+        if !Arc::ptr_eq(&self.arena, &charge.arena) {
+            return Err(capacity());
+        }
+        drop(data);
+        self.remaining = self
+            .remaining
+            .checked_add(charge.remaining)
+            .ok_or_else(capacity)?;
+        charge.remaining = 0;
+        Ok(())
+    }
+    pub(super) fn reclaim_value(&mut self, value: ChargedBytes) -> Result<(), ProtocolError> {
+        let owned = Arc::try_unwrap(value.0).map_err(|_| capacity())?;
+        self.reclaim_buffer(ChargedBuffer {
+            data: owned.data,
+            charge: owned._charge,
+        })
+    }
     pub(super) fn rehome(&mut self, value: ChargedBytes) -> Result<ChargedBytes, ProtocolError> {
         if Arc::ptr_eq(&self.arena, &value.0._charge.arena) {
             Ok(value)

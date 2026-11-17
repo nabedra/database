@@ -13,6 +13,28 @@ use std::{
     mem::size_of,
     sync::{Arc, OnceLock},
 };
+/// Hash an already-owned bounded DTO without allocating a second encoded
+/// buffer. Call this from the owned native codec/apply job.
+pub(crate) fn serialized_digest(
+    value: &impl Serialize,
+) -> Result<crate::oltp_replication::types::Digest, ProtocolError> {
+    use sha2::{Digest as _, Sha256};
+    struct Writer(Sha256);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer(Sha256::new());
+    serde_json::to_writer(&mut writer, value).map_err(|_| invalid())?;
+    Ok(crate::oltp_replication::types::Digest::from_bytes(
+        writer.0.finalize().into(),
+    ))
+}
 
 /// Implementations count all uncharged retained heap, including Vec capacity
 /// and String capacity. Field attachment must retain the same whole-command
@@ -49,6 +71,18 @@ impl<D: OwnedPayload + fmt::Display> fmt::Display for OwnedCommand<D> {
     }
 }
 impl<D: OwnedPayload> OwnedCommand<D> {
+    /// A native builder reserves its complete working footprint before growing
+    /// this typed payload. Validate its retained heap and attach the same owner
+    /// before any field or command can leave that native job.
+    pub(crate) fn new_with_owner(
+        payload: D,
+        owner: Arc<ScratchLease>,
+    ) -> Result<Self, ProtocolError> {
+        let command = Self::unattached(payload);
+        let required = command.minimum_bytes()?;
+        command.attach(owner, required)?;
+        Ok(command)
+    }
     fn unattached(payload: D) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -64,6 +98,24 @@ impl<D: OwnedPayload> OwnedCommand<D> {
             .checked_add(size_of::<Inner<D>>())
             .and_then(|n| n.checked_add(64))
             .ok_or_else(capacity)
+    }
+    pub(crate) fn uncharged_heap_bytes(&self) -> Result<usize, ProtocolError> {
+        if self.is_attached() {
+            Ok(0)
+        } else {
+            self.minimum_bytes()
+        }
+    }
+    pub(crate) fn attach_from_codec(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
+        if self.is_attached() {
+            return Ok(());
+        }
+        let required = owner.bytes();
+        self.attach(owner, required)
+    }
+    pub(crate) fn decode_owner(&self) -> Result<Arc<ScratchLease>, ProtocolError> {
+        self.ensure_charged()?;
+        self.inner.owner.get().cloned().ok_or_else(capacity)
     }
     fn attach(
         &self,

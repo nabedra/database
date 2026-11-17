@@ -5,10 +5,10 @@ Implementation continues on `nabedra/oltp-engine-plan` in the existing design wo
 | P0 | Transaction, fencing and recovery argument | Integration | Written; production histories still need validation |
 | P1 | Independent OLAP/OLTP features, optional S3, unchanged ORM protocol | Packaging | Implemented and previously checked; final regression remains |
 | P2 | Shared durable pools, indexed primary storage, bounded native work | Storage | Implemented components; production MVCC path still being connected |
-| P3 | Streaming exact queries, secondary/composite/covering indexes, online publication | Storage | Primary standalone query path exists; production planner/index path unfinished |
-| P4 | Actual durable Control/TSO/Status and Data consensus over authenticated transport | Packaging and runtime | State machines and typed host exist; live service construction/integration unfinished |
-| P5 | Guarded Prepare/Seal/Decide/Resolve, snapshots, exact decisions, schema lifecycle | Storage and runtime | Native MVCC transitions exist; real Status proofs, lifecycle guards and coordinator unfinished |
-| P6 API | All 13 unchanged Python ORM operations through the common RF1/distributed runtime | Runtime | Standalone legacy path works; common production path unfinished |
+| P3 | Streaming exact queries, secondary/composite/covering indexes, online publication | Storage | All 13 primary paths passed the local HTTP/ORM program; secondary indexes and distributed query validation unfinished |
+| P4 | Actual durable Control/TSO/Status and Data consensus over authenticated transport | Packaging and runtime | Real handles and local hosted manager compile; distributed service forwarding/snapshot integration unfinished |
+| P5 | Guarded Prepare/Seal/Decide/Resolve, snapshots, exact decisions, schema lifecycle | Storage and runtime | Local real-Raft transaction path passed the ORM program; multi-shard/fault histories and full recovery remain unverified |
+| P6 API | All 13 unchanged Python ORM operations through the common RF1/distributed runtime | Runtime | Actual serve/WorkerRuntime passed all 13 at 1/100/1,000 rows, receipts/errors/auth/stale handles; OLAP parity and distributed topology unfinished |
 | P6 queue | All-ready RAM copies, takeover, original context, retirement, cold abandonment | Runtime | Process/component helpers exist; actual authority integration and retirement unfinished |
 | P7 | Verified mounted pools, safe splits/moves, learner catch-up, quorum-aware drain | Packaging | Unfinished |
 | P8 backup | Consistent backups, archives/PITR and empty-queue restore | Storage | Unfinished |

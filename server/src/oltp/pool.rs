@@ -18,8 +18,8 @@ use crate::{
     scheduling::MemoryCharge,
 };
 use rocksdb::{
-    BlockBasedOptions, DB, DBCompressionType, DBPinnableSlice, DBRecoveryMode, Options, Snapshot,
-    WriteBatch,
+    BlockBasedOptions, DB, DBCompressionType, DBPinnableSlice, DBRawIterator, DBRecoveryMode,
+    Options, Snapshot, WriteBatch,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -94,6 +94,20 @@ enum MutationLane {
     State,
     Log,
     LogMetadata,
+}
+#[derive(Clone, Copy)]
+enum ReplyLane {
+    Query,
+    Control,
+    DataApply,
+}
+impl From<ExecutionClass> for ReplyLane {
+    fn from(value: ExecutionClass) -> Self {
+        match value {
+            ExecutionClass::Query => Self::Query,
+            ExecutionClass::Control => Self::Control,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct GroupStore {
@@ -507,10 +521,18 @@ impl GroupStore {
         };
         let owner = order.clone().lock_owned().await;
         let group = self.clone();
-        let output = self
-            .resources()
-            .reply_budget(ExecutionClass::Control, budget.output_bytes)
-            .await?;
+        let output = match execution_class {
+            ExecutionClass::Query => {
+                self.resources()
+                    .data_apply_reply_budget(budget.output_bytes)
+                    .await?
+            }
+            ExecutionClass::Control => {
+                self.resources()
+                    .reply_budget(ExecutionClass::Control, budget.output_bytes)
+                    .await?
+            }
+        };
         let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output)?;
         prepared
@@ -606,7 +628,26 @@ impl GroupStore {
         self.read_namespace(
             false,
             self.execution_class(),
-            self.execution_class(),
+            self.execution_class().into(),
+            budget,
+            move |view| {
+                let result = work(view)?;
+                view.output.rehome(result)
+            },
+        )
+        .await
+    }
+    /// Bounded current application metadata such as durable participant seals
+    /// uses the protected execution lane and one native snapshot.
+    pub(crate) async fn read_metadata(
+        &self,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.read_namespace(
+            false,
+            ExecutionClass::Control,
+            ReplyLane::Control,
             budget,
             move |view| {
                 let result = work(view)?;
@@ -623,7 +664,7 @@ impl GroupStore {
         self.read_namespace(
             true,
             self.execution_class(),
-            self.execution_class(),
+            self.execution_class().into(),
             budget,
             move |view| {
                 let result = work(view)?;
@@ -636,14 +677,27 @@ impl GroupStore {
         &self,
         log: bool,
         execution_class: ExecutionClass,
-        reply_class: ExecutionClass,
+        reply_class: ReplyLane,
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupRead<'_>) -> Result<T, ProtocolError> + Send + 'static,
     ) -> Result<T, ProtocolError> {
-        let output = self
-            .resources()
-            .reply_budget(reply_class, budget.output_bytes)
-            .await?;
+        let output = match reply_class {
+            ReplyLane::Query => {
+                self.resources()
+                    .reply_budget(ExecutionClass::Query, budget.output_bytes)
+                    .await?
+            }
+            ReplyLane::Control => {
+                self.resources()
+                    .reply_budget(ExecutionClass::Control, budget.output_bytes)
+                    .await?
+            }
+            ReplyLane::DataApply => {
+                self.resources()
+                    .data_apply_reply_budget(budget.output_bytes)
+                    .await?
+            }
+        };
         let prepared = self.resources().prepare(execution_class).await?;
         let (scratch, _batch, output) = prepared.buffers(budget, output)?;
         let group = self.clone();
@@ -673,7 +727,7 @@ impl GroupStore {
         self.read_namespace(
             true,
             ExecutionClass::Control,
-            ExecutionClass::Control,
+            ReplyLane::Control,
             budget,
             move |view| {
                 let result = work(view)?;
@@ -692,7 +746,10 @@ impl GroupStore {
         self.read_namespace(
             true,
             self.execution_class(),
-            ExecutionClass::Control,
+            match self.execution_class() {
+                ExecutionClass::Query => ReplyLane::DataApply,
+                ExecutionClass::Control => ReplyLane::Control,
+            },
             budget,
             move |view| {
                 let result = work(view)?;
@@ -719,7 +776,35 @@ impl GroupStore {
         self.read_namespace(
             true,
             self.execution_class(),
-            ExecutionClass::Control,
+            ReplyLane::Control,
+            TransactionBudget {
+                output_bytes: 0,
+                ..budget
+            },
+            move |view| {
+                let result = work(view, owner)?;
+                result.ensure_charged()?;
+                Ok(result)
+            },
+        )
+        .await
+    }
+    pub(crate) async fn read_owned<D: crate::oltp_replication::owned::OwnedPayload>(
+        &self,
+        budget: TransactionBudget,
+        owner: Arc<ScratchLease>,
+        work: impl FnOnce(
+            &mut GroupRead<'_>,
+            Arc<ScratchLease>,
+        )
+            -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError>
+        + Send
+        + 'static,
+    ) -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError> {
+        self.read_namespace(
+            false,
+            self.execution_class(),
+            ReplyLane::Control,
             TransactionBudget {
                 output_bytes: 0,
                 ..budget
@@ -740,7 +825,7 @@ impl GroupStore {
         self.read_namespace(
             false,
             ExecutionClass::Control,
-            ExecutionClass::Control,
+            ReplyLane::Control,
             budget,
             move |view| {
                 let mut result = group.read_applied(view.snapshot, &mut view.scratch)?;
@@ -835,12 +920,36 @@ pub struct GroupRead<'a> {
     output: ByteReservation,
     key_buffer: KeyBuffer,
 }
+/// One record pinned by the native iterator at a bounded seek. The record
+/// cannot outlive the one consistent group snapshot used by its callback.
+pub struct ScopedRecord<'a> {
+    iterator: DBRawIterator<'a>,
+    scope_length: usize,
+}
+impl ScopedRecord<'_> {
+    pub fn key(&self) -> &[u8] {
+        &self.iterator.key().expect("validated scoped record")[self.scope_length..]
+    }
+    pub fn value(&self) -> &[u8] {
+        self.iterator.value().expect("validated scoped record")
+    }
+}
 #[derive(Default)]
 struct KeyBuffer {
     data: Vec<u8>,
     charges: Vec<ByteReservation>,
 }
 impl<'a> GroupRead<'a> {
+    pub fn with_scratch_buffer<T>(
+        &mut self,
+        length: usize,
+        work: impl FnOnce(&mut Self, &mut [u8]) -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let mut buffer = self.scratch.allocate(length)?;
+        let result = work(self, buffer.as_mut_slice());
+        self.scratch.reclaim_buffer(buffer)?;
+        result
+    }
     /// Inspect a pinned value without copying a full log entry to a reply.
     /// The borrow ends with this callback; retain only explicitly owned output.
     pub fn inspect<T>(
@@ -857,6 +966,35 @@ impl<'a> GroupRead<'a> {
         let snapshot = self.snapshot;
         let key = self.key(key)?;
         snapshot.get_pinned(key).map_err(storage_error)
+    }
+    /// Seek directly to the first logical record at or after `start` within
+    /// `prefix`. Versioned point reads need not scan newer versions or copy an
+    /// entire row to choose the version visible at their read timestamp.
+    pub fn first_from(
+        &mut self,
+        prefix: &[u8],
+        start: &[u8],
+    ) -> Result<Option<ScopedRecord<'a>>, ProtocolError> {
+        if !start.starts_with(prefix) || prefix.len() > MAX_KEY_BYTES {
+            return Err(failure(
+                ErrorCode::ValidationError,
+                "seek outside scoped prefix",
+            ));
+        }
+        let snapshot = self.snapshot;
+        let scope_length = self.prefix.len();
+        let mut iterator = snapshot.raw_iterator();
+        iterator.seek(self.key(start)?);
+        iterator.status().map_err(storage_error)?;
+        if iterator.key().is_none_or(|key| {
+            !key.starts_with(&self.prefix) || !key[scope_length..].starts_with(prefix)
+        }) {
+            return Ok(None);
+        }
+        Ok(Some(ScopedRecord {
+            iterator,
+            scope_length,
+        }))
     }
     /// Snapshot-only. Candidate writes are deliberately not consulted.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<ChargedBytes>, ProtocolError> {
@@ -884,7 +1022,12 @@ impl<'a> GroupRead<'a> {
             .ok_or_else(capacity)?;
         if length > self.key_buffer.data.capacity() {
             let grow = length
-                .max(self.key_buffer.data.capacity().saturating_mul(2))
+                .max(
+                    self.key_buffer
+                        .data
+                        .capacity()
+                        .saturating_add(self.key_buffer.data.capacity().min(64 << 10)),
+                )
                 .min(MAX_KEY_BYTES + self.prefix.len());
             let charge = self.scratch.split(
                 grow - self.key_buffer.data.capacity() + std::mem::size_of::<ByteReservation>(),
@@ -994,8 +1137,39 @@ impl<'a> GroupTransaction<'a> {
             _batch_charge: batch,
         }
     }
+    /// Temporary private encoding has one owner, is copied into the native
+    /// batch, then returns its scratch allowance for the next fixed write.
+    pub fn put_serialized(
+        &mut self,
+        key: &[u8],
+        value: &impl Serialize,
+    ) -> Result<(), ProtocolError> {
+        let encoded = self.read.scratch.encode_value(value)?;
+        let result = self.put(key, encoded.as_slice());
+        self.read.scratch.reclaim_value(encoded)?;
+        result
+    }
+    /// The borrowed temporary cannot escape the callback. Its allocation and
+    /// byte allowance are released before another page record is processed.
+    pub fn with_scratch_buffer<T>(
+        &mut self,
+        length: usize,
+        work: impl FnOnce(&mut Self, &mut [u8]) -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let mut buffer = self.read.scratch.allocate(length)?;
+        let result = work(self, buffer.as_mut_slice());
+        self.read.scratch.reclaim_buffer(buffer)?;
+        result
+    }
     pub fn get(&mut self, key: &[u8]) -> Result<Option<ChargedBytes>, ProtocolError> {
         self.read.get(key)
+    }
+    pub fn first_from(
+        &mut self,
+        prefix: &[u8],
+        start: &[u8],
+    ) -> Result<Option<ScopedRecord<'a>>, ProtocolError> {
+        self.read.first_from(prefix, start)
     }
     pub fn encode<T: Serialize>(&mut self, value: &T) -> Result<ChargedBytes, ProtocolError> {
         self.read.encode(value)

@@ -9,6 +9,7 @@ use crate::{
     protocol,
     request_queue::{
         QueueError, QueueLimits, RequestQueue, RequestRecord, RequestState, ValidatedRecord,
+        ValidatedResponse,
     },
     scheduling::MemoryCharge,
 };
@@ -130,7 +131,8 @@ impl AcceptedContext {
 
 /// The caller obtained this view through the Control authority lane. The owner
 /// identity is current enrollment, independent of permanent Raft replica IDs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueAuthority {
     pub ready: ReadyMembership,
     pub owner: WorkerIdentity,
@@ -257,10 +259,88 @@ pub struct InstallEnvironment {
     authority: QueueAuthority,
     members: Arc<BTreeMap<Uuid, WorkerIdentity>>,
 }
+// Includes the BTreeMap node and fixed metadata. The queue reserves this slot
+// from initial admission through eventual durable identity retirement.
+const PROOF_METADATA_BYTES: usize = 1024;
+#[derive(Clone)]
+struct TerminalMetadata {
+    version: u64,
+    request: RequestBinding,
+    response_hash: Digest,
+    pin: Option<(PinIdentity, StoragePin)>,
+}
+const _: () = assert!(std::mem::size_of::<TerminalMetadata>() + 128 <= PROOF_METADATA_BYTES);
+impl TerminalMetadata {
+    fn prepare(
+        record: &RequestRecord,
+        context: &AcceptedContext,
+        context_bytes: &[u8],
+        response: &[u8],
+    ) -> Result<Self, QueueError> {
+        Ok(Self {
+            version: record.version,
+            request: RequestBinding {
+                run_id: record.run_id,
+                request_id: record.request_id,
+                digest: Digest::parse(&record.digest).map_err(invalid)?,
+                accepted_context: hash(context_bytes),
+            },
+            response_hash: hash(response),
+            pin: context
+                .read
+                .as_ref()
+                .map(|read| (read.identity.clone(), read.storage_pin)),
+        })
+    }
+}
+/// A bounded immutable descriptor copied under the queue lock, then decoded and
+/// hashed on the owned native executor before the completion transition.
+pub struct TerminalInput {
+    version: u64,
+    request: RequestBinding,
+    context: Vec<u8>,
+}
+pub struct PreparedTerminal {
+    input: TerminalInput,
+    metadata: TerminalMetadata,
+    response: ValidatedResponse,
+    now_ms: u64,
+}
+impl PreparedTerminal {
+    pub fn prepare(
+        input: TerminalInput,
+        status: u16,
+        body: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<Self, QueueError> {
+        if !(200..600).contains(&status) || body.is_empty() || body.len() > protocol::MAX_BODY_BYTES
+        {
+            return Err(QueueError::Invalid);
+        }
+        let context: AcceptedContext = serde_json::from_slice(&input.context).map_err(invalid)?;
+        let metadata = TerminalMetadata {
+            version: input.version,
+            request: RequestBinding {
+                accepted_context: hash(&input.context),
+                ..input.request
+            },
+            response_hash: hash(&body),
+            pin: context.read.map(|read| (read.identity, read.storage_pin)),
+        };
+        let response = ValidatedResponse::prepare(input.request.request_id, status, body)?;
+        Ok(Self {
+            input,
+            metadata,
+            response,
+            now_ms,
+        })
+    }
+}
 pub struct PreparedInstall {
     authority: QueueAuthority,
     version: RecordVersion,
     record: ValidatedRecord,
+    terminal: Option<TerminalMetadata>,
 }
 impl PreparedInstall {
     /// Run under a native/task/scratch owner outside the queue lock.
@@ -304,10 +384,23 @@ impl PreparedInstall {
             },
         };
         context.validate(&environment.scope, &record)?;
+        let terminal = record
+            .state
+            .terminal()
+            .then(|| {
+                TerminalMetadata::prepare(
+                    &record,
+                    &context,
+                    context_bytes,
+                    record.response_body.as_deref().ok_or(QueueError::Invalid)?,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             authority: environment.authority,
             version,
             record: ValidatedRecord::prepare(record)?,
+            terminal,
         })
     }
 }
@@ -337,10 +430,12 @@ pub struct WorkerReplica {
     members: Arc<BTreeMap<Uuid, WorkerIdentity>>,
     queue: RequestQueue,
     barriers: BTreeMap<Uuid, CopyBarrier>,
+    terminal_metadata: BTreeMap<Uuid, TerminalMetadata>,
     change_cut: u64,
     changes: BTreeMap<Uuid, u64>,
     export: Option<transfer::JoinExport>,
     import: Option<transfer::JoinImport>,
+    bootstrap: Option<JoinTicket>,
     _memory: MemoryCharge,
     _membership_memory: MemoryCharge,
     _queue_owner: QueueLease,
@@ -356,6 +451,72 @@ impl WorkerReplica {
         limits: QueueLimits,
     ) -> Result<Self, QueueError> {
         Self::construct(shared, scope, local, authority, members, limits, None)
+    }
+    /// Initial/cold bootstrap owns a real empty physical RAM queue, but grants
+    /// no admission until Control's TSO-fenced ready transition is published.
+    pub(crate) fn new_empty_bootstrap(
+        shared: Arc<WorkerSharedResources>,
+        scope: QueueScope,
+        local: WorkerIdentity,
+        ticket: JoinTicket,
+        limits: QueueLimits,
+    ) -> Result<Self, QueueError> {
+        if ticket.ticket_id.is_nil()
+            || ticket.target != local
+            || ticket.source_ready.ready_count != 0
+            || ticket.source_ready.ready_root != ReadySetHasher::default().finish()
+        {
+            return Err(QueueError::Invalid);
+        }
+        let mut hash = ReadySetHasher::default();
+        hash.push(local).map_err(invalid)?;
+        let mut view = ticket.source_ready.view;
+        view.membership_revision = view
+            .membership_revision
+            .checked_add(1)
+            .ok_or(QueueError::Invalid)?;
+        let authority = QueueAuthority {
+            ready: ReadyMembership {
+                view,
+                ready_root: hash.finish(),
+                ready_count: 1,
+            },
+            owner: local,
+        };
+        let mut replica = Self::construct(shared, scope, local, authority, [local], limits, None)?;
+        replica.bootstrap = Some(ticket);
+        Ok(replica)
+    }
+    pub(crate) fn empty_bootstrap_statement(
+        &self,
+        ticket: JoinTicket,
+    ) -> Result<QueueCopyStatement, QueueError> {
+        if self.bootstrap != Some(ticket)
+            || self.queue.records().next().is_some()
+            || self.change_cut != 0
+        {
+            return Err(QueueError::Conflict);
+        }
+        Ok(QueueCopyStatement {
+            ticket,
+            source: self.local,
+            snapshot_id: Uuid::new_v4(),
+            snapshot_cut: 0,
+            final_cut: 0,
+            record_version_hash: hash(b"nabedra/ram-queue-cut/v1\0"),
+        })
+    }
+    pub(crate) fn activate_empty_bootstrap(
+        &mut self,
+        current: QueueAuthority,
+    ) -> Result<(), QueueError> {
+        let ticket = self.bootstrap.ok_or(QueueError::Conflict)?;
+        self.empty_bootstrap_statement(ticket)?;
+        if current != self.authority {
+            return Err(QueueError::Stale);
+        }
+        self.bootstrap = None;
+        Ok(())
     }
     /// A joining process starts unready. Only the revision-bound ticket grants
     /// snapshot import; it grants no admission, execution or ready membership.
@@ -433,12 +594,13 @@ impl WorkerReplica {
                     .ok_or(QueueError::Overloaded)? as u64,
             )
             .map_err(|_| QueueError::Overloaded)?;
-        let queue = RequestQueue::new(
+        let queue = RequestQueue::new_with_metadata_overhead(
             authority.ready.view.run_id,
             authority.ready.view.owner_term,
             authority.ready.view.membership_revision,
             limits,
             ordered.keys().copied().collect(),
+            PROOF_METADATA_BYTES,
         )?;
         let queue_owner = shared.claim_queue().map_err(|_| QueueError::Overloaded)?;
         Ok(Self {
@@ -449,10 +611,12 @@ impl WorkerReplica {
             members: Arc::new(ordered),
             queue,
             barriers: BTreeMap::new(),
+            terminal_metadata: BTreeMap::new(),
             change_cut: 0,
             changes: BTreeMap::new(),
             export: None,
             import: joining.map(transfer::JoinImport::new),
+            bootstrap: None,
             _memory: memory,
             _membership_memory: membership_memory,
             _queue_owner: queue_owner,
@@ -465,6 +629,85 @@ impl WorkerReplica {
     pub fn record(&self, id: Uuid) -> Option<&RequestRecord> {
         self.queue.record(id)
     }
+    pub(crate) fn observation(&self, id: Uuid) -> Result<RequestRecord, QueueError> {
+        let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
+        Ok(RequestRecord {
+            context: None,
+            run_id: record.run_id,
+            scheduler_term: record.scheduler_term,
+            membership_revision: record.membership_revision,
+            request_id: record.request_id,
+            digest: record.digest.clone(),
+            sequence: record.sequence,
+            version: record.version,
+            body: Vec::new(),
+            accepted: record.accepted,
+            state: record.state,
+            pinned_catalog: None,
+            response_status: record.response_status,
+            response_body: None,
+            completed_at_ms: record.completed_at_ms,
+            result_expired: record.result_expired,
+            replicas: Default::default(),
+        })
+    }
+    pub(crate) fn input(
+        &self,
+        id: Uuid,
+    ) -> Result<(ChargedBytes, ChargedBytes, RequestRecord), QueueError> {
+        let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
+        let body = self
+            .shared
+            .copy_bytes(&record.body)
+            .map_err(|_| QueueError::Overloaded)?;
+        let context = self
+            .shared
+            .copy_bytes(
+                record
+                    .pinned_catalog
+                    .as_deref()
+                    .ok_or(QueueError::Invalid)?,
+            )
+            .map_err(|_| QueueError::Overloaded)?;
+        Ok((body, context, self.observation(id)?))
+    }
+    pub(crate) fn response(
+        &self,
+        run: Uuid,
+        id: Uuid,
+        now: u64,
+    ) -> Result<(RequestRecord, Option<ChargedBytes>), QueueError> {
+        if run != self.queue.run_id() {
+            return Err(QueueError::Abandoned);
+        }
+        let record = self.retained_record(id, now)?;
+        let bytes = record
+            .response_body
+            .as_ref()
+            .map(|body| {
+                self.shared
+                    .copy_bytes(body)
+                    .map_err(|_| QueueError::Overloaded)
+            })
+            .transpose()?;
+        Ok((self.observation(id)?, bytes))
+    }
+    pub(crate) fn reconcile(
+        &mut self,
+        current: QueueAuthority,
+        id: Uuid,
+    ) -> Result<(), QueueError> {
+        self.mutating_owner(current)?;
+        if self
+            .queue
+            .record(id)
+            .is_some_and(|record| record.state.terminal())
+        {
+            return Ok(());
+        }
+        self.queue.transition(id, RequestState::Reconciling)?;
+        self.changed(id)
+    }
     pub fn pending(&self) -> usize {
         self.queue.pending()
     }
@@ -472,7 +715,9 @@ impl WorkerReplica {
         self.local
     }
     pub fn is_ready_member(&self) -> bool {
-        self.import.is_none() && self.members.get(&self.local.worker_id) == Some(&self.local)
+        self.bootstrap.is_none()
+            && self.import.is_none()
+            && self.members.get(&self.local.worker_id) == Some(&self.local)
     }
     pub fn scope(&self) -> &QueueScope {
         &self.scope
@@ -515,7 +760,10 @@ impl WorkerReplica {
     }
     fn mutating_owner(&self, current: QueueAuthority) -> Result<(), QueueError> {
         self.check_owner(current, self.local)?;
-        if self.export.as_ref().is_some_and(|e| e.final_cut.is_some()) || self.import.is_some() {
+        if self.bootstrap.is_some()
+            || self.export.as_ref().is_some_and(|e| e.final_cut.is_some())
+            || self.import.is_some()
+        {
             return Err(QueueError::Unavailable);
         }
         Ok(())
@@ -593,6 +841,9 @@ impl WorkerReplica {
         authenticated_sender: WorkerIdentity,
     ) -> Result<InstallEnvironment, QueueError> {
         self.check_owner(current, authenticated_sender)?;
+        if self.bootstrap.is_some() {
+            return Err(QueueError::Unavailable);
+        }
         if self.export.as_ref().is_some_and(|e| e.final_cut.is_some()) {
             return Err(QueueError::Unavailable);
         }
@@ -613,6 +864,10 @@ impl WorkerReplica {
             .record(incoming.request_id)
             .is_none_or(|old| old.version != incoming.version);
         self.queue.install_validated(prepared.record)?;
+        if let Some(metadata) = prepared.terminal {
+            self.terminal_metadata
+                .insert(prepared.version.request_id, metadata);
+        }
         if changed {
             self.changed(prepared.version.request_id)?;
         }
@@ -718,8 +973,68 @@ impl WorkerReplica {
         self.begin_barrier(id)
     }
 
-    /// Receipt races reuse this immutable terminal version and resume its copy
-    /// barrier. They never call the nonterminal completion transition twice.
+    pub fn terminal_input(&self, id: Uuid) -> Result<TerminalInput, QueueError> {
+        let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
+        Ok(TerminalInput {
+            version: record.version,
+            request: RequestBinding {
+                run_id: record.run_id,
+                request_id: id,
+                digest: Digest::parse(&record.digest).map_err(invalid)?,
+                accepted_context: Digest::from_bytes([0; 32]),
+            },
+            context: record
+                .pinned_catalog
+                .as_ref()
+                .ok_or(QueueError::Invalid)?
+                .clone(),
+        })
+    }
+    pub fn shared_resources(&self) -> Arc<WorkerSharedResources> {
+        self.shared.clone()
+    }
+
+    /// Receipt races reuse an immutable terminal version. Hashing and decoding
+    /// happened outside this mutex; settlement checks its exact captured input.
+    pub fn finish_prepared(
+        &mut self,
+        current: QueueAuthority,
+        prepared: PreparedTerminal,
+    ) -> Result<RecordFrame, QueueError> {
+        self.mutating_owner(current)?;
+        let id = prepared.input.request.request_id;
+        let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
+        if record.run_id != prepared.input.request.run_id
+            || record.digest != prepared.input.request.digest.to_string()
+            || record.pinned_catalog.as_ref() != Some(&prepared.input.context)
+        {
+            return Err(QueueError::Stale);
+        }
+        if record.state.terminal() {
+            let cache = self.terminal_metadata.get(&id).ok_or(QueueError::Invalid)?;
+            if cache.version != record.version
+                || cache.request != prepared.metadata.request
+                || cache.response_hash != prepared.metadata.response_hash
+                || record.response_status != Some(prepared.response.status())
+                || record.response_body.as_ref().map(Vec::len)
+                    != Some(prepared.response.body().len())
+            {
+                return Err(QueueError::Conflict);
+            }
+            return self.begin_barrier(id);
+        }
+        if record.version != prepared.input.version {
+            return Err(QueueError::Stale);
+        }
+        self.queue
+            .finish_retained_validated(id, prepared.response, prepared.now_ms)?;
+        let mut metadata = prepared.metadata;
+        metadata.version = self.queue.record(id).ok_or(QueueError::NotFound)?.version;
+        self.terminal_metadata.insert(id, metadata);
+        self.changed(id)?;
+        self.begin_barrier(id)
+    }
+    #[cfg(test)]
     pub fn finish(
         &mut self,
         current: QueueAuthority,
@@ -728,47 +1043,39 @@ impl WorkerReplica {
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RecordFrame, QueueError> {
-        self.mutating_owner(current)?;
-        if let Some(record) = self.queue.record(id)
-            && record.state.terminal()
-        {
-            if record.response_status != Some(status)
-                || record.response_body.as_ref() != Some(&body)
-            {
-                return Err(QueueError::Conflict);
-            }
-            return self.begin_barrier(id);
-        }
-        // Physical expiry waits for authenticated terminal-copy and TSO release
-        // evidence. Receipt retention still reports explicit expiry by wall time.
-        self.queue.finish_retained(id, status, body, now_ms)?;
-        self.changed(id)?;
-        self.begin_barrier(id)
+        let prepared = PreparedTerminal::prepare(self.terminal_input(id)?, status, body, now_ms)?;
+        self.finish_prepared(current, prepared)
     }
-
+    /// Protected proof reads perform fixed-size copies only. Terminal bytes
+    /// and the original storage pin stay retained until durable TSO release.
     pub fn terminal_statement(&self, id: Uuid) -> Result<TerminalCopyStatement, QueueError> {
         if !self.copies_complete(id) {
             return Err(QueueError::Unavailable);
         }
+        self.terminal_copy_statement(id)
+    }
+    /// Describes only this holder. The TSO leader verifies the complete current
+    /// ready inventory itself; followers need no lost owner's private ACK set.
+    pub fn terminal_copy_statement(&self, id: Uuid) -> Result<TerminalCopyStatement, QueueError> {
         let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
-        if !record.state.terminal() {
+        if !record.accepted || !record.state.terminal() {
             return Err(QueueError::Conflict);
         }
-        let bytes = record.pinned_catalog.as_ref().ok_or(QueueError::Invalid)?;
-        let context: AcceptedContext = serde_json::from_slice(bytes).map_err(invalid)?;
-        let read = context.read.ok_or(QueueError::Invalid)?;
+        let metadata = self.terminal_metadata.get(&id).ok_or(QueueError::Invalid)?;
+        if metadata.version != record.version
+            || metadata.request.request_id != id
+            || metadata.request.run_id != record.run_id
+        {
+            return Err(QueueError::Stale);
+        }
+        let (pin_identity, storage_pin) = metadata.pin.clone().ok_or(QueueError::Invalid)?;
         Ok(TerminalCopyStatement {
             ready: self.authority.ready,
-            request: RequestBinding {
-                run_id: record.run_id,
-                request_id: id,
-                digest: Digest::parse(&record.digest).map_err(invalid)?,
-                accepted_context: hash(bytes),
-            },
+            request: metadata.request,
             terminal_version: record.version,
-            response_hash: hash(record.response_body.as_ref().ok_or(QueueError::Invalid)?),
-            pin_identity: read.identity,
-            storage_pin: read.storage_pin,
+            response_hash: metadata.response_hash,
+            pin_identity,
+            storage_pin,
         })
     }
 
@@ -828,6 +1135,9 @@ impl WorkerReplica {
             .ok_or(QueueError::Overloaded)?;
         self.change_cut = cut;
         for record in self.queue.records() {
+            if let Some(metadata) = self.terminal_metadata.get_mut(&record.request_id) {
+                metadata.version = record.version;
+            }
             self.changes.insert(record.request_id, cut);
         }
         self._membership_memory = memory;

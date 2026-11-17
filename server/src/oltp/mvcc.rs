@@ -1,6 +1,9 @@
 //! Common fixed changes for Catalog and Data groups. This module does not
 //! evaluate application operations during recovery or resolve a transaction by
 //! guessing its status. The coordinator/status protocol supplies those proofs.
+pub(crate) mod catalog;
+pub(crate) mod planner;
+pub(crate) mod store;
 use super::{
     failure,
     pool::{ByteClass, ChargedBytes, ScratchLease, WorkerSharedResources},
@@ -49,6 +52,29 @@ impl PartialEq for CanonicalJson {
 impl Eq for CanonicalJson {}
 
 impl CanonicalJson {
+    /// Only the MVCC store calls this on values installed from validated
+    /// canonical fixed changes. The page builder precharges aggregate retained
+    /// bytes before copying. Parsing RawValue checks syntax without a row tree.
+    pub(crate) fn from_stored_json(
+        bytes: &[u8],
+        owner: Arc<ScratchLease>,
+    ) -> Result<Self, ProtocolError> {
+        if bytes
+            .len()
+            .checked_add(128)
+            .is_none_or(|n| n > owner.bytes())
+        {
+            return Err(invalid_json());
+        }
+        crate::protocol::json_input(bytes, MAX_FIXED_COMMAND_BYTES).map_err(|_| invalid_json())?;
+        let raw = serde_json::from_slice::<Box<RawValue>>(bytes).map_err(|_| invalid_json())?;
+        let cell = OnceLock::new();
+        let _ = cell.set(owner);
+        Ok(Self(Arc::new(JsonStorage::Unattached {
+            raw: Arc::from(raw),
+            owner: cell,
+        })))
+    }
     pub fn from_serializable<T: Serialize>(
         shared: &WorkerSharedResources,
         value: &T,

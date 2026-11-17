@@ -15,6 +15,7 @@ pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,
 };
+pub(crate) use transport::{ReplicaLease, ReplicaMetadata};
 
 pub const MAX_SECTIONS: usize = 3;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -196,6 +197,12 @@ impl Deref for ReceivedReply {
     }
 }
 impl ReceivedReply {
+    /// Metadata readers use the worker's independent bounded reply decoder,
+    /// never the query working budget or an arena holding their raw frames.
+    pub(crate) async fn reserve_reply_decode(mut self,shared:&Arc<crate::oltp::pool::WorkerSharedResources>,bytes:usize)->Result<Self,ProtocolError>{
+        if !Arc::ptr_eq(shared,&self.resources){return Err(malformed("reply decoder belongs to another worker"))}
+        self.scratch=Arc::new(shared.reserve_reply_decode(bytes).await?);Ok(self)
+    }
     pub fn reserve_decode(
         mut self,
         shared: &Arc<crate::oltp::pool::WorkerSharedResources>,

@@ -107,6 +107,7 @@ struct Residency {
     identity: GroupIdentity,
     _slot: OwnedSemaphorePermit,
     _bytes: MemoryCharge,
+    shared: Arc<WorkerSharedResources>,
 }
 /// Clone this into the Raft network factory and state machine BEFORE spawning
 /// their tasks. The last task owner retains the resident permit on cancellation.
@@ -120,12 +121,115 @@ impl ResidentLease {
 struct Binding {
     lease: ResidentLease,
     endpoints: Mutex<BTreeMap<Purpose, Arc<dyn Endpoint>>>,
+    replicas: Mutex<BTreeMap<u64, std::sync::Weak<ReplicaResidency>>>,
+}
+const REPLICA_METADATA_BYTES: usize = 8 << 20;
+struct ReplicaResidency {
+    group: ResidentLease,
+    node_id: u64,
+    _slot: OwnedSemaphorePermit,
+    _bytes: MemoryCharge,
+    metadata_used: std::sync::atomic::AtomicUsize,
+    ownership: std::sync::OnceLock<Arc<dyn Send + Sync>>,
+}
+/// One live Raft instance, keyed by permanent node ID inside its group. A
+/// colocated replacement learner consumes a second real slot and byte budget.
+#[derive(Clone)]
+pub(crate) struct ReplicaLease(Arc<ReplicaResidency>);
+impl ReplicaLease {
+    pub(crate) fn retain_owner(&self, owner: Arc<dyn Send + Sync>) -> Result<(), ProtocolError> {
+        self.0
+            .ownership
+            .set(owner)
+            .map_err(|_| malformed("replica ownership already bound"))
+    }
+    pub(crate) fn identity(&self) -> &GroupIdentity {
+        self.0.group.identity()
+    }
+    pub(crate) fn node_id(&self) -> u64 {
+        self.0.node_id
+    }
+    pub(crate) fn same_resources(&self, shared: &Arc<WorkerSharedResources>) -> bool {
+        Arc::ptr_eq(shared, &self.0.group.0.shared)
+    }
+    pub(crate) fn metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
+        use std::sync::atomic::Ordering;
+        let mut used = self.0.metadata_used.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(bytes)
+                .filter(|n| *n <= REPLICA_METADATA_BYTES / 2)
+                .ok_or_else(|| overloaded("replica snapshot metadata capacity exhausted"))?;
+            match self.0.metadata_used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(ReplicaMetadata {
+                        owner: self.clone(),
+                        bytes,
+                    });
+                }
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+pub(crate) struct ReplicaMetadata {
+    owner: ReplicaLease,
+    bytes: usize,
+}
+impl Drop for ReplicaMetadata {
+    fn drop(&mut self) {
+        self.owner
+            .0
+            .metadata_used
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 #[derive(Clone)]
 pub struct ResidentGroup(Arc<Binding>);
 impl ResidentGroup {
     pub fn lease(&self) -> ResidentLease {
         self.0.lease.clone()
+    }
+    pub(crate) fn activate_replica(
+        &self,
+        node_id: u64,
+        shared: &Arc<WorkerSharedResources>,
+    ) -> Result<ReplicaLease, ProtocolError> {
+        if node_id == 0 || !Arc::ptr_eq(shared, &self.0.lease.0.shared) {
+            return Err(malformed(
+                "invalid hosted replica node or physical worker resources",
+            ));
+        }
+        let mut replicas = self.0.replicas.lock().map_err(|_| unavailable())?;
+        replicas.retain(|_, replica| replica.strong_count() != 0);
+        if replicas
+            .get(&node_id)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some()
+        {
+            return Err(malformed("replica node is already live"));
+        }
+        let slot = shared
+            .reserve_replica_residency()
+            .map_err(|_| overloaded("worker active Raft replica capacity exhausted"))?;
+        let bytes = shared
+            .scheduler()
+            .charge_memory(shared.scheduler_node_id(), REPLICA_METADATA_BYTES as u64)?;
+        let replica = Arc::new(ReplicaResidency {
+            group: self.lease(),
+            node_id,
+            _slot: slot,
+            _bytes: bytes,
+            metadata_used: std::sync::atomic::AtomicUsize::new(0),
+            ownership: std::sync::OnceLock::new(),
+        });
+        replicas.insert(node_id, Arc::downgrade(&replica));
+        Ok(ReplicaLease(replica))
     }
     pub fn bind(&self, purpose: Purpose, endpoint: Arc<dyn Endpoint>) -> Result<(), ProtocolError> {
         traffic(self.lease().identity(), purpose)?;
@@ -175,8 +279,10 @@ impl EndpointRegistry {
                 identity,
                 _slot: slot,
                 _bytes: bytes,
+                shared: self.shared.clone(),
             })),
             endpoints: Mutex::new(BTreeMap::new()),
+            replicas: Mutex::new(BTreeMap::new()),
         });
         groups.insert(binding.lease.identity().group_id, binding.clone());
         Ok(ResidentGroup(binding))

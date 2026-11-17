@@ -230,6 +230,16 @@ pub struct AppliedPosition {
     pub node_id: u64,
     pub index: u64,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GroupFenceReceipt {
+    pub group: GroupIdentity,
+    pub transition_id: Uuid,
+    pub expected: Option<Authority>,
+    pub next: Authority,
+    pub applied_at: AppliedPosition,
+    pub command_digest: Digest,
+}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GroupIdentity {

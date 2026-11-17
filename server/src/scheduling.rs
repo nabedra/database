@@ -732,7 +732,8 @@ impl State {
                 .filter(|(id, node)| {
                     let fit = node.enabled
                         && (!pending.compute || node.threads < node.limits.max_threads)
-                        && (!(pending.node_allocation && !pending.compute)
+                        && (!pending.node_allocation
+                            || pending.compute
                             || node.io_allocations < node.io_limit)
                         && pending.fixed_node.is_none_or(|wanted| wanted == **id)
                         && (pending.headroom > 0

@@ -5,6 +5,7 @@ use super::{
     worker_endpoint::{AuthorityReader, QueuePeerClient},
 };
 use crate::{
+    oltp::pool::ExecutionClass,
     oltp_replication::{multiplex::EndpointFuture, types::WorkerIdentity},
     protocol::ProtocolError,
     request_queue::QueueError,
@@ -178,11 +179,38 @@ impl QueueCoordinator {
         now_ms: u64,
     ) -> Result<RecordVersion, ProtocolError> {
         let current = self.current().await?;
+        let (input, shared) = {
+            let replica = self
+                .replica
+                .lock()
+                .map_err(|_| QueueError::Unavailable.protocol())?;
+            (
+                replica.terminal_input(id).map_err(QueueError::protocol)?,
+                replica.shared_resources(),
+            )
+        };
+        let bytes = (body.len() + super::replica::MAX_CONTEXT_BYTES + 4096) as u64;
+        let prepared = shared.prepare(ExecutionClass::Query).await?;
+        let grant = shared
+            .scheduler()
+            .reserve_on(
+                u64::from_le_bytes(id.as_bytes()[..8].try_into().expect("UUID prefix")),
+                1,
+                shared.scheduler_node_id(),
+                bytes,
+            )
+            .await?;
+        let (terminal, grant) = prepared
+            .run_with_guard(grant, move || {
+                PreparedTerminal::prepare(input, status, body, now_ms).map_err(QueueError::protocol)
+            })
+            .await?;
         self.replica
             .lock()
             .map_err(|_| QueueError::Unavailable.protocol())?
-            .finish(current, id, status, body, now_ms)
+            .finish_prepared(current, terminal?)
             .map_err(QueueError::protocol)?;
+        drop(grant);
         self.ensure_copies(current, id).await
     }
 }

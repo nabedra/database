@@ -1,5 +1,6 @@
-//! Model of terminal-copy proof verification; no production release service.
-use super::{ReadySetHasher, hash, member_hash};
+//! Private terminal-copy verification. Only the current leader's own
+//! authenticated metadata reads can supply acknowledgements.
+use crate::oltp_replication::proof::{ReadySetHasher, hash, member_hash};
 use crate::oltp_replication::types::{
     Digest, Invalid, ReadyMembership, TerminalCopyStatement, WorkerIdentity,
 };
@@ -17,7 +18,11 @@ pub(crate) struct AuthenticatedAck {
 impl AuthenticatedAck {
     /// Called only after the transport verifies the TLS peer, its current
     /// enrollment, RPC purpose, statement digest and response nonce.
-    pub(super) fn from_transport(member: WorkerIdentity, statement: Digest, nonce: Uuid) -> Self {
+    pub(in crate::oltp_replication) fn from_transport(
+        member: WorkerIdentity,
+        statement: Digest,
+        nonce: Uuid,
+    ) -> Self {
         Self {
             member,
             statement,
@@ -82,7 +87,7 @@ impl TerminalVerifier {
         required: WorkerIdentity,
         ack: &AuthenticatedAck,
     ) -> Result<(), Invalid> {
-        if self.ready.count >= self.statement.ready.ready_count
+        if self.ready.count() >= self.statement.ready.ready_count
             || ack.member != required
             || ack.statement != self.statement_digest
             || ack.nonce.is_nil()
@@ -108,7 +113,7 @@ impl TerminalVerifier {
         current: ReadyMembership,
     ) -> Result<VerifiedTerminalCopies, Invalid> {
         if current != self.statement.ready
-            || self.ready.count != current.ready_count
+            || self.ready.count() != current.ready_count
             || self.ready.finish() != current.ready_root
         {
             return Err(Invalid(
@@ -120,7 +125,7 @@ impl TerminalVerifier {
                 statement: self.statement,
                 statement_digest: self.statement_digest,
                 acknowledgement_root: self.acknowledgement_root,
-                acknowledgement_count: self.ready.count,
+                acknowledgement_count: self.ready.count(),
             },
         })
     }

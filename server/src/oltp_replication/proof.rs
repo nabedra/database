@@ -1,12 +1,11 @@
 //! Ordered ready-set hashing for bounded worker membership pages.
-//! Terminal-proof verification remains a test model until the private typed
-//! authority leader service is integrated.
+//! The private authority component consumes the same ordered hash domain.
 use super::types::{Digest, Invalid, WorkerIdentity};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-fn hash(parts: &[&[u8]]) -> Digest {
+pub(super) fn hash(parts: &[&[u8]]) -> Digest {
     let mut digest = Sha256::new();
     for part in parts {
         digest.update(part);
@@ -61,7 +60,7 @@ impl ReadySetHasher {
         ])
     }
 }
-fn member_hash(domain: &[u8], prior: Digest, member: WorkerIdentity) -> Digest {
+pub(super) fn member_hash(domain: &[u8], prior: Digest, member: WorkerIdentity) -> Digest {
     hash(&[
         domain,
         prior.as_bytes(),
@@ -71,6 +70,3 @@ fn member_hash(domain: &[u8], prior: Digest, member: WorkerIdentity) -> Digest {
         &member.enrollment_revision.to_be_bytes(),
     ])
 }
-
-#[cfg(test)]
-mod terminal;

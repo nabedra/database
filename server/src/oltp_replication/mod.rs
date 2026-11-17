@@ -1,10 +1,16 @@
 //! Durable per-group consensus components. The standalone RF1 runtime does not
 //! silently adopt these stores or claim replicated durability.
+pub(crate) mod authority;
+pub mod entry;
+pub(crate) mod hosted;
+pub(crate) mod manager;
 mod log;
 pub mod multiplex;
 mod network;
 pub mod owned;
 mod proof;
+pub mod typed_log;
+pub(crate) mod typed_network;
 pub mod types;
 pub use log::LogStore;
 pub use network::{NetworkFactory, Server, TlsMaterial, validate_membership};

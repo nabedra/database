@@ -20,6 +20,22 @@ use uuid::Uuid;
 /// consensus through another strong Control lookup.
 pub trait AuthorityReader: Send + Sync + 'static {
     fn current<'a>(&'a self, scope: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority>;
+    /// One Control snapshot checks the exact current enrollment and TSO group
+    /// membership. Ordinary worker authorities cannot read proof metadata.
+    fn terminal_reader_view<'a>(
+        &'a self,
+        _scope: &'a QueueScope,
+        _remote: WorkerIdentity,
+        _timestamps_group_id: Uuid,
+    ) -> EndpointFuture<'a, QueueAuthority> {
+        Box::pin(async {
+            Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "terminal proof reader is not authorized",
+                Outcome::NotApplied,
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +55,12 @@ pub enum QueueRequest {
         view: AuthorityView,
         request_id: Uuid,
     },
+    TerminalState {
+        scope: QueueScope,
+        view: AuthorityView,
+        request_id: Uuid,
+        timestamps_group_id: Uuid,
+    },
     Result {
         scope: QueueScope,
         view: AuthorityView,
@@ -51,6 +73,7 @@ impl QueueRequest {
         match self {
             Self::Install { record } => &record.scope,
             Self::State { scope, .. }
+            | Self::TerminalState { scope, .. }
             | Self::Result { scope, .. }
             | Self::JoinPage { scope, .. } => scope,
         }
@@ -58,9 +81,10 @@ impl QueueRequest {
     fn view(&self) -> AuthorityView {
         match self {
             Self::Install { record } => record.ready.view,
-            Self::State { view, .. } | Self::Result { view, .. } | Self::JoinPage { view, .. } => {
-                *view
-            }
+            Self::State { view, .. }
+            | Self::TerminalState { view, .. }
+            | Self::Result { view, .. }
+            | Self::JoinPage { view, .. } => *view,
         }
     }
 }
@@ -89,12 +113,30 @@ pub enum QueueReply {
         nonce: Uuid,
     },
     State(QueueState),
+    TerminalState {
+        worker: WorkerIdentity,
+        statement: Box<TerminalCopyStatement>,
+        nonce: Uuid,
+    },
     Result {
         request_id: Uuid,
         version: u64,
         status: u16,
         response_bytes: u64,
     },
+}
+
+/// Constructed only by the authenticated client response path. Callers cannot
+/// deserialize an observation or supply a worker's unverified ACK payload.
+pub(crate) struct TerminalObservation {
+    worker: WorkerIdentity,
+    statement: TerminalCopyStatement,
+    nonce: Uuid,
+}
+impl TerminalObservation {
+    pub(crate) fn into_parts(self) -> (WorkerIdentity, TerminalCopyStatement, Uuid) {
+        (self.worker, self.statement, self.nonce)
+    }
 }
 
 pub struct QueueEndpoint {
@@ -217,6 +259,62 @@ impl QueuePeerClient {
             return Err(malformed("queue state identity differs"));
         }
         Ok(state.clone())
+    }
+    pub(crate) async fn terminal_state(
+        &self,
+        target: WorkerIdentity,
+        scope: QueueScope,
+        expected: &TerminalCopyStatement,
+        timestamps_group_id: Uuid,
+    ) -> Result<TerminalObservation, ProtocolError> {
+        expected
+            .validate()
+            .map_err(|_| malformed("invalid terminal proof statement"))?;
+        let header = self.shared.encode_in(
+            ByteClass::Progress,
+            &QueueRequest::TerminalState {
+                scope,
+                view: expected.ready.view,
+                request_id: expected.request.request_id,
+                timestamps_group_id,
+            },
+            super::replica::MAX_HEADER_BYTES,
+        )?;
+        let reply = self
+            .client
+            .request(
+                &self.group,
+                target.worker_id,
+                Purpose::QueueControl,
+                header,
+                [None, None, None],
+                4 * super::replica::MAX_HEADER_BYTES,
+            )
+            .await?;
+        if reply.remote_identity() != target
+            || reply.group() != &self.group
+            || reply.purpose() != Purpose::QueueControl
+            || reply.sections.iter().any(Option::is_some)
+        {
+            return Err(malformed("terminal metadata transport context differs"));
+        }
+        let decoded = reply.decode_header::<QueueReply>()?;
+        let QueueReply::TerminalState {
+            worker,
+            statement,
+            nonce,
+        } = &*decoded
+        else {
+            return Err(malformed("expected terminal metadata reply"));
+        };
+        if *worker != target || statement.as_ref() != expected || *nonce != reply.nonce() {
+            return Err(malformed("terminal metadata statement differs"));
+        }
+        Ok(TerminalObservation {
+            worker: *worker,
+            statement: statement.as_ref().clone(),
+            nonce: *nonce,
+        })
     }
     pub async fn install_join_page(
         &self,
@@ -396,13 +494,15 @@ impl QueueEndpoint {
         }
         let permitted = matches!(
             (&request, session.purpose()),
-            (QueueRequest::State { .. }, Purpose::QueueControl)
-                | (
-                    QueueRequest::Install { .. }
-                        | QueueRequest::Result { .. }
-                        | QueueRequest::JoinPage { .. },
-                    Purpose::QueueData
-                )
+            (
+                QueueRequest::State { .. } | QueueRequest::TerminalState { .. },
+                Purpose::QueueControl
+            ) | (
+                QueueRequest::Install { .. }
+                    | QueueRequest::Result { .. }
+                    | QueueRequest::JoinPage { .. },
+                Purpose::QueueData
+            )
         );
         if !permitted {
             return Err(malformed(
@@ -419,7 +519,20 @@ impl QueueEndpoint {
     ) -> Result<QueueAuthority, ProtocolError> {
         // No queue lock, scheduler CPU grant or payload permit from this module
         // is held while the independent Control authority lookup waits.
-        let current = self.authority.current(&self.scope).await?;
+        let current = if let QueueRequest::TerminalState {
+            timestamps_group_id,
+            ..
+        } = request
+        {
+            if timestamps_group_id.is_nil() {
+                return Err(malformed("missing timestamps group"));
+            }
+            self.authority
+                .terminal_reader_view(&self.scope, session.remote(), *timestamps_group_id)
+                .await?
+        } else {
+            self.authority.current(&self.scope).await?
+        };
         if request.view() != current.ready.view {
             return Err(QueueError::Stale.protocol());
         }
@@ -567,7 +680,9 @@ impl Endpoint for QueueEndpoint {
                     // is sized from their actual structure after reception.
                     (TrafficClass::QueueData, record.section_lengths, 0)
                 }
-                QueueRequest::State { .. } => (TrafficClass::QueueControl, [0; 3], 0),
+                QueueRequest::State { .. } | QueueRequest::TerminalState { .. } => {
+                    (TrafficClass::QueueControl, [0; 3], 0)
+                }
                 QueueRequest::Result { .. } => (TrafficClass::QueueData, [0; 3], 0),
                 QueueRequest::JoinPage { record: None, .. } => (TrafficClass::QueueData, [0; 3], 0),
             };
@@ -702,6 +817,32 @@ impl Endpoint for QueueEndpoint {
                         sections: [None, None, None],
                     })
                 }
+                QueueRequest::TerminalState { request_id, .. } => {
+                    if (0..3).any(|i| sections.section(i).is_some()) {
+                        return Err(malformed("terminal metadata RPC has unexpected payload"));
+                    }
+                    let statement = {
+                        let replica = self.replica.lock().map_err(|_| unavailable())?;
+                        if replica.authority() != current {
+                            return Err(QueueError::Stale.protocol());
+                        }
+                        replica
+                            .terminal_copy_statement(request_id)
+                            .map_err(QueueError::protocol)?
+                    };
+                    Ok(ChargedReply {
+                        header: self.shared.encode_in(
+                            ByteClass::Progress,
+                            &QueueReply::TerminalState {
+                                worker: session.local(),
+                                statement: Box::new(statement),
+                                nonce: session.nonce(),
+                            },
+                            super::replica::MAX_HEADER_BYTES,
+                        )?,
+                        sections: [None, None, None],
+                    })
+                }
                 QueueRequest::Result {
                     request_id,
                     version,
@@ -765,7 +906,7 @@ fn decode_capacity() -> ProtocolError {
 /// An allocation-free upper bound for recursive request RawValue copies.
 /// Object depth counts the predicate nodes whose raw subtree can remain live;
 /// ordinary wide rows stay shallow. Braces inside strings never change depth.
-fn request_raw_clone_bytes(bytes: &[u8]) -> Result<usize, ProtocolError> {
+pub(crate) fn request_raw_clone_bytes(bytes: &[u8]) -> Result<usize, ProtocolError> {
     let (mut depth, mut quoted, mut escaped, mut total) = (0usize, false, false, 0usize);
     for byte in bytes {
         if !quoted && *byte == b'{' {

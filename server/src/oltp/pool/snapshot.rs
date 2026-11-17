@@ -44,7 +44,7 @@ impl GroupStore {
             .resources()
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
-        let prepared = self.resources().prepare(self.execution_class()).await?;
+        let prepared = self.resources().prepare(ExecutionClass::Control).await?;
         let (mut scratch, _batch, _unused) = prepared.buffers(
             TransactionBudget {
                 output_bytes: 0,

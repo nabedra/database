@@ -1,5 +1,13 @@
 This ledger records execution for [the OLTP contract](oltp-contract.md) and [implementation plan](../../plans/oltp-engine.md). The implementation is experimental. A local assertion is not evidence of distributed or provider behavior.
 
+## Common runtime integration
+
+The actual `serve` entry point now uses WorkerRuntime with typed Control, timestamp, Status, Catalog and Data Raft groups, guarded MVCC and fixed Prepare/Decide/Resolve transactions. The unchanged [public ORM program](../../server/tests/oltp_orm_contract.py) passed all thirteen operations, exact result types, atomic conflicts, submit/receipt/replay, authentication/database scope, stale handles and 1/100/1,000-row variations against the local RF1 topology. The server exited through SIGTERM and its child was reaped. This is the new runtime, not fixture authority or the legacy Operation-Raft adapter.
+
+The exercised native binary SHA-256 was `8f764601784eb0e3e33c91c1f8deb7c5d688b7c3d46698b0137318330f1c0e99`. It ran `serve --data-dir <private directory> --database test --port <loopback port> --workers 4`, with its token supplied through the environment. The client ran `python3.12 server/tests/oltp_orm_contract.py --url <loopback URL> --database test --unauthorized-database other`, also using an environment token. The native thread budget was four, with one query thread, one control thread and two maintenance threads; this was one storage worker, not a four-worker cluster.
+
+After small integration refinements, the coordinated OLTP all-target compilation check passed in 54.15 seconds. The exercised binary predates those refinements, so compilation is the only newer assertion claimed here. Warnings remain for unfinished paths. This does not pass full O01: OLAP parity, distributed topology, retirement/pin release, failure recovery, indexes, placement/growth and the remaining acceptance scenarios are still listed in [the finite checklist](../../plans/oltp-implementation-status.md). No additional platform matrix, optimized build or performance capture was run for this checkpoint.
+
 ## Verified local checkpoint
 
 Worktree: `nabedra/oltp-engine-plan`, based on `0d02e105183e12626e18332bfd35a23ba3266530`. The quiet process run captured complete Cargo/Rust/ORM source SHA-256 `f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff`, including untracked implementation files. It verified unchanged source and driver hashes throughout execution. Its recorded Git commit `964ac69` contains the original plan; the implementation was still uncommitted when measured. Later source changes require their own checks.

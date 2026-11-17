@@ -1,15 +1,20 @@
 //! Standalone OLTP server and experimental worker-memory queue components.
 //! The installed server uses RF1; distributed production composition and
 //! provisioning are not enabled by the CLI.
+mod admission;
+mod bootstrap;
 pub mod coordinator;
 mod http;
+mod http_runtime;
 mod queue;
 pub mod replica;
+mod transaction;
 pub mod worker_endpoint;
+pub(crate) mod worker_runtime;
 
 use crate::{
     config::{ExecutionConfig, WorkerResources},
-    oltp::{OltpEngine, OltpResources},
+    oltp::OltpEngine,
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -83,7 +88,7 @@ fn invalid(message: &'static str) -> ProtocolError {
 
 impl ServeOptions {
     pub fn limits(&self) -> Result<(ExecutionConfig, WorkerResources), ProtocolError> {
-        if self.workers < 3
+        if self.workers < 4
             || self.workers > 256
             || !valid_database(&self.database)
             || self.tls_cert.is_some() != self.tls_key.is_some()
@@ -106,7 +111,7 @@ impl ServeOptions {
         };
         let capacity = resources
             .max_threads
-            .saturating_sub(2)
+            .saturating_sub(3)
             .checked_add(self.queue_size as u64)
             .filter(|n| *n <= 1_000_000)
             .ok_or_else(|| invalid("invalid queue capacity"))?;
@@ -117,9 +122,9 @@ impl ServeOptions {
                 ..Default::default()
             },
         };
-        if resources.max_threads < 3 {
+        if resources.max_threads < 4 {
             return Err(invalid(
-                "OLTP requires at least three threads including two storage maintenance threads",
+                "OLTP requires one query, one control and two storage maintenance threads",
             ));
         }
         resources
@@ -196,28 +201,20 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
     #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|_| "signal initialization failed")?;
-    let query_memory_bytes = resources
-        .task_memory_limit_bytes
-        .checked_sub((MAX_DECODED_REQUEST_BYTES + 2 * crate::protocol::MAX_BODY_BYTES) as u64)
-        .filter(|n| *n >= 1024)
-        .ok_or("task memory cannot fit OLTP decoding and response buffers")?;
-    let engine = OltpEngine::open(
+    let runtime = worker_runtime::WorkerRuntime::open(
         &options.data_dir,
-        OltpResources {
-            executor_threads: (resources.max_threads - 2) as usize,
-            background_threads: 2,
-            query_memory_bytes: query_memory_bytes as usize,
-            ..Default::default()
-        },
+        &options.database,
+        &token,
+        execution,
+        resources,
     )
-    .map_err(|_| "OLTP storage initialization failed")?;
-    engine
-        .bind_database(&options.database)
-        .map_err(|_| "OLTP database selector differs from attached storage")?;
-    let runtime = LocalRuntime::new(engine, execution, resources)
-        .map_err(|_| "OLTP admission initialization failed")?;
-    let app =
-        router(runtime.clone(), token, options.database).map_err(|_| "configuration invalid")?;
+    .await
+    .map_err(|error| {
+        eprintln!("nabedra-db: {}", error.message);
+        "OLTP typed runtime initialization failed"
+    })?;
+    let app = http::router_for(runtime.clone(), token, options.database)
+        .map_err(|_| "configuration invalid")?;
     let listener = tokio::net::TcpListener::bind((options.host, options.port))
         .await
         .map_err(|_| "listener failed")?;
@@ -233,6 +230,9 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
     let result = crate::network::serve_router(listener, app, tls, shutdown)
         .await
         .map_err(|_| "listener failed");
-    runtime.drain().await;
+    runtime
+        .drain()
+        .await
+        .map_err(|_| "OLTP typed runtime shutdown failed")?;
     result
 }

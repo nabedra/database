@@ -1,4 +1,4 @@
-use super::{LocalRuntime, invalid, valid_database};
+use super::{LocalRuntime, http_runtime::HttpRuntime, invalid, valid_database};
 use crate::{
     protocol::{self, ErrorCode, Outcome, ProtocolError},
     response::{self, EncodedResponse},
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 struct ApiState {
-    runtime: Arc<LocalRuntime>,
+    runtime: Arc<dyn HttpRuntime>,
     token: String,
     database: String,
 }
@@ -26,12 +26,20 @@ pub fn router(
     token: String,
     database: String,
 ) -> Result<Router, ProtocolError> {
+    super::require_standalone(&runtime.engine)?;
+    runtime.engine.bind_database(&database)?;
+    router_for(runtime, token, database)
+}
+pub(crate) fn router_for(
+    runtime: Arc<dyn HttpRuntime>,
+    token: String,
+    database: String,
+) -> Result<Router, ProtocolError> {
     if token.trim().is_empty() || !valid_database(&database) {
         return Err(invalid("invalid authentication configuration"));
     }
-    super::require_standalone(&runtime.engine)?;
-    runtime.engine.bind_database(&database)?;
-    let scheduler = runtime.scheduler.clone();
+    let scheduler = runtime.scheduler();
+    let scheduler_node = runtime.scheduler_node_id();
     let operation_capacity = Arc::new(tokio::sync::Semaphore::new(256));
     let submissions = Arc::new(tokio::sync::Semaphore::new(16));
     let receipts = Arc::new(tokio::sync::Semaphore::new(8));
@@ -67,7 +75,7 @@ pub fn router(
                     let bytes = <Body as hyper::body::Body>::size_hint(response.body())
                         .exact()
                         .unwrap_or(protocol::MAX_BODY_BYTES as u64);
-                    match scheduler.charge_memory(0, bytes) {
+                    match scheduler.charge_memory(scheduler_node, bytes) {
                         Ok(charge) => {
                             let (parts, body) = response.into_parts();
                             Response::from_parts(
@@ -176,16 +184,16 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
     if !content_type(request.headers()) {
         return failure(None, invalid("Content-Type must be application/json"));
     }
-    let admitted = match state.runtime.ingress.try_admit() {
+    let admitted = match state.runtime.ingress().try_admit() {
         Ok(value) => value,
         Err(error) => return failure(None, error),
     };
     let operation = admitted.spawn(move || async move {
         let staging = state
             .runtime
-            .scheduler
+            .scheduler()
             .charge_memory(
-                0,
+                state.runtime.scheduler_node_id(),
                 (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64,
             )
             .map_err(|_| {
@@ -202,7 +210,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         };
         let id = Some(parsed.request_id);
         drop(parsed);
-        let record = state.runtime.submit(bytes).await;
+        let record = state.runtime.clone().submit(bytes).await;
         drop(staging);
         Ok((state, id, record))
     });
@@ -293,33 +301,10 @@ async fn unsupported(State(state): State<Arc<ApiState>>, request: Request) -> Re
     )
 }
 async fn health(State(state): State<Arc<ApiState>>) -> Response {
-    if state.runtime.engine.requires_recovery() {
-        return failure(
-            None,
-            ProtocolError::new(
-                ErrorCode::StorageUnavailable,
-                "OLTP store requires authoritative reopen",
-                Outcome::Unknown,
-            ),
-        );
+    match state.runtime.health().await {
+        Ok(encoded) => complete(encoded),
+        Err(error) => failure(None, error),
     }
-    if !state.runtime.accepting() {
-        return failure(
-            None,
-            ProtocolError::new(
-                ErrorCode::StorageUnavailable,
-                "OLTP runtime is draining",
-                Outcome::NotApplied,
-            ),
-        );
-    }
-    let manifest = state.runtime.engine.manifest();
-    complete(EncodedResponse { status: 200, body: serde_json::to_vec(&serde_json::json!({
-        "status":"ready", "engine":manifest.engine.as_str(), "format_version":manifest.format_version, "topology":manifest.topology.as_str(), "replication_factor":1,
-        "run_id":state.runtime.run_id(), "cluster_id": manifest.cluster_id,
-        "native_thread_budget":state.runtime.engine.thread_budget(),
-        "network_stack_bytes":"provided by hosting runtime; excluded from native_thread_budget"
-    })).expect("fixed health JSON") })
 }
 fn failure(id: Option<Uuid>, error: ProtocolError) -> Response {
     complete(response::encode_error(id, error))

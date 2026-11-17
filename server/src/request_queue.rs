@@ -220,6 +220,7 @@ pub struct RequestQueue {
     membership_revision: u64,
     members: BTreeSet<Uuid>,
     limits: QueueLimits,
+    metadata_bytes_per_record: usize,
     next_sequence: u64,
     records: BTreeMap<RequestKey, RequestRecord>,
 }
@@ -233,6 +234,30 @@ impl ValidatedRecord {
     }
     pub fn record(&self) -> &RequestRecord {
         &self.0
+    }
+}
+
+/// An exact response validated under its caller's execution owner before the
+/// queue mutex is acquired. It cannot be constructed by a wire deserializer.
+pub struct ValidatedResponse {
+    request_id: Uuid,
+    status: u16,
+    body: Vec<u8>,
+}
+impl ValidatedResponse {
+    pub fn prepare(request_id: Uuid, status: u16, body: Vec<u8>) -> Result<Self, QueueError> {
+        validate_response(request_id, status, &body)?;
+        Ok(Self {
+            request_id,
+            status,
+            body,
+        })
+    }
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 }
 
@@ -296,6 +321,25 @@ impl RequestQueue {
         limits: QueueLimits,
         members: BTreeSet<Uuid>,
     ) -> Result<Self, QueueError> {
+        Self::new_with_metadata_overhead(
+            run_id,
+            scheduler_term,
+            membership_revision,
+            limits,
+            members,
+            0,
+        )
+    }
+    /// Additional fixed worker metadata shares the queue-byte ceiling. Existing
+    /// runtimes use zero; callers reserve each slot before installing a record.
+    pub(crate) fn new_with_metadata_overhead(
+        run_id: Uuid,
+        scheduler_term: u64,
+        membership_revision: u64,
+        limits: QueueLimits,
+        members: BTreeSet<Uuid>,
+        metadata_bytes_per_record: usize,
+    ) -> Result<Self, QueueError> {
         limits.validate()?;
         if run_id.is_nil()
             || scheduler_term == 0
@@ -310,6 +354,7 @@ impl RequestQueue {
             membership_revision,
             members,
             limits,
+            metadata_bytes_per_record,
             next_sequence: 1,
             records: BTreeMap::new(),
         })
@@ -354,7 +399,8 @@ impl RequestQueue {
     pub fn charged_bytes(&self) -> (usize, usize) {
         self.records.values().fold((0, 0), |(q, r), record| {
             (
-                q.saturating_add(record.queue_bytes().unwrap_or(usize::MAX)),
+                q.saturating_add(record.queue_bytes().unwrap_or(usize::MAX))
+                    .saturating_add(self.metadata_bytes_per_record),
                 r.saturating_add(record.result_bytes()),
             )
         })
@@ -502,7 +548,10 @@ impl RequestQueue {
     }
     fn check_capacity(&self, incoming: &RequestRecord) -> Result<(), QueueError> {
         let mut pending = usize::from(!incoming.state.terminal());
-        let mut bytes = incoming.queue_bytes()?;
+        let mut bytes = incoming
+            .queue_bytes()?
+            .checked_add(self.metadata_bytes_per_record)
+            .ok_or(QueueError::Overloaded)?;
         // Reserve all-ready acknowledgment metadata at initial installation, so
         // acceptance cannot fail solely because proof UUIDs grow afterward.
         bytes = bytes
@@ -530,6 +579,7 @@ impl RequestQueue {
                 .ok_or(QueueError::Overloaded)?;
             bytes = bytes
                 .checked_add(old.queue_bytes()?)
+                .and_then(|n| n.checked_add(self.metadata_bytes_per_record))
                 .and_then(|n| {
                     n.checked_add(
                         self.members
@@ -660,7 +710,7 @@ impl RequestQueue {
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
-        self.finish_inner(id.into(), status, body, now_ms, false)
+        self.finish_inner(id.into(), status, body, now_ms, false, false)
     }
     /// Distributed readers must keep their pinned input and terminal bytes until
     /// all required copies exist. Capacity failure leaves the original record
@@ -672,7 +722,19 @@ impl RequestQueue {
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
-        self.finish_inner(id.into(), status, body, now_ms, true)
+        self.finish_inner(id.into(), status, body, now_ms, true, false)
+    }
+    pub fn finish_retained_validated(
+        &mut self,
+        id: impl Into<RequestKey>,
+        response: ValidatedResponse,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
+        if id.request_id != response.request_id {
+            return Err(QueueError::Invalid);
+        }
+        self.finish_inner(id, response.status, response.body, now_ms, true, true)
     }
     fn finish_inner(
         &mut self,
@@ -681,6 +743,7 @@ impl RequestQueue {
         body: Vec<u8>,
         now_ms: u64,
         retain: bool,
+        prevalidated: bool,
     ) -> Result<RequestRecord, QueueError> {
         if !retain {
             self.expire(now_ms);
@@ -689,7 +752,9 @@ impl RequestQueue {
         if !record.accepted || record.state.terminal() || !(200..600).contains(&status) {
             return Err(QueueError::Conflict);
         }
-        validate_response(id.request_id, status, &body)?;
+        if !prevalidated {
+            validate_response(id.request_id, status, &body)?;
+        }
         record.state = if status == 200 {
             RequestState::Succeeded
         } else {
@@ -814,12 +879,13 @@ impl RequestQueue {
         {
             return Err(QueueError::Stale);
         }
-        let mut replacement = Self::new(
+        let mut replacement = Self::new_with_metadata_overhead(
             self.run_id,
             self.scheduler_term,
             self.membership_revision,
             self.limits,
             self.members.clone(),
+            self.metadata_bytes_per_record,
         )?;
         for record in snapshot.records {
             replacement.install(record)?;
@@ -887,7 +953,8 @@ impl RequestQueue {
                 .checked_add(
                     record
                         .queue_bytes()?
-                        .checked_sub(old_ack_bytes)
+                        .checked_add(self.metadata_bytes_per_record)
+                        .and_then(|n| n.checked_sub(old_ack_bytes))
                         .and_then(|n| n.checked_add(new_ack_bytes))
                         .ok_or(QueueError::Overloaded)?,
                 )

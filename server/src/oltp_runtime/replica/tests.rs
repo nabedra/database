@@ -230,6 +230,23 @@ fn q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy
         context.read.unwrap().storage_pin
     );
     assert_eq!(proof_statement.response_hash, hash(&response));
+    // Every copied holder can supply its own metadata without the old owner's
+    // private all-copy barrier. The TSO leader checks them independently.
+    for replica in &mut replicas {
+        assert!(!replica.copies_complete(id));
+        assert_eq!(
+            replica.terminal_copy_statement(id).unwrap(),
+            proof_statement
+        );
+        let actual = replica.terminal_metadata.get(&id).unwrap().version;
+        replica.terminal_metadata.get_mut(&id).unwrap().version = actual - 1;
+        assert!(matches!(
+            replica.terminal_copy_statement(id),
+            Err(QueueError::Stale)
+        ));
+        replica.terminal_metadata.get_mut(&id).unwrap().version = actual;
+    }
+
     assert!(matches!(
         owner.finish(
             fixture.authority,
@@ -581,4 +598,57 @@ fn q02_q06_retained_result_capacity_never_discards_running_body_or_snapshot_pin(
     assert!(record.response_body.is_none());
     assert!(!record.result_expired);
     assert_eq!(owner.pending(), 1);
+}
+
+#[test]
+fn m02_fixed_terminal_cache_slot_is_reserved_at_initial_admission_and_snapshot_replacement() {
+    let fixture = Fixture::new(1);
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let context_len = serde_json::to_vec(&context).unwrap().len();
+    let limits = QueueLimits {
+        max_pending_requests: 4,
+        max_queue_bytes_per_replica: 1024 + body.len() + context_len + 32 + PROOF_METADATA_BYTES
+            - 1,
+        max_retained_result_bytes_per_worker: 1 << 20,
+        result_retention_ms: 100,
+    };
+    let mut replica = WorkerReplica::new(
+        fixture.shared.clone(),
+        fixture.scope.clone(),
+        fixture.members[0],
+        fixture.authority,
+        fixture.members.clone(),
+        limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        replica.propose(fixture.authority, body.clone(), context.clone(), 1),
+        Err(QueueError::Overloaded)
+    ));
+    assert_eq!(replica.pending(), 0);
+    drop(replica);
+    let mut replica = WorkerReplica::new(
+        fixture.shared.clone(),
+        fixture.scope.clone(),
+        fixture.members[0],
+        fixture.authority,
+        fixture.members.clone(),
+        QueueLimits {
+            max_queue_bytes_per_replica: limits.max_queue_bytes_per_replica + 1,
+            ..limits
+        },
+    )
+    .unwrap();
+    replica
+        .propose(fixture.authority, body, context, 1)
+        .unwrap();
+    let bytes = replica.queue.charged_bytes();
+    assert!(bytes.0 >= PROOF_METADATA_BYTES + 1024);
+    replica
+        .queue
+        .install_snapshot(replica.queue.snapshot())
+        .unwrap();
+    assert_eq!(replica.queue.charged_bytes(), bytes);
 }
