@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 mod footer;
 mod partition;
+pub(crate) mod stream;
 
 // Remove the unused-import allowance when R02a2 wires the captured handler.
 #[allow(unused_imports)]
@@ -279,47 +280,7 @@ fn decode_inner(
     bytes: Bytes,
     expected_rows: Option<u64>,
 ) -> Result<Vec<Row>, ProtocolError> {
-    // Check raw schema declarations before either reader constructs schema
-    // types. A capped footer alone cannot bound num_children allocations.
-    crate::scheduling::check_task_memory((bytes.len() as u64).checked_mul(4).ok_or_else(limit)?)?;
-    footer::validate(check_envelope(&bytes)?, table.schema.len())?;
-    let file = SerializedFileReader::new(bytes.clone()).map_err(|_| stored())?;
-    let metadata = file.metadata();
-    let count = usize::try_from(metadata.file_metadata().num_rows()).map_err(|_| stored())?;
-    if count > MAX_TABLE_ROWS {
-        return Err(limit());
-    }
-    if expected_rows.is_some_and(|n| n != count as u64) {
-        return Err(stored());
-    }
-    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-    let encoded_len = bytes.len() as u64;
-    check_memory_shape(table, count, 0, bytes.len())?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)
-        .map_err(|_| stored())?;
-    if builder.schema().as_ref() != &schema(table) {
-        return Err(stored());
-    }
-    // Check physical schema independently of embedded Arrow metadata.
-    let descriptor = metadata.file_metadata().schema_descr();
-    if descriptor.num_columns() != table.schema.len() {
-        return Err(stored());
-    }
-    for (col, ty) in descriptor.columns().iter().zip(table.schema.values()) {
-        let physical = match ty {
-            ColumnType::Utf8 => Type::BYTE_ARRAY,
-            ColumnType::Int64 => Type::INT64,
-            ColumnType::Float64 => Type::DOUBLE,
-            ColumnType::Bool => Type::BOOLEAN,
-        };
-        if col.physical_type() != physical {
-            return Err(stored());
-        }
-        if col.max_def_level() != 0 || col.max_rep_level() != 0 {
-            return Err(stored());
-        }
-    }
-    preflight(&file, table, count, encoded_len)?;
+    let (builder, count, _) = validated_reader(table, bytes, expected_rows, true)?;
     let reader = builder.with_batch_size(1).build().map_err(|_| stored())?;
     let mut rows = Vec::new();
     rows.try_reserve_exact(count).map_err(|_| limit())?;
@@ -351,6 +312,61 @@ fn decode_inner(
     validate_rows(table, &rows).map_err(stored_validation)?;
     Ok(rows)
 }
+fn validated_reader(
+    table: &TableDescriptor,
+    bytes: Bytes,
+    expected_rows: Option<u64>,
+    materialize: bool,
+) -> Result<(ParquetRecordBatchReaderBuilder<Bytes>, usize, usize), ProtocolError> {
+    // Check raw schema declarations before either reader constructs schema
+    // types. A capped footer alone cannot bound num_children allocations.
+    crate::scheduling::check_task_memory((bytes.len() as u64).checked_mul(4).ok_or_else(limit)?)?;
+    footer::validate(check_envelope(&bytes)?, table.schema.len())?;
+    let file = SerializedFileReader::new(bytes.clone()).map_err(|_| stored())?;
+    let metadata = file.metadata();
+    let count = usize::try_from(metadata.file_metadata().num_rows()).map_err(|_| stored())?;
+    if count > MAX_TABLE_ROWS {
+        return Err(limit());
+    }
+    if expected_rows.is_some_and(|n| n != count as u64) {
+        return Err(stored());
+    }
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let encoded_len = bytes.len() as u64;
+    if materialize {
+        check_memory_shape(table, count, 0, bytes.len())?;
+    }
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)
+        .map_err(|_| stored())?;
+    if builder.schema().as_ref() != &schema(table) {
+        return Err(stored());
+    }
+    // Check physical schema independently of embedded Arrow metadata.
+    let descriptor = metadata.file_metadata().schema_descr();
+    if descriptor.num_columns() != table.schema.len() {
+        return Err(stored());
+    }
+    for (col, ty) in descriptor.columns().iter().zip(table.schema.values()) {
+        let physical = match ty {
+            ColumnType::Utf8 => Type::BYTE_ARRAY,
+            ColumnType::Int64 => Type::INT64,
+            ColumnType::Float64 => Type::DOUBLE,
+            ColumnType::Bool => Type::BOOLEAN,
+        };
+        if col.physical_type() != physical {
+            return Err(stored());
+        }
+        if col.max_def_level() != 0 || col.max_rep_level() != 0 {
+            return Err(stored());
+        }
+    }
+    let payload = preflight(&file, table, count, encoded_len)?;
+    if materialize {
+        check_memory_shape(table, count, payload, encoded_len as usize)?;
+    }
+    Ok((builder, count, payload))
+}
+
 fn scalar(arr: &ArrayRef, ty: ColumnType, i: usize) -> Result<Scalar, ProtocolError> {
     Ok(match ty {
         ColumnType::Utf8 => {
@@ -392,7 +408,7 @@ fn preflight(
     table: &TableDescriptor,
     count: usize,
     encoded_len: u64,
-) -> Result<(), ProtocolError> {
+) -> Result<usize, ProtocolError> {
     let mut total_rows = 0usize;
     let overhead: usize = 8 + table.schema.keys().map(|s| 8 + s.len()).sum::<usize>();
     let mut payload = count.checked_mul(overhead).ok_or_else(limit)?;
@@ -464,8 +480,7 @@ fn preflight(
     if total_rows != count {
         return Err(stored());
     }
-    check_memory_shape(table, count, payload, encoded_len as usize)?;
-    Ok(())
+    Ok(payload)
 }
 fn plain_payload(mut buf: &[u8], ty: ColumnType, n: usize) -> Result<usize, ProtocolError> {
     match ty {
