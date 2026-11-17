@@ -156,6 +156,35 @@ class PublicRequestGate:
         return True
 
 
+class RecoveryPageGate:
+    """Hold the first recovery page request that carries a saved cursor."""
+
+    def __init__(self, term, coordinator):
+        self.term, self.coordinator = term, coordinator
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.pages = []
+        self.cursor = None
+
+    def claim(self, command, trace, _request):
+        if (command['command'] != 'stream_page' or trace['term'] != self.term
+                or trace['sender'] != self.coordinator):
+            return None
+        page = trace['receiver'], command['payload']['after']
+        with self.lock:
+            self.pages.append(page)
+            if self.cursor is not None or page[1] is None:
+                return None
+            self.cursor = page
+            return self
+
+    def before(self):
+        self.entered.set()
+        self.release.wait(30)
+        return False
+
+
 class PublicFaultProxy(FrontDoor):
     """Drop or truncate one selected response after receiving it in full."""
 
@@ -312,6 +341,39 @@ def seed(cluster):
     status, value = cluster.operation('table.insert_many', {'table_id': table, 'rows': data})
     assert status == 200 and value['data'] == len(data), value
     return table, data
+
+
+def join_with_legacy_peer(cluster, legacy_binary, evidence):
+    coordinator = cluster.start_worker(10, 1)
+    table, rows = seed(cluster)
+    original = cluster.control()['scheduler']
+    run = cluster.catalog_fence()['run_id']
+    assert original['coordinator_node'] == coordinator
+
+    modern = cluster.binary
+    try:
+        cluster.binary = legacy_binary
+        older = cluster.start_worker(20, 1)
+    finally:
+        cluster.binary = modern
+    joining = cluster.start_worker(30, 1)
+    control = cluster.control()
+    ready = {node['node_id'] for node in control['nodes'] if node['state'] == 'ready'}
+    assert ready == {coordinator, older, joining}, control
+    assert control['scheduler']['coordinator_node'] == coordinator, control
+    status, result = cluster.operation('table.get', {'table_id': table, 'key': 9})
+    assert status == 200 and result['data'] == rows[9], result
+    evidence.append('ST04/R03: a modern coordinator enrolled a new worker while a legacy peer stayed ready on the live run and ordinary reads continued')
+
+    body = cluster.open_body(table, run=run)
+    cluster.fetch('POST', OPEN, body).error(503, 'storage_unavailable')
+    cluster.stop_worker(older)
+    assert cluster.start_worker(uuid.UUID(older).int, 1) == older
+    assert cluster.ready_run()['run_id'] == run
+    opened = cluster.open(body)
+    assert cluster.batch(opened, 0).json()['rows'] == rows[:3]
+    cluster.fetch('DELETE', batch_path(opened)).empty()
+    evidence.append('ST04/R03: mixed workers declined new streams, and replacing the legacy worker enabled an exact batch on the same run')
 
 
 def lease_lifecycle(cluster, table, rows, extra, evidence):
@@ -573,6 +635,36 @@ def stale_owner(cluster, table, rows, extra, evidence):
     evidence.append('ST04/R05: resumed former owner could not deliver after a higher-term survivor replayed its fully installed checkpoint')
 
 
+def recovery_deadline(cluster, table, rows, extra, evidence):
+    opened = cluster.open(cluster.open_body(table))
+    first = cluster.batch(opened, 0)
+    assert first.json()['rows'] == rows[:3]
+    former = cluster.control()['scheduler']
+    process, _, _ = cluster.workers[former['coordinator_node']]
+    process.kill()
+    assert process.wait(8) == -signal.SIGKILL
+    current = cluster.takeover(former['coordinator_node'], former['scheduler_term'], opened['run_id'])
+    gate = RecoveryPageGate(current['scheduler_term'], current['coordinator_node'])
+
+    with ThreadPoolExecutor(max_workers=2) as pool, cluster.gated(gate):
+        attempt = pool.submit(cluster.fetch, 'GET', CAPABILITIES, url=extra, timeout=27)
+        assert gate.entered.wait(10), 'takeover did not fetch a second recovery page'
+        assert gate.pages == [(gate.cursor[0], None), gate.cursor], gate.pages
+        ordinary = pool.submit(cluster.operation, 'table.get', {'table_id': table, 'key': 9})
+        status, result = ordinary.result(10)
+        assert status == 200 and result['data'] == rows[9], result
+        assert not attempt.done(), 'ordinary read did not finish while recovery was held'
+        attempt.result(27).error(503, 'storage_unavailable')
+        gate.release.set()
+        assert cluster.batch(opened, 0, url=extra).body == first.body
+        assert gate.pages[2] == gate.cursor, gate.pages
+
+    assert cluster.batch(opened, 1).json()['rows'] == rows[3:6]
+    cluster.fetch('DELETE', batch_path(opened)).empty()
+    cluster.start_worker(uuid.UUID(former['coordinator_node']).int, 1)
+    evidence.append('ST04/R01/Q03: takeover kept its acknowledged page cursor across a deadline and an ordinary read settled while the next peer page was held')
+
+
 def cold_start(cluster, table, rows, extra, evidence):
     body = cluster.open_body(table)
     proxy = PublicFaultProxy(extra)
@@ -616,9 +708,13 @@ def cgroup():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--legacy-binary', type=Path)
     parser.add_argument('--evidence', type=Path)
-    parser.add_argument('--scenario', choices=('all', 'leases', 'replies', 'overlap', 'failover', 'stale', 'stale-rpc', 'cold'), default='all')
+    parser.add_argument('--scenario', choices=('all', 'leases', 'replies', 'overlap', 'failover', 'stale',
+                                               'stale-rpc', 'recovery-deadline', 'legacy-join', 'cold'), default='all')
     args = parser.parse_args()
+    if args.scenario == 'legacy-join' and args.legacy_binary is None:
+        parser.error('--legacy-binary is required for legacy-join')
     binary = args.binary.resolve()
     evidence = Evidence(binary)
     started = time.monotonic()
@@ -626,18 +722,22 @@ def main():
         with tempfile.TemporaryDirectory(prefix='nabedra-olap-stream-') as directory:
             cluster = StreamCluster(binary, directory)
             try:
-                for worker in (10, 20, 30):
-                    cluster.start_worker(worker, 1)
-                extra, _, extra_channel = cluster.start_extra_api()
-                table, rows = seed(cluster)
-                for name, scenario in [('leases', lease_lifecycle), ('replies', sdk_faults),
-                                       ('overlap', overlapping_delivery), ('stale-rpc', stale_signed_request),
-                                       ('stale', stale_owner),
-                                       ('failover', apis_and_failover),
-                                       ('cold', cold_start)]:
-                    if args.scenario in ('all', name):
-                        scenario(cluster, table, rows, extra, evidence)
-                send(extra_channel, {'version': 1, 'type': 'shutdown'})
+                if args.scenario == 'legacy-join':
+                    join_with_legacy_peer(cluster, args.legacy_binary.resolve(), evidence)
+                else:
+                    for worker in (10, 20, 30):
+                        cluster.start_worker(worker, 1)
+                    extra, _, extra_channel = cluster.start_extra_api()
+                    table, rows = seed(cluster)
+                    for name, scenario in [('leases', lease_lifecycle), ('replies', sdk_faults),
+                                           ('overlap', overlapping_delivery), ('stale-rpc', stale_signed_request),
+                                           ('stale', stale_owner),
+                                           ('recovery-deadline', recovery_deadline),
+                                           ('failover', apis_and_failover),
+                                           ('cold', cold_start)]:
+                        if args.scenario in ('all', name):
+                            scenario(cluster, table, rows, extra, evidence)
+                    send(extra_channel, {'version': 1, 'type': 'shutdown'})
             except BaseException:
                 cluster.diagnostics.flush()
                 sys.stderr.write((Path(directory) / 'diagnostics').read_text()[-24000:])
@@ -648,6 +748,9 @@ def main():
         result = {'binary_sha256': evidence.binary_sha256, 'scenario': args.scenario,
                   'passed_assertions': evidence, 'seconds': time.monotonic() - started,
                   'cgroup': cgroup(), 'provider_evidence': False}
+        if args.legacy_binary:
+            with args.legacy_binary.open('rb') as stream:
+                result['legacy_binary_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
         encoded = json.dumps(result, indent=2)
         if args.evidence:
             args.evidence.write_text(encoded + '\n')
