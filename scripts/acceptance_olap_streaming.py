@@ -306,9 +306,18 @@ class StreamCluster(Cluster):
 
     def batch(self, opened, sequence, *, url=None):
         path = batch_path(opened, sequence)
+        deadline = time.monotonic() + 40
+
         def lookup():
-            response = self.fetch('POST', path, url=url, timeout=5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                response = self.fetch('POST', path, url=url, timeout=min(25, remaining))
+            except (TimeoutError, http.client.RemoteDisconnected):
+                return None
             return None if response.status in (429, 503) else response
+
         return wait_for(lookup, f'batch {sequence} did not settle', 40)
 
     def catalog_fence(self):
