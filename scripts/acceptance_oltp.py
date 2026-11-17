@@ -124,8 +124,11 @@ def source_identity():
     digest = hashlib.sha256()
     paths = [ROOT / "server/Cargo.toml", ROOT / "server/Cargo.lock", Path(__file__)]
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
+    paths += sorted((ROOT / "server/tests").rglob("*.rs"))
+    paths += sorted((ROOT / "server/tests").rglob("*.py"))
+    paths += sorted((ROOT / "scripts").glob("*.py"))
     paths += sorted((ROOT / "orm/python/src").rglob("*.py"))
-    for path in paths:
+    for path in sorted(set(paths)):
         digest.update(str(path.relative_to(ROOT)).encode() + b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).digest())
     return dict(commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
@@ -160,7 +163,7 @@ def build_tests(env, output):
 def run_scenario(binary, name, scenario, env, output, timeout):
     start = time.monotonic()
     with output.open("w") as log:
-        process = subprocess.Popen([str(binary), "--exact", name, "--nocapture", "--test-threads=1"], cwd=ROOT,
+        process = subprocess.Popen([str(binary), "--exact", name, "--include-ignored", "--nocapture", "--test-threads=1"], cwd=ROOT,
                                    env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
@@ -224,6 +227,8 @@ def main():
         env["NABEDRA_OLAP_BINARY"] = str(args.olap_binary.resolve())
     selected = [s for s in SCENARIOS if (not args.scenario or s.id in args.scenario)
                 and (not args.category or s.category in args.category)]
+    if not selected:
+        parser.error("the selected scenarios and categories do not overlap")
     args.output.mkdir(parents=True, exist_ok=True)
     report = dict(source=source_identity(), categories={k: v[0] for k, v in CATEGORIES.items()}, results=[])
     try:
@@ -252,6 +257,10 @@ def main():
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         report["error"] = str(error)
         print(str(error), file=sys.stderr)
+    recorded = {r["scenario"] for r in report["results"]}
+    for s in SCENARIOS:
+        if s.id not in recorded:
+            report["results"].append(s.result(reason="build or runner failed before execution" if s in selected else "not selected"))
     report["source_after"] = source_identity()
     report["source_changed"] = report["source"]["source_sha256"] != report["source_after"]["source_sha256"]
     chosen = [r for r in report["results"] if r["scenario"] in {s.id for s in selected}]

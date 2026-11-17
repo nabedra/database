@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,21 @@ import acceptance_oltp as acceptance
 
 
 class EssentialRunnerTests(unittest.TestCase):
+    def test_supporting_component_does_not_pass_a_missing_production_scenario(self):
+        with tempfile.TemporaryDirectory(prefix='nabedra-runner-cli-') as directory:
+            root = Path(directory)
+            binary = root / 'component-tests'
+            binary.write_text(f'#!{sys.executable}\nprint("supporting_component: test")\n')
+            binary.chmod(0o700)
+            result = subprocess.run([sys.executable, str(Path(acceptance.__file__)), '--scenario', 'O01',
+                                     '--test-binary', str(binary), '--target-dir', str(root / 'target'),
+                                     '--output', str(root / 'report')], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            report = json.loads((root / 'report/results.json').read_text())
+            self.assertEqual(len(report['results']), 29)
+            self.assertEqual(report['summary'], {'passed': 0, 'failed': 0, 'not-run': 1})
+            self.assertEqual(next(r for r in report['results'] if r['scenario'] == 'O01')['status'], 'not-run')
+
     def test_rubric_preserves_all_scenarios_scheduler_ids_and_regressions(self):
         self.assertEqual(sorted(s.number for s in acceptance.SCENARIOS), list(range(1, 30)))
         self.assertEqual(len(acceptance.CATEGORIES), 7)
