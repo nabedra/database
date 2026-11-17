@@ -214,7 +214,13 @@ class _Owner:
                 self.wake.recv(4096)
             elif key.data == 'channel':
                 # At most one maximum frame plus its header is retained.
-                chunk = self.channel.recv(max(1, _LIMIT + 4 - len(self.buffer)))
+                try:
+                    chunk = self.channel.recv(max(1, _LIMIT + 4 - len(self.buffer)))
+                except ConnectionResetError:
+                    # Linux can reset AF_UNIX when a child closes with unread
+                    # shutdown bytes. This closes the protocol channel; only
+                    # Popen poll/wait can prove that the child has exited.
+                    chunk = b''
                 if not chunk:
                     self.eof = True
                     self.selector.unregister(self.channel)

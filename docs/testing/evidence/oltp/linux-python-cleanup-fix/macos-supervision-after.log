@@ -1,0 +1,30 @@
+test_failed_spawn_closes_both_socket_ends (test_serve_process.ServeProcessTests.test_failed_spawn_closes_both_socket_ends) ... ok
+test_held_shutdown_forces_failure (test_serve_process.ServeProcessTests.test_held_shutdown_forces_failure) ... ok
+test_invalid_explicit_binary_has_no_fallback_or_child (test_serve_process.ServeProcessTests.test_invalid_explicit_binary_has_no_fallback_or_child) ... ok
+test_reset_channel_during_shutdown_does_not_prove_child_exit (test_serve_process.ServeProcessTests.test_reset_channel_during_shutdown_does_not_prove_child_exit) ... ok
+test_second_signal_expedites_owned_kill (test_serve_process.ServeProcessTests.test_second_signal_expedites_owned_kill) ... ok
+test_selector_failure_stops_admission_and_sanitizes (test_serve_process.ServeProcessTests.test_selector_failure_stops_admission_and_sanitizes) ... ok
+test_signal_arriving_during_failure_shutdown_is_forwarded (test_serve_process.ServeProcessTests.test_signal_arriving_during_failure_shutdown_is_forwarded) ... ok
+test_signal_handshake_flood_and_reap (test_serve_process.ServeProcessTests.test_signal_handshake_flood_and_reap) ... ok
+test_startup_and_lifetime_failures_cleanup (test_serve_process.ServeProcessTests.test_startup_and_lifetime_failures_cleanup) ... ok
+test_startup_signal_closes_admission_before_activate (test_serve_process.ServeProcessTests.test_startup_signal_closes_admission_before_activate) ... ok
+test_stop_interrupt_still_reaps (test_serve_process.ServeProcessTests.test_stop_interrupt_still_reaps) ... ok
+test_attached_unused_receipt_requires_explicit_no_spawn_completion (test_serve_exit.ServeExitTests.test_attached_unused_receipt_requires_explicit_no_spawn_completion) ... ok
+test_dead_child_cannot_finish_active_run (test_serve_exit.ServeExitTests.test_dead_child_cannot_finish_active_run) ... ok
+test_no_spawn_cleanup_failure_and_exit_are_distinct (test_serve_exit.ServeExitTests.test_no_spawn_cleanup_failure_and_exit_are_distinct) ... ok
+test_real_startup_failure_exit_with_close_failure (test_serve_exit.ServeExitTests.test_real_startup_failure_exit_with_close_failure) ... ok
+test_reaped_returncode_is_exit_proof_even_if_later_poll_fails (test_serve_exit.ServeExitTests.test_reaped_returncode_is_exit_proof_even_if_later_poll_fails) ... ok
+test_resource_close_failure_still_closes_other_resources_and_restores (test_serve_exit.ServeExitTests.test_resource_close_failure_still_closes_other_resources_and_restores) ... ok
+test_saved_handler_still_owns_active_run (test_serve_exit.ServeExitTests.test_saved_handler_still_owns_active_run) ... ok
+test_signal_receipt_confirms_exit_and_cleanup (test_serve_exit.ServeExitTests.test_signal_receipt_confirms_exit_and_cleanup) ... ok
+test_unknown_exit_retains_exact_live_owner_and_recovers (test_serve_exit.ServeExitTests.test_unknown_exit_retains_exact_live_owner_and_recovers) ... ok
+test_compatible_path_binary_runs_both_api_and_worker (test_cli_supervision.SupervisionTests.test_compatible_path_binary_runs_both_api_and_worker) ... ok
+test_existing_cluster_name_is_sent_without_renaming (test_cli_supervision.SupervisionTests.test_existing_cluster_name_is_sent_without_renaming) ... ok
+test_invalid_cluster_name_is_rejected_before_startup (test_cli_supervision.SupervisionTests.test_invalid_cluster_name_is_rejected_before_startup) ... ok
+test_signal_drains_and_reaps_worker (test_cli_supervision.SupervisionTests.test_signal_drains_and_reaps_worker) ... ok
+test_worker_failure_preserves_status_and_reaps_api (test_cli_supervision.SupervisionTests.test_worker_failure_preserves_status_and_reaps_api) ... ok
+
+----------------------------------------------------------------------
+Ran 25 tests in 19.415s
+
+OK

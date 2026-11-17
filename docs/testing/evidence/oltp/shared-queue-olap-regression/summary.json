@@ -1,0 +1,7 @@
+{
+  "targets": 41,
+  "passed": 759,
+  "failed": 0,
+  "ignored": 1,
+  "scope": "Whole default OLAP library/integration suite after shared queue changes; ignored live S3 fixture not executed"
+}

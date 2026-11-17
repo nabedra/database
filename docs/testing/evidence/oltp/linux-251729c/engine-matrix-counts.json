@@ -1,0 +1,26 @@
+{
+  "default": {
+    "targets": 39,
+    "passed": 759,
+    "failed": 0,
+    "ignored": 1
+  },
+  "olap": {
+    "targets": 39,
+    "passed": 757,
+    "failed": 0,
+    "ignored": 0
+  },
+  "oltp": {
+    "targets": 7,
+    "passed": 98,
+    "failed": 0,
+    "ignored": 1
+  },
+  "oltp-s3": {
+    "targets": 7,
+    "passed": 98,
+    "failed": 0,
+    "ignored": 1
+  }
+}

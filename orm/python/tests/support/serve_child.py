@@ -36,6 +36,14 @@ def receive():
 def send(obj):
     data = json.dumps(obj).encode()
     s.sendall(struct.pack('!I', len(data)) + data)
+def shutdown():
+    event('shutdown')
+    # Signal-forwarding cases must remain alive until the signal handler logs
+    # the actual forwarded signal. A protocol shutdown alone cannot pass them.
+    if config.get('await_signal') or mode.startswith('held'):
+        while True:
+            signal.pause()
+    sys.exit(0)
 event('spawn')
 init = receive()
 assert init['type'] == 'init'
@@ -67,7 +75,10 @@ prepared = dict(version=1, type='prepared', cluster_id=cluster, bound_url=url,
 if mode == 'bad_url':
     prepared['authorize_url'] = url + '/private/v1/authorize?'
 send(prepared)
-assert receive() == {'version': 1, 'type': 'activate'}
+activation = receive()
+if activation == {'version': 1, 'type': 'shutdown'}:
+    shutdown()
+assert activation == {'version': 1, 'type': 'activate'}
 event('activate')
 send(dict(version=1, type='ready', cluster_id=cluster,
           bound_url=url if mode != 'mismatch' else url + '/wrong'))
@@ -84,8 +95,4 @@ if mode == 'forward_race':
 if mode == 'lifetime_partial':
     s.sendall(b'\x00')
 if receive() == {'version': 1, 'type': 'shutdown'}:
-    event('shutdown')
-if mode.startswith('held'):
-    # A held gate never opens in this fixture. Only the owner's kill ends it.
-    while True:
-        signal.pause()
+    shutdown()

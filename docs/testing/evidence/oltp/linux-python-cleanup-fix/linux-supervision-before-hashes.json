@@ -1,0 +1,7 @@
+{
+  "orm/python/src/nabedra/_serve_process.py": "737527145359687e318eff4262409651dbd6aa2b4d27dd99f128e308ce2c5093",
+  "orm/python/tests/test_serve_process.py": "6d3a0f8d39e0bf0f2145d3591291400c617026e5844666009228c5a42becf16d",
+  "orm/python/tests/support/serve_child.py": "5c8ad7ec3f5f81fdda7b4b6bfcefc5268eedbee93585ed81c41bc68eafadaae8",
+  "orm/python/tests/test_serve_exit.py": "144600a26062ac67b444b4a0a5d0a27d3290d97176766d1c0621336bf7bf8ca2",
+  "orm/python/tests/test_cli_supervision.py": "bbb2ed1b07ec84b02035a12a99ed1e688b8b3a714b970a39bdd0969b621355f9"
+}

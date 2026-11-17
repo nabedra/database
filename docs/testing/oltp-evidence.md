@@ -19,7 +19,7 @@ The native dependency spike compiled `rocksdb 0.25.0` and `librocksdb-sys 0.19.0
 | Additional feature guards/builds | OLAP without S3 checked cleanly; OLTP with S3 built and reported its engine; both-engine and neither-engine builds failed at the explicit compile guard | O02 selections; S3 backup remains unimplemented |
 | Formatting and OLTP lint | Formatting passed; OLTP all-target Clippy passed with warnings denied | Default Clippy's inherited findings are described separately |
 
-The [complete feature matrix](evidence/oltp/packaging/full-engine-matrix-summary.json) passed on the same source hash as the quiet process run. Its [raw output](evidence/oltp/packaging/full-engine-matrix.log) contains every target result, all four dependency graphs and executable identities, and both invalid compile guards.
+The [complete feature matrix](evidence/oltp/packaging/full-engine-matrix-summary.json) passed on the same source hash as the quiet process run. Its [raw output](evidence/oltp/packaging/full-engine-matrix.log) contains every target result, dependency-graph assertion results, executable identities, and both invalid compile guards. The separate [graph output](evidence/oltp/packaging/dependency-graphs.log) retains the dependency listings.
 
 | Features | Passed | Ignored |
 | --- | --- | --- |
@@ -77,7 +77,17 @@ The follow-up correction returns `OutcomeUnknown/Unknown` when an existing mutat
 
 The [follow-up library run](evidence/oltp/decision-proof-fix/library.log) passed 78 assertions in 18.82 seconds, including the new regression and in-progress identity/proof helper tests. Its [provenance](evidence/oltp/decision-proof-fix/library-provenance.json) verifies unchanged source SHA-256 `1e8acef80ae5f69fb742ecd808145f9348a5ecfeb396a0b68ba27059e5a98e9e` during execution and records the corrected module's hash. The [scope notes](evidence/oltp/decision-proof-fix/README.md) distinguish this working tree from the isolated fix commit and earlier checkpoint. Identity-stage Clippy passed before later private proof helpers were added; those unfinished helpers are not represented as a current whole-tree lint pass.
 
+## Linux checkpoint and shared queue regression
+
+Immutable commit `251729c` passed all four Rust selections in a Linux container with Rust 1.94.1, a two-CPU quota and 6 GiB RAM. The [Linux evidence](evidence/oltp/linux-251729c/README.md) records 759 default OLAP tests, 757 OLAP-without-S3 tests and 98 tests for each OLTP selection. The ignored live-S3 assertion was not run; each OLTP crash parent invokes its ignored child fixture. The real no-S3 server process and sixteen harness tests also passed. The original pipeline failed at Python discovery with six failures; adding Docker init still left eight failures. Those logs remain recorded. These results do not establish a passing entire Linux pipeline or the later native-budget correction.
+
+The [subsequent Unix-socket correction](evidence/oltp/linux-python-cleanup-fix/README.md) treats Linux connection reset as channel EOF while retaining independent child-exit proof. Signal fixtures use an explicit wait gate. All 179 Python tests then passed on both Linux and macOS, with unchanged recorded Python inputs during each run. This later correction is separate from the original immutable Rust/process capture.
+
+After the shared queue changes, the current default OLAP library/integration suite passed all 759 assertions, with the live-S3 assertion ignored. Its [raw log](evidence/oltp/shared-queue-olap-regression/default-tests.log), [counts](evidence/oltp/shared-queue-olap-regression/summary.json) and [input hashes](evidence/oltp/shared-queue-olap-regression/provenance.json) cover unchanged default/shared Rust inputs during the run. Evolving OLTP-only source was excluded from that hash scope. This is a full default regression run, not a full current OLTP checkpoint.
+
 ## Pending evidence
+
+Subsequent pinned-source inspection found that RocksDB database open raises both HIGH and LOW native execution pools to at least one thread. The original one-background-thread configuration therefore does not establish O05/O23's aggregate native budget. The functional checkpoints above remain recorded with their original settings; their query-thread identities do not measure all native threads. A correction to the maintenance budget and per-open options, plus actual native-thread observations and separate housekeeping accounting, is in progress.
 
 The single-group consensus dependency spike still logs deterministic application operations. Its local ordered-fence tests do not establish the target rule that cold start applies only prepared committed state without reevaluating abandoned user operations. P4/P5's typed prepare/decision/resolution implementation and its multi-shard/cold-start assertions remain required before production remote execution.
 

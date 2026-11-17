@@ -1,0 +1,79 @@
+{"name": "engine-matrix", "command": ["python", "scripts/check_engine_features.py"], "exit_code": 0, "elapsed_seconds": 2678.947742613}
+{"name": "oltp-no-s3-build", "command": ["cargo", "build", "--locked", "--manifest-path", "server/Cargo.toml", "--no-default-features", "--features", "oltp", "--bin", "nabedra-db"], "exit_code": 0, "elapsed_seconds": 0.3446919319999324}
+{"name": "process", "command": ["python", "server/tests/oltp_process.py", "--binary", "/target/debug/nabedra-db", "--evidence-dir", "/evidence/process", "--benchmark-condition", "Linux Docker container, two CPU quota, six GiB memory limit; concurrent host compilation uncontrolled"], "exit_code": 0, "elapsed_seconds": 23.43374707599969}
+{"name": "python-unit", "command": ["python", "-m", "unittest", "discover", "-s", "orm/python/tests", "-v"], "exit_code": 1, "elapsed_seconds": 64.63349229300002}
+ests.test_callback_declaration_failure_does_not_launch) ... ok
+test_atomic_bounded_batch_and_exact_utf8_envelope_limit (test_table.TableTests.test_atomic_bounded_batch_and_exact_utf8_envelope_limit) ... ok
+test_crud_payloads_and_server_results (test_table.TableTests.test_crud_payloads_and_server_results) ... ok
+test_handle_owns_metadata_and_query_construction_is_local (test_table.TableTests.test_handle_owns_metadata_and_query_construction_is_local) ... ok
+test_local_validation_and_result_uncertainty (test_table.TableTests.test_local_validation_and_result_uncertainty) ... ok
+test_bounded_reads_close_success_http_error_and_read_failure (test_transport.TransportTests.test_bounded_reads_close_success_http_error_and_read_failure) ... ok
+test_exact_wire_and_fresh_ids_and_decoder (test_transport.TransportTests.test_exact_wire_and_fresh_ids_and_decoder) ... ok
+test_invalid_responses_respect_mutation_boundary (test_transport.TransportTests.test_invalid_responses_respect_mutation_boundary) ... ok
+test_local_preflight_never_opens_connection (test_transport.TransportTests.test_local_preflight_never_opens_connection) ... ok
+test_malformed_http_differs_from_disconnects (test_transport.TransportTests.test_malformed_http_differs_from_disconnects) ... ok
+test_redirect_is_not_followed (test_transport.TransportTests.test_redirect_is_not_followed) ... ok
+test_server_error_mapping_and_diagnostics (test_transport.TransportTests.test_server_error_mapping_and_diagnostics) ... ok
+test_strict_json_rejects_ambiguous_and_nonfinite_successes (test_transport.TransportTests.test_strict_json_rejects_ambiguous_and_nonfinite_successes) ... ok
+test_truncated_response_and_decoder_failure (test_transport.TransportTests.test_truncated_response_and_decoder_failure) ... ok
+test_exact_values_int64_and_key_validation (test_validation.ValidationTests.test_exact_values_int64_and_key_validation) ... ok
+test_full_and_partial_rows (test_validation.ValidationTests.test_full_and_partial_rows) ... ok
+test_invalid_schema_name_key_and_format (test_validation.ValidationTests.test_invalid_schema_name_key_and_format) ... ok
+test_schema_round_trip_and_mapping_ownership (test_validation.ValidationTests.test_schema_round_trip_and_mapping_ownership) ... ok
+
+======================================================================
+FAIL: test_compatible_path_binary_runs_both_api_and_worker (test_cli_supervision.SupervisionTests.test_compatible_path_binary_runs_both_api_and_worker)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_cli_supervision.py", line 141, in test_compatible_path_binary_runs_both_api_and_worker
+    self.assertEqual(child.returncode, -signal.SIGTERM, (out, err))
+AssertionError: 1 != -15 : (b'{"event":"nabedra.serve.launched","bound_url":"http://127.0.0.1:8000"}\n', b'Cannot launch compatible nabedra-db. Set NABEDRA_SERVER_BINARY to an executable file path or put nabedra-db on PATH.\n')
+
+======================================================================
+FAIL: test_signal_drains_and_reaps_worker (test_cli_supervision.SupervisionTests.test_signal_drains_and_reaps_worker)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_cli_supervision.py", line 117, in test_signal_drains_and_reaps_worker
+    self.assertEqual(child.returncode, -signal.SIGTERM)
+AssertionError: 1 != -15
+
+======================================================================
+FAIL: test_reaped_returncode_is_exit_proof_even_if_later_poll_fails (test_serve_exit.ServeExitTests.test_reaped_returncode_is_exit_proof_even_if_later_poll_fails)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_serve_exit.py", line 183, in test_reaped_returncode_is_exit_proof_even_if_later_poll_fails
+    self.assertEqual(caught.exception.code, 'bind_failed')
+AssertionError: 'shutdown_failed' != 'bind_failed'
+- shutdown_failed
++ bind_failed
+
+
+======================================================================
+FAIL: test_signal_handshake_flood_and_reap (test_serve_process.ServeProcessTests.test_signal_handshake_flood_and_reap) (mode='external')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_serve_process.py", line 151, in test_signal_handshake_flood_and_reap
+    self.assertIn('saved_callable' if mode == 'callable' else
+AssertionError: 'return' not found in 'prepared\nstop\nerror:shutdown_failed:Nabedra Database API process failed.\nrestored:True\n'
+
+======================================================================
+FAIL: test_signal_handshake_flood_and_reap (test_serve_process.ServeProcessTests.test_signal_handshake_flood_and_reap) (mode='flood')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_serve_process.py", line 155, in test_signal_handshake_flood_and_reap
+    self.assertIn('signal_' + str(sig), names)
+AssertionError: 'signal_2' not found in ['spawn', 'init', 'flooded', 'activate', 'shutdown']
+
+======================================================================
+FAIL: test_startup_signal_closes_admission_before_activate (test_serve_process.ServeProcessTests.test_startup_signal_closes_admission_before_activate)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/source/orm/python/tests/test_serve_process.py", line 244, in test_startup_signal_closes_admission_before_activate
+    self.assertIn('return', result)
+AssertionError: 'return' not found in 'prepared\nstop\nerror:shutdown_failed:Nabedra Database API process failed.\nrestored:True\n'
+
+----------------------------------------------------------------------
+Ran 178 tests in 63.865s
+
+FAILED (failures=6)
+

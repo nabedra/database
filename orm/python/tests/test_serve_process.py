@@ -3,9 +3,12 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,12 +91,12 @@ finally:
 '''
 
 class ServeProcessTests(unittest.TestCase):
-    def launch(self, mode):
+    def launch(self, mode, *, await_signal=False):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         config = Path(temp.name) / 'config.json'
         record = Path(temp.name) / 'child.jsonl'
-        config.write_text(json.dumps(dict(mode=mode, record=str(record))))
+        config.write_text(json.dumps(dict(mode=mode, record=str(record), await_signal=await_signal)))
         env = {k: os.environ[k] for k in ('PATH', 'SYSTEMROOT') if k in os.environ}
         env.update(PYTHONPATH=str(ROOT / 'src'), NABEDRA_SERVER_BINARY=str(CHILD),
                    NABEDRA_SUPERVISOR_FD='discard-me')
@@ -142,7 +145,7 @@ class ServeProcessTests(unittest.TestCase):
         for mode, sig in [('external', signal.SIGTERM), ('normal', signal.SIGTERM), ('flood', signal.SIGINT),
                           ('callable', signal.SIGINT)]:
             with self.subTest(mode=mode):
-                host, config, record = self.launch(mode)
+                host, config, record = self.launch(mode, await_signal=True)
                 self.ready(host)
                 host.send_signal(sig)
                 result, events, out = self.finish(host, config, record)
@@ -239,11 +242,42 @@ class ServeProcessTests(unittest.TestCase):
         self.assertIn('interrupt', result)
 
     def test_startup_signal_closes_admission_before_activate(self):
-        host, config, record = self.launch('startup_signal')
+        host, config, record = self.launch('startup_signal', await_signal=True)
         result, events, out = self.finish(host, config, record)
         self.assertIn('return', result)
         self.assertEqual(out, b'')
         self.assertNotIn('activate', [e['event'] for e in events])
+        self.assertIn('signal_' + str(signal.SIGTERM), [e['event'] for e in events])
+
+    def test_reset_channel_during_shutdown_does_not_prove_child_exit(self):
+        from nabedra import _serve_process as p
+        owner = p._Owner()
+        peer = None
+        try:
+            owner.install()
+            owner.channel, peer = socket.socketpair()
+            owner.channel.setblocking(False)
+            owner.selector.register(owner.channel, selectors.EVENT_READ, 'channel')
+            owner.child = SimpleNamespace(returncode=None, poll=lambda: None,
+                                          stdout=None, stderr=None)
+            receipt = p._ExitReceipt()
+            receipt._owner = owner
+            owner.channel.sendall(b'unread shutdown')
+            peer.close()
+            owner.pump(time.monotonic() + 1, stopping=True)
+            self.assertTrue(owner.eof)
+            with self.assertRaises(KeyError):
+                owner.selector.get_key(owner.channel)
+            with self.assertRaises(p.NabedraError) as caught:
+                owner.receive(time.monotonic() + 1)
+            self.assertEqual(caught.exception.code, 'protocol_error')
+            receipt._observe()
+            self.assertFalse(receipt._exited)
+            self.assertIsNone(owner.child.returncode)
+        finally:
+            if peer is not None:
+                peer.close()
+            owner.close()
 
     def test_held_shutdown_forces_failure(self):
         host, config, record = self.launch('held')
