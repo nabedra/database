@@ -1,0 +1,21 @@
+test_interrupt_stops_scheduling_and_saves_report (test_acceptance_cancellation.CancellationTest.test_interrupt_stops_scheduling_and_saves_report) ... ok
+test_report_setup_interrupt_saves_without_starting_work (test_acceptance_cancellation.CancellationTest.test_report_setup_interrupt_saves_without_starting_work) ... ok
+test_catalog_diagnosis_exports_only_presence_and_counts (test_acceptance_serverless_s3.PrivacyTests.test_catalog_diagnosis_exports_only_presence_and_counts) ... ok
+test_error_message_classification_is_allowlisted_and_preserves_bytes (test_acceptance_serverless_s3.PrivacyTests.test_error_message_classification_is_allowlisted_and_preserves_bytes) ... ok
+test_failure_report_never_stringifies_exception_or_private_config (test_acceptance_serverless_s3.PrivacyTests.test_failure_report_never_stringifies_exception_or_private_config) ... ok
+test_owned_child_observer_uses_portable_numeric_process_columns (test_acceptance_serverless_s3.PrivacyTests.test_owned_child_observer_uses_portable_numeric_process_columns) ... ok
+test_prefix_guard_rejects_foreign_or_unsafe_key_before_aws (test_acceptance_serverless_s3.PrivacyTests.test_prefix_guard_rejects_foreign_or_unsafe_key_before_aws) ... ok
+test_receipt_observer_preserves_terminal_error_null (test_acceptance_serverless_s3.PrivacyTests.test_receipt_observer_preserves_terminal_error_null) ... ok
+test_current_references_across_catalog_versions (test_acceptance_support.CatalogShapeGuard.test_current_references_across_catalog_versions) ... ok
+test_dotenv_and_namespace_stay_inside_configured_bucket (test_acceptance_support.ConfigurationGuard.test_dotenv_and_namespace_stay_inside_configured_bucket) ... ok
+test_tls_cleanup_depends_on_observed_exit (test_lifecycle_cleanup.CleanupTest.test_tls_cleanup_depends_on_observed_exit) ... ok
+test_conditional_tcp_storage_and_restart (test_local_store.LocalStoreTests.test_conditional_tcp_storage_and_restart) ... ok
+test_post_commit_response_loss_is_recovered_by_get (test_local_store.LocalStoreTests.test_post_commit_response_loss_is_recovered_by_get) ... ok
+test_local_process_restart_and_failed_start_cleanup (test_server_process.ProcessGuard.test_local_process_restart_and_failed_start_cleanup) ... ok
+test_r04_unconfirmed_child_exit_cannot_authorize_a_replacement (test_server_process.ProcessGuard.test_r04_unconfirmed_child_exit_cannot_authorize_a_replacement) ... ok
+test_uncooperative_server_is_killed_reaped_and_reported_as_failure (test_server_process.ProcessGuard.test_uncooperative_server_is_killed_reaped_and_reported_as_failure) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 3.019s
+
+OK

@@ -1,0 +1,38 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 398B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/rust:1.94.1-bookworm
+#2 DONE 1.2s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/4] FROM docker.io/library/rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55
+#4 resolve docker.io/library/rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 0.0s done
+#4 DONE 0.0s
+
+#5 [2/4] RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev python3 python3-venv openssl procps && rm -rf /var/lib/apt/lists/*
+#5 CACHED
+
+#6 [3/4] RUN python3 -m venv /opt/nabedra-check-env && /opt/nabedra-check-env/bin/pip install --no-cache-dir httpx==0.28.1
+#6 CACHED
+
+#7 [4/4] WORKDIR /source
+#7 CACHED
+
+#8 exporting to image
+#8 exporting layers done
+#8 exporting manifest sha256:1ce1a39e0ef73b8aaaae00876c0eec1366a57b1d6c996e8308fe831f185d4413 done
+#8 exporting config sha256:c9e67de9399dc9b1b62e15224adc3f3f317fd2b67f10b7ce99fbd8dc68f8534e done
+#8 exporting attestation manifest sha256:00f48e77b1ed7b9000b7fcbfbd27086301287349dbeed536cea5f57b2b8a0310
+#8 exporting attestation manifest sha256:00f48e77b1ed7b9000b7fcbfbd27086301287349dbeed536cea5f57b2b8a0310 0.0s done
+#8 exporting manifest list sha256:d5047bbed65bc1e04a39215f4daf47066a7e4da070e2b97ff257d1543519273a 0.0s done
+#8 naming to docker.io/library/nabedra-local-check:251729c-rust1941 done
+#8 unpacking to docker.io/library/nabedra-local-check:251729c-rust1941 0.0s done
+#8 DONE 0.1s
+
+View build details: docker-desktop://dashboard/build/desktop-linux/desktop-linux/1zamzfn0n96a534bxk8hlvf5d

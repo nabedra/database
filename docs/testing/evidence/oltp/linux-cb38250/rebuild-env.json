@@ -1,0 +1,13 @@
+{
+  "command": [
+    "docker",
+    "build",
+    "--progress=plain",
+    "-t",
+    "nabedra-local-check:251729c-rust1941",
+    "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-linux-cb38250-kkt8vzqn/build-env"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 8.402172240996151,
+  "reason": "Previously built validation image no longer present; target and registry volumes retained"
+}
