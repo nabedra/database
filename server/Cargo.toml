@@ -198,3 +198,6 @@ required-features = ["olap"]
 [[example]]
 name = "resource_scheduler_benchmark"
 required-features = ["olap"]
+
+[dependencies.arrow-ipc]
+version = "=60.1.0"
