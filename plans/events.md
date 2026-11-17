@@ -97,11 +97,14 @@ Use one SQLite database on a local durable volume. Store the next position and r
 
 ## OLAP subscription and cloud deployment
 
+Events and OLAP are independently deployed services. Events owns publish, retention, polling, and subscription checkpoints. A separately supervised subscriber converts deliveries to database requests. The OLAP API and its worker cluster own admission, table writes, and analytics queries. Multiple OLAP workers can serve the same database API while Events runs on one machine.
+
 ```mermaid
 flowchart LR
-    P[Orders, payments, application logs] -->|Publish over HTTPS| E[Events topic on durable storage]
-    E -->|Analytics subscription| S[OLAP subscription runner]
-    S -->|Existing database API| D[Nabedra OLAP table]
+    P[Orders, payments, application logs] -->|Publish over HTTPS| E[One Events host]
+    E --- V[SQLite event log and checkpoints on EBS]
+    E -->|Analytics subscription| S[Separate subscription runner]
+    S -->|Insert through database API| D[OLAP cluster with multiple workers]
     E -->|Notifications subscription| N[Notification service]
     E -->|Fraud subscription| F[Fraud service]
 ```
@@ -112,7 +115,9 @@ For each delivery, insert the row using the existing `Database.submit("table.ins
 
 The durable log records published events as data. The database uses its existing replicated worker-RAM queue for each insert. After a full worker shutdown, old pending requests are abandoned. The subscription reads the durable event again and can start a fresh destination write under the current run. Thus a crash after database commit but before event ack can resume without a second destination row. The sink uses the same public database contract that OLTP implements, so an OLTP target can follow after compatibility tests.
 
-Deploy `nabedra-events` separately from the database and run the subscriber near the OLAP API. On AWS, start with one supervised instance on EC2, an encrypted EBS volume retained on replacement, and TLS at ingress. Replace the host in the same Availability Zone and reattach its volume before starting the replacement. Keep the service private where producers and consumers can reach it. Use a separate instance per tenant where tenants need deployment isolation. Keep credentials in runtime secrets and out of event payloads and logs. Report publish latency, retained bytes, oldest retained position, subscription lag/age, runner errors, and disk/WAL headroom. Document consistent backup and restore. Restore a historical backup as a separate log and reconcile consumer checkpoints before switching traffic. The cloud release starts as single-AZ with restart recovery. [Amazon EBS volumes](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volumes.html) · [SQLite backup API](https://www.sqlite.org/backup.html)
+The v1 Events endpoint routes to one active `nabedra-events` process on one EC2 instance. Mount one encrypted EBS volume there for the authoritative SQLite database, including its WAL. Keep a stable HTTPS hostname and retain the volume on instance replacement. To recover from a host failure, confirm the original process has stopped, attach the same volume to a replacement in the same Availability Zone, then start Events and route the endpoint to it. Publish, poll, and ack are unavailable during replacement. This is single-AZ restart recovery. If Events later needs a multi-host endpoint, design it around one replicated transactional store for the log and checkpoints. Independent SQLite files would give each host its own offsets and checkpoints. [Amazon EBS volumes](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-volumes.html) · [SQLite WAL](https://sqlite.org/wal.html)
+
+Run the subscriber near the OLAP API. Keep the Events endpoint private where producers and consumers can reach it. Use a separate instance per tenant where tenants need deployment isolation. Keep credentials in runtime secrets and out of event payloads and logs. Report publish latency, retained bytes, oldest retained position, subscription lag/age, runner errors, and disk/WAL headroom. Document consistent backup and restore. Restore a historical backup as a separate log and reconcile consumer checkpoints before switching traffic. [SQLite backup API](https://www.sqlite.org/backup.html)
 
 This covers application events, analytics ingestion, notifications, fraud processing, log collection, and replay within retention. External ETL or CDC adapters can publish to the same contract. Automatic emission from Nabedra table changes, atomic publish alongside an application database commit, and large-scale partitioned ingestion each need a separate design. The first OLAP sink inherits the existing table limits of 100,000 rows and 64 MiB decoded payload in the inspected tree. Alert and pause on those limits. Sustained analytics ingestion will need table rotation or larger OLAP tables.
 
@@ -129,4 +134,4 @@ Run the following assertions before claiming support. Use deterministic fault ba
 | EV03 | Flood malformed, oversized, or slow requests while a separate subscription reads. Verify request and poll bounds, explicit overload or low-disk rejection, isolation, bounded WAL/checkpointing, and defined retention cutoff under a fake clock. |
 | EV04 | Ingest through the real OLAP API while an external consumer reads the same topic. Lose the database reply after commit, kill the sink before event ack, and test both surviving-worker and full-worker-shutdown cases. Verify one matching row per event, no old request resubmission, no early ack, and pause on conflicting row/schema or a table limit. Exercise Q02, Q04–Q06, R01, R04, T04–T06 and U01–U02 for the affected integration paths. |
 | EV05 | Build Events independently, run the unchanged ORM program on both database builds, and inspect dependencies with `cargo tree`. Apply O01 and O02. Measure publish and publish-to-row p50/p95/p99, sink lag, throughput, RSS, and disk growth while ordinary OLAP queries run. Use B02 for mixed-load evidence. |
-| EV06 | Exercise TLS, scoped credentials, persistent volume replacement, and backup restore in the target cloud deployment before claiming cloud recovery. Keep cloud evidence separate from local process tests. |
+| EV06 | Exercise TLS and scoped credentials. Replace the Events instance with the same volume and hostname. Verify the interruption and confirm topics, original publish receipts, and subscription checkpoints survive. Exercise backup restore separately before claiming cloud recovery. Keep cloud evidence separate from local process tests. |
