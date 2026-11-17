@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="306" viewBox="0 0 800 306" role="img" aria-labelledby="title desc">
+<title id="title">Events publish performance in Docker</title>
+<desc id="desc">1 brokers, RF1 recorded 117.2 events/s and 170.7 ms. 3 brokers, RF3 recorded 23.3 events/s and 1164.8 ms. 6 brokers, RF3 recorded 17.5 events/s and 2091.9 ms</desc>
+<rect width="800" height="306" fill="#fff"/>
+<g font-family="system-ui, sans-serif" fill="#142838">
+<text x="26" y="35" font-size="24" font-weight="700">Events publish performance in Docker</text>
+<text x="26" y="60" font-size="14">2 CPU and 1.5 GiB per run · debug Rust and shared RocksDB 11.8.1</text>
+<text x="144" y="107" font-size="15" font-weight="700">Median throughput (events/s)</text>
+<text x="475" y="107" font-size="15" font-weight="700">Highest round p99 (ms)</text>
+<text x="26" y="147" font-size="14">1 broker · RF1</text>
+<rect x="144" y="131" width="248.0" height="22" fill="#1c6aa6"/>
+<text x="401.0" y="147" font-size="14">117.2</text>
+<rect x="475" y="131" width="20.2" height="22" fill="#2f7867"/>
+<text x="504.2" y="147" font-size="14">170.7</text>
+<text x="26" y="191" font-size="14">3 brokers · RF3</text>
+<rect x="144" y="175" width="49.3" height="22" fill="#1c6aa6"/>
+<text x="202.3" y="191" font-size="14">23.3</text>
+<rect x="475" y="175" width="138.1" height="22" fill="#2f7867"/>
+<text x="622.1" y="191" font-size="14">1164.8</text>
+<text x="26" y="235" font-size="14">6 brokers · RF3</text>
+<rect x="144" y="219" width="37.0" height="22" fill="#1c6aa6"/>
+<text x="190.0" y="235" font-size="14">17.5</text>
+<rect x="475" y="219" width="248.0" height="22" fill="#2f7867"/>
+<text x="732.0" y="235" font-size="14">2091.9</text>
+<text x="26" y="280" font-size="13">64 warm-up events and three rounds of 256 events per run. Three- and six-broker runs both use RF3.</text>
+</g></svg>

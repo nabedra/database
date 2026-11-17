@@ -1,0 +1,30 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:524b09a5e5aeade937ea25d9fd6772e2baafc16e13b4a933050ac25838040645",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "f9c7b9ddb637670bf572e051c95582cce52538e2883ddd2933741a4edce5c65e",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "tls": {
+      "pass": true,
+      "seconds": 43.633
+    }
+  },
+  "checks": [
+    {
+      "check": "EV10 Docker peer mTLS and rolling signing key rotation preserve old grant and delivery",
+      "broker_restarts": 6,
+      "durable_checkpoint": 1
+    }
+  ]
+}

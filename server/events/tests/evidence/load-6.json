@@ -1,0 +1,207 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:630389e108220d346d14344f4e3a8bac02c303895e50f8d88b084ba7df76c944",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "0c56e9cd389752c6eb91fff7f81419c1c76180734eba6a55afd587bbb0b0da90",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "load-6": {
+      "pass": true,
+      "seconds": 113.951
+    }
+  },
+  "checks": [
+    {
+      "check": "EV09 6 broker Docker load run with independent fast and slow replay oracles",
+      "brokers": 6,
+      "replication_factor": 3,
+      "broker_caps": {
+        "cpu": 1.998,
+        "memory_mib": 1536
+      },
+      "stages": [
+        {
+          "phase": "balanced",
+          "events": 256,
+          "seconds": 14.6413,
+          "events_per_second": 17.48,
+          "p50_publish_ms": 287.51,
+          "p99_publish_ms": 1468.73,
+          "p99_poll_ms": 827.47,
+          "retry_responses": {
+            "publish": {},
+            "poll": {
+              "unavailable": 3
+            },
+            "checkpoint": {}
+          }
+        },
+        {
+          "phase": "skewed",
+          "events": 256,
+          "seconds": 29.0931,
+          "events_per_second": 8.8,
+          "p50_publish_ms": 819.01,
+          "p99_publish_ms": 2091.93,
+          "p99_poll_ms": 258.42,
+          "retry_responses": {
+            "publish": {},
+            "poll": {
+              "unavailable": 7
+            },
+            "checkpoint": {}
+          }
+        },
+        {
+          "phase": "balanced",
+          "events": 256,
+          "seconds": 13.0798,
+          "events_per_second": 19.57,
+          "p50_publish_ms": 283.25,
+          "p99_publish_ms": 1306.62,
+          "p99_poll_ms": 521.95,
+          "retry_responses": {
+            "publish": {},
+            "poll": {
+              "unavailable": 4
+            },
+            "checkpoint": {}
+          }
+        }
+      ],
+      "payload_distribution": "512-byte padding per JSON object, 8 concurrent producers",
+      "event_id_namespace": "91cc4a30-4813-47cb-95ff-0a829ed4f53d",
+      "arrival_schedule": "Fast subscriber commits before second half of each publish round",
+      "asserted_ids": 832,
+      "duplicate_ids": 0,
+      "lost_ids": 0,
+      "slow_subscription_lag_by_partition": {
+        "0": 310,
+        "1": 105,
+        "2": 105,
+        "3": 106,
+        "4": 103,
+        "5": 103
+      },
+      "post_replay_lag": 0,
+      "docker_stats": [
+        {
+          "BlockIO": "0B / 8.2MB",
+          "CPUPerc": "19.83%",
+          "Container": "5b40e55acde635204c9c3f01fa28f4107e511f2d26bb9cb92cfa359f588ace00",
+          "ID": "5b40e55acde6",
+          "MemPerc": "5.42%",
+          "MemUsage": "13.87MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-1-1",
+          "NetIO": "4.5MB / 6.59MB",
+          "PIDs": "15"
+        },
+        {
+          "BlockIO": "0B / 9.49MB",
+          "CPUPerc": "10.17%",
+          "Container": "c85735513011e2811f1299658d61b07897bd5c573c02b7376e6837954f3526c2",
+          "ID": "c85735513011",
+          "MemPerc": "4.74%",
+          "MemUsage": "12.13MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-2-1",
+          "NetIO": "5.17MB / 3.87MB",
+          "PIDs": "12"
+        },
+        {
+          "BlockIO": "0B / 9.32MB",
+          "CPUPerc": "10.46%",
+          "Container": "761d7aa3824710f2ea1583176884b707ee3c7f9277bb2d9ce977795084188a5a",
+          "ID": "761d7aa38247",
+          "MemPerc": "4.78%",
+          "MemUsage": "12.23MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-3-1",
+          "NetIO": "5.09MB / 3.76MB",
+          "PIDs": "12"
+        },
+        {
+          "BlockIO": "0B / 7.95MB",
+          "CPUPerc": "5.91%",
+          "Container": "9ae76b3bdc35c6b3642a0a4abfd5492848b35a22e161aad6d908f677fc2d7617",
+          "ID": "9ae76b3bdc35",
+          "MemPerc": "4.40%",
+          "MemUsage": "11.26MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-4-1",
+          "NetIO": "4.18MB / 3.77MB",
+          "PIDs": "13"
+        },
+        {
+          "BlockIO": "0B / 8.21MB",
+          "CPUPerc": "6.65%",
+          "Container": "6ecc70cf2e75878e632ca59245e722da2573249bc7439f0bbe9d69d32f682901",
+          "ID": "6ecc70cf2e75",
+          "MemPerc": "4.45%",
+          "MemUsage": "11.39MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-5-1",
+          "NetIO": "4.15MB / 3.52MB",
+          "PIDs": "13"
+        },
+        {
+          "BlockIO": "4.1kB / 8.34MB",
+          "CPUPerc": "5.68%",
+          "Container": "72bef6cf8eb33acb55b202ec3f04632579fcd60463bd8145397a06b63b16db0f",
+          "ID": "72bef6cf8eb3",
+          "MemPerc": "4.34%",
+          "MemUsage": "11.1MiB / 256MiB",
+          "Name": "events-b2bea9ab7206-broker-6-1",
+          "NetIO": "4.1MB / 3.38MB",
+          "PIDs": "11"
+        }
+      ],
+      "cgroup_samples": [
+        {
+          "peak_cgroup_bytes": 18690048,
+          "broker_peak_rss_bytes": 48234496,
+          "cpu_usage_usec": 30061149,
+          "disk_bytes": 1736080
+        },
+        {
+          "peak_cgroup_bytes": 16691200,
+          "broker_peak_rss_bytes": 46661632,
+          "cpu_usage_usec": 24765168,
+          "disk_bytes": 1756775
+        },
+        {
+          "peak_cgroup_bytes": 16703488,
+          "broker_peak_rss_bytes": 46804992,
+          "cpu_usage_usec": 24886005,
+          "disk_bytes": 1767363
+        },
+        {
+          "peak_cgroup_bytes": 15753216,
+          "broker_peak_rss_bytes": 45281280,
+          "cpu_usage_usec": 23206966,
+          "disk_bytes": 1354464
+        },
+        {
+          "peak_cgroup_bytes": 15417344,
+          "broker_peak_rss_bytes": 45760512,
+          "cpu_usage_usec": 22090015,
+          "disk_bytes": 1357401
+        },
+        {
+          "peak_cgroup_bytes": 15798272,
+          "broker_peak_rss_bytes": 45576192,
+          "cpu_usage_usec": 22226811,
+          "disk_bytes": 1344664
+        }
+      ],
+      "encoded_publish_record_bytes": 502956,
+      "rough_disk_to_ingress_ratio": 18.52
+    }
+  ]
+}
