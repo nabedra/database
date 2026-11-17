@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [features]
 default = ["olap", "s3"]
-olap = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
 oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 
@@ -60,6 +60,7 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 
 [dependencies.arrow-ipc]
 version = "=60.1.0"
+optional = true
 
 [target.'cfg(unix)'.dependencies]
 # Bounded startup material reads use O_NONBLOCK before opened-handle validation.
