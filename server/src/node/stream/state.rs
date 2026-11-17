@@ -1,5 +1,8 @@
 //! Live-run leases, replay checkpoints and worker-local caches.
-use super::wire::{self, Error, Format, Opened, SnapshotOpened};
+use super::{
+    Authority,
+    wire::{self, Error, Format, Opened, SnapshotOpened},
+};
 use crate::{
     cluster::state::MAX_NODES,
     engine::stream::{Cursor, PinnedScan, ScanReader},
@@ -311,6 +314,7 @@ pub(in crate::node) struct Registry {
 }
 struct State {
     run: Option<Uuid>,
+    observed_term: u64,
     recovered_view: Option<(RecoveryView, RecoveryStatus)>,
     entries: BTreeMap<Key, Arc<Stored>>,
     deliveries: BTreeMap<Uuid, DeliveryHold>,
@@ -414,6 +418,7 @@ impl Registry {
         Self {
             state: Mutex::new(State {
                 run: None,
+                observed_term: 0,
                 recovered_view: None,
                 entries: BTreeMap::new(),
                 deliveries: BTreeMap::new(),
@@ -431,17 +436,31 @@ impl Registry {
 
     pub(in crate::node) fn set_run(&self, run: Uuid, clear: bool) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().unwrap();
-        match state.run {
-            None => state.run = Some(run),
-            Some(existing) if existing == run => {}
-            Some(_) => return Err(wire::unavailable()),
-        }
+        state.bind_run(run)?;
         if clear {
-            state.recovered_view = None;
-            state.entries.clear();
-            state.deliveries.clear();
+            state.clear();
         }
         Ok(())
+    }
+
+    pub(super) fn reset_replica(&self, authority: Authority) -> Result<(), ProtocolError> {
+        let mut state = self.live_state()?;
+        state.bind_run(authority.run)?;
+        state.observe(authority.run, authority.term)?;
+        state.clear();
+        Ok(())
+    }
+
+    pub(super) fn observe(&self, authority: Authority) -> Result<(), ProtocolError> {
+        self.live_state()?.observe(authority.run, authority.term)
+    }
+
+    fn live_state(&self) -> Result<std::sync::MutexGuard<'_, State>, ProtocolError> {
+        let state = self.state.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(wire::unavailable());
+        }
+        Ok(state)
     }
 
     pub(super) fn recovery_status(&self, view: RecoveryView) -> Option<RecoveryStatus> {
@@ -466,11 +485,9 @@ impl Registry {
     }
 
     pub(super) fn begin_recovery(&self, view: RecoveryView) -> Result<(), ProtocolError> {
-        self.set_run(view.run, false)?;
-        let mut state = self.state.lock().unwrap();
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(wire::unavailable());
-        }
+        let mut state = self.live_state()?;
+        state.bind_run(view.run)?;
+        state.observe(view.run, view.term)?;
         state.recovered_view = None;
         Ok(())
     }
@@ -480,20 +497,15 @@ impl Registry {
         view: RecoveryView,
         status: RecoveryStatus,
     ) -> Result<(), ProtocolError> {
-        let mut state = self.state.lock().unwrap();
-        if self.stopped.load(Ordering::Acquire) || state.run != Some(view.run) {
-            return Err(wire::unavailable());
-        }
+        let mut state = self.live_state()?;
+        state.observe(view.run, view.term)?;
         state.recovered_view = Some((view, status));
         Ok(())
     }
 
     pub(in crate::node) fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
-        let mut state = self.state.lock().unwrap();
-        state.recovered_view = None;
-        state.entries.clear();
-        state.deliveries.clear();
+        self.state.lock().unwrap().clear();
     }
 
     pub(in crate::node) fn reap(&self, now: u64) {
@@ -579,13 +591,11 @@ impl Registry {
 
     pub(super) fn page(
         &self,
-        run: Uuid,
+        authority: Authority,
         after: Option<&Key>,
     ) -> Result<Option<Arc<Stored>>, ProtocolError> {
-        let mut state = self.state.lock().unwrap();
-        if state.run != Some(run) {
-            return Err(wire::unavailable());
-        }
+        let mut state = self.live_state()?;
+        state.observe(authority.run, authority.term)?;
         state.reap(super::now_ms());
         use std::ops::Bound::{Excluded, Unbounded};
         Ok(match after {
@@ -597,19 +607,74 @@ impl Registry {
 
     pub(super) fn install(
         &self,
+        entry: Entry,
+        expect: Option<Option<Version>>,
+        owned_bytes: u64,
+        budget: &ResourceScheduler,
+        now: u64,
+    ) -> Result<Option<Arc<Stored>>, ProtocolError> {
+        self.live_state()?
+            .install(entry, expect, owned_bytes, budget, now)
+    }
+
+    pub(super) fn install_fenced(
+        &self,
+        authority: Authority,
+        entry: Entry,
+        expect: Option<Option<Version>>,
+        owned_bytes: u64,
+        budget: &ResourceScheduler,
+        now: u64,
+    ) -> Result<Option<Arc<Stored>>, ProtocolError> {
+        let mut state = self.live_state()?;
+        state.observe(authority.run, authority.term)?;
+        if entry.run != authority.run || entry.version.term > authority.term {
+            return Err(wire::unavailable());
+        }
+        state.install(entry, expect, owned_bytes, budget, now)
+    }
+}
+impl State {
+    fn bind_run(&mut self, run: Uuid) -> Result<(), ProtocolError> {
+        match self.run {
+            None => self.run = Some(run),
+            Some(existing) if existing == run => {}
+            Some(_) => return Err(wire::unavailable()),
+        }
+        Ok(())
+    }
+
+    fn observe(&mut self, run: Uuid, term: u64) -> Result<(), ProtocolError> {
+        if self.run != Some(run) || term < self.observed_term {
+            return Err(wire::unavailable());
+        }
+        if term > self.observed_term {
+            self.observed_term = term;
+            self.recovered_view = None;
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.recovered_view = None;
+        self.entries.clear();
+        self.deliveries.clear();
+    }
+
+    fn install(
+        &mut self,
         mut entry: Entry,
         expect: Option<Option<Version>>,
         owned_bytes: u64,
         budget: &ResourceScheduler,
         now: u64,
     ) -> Result<Option<Arc<Stored>>, ProtocolError> {
-        let mut state = self.state.lock().unwrap();
-        if self.stopped.load(Ordering::Acquire) || state.run != Some(entry.run) {
+        if self.run != Some(entry.run) {
             return Err(wire::unavailable());
         }
-        state.reap(now);
+        self.reap(now);
         entry.compact(now);
-        let previous = state.entries.get(&entry.key);
+        let previous = self.entries.get(&entry.key);
         if expect.is_some_and(|expect| expect != previous.map(|record| record.entry.version)) {
             return Err(wire::conflict());
         }
@@ -647,7 +712,7 @@ impl Registry {
             return Ok(None);
         }
         if previous.is_none() {
-            state.admit(&entry, now)?;
+            self.admit(&entry, now)?;
         }
         let reserved = previous.filter(|old| {
             entry.scan.is_some()
@@ -661,8 +726,7 @@ impl Registry {
             old.retained.clone()
         } else {
             let (pinned, database_pinned) =
-                state
-                    .entries
+                self.entries
                     .values()
                     .fold((0, 0), |(all, database), stored| {
                         let bytes = stored.retained.as_ref().map_or(0, |charge| charge.bytes());
@@ -694,13 +758,11 @@ impl Registry {
             _identity: identity,
             retained,
         });
-        state
-            .entries
+        self.entries
             .insert(stored.entry.key.clone(), stored.clone());
         Ok(Some(stored))
     }
-}
-impl State {
+
     fn reap(&mut self, now: u64) {
         self.deliveries.retain(|_, hold| hold.idle_at > now);
         self.entries.retain(|_, record| {
@@ -777,6 +839,80 @@ mod tests {
         protocol::{ColumnType, Query, TableFormat},
         storage::{Catalog, CatalogEntry, TableData},
     };
+
+    #[test]
+    fn r05_q03_stream_page_fences_delayed_replica_writes() {
+        let former = Authority {
+            run: Uuid::new_v4(),
+            term: 7,
+        };
+        let current = Authority { term: 8, ..former };
+        let registry = Registry::new();
+        registry.reset_replica(former).unwrap();
+        let now = super::super::now_ms();
+        let key = Key {
+            scope: Scope::from_context(None).unwrap(),
+            id: Uuid::new_v4(),
+        };
+        let late = Entry {
+            key: key.clone(),
+            run: former.run,
+            version: Version { term: 7, index: 1 },
+            identity: [1; 32],
+            accepted_request: None,
+            idle_at: now,
+            closed_at: Some(now),
+            context: None,
+            scan: None,
+            kind: Kind::Snapshot(Snapshot {
+                opened: SnapshotOpened {
+                    snapshot_id: "old".into(),
+                    run_id: former.run,
+                    expires_at: now + IDLE_MS,
+                },
+                handle_id: Uuid::new_v4(),
+                shards: 1,
+            }),
+        };
+        let budget = ResourceScheduler::new(vec![(0, WorkerResources::default())]).unwrap();
+        let install =
+            |authority, entry| registry.install_fenced(authority, entry, None, 0, &budget, now);
+
+        // An old install passed its async fence check before the new page.
+        assert!(registry.page(current, None).unwrap().is_none());
+        let failure = install(former, late.clone()).err().unwrap();
+        assert_eq!(failure.code, ErrorCode::StorageUnavailable);
+        assert!(registry.get(&key).is_none());
+
+        let mut reopened = late.clone();
+        reopened.version = Version { term: 8, index: 1 };
+        let Kind::Snapshot(snapshot) = &mut reopened.kind else {
+            unreachable!()
+        };
+        snapshot.handle_id = Uuid::new_v4();
+        assert_eq!(
+            install(current, reopened.clone())
+                .unwrap()
+                .unwrap()
+                .entry
+                .handle_id(),
+            reopened.handle_id()
+        );
+        assert_eq!(
+            registry.reset_replica(former).unwrap_err().code,
+            ErrorCode::StorageUnavailable
+        );
+        assert_eq!(
+            registry.get(&key).unwrap().entry.handle_id(),
+            reopened.handle_id()
+        );
+
+        // A current repair can restore an older record from another holder.
+        let mut surviving = late;
+        surviving.key.id = Uuid::new_v4();
+        let restored = install(current, surviving.clone()).unwrap().unwrap();
+        assert!(restored.entry == surviving);
+    }
 
     #[test]
     fn st04_recovery_restores_a_complete_record_missing_from_the_new_owner() {

@@ -1,7 +1,7 @@
 //! Signed stream traffic, all-ready installation, and sealed join handoff.
 use super::{
     Authority, Dependency, Driver, Entry, FENCE_READ_BYTES, Key, Registry, Source, Stored, Version,
-    call, check_dependency, install, now_ms, record_bytes,
+    call, check_dependency, now_ms, record_bytes,
     state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryStatus, RecoveryView},
     wire::{self, Batch, Capabilities, Error, Format, Opened, Reply, Request, SnapshotOpened},
 };
@@ -389,7 +389,9 @@ impl Driver for WorkerDriver {
         previous: Option<Version>,
         dependency: Option<Dependency>,
     ) -> Result<Arc<Stored>, Error> {
-        let _change = self.0.queue.lock_changes().await;
+        let _change = tokio::time::timeout(TRANSACTION_TIMEOUT, self.0.queue.lock_stream_changes())
+            .await
+            .map_err(|_| wire::unavailable())?;
         let (observed, root) = self.0.stream_authority().await?;
         if observed.run != authority.run {
             return Err(Error::abandoned());
@@ -401,7 +403,18 @@ impl Driver for WorkerDriver {
             return Err(wire::unavailable().into());
         }
         check_dependency(self.registry(), dependency)?;
-        let stored = install(self, entry, previous)?;
+        let bytes = record_bytes(&entry)?;
+        let stored = self
+            .registry()
+            .install_fenced(
+                observed,
+                entry,
+                Some(previous),
+                bytes,
+                self.pool().scheduler(),
+                now_ms(),
+            )?
+            .ok_or_else(Error::expired)?;
         let own = self
             .0
             .signer
@@ -426,7 +439,9 @@ impl Driver for WorkerDriver {
         if current.run != observed.run {
             return Err(Error::abandoned());
         }
-        if stream_recovery_view(current, &fresh) != view {
+        if stream_recovery_view(current, &fresh) != view
+            || self.registry().recovery_status(view) != Some(RecoveryStatus::AllPeers)
+        {
             return Err(wire::unavailable().into());
         }
         Ok(stored)
@@ -454,7 +469,7 @@ impl Worker {
         Ok(view)
     }
 
-    /// Called with the ordinary queue sealed, after recovery has completed.
+    /// Called with both queues sealed, after stream recovery has completed.
     pub(in crate::node) async fn verify_stream_handoff(
         &self,
         expected: RecoveryView,
@@ -475,6 +490,7 @@ impl Worker {
             return Ok(status);
         }
         tokio::time::timeout(TRANSACTION_TIMEOUT, async {
+            let _change = self.queue.lock_stream_changes().await;
             let mut progress = registry.recovery.lock().await;
             if let Some(status) = registry.recovery_status(expected) {
                 return Ok(status);
@@ -494,7 +510,6 @@ impl Worker {
             }
             let recovery = progress.as_mut().unwrap();
             self.repair_stream_replicas(&root, recovery).await?;
-            let _change = self.queue.lock_changes().await;
             self.check_stream_view(expected).await?;
             let status = if recovery.legacy_peers.contains(&true) {
                 RecoveryStatus::LegacyPeers
@@ -526,19 +541,21 @@ impl Worker {
             .nodes
             .iter()
             .filter(|node| node.node_id != own && ready_stream_worker(node));
-        let run = recovery.view.run;
+        let authority = Authority {
+            run: recovery.view.run,
+            term: recovery.view.term,
+        };
         if let Some(cursor) = recovery.merge.as_mut() {
             while let Some(node) = peers.clone().nth(cursor.peer) {
                 match self
-                    .fetch_stream_page(root, node, run, cursor.after.as_ref())
+                    .fetch_stream_page(root, node, authority.run, cursor.after.as_ref())
                     .await?
                 {
                     StreamPage::Entry(entry, _charge) => {
                         cursor.check_page()?;
                         queue_transport::encoded_len(&entry.key, MAX_RECOVERY_KEY_BYTES)?;
                         let key = entry.key.clone();
-                        let _change = self.queue.lock_changes().await;
-                        self.install_stream_replica(*entry)?;
+                        self.install_stream_replica(authority, *entry)?;
                         cursor.finish_page(key);
                     }
                     StreamPage::End => cursor.finish_peer(),
@@ -555,7 +572,9 @@ impl Worker {
         while let Some(node) = peers.clone().nth(cursor.peer) {
             if recovery.legacy_peers[cursor.peer] {
                 cursor.finish_peer();
-            } else if let Some(stored) = self.queue.streams.page(run, cursor.after.as_ref())? {
+            } else if let Some(stored) =
+                self.queue.streams.page(authority, cursor.after.as_ref())?
+            {
                 queue_transport::encoded_len(&stored.entry.key, MAX_RECOVERY_KEY_BYTES)?;
                 self.transfer_stream(root, node, &stored, true).await?;
                 cursor.finish_page(stored.entry.key.clone());
@@ -687,29 +706,33 @@ impl Worker {
         node: &Node,
         run: Uuid,
     ) -> Result<(), ProtocolError> {
-        self.queue.streams.set_run(run, true)?;
-        self.merge_stream_pages(root, node, run).await
+        let authority = Authority {
+            run,
+            term: root.scheduler.scheduler_term,
+        };
+        self.queue.streams.reset_replica(authority)?;
+        self.merge_stream_pages(root, node, authority).await
     }
 
     async fn merge_stream_pages(
         &self,
         root: &Control,
         node: &Node,
-        run: Uuid,
+        authority: Authority,
     ) -> Result<(), ProtocolError> {
         let mut after = None;
         for _ in 0..MAX_IDENTITIES {
             let StreamPage::Entry(entry, _charge) = self
-                .fetch_stream_page(root, node, run, after.as_ref())
+                .fetch_stream_page(root, node, authority.run, after.as_ref())
                 .await?
             else {
                 return Ok(());
             };
             after = Some(entry.key.clone());
-            self.install_stream_replica(*entry)?;
+            self.install_stream_replica(authority, *entry)?;
         }
         match self
-            .fetch_stream_page(root, node, run, after.as_ref())
+            .fetch_stream_page(root, node, authority.run, after.as_ref())
             .await?
         {
             StreamPage::End => Ok(()),
@@ -793,6 +816,10 @@ impl Worker {
         node: &Node,
         run: Uuid,
     ) -> Result<(), ProtocolError> {
+        let authority = Authority {
+            run,
+            term: root.scheduler.scheduler_term,
+        };
         let reset = self
             .stream_exchange(
                 root,
@@ -811,7 +838,7 @@ impl Worker {
             // stream identity needs to be transferred to them.
             Err(error)
                 if error.code == ErrorCode::NotFound
-                    && self.queue.streams.page(run, None)?.is_none() =>
+                    && self.queue.streams.page(authority, None)?.is_none() =>
             {
                 return self.confirm_legacy_stream_peer(root, node, run).await;
             }
@@ -819,18 +846,27 @@ impl Worker {
             _ => return Err(wire::invalid()),
         }
         let mut after = None;
-        while let Some(stored) = self.queue.streams.page(run, after.as_ref())? {
+        while let Some(stored) = self.queue.streams.page(authority, after.as_ref())? {
             self.transfer_stream(root, node, &stored, true).await?;
             after = Some(stored.entry.key.clone());
         }
         Ok(())
     }
 
-    fn install_stream_replica(&self, entry: Entry) -> Result<(), ProtocolError> {
+    fn install_stream_replica(
+        &self,
+        authority: Authority,
+        entry: Entry,
+    ) -> Result<(), ProtocolError> {
         let bytes = record_bytes(&entry)?;
-        self.queue
-            .streams
-            .install(entry, None, bytes, self.cpu.scheduler(), now_ms())?;
+        self.queue.streams.install_fenced(
+            authority,
+            entry,
+            None,
+            bytes,
+            self.cpu.scheduler(),
+            now_ms(),
+        )?;
         Ok(())
     }
 }
@@ -925,6 +961,7 @@ async fn handle(
         {
             return Err(wire::unavailable());
         }
+        worker.queue.streams.observe(authority)?;
         // Reading or replicating a batch can outlast its storage credentials.
         if matches!(&reply, WorkerReply::Batch(_))
             && let Some((context, token)) = batch_context
@@ -1041,7 +1078,7 @@ async fn accept(
                     Err(error)
                 }
             })?;
-            worker.install_stream_replica(*entry)?;
+            worker.install_stream_replica(fence, *entry)?;
             ControlReply::Installed
         }
         Command::StreamReset { run } => {
@@ -1064,18 +1101,22 @@ async fn accept(
             {
                 return Err(wire::unauthorized().into());
             }
-            worker.queue.streams.set_run(run, true)?;
+            worker.queue.streams.reset_replica(fence)?;
             ControlReply::Installed
         }
         Command::StreamPage { run, after } => {
-            if sender.is_none() || worker.stream_fence(root).await?.run != run {
+            if sender.is_none() {
+                return Err(wire::unauthorized().into());
+            }
+            let fence = worker.stream_fence(root).await?;
+            if fence.run != run {
                 return Err(wire::unauthorized().into());
             }
             ControlReply::Page {
                 entry: worker
                     .queue
                     .streams
-                    .page(run, after.as_ref())?
+                    .page(fence, after.as_ref())?
                     .map(|stored| Box::new(stored.entry.clone())),
             }
         }

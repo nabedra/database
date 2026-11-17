@@ -209,7 +209,8 @@ pub(super) struct QueueRuntime {
     pub(super) seen: Mutex<BTreeMap<Uuid, u64>>,
     active: Mutex<BTreeSet<RequestKey>>,
     changes: Arc<tokio::sync::Mutex<()>>,
-    seals: Mutex<BTreeMap<Uuid, (tokio::time::Instant, tokio::sync::OwnedMutexGuard<()>)>>,
+    stream_changes: Arc<tokio::sync::Mutex<()>>,
+    seals: Mutex<BTreeMap<Uuid, QueueSeal>>,
     changed: tokio::sync::Notify,
     retries: Mutex<BTreeMap<RequestKey, (u32, tokio::time::Instant)>>,
     first_seen: Mutex<BTreeMap<RequestKey, u64>>,
@@ -219,6 +220,13 @@ pub(super) struct QueueRuntime {
     bootstrap: Arc<tokio::sync::Semaphore>,
     progress: Arc<tokio::sync::Semaphore>,
 }
+
+struct QueueSeal {
+    until: tokio::time::Instant,
+    _changes: tokio::sync::OwnedMutexGuard<()>,
+    _stream_changes: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl QueueRuntime {
     pub(super) fn new() -> Self {
         Self {
@@ -228,6 +236,7 @@ impl QueueRuntime {
             seen: Mutex::new(BTreeMap::new()),
             active: Mutex::new(BTreeSet::new()),
             changes: Arc::new(tokio::sync::Mutex::new(())),
+            stream_changes: Arc::new(tokio::sync::Mutex::new(())),
             seals: Mutex::new(BTreeMap::new()),
             changed: tokio::sync::Notify::new(),
             retries: Mutex::new(BTreeMap::new()),
@@ -244,6 +253,15 @@ impl QueueRuntime {
         *self.queue.lock().unwrap() = Some(queue);
     }
     pub(super) async fn lock_changes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_unsealed(&self.changes).await
+    }
+    pub(super) async fn lock_stream_changes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_unsealed(&self.stream_changes).await
+    }
+    async fn lock_unsealed(
+        &self,
+        changes: &Arc<tokio::sync::Mutex<()>>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         loop {
             // Register before inspecting seals so a seal installed by an owner
             // currently copying a join cannot lose its expiration notification.
@@ -253,8 +271,8 @@ impl QueueRuntime {
             let nearest = {
                 let mut seals = self.seals.lock().unwrap();
                 let now = tokio::time::Instant::now();
-                seals.retain(|_, (until, _)| *until > now);
-                seals.values().map(|(until, _)| *until).min()
+                seals.retain(|_, seal| seal.until > now);
+                seals.values().map(|seal| seal.until).min()
             };
             let expiration = async {
                 match nearest {
@@ -263,11 +281,28 @@ impl QueueRuntime {
                 }
             };
             tokio::select! {
-                guard = self.changes.clone().lock_owned() => return guard,
+                guard = changes.clone().lock_owned() => return guard,
                 _ = changed => {},
                 _ = expiration => {},
             }
         }
+    }
+    fn retain_seal(
+        &self,
+        changes: tokio::sync::OwnedMutexGuard<()>,
+        stream_changes: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Uuid {
+        let token = Uuid::new_v4();
+        self.seals.lock().unwrap().insert(
+            token,
+            QueueSeal {
+                until: tokio::time::Instant::now() + Duration::from_secs(30),
+                _changes: changes,
+                _stream_changes: stream_changes,
+            },
+        );
+        self.changed.notify_waiters();
+        token
     }
     pub(super) fn transport(&self, class: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
         match class {
@@ -1109,19 +1144,12 @@ impl Worker {
                     return Err(unavailable());
                 }
                 let stream_view = self.recover_streams_before_handoff(root).await?;
-                self.queue
-                    .seals
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (until, _)| *until > tokio::time::Instant::now());
+                // Handoffs lock streams before the ordinary queue so a
+                // pending replica ACK leaves ordinary operations free to run.
+                let stream_seal = self.queue.lock_stream_changes().await;
                 let seal = self.queue.lock_changes().await;
                 self.verify_stream_handoff(stream_view).await?;
-                let token = Uuid::new_v4();
-                self.queue.seals.lock().unwrap().insert(
-                    token,
-                    (tokio::time::Instant::now() + Duration::from_secs(30), seal),
-                );
-                self.queue.changed.notify_waiters();
+                let token = self.queue.retain_seal(seal, stream_seal);
                 Ok(Reply::Joined { token })
             }
             Command::Join { node_id } => {
@@ -1131,11 +1159,7 @@ impl Worker {
                     return Err(unavailable());
                 }
                 let stream_view = self.recover_streams_before_handoff(root).await?;
-                self.queue
-                    .seals
-                    .lock()
-                    .unwrap()
-                    .retain(|_, (until, _)| *until > tokio::time::Instant::now());
+                let stream_seal = self.queue.lock_stream_changes().await;
                 let seal = self.queue.lock_changes().await;
                 self.verify_stream_handoff(stream_view).await?;
                 self.refresh_queue(root).await?;
@@ -1202,12 +1226,7 @@ impl Worker {
                 }
                 self.copy_stream_replicas(root, node, self.queue.fence()?.run_id)
                     .await?;
-                let token = Uuid::new_v4();
-                self.queue.seals.lock().unwrap().insert(
-                    token,
-                    (tokio::time::Instant::now() + Duration::from_secs(30), seal),
-                );
-                self.queue.changed.notify_waiters();
+                let token = self.queue.retain_seal(seal, stream_seal);
                 Ok(Reply::Joined { token })
             }
             Command::Unseal { token } => {
@@ -1391,7 +1410,7 @@ impl Worker {
                     .seals
                     .lock()
                     .unwrap()
-                    .retain(|_, (until, _)| *until > tokio::time::Instant::now());
+                    .retain(|_, seal| seal.until > tokio::time::Instant::now());
                 let fresh_grant = if let Some(context) = context.as_ref() {
                     let grant = self.open_database(context.clone()).await?;
                     let loaded = self.owned_catalog(root, &grant).await?;
@@ -1618,7 +1637,7 @@ impl Worker {
                 .seals
                 .lock()
                 .unwrap()
-                .retain(|_, (until, _)| *until > tokio::time::Instant::now());
+                .retain(|_, seal| seal.until > tokio::time::Instant::now());
             if let Ok(root) = self.root().await
                 && scheduler(&root)
                     .ok()
@@ -2137,20 +2156,18 @@ mod class_capacity_tests {
     #[tokio::test(start_paused = true)]
     async fn f03_r03_expired_join_seal_releases_waiter_without_pump_or_later_commands() {
         let queue = Arc::new(QueueRuntime::new());
+        let stream_copying = queue.lock_stream_changes().await;
         let copying = queue.lock_changes().await;
         let waiter_queue = queue.clone();
         let waiter = tokio::spawn(async move { waiter_queue.lock_changes().await });
+        let waiter_queue = queue.clone();
+        let stream_waiter = tokio::spawn(async move { waiter_queue.lock_stream_changes().await });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
+        assert!(!stream_waiter.is_finished());
         // The waiting actor started while a join was still copying, before its
         // seal/deadline existed. No pump or second admission runs in this test.
-        let expires = tokio::time::Instant::now() + Duration::from_secs(30);
-        queue
-            .seals
-            .lock()
-            .unwrap()
-            .insert(Uuid::new_v4(), (expires, copying));
-        queue.changed.notify_waiters();
+        queue.retain_seal(copying, stream_copying);
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(29)).await;
         tokio::task::yield_now().await;
@@ -2158,16 +2175,23 @@ mod class_capacity_tests {
             !waiter.is_finished(),
             "join remains sealed before its deadline"
         );
+        assert!(!stream_waiter.is_finished());
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         let admitted = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("expired seal must wake the owned actor without a pump")
             .unwrap();
+        let stream_admitted = tokio::time::timeout(Duration::from_secs(1), stream_waiter)
+            .await
+            .expect("expired seal must wake the stream actor without a pump")
+            .unwrap();
         assert!(queue.seals.lock().unwrap().is_empty());
         assert!(queue.changes.try_lock().is_err());
-        drop(admitted);
+        assert!(queue.stream_changes.try_lock().is_err());
+        drop((admitted, stream_admitted));
         assert!(queue.changes.try_lock().is_ok());
+        assert!(queue.stream_changes.try_lock().is_ok());
     }
     #[test]
     fn m02_r03_working_memory_pressure_does_not_consume_bootstrap_or_small_control_bytes() {
