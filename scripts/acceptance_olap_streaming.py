@@ -341,14 +341,16 @@ class StreamCluster(Cluster):
 def seed(cluster):
     data = [{'id': index, 'text': f'value-{index}'}
             for index in range(23)]
-    status, value = cluster.operation('table.create', {
+    created = cluster.submit('table.create', {
         'name': 'items', 'schema': {'id': 'int64', 'text': 'utf8'},
         'key': 'id', 'format': 'parquet',
     })
-    assert status == 200, value
-    table = value['data']['id']
-    status, value = cluster.operation('table.insert_many', {'table_id': table, 'rows': data})
-    assert status == 200 and value['data'] == len(data), value
+    result = cluster.terminal(created)
+    assert result['state'] == 'succeeded', result
+    table = result['result']['id']
+    inserted = cluster.submit('table.insert_many', {'table_id': table, 'rows': data})
+    result = cluster.terminal(inserted)
+    assert result['state'] == 'succeeded' and result['result'] == len(data), result
     return table, data
 
 
@@ -395,7 +397,7 @@ def lease_lifecycle(cluster, table, rows, extra, evidence):
         assert opened['prefetch_batches'] == depth
         assert cluster.open(body, url=extra) == opened
         cluster.fetch('POST', OPEN, {**body, 'batch_rows': 1}).error(409, 'conflict')
-        cluster.fetch('POST', batch_path(opened, 1)).error(409, 'conflict')
+        cluster.batch(opened, 1).error(409, 'conflict')
         joined = []
         for seq in range(4):
             reply = cluster.batch(opened, seq)
@@ -403,13 +405,13 @@ def lease_lifecycle(cluster, table, rows, extra, evidence):
             joined += reply.json()['rows']
             assert cluster.batch(opened, seq, url=extra).body == reply.body
             if seq > 0:
-                cluster.fetch('POST', batch_path(opened, seq - 1)).error(409, 'conflict')
+                cluster.batch(opened, seq - 1).error(409, 'conflict')
         assert joined == rows
         cluster.batch(opened, 4).empty()
         cluster.batch(opened, 4, url=extra).empty()
         cluster.fetch('DELETE', batch_path(opened)).empty()
         cluster.fetch('DELETE', batch_path(opened), url=extra).empty()
-        cluster.fetch('POST', batch_path(opened, 4)).error(410, 'stream_expired')
+        cluster.batch(opened, 4).error(410, 'stream_expired')
     evidence.append('ST03/ST04/Q05/Q06: all depths, exact rows, same-run open and batch replay, monotonic sequences, EOF replay and idempotent close across APIs')
 
     pending = [cluster.open(cluster.open_body(table, run=run)) for _ in range(16)]
