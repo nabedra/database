@@ -742,6 +742,16 @@ async fn demand<D: Driver>(
             }
         }
     };
+    if context.is_some() && !matches!(&output.checkpoint.outcome, Frame::Error(_)) {
+        let scan = record.entry.scan.as_ref().ok_or_else(Error::expired)?;
+        scan.authorize_examined(
+            source.storage(),
+            driver.pool(),
+            output.checkpoint.first,
+            output.checkpoint.next,
+        )
+        .await?;
+    }
     let updated = if let Some(checkpoint) = replay {
         if output.checkpoint != *checkpoint {
             return Err(wire::fail(
@@ -832,6 +842,11 @@ async fn scan_one<D: Driver>(
         .take()
         .unwrap_or_default();
     let eviction = driver.registry().eviction.load(Ordering::Acquire);
+    if record.entry.context.is_some() {
+        reader
+            .authorize_retained_file(source.storage(), driver.pool(), &scan, first)
+            .await?;
+    }
     let result = reader
         .next_batch(
             source.storage(),

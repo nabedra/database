@@ -6,7 +6,7 @@ use crate::{
     protocol::{ErrorCode, ProtocolError, Row},
     scheduling::{MemoryCharge, with_task_limit},
     snapshot::{self, stream::ProjectedReader},
-    storage::{ObjectKey, ObjectStore, Storage, StorageError, TableData},
+    storage::{ObjectStore, Storage, StorageError, TableData},
     worker_pool::WorkerPool,
 };
 use bytes::Bytes;
@@ -43,7 +43,7 @@ impl OpenFile {
             .filter(|rows| *rows > 0)
             .ok_or_else(corrupt)?
             .min(cursor.raw_remaining);
-        let (key, max_bytes, charge_bytes) = match &scan.data {
+        let (max_bytes, charge_bytes) = match &scan.data {
             TableData::Partitioned { files } => {
                 let file = files.get(cursor.file).ok_or_else(corrupt)?;
                 let metadata = 128 * 1024 + (scan.table.schema.len() as u64) * 4096;
@@ -56,12 +56,11 @@ impl OpenFile {
                     .filter(|bytes| *bytes <= file_budget)
                     .ok_or_else(resource)?;
                 (
-                    ObjectKey::parse_partition(&file.object, scan.table.id),
                     usize::try_from(file.byte_size).map_err(|_| corrupt())?,
                     charged,
                 )
             }
-            TableData::Legacy { snapshot } => {
+            TableData::Legacy { .. } => {
                 let count = usize::try_from(file_rows).map_err(|_| corrupt())?;
                 let base = snapshot::memory_shape(&scan.table, count, 0, 0)?;
                 let max_bytes = file_budget
@@ -70,14 +69,10 @@ impl OpenFile {
                     .filter(|bytes| *bytes > 0)
                     .ok_or_else(legacy_unsupported)?
                     .min(snapshot::MAX_ENCODED_SNAPSHOT_BYTES);
-                (
-                    ObjectKey::parse_snapshot(snapshot, scan.table.id),
-                    max_bytes,
-                    file_budget,
-                )
+                (max_bytes, file_budget)
             }
         };
-        let key = key.map_err(storage_failure)?;
+        let key = scan.file_key(cursor.file)?;
         // Do not wait with a partially filled output accumulator for another
         // stream to release a cached file. The worker can retry this batch
         // from its durable-in-RAM cursor when capacity next becomes available.

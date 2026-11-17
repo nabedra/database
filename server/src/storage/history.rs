@@ -126,6 +126,16 @@ pub enum FenceTransition {
     ColdStart,
 }
 impl<B: ObjectStore> Storage<B> {
+    /// Check GET permission and drop the transfer before reading its body.
+    pub(crate) async fn authorize_object(&self, key: &ObjectKey) -> Result<(), StorageError> {
+        drop(
+            self.backend
+                .get(&format!("{}{}", self.namespace.as_str(), key.as_str()))
+                .await?,
+        );
+        Ok(())
+    }
+
     /// Reauthorize all backing objects before exposing a retained result through
     /// a fresh grant. A successful GET establishes object permission; the body
     /// is immediately dropped rather than downloaded into a shared cache.
@@ -139,27 +149,16 @@ impl<B: ObjectStore> Storage<B> {
             match &entry.data {
                 super::TableData::Legacy { snapshot } => {
                     let key = ObjectKey::parse_snapshot(snapshot, entry.id)?;
-                    timeout_at(
-                        deadline,
-                        self.backend
-                            .get(&format!("{}{}", self.namespace.as_str(), key.as_str())),
-                    )
-                    .await
-                    .map_err(|_| StorageError::Unavailable)??;
+                    timeout_at(deadline, self.authorize_object(&key))
+                        .await
+                        .map_err(|_| StorageError::Unavailable)??;
                 }
                 super::TableData::Partitioned { files } => {
                     for file in files {
                         let key = ObjectKey::parse_partition(&file.object, entry.id)?;
-                        timeout_at(
-                            deadline,
-                            self.backend.get(&format!(
-                                "{}{}",
-                                self.namespace.as_str(),
-                                key.as_str()
-                            )),
-                        )
-                        .await
-                        .map_err(|_| StorageError::Unavailable)??;
+                        timeout_at(deadline, self.authorize_object(&key))
+                            .await
+                            .map_err(|_| StorageError::Unavailable)??;
                     }
                 }
             }

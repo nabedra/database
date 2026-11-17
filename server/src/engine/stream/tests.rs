@@ -370,6 +370,92 @@ async fn st01_st05_shards_seek_to_ranges_and_legacy_rows_sort_once() {
 }
 
 #[tokio::test]
+async fn st04_stream_authorization_checks_only_examined_files() {
+    let (fixture, workers) = ScanFixture::new();
+    let table = table();
+    let rows: Vec<_> = (0..27).map(|id| row(id, id.to_string())).collect();
+    let catalog = fixture.partitioned(&table, &rows, 13).await;
+    let scan = Arc::new(PinnedScan::capture(&catalog, table.id, all()).unwrap());
+    let first = scan.cursor(0, 1).unwrap();
+    let mut reader = ScanReader::default();
+    let batch = reader
+        .next_batch(
+            &fixture.storage,
+            &fixture.pool,
+            scan.clone(),
+            first,
+            options(BatchFormat::Rows, 13),
+        )
+        .await
+        .unwrap();
+    fixture.storage.backend().reads.lock().unwrap().clear();
+    scan.authorize_examined(&fixture.storage, &fixture.pool, first, batch.cursor)
+        .await
+        .unwrap();
+    {
+        let reads = fixture.storage.backend().reads.lock().unwrap();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].ends_with("/0.parquet"));
+    }
+    let successor = reader
+        .next_batch(
+            &fixture.storage,
+            &fixture.pool,
+            scan.clone(),
+            batch.cursor,
+            options(BatchFormat::Rows, 2),
+        )
+        .await
+        .unwrap();
+    fixture.storage.backend().reads.lock().unwrap().clear();
+    scan.authorize_examined(
+        &fixture.storage,
+        &fixture.pool,
+        batch.cursor,
+        successor.cursor,
+    )
+    .await
+    .unwrap();
+    {
+        let reads = fixture.storage.backend().reads.lock().unwrap();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].ends_with("/1.parquet"));
+    }
+    let eof = reader
+        .next_batch(
+            &fixture.storage,
+            &fixture.pool,
+            scan.clone(),
+            successor.cursor,
+            BatchOptions {
+                drop_last: true,
+                ..options(BatchFormat::Rows, 32)
+            },
+        )
+        .await
+        .unwrap();
+    assert!(eof.data.is_none());
+    fixture.storage.backend().reads.lock().unwrap().clear();
+    scan.authorize_examined(
+        &fixture.storage,
+        &fixture.pool,
+        successor.cursor,
+        eof.cursor,
+    )
+    .await
+    .unwrap();
+    scan.authorize_examined(&fixture.storage, &fixture.pool, eof.cursor, eof.cursor)
+        .await
+        .unwrap();
+    {
+        let reads = fixture.storage.backend().reads.lock().unwrap();
+        assert_eq!(reads.len(), 1);
+        assert!(reads[0].ends_with("/1.parquet"));
+    }
+    workers.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn st01_projection_keeps_partition_integrity_checks() {
     let (fixture, workers) = ScanFixture::new();
     let table = table();

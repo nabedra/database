@@ -9,6 +9,7 @@ use crate::{
     worker_pool::WorkerThreads,
 };
 use serde_json::{Value, json};
+use std::sync::atomic::AtomicBool;
 
 const MIB: u64 = 1 << 20;
 
@@ -16,10 +17,14 @@ const MIB: u64 = 1 << 20;
 struct Store {
     inner: Fake,
     next_partition: std::sync::Mutex<Option<Arc<ReadGate>>>,
+    partition_denied: AtomicBool,
 }
 impl ObjectStore for Store {
     async fn get(&self, key: &str) -> Result<Download, StorageError> {
         if key.ends_with(".parquet") {
+            if self.partition_denied.load(Ordering::Acquire) {
+                return Err(StorageError::Unavailable);
+            }
             let gate = self.next_partition.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.entered.add_permits(1);
@@ -328,6 +333,160 @@ fn managed(prefix: &str, secret: &str) -> RequestContext {
         }
     }))
     .unwrap()
+}
+
+#[derive(Clone)]
+struct GrantDriver(LocalDriver<Store>);
+impl Driver for GrantDriver {
+    type Store = Store;
+
+    fn registry(&self) -> &Arc<Registry> {
+        self.0.registry()
+    }
+
+    fn pool(&self) -> &WorkerPool {
+        self.0.pool()
+    }
+
+    async fn authority(&self) -> Result<Authority, ProtocolError> {
+        self.0.authority().await
+    }
+
+    async fn source(
+        &self,
+        context: Option<RequestContext>,
+    ) -> Result<Source<Store>, ProtocolError> {
+        context
+            .ok_or_else(wire::unauthorized)?
+            .validate(now_ms() / 1000)
+            .map_err(|_| wire::unauthorized())?;
+        self.0.source(None).await
+    }
+
+    async fn catalog(&self, source: &Source<Store>) -> Result<LoadedClusterCatalog, ProtocolError> {
+        self.0.catalog(source).await
+    }
+
+    async fn commit(
+        &self,
+        authority: Authority,
+        entry: Entry,
+        previous: Option<Version>,
+        dependency: Option<Dependency>,
+    ) -> Result<Arc<Stored>, Error> {
+        self.0.commit(authority, entry, previous, dependency).await
+    }
+}
+
+#[tokio::test]
+async fn st04_managed_stream_rechecks_revoked_object_access() {
+    let (engine, threads, run, table) = seeded().await;
+    let local = Local::new();
+    local.registry.set_run(run, false).unwrap();
+    let driver = GrantDriver(LocalDriver {
+        registry: local.registry.clone(),
+        changes: local.changes.clone(),
+        engine: engine.clone(),
+        run,
+    });
+    let context = managed("stream-worker-test", "synthetic-secret");
+    let ask = |request| call(driver.clone(), request, Some(context.clone()));
+    let denied = &engine.storage().backend().partition_denied;
+    let scope = Scope::from_context(Some(&context)).unwrap();
+
+    let mut body = open(run, table, 1);
+    let Reply::SnapshotOpened(snapshot) = ask(Request::OpenSnapshot(OpenSnapshot {
+        request_id: Uuid::new_v4(),
+        expected_run_id: run,
+        table_id: table,
+        query: body.query.clone(),
+        shards: 1,
+    }))
+    .await
+    .unwrap() else {
+        panic!("shared snapshot did not open");
+    };
+    body.snapshot_id = Some(snapshot.snapshot_id);
+    let key = Key {
+        scope: scope.clone(),
+        id: body.request_id,
+    };
+    let Reply::Opened(prefetched) = ask(Request::Open(body)).await.unwrap() else {
+        panic!("prefetched stream did not open");
+    };
+    let before = local.registry.get(&key).unwrap();
+    settled(&before.activity).await;
+    assert_eq!(ready(&before.activity), vec![0]);
+    denied.store(true, Ordering::Release);
+    assert_eq!(
+        code(ask(request(&prefetched, 0)).await.unwrap_err()),
+        ErrorCode::Unauthorized
+    );
+    assert!(local.registry.get(&key).unwrap().entry.eq(&before.entry));
+
+    denied.store(false, Ordering::Release);
+    let Reply::Batch(delivered) = ask(request(&prefetched, 0)).await.unwrap() else {
+        panic!("first authorized batch was unavailable");
+    };
+    let original = delivered.bytes.to_vec();
+    drop(delivered);
+    let delivered_record = local.registry.get(&key).unwrap();
+    settled(&delivered_record.activity).await;
+    assert!(
+        delivered_record
+            .activity
+            .cache
+            .lock()
+            .unwrap()
+            .last
+            .is_some()
+    );
+    denied.store(true, Ordering::Release);
+    assert_eq!(
+        code(ask(request(&prefetched, 0)).await.unwrap_err()),
+        ErrorCode::Unauthorized
+    );
+    assert!(
+        local
+            .registry
+            .get(&key)
+            .unwrap()
+            .entry
+            .eq(&delivered_record.entry)
+    );
+    denied.store(false, Ordering::Release);
+    let Reply::Batch(replayed) = ask(request(&prefetched, 0)).await.unwrap() else {
+        panic!("authorized replay was unavailable");
+    };
+    assert_eq!(replayed.bytes.as_ref(), original.as_slice());
+    drop(replayed);
+
+    let body = open(run, table, 0);
+    let key = Key {
+        scope,
+        id: body.request_id,
+    };
+    let Reply::Opened(on_demand) = ask(Request::Open(body)).await.unwrap() else {
+        panic!("on-demand stream did not open");
+    };
+    drop(ask(request(&on_demand, 0)).await.unwrap());
+    let before = local.registry.get(&key).unwrap();
+    assert!(before.activity.reader.lock().unwrap().is_some());
+    denied.store(true, Ordering::Release);
+    assert_eq!(
+        code(ask(request(&on_demand, 1)).await.unwrap_err()),
+        ErrorCode::Unauthorized
+    );
+    assert!(local.registry.get(&key).unwrap().entry.eq(&before.entry));
+    denied.store(false, Ordering::Release);
+    let Reply::Batch(successor) = ask(request(&on_demand, 1)).await.unwrap() else {
+        panic!("authorized successor batch was unavailable");
+    };
+    let frame: Value = serde_json::from_slice(&successor.bytes).unwrap();
+    assert_eq!(frame["rows"][0]["id"], 3);
+    drop(successor);
+    drop(local);
+    threads.shutdown().await.unwrap();
 }
 
 #[tokio::test]

@@ -5,12 +5,13 @@ mod file;
 mod tests;
 
 use crate::{
+    engine::partition::storage_failure,
     protocol::{
         ErrorCode, LogicalPredicate, MAX_BATCH_ROWS, MAX_BODY_BYTES, Outcome, Predicate,
         ProtocolError, Query, TableDescriptor,
     },
     scheduling::MemoryCharge,
-    storage::{Catalog, CatalogEntry, ClusterCatalog, ObjectStore, Storage, TableData},
+    storage::{Catalog, CatalogEntry, ClusterCatalog, ObjectKey, ObjectStore, Storage, TableData},
     worker_pool::WorkerPool,
 };
 use bytes::Bytes;
@@ -19,14 +20,19 @@ use serde_json::value::RawValue;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Write},
+    ops::Range,
     sync::Arc,
+    time::Duration,
 };
+use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
 
 use encoding::BatchEncoder;
 use file::OpenFile;
 
 pub(crate) const MAX_PINNED_QUERY_BYTES: usize = 128 * 1024;
+const GET_AUTH_BYTES: u64 = 64 * 1024;
+const GET_AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The worker can transfer this descriptor through its replicated RAM queue.
 /// The manifest and query come from a validated catalog and stream request.
@@ -195,6 +201,65 @@ impl PinnedScan {
         end.checked_sub(*start).ok_or_else(corrupt)
     }
 
+    fn file_key(&self, file: usize) -> Result<ObjectKey, ProtocolError> {
+        match &self.data {
+            TableData::Partitioned { files } => {
+                let partition = files.get(file).ok_or_else(corrupt)?;
+                ObjectKey::parse_partition(&partition.object, self.table.id)
+            }
+            TableData::Legacy { snapshot } if file == 0 => {
+                ObjectKey::parse_snapshot(snapshot, self.table.id)
+            }
+            TableData::Legacy { .. } => return Err(corrupt()),
+        }
+        .map_err(storage_failure)
+    }
+
+    pub(crate) async fn authorize_examined<B: ObjectStore>(
+        &self,
+        storage: &Storage<B>,
+        pool: &WorkerPool,
+        first: Cursor,
+        next: Cursor,
+    ) -> Result<(), ProtocolError> {
+        if first == next {
+            return Ok(());
+        }
+        // Readers advance to the next file at an exact boundary. A nonzero
+        // final offset includes that file, even if every row was filtered out.
+        let end = next
+            .file
+            .checked_add(usize::from(next.raw_offset != 0))
+            .ok_or_else(corrupt)?;
+        self.authorize_files(storage, pool, first.file..end).await
+    }
+
+    async fn authorize_files<B: ObjectStore>(
+        &self,
+        storage: &Storage<B>,
+        pool: &WorkerPool,
+        files: Range<usize>,
+    ) -> Result<(), ProtocolError> {
+        if files.is_empty() || files.end >= self.file_starts.len() {
+            return Err(corrupt());
+        }
+        let _charge = pool.scheduler().charge_memory(0, GET_AUTH_BYTES)?;
+        let deadline = Instant::now() + GET_AUTH_TIMEOUT;
+        for file in files {
+            let key = self.file_key(file)?;
+            timeout_at(deadline, storage.authorize_object(&key))
+                .await
+                .map_err(|_| {
+                    error(
+                        ErrorCode::StorageUnavailable,
+                        "stream authorization timed out",
+                    )
+                })?
+                .map_err(|_| error(ErrorCode::Unauthorized, "stream object access denied"))?;
+        }
+        Ok(())
+    }
+
     fn output_columns(&self) -> &[String] {
         self.query.select.as_ref().expect("normalized projection")
     }
@@ -341,6 +406,21 @@ pub(crate) struct ScanReader {
     file: Option<OpenFile>,
 }
 impl ScanReader {
+    pub(crate) async fn authorize_retained_file<B: ObjectStore>(
+        &mut self,
+        storage: &Storage<B>,
+        pool: &WorkerPool,
+        scan: &PinnedScan,
+        cursor: Cursor,
+    ) -> Result<(), ProtocolError> {
+        if !cursor.exhausted() && self.file.as_ref().is_some_and(|file| file.at(scan, cursor)) {
+            let end = cursor.file.checked_add(1).ok_or_else(corrupt)?;
+            scan.authorize_files(storage, pool, cursor.file..end)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn next_batch<B: ObjectStore>(
         &mut self,
         storage: &Storage<B>,
