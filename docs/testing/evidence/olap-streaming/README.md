@@ -35,10 +35,11 @@ The earlier OLAP process run completed ten assertion groups in 125.9 seconds. Be
 ## Engine regression and remaining checks
 
 - The full candidate OLAP Rust run at `b30fc1f` passed all 774 tests across 41 Cargo test groups in 447 seconds.
-- At `9c37b68` the full OLAP Rust run passed 765 tests. Python passed 183 tests and skipped one Arrow case in the base environment. A separate five-test Python stream run at `3696d63` passed with PyArrow installed, including IPC validation. The default, OLAP-only, OLTP-only, and OLTP with S3 dependency graph checks passed (O02). The OLAP-only dependency graph included Arrow IPC 60.1.0. The OLTP-only graph excluded it. The invalid-feature compile guards were interrupted for the test handoff.
-- The OLTP build at `9c37b68` linked a cached native RocksDB archive after checking the exact `librocksdb-sys` lock entry, target and compiler settings, and byte-for-byte matches for six newly compiled object files. The build compiled the Rust crate, wrappers and tests from the pinned source. The OLTP library suite passed 146 of 147 tests. `c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory` panicked on a subtraction underflow in `src/oltp/pool/tests.rs`. Fifteen integration tests passed in four test executables before handoff. The exact older-baseline rerun remains pending.
+- The candidate S3-enabled OLAP library check passed in 385 seconds using 1.5 CPUs and 3.5 GiB, with a 1.46 GiB peak and zero OOM events. Both invalid engine selections exited with the expected `select exactly one engine: olap or oltp` diagnostic. The check with neither engine took 22 seconds and the check with both engines took 104 seconds. The two checks shared a 2 CPU and 3.5 GiB container with a 1.53 GiB peak and zero OOM events.
+- At `9c37b68` the full OLAP Rust run passed 765 tests. Python passed 183 tests and skipped one Arrow case in the base environment. A separate five-test Python stream run at `3696d63` passed with PyArrow installed, including IPC validation. The default, OLAP-only, OLTP-only, and OLTP with S3 dependency graph checks passed (O02). The OLAP-only dependency graph included Arrow IPC 60.1.0. The OLTP-only graph excluded it.
+- The OLTP build at `9c37b68` linked a cached native RocksDB archive after checking the exact `librocksdb-sys` lock entry, target and compiler settings, and byte-for-byte matches for six newly compiled object files. The build compiled the Rust crate, wrappers and tests from the pinned source. The OLTP library suite passed 146 of 147 tests and 15 integration tests passed in four test executables before handoff. `c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory` panicked on a subtraction underflow at `src/oltp/pool/tests.rs:722:28`. A Docker rerun of that exact selector on the earlier `6dfc713` baseline used the same Rust toolchain and verified RocksDB archive. It reproduced the same panic and exit code 101.
 - The pinned OLTP single-node probe required four workers in its local fixture. All 13 unchanged ORM operations passed at 1 and 100 rows. The 1,000-row `insert_many` exceeded the 20-second SDK deadline and returned `UnknownOutcomeError`. The separate retry measured 20,049 ms and the owned process was reaped after its 15-second graceful shutdown watchdog. The trace leaves the mutation outcome unknown.
-- GPU performance, live S3 permissions, autoscaling and provider tests, final feature guards, and verification against the published OLTP branch remain open. The cgroup evidence covers local Docker execution.
+- GPU performance, live S3 permissions, autoscaling and provider tests, and verification against the published OLTP branch remain open. The cgroup evidence covers local Docker execution.
 
 ## Reproduce
 
@@ -50,6 +51,7 @@ export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 RUST_TEST_THREADS=1
 
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap --bin nabedra-db
 cargo test --locked --manifest-path server/Cargo.toml --no-default-features --features olap --lib --tests
+cargo check --locked --manifest-path server/Cargo.toml --no-default-features --features olap,s3 --lib
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features oltp --bin nabedra-db
 cargo test --locked --manifest-path server/Cargo.toml --no-default-features --features oltp --lib --tests
 python3.11 scripts/check_engine_features.py --dependencies-only
