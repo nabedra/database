@@ -312,8 +312,8 @@ def main():
     with binary.open('rb') as stream:
         binary_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
     workloads = (
-        Workload('dense_fast', 1024, (32, 80), 32),
-        Workload('sparse_wide', 1536, (128, 480), 24, train_delay_ms=35,
+        Workload('dense_fast', 512, (32, 80), 64),
+        Workload('sparse_wide', 640, (128, 480), 32, train_delay_ms=35,
                  storage_jitter_ms=(0, 5, 13, 25), sparse=True, ordinary_rate=8),
     )
     options = execution(cap=3, pending=64, queue_bytes=64 << 20)
