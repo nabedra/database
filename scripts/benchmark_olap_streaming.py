@@ -49,7 +49,11 @@ def seed_table(db, name, count, width, seed):
                  payload=''.join(rng.choices(alphabet, k=rng.randint(*width))))
             for index in range(count)]
     table = db.create_table(name, {'id': int, 'selected': bool, 'payload': str}, key='id')
-    assert table.insert_many(rows) == count
+    # Bound the setup mutation when the fixture runs beside other test jobs.
+    # Seed the same rows before creating the snapshot used by every trial.
+    for start in range(0, count, 128):
+        chunk = rows[start:start + 128]
+        assert table.insert_many(chunk) == len(chunk)
     return table, rows
 
 
@@ -262,7 +266,7 @@ def depth_summary(trials):
 
 
 def measure(cluster, observer, table, reference, workload, seed, result, save):
-    db = Database(cluster.api_door.url, cluster.auth['data_token'], mode='olap', timeout=15)
+    db = Database(cluster.api_door.url, cluster.auth['data_token'], mode='olap', timeout=40)
     training, rows = seed_table(db, workload.name, workload.rows, workload.payload_width, seed)
     catalog_commit, files = cluster.manifest(workload.name)
     jitter = {path: workload.storage_jitter_ms[index % len(workload.storage_jitter_ms)] / 1000
