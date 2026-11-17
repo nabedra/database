@@ -688,6 +688,32 @@ impl AsRef<[u8]> for BatchOwner {
     }
 }
 
+fn demand_position(
+    record: &Stored,
+    sequence: u64,
+    now: u64,
+) -> Result<(&Stream, Cursor, Option<&Checkpoint>), Error> {
+    let Kind::Stream(stream) = &record.entry.kind else {
+        return Err(wire::conflict().into());
+    };
+    if !record.entry.active(now) {
+        return Err(Error::expired());
+    }
+    match &stream.checkpoint {
+        Some(checkpoint) if sequence == checkpoint.sequence => {
+            Ok((stream, checkpoint.first, Some(checkpoint)))
+        }
+        Some(checkpoint)
+            if checkpoint.sequence.checked_add(1) == Some(sequence)
+                && matches!(checkpoint.outcome, Frame::Bytes(_)) =>
+        {
+            Ok((stream, checkpoint.next, None))
+        }
+        None if sequence == 0 => Ok((stream, stream.first, None)),
+        _ => Err(wire::conflict().into()),
+    }
+}
+
 async fn demand<D: Driver>(
     driver: D,
     authority: Authority,
@@ -699,26 +725,17 @@ async fn demand<D: Driver>(
     if key.id.is_nil() {
         return Err(wire::invalid().into());
     }
-    let record = driver.registry().handle(&key)?.ok_or_else(Error::expired)?;
-    let Kind::Stream(stream) = &record.entry.kind else {
-        return Err(wire::conflict().into());
-    };
-    if !record.entry.active(now) {
-        return Err(Error::expired());
-    }
+    let registry = driver.registry();
+    let mut record = registry.handle(&key)?.ok_or_else(Error::expired)?;
+    demand_position(&record, sequence, now)?;
     let delivery = record.activity.delivery()?;
+    // A batch or close may have committed between lookup and permit acquisition.
+    record = registry
+        .get(&record.entry.key)
+        .filter(|current| Arc::ptr_eq(&current.activity, &record.activity))
+        .ok_or_else(Error::expired)?;
+    let (stream, first, replay) = demand_position(&record, sequence, now_ms())?;
     let source = driver.source(context.clone()).await?;
-    let (first, replay) = match &stream.checkpoint {
-        Some(checkpoint) if sequence == checkpoint.sequence => (checkpoint.first, Some(checkpoint)),
-        Some(checkpoint)
-            if checkpoint.sequence.checked_add(1) == Some(sequence)
-                && matches!(checkpoint.outcome, Frame::Bytes(_)) =>
-        {
-            (checkpoint.next, None)
-        }
-        None if sequence == 0 => (stream.first, None),
-        _ => return Err(wire::conflict().into()),
-    };
 
     let output = if let Some(checkpoint) = replay
         && !matches!(checkpoint.outcome, Frame::Bytes(_))

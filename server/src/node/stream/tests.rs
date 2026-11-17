@@ -186,6 +186,42 @@ fn code(error: Error) -> ErrorCode {
 }
 
 #[tokio::test]
+async fn st04_invalid_sequences_conflict_during_delivery() {
+    let (engine, threads, run, table) = seeded().await;
+    let local = Local::new();
+    let opened = opened(&local, &engine, run, open(run, table, 0)).await;
+    assert!(matches!(
+        local.call(&engine, run, request(&opened, 0)).await.unwrap(),
+        Reply::Batch(_)
+    ));
+    let Reply::Batch(delivery) = local.call(&engine, run, request(&opened, 1)).await.unwrap()
+    else {
+        panic!("second demand did not return a batch");
+    };
+    for sequence in [0, 3] {
+        let error = local
+            .call(&engine, run, request(&opened, sequence))
+            .await
+            .unwrap_err();
+        assert_eq!(code(error), ErrorCode::Conflict, "sequence {sequence}");
+    }
+    let overlap = local
+        .call(&engine, run, request(&opened, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(code(overlap), ErrorCode::Overloaded);
+    let expected = delivery.bytes.to_vec();
+    drop(delivery);
+    let Reply::Batch(replay) = local.call(&engine, run, request(&opened, 1)).await.unwrap() else {
+        panic!("retry did not return a batch");
+    };
+    assert_eq!(replay.bytes.as_ref(), expected.as_slice());
+    drop(replay);
+    drop(local);
+    threads.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn st03_prefetch_window_and_egress_lifetime() {
     let (engine, threads, run, table) = seeded().await;
     let pool = engine.worker_pool();
