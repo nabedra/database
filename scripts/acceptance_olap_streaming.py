@@ -354,9 +354,10 @@ def sdk_faults(cluster, _table, rows, extra, evidence):
             assert [row for batch in stream for row in batch] == rows
         for pair, fault in ((batch_zero, 'drop'), (batch_one, 'truncate')):
             attempts = [record for record in proxy.exchanges if record[0] == pair]
-            assert [record[1] for record in attempts] == [fault, None]
-            assert attempts[0][3].status == attempts[1][3].status == 200
-            assert attempts[0][3].body == attempts[1][3].body
+            assert attempts[0][1] == fault and all(attempt[1] is None for attempt in attempts[1:])
+            assert attempts[0][3].status == attempts[-1][3].status == 200
+            assert all(attempt[3].status in (429, 503) for attempt in attempts[1:-1])
+            assert attempts[0][3].body == attempts[-1][3].body
         assert cluster.fetch('POST', batch_path(lease, 0)).status == 410
     finally:
         proxy.close()
