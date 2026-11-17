@@ -4,6 +4,8 @@ mod file;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+use crate::storage::Catalog;
 use crate::{
     engine::partition::storage_failure,
     protocol::{
@@ -12,8 +14,7 @@ use crate::{
     },
     scheduling::MemoryCharge,
     storage::{
-        Catalog, CatalogEntry, ClusterCatalog, ObjectAccessError, ObjectKey, ObjectStore, Storage,
-        TableData,
+        CatalogEntry, ClusterCatalog, ObjectAccessError, ObjectKey, ObjectStore, Storage, TableData,
     },
     worker_pool::WorkerPool,
 };
@@ -78,6 +79,7 @@ impl Write for QueryBytesLeft {
 }
 
 impl PinnedScan {
+    #[cfg(test)]
     pub(crate) fn capture(
         catalog: &Catalog,
         table_id: Uuid,
