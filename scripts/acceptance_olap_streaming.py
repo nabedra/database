@@ -477,7 +477,7 @@ def sdk_faults(cluster, _table, rows, extra, evidence):
 
 def overlapping_delivery(cluster, table, rows, extra, evidence):
     opened = cluster.open(cluster.open_body(table))
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         with cluster.checkpoint_gate(opened, 0, 'after') as gate:
             demand = pool.submit(cluster.fetch, 'POST', batch_path(opened, 0))
             assert gate.entered.wait(12), 'replica never returned a complete checkpoint ACK'
@@ -485,11 +485,16 @@ def overlapping_delivery(cluster, table, rows, extra, evidence):
             assert gate.trace['sender'] != gate.trace['receiver']
             assert not demand.done(), 'API delivered before receiving the install ACK'
             cluster.fetch('POST', batch_path(opened, 0), url=extra).error(429, 'overloaded')
+            ordinary = pool.submit(cluster.operation, 'table.get', {'table_id': table, 'key': 9})
+            status, result = ordinary.result(10)
+            assert status == 200 and result['data'] == rows[9], result
+            assert not gate.release.is_set()
             assert not demand.done()
         assert demand.result(20).json()['rows'] == rows[:3]
     assert cluster.batch(opened, 0, url=extra).json()['rows'] == rows[:3]
     cluster.fetch('DELETE', batch_path(opened)).empty()
     evidence.append('ST03/ST04/Q03/Q05: real second API refused overlapping same-sequence delivery while complete replica ACK was held')
+    evidence.append('ST03/C07: an ordinary table.get settled before the stream checkpoint acknowledgement was released')
 
 
 def unauthorized_signature(door, original):
