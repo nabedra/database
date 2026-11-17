@@ -42,6 +42,8 @@ use std::{
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
 use uuid::Uuid;
 
+const FENCE_READ_BYTES: u64 = 8 * MAX_CATALOG_BYTES as u64;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Authority {
     run: Uuid,
@@ -175,6 +177,11 @@ impl<B: ObjectStore + 'static> Driver for LocalDriver<B> {
         if self.registry.stopped.load(Ordering::Acquire) {
             return Err(wire::unavailable());
         }
+        let _catalog = self
+            .pool()
+            .scheduler()
+            .charge_memory(0, FENCE_READ_BYTES)
+            .map_err(|_| wire::overloaded())?;
         let catalog = self
             .engine
             .storage()
@@ -372,7 +379,7 @@ async fn capture<D: Driver>(
     let charge = driver
         .pool()
         .scheduler()
-        .charge_memory(0, 8 * MAX_CATALOG_BYTES as u64)?;
+        .charge_memory(0, FENCE_READ_BYTES)?;
     let loaded = driver.catalog(&source).await?;
     let catalog = loaded.catalog();
     let fence = catalog.fence.ok_or_else(wire::unavailable)?;

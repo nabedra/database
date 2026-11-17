@@ -1,8 +1,8 @@
 //! Signed stream traffic, all-ready installation, and sealed join handoff.
 use super::{
-    Authority, Dependency, Driver, Entry, Key, Registry, Source, Stored, Version, call,
-    check_dependency, install, now_ms, record_bytes,
-    state::MAX_RECORD_BYTES,
+    Authority, Dependency, Driver, Entry, FENCE_READ_BYTES, Key, Registry, Source, Stored, Version,
+    call, check_dependency, install, now_ms, record_bytes,
+    state::{MAX_IDENTITIES, MAX_RECORD_BYTES},
     wire::{self, Batch, Capabilities, Error, Format, Opened, Reply, Request, SnapshotOpened},
 };
 use crate::{
@@ -16,7 +16,8 @@ use crate::{
         queue_transport,
         runtime::Worker,
     },
-    protocol::ProtocolError,
+    protocol::{ErrorCode, MAX_PREDICATE_DEPTH, ProtocolError},
+    scheduling::MemoryCharge,
     storage::{LoadedClusterCatalog, RuntimeStore, context::RequestContext},
     worker_pool::WorkerPool,
 };
@@ -38,6 +39,12 @@ pub(crate) const PATH: &str = "/internal/v1/streams";
 const CONTROL_REPLY_BYTES: usize = 16 << 10;
 const CONTROL_REQUEST_BYTES: usize = wire::MAX_REQUEST_BYTES + (64 << 10);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn predicate_decode_bytes(wire_bytes: usize) -> u64 {
+    // A stream record may contain a large manifest. Only the bounded query
+    // inside it can retain a raw predicate copy at each decoding level.
+    (wire_bytes.min(wire::MAX_REQUEST_BYTES) * (MAX_PREDICATE_DEPTH + 8)) as u64
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(
@@ -101,6 +108,12 @@ enum WorkerReply {
     Control(ControlReply),
     Batch(Batch),
 }
+
+struct StagedReply {
+    reply: ControlReply,
+    _charge: MemoryCharge,
+}
+
 impl From<Reply> for WorkerReply {
     fn from(reply: Reply) -> Self {
         match reply {
@@ -133,12 +146,16 @@ pub(crate) async fn remote(
     } else {
         CONTROL_REPLY_BYTES
     };
-    let reply = exchange(client, signer, root, node, &command, response_cap).await;
+    let reply = exchange(client, signer, root, node, &command, response_cap, |_| {
+        Ok(())
+    })
+    .await;
     if let (Err(_), Some(token)) = (&reply, delivery) {
         let _ = tokio::time::timeout(Duration::from_secs(2), release(client, signer, root, token))
             .await;
     }
-    match reply? {
+    let (reply, ()) = reply?;
+    match reply {
         WorkerReply::Control(ControlReply::Capabilities(value)) => Ok(Reply::Capabilities(value)),
         WorkerReply::Control(ControlReply::Opened(value)) => Ok(Reply::Opened(value)),
         WorkerReply::Control(ControlReply::SnapshotOpened(value)) => {
@@ -181,52 +198,56 @@ async fn settle_delivery(
     renew: bool,
 ) -> Result<(), ProtocolError> {
     let node = scheduler(root)?;
-    match exchange(
+    let (reply, ()) = exchange(
         client,
         signer,
         root,
         node,
         &Command::StreamRelease { token, renew },
         CONTROL_REPLY_BYTES,
+        |_| Ok(()),
     )
-    .await?
-    {
+    .await?;
+    match reply {
         WorkerReply::Control(ControlReply::Released) => Ok(()),
         _ => Err(wire::unavailable()),
     }
 }
 
-async fn exchange(
+async fn exchange<T>(
     client: &http::HttpClient,
     signer: &http::Signer,
     root: &Control,
     node: &Node,
     command: &Command,
     response_cap: usize,
-) -> Result<WorkerReply, ProtocolError> {
+    reserve_reply: impl FnOnce(usize) -> Result<T, ProtocolError>,
+) -> Result<(WorkerReply, T), ProtocolError> {
     let cap = match command {
         Command::StreamInstall { .. } => MAX_RECORD_BYTES + 4096,
         _ => CONTROL_REQUEST_BYTES,
     };
     let length = queue_transport::encoded_len(command, cap)?;
     let bytes = queue_transport::encode_exact(command, length)?;
-    let bytes = queue_transport::exchange_bounded(
+    let (bytes, charge) = queue_transport::exchange_accounted(
         client,
         signer,
         root,
         node,
         bytes,
         response_cap.saturating_add(1),
+        None,
+        reserve_reply,
     )
     .await?;
     let Some(&marker) = bytes.first() else {
         return Err(wire::invalid());
     };
-    match marker {
-        0 => Ok(WorkerReply::Control(
-            serde_json::from_slice(&bytes[1..]).map_err(|_| wire::invalid())?,
-        )),
-        1 | 2 if bytes.len() > 1 => Ok(WorkerReply::Batch(Batch {
+    let reply = match marker {
+        0 => {
+            WorkerReply::Control(serde_json::from_slice(&bytes[1..]).map_err(|_| wire::invalid())?)
+        }
+        1 | 2 if bytes.len() > 1 => WorkerReply::Batch(Batch {
             bytes: Bytes::from(bytes).slice(1..),
             format: if marker == 1 {
                 Format::Rows
@@ -234,9 +255,10 @@ async fn exchange(
                 Format::Arrow
             },
             release: None,
-        })),
-        _ => Err(wire::invalid()),
-    }
+        }),
+        _ => return Err(wire::invalid()),
+    };
+    Ok((reply, charge))
 }
 
 #[derive(Clone)]
@@ -260,6 +282,7 @@ impl Driver for WorkerDriver {
             return Err(wire::unavailable());
         }
         self.registry().set_run(authority.run, false)?;
+        self.0.ensure_stream_recovered(authority).await?;
         Ok(authority)
     }
 
@@ -360,6 +383,72 @@ impl Driver for WorkerDriver {
 }
 
 impl Worker {
+    async fn ensure_stream_recovered(&self, expected: Authority) -> Result<(), ProtocolError> {
+        if self.queue.streams.recovered(expected.run, expected.term) {
+            return Ok(());
+        }
+        tokio::time::timeout(TRANSACTION_TIMEOUT, async {
+            let _change = self.queue.lock_changes().await;
+            if self.queue.streams.recovered(expected.run, expected.term) {
+                return Ok(());
+            }
+            let (authority, root) = self.stream_authority().await?;
+            if authority != expected {
+                return Err(wire::unavailable());
+            }
+            self.repair_stream_replicas(&root, authority).await
+        })
+        .await
+        .map_err(|_| wire::unavailable())?
+    }
+
+    /// A fenced predecessor may have lost its reply mid-installation. Recover
+    /// complete records from every ready holder before accepting new work.
+    async fn repair_stream_replicas(
+        &self,
+        root: &Control,
+        authority: Authority,
+    ) -> Result<(), ProtocolError> {
+        let own = self
+            .signer
+            .sender()
+            .node_id()
+            .ok_or_else(wire::unavailable)?;
+        let ready = members(root);
+        let peers = root
+            .nodes
+            .iter()
+            .filter(|node| node.node_id != own && ready.contains(&node.node_id));
+        for node in peers.clone() {
+            self.merge_stream_pages(root, node, authority.run).await?;
+        }
+        self.check_stream_view(root, authority).await?;
+
+        let mut after = None;
+        while let Some(stored) = self.queue.streams.page(authority.run, after.as_ref())? {
+            for node in peers.clone() {
+                self.transfer_stream(root, node, &stored, true).await?;
+            }
+            after = Some(stored.entry.key.clone());
+        }
+        self.check_stream_view(root, authority).await?;
+        self.queue
+            .streams
+            .mark_recovered(authority.run, authority.term)
+    }
+
+    async fn check_stream_view(
+        &self,
+        root: &Control,
+        expected: Authority,
+    ) -> Result<(), ProtocolError> {
+        let (authority, fresh) = self.stream_authority().await?;
+        if authority != expected || members(root) != members(&fresh) {
+            return Err(wire::unavailable());
+        }
+        Ok(())
+    }
+
     async fn stream_authority(&self) -> Result<(Authority, Control), ProtocolError> {
         let root = self.root().await?;
         let own = self
@@ -375,6 +464,10 @@ impl Worker {
     }
 
     async fn stream_fence(&self, root: &Control) -> Result<Authority, ProtocolError> {
+        let _catalog = self
+            .control_budget
+            .charge_memory(0, FENCE_READ_BYTES)
+            .map_err(|_| wire::overloaded())?;
         let loaded = self
             .storage
             .load_cluster_catalog()
@@ -397,32 +490,43 @@ impl Worker {
         command: &Command,
         response_cap: usize,
         bootstrap: bool,
-    ) -> Result<ControlReply, ProtocolError> {
+    ) -> Result<StagedReply, ProtocolError> {
         let encoded = queue_transport::encoded_len(command, MAX_RECORD_BYTES + 4096)? as u64;
-        let budget = (response_cap as u64)
-            .checked_mul(4)
-            .and_then(|response| response.checked_add(encoded + 64 * 1024))
-            .ok_or_else(wire::unavailable)?;
-        let _charge = if bootstrap {
-            self.control_budget.charge_memory(0, budget)?
+        let budget = if bootstrap {
+            &self.control_budget
         } else {
-            self.cpu.scheduler().charge_memory(0, budget)?
+            self.cpu.scheduler()
         };
-        match exchange(
+        let _request = budget
+            .charge_memory(0, encoded + 64 * 1024)
+            .map_err(|_| wire::overloaded())?;
+        let (reply, charge) = exchange(
             &self.client,
             &self.signer,
             root,
             node,
             command,
             response_cap,
+            |length| {
+                let decode = match command {
+                    Command::StreamPage { .. } => predicate_decode_bytes(length),
+                    _ => 0,
+                };
+                budget
+                    .charge_memory(0, 4 * length as u64 + 4096 + decode)
+                    .map_err(|_| wire::overloaded())
+            },
         )
-        .await?
-        {
+        .await?;
+        match reply {
             WorkerReply::Control(ControlReply::Error {
                 error: Error::Protocol(error),
             }) => Err(error),
             WorkerReply::Control(ControlReply::Error { .. }) => Err(wire::unavailable()),
-            WorkerReply::Control(control) => Ok(control),
+            WorkerReply::Control(reply) => Ok(StagedReply {
+                reply,
+                _charge: charge,
+            }),
             _ => Err(wire::invalid()),
         }
     }
@@ -440,6 +544,7 @@ impl Worker {
         match self
             .stream_exchange(root, node, &command, CONTROL_REPLY_BYTES, bootstrap)
             .await?
+            .reply
         {
             ControlReply::Installed => Ok(()),
             _ => Err(wire::invalid()),
@@ -456,18 +561,30 @@ impl Worker {
         run: Uuid,
     ) -> Result<(), ProtocolError> {
         self.queue.streams.set_run(run, true)?;
+        self.merge_stream_pages(root, node, run).await
+    }
+
+    async fn merge_stream_pages(
+        &self,
+        root: &Control,
+        node: &Node,
+        run: Uuid,
+    ) -> Result<(), ProtocolError> {
         let mut after = None;
-        loop {
+        for _ in 0..=MAX_IDENTITIES {
             let command = Command::StreamPage {
                 run,
                 after: after.clone(),
             };
-            match self
+            let StagedReply { reply, _charge } = self
                 .stream_exchange(root, node, &command, MAX_RECORD_BYTES + 4096, true)
-                .await?
-            {
+                .await?;
+            match reply {
                 ControlReply::Page { entry: Some(entry) } => {
-                    if entry.run != run || after.as_ref().is_some_and(|after| after >= &entry.key) {
+                    if entry.run != run
+                        || entry.version.term > root.scheduler.scheduler_term
+                        || after.as_ref().is_some_and(|after| after >= &entry.key)
+                    {
                         return Err(wire::invalid());
                     }
                     after = Some(entry.key.clone());
@@ -477,6 +594,7 @@ impl Worker {
                 _ => return Err(wire::invalid()),
             }
         }
+        Err(wire::invalid())
     }
 
     pub(in crate::node) async fn copy_stream_replicas(
@@ -495,11 +613,14 @@ impl Worker {
             )
             .await;
         match reset {
-            Ok(ControlReply::Installed) => {}
+            Ok(StagedReply {
+                reply: ControlReply::Installed,
+                ..
+            }) => {}
             // Workers without the stream endpoint can still join before a
             // stream identity needs to be transferred to them.
             Err(error)
-                if error.code == crate::protocol::ErrorCode::NotFound
+                if error.code == ErrorCode::NotFound
                     && self.queue.streams.page(run, None)?.is_none() =>
             {
                 return Ok(());
@@ -544,7 +665,14 @@ async fn handle(
 ) -> Result<Response<Body>, ProtocolError> {
     let headers = request.headers().clone();
     let root = worker.root().await?;
-    let (nonce, sender, digest, expected, class) = queue_transport::preauthenticate(
+    let queue_transport::StreamAuthentication {
+        nonce,
+        sender,
+        digest,
+        command: expected,
+        class,
+        stale_term,
+    } = queue_transport::preauthenticate_stream(
         &headers,
         &root,
         worker.signer.sender(),
@@ -564,7 +692,13 @@ async fn handle(
         "progress" => &worker.progress_budget,
         _ => worker.cpu.scheduler(),
     };
-    let _ingress = budget.charge_memory(0, 64 * 1024 + length as u64 * 5)?;
+    let decode = match expected.as_str() {
+        "stream_request" | "stream_install" => predicate_decode_bytes(length),
+        _ => 0,
+    };
+    let _ingress = budget
+        .charge_memory(0, 64 * 1024 + length as u64 * 5 + decode)
+        .map_err(|_| wire::overloaded())?;
     let bytes = http::read_small(
         request.into_body(),
         length,
@@ -580,6 +714,9 @@ async fn handle(
     .await?;
     if command.name() != expected {
         return Err(wire::invalid());
+    }
+    if stale_term {
+        return Err(wire::unavailable());
     }
     let batch_context = match &command {
         Command::StreamRequest {

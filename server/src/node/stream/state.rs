@@ -22,7 +22,7 @@ use uuid::Uuid;
 pub(super) const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PIN_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PIN_BYTES_PER_DATABASE: u64 = 16 * 1024 * 1024;
-const MAX_IDENTITIES: usize = 384;
+pub(super) const MAX_IDENTITIES: usize = 384;
 const MAX_PER_SCOPE: usize = 96;
 const MAX_ACTIVE: usize = 32;
 const MAX_ACTIVE_PER_SCOPE: usize = 16;
@@ -146,10 +146,22 @@ impl Entry {
 
     pub(super) fn compact(&mut self, now: u64) {
         if !self.active(now) {
-            self.scan = None;
-            self.context = None;
-            self.accepted_request = None;
+            self.clear_payload();
         }
+    }
+
+    fn clear_payload(&mut self) {
+        self.scan = None;
+        self.context = None;
+        self.accepted_request = None;
+    }
+
+    fn matches_compacted(&self, other: &Self) -> bool {
+        let mut entry = self.clone();
+        let mut other = other.clone();
+        entry.clear_payload();
+        other.clear_payload();
+        entry == other
     }
 }
 fn serialize_request<S: serde::Serializer>(
@@ -239,6 +251,7 @@ pub(in crate::node) struct Registry {
 }
 struct State {
     run: Option<Uuid>,
+    recovered_term: Option<u64>,
     entries: BTreeMap<Key, Arc<Stored>>,
     deliveries: BTreeMap<Uuid, DeliveryHold>,
 }
@@ -341,6 +354,7 @@ impl Registry {
         Self {
             state: Mutex::new(State {
                 run: None,
+                recovered_term: None,
                 entries: BTreeMap::new(),
                 deliveries: BTreeMap::new(),
             }),
@@ -362,15 +376,31 @@ impl Registry {
             Some(_) => return Err(wire::unavailable()),
         }
         if clear {
+            state.recovered_term = None;
             state.entries.clear();
             state.deliveries.clear();
         }
         Ok(())
     }
 
+    pub(super) fn recovered(&self, run: Uuid, term: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        state.run == Some(run) && state.recovered_term == Some(term)
+    }
+
+    pub(super) fn mark_recovered(&self, run: Uuid, term: u64) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) || state.run != Some(run) {
+            return Err(wire::unavailable());
+        }
+        state.recovered_term = Some(term);
+        Ok(())
+    }
+
     pub(in crate::node) fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap();
+        state.recovered_term = None;
         state.entries.clear();
         state.deliveries.clear();
     }
@@ -493,20 +523,32 @@ impl Registry {
             return Err(wire::conflict());
         }
         if let Some(previous) = previous {
-            if entry.version < previous.entry.version {
+            if entry.identity != previous.entry.identity
+                || entry.handle_id() != previous.entry.handle_id()
+            {
                 return Err(wire::conflict());
             }
+            if entry.version < previous.entry.version {
+                // A recovery page can arrive after a newer copy was merged.
+                return if expect.is_none() {
+                    Ok(Some(previous.clone()))
+                } else {
+                    Err(wire::conflict())
+                };
+            }
             if entry.version == previous.entry.version {
-                if entry != previous.entry {
+                if entry == previous.entry {
+                    return Ok(Some(previous.clone()));
+                }
+                if (entry.scan.is_some() && previous.entry.scan.is_some())
+                    || !entry.matches_compacted(&previous.entry)
+                {
                     return Err(wire::conflict());
                 }
-                return Ok(Some(previous.clone()));
-            }
-            if entry.identity != previous.entry.identity {
-                // An unacknowledged partial open from an earlier term cannot
-                // override the identity installed by the authoritative owner.
-                if entry.version.term <= previous.entry.version.term {
-                    return Err(wire::conflict());
+                // Replicas can reap independently. Preserve a complete copy
+                // while its deadline is still in the future at this worker.
+                if entry.scan.is_none() {
+                    return Ok(Some(previous.clone()));
                 }
             }
         }
@@ -634,4 +676,138 @@ pub(super) fn retryable(error: &ProtocolError) -> bool {
         error.code,
         ErrorCode::Overloaded | ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::WorkerResources,
+        protocol::{ColumnType, Query, TableFormat},
+        storage::{Catalog, CatalogEntry, TableData},
+    };
+
+    #[test]
+    fn st04_recovery_restores_a_complete_record_missing_from_the_new_owner() {
+        let run = Uuid::new_v4();
+        let table = Uuid::new_v4();
+        let mut catalog = Catalog::empty();
+        catalog.tables.insert(
+            "examples".into(),
+            CatalogEntry {
+                id: table,
+                schema: BTreeMap::from([("id".into(), ColumnType::Int64)]),
+                key: "id".into(),
+                format: TableFormat::Parquet,
+                data: TableData::Legacy {
+                    snapshot: "fixture".into(),
+                },
+                row_count: 8,
+            },
+        );
+        let scan = Arc::new(
+            PinnedScan::capture(
+                &catalog,
+                table,
+                Query {
+                    select: None,
+                    filter: None,
+                    order_by: None,
+                    limit: None,
+                },
+            )
+            .unwrap(),
+        );
+        let first = scan.cursor(0, 1).unwrap();
+        let key = Key {
+            scope: Scope::from_context(None).unwrap(),
+            id: Uuid::new_v4(),
+        };
+        let opened = Opened {
+            stream_id: Uuid::new_v4(),
+            run_id: run,
+            prefetch_batches: 0,
+            expires_at: 1_000,
+        };
+        let initial = Entry {
+            key: key.clone(),
+            run,
+            version: Version { term: 1, index: 1 },
+            identity: [7; 32],
+            accepted_request: Some(Arc::from("{}")),
+            idle_at: 500,
+            closed_at: None,
+            context: None,
+            scan: Some(scan.clone()),
+            kind: Kind::Stream(Stream {
+                opened: opened.clone(),
+                batch_rows: 4,
+                format: Format::Rows,
+                drop_last: false,
+                first,
+                checkpoint: None,
+            }),
+        };
+        let mut latest = initial.clone();
+        latest.version = Version { term: 1, index: 2 };
+        latest.idle_at = 600;
+        let Kind::Stream(stream) = &mut latest.kind else {
+            unreachable!()
+        };
+        let checkpoint = Checkpoint {
+            sequence: 0,
+            first,
+            next: scan.cursor(1, 2).unwrap(),
+            outcome: Frame::Bytes([8; 32]),
+        };
+        stream.checkpoint = Some(checkpoint.clone());
+
+        let budget = ResourceScheduler::new(vec![(0, WorkerResources::default())]).unwrap();
+        let old_owner = Registry::new();
+        let holder = Registry::new();
+        let new_owner = Registry::new();
+        for registry in [&old_owner, &holder, &new_owner] {
+            registry.set_run(run, false).unwrap();
+        }
+        let install = |registry: &Registry, entry: Entry| {
+            let bytes = super::super::record_bytes(&entry).unwrap();
+            registry.install(entry, None, bytes, &budget, 100)
+        };
+        install(&old_owner, latest.clone()).unwrap();
+        install(&holder, latest.clone()).unwrap();
+        old_owner.stop();
+        assert!(new_owner.get(&key).is_none());
+        assert!(!new_owner.recovered(run, 2));
+
+        let page = holder.get(&key).unwrap().entry.clone();
+        let encoded = serde_json::to_vec(&page).unwrap();
+        let page = serde_json::from_slice(&encoded).unwrap();
+        install(&new_owner, page).unwrap();
+        install(&new_owner, initial.clone()).unwrap();
+        let mut compacted = latest.clone();
+        compacted.compact(latest.idle_at);
+        install(&new_owner, compacted).unwrap();
+        let merged = new_owner.get(&key).unwrap();
+        install(&holder, merged.entry.clone()).unwrap();
+        new_owner.mark_recovered(run, 2).unwrap();
+        assert!(new_owner.recovered(run, 2));
+        assert!(merged.entry == latest);
+        assert!(holder.get(&key).unwrap().entry == latest);
+        let Kind::Stream(stream) = &merged.entry.kind else {
+            unreachable!()
+        };
+        assert_eq!(stream.opened, opened);
+        assert!(stream.checkpoint.as_ref() == Some(&checkpoint));
+
+        let mut conflicting_checkpoint = latest.clone();
+        conflicting_checkpoint.idle_at += 1;
+        let error = install(&new_owner, conflicting_checkpoint).err().unwrap();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let mut conflicting = initial;
+        conflicting.version = Version { term: 2, index: 1 };
+        conflicting.identity = [9; 32];
+        let error = install(&new_owner, conflicting).err().unwrap();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(new_owner.get(&key).unwrap().entry == latest);
+    }
 }
