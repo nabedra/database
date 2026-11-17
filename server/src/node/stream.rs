@@ -1,6 +1,8 @@
 //! OLAP stream leases and deterministic batch replay. Only workers own lookahead.
 mod distributed;
 mod state;
+#[cfg(test)]
+mod tests;
 pub(crate) mod wire;
 
 pub(super) use distributed::{PATH, handler};

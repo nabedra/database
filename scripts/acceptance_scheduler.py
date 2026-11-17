@@ -145,8 +145,20 @@ class GateForward:
                         candidate = self.server.install_gates.get(record['request_id'])
                     if candidate is not None and candidate.claim(record):
                         ack_gate = candidate
+            exchange = None
+            if path == '/internal/v1/streams' and self.server.stream_exchange is not None:
+                header, body = read_http_message(self.request, header, cap=3 * 1024 * 1024)
+                exchange = self.server.stream_exchange(json.loads(body), self.trace)
+                if exchange is not None and not exchange.before():
+                    return
             with socket.create_connection(self.server.target, timeout=5) as upstream:
                 upstream.sendall(header)
+                if exchange is not None:
+                    upstream.settimeout(20)
+                    reply, reply_body = read_http_message(upstream, cap=3 * 1024 * 1024)
+                    if exchange.after(reply, reply_body):
+                        self.request.sendall(reply)
+                    return
                 if ack_gate is not None:
                     upstream.settimeout(10)
                     reply, reply_body = read_http_message(upstream)
@@ -174,6 +186,7 @@ class WorkerDoor(FrontDoor):
     def __init__(self):
         self.gates = {}
         self.install_gates = {}
+        self.stream_exchange = None
         self.queue_requests = []
         super().__init__()
         self.RequestHandlerClass = GateForward
@@ -292,6 +305,10 @@ class Cluster:
         assert self.api.wait(40) == 0
         self.channel.close()
 
+    def worker_resources(self, threads):
+        return {'max_threads': threads, 'memory_limit_bytes': (threads + 1) * (4 << 30),
+                'task_memory_limit_bytes': 512 << 20, 'control_memory_reserve_bytes': 256 << 20}
+
     def start_worker(self, node, threads):
         identity = str(uuid.UUID(int=node))
         door = self.worker_door_type()
@@ -299,8 +316,7 @@ class Cluster:
         bootstrap = dict(self.template, partition_slots=threads, version=1, cluster_id=self.cluster,
                          node_id=identity, request_id=None, api_urls=[self.api_door.url], advertise_url=door.url,
                          storage=self.backend, enrollment_token=self.auth['enrollment_token'], tls=None,
-                         resources={'max_threads': threads, 'memory_limit_bytes': (threads + 1) * (4 << 30),
-                                    'task_memory_limit_bytes': 512 << 20, 'control_memory_reserve_bytes': 256 << 20})
+                         resources=self.worker_resources(threads))
         path = self.root / f'worker-{node}.json'
         write(path, bootstrap)
         process = subprocess.Popen([str(self.binary), 'worker', '--bootstrap', str(path)], env=self.env,
