@@ -1152,3 +1152,555 @@ async fn f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic() {
     assert_eq!(resources.control_bytes_used(), 0);
     assert_eq!(resources.working_decode_bytes(), 0);
 }
+
+#[tokio::test]
+async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headroom() {
+    let resources = shared(SharedResourceConfig {
+        query_reply_bytes: 64,
+        ..Default::default()
+    });
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let data = pool.group(group_identity(&pool)).await.unwrap();
+    let mut identity = group_identity(&pool);
+    identity.kind = GroupKind::Control;
+    let control = pool.group(identity).await.unwrap();
+    let small = TransactionBudget {
+        output_bytes: 1,
+        ..budget()
+    };
+    let large = TransactionBudget {
+        output_bytes: 64,
+        ..budget()
+    };
+    let retained = data
+        .read(small, |view| view.copy_output(b"h"))
+        .await
+        .unwrap();
+    let large_waiter = tokio::spawn({
+        let data = data.clone();
+        async move { data.read(large, |view| view.copy_output(&[9u8; 64])).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.reply_waiters(ExecutionClass::Query) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Before aging, each fitting small request finishes while the retained
+    // one-byte response prevents the full-capacity request from fitting.
+    for _ in 0..32 {
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            data.read(small, |view| view.copy_output(b"s")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(answer.as_slice(), b"s");
+        drop(answer);
+    }
+    let small_waiter = tokio::spawn({
+        let data = data.clone();
+        async move { data.read(small, |view| view.copy_output(b"t")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.reply_waiters(ExecutionClass::Query) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(resources.scheduler().usage()[0].1, 0);
+    assert!(!small_waiter.is_finished());
+    let authority = tokio::time::timeout(
+        Duration::from_secs(10),
+        control.read(budget(), |view| view.copy_output(b"control")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(authority.as_slice(), b"control");
+    drop(authority);
+    drop(retained);
+    let granted = tokio::time::timeout(Duration::from_secs(10), large_waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(granted.as_slice(), &[9u8; 64]);
+    assert!(!small_waiter.is_finished());
+    assert_eq!(resources.reply_waiters(ExecutionClass::Query), 1);
+    assert_eq!(resources.scheduler().usage()[0].1, 0);
+    drop(granted);
+    let small_result = tokio::time::timeout(Duration::from_secs(10), small_waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(small_result.as_slice(), b"t");
+    drop(small_result);
+    assert_eq!(resources.reply_waiters(ExecutionClass::Query), 0);
+    assert_eq!(resources.apply_bytes_used(), 0);
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn m03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom() {
+    let resources = shared(SharedResourceConfig {
+        query_reply_bytes: 64,
+        ..Default::default()
+    });
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let data = pool.group(group_identity(&pool)).await.unwrap();
+    let small = TransactionBudget {
+        output_bytes: 1,
+        ..budget()
+    };
+    let large = TransactionBudget {
+        output_bytes: 64,
+        ..budget()
+    };
+    let retained = data
+        .read(small, |view| view.copy_output(b"h"))
+        .await
+        .unwrap();
+    let head = tokio::spawn({
+        let data = data.clone();
+        async move { data.read(large, |view| view.copy_output(&[0; 64])).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.reply_waiters(ExecutionClass::Query) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..32 {
+        drop(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                data.read(small, |view| view.copy_output(b"s")),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let follower = tokio::spawn({
+        let data = data.clone();
+        async move { data.read(small, |view| view.copy_output(b"f")).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while resources.reply_waiters(ExecutionClass::Query) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(resources.scheduler().usage()[0].1, 0);
+    head.abort();
+    assert!(head.await.unwrap_err().is_cancelled());
+    // The held byte still exists. Progress follows cancellation of headroom
+    // protection, rather than the large allocation suddenly becoming feasible.
+    let answer = tokio::time::timeout(Duration::from_secs(10), follower)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.as_slice(), b"f");
+    assert_eq!(retained.as_slice(), b"h");
+    drop(answer);
+    drop(retained);
+    assert_eq!(resources.reply_waiters(ExecutionClass::Query), 0);
+    assert_eq!(resources.apply_bytes_used(), 0);
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn o04_m01_scans_reuse_wide_key_scratch_and_copy_only_one_cursor_per_page() {
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    let write = TransactionBudget {
+        scratch_bytes: 16 << 10,
+        batch_bytes: 2 << 20,
+        output_bytes: 1024,
+    };
+    group
+        .transaction(meta(0), write, |tx| {
+            let padding = "x".repeat(8 << 10);
+            for index in 0..130 {
+                let key = format!("row/{index:04}{padding}");
+                tx.put(key.as_bytes(), b"v")?;
+            }
+            Ok(Transition::Commit(tx.copy_output(b"ok")?))
+        })
+        .await
+        .unwrap();
+    #[derive(Deserialize)]
+    struct Page {
+        keys: Vec<u32>,
+        cursor: Option<String>,
+        done: bool,
+    }
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let next = cursor.take();
+        let response = group
+            .read(
+                TransactionBudget {
+                    scratch_bytes: 16 << 10,
+                    batch_bytes: 0,
+                    output_bytes: 64 << 10,
+                },
+                move |view| {
+                    let mut keys = Vec::new();
+                    let progress =
+                        view.scan_page(b"row/", next.as_deref(), 128, |key, value| {
+                            assert_eq!(value, b"v");
+                            keys.push(
+                                std::str::from_utf8(&key[4..8])
+                                    .unwrap()
+                                    .parse::<u32>()
+                                    .unwrap(),
+                            );
+                            Ok(())
+                        })?;
+                    #[derive(Serialize)]
+                    struct Wire<'a> {
+                        keys: Vec<u32>,
+                        cursor: Option<&'a str>,
+                        done: bool,
+                    }
+                    view.encode(&Wire {
+                        keys,
+                        cursor: progress
+                            .last_key
+                            .as_ref()
+                            .map(|key| std::str::from_utf8(key.as_slice()).unwrap()),
+                        done: progress.exhausted,
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        let page: Page = serde_json::from_slice(response.as_slice()).unwrap();
+        seen.extend(page.keys);
+        pages += 1;
+        if page.done {
+            break;
+        }
+        cursor = Some(page.cursor.unwrap().into_bytes());
+    }
+    assert_eq!(pages, 2);
+    assert_eq!(seen, (0..130).collect::<Vec<u32>>());
+    assert_eq!(resources.apply_bytes_used(), 0);
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn o11_scoped_log_range_delete_and_tail_marker_commit_in_one_batch() {
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let a = pool.group(group_identity(&pool)).await.unwrap();
+    let b = pool.group(group_identity(&pool)).await.unwrap();
+    for group in [&a, &b] {
+        group
+            .log_transaction(budget(), |tx| {
+                for key in [b"log/1", b"log/2", b"log/3"] {
+                    tx.put(key, b"entry")?;
+                }
+                tx.put(b"tail", b"3")?;
+                Ok(Transition::Commit(tx.copy_output(b"ok")?))
+            })
+            .await
+            .unwrap();
+    }
+    assert!(
+        a.log_transaction(budget(), |tx| {
+            tx.delete_range(b"log/2", b"log/4")?;
+            tx.put(b"tail", b"1")?;
+            Err(capacity())
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        a.log_read(budget(), |view| view
+            .get(b"log/3")
+            .and_then(|value| value.ok_or_else(capacity)))
+            .await
+            .unwrap()
+            .as_slice(),
+        b"entry"
+    );
+    assert_eq!(
+        a.log_read(budget(), |view| view
+            .get(b"tail")
+            .and_then(|value| value.ok_or_else(capacity)))
+            .await
+            .unwrap()
+            .as_slice(),
+        b"3"
+    );
+    a.log_transaction(budget(), |tx| {
+        tx.delete_range(b"log/2", b"log/4")?;
+        tx.put(b"tail", b"1")?;
+        Ok(Transition::Commit(tx.copy_output(b"truncated")?))
+    })
+    .await
+    .unwrap();
+    for key in [b"log/2", b"log/3"] {
+        assert_eq!(
+            a.log_read(budget(), move |view| {
+                let absent = view.get(key)?.is_none();
+                view.encode(&absent)
+            })
+            .await
+            .unwrap()
+            .as_slice(),
+            b"true"
+        );
+    }
+    assert_eq!(
+        a.log_read(budget(), |view| view
+            .get(b"tail")
+            .and_then(|value| value.ok_or_else(capacity)))
+            .await
+            .unwrap()
+            .as_slice(),
+        b"1"
+    );
+    assert_eq!(
+        b.log_read(budget(), |view| view
+            .get(b"log/3")
+            .and_then(|value| value.ok_or_else(capacity)))
+            .await
+            .unwrap()
+            .as_slice(),
+        b"entry"
+    );
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn o11_snapshot_membership_comes_from_immutable_cut_and_rejects_corrupt_record() {
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    let mut first = meta(0);
+    first.membership = Some(resources.copy_bytes(b"membership-a").unwrap());
+    group
+        .transaction(first, budget(), |tx| {
+            Ok(Transition::Commit(tx.copy_output(b"old")?))
+        })
+        .await
+        .unwrap();
+    let original = group.export_snapshot(budget()).await.unwrap();
+    let mut bytes = fs::read(&original.path).unwrap();
+    let mut second = meta(1);
+    second.membership = Some(resources.copy_bytes(b"membership-b").unwrap());
+    group
+        .transaction(second, budget(), |tx| {
+            Ok(Transition::Commit(tx.copy_output(b"new")?))
+        })
+        .await
+        .unwrap();
+    let _current = group.export_snapshot(budget()).await.unwrap();
+    assert!(!original.path.exists());
+    let exact = group
+        .snapshot_membership(original.clone(), budget())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact.as_slice(), b"membership-a");
+    drop(exact);
+    let offset = bytes
+        .windows(b"membership-a".len())
+        .position(|bytes| bytes == b"membership-a")
+        .unwrap();
+    bytes[offset + b"membership-".len()] = b'x';
+    let path = dir.0.join("corrupt-member.bin");
+    fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let damaged = GroupSnapshot {
+        file: Arc::new(file),
+        path,
+        bytes: bytes.len() as u64,
+        header: original.header,
+    };
+    assert!(group.snapshot_membership(damaged, budget()).await.is_err());
+    assert_eq!(
+        group
+            .applied_state(budget())
+            .await
+            .unwrap()
+            .unwrap()
+            .membership
+            .unwrap()
+            .as_slice(),
+        b"membership-b"
+    );
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn c07_o05_consensus_metadata_progresses_with_pending_data_apply_and_query_slot_held() {
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    let query = resources.prepare(ExecutionClass::Query).await.unwrap();
+    let mut apply = Box::pin(group.transaction(meta(0), budget(), |tx| {
+        tx.put(b"row", b"committed")?;
+        Ok(Transition::Commit(tx.copy_output(b"applied")?))
+    }));
+    assert!(futures_util::poll!(apply.as_mut()).is_pending());
+    // It has reached the native query-capacity wait while retaining state order.
+    assert!(group.inner.order.try_lock().is_err());
+    assert_eq!(
+        resources
+            .scheduler()
+            .usage()
+            .iter()
+            .map(|entry| entry.1)
+            .sum::<u64>(),
+        0
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        group.log_transaction_metadata(budget(), |tx| {
+            tx.put(b"vote", b"term-7")?;
+            Ok(Transition::Commit(tx.copy_output(b"saved")?))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let vote = tokio::time::timeout(
+        Duration::from_secs(5),
+        group.log_read_metadata(budget(), |view| view.get(b"vote")?.ok_or_else(capacity)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(vote.as_slice(), b"term-7");
+    drop(vote);
+    // Large entry probes must still wait for the held query slot.
+    let mut probe = Box::pin(group.log_read_probe(budget(), |view| view.copy_output(b"probe")));
+    assert!(futures_util::poll!(probe.as_mut()).is_pending());
+    assert_eq!(
+        resources
+            .scheduler()
+            .usage()
+            .iter()
+            .map(|entry| entry.1)
+            .sum::<u64>(),
+        0
+    );
+    drop(query);
+    assert_eq!(apply.await.unwrap().as_slice(), b"applied");
+    assert_eq!(probe.await.unwrap().as_slice(), b"probe");
+    assert_eq!(get(&group, b"row").await, b"committed");
+    assert_eq!(
+        group
+            .applied_state(budget())
+            .await
+            .unwrap()
+            .unwrap()
+            .position,
+        meta(0).position
+    );
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn o11_c07_committed_membership_serializes_in_apply_with_all_wire_bytes_held() {
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    let config = resources.config();
+    let progress = resources
+        .allocate_bytes(ByteClass::Progress, config.progress_bytes)
+        .unwrap();
+    let data = resources
+        .allocate_bytes(
+            ByteClass::Data,
+            config.control_bytes - config.progress_bytes,
+        )
+        .unwrap();
+    let reply = group
+        .transaction_with_membership(meta(0), budget(), Some([3u64, 5, 8]), |tx| {
+            tx.put(b"row", b"same-batch")?;
+            Ok(Transition::Commit(tx.copy_output(b"member")?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply.as_slice(), b"member");
+    drop(reply);
+    let applied = group.applied_state(budget()).await.unwrap().unwrap();
+    assert_eq!(applied.position, meta(0).position);
+    assert_eq!(applied.membership.unwrap().as_slice(), b"[3,5,8]");
+    // An exact replay cannot evaluate either application logic or serialization.
+    struct CannotSerialize;
+    impl Serialize for CannotSerialize {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            panic!("replay must not serialize membership")
+        }
+    }
+    group
+        .transaction_with_membership(meta(0), budget(), Some(CannotSerialize), |_| {
+            panic!("replay must not rerun application")
+        })
+        .await
+        .unwrap();
+    assert_eq!(get(&group, b"row").await, b"same-batch");
+    drop((progress, data));
+    assert_eq!(resources.control_bytes_used(), 0);
+}
+
+#[tokio::test]
+async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wire_arenas_full() {
+    let resources = shared(SharedResourceConfig::default());
+    let config = resources.config();
+    let raw = resources
+        .reply_budget(ExecutionClass::Control, config.control_reply_bytes)
+        .await
+        .unwrap();
+    let progress = resources
+        .allocate_bytes(ByteClass::Progress, config.progress_bytes)
+        .unwrap();
+    let data = resources
+        .allocate_bytes(
+            ByteClass::Data,
+            config.control_bytes - config.progress_bytes,
+        )
+        .unwrap();
+    let owner = Arc::new(
+        tokio::time::timeout(Duration::from_secs(5), resources.reserve_reply_decode(4096))
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(owner.bytes(), 4096);
+    let retained = owner.clone();
+    drop(owner);
+    assert_eq!(resources.reply_decode_bytes_used(), 4096);
+    assert!(
+        resources
+            .reserve_reply_decode(config.reply_decode_bytes + 1)
+            .await
+            .is_err()
+    );
+    drop((retained, raw, progress, data));
+    assert_eq!(resources.control_bytes_used(), 0);
+}

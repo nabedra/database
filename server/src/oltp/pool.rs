@@ -18,7 +18,8 @@ use crate::{
     scheduling::MemoryCharge,
 };
 use rocksdb::{
-    BlockBasedOptions, DB, DBCompressionType, DBRecoveryMode, Options, Snapshot, WriteBatch,
+    BlockBasedOptions, DB, DBCompressionType, DBPinnableSlice, DBRecoveryMode, Options, Snapshot,
+    WriteBatch,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -84,7 +85,15 @@ struct GroupInner {
     pool: OltpPool,
     identity: GroupIdentity,
     order: Arc<tokio::sync::Mutex<()>>,
+    log_order: Arc<tokio::sync::Mutex<()>>,
+    log_metadata_order: Arc<tokio::sync::Mutex<()>>,
     _handle_slot: OwnedSemaphorePermit,
+}
+#[derive(Clone, Copy)]
+enum MutationLane {
+    State,
+    Log,
+    LogMetadata,
 }
 #[derive(Clone)]
 pub struct GroupStore {
@@ -275,6 +284,8 @@ impl OltpPool {
                     pool: pool.clone(),
                     identity,
                     order: Arc::new(tokio::sync::Mutex::new(())),
+                    log_order: Arc::new(tokio::sync::Mutex::new(())),
+                    log_metadata_order: Arc::new(tokio::sync::Mutex::new(())),
                     _handle_slot: slot,
                 });
                 groups.insert(group.identity.group_id, Arc::downgrade(&group));
@@ -428,7 +439,29 @@ impl GroupStore {
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.mutate(Some(meta), false, budget, work).await
+        self.mutate(Some(meta), None::<()>, MutationLane::State, budget, work)
+            .await
+    }
+    /// Membership is serialized from an already owned Raft entry inside the
+    /// private native apply reservation. Transport arenas are not prerequisites
+    /// for applying a committed membership change.
+    pub async fn transaction_with_membership<T: Serialize + Send + 'static>(
+        &self,
+        meta: ApplyMeta,
+        budget: TransactionBudget,
+        membership: Option<T>,
+        work: impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError>
+        + Send
+        + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        if meta.membership.is_some() && membership.is_some() {
+            return Err(failure(
+                ErrorCode::ValidationError,
+                "duplicate membership sources",
+            ));
+        }
+        self.mutate(Some(meta), membership, MutationLane::State, budget, work)
+            .await
     }
     pub async fn log_transaction(
         &self,
@@ -437,24 +470,48 @@ impl GroupStore {
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.mutate(None, true, budget, work).await
+        self.mutate(None, None::<()>, MutationLane::Log, budget, work)
+            .await
     }
-    async fn mutate(
+    /// Small retained node/vote/commit metadata has independent execution and
+    /// order from large log bodies and application state. Adapters must retain
+    /// their log writer order for overlapping tail/purge/truncation updates.
+    pub async fn log_transaction_metadata(
         &self,
-        meta: Option<ApplyMeta>,
-        log: bool,
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError>
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        let owner = self.inner.order.clone().lock_owned().await;
+        self.mutate(None, None::<()>, MutationLane::LogMetadata, budget, work)
+            .await
+    }
+    async fn mutate<T: Serialize + Send + 'static>(
+        &self,
+        meta: Option<ApplyMeta>,
+        membership: Option<T>,
+        lane: MutationLane,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError>
+        + Send
+        + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let (order, log, execution_class) = match lane {
+            MutationLane::State => (&self.inner.order, false, self.execution_class()),
+            MutationLane::Log => (&self.inner.log_order, true, self.execution_class()),
+            MutationLane::LogMetadata => (
+                &self.inner.log_metadata_order,
+                true,
+                ExecutionClass::Control,
+            ),
+        };
+        let owner = order.clone().lock_owned().await;
         let group = self.clone();
         let output = self
             .resources()
             .reply_budget(ExecutionClass::Control, budget.output_bytes)
             .await?;
-        let prepared = self.resources().prepare(self.execution_class()).await?;
+        let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output)?;
         prepared
             .execute(0, 0, move || {
@@ -512,7 +569,13 @@ impl GroupStore {
                             group_key(group.identity().group_id, b'r', &[]),
                             response.as_slice(),
                         )?;
-                        if let Some(membership) = &meta.membership {
+                        let encoded_membership = membership
+                            .as_ref()
+                            .map(|value| transaction.read.scratch.encode_value(value))
+                            .transpose()?;
+                        if let Some(membership) =
+                            encoded_membership.as_ref().or(meta.membership.as_ref())
+                        {
                             transaction.put_meta(
                                 group_key(group.identity().group_id, b'm', &[]),
                                 membership.as_slice(),
@@ -540,10 +603,16 @@ impl GroupStore {
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.read_namespace(false, self.execution_class(), budget, move |view| {
-            let result = work(view)?;
-            view.output.rehome(result)
-        })
+        self.read_namespace(
+            false,
+            self.execution_class(),
+            self.execution_class(),
+            budget,
+            move |view| {
+                let result = work(view)?;
+                view.output.rehome(result)
+            },
+        )
         .await
     }
     pub async fn log_read(
@@ -551,15 +620,22 @@ impl GroupStore {
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.read_namespace(true, self.execution_class(), budget, move |view| {
-            let result = work(view)?;
-            view.output.rehome(result)
-        })
+        self.read_namespace(
+            true,
+            self.execution_class(),
+            self.execution_class(),
+            budget,
+            move |view| {
+                let result = work(view)?;
+                view.output.rehome(result)
+            },
+        )
         .await
     }
     async fn read_namespace<T: Send + 'static>(
         &self,
         log: bool,
+        execution_class: ExecutionClass,
         reply_class: ExecutionClass,
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupRead<'_>) -> Result<T, ProtocolError> + Send + 'static,
@@ -568,7 +644,7 @@ impl GroupStore {
             .resources()
             .reply_budget(reply_class, budget.output_bytes)
             .await?;
-        let prepared = self.resources().prepare(self.execution_class()).await?;
+        let prepared = self.resources().prepare(execution_class).await?;
         let (scratch, _batch, output) = prepared.buffers(budget, output)?;
         let group = self.clone();
         prepared
@@ -581,6 +657,7 @@ impl GroupStore {
                     prefix,
                     scratch,
                     output,
+                    key_buffer: KeyBuffer::default(),
                 };
                 let result = work(&mut read)?;
                 group.pool().healthy()?;
@@ -593,10 +670,35 @@ impl GroupStore {
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.read_namespace(true, ExecutionClass::Control, budget, move |view| {
-            let result = work(view)?;
-            view.output.rehome(result)
-        })
+        self.read_namespace(
+            true,
+            ExecutionClass::Control,
+            ExecutionClass::Control,
+            budget,
+            move |view| {
+                let result = work(view)?;
+                view.output.rehome(result)
+            },
+        )
+        .await
+    }
+    /// A full log-body probe stays on the group's execution lane. Only its
+    /// small footprint/hash response uses protected reply bytes.
+    pub async fn log_read_probe(
+        &self,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.read_namespace(
+            true,
+            self.execution_class(),
+            ExecutionClass::Control,
+            budget,
+            move |view| {
+                let result = work(view)?;
+                view.output.rehome(result)
+            },
+        )
         .await
     }
     /// The caller reserves actual decode ownership before entering native work.
@@ -616,6 +718,7 @@ impl GroupStore {
     ) -> Result<crate::oltp_replication::owned::OwnedCommand<D>, ProtocolError> {
         self.read_namespace(
             true,
+            self.execution_class(),
             ExecutionClass::Control,
             TransactionBudget {
                 output_bytes: 0,
@@ -634,15 +737,21 @@ impl GroupStore {
         budget: TransactionBudget,
     ) -> Result<Option<AppliedState>, ProtocolError> {
         let group = self.clone();
-        self.read_namespace(false, ExecutionClass::Control, budget, move |view| {
-            let mut result = group.read_applied(view.snapshot, &mut view.scratch)?;
-            if let Some(state) = &mut result
-                && let Some(membership) = state.membership.take()
-            {
-                state.membership = Some(view.output.rehome(membership)?);
-            }
-            Ok(result)
-        })
+        self.read_namespace(
+            false,
+            ExecutionClass::Control,
+            ExecutionClass::Control,
+            budget,
+            move |view| {
+                let mut result = group.read_applied(view.snapshot, &mut view.scratch)?;
+                if let Some(state) = &mut result
+                    && let Some(membership) = state.membership.take()
+                {
+                    state.membership = Some(view.output.rehome(membership)?);
+                }
+                Ok(result)
+            },
+        )
         .await
     }
     fn read_applied(
@@ -724,8 +833,14 @@ pub struct GroupRead<'a> {
     prefix: Vec<u8>,
     scratch: ByteReservation,
     output: ByteReservation,
+    key_buffer: KeyBuffer,
 }
-impl GroupRead<'_> {
+#[derive(Default)]
+struct KeyBuffer {
+    data: Vec<u8>,
+    charges: Vec<ByteReservation>,
+}
+impl<'a> GroupRead<'a> {
     /// Inspect a pinned value without copying a full log entry to a reply.
     /// The borrow ends with this callback; retain only explicitly owned output.
     pub fn inspect<T>(
@@ -733,19 +848,19 @@ impl GroupRead<'_> {
         key: &[u8],
         read: impl FnOnce(Option<&[u8]>) -> Result<T, ProtocolError>,
     ) -> Result<T, ProtocolError> {
-        let key = self.key(key)?;
-        let value = self
-            .snapshot
-            .get_pinned(key.as_slice())
-            .map_err(storage_error)?;
+        let value = self.pinned(key)?;
         read(value.as_ref().map(|value| value.as_ref()))
+    }
+    /// A pinned value cannot outlive this native snapshot. Keeping it borrowed
+    /// avoids copying a large private row merely to encode its fixed resolution.
+    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<DBPinnableSlice<'a>>, ProtocolError> {
+        let snapshot = self.snapshot;
+        let key = self.key(key)?;
+        snapshot.get_pinned(key).map_err(storage_error)
     }
     /// Snapshot-only. Candidate writes are deliberately not consulted.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<ChargedBytes>, ProtocolError> {
-        let key = self.key(key)?;
-        self.snapshot
-            .get_pinned(key.as_slice())
-            .map_err(storage_error)?
+        self.pinned(key)?
             .map(|value| self.scratch.copy(&value))
             .transpose()
     }
@@ -758,13 +873,37 @@ impl GroupRead<'_> {
     pub fn copy_output(&mut self, bytes: &[u8]) -> Result<ChargedBytes, ProtocolError> {
         self.output.copy(bytes)
     }
-    fn key(&mut self, key: &[u8]) -> Result<ChargedBytes, ProtocolError> {
+    fn key(&mut self, key: &[u8]) -> Result<&[u8], ProtocolError> {
         if key.len() > MAX_KEY_BYTES {
             return Err(capacity());
         }
-        self.scratch.join(&[&self.prefix, key])
+        let length = self
+            .prefix
+            .len()
+            .checked_add(key.len())
+            .ok_or_else(capacity)?;
+        if length > self.key_buffer.data.capacity() {
+            let grow = length
+                .max(self.key_buffer.data.capacity().saturating_mul(2))
+                .min(MAX_KEY_BYTES + self.prefix.len());
+            let charge = self.scratch.split(
+                grow - self.key_buffer.data.capacity() + std::mem::size_of::<ByteReservation>(),
+            )?;
+            self.key_buffer
+                .charges
+                .try_reserve(1)
+                .map_err(|_| capacity())?;
+            self.key_buffer
+                .data
+                .try_reserve_exact(grow - self.key_buffer.data.len())
+                .map_err(|_| capacity())?;
+            self.key_buffer.charges.push(charge);
+        }
+        self.key_buffer.data.clear();
+        self.key_buffer.data.extend_from_slice(&self.prefix);
+        self.key_buffer.data.extend_from_slice(key);
+        Ok(&self.key_buffer.data)
     }
-
     /// Values borrow the native iterator for this callback only. Callers encode
     /// retained outputs through this view's precharged output budget.
     pub fn scan_page(
@@ -774,20 +913,22 @@ impl GroupRead<'_> {
         max_items: usize,
         mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), ProtocolError>,
     ) -> Result<ScanProgress, ProtocolError> {
-        if max_items == 0 || max_items > 128 {
+        if max_items == 0 || max_items > 128 || prefix.len() > MAX_KEY_BYTES {
             return Err(capacity());
         }
-        let lower = self.key(prefix)?;
+        let native = self.snapshot;
+        let scope_length = self.prefix.len();
+        let lower = self.scratch.join(&[&self.prefix, prefix])?;
         let start = self.key(after.unwrap_or(prefix))?;
-        if !start.as_slice().starts_with(lower.as_slice()) {
+        if !start.starts_with(lower.as_slice()) {
             return Err(failure(
                 ErrorCode::ValidationError,
                 "scan cursor outside prefix",
             ));
         }
-        let mut iterator = self.snapshot.raw_iterator();
-        iterator.seek(start.as_slice());
-        if after.is_some() && iterator.key() == Some(start.as_slice()) {
+        let mut iterator = native.raw_iterator();
+        iterator.seek(start);
+        if after.is_some() && iterator.key() == Some(start) {
             iterator.next();
         }
         let mut progress = ScanProgress {
@@ -800,14 +941,24 @@ impl GroupRead<'_> {
             if !key.starts_with(lower.as_slice()) {
                 break;
             }
+            visit(
+                &key[scope_length..],
+                iterator.value().ok_or_else(recovery_unknown)?,
+            )?;
+            progress.visited += 1;
             if progress.visited == max_items {
+                let cursor = self.scratch.copy(&key[scope_length..])?;
+                iterator.next();
                 iterator.status().map_err(storage_error)?;
+                progress.exhausted = !iterator.valid()
+                    || iterator
+                        .key()
+                        .is_none_or(|key| !key.starts_with(lower.as_slice()));
+                if !progress.exhausted {
+                    progress.last_key = Some(cursor);
+                }
                 return Ok(progress);
             }
-            let value = iterator.value().ok_or_else(recovery_unknown)?;
-            visit(&key[self.prefix.len()..], value)?;
-            progress.last_key = Some(self.scratch.copy(&key[self.prefix.len()..])?);
-            progress.visited += 1;
             iterator.next();
         }
         iterator.status().map_err(storage_error)?;
@@ -835,6 +986,7 @@ impl<'a> GroupTransaction<'a> {
                 prefix,
                 scratch,
                 output,
+                key_buffer: KeyBuffer::default(),
             },
             batch: WriteBatch::with_capacity_bytes(budget.batch_bytes),
             batch_used: 12,
@@ -864,14 +1016,45 @@ impl<'a> GroupTransaction<'a> {
         self.read.scan_page(prefix, after, max_items, visit)
     }
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
+        if key.len() > MAX_KEY_BYTES {
+            return Err(capacity());
+        }
+        self.preflight(self.read.prefix.len() + key.len(), value.len())?;
         let key = self.read.key(key)?;
-        self.put_meta(key.as_slice(), value)
+        self.batch.put(key, value);
+        Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), ProtocolError> {
+        if key.len() > MAX_KEY_BYTES {
+            return Err(capacity());
+        }
+        self.preflight(self.read.prefix.len() + key.len(), 0)?;
         let key = self.read.key(key)?;
-        self.preflight(key.len(), 0)?;
-        self.batch.delete(key.as_slice());
+        self.batch.delete(key);
         Ok(())
+    }
+    /// Both boundaries are logical keys in this one group/generation domain.
+    /// They cannot name native metadata, another group, or an active pointer.
+    pub fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<(), ProtocolError> {
+        if start >= end || start.len() > MAX_KEY_BYTES || end.len() > MAX_KEY_BYTES {
+            return Err(failure(ErrorCode::ValidationError, "invalid scoped range"));
+        }
+        let cost = self
+            .read
+            .prefix
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(start.len()))
+            .and_then(|n| n.checked_add(end.len()))
+            .ok_or_else(capacity)?;
+        self.preflight(cost, 0)?;
+        let start = self.read.scratch.join(&[&self.read.prefix, start])?;
+        let end = self.read.scratch.join(&[&self.read.prefix, end])?;
+        self.batch.delete_range(start.as_slice(), end.as_slice());
+        Ok(())
+    }
+    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<DBPinnableSlice<'a>>, ProtocolError> {
+        self.read.pinned(key)
     }
     fn put_meta(&mut self, key: impl AsRef<[u8]>, value: &[u8]) -> Result<(), ProtocolError> {
         self.preflight(key.as_ref().len(), value.len())?;

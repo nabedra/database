@@ -28,6 +28,128 @@ pub struct GroupSnapshot {
 }
 
 impl GroupStore {
+    /// Read membership from the immutable export cut, never from current DB
+    /// state. The replica must transfer decoded metadata to its resident owner
+    /// before retaining it in cached SnapshotMeta or transfer state.
+    pub async fn snapshot_membership(
+        &self,
+        snapshot: GroupSnapshot,
+        budget: TransactionBudget,
+    ) -> Result<Option<ChargedBytes>, ProtocolError> {
+        let mut output = self
+            .resources()
+            .reply_budget(ExecutionClass::Control, budget.output_bytes)
+            .await?;
+        let unused = self
+            .resources()
+            .reply_budget(ExecutionClass::Control, 0)
+            .await?;
+        let prepared = self.resources().prepare(self.execution_class()).await?;
+        let (mut scratch, _batch, _unused) = prepared.buffers(
+            TransactionBudget {
+                output_bytes: 0,
+                batch_bytes: 0,
+                ..budget
+            },
+            unused,
+        )?;
+        let identity = self.identity().clone();
+        let group = self.clone();
+        prepared
+            .execute(0, 0, move || {
+                group.pool().healthy()?;
+                if snapshot.header.identity != identity {
+                    return Err(storage_error_message());
+                }
+                let metadata = snapshot
+                    .file
+                    .metadata()
+                    .map_err(|_| storage_error_message())?;
+                if !metadata.is_file() || metadata.len() != snapshot.bytes {
+                    return Err(storage_error_message());
+                }
+                let mut offset = 0u64;
+                let mut first = [0u8; 20];
+                read_exact_at(&snapshot.file, snapshot.bytes, &mut offset, &mut first)?;
+                if &first[..16] != MAGIC {
+                    return Err(storage_error_message());
+                }
+                let length = u32::from_be_bytes(
+                    first[16..]
+                        .try_into()
+                        .expect("fixed snapshot header length"),
+                ) as usize;
+                if length > HEADER_LIMIT {
+                    return Err(capacity());
+                }
+                let header = {
+                    let mut buffer = scratch.buffer(length)?;
+                    read_exact_at(
+                        &snapshot.file,
+                        snapshot.bytes,
+                        &mut offset,
+                        buffer.as_mut_slice(),
+                    )?;
+                    serde_json::from_slice::<GroupSnapshotHeader>(buffer.as_slice())
+                        .map_err(|_| storage_error_message())?
+                };
+                if header != snapshot.header {
+                    return Err(storage_error_message());
+                }
+                let mut applied = None;
+                let mut member = None;
+                let mut prior = 0u8;
+                loop {
+                    let mut tag = [0u8; 1];
+                    read_exact_at(&snapshot.file, snapshot.bytes, &mut offset, &mut tag)?;
+                    if matches!(tag[0], 3 | 4 | 255) {
+                        break;
+                    }
+                    if !matches!(tag[0], 1 | 2) || tag[0] <= prior {
+                        return Err(storage_error_message());
+                    }
+                    prior = tag[0];
+                    let mut lengths = [0u8; 12];
+                    read_exact_at(&snapshot.file, snapshot.bytes, &mut offset, &mut lengths)?;
+                    if lengths[..4] != [0; 4] {
+                        return Err(storage_error_message());
+                    }
+                    let length = usize::try_from(u64::from_be_bytes(
+                        lengths[4..]
+                            .try_into()
+                            .expect("fixed snapshot record length"),
+                    ))
+                    .map_err(|_| capacity())?;
+                    if length > HEADER_LIMIT {
+                        return Err(capacity());
+                    }
+                    let mut bytes = scratch.buffer(length)?;
+                    read_exact_at(
+                        &snapshot.file,
+                        snapshot.bytes,
+                        &mut offset,
+                        bytes.as_mut_slice(),
+                    )?;
+                    if tag[0] == 1 {
+                        applied = Some(decode_applied(bytes.as_slice())?);
+                    } else {
+                        if Some(hash(bytes.as_slice())) != header.membership_digest {
+                            return Err(storage_error_message());
+                        }
+                        member = Some(output.copy(bytes.as_slice())?);
+                    }
+                }
+                if applied.as_ref().map(|value| value.0) != header.applied
+                    || applied.as_ref().map(|value| value.1) != header.command_digest
+                    || member.is_some() != header.membership_digest.is_some()
+                {
+                    return Err(storage_error_message());
+                }
+                group.pool().healthy()?;
+                Ok(member)
+            })
+            .await
+    }
     pub async fn current_snapshot(
         &self,
         budget: TransactionBudget,
@@ -699,4 +821,41 @@ fn valid_snapshot_name(name: &str) -> bool {
     name.strip_prefix("snap-")
         .and_then(|value| value.strip_suffix(".bin"))
         .is_some_and(|value| Uuid::parse_str(value).is_ok())
+}
+
+fn read_exact_at(
+    file: &File,
+    total: u64,
+    offset: &mut u64,
+    mut target: &mut [u8],
+) -> Result<(), ProtocolError> {
+    if offset
+        .checked_add(target.len() as u64)
+        .is_none_or(|end| end > total)
+    {
+        return Err(storage_error_message());
+    }
+    while !target.is_empty() {
+        #[cfg(unix)]
+        let count = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(target, *offset)
+        };
+        #[cfg(windows)]
+        let count = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(target, *offset)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let count: std::io::Result<usize> = Err(std::io::Error::other(
+            "positional snapshot reads unsupported",
+        ));
+        let count = count.map_err(|_| storage_error_message())?;
+        if count == 0 {
+            return Err(storage_error_message());
+        }
+        *offset += count as u64;
+        target = &mut target[count..];
+    }
+    Ok(())
 }
