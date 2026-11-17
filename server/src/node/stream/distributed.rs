@@ -581,9 +581,37 @@ async fn handle(
     if command.name() != expected {
         return Err(wire::invalid());
     }
-    let reply = accept(worker, &root, sender, command)
+    let batch_context = match &command {
+        Command::StreamRequest {
+            context: Some(context),
+            delivery: Some(token),
+            ..
+        } => Some((context.clone(), *token)),
+        _ => None,
+    };
+    let mut reply = accept(worker, &root, sender, command)
         .await
         .unwrap_or_else(|error| WorkerReply::Control(ControlReply::Error { error }));
+    if expected == "stream_request" {
+        let (authority, current) = worker.stream_authority().await?;
+        if authority.term != root.scheduler.scheduler_term || members(&current) != members(&root) {
+            return Err(wire::unavailable());
+        }
+        // Reading or replicating a batch can outlast its storage credentials.
+        if matches!(&reply, WorkerReply::Batch(_))
+            && let Some((context, token)) = batch_context
+            && let Err(error) = crate::request_queue::admission::validate_context(
+                &current.template,
+                Some(&context),
+                now_ms() / 1000,
+            )
+        {
+            worker.queue.streams.release_delivery(token);
+            reply = WorkerReply::Control(ControlReply::Error {
+                error: error.into(),
+            });
+        }
+    }
     let (marker, body) = match reply {
         WorkerReply::Control(control) => {
             let len = queue_transport::encoded_len(&control, MAX_RECORD_BYTES + 4096)?;
@@ -606,12 +634,6 @@ async fn handle(
         bytes: body,
         _transport: transport,
     });
-    if expected == "stream_request" {
-        let (authority, current) = worker.stream_authority().await?;
-        if authority.term != root.scheduler.scheduler_term || members(&current) != members(&root) {
-            return Err(wire::unavailable());
-        }
-    }
     queue_transport::stream_reply(&worker.signer, &root, &headers, nonce, marker, body)
 }
 
