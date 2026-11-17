@@ -1,5 +1,7 @@
 //! Authenticated conditional-object HTTP transport. No redirects or PUT retries.
-use super::{Download, Namespace, ObjectKey, ObjectStore, StorageError, WriteCondition};
+use super::{
+    Download, Namespace, ObjectAccessError, ObjectKey, ObjectStore, StorageError, WriteCondition,
+};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{BodyExt, Full};
@@ -214,9 +216,7 @@ impl HttpStore {
             .body(Full::new(Bytes::from(bytes)))
             .map_err(|_| StorageError::Configuration)
     }
-}
-impl ObjectStore for HttpStore {
-    async fn get(&self, key: &str) -> Result<Download, StorageError> {
+    async fn get_with_access_error(&self, key: &str) -> Result<Download, ObjectAccessError> {
         self.key(key)?;
         let request = self.request("GET", key, vec![])?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -225,9 +225,10 @@ impl ObjectStore for HttpStore {
             .map_err(|_| StorageError::Unavailable)?
             .map_err(|_| StorageError::Unavailable)?;
         match response.status().as_u16() {
-            404 => return Err(StorageError::NotFound),
+            401 | 403 => return Err(ObjectAccessError::Denied),
+            404 => return Err(StorageError::NotFound.into()),
             200 => (),
-            _ => return Err(StorageError::Unavailable),
+            _ => return Err(StorageError::Unavailable.into()),
         }
         let etag = etag(response.headers()).ok_or(StorageError::Unavailable)?;
         let stream = response
@@ -241,6 +242,16 @@ impl ObjectStore for HttpStore {
             },
             etag,
         ))
+    }
+}
+impl ObjectStore for HttpStore {
+    async fn get(&self, key: &str) -> Result<Download, StorageError> {
+        self.get_with_access_error(key)
+            .await
+            .map_err(ObjectAccessError::into_storage_error)
+    }
+    async fn authorize_get(&self, key: &str) -> Result<(), ObjectAccessError> {
+        self.get_with_access_error(key).await.map(drop)
     }
     async fn put(
         &self,

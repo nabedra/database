@@ -1,5 +1,8 @@
 //! Legacy S3 adapter. Provider setup and SDK types stay behind the `s3` feature.
-use super::{Download, Namespace, ObjectKey, ObjectStore, Storage, StorageError, WriteCondition};
+use super::{
+    Download, Namespace, ObjectAccessError, ObjectKey, ObjectStore, Storage, StorageError,
+    WriteCondition,
+};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{Client, config::retry::RetryConfig, primitives::ByteStream};
 
@@ -128,9 +131,7 @@ impl S3Store {
             .ok_or(StorageError::InvalidPath)?;
         ObjectKey::parse_relative(relative).map(|_| ())
     }
-}
-impl ObjectStore for S3Store {
-    async fn get(&self, key: &str) -> Result<Download, StorageError> {
+    async fn get_with_access_error(&self, key: &str) -> Result<Download, ObjectAccessError> {
         self.check_key(key)?;
         let response = self
             .reads
@@ -139,17 +140,18 @@ impl ObjectStore for S3Store {
             .key(key)
             .send()
             .await
-            .map_err(|error| {
-                if error.as_service_error().and_then(|e| e.code()) != Some("NoSuchBucket")
-                    && error
-                        .raw_response()
-                        .is_some_and(|r| r.status().as_u16() == 404)
-                {
-                    StorageError::NotFound
-                } else {
-                    StorageError::Unavailable
-                }
-            })?;
+            .map_err(
+                |error| match error.raw_response().map(|r| r.status().as_u16()) {
+                    Some(401 | 403) => ObjectAccessError::Denied,
+                    Some(404)
+                        if error.as_service_error().and_then(|e| e.code())
+                            != Some("NoSuchBucket") =>
+                    {
+                        StorageError::NotFound.into()
+                    }
+                    _ => StorageError::Unavailable.into(),
+                },
+            )?;
         let etag = response
             .e_tag
             .filter(|s| !s.is_empty())
@@ -161,6 +163,16 @@ impl ObjectStore for S3Store {
             },
             etag,
         ))
+    }
+}
+impl ObjectStore for S3Store {
+    async fn get(&self, key: &str) -> Result<Download, StorageError> {
+        self.get_with_access_error(key)
+            .await
+            .map_err(ObjectAccessError::into_storage_error)
+    }
+    async fn authorize_get(&self, key: &str) -> Result<(), ObjectAccessError> {
+        self.get_with_access_error(key).await.map(drop)
     }
     async fn put(
         &self,

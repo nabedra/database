@@ -1,5 +1,5 @@
 //! A single distributed runtime supports either conditional object adapter.
-use super::{Download, HttpStore, ObjectStore, StorageError, WriteCondition};
+use super::{Download, HttpStore, ObjectAccessError, ObjectStore, StorageError, WriteCondition};
 #[derive(Clone)]
 pub enum RuntimeStore {
     Http(HttpStore),
@@ -19,6 +19,15 @@ impl ObjectStore for RuntimeStore {
             Self::Fixture { backend, .. } => backend.get(key).await,
             #[cfg(feature = "s3")]
             Self::S3(s) => s.get(key).await,
+        }
+    }
+    async fn authorize_get(&self, key: &str) -> Result<(), ObjectAccessError> {
+        match self {
+            Self::Http(s) => s.authorize_get(key).await,
+            #[cfg(test)]
+            Self::Fixture { backend, .. } => backend.authorize_get(key).await,
+            #[cfg(feature = "s3")]
+            Self::S3(s) => s.authorize_get(key).await,
         }
     }
     async fn put(

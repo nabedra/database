@@ -11,7 +11,10 @@ use crate::{
         ProtocolError, Query, TableDescriptor,
     },
     scheduling::MemoryCharge,
-    storage::{Catalog, CatalogEntry, ClusterCatalog, ObjectKey, ObjectStore, Storage, TableData},
+    storage::{
+        Catalog, CatalogEntry, ClusterCatalog, ObjectAccessError, ObjectKey, ObjectStore, Storage,
+        TableData,
+    },
     worker_pool::WorkerPool,
 };
 use bytes::Bytes;
@@ -255,7 +258,15 @@ impl PinnedScan {
                         "stream authorization timed out",
                     )
                 })?
-                .map_err(|_| error(ErrorCode::Unauthorized, "stream object access denied"))?;
+                .map_err(|failure| match failure {
+                    ObjectAccessError::Denied => {
+                        error(ErrorCode::Unauthorized, "stream object access denied")
+                    }
+                    ObjectAccessError::Storage(_) => error(
+                        ErrorCode::StorageUnavailable,
+                        "stream object access check unavailable",
+                    ),
+                })?;
         }
         Ok(())
     }

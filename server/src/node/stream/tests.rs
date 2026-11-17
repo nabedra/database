@@ -4,7 +4,7 @@ use crate::{
     config::WorkerResources,
     partition_size::PartitionSize,
     protocol::parse_request,
-    storage::{CatalogFence, Download, Namespace, StorageError, WriteCondition},
+    storage::{CatalogFence, Download, Namespace, ObjectAccessError, StorageError, WriteCondition},
     test_storage::{Fake, ReadGate},
     worker_pool::WorkerThreads,
 };
@@ -18,11 +18,14 @@ struct Store {
     inner: Fake,
     next_partition: std::sync::Mutex<Option<Arc<ReadGate>>>,
     partition_denied: AtomicBool,
+    partition_unavailable: AtomicBool,
 }
 impl ObjectStore for Store {
     async fn get(&self, key: &str) -> Result<Download, StorageError> {
         if key.ends_with(".parquet") {
-            if self.partition_denied.load(Ordering::Acquire) {
+            if self.partition_denied.load(Ordering::Acquire)
+                || self.partition_unavailable.load(Ordering::Acquire)
+            {
                 return Err(StorageError::Unavailable);
             }
             let gate = self.next_partition.lock().unwrap().take();
@@ -32,6 +35,16 @@ impl ObjectStore for Store {
             }
         }
         self.inner.get(key).await
+    }
+
+    async fn authorize_get(&self, key: &str) -> Result<(), ObjectAccessError> {
+        if key.ends_with(".parquet") && self.partition_denied.load(Ordering::Acquire) {
+            return Err(ObjectAccessError::Denied);
+        }
+        self.get(key)
+            .await
+            .map(drop)
+            .map_err(ObjectAccessError::Storage)
     }
 
     async fn put(
@@ -391,7 +404,9 @@ async fn st04_managed_stream_rechecks_revoked_object_access() {
     });
     let context = managed("stream-worker-test", "synthetic-secret");
     let ask = |request| call(driver.clone(), request, Some(context.clone()));
-    let denied = &engine.storage().backend().partition_denied;
+    let backend = engine.storage().backend();
+    let denied = &backend.partition_denied;
+    let unavailable = &backend.partition_unavailable;
     let scope = Scope::from_context(Some(&context)).unwrap();
 
     let mut body = open(run, table, 1);
@@ -441,6 +456,22 @@ async fn st04_managed_stream_rechecks_revoked_object_access() {
             .last
             .is_some()
     );
+    unavailable.store(true, Ordering::Release);
+    let failure = ask(request(&prefetched, 0)).await.unwrap_err();
+    assert!(matches!(
+        &failure,
+        Error::Protocol(error) if retryable(error)
+    ));
+    assert_eq!(code(failure), ErrorCode::StorageUnavailable);
+    assert!(
+        local
+            .registry
+            .get(&key)
+            .unwrap()
+            .entry
+            .eq(&delivered_record.entry)
+    );
+    unavailable.store(false, Ordering::Release);
     denied.store(true, Ordering::Release);
     assert_eq!(
         code(ask(request(&prefetched, 0)).await.unwrap_err()),
