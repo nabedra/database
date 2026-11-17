@@ -144,7 +144,14 @@ pub(crate) async fn serve_router_with_budget(
             let controls = controls.clone();
             async move {
                 let path = request.uri().path();
-                let class = if path == "/internal/v1/queue" {
+                let stream_transport = cfg!(feature = "olap")
+                    && (path == "/v1/streams"
+                        || path.starts_with("/v1/streams/")
+                        || path == "/v1/stream-snapshots"
+                        || path.starts_with("/v1/stream-snapshots/"));
+                let class = if path == "/internal/v1/queue"
+                    || (cfg!(feature = "olap") && path == "/internal/v1/streams")
+                {
                     request
                         .headers()
                         .get("x-nabedra-queue-class")
@@ -154,7 +161,9 @@ pub(crate) async fn serve_router_with_budget(
                     "bootstrap"
                 } else if path == "/v1/requests" && request.method() == axum::http::Method::POST {
                     "ingress"
-                } else if path.starts_with("/v1/requests/") {
+                } else if path.starts_with("/v1/requests/")
+                    || (stream_transport && request.method() != axum::http::Method::POST)
+                {
                     "receipt"
                 } else if path.starts_with("/health/")
                     || (path.starts_with("/internal/")
@@ -176,12 +185,21 @@ pub(crate) async fn serve_router_with_budget(
                 }
                 .try_acquire_owned();
                 match permit {
-                    Ok(permit) => next.run(request).await.map(|body| {
-                        axum::body::Body::new(NetworkBody {
-                            body,
-                            _permit: permit,
+                    Ok(permit) => {
+                        let mut response = next.run(request).await;
+                        if !stream_transport {
+                            response.headers_mut().insert(
+                                axum::http::header::CONNECTION,
+                                axum::http::HeaderValue::from_static("close"),
+                            );
+                        }
+                        response.map(|body| {
+                            axum::body::Body::new(NetworkBody {
+                                body,
+                                _permit: permit,
+                            })
                         })
-                    }),
+                    }
                     Err(_) => {
                         let error = response::encode_error(
                             None,
@@ -194,6 +212,15 @@ pub(crate) async fn serve_router_with_budget(
                         axum::http::Response::builder()
                             .status(error.status)
                             .header("content-type", "application/json")
+                            .header("cache-control", "no-store")
+                            .header(
+                                "connection",
+                                if stream_transport {
+                                    "keep-alive"
+                                } else {
+                                    "close"
+                                },
+                            )
                             .body(axum::body::Body::from(error.body))
                             .unwrap()
                     }
@@ -217,7 +244,7 @@ pub(crate) async fn serve_router_with_budget(
     server
         .http_builder()
         .http1()
-        .keep_alive(false)
+        .keep_alive(cfg!(feature = "olap"))
         .max_headers(32)
         .max_buf_size(32768)
         .timer(hyper_util::rt::TokioTimer::new())

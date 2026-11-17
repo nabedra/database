@@ -4,6 +4,7 @@ mod control;
 pub mod health;
 mod queue;
 pub mod response;
+pub(crate) mod stream;
 
 use crate::{
     engine::Engine,
@@ -30,9 +31,46 @@ struct ApiState<B: ObjectStore> {
     executor: Executor,
     token: String,
     queue: Arc<queue::LocalQueue>,
+    streams: crate::node::stream::Local,
+    stream_frontend: Arc<stream::Frontend>,
 }
 
-/// Build only `POST /v1/operations` over an already initialized engine.
+impl<B: ObjectStore + 'static> stream::Backend for ApiState<B> {
+    const PROXY_BATCH_BYTES: usize = 0;
+
+    fn frontend(&self) -> &stream::Frontend {
+        &self.stream_frontend
+    }
+
+    fn scheduler(&self) -> &crate::scheduling::ResourceScheduler {
+        self.engine.worker_pool().scheduler()
+    }
+
+    fn authorize(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::storage::context::RequestContext>, crate::node::stream::wire::Error>
+    {
+        if headers.contains_key("x-nabedra-storage")
+            || self.token.is_empty()
+            || !crate::node::http::bearer(headers, &self.token)
+        {
+            return Err(not_applied(ErrorCode::Unauthorized, "unauthorized").into());
+        }
+        Ok(None)
+    }
+
+    async fn call(
+        &self,
+        request: crate::node::stream::wire::Request,
+        _context: Option<crate::storage::context::RequestContext>,
+    ) -> Result<crate::node::stream::wire::Reply, crate::node::stream::wire::Error> {
+        let fence = self.queue.initialize(&self.engine).await?;
+        self.streams.call(&self.engine, fence.run_id, request).await
+    }
+}
+
+/// Build the local OLAP router over an already initialized engine.
 /// Pass clones of ONE engine and executor; clones share their coordinator and
 /// admission state. Retain the executor for stop/drain before runtime shutdown.
 /// The returned stateless Router can be merged with R10's health routes. This
@@ -77,6 +115,7 @@ pub fn router_with_migration<B: ObjectStore + 'static>(
         execution,
         cold_start,
         migration_allowed,
+        Arc::new(stream::Frontend::new()?),
     )?;
     Ok((router, tasks))
 }
@@ -87,6 +126,7 @@ pub(crate) fn router_with_queue_startup<B: ObjectStore + 'static>(
     execution: crate::config::ExecutionConfig,
     cold_start: bool,
     migration_allowed: bool,
+    stream_frontend: Arc<stream::Frontend>,
 ) -> Result<(Router, Executor, Arc<queue::LocalQueue>), ProtocolError> {
     let queue = queue::LocalQueue::new(&engine, execution, cold_start, migration_allowed)?;
     let tasks = queue.executor();
@@ -99,11 +139,14 @@ pub(crate) fn router_with_queue_startup<B: ObjectStore + 'static>(
                 "/v1/requests/{run_id}/{request_id}",
                 get(receipt_request::<B>),
             )
+            .merge(stream::routes::<ApiState<B>>())
             .with_state(Arc::new(ApiState {
                 engine,
                 executor,
                 token,
                 queue: queue.clone(),
+                streams: crate::node::stream::Local::new(),
+                stream_frontend,
             })),
         tasks,
         queue,

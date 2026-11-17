@@ -102,6 +102,7 @@ struct Api {
     data: Executor,
     controls: Executor,
     submissions: Executor,
+    stream_frontend: crate::api::stream::Frontend,
     accepting: AtomicBool,
     cold_start: AtomicBool,
     authority_epoch: AtomicU64,
@@ -635,6 +636,72 @@ impl Api {
         receipt_observation::route(self, bytes, context, staging).await
     }
 }
+impl crate::api::stream::Backend for Api {
+    const PROXY_BATCH_BYTES: usize = crate::node::stream::wire::MAX_BATCH_BYTES + 1;
+
+    fn frontend(&self) -> &crate::api::stream::Frontend {
+        &self.stream_frontend
+    }
+
+    fn scheduler(&self) -> &crate::scheduling::ResourceScheduler {
+        self.pool.scheduler()
+    }
+
+    fn authorize(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> std::result::Result<
+        Option<crate::storage::context::RequestContext>,
+        crate::node::stream::wire::Error,
+    > {
+        if !http::bearer(headers, &self.attached.local().prepared.auth.data_token) {
+            return Err(failure(ErrorCode::Unauthorized).into());
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(unavailable().into());
+        }
+        Ok(self.request_context(headers)?)
+    }
+
+    async fn call(
+        &self,
+        request: crate::node::stream::wire::Request,
+        context: Option<crate::storage::context::RequestContext>,
+    ) -> std::result::Result<crate::node::stream::wire::Reply, crate::node::stream::wire::Error>
+    {
+        let control = self.load().await.map_err(|error| {
+            if error.code == ErrorCode::StorageUnavailable {
+                failure(ErrorCode::Overloaded)
+            } else {
+                error
+            }
+        })?;
+        crate::node::stream::remote(&self.client, &self.signer, control.root(), request, context)
+            .await
+    }
+    async fn renew(&self, token: Uuid) -> bool {
+        let Ok(_charge) = self.pool.scheduler().charge_memory(0, 32 * 1024) else {
+            return false;
+        };
+        let Ok(control) = self.load().await else {
+            return false;
+        };
+        crate::node::stream::renew(&self.client, &self.signer, control.root(), token)
+            .await
+            .is_ok()
+    }
+
+    async fn release(&self, token: Uuid) {
+        if let (Ok(_charge), Ok(control)) = (
+            self.pool.scheduler().charge_memory(0, 32 * 1024),
+            self.load().await,
+        ) {
+            let _ = crate::node::stream::release(&self.client, &self.signer, control.root(), token)
+                .await;
+        }
+    }
+}
+
 impl receipt_observation::QueueAccess for Api {
     async fn submit(
         &self,
@@ -1153,6 +1220,7 @@ async fn api_process(
         data: Executor::new(data_coordination, 0)?,
         controls: Executor::new(8, 0)?,
         submissions: Executor::new(16, 0)?,
+        stream_frontend: crate::api::stream::Frontend::new()?,
         accepting: AtomicBool::new(false),
         cold_start: AtomicBool::new(cold_start),
         authority_epoch: AtomicU64::new(0),
@@ -1254,11 +1322,13 @@ async fn api_process(
         .route("/internal/v1/queue/run", get(run_initialization))
         .route("/health/live", get(|| async { "true" }))
         .route("/health/ready", get(|| async { "true" }))
+        .merge(crate::api::stream::routes::<Api>())
         .with_state(api.clone());
     let served = if ready.is_ok() {
         crate::runtime::serve_router(listener, app, tls, async {
             tokio::select! { _ = frame(channel, None) => {}, _ = crate::runtime::shutdown_signal() => {} }
             api.accepting.store(false,Ordering::Release); api.data.stop_accepting(); api.controls.stop_accepting();api.submissions.stop_accepting();
+            api.stream_frontend.stop_accepting();
         }).await.map_err(|_| unavailable())
     } else {
         ready
@@ -1272,6 +1342,7 @@ async fn api_process(
     api.data.drain().await;
     api.controls.drain().await;
     api.submissions.drain().await;
+    api.stream_frontend.drain().await;
     renewed.map_err(|_| unavailable())?;
     probed.map_err(|_| unavailable())?;
     if let Some(authorizer) = authorizer {
