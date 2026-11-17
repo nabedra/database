@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{HeaderMap, Request, Response},
 };
+use bytes::Bytes;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
@@ -61,7 +62,10 @@ pub(crate) fn command_class(command: &str) -> Result<&'static str> {
         "lookup" => "receipt",
         "install" => "replica",
         "snapshot" | "bootstrap" => "bootstrap",
-        "stats" | "seal" | "unseal" | "join" => "progress",
+        "stats" | "seal" | "unseal" | "join" | "stream_release" => "progress",
+        "stream_request" => "ingress",
+        "stream_install" => "replica",
+        "stream_reset" | "stream_page" => "bootstrap",
         _ => return Err(invalid()),
     })
 }
@@ -76,6 +80,11 @@ fn wire_command(bytes: &[u8]) -> Result<&'static str> {
         "seal",
         "unseal",
         "join",
+        "stream_request",
+        "stream_install",
+        "stream_reset",
+        "stream_page",
+        "stream_release",
     ] {
         let prefix = format!("{{\"command\":\"{command}\"");
         if bytes.starts_with(prefix.as_bytes()) {
@@ -260,7 +269,11 @@ pub(super) async fn exchange_class(
                 .as_ref()
                 .ok_or_else(unavailable)?
                 .trim_end_matches('/'),
-            PATH
+            if c.command.starts_with("stream_") {
+                super::stream::PATH
+            } else {
+                PATH
+            }
         ))
         .header("connection", "close")
         .header("content-type", "application/json")
@@ -352,6 +365,66 @@ pub(super) fn reply(
     nonce: Uuid,
     bytes: Vec<u8>,
 ) -> Result<Response<Body>> {
+    let len = bytes.len();
+    let digest = http::digest(&bytes);
+    signed_reply(
+        signer,
+        root,
+        headers,
+        nonce,
+        len,
+        digest,
+        "application/json",
+        Body::from(bytes),
+    )
+}
+
+pub(super) fn stream_reply(
+    signer: &Signer,
+    root: &Control,
+    headers: &HeaderMap,
+    nonce: Uuid,
+    marker: u8,
+    bytes: Bytes,
+) -> Result<Response<Body>> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update([marker]);
+    digest.update(&bytes);
+    let len = bytes.len().checked_add(1).ok_or_else(invalid)?;
+    let prefix = match marker {
+        0 => Bytes::from_static(&[0]),
+        1 => Bytes::from_static(&[1]),
+        2 => Bytes::from_static(&[2]),
+        _ => return Err(invalid()),
+    };
+    let body = http_body_util::StreamBody::new(futures_util::stream::iter([
+        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(prefix)),
+        Ok(hyper::body::Frame::data(bytes)),
+    ]));
+    signed_reply(
+        signer,
+        root,
+        headers,
+        nonce,
+        len,
+        http::hex(&digest.finalize()),
+        "application/octet-stream",
+        Body::new(body),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_reply(
+    signer: &Signer,
+    root: &Control,
+    headers: &HeaderMap,
+    nonce: Uuid,
+    len: usize,
+    digest: String,
+    media_type: &'static str,
+    body: Body,
+) -> Result<Response<Body>> {
     let raw = http::one(headers, "x-nabedra-queue-auth")?;
     let decoded = (0..raw.len())
         .step_by(2)
@@ -377,16 +450,16 @@ pub(super) fn reply(
         nonce,
         response: true,
         expires_at_ms: super::queue_runtime::now_ms().saturating_add(30000),
-        digest: http::digest(&bytes),
+        digest,
     };
     let (a, s) = signed(signer, &c)?;
     Response::builder()
         .status(200)
-        .header("content-type", "application/json")
-        .header("content-length", bytes.len())
+        .header("content-type", media_type)
+        .header("content-length", len)
         .header("x-nabedra-queue-auth", a)
         .header("x-nabedra-queue-signature", s)
-        .body(Body::from(bytes))
+        .body(body)
         .map_err(|_| invalid())
 }
 

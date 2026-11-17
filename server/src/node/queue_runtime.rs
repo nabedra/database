@@ -199,9 +199,10 @@ pub(crate) enum Reply {
     },
 }
 pub(super) struct QueueRuntime {
+    pub(super) streams: Arc<super::stream::Registry>,
     queue: Mutex<Option<RequestQueue>>,
     retained_data: Mutex<BTreeMap<RequestKey, super::runtime::DataGrant>>,
-    seen: Mutex<BTreeMap<Uuid, u64>>,
+    pub(super) seen: Mutex<BTreeMap<Uuid, u64>>,
     active: Mutex<BTreeSet<RequestKey>>,
     changes: Arc<tokio::sync::Mutex<()>>,
     seals: Mutex<BTreeMap<Uuid, (tokio::time::Instant, tokio::sync::OwnedMutexGuard<()>)>>,
@@ -217,6 +218,7 @@ pub(super) struct QueueRuntime {
 impl QueueRuntime {
     pub(super) fn new() -> Self {
         Self {
+            streams: Arc::new(super::stream::Registry::new()),
             queue: Mutex::new(None),
             retained_data: Mutex::new(BTreeMap::new()),
             seen: Mutex::new(BTreeMap::new()),
@@ -237,7 +239,7 @@ impl QueueRuntime {
     pub(super) fn install_fixture_queue(&self, queue: RequestQueue) {
         *self.queue.lock().unwrap() = Some(queue);
     }
-    async fn lock_changes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn lock_changes(&self) -> tokio::sync::OwnedMutexGuard<()> {
         loop {
             // Register before inspecting seals so a seal installed by an owner
             // currently copying a join cannot lose its expiration notification.
@@ -263,7 +265,7 @@ impl QueueRuntime {
             }
         }
     }
-    fn transport(&self, class: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    pub(super) fn transport(&self, class: &str) -> Result<tokio::sync::OwnedSemaphorePermit> {
         match class {
             "ingress" => self.ingress.clone(),
             "receipt" => self.receipts.clone(),
@@ -274,6 +276,13 @@ impl QueueRuntime {
         }
         .try_acquire_owned()
         .map_err(|_| http::failure(crate::protocol::ErrorCode::Overloaded))
+    }
+    pub(super) fn has_pending(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|q| q.pending() > 0)
     }
     pub(super) fn checked_execution(
         &self,
@@ -591,7 +600,7 @@ impl Worker {
         let mut grants = self.queue.retained_data.lock().unwrap();
         Ok(grants.entry(record.identity()).or_insert(grant).clone())
     }
-    async fn owned_catalog(
+    pub(super) async fn owned_catalog(
         &self,
         root: &Control,
         grant: &super::runtime::DataGrant,
@@ -674,8 +683,19 @@ impl Worker {
                 }
             }
             if copied.is_some() {
-                restored = copied;
-                break;
+                match self.load_stream_replicas(&root, node, fence.run_id).await {
+                    Ok(()) => {
+                        restored = copied;
+                        break;
+                    }
+                    // An older ready worker has no stream endpoint. Its ordinary
+                    // queue can still join a rolling upgrade before streams open.
+                    Err(error) if error.code == crate::protocol::ErrorCode::NotFound => {
+                        restored = copied;
+                        break;
+                    }
+                    Err(_) => {}
+                }
             }
         }
         // A committed new run has no worker copies until its first enrollment.
@@ -683,6 +703,9 @@ impl Worker {
         if restored.is_none() && !self.initialization_authorized(fence).await? {
             return Err(unavailable());
         }
+        self.queue
+            .streams
+            .set_run(fence.run_id, restored.is_none())?;
         let mut initial = ready.clone();
         initial.insert(local);
         let mut q = if let Some(snapshot) = restored {
@@ -1175,6 +1198,8 @@ impl Worker {
                         break;
                     }
                 }
+                self.copy_stream_replicas(root, node, self.queue.fence()?.run_id)
+                    .await?;
                 let token = Uuid::new_v4();
                 self.queue.seals.lock().unwrap().insert(
                     token,
@@ -1580,6 +1605,10 @@ impl Worker {
             if *stop.borrow() {
                 break;
             }
+            self.queue.streams.reap(now_ms());
+            if self.queue.has_pending() && super::stream::memory_pressure(&self.cpu) {
+                self.queue.streams.evict_speculation();
+            }
             self.queue
                 .seals
                 .lock()
@@ -1591,6 +1620,7 @@ impl Worker {
                     .is_some_and(|n| Some(n.node_id) == self.signer.sender().node_id())
                 && self.refresh_queue(&root).await.is_ok()
             {
+                self.queue.streams.scheduler_owner(true);
                 let records = {
                     let q = self.queue.queue.lock().unwrap();
                     let active = self.queue.active.lock().unwrap();
@@ -1712,6 +1742,8 @@ impl Worker {
                         Ok::<(), crate::protocol::ProtocolError>(())
                     });
                 }
+            } else {
+                self.queue.streams.scheduler_owner(false);
             }
             tokio::select! {_=stop.changed()=>{},_=self.queue.changed.notified()=>{},_=tasks.join_next(),if !tasks.is_empty()=>{},_=tokio::time::sleep(Duration::from_millis(100))=>{}}
         }

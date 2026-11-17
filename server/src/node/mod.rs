@@ -24,3 +24,4 @@ pub mod runtime;
 
 pub(crate) mod queue_runtime;
 pub(crate) mod queue_transport;
+pub(crate) mod stream;
