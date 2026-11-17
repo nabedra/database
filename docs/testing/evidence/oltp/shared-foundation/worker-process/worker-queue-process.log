@@ -1,0 +1,72 @@
+
+running 6 tests
+test q03_r01_q06_real_process_ack_boundaries_takeover_terminal_race_and_cold_abandonment ... queue_child_started pid=10620 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-f18d5484-bc3d-4c4a-bab5-9a0ddfe31fa7
+queue_child_started pid=10621 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-f18d5484-bc3d-4c4a-bab5-9a0ddfe31fa7
+queue_child_reaped pid=10620 signal=Some(9) exit=None
+queue_child_reaped pid=10621 signal=Some(9) exit=None
+queue_child_started pid=10622 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-f18d5484-bc3d-4c4a-bab5-9a0ddfe31fa7
+queue_child_reaped pid=10622 signal=Some(9) exit=None
+queue_child_started pid=10638 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2d422990-07de-4ac2-ba03-08fed0088c5a
+queue_child_started pid=10639 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2d422990-07de-4ac2-ba03-08fed0088c5a
+queue_child_reaped pid=10638 signal=Some(9) exit=None
+queue_child_reaped pid=10639 signal=Some(9) exit=None
+queue_child_started pid=10652 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2d422990-07de-4ac2-ba03-08fed0088c5a
+queue_child_reaped pid=10652 signal=Some(9) exit=None
+queue_child_started pid=10668 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-8f146fa1-56ef-467d-a900-a9839dfa4cda
+queue_child_started pid=10669 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-8f146fa1-56ef-467d-a900-a9839dfa4cda
+queue_child_reaped pid=10668 signal=Some(9) exit=None
+queue_child_reaped pid=10669 signal=Some(9) exit=None
+queue_child_started pid=10706 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-8f146fa1-56ef-467d-a900-a9839dfa4cda
+queue_child_reaped pid=10706 signal=Some(9) exit=None
+queue_process: Q03/R01/Q06/C07 ACK phases and R04 outstanding-read abandonment passed; fixture authority and read backend only
+ok
+test q04_real_api_process_restart_and_lost_submit_reply_keep_worker_identity_once ... queue_child_started pid=10722 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-374025b5-358a-4fda-a123-658341569351
+queue_child_started pid=10723 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-374025b5-358a-4fda-a123-658341569351
+queue_child_started pid=10724 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-374025b5-358a-4fda-a123-658341569351
+queue_child_reaped pid=10724 signal=Some(9) exit=None
+queue_child_started pid=10725 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-374025b5-358a-4fda-a123-658341569351
+queue_child_reaped pid=10725 signal=Some(9) exit=None
+queue_child_started pid=10726 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-374025b5-358a-4fda-a123-658341569351
+queue_process: Q04 separate API-only process restarts and lost-reply worker retention passed; fixture API protocol only
+queue_child_reaped pid=10726 signal=Some(9) exit=None
+queue_child_reaped pid=10722 signal=Some(9) exit=None
+queue_child_reaped pid=10723 signal=Some(9) exit=None
+ok
+test r03_q03_real_process_paged_join_delta_before_readiness_and_surviving_last_holder ... queue_child_started pid=10782 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-6e0ba04c-ecfa-4c83-a1c6-a02aa89f55c6
+queue_child_started pid=10783 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-6e0ba04c-ecfa-4c83-a1c6-a02aa89f55c6
+queue_child_started pid=10784 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-6e0ba04c-ecfa-4c83-a1c6-a02aa89f55c6
+queue_child_reaped pid=10782 signal=Some(9) exit=None
+queue_child_reaped pid=10783 signal=Some(9) exit=None
+queue_child_reaped pid=10784 signal=Some(9) exit=None
+queue_child_started pid=10806 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-76ad782f-fcdd-4787-868a-8a3f89bb9a43
+queue_child_started pid=10807 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-76ad782f-fcdd-4787-868a-8a3f89bb9a43
+queue_child_started pid=10808 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-76ad782f-fcdd-4787-868a-8a3f89bb9a43
+queue_child_reaped pid=10806 signal=Some(9) exit=None
+queue_child_reaped pid=10807 signal=Some(9) exit=None
+queue_child_reaped pid=10808 signal=Some(9) exit=None
+queue_child_started pid=10878 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-a374d5d3-8024-4061-be2c-c6f84aea0790
+queue_child_started pid=10879 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-a374d5d3-8024-4061-be2c-c6f84aea0790
+queue_child_started pid=10880 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-a374d5d3-8024-4061-be2c-c6f84aea0790
+queue_child_reaped pid=10878 signal=Some(9) exit=None
+queue_child_reaped pid=10879 signal=Some(9) exit=None
+queue_child_reaped pid=10880 signal=Some(9) exit=None
+queue_process: R03/Q03 empty/single/multiple snapshot+delta joins and last-holder takeover passed; fixture authority only
+ok
+test u02_m02_real_process_full_protocol_body_copies_and_joins_with_default_task_budget ... queue_child_started pid=10902 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2e1174e8-992c-4b94-8317-b46787740609
+queue_child_started pid=10903 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2e1174e8-992c-4b94-8317-b46787740609
+queue_child_started pid=10904 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-2e1174e8-992c-4b94-8317-b46787740609
+queue_process: U02/M02 exact8MiB valid request copied/joined with default512MiB task budget and protected receipt progress; admission only, no data write
+queue_child_reaped pid=10902 signal=Some(9) exit=None
+queue_child_reaped pid=10903 signal=Some(9) exit=None
+queue_child_reaped pid=10904 signal=Some(9) exit=None
+ok
+test u02_real_transport_preserves_maximum_logical_predicate_depth_and_rejects_one_over ... queue_child_started pid=11054 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-d3af1336-3da8-4d51-9871-c2bf7fe0712b
+queue_child_started pid=11055 fixture=/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-queue-process-d3af1336-3da8-4d51-9871-c2bf7fe0712b
+queue_process: U02 logical predicate depth32 copied over real mTLS; depth33 rejected before queue installation
+queue_child_reaped pid=11054 signal=Some(9) exit=None
+queue_child_reaped pid=11055 signal=Some(9) exit=None
+ok
+test worker_child ... ignored, fixture worker, started only by this integration test
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 16.43s
+

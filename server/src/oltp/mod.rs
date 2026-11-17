@@ -2,6 +2,10 @@
 //! It provides atomic synchronous local writes and snapshot reads. It does not
 //! implement Raft, distributed timestamps, cross-pool commits or worker failover.
 mod codec;
+mod native;
+pub use native::NativeThreadBudget;
+pub mod mvcc;
+pub mod pool;
 mod query;
 mod snapshot;
 mod state_machine;
@@ -52,7 +56,7 @@ impl Default for OltpResources {
             write_buffer_bytes: 16 * 1024 * 1024,
             query_memory_bytes: 64 * 1024 * 1024,
             executor_threads: 2,
-            background_threads: 1,
+            background_threads: 2,
         }
     }
 }
@@ -63,7 +67,7 @@ impl OltpResources {
             || self.query_memory_bytes < 1024
             || self.executor_threads == 0
             || self.executor_threads > 1024
-            || !(1..=128).contains(&self.background_threads)
+            || !(2..=128).contains(&self.background_threads)
             || self
                 .cache_bytes
                 .checked_add(self.write_buffer_bytes)
@@ -139,6 +143,7 @@ struct Inner {
     active_executions: AtomicUsize,
     recovery: Arc<AtomicBool>,
     resources: OltpResources,
+    thread_budget: NativeThreadBudget,
     slots: Arc<Semaphore>,
     manifest: StoreManifest,
 }
@@ -285,6 +290,8 @@ impl OltpEngine {
         identity: Option<(Uuid, Uuid, &str)>,
     ) -> Result<Self, ProtocolError> {
         let resources = resources.validate()?;
+        let thread_budget =
+            NativeThreadBudget::new(resources.executor_threads, 0, resources.background_threads)?;
         let manifest = open_manifest(path, identity)?;
         let mut options = Options::default();
         options.create_if_missing(true);
@@ -292,7 +299,7 @@ impl OltpEngine {
         options.set_wal_recovery_mode(DBRecoveryMode::AbsoluteConsistency);
         options.set_write_buffer_size(resources.write_buffer_bytes / 2);
         options.set_max_write_buffer_number(2);
-        options.set_max_background_jobs(resources.background_threads);
+        configure_native_jobs(&mut options, resources.background_threads);
         options.set_max_open_files(128);
         options.set_max_total_wal_size(resources.write_buffer_bytes as u64);
         let native_env = native_environment(resources.background_threads)?;
@@ -343,6 +350,7 @@ impl OltpEngine {
                 active_executions: AtomicUsize::new(0),
                 recovery: Arc::new(AtomicBool::new(false)),
                 resources,
+                thread_budget,
                 slots: Arc::new(Semaphore::new(resources.executor_threads)),
                 manifest,
             }),
@@ -354,6 +362,9 @@ impl OltpEngine {
     }
     pub fn resources(&self) -> OltpResources {
         self.inner.resources
+    }
+    pub fn thread_budget(&self) -> NativeThreadBudget {
+        self.inner.thread_budget
     }
 
     pub(crate) fn shared_db(&self) -> Arc<DB> {
@@ -1025,6 +1036,16 @@ fn check_memory(charge: usize, budget: usize) -> Result<(), ProtocolError> {
     }
 }
 
+// The pinned native GetBGJobLimits forces HIGH>=1 and LOW>=1. Explicit
+// compatibility limits are required to keep HIGH1 when the total exceeds4.
+#[allow(deprecated)]
+fn configure_native_jobs(options: &mut Options, threads: i32) {
+    options.set_max_background_jobs(threads);
+    options.set_max_background_flushes(1);
+    options.set_max_background_compactions(threads - 1);
+    options.set_max_subcompactions(1);
+}
+
 fn native_environment(threads: i32) -> Result<Env, ProtocolError> {
     let mut shared = NATIVE_ENV.lock().map_err(|_| {
         failure(
@@ -1042,9 +1063,9 @@ fn native_environment(threads: i32) -> Result<Env, ProtocolError> {
         return Ok(env.clone());
     }
     let mut env = Env::new().map_err(storage_error)?;
-    env.set_high_priority_background_threads(0);
+    env.set_high_priority_background_threads(1);
     env.set_bottom_priority_background_threads(0);
-    env.set_low_priority_background_threads(threads);
+    env.set_low_priority_background_threads(threads - 1);
     *shared = Some((threads, env.clone()));
     Ok(env)
 }
@@ -1802,7 +1823,7 @@ mod tests {
             &dir.0,
             OltpResources {
                 executor_threads: JOBS,
-                background_threads: 1,
+                background_threads: 2,
                 ..Default::default()
             },
         )
@@ -1987,5 +2008,152 @@ mod tests {
         assert_eq!(read_error.code, ErrorCode::StorageUnavailable);
         assert_eq!(read_error.outcome, Outcome::NotApplied);
         assert_eq!(engine.inner.db.latest_sequence_number(), sequence);
+    }
+
+    #[test]
+    fn o05_native_background_floor_is_validated_before_directory_creation() {
+        let dir = TestDir::new();
+        let result = OltpEngine::open(
+            &dir.0,
+            OltpResources {
+                background_threads: 1,
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        assert!(!dir.0.exists());
+        assert!(
+            pool::WorkerSharedResources::new(
+                0,
+                crate::config::WorkerResources::default(),
+                pool::SharedResourceConfig {
+                    background_threads: 1,
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        let shared = pool::WorkerSharedResources::new(
+            0,
+            crate::config::WorkerResources::default(),
+            pool::SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let config = shared.config();
+        assert_eq!(
+            config.query_threads + config.control_threads + config.background_threads as usize,
+            4
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn o05_isolated_native_open_observes_shared_background_pools_and_housekeeping() {
+        const FLAG: &str = "NABEDRA_OLTP_NATIVE_THREAD_PROBE";
+        const NAME: &str = "oltp::tests::o05_isolated_native_open_observes_shared_background_pools_and_housekeeping";
+        if std::env::var_os(FLAG).is_none() {
+            for background in [2, 8] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", NAME, "--nocapture"])
+                    .env(FLAG, background.to_string())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                while child.try_wait().unwrap().is_none() {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("native thread probe child exceeded watchdog");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "native probe stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            return;
+        }
+        fn count() -> usize {
+            #[cfg(target_os = "linux")]
+            {
+                fs::read_dir("/proc/self/task").unwrap().count()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // proc_pidinfo writes exactly the initialized task-info buffer.
+                let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+                let size = std::mem::size_of::<libc::proc_taskinfo>();
+                let copied = unsafe {
+                    libc::proc_pidinfo(
+                        libc::getpid(),
+                        libc::PROC_PIDTASKINFO,
+                        0,
+                        info.as_mut_ptr().cast(),
+                        size as i32,
+                    )
+                };
+                assert_eq!(copied as usize, size);
+                unsafe { info.assume_init().pti_threadnum as usize }
+            }
+        }
+        let background: i32 = std::env::var(FLAG).unwrap().parse().unwrap();
+        let resources = OltpResources {
+            background_threads: background,
+            ..Default::default()
+        };
+        let before = count();
+        let first_dir = TestDir::new();
+        let second_dir = TestDir::new();
+        let first = OltpEngine::open(&first_dir.0, resources).unwrap();
+        let after_first = count();
+        let second = OltpEngine::open(&second_dir.0, resources).unwrap();
+        let after_second = count();
+        // Native source pins HIGH1/LOW1 plus one process-shared periodic timer.
+        // Network/executor threads are deliberately absent from this child.
+        assert_eq!(after_first - before, background as usize + 1);
+        assert_eq!(after_second, after_first);
+        #[cfg(target_os = "linux")]
+        {
+            let names: Vec<_> = fs::read_dir("/proc/self/task")
+                .unwrap()
+                .map(|entry| fs::read_to_string(entry.unwrap().path().join("comm")).unwrap())
+                .collect();
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.trim() == "rocksdb:high")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.trim() == "rocksdb:low")
+                    .count(),
+                background as usize - 1
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.trim() == "rocksdb:bottom")
+                    .count(),
+                0
+            );
+        }
+        eprintln!(
+            "O05 native isolated probe: before={before}, after_first={after_first}, after_second={after_second}, maintenance_HIGH=1, maintenance_LOW={}, shared_housekeeping_timer=1",
+            background - 1
+        );
+        eprintln!("O05 stack reservation: {:?}", first.thread_budget());
+        drop(first);
+        drop(second);
     }
 }

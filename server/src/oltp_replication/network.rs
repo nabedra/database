@@ -100,6 +100,16 @@ impl TlsMaterial {
     pub fn certificate_sha256(&self) -> &str {
         &self.certificate_sha256
     }
+    pub(super) fn transports(&self, alpn: &[u8]) -> (TlsConnector, TlsAcceptor) {
+        let mut client = (*self.client).clone();
+        let mut server = (*self.server).clone();
+        client.alpn_protocols = vec![alpn.to_vec()];
+        server.alpn_protocols = vec![alpn.to_vec()];
+        (
+            TlsConnector::from(Arc::new(client)),
+            TlsAcceptor::from(Arc::new(server)),
+        )
+    }
 }
 
 #[derive(Clone)]

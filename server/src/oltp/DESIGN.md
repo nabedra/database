@@ -7,6 +7,11 @@ per-shard MVCC, cross-group transactions or distributed request retention.
 Opening the store requires an explicit engine, format
 and topology manifest. A future replicated format must not adopt it silently.
 
+The separate [typed pool foundation](pool/DESIGN.md) now supplies shared worker
+resources, group namespaces and group-local snapshots for the next format. It
+does not turn this legacy standalone/one-group execution path into the target
+MVCC or distributed runtime.
+
 Serialization and recovery argument
 ===================================
 

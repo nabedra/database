@@ -1,0 +1,47 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 26.24s
+     Running unittests src/lib.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/nabedra_database_server-78a7c74a9dd6b50c)
+
+running 39 tests
+test oltp::codec::tests::o03_integer_extrema_and_utf8_boundaries_keep_logical_order ... ok
+test oltp::mvcc::tests::m01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop ... ok
+test oltp::mvcc::tests::m01_fixed_json_is_sorted_compact_and_rejects_insufficient_decode_charge ... ok
+test oltp::mvcc::tests::m01_wide_fixed_value_releases_source_copy_before_encoding_canonical_output ... ok
+test oltp::native::tests::o05_large_native_pool_reserves_each_default_pthread_stack_and_shared_timer ... ok
+test oltp::pool::tests::c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_cancelled_native_charges ... ok
+test oltp::pool::tests::c02_o05_worker_identity_cannot_reset_budgets_or_adopt_a_second_resource_owner ... ok
+test oltp::pool::tests::c07_m02_data_saturation_keeps_progress_buffers_and_decode_scratch_available ... ok
+test oltp::pool::tests::c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory ... ok
+test oltp::pool::tests::c07_m02_small_encoded_control_values_charge_actual_capacity_and_clones_retain_it ... ok
+test oltp::pool::tests::f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic ... ok
+test oltp::pool::tests::f03_query_reply_capacity_wait_has_no_cpu_and_does_not_block_control_progress ... ok
+test oltp::pool::tests::m02_f03_retained_wire_and_decode_owners_prevent_worker_budget_reset ... ok
+test oltp::pool::tests::o05_c07_committed_storage_apply_uses_private_capacity_with_full_transport_arenas ... ok
+test oltp::pool::tests::o05_m01_wide_internal_log_read_retains_dynamic_owner_without_apply_or_reply_escape ... ok
+test oltp::pool::tests::o05_m02_historical_group_inventory_does_not_grow_resident_handles_or_reset_pool_budget ... ok
+test oltp::pool::tests::o05_o11_shared_pool_groups_atomically_isolate_state_logs_membership_and_replays ... ok
+test oltp::pool::tests::o10_o29_pool_recovery_state_is_shared_and_private_failures_do_not_commit_applied_metadata ... ok
+test oltp::pool::tests::o11_o16_group_snapshot_activates_atomically_preserves_other_groups_and_reclaims_unpinned_paths ... ok
+test oltp::pool::tests::o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_active_state ... ok
+test oltp::pool::tests::o11_o16_snapshot_boundary_interruption_models_recover_old_or_new_generation_and_clean_stages ... ok
+test oltp::pool::tests::q02_m02_one_physical_queue_owner_preserves_worker_identity_until_last_owner_releases ... ok
+test oltp::state_machine::tests::o02_o11_replica_identity_and_public_mutation_helpers_cannot_bypass_consensus ... ok
+test oltp::state_machine::tests::o06_o11_openraft_official_storage_contract ... ok
+test oltp::state_machine::tests::o08_o10_o11_replicated_commands_are_deterministic_atomic_and_deduplicated ... ok
+test oltp::state_machine::tests::o11_o16_snapshot_staging_preserves_consensus_keys_and_old_read_pins ... ok
+test oltp::state_machine::tests::o15_r04_r05_consensus_fence_orders_prior_commits_and_rejects_late_old_work ... ok
+test oltp::tests::c01_cli_runtime_dispatches_seven_native_threads_before_barrier_release ... ok
+test oltp::tests::c07_raw_preparation_checks_mutation_flag_and_cancelled_waiters_release_ownership ... ok
+test oltp::tests::f02_o10_panic_after_durable_write_stays_unknown_and_reconciles ... ok
+test oltp::tests::f02_panic_inside_unit_writer_mutex_does_not_disable_future_mutations ... ok
+test oltp::tests::f03_cancelled_execution_retains_external_charge_until_native_work_settles ... ok
+test oltp::tests::m01_f01_preflight_rejects_memory_without_partial_write_and_releases_slot ... ok
+test oltp::tests::o01_o03_constructed_nonfinite_rows_fail_validation_before_serialization ... ok
+test oltp::tests::o05_isolated_native_open_observes_shared_background_pools_and_housekeeping ... ok
+test oltp::tests::o05_native_background_floor_is_validated_before_directory_creation ... ok
+test oltp::tests::o07_o11_prepared_batch_is_private_and_old_snapshot_pins_schema_and_rows ... ok
+test oltp::tests::o10_o29_unreadable_decision_proof_remains_unknown_without_reapplying ... ok
+test oltp::tests::o29_o11_model_durable_but_unobserved_native_write_requires_reopen_before_absence_is_authoritative ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 73 filtered out; finished in 19.82s
+

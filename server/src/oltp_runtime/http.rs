@@ -316,7 +316,9 @@ async fn health(State(state): State<Arc<ApiState>>) -> Response {
     let manifest = state.runtime.engine.manifest();
     complete(EncodedResponse { status: 200, body: serde_json::to_vec(&serde_json::json!({
         "status":"ready", "engine":manifest.engine.as_str(), "format_version":manifest.format_version, "topology":manifest.topology.as_str(), "replication_factor":1,
-        "run_id":state.runtime.run_id(), "cluster_id": manifest.cluster_id
+        "run_id":state.runtime.run_id(), "cluster_id": manifest.cluster_id,
+        "native_thread_budget":state.runtime.engine.thread_budget(),
+        "network_stack_bytes":"provided by hosting runtime; excluded from native_thread_budget"
     })).expect("fixed health JSON") })
 }
 fn failure(id: Option<Uuid>, error: ProtocolError) -> Response {

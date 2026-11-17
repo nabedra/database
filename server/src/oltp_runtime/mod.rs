@@ -1,7 +1,11 @@
-//! Standalone, single-volume OLTP composition. The RF1 topology has one ready
-//! queue member. Distributed ownership, replication and provisioning are rejected.
+//! Standalone OLTP server and experimental worker-memory queue components.
+//! The installed server uses RF1; distributed production composition and
+//! provisioning are not enabled by the CLI.
+pub mod coordinator;
 mod http;
 mod queue;
+pub mod replica;
+pub mod worker_endpoint;
 
 use crate::{
     config::{ExecutionConfig, WorkerResources},
@@ -24,7 +28,7 @@ pub(crate) const RECEIPT_OBSERVATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
 
 /// Runtime used by the standalone CLI. Validated worker resources allow at most
-/// 255 foreground native jobs, so this pool does not impose an extra four-job cap.
+/// 254 foreground native jobs, so this pool does not impose an extra four-job cap.
 pub fn standalone_network_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -45,7 +49,7 @@ pub struct ServeOptions {
     pub host: IpAddr,
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
-    /// Total execution threads, including one storage maintenance thread.
+    /// Total execution threads, including two storage maintenance threads.
     #[arg(long, default_value_t = 4)]
     pub workers: usize,
     /// Additional pending slots beyond foreground executors.
@@ -79,7 +83,7 @@ fn invalid(message: &'static str) -> ProtocolError {
 
 impl ServeOptions {
     pub fn limits(&self) -> Result<(ExecutionConfig, WorkerResources), ProtocolError> {
-        if self.workers < 2
+        if self.workers < 3
             || self.workers > 256
             || !valid_database(&self.database)
             || self.tls_cert.is_some() != self.tls_key.is_some()
@@ -102,7 +106,7 @@ impl ServeOptions {
         };
         let capacity = resources
             .max_threads
-            .saturating_sub(1)
+            .saturating_sub(2)
             .checked_add(self.queue_size as u64)
             .filter(|n| *n <= 1_000_000)
             .ok_or_else(|| invalid("invalid queue capacity"))?;
@@ -113,9 +117,9 @@ impl ServeOptions {
                 ..Default::default()
             },
         };
-        if resources.max_threads < 2 {
+        if resources.max_threads < 3 {
             return Err(invalid(
-                "OLTP requires at least two threads including storage maintenance",
+                "OLTP requires at least three threads including two storage maintenance threads",
             ));
         }
         resources
@@ -200,8 +204,8 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
     let engine = OltpEngine::open(
         &options.data_dir,
         OltpResources {
-            executor_threads: (resources.max_threads - 1) as usize,
-            background_threads: 1,
+            executor_threads: (resources.max_threads - 2) as usize,
+            background_threads: 2,
             query_memory_bytes: query_memory_bytes as usize,
             ..Default::default()
         },

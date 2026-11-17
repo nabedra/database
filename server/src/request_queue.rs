@@ -223,6 +223,71 @@ pub struct RequestQueue {
     next_sequence: u64,
     records: BTreeMap<RequestKey, RequestRecord>,
 }
+/// Fully decoded/hashed input, prepared under an execution memory/CPU owner
+/// before taking the short queue-state lock. Its contents cannot be modified.
+pub struct ValidatedRecord(RequestRecord);
+impl ValidatedRecord {
+    pub fn prepare(record: RequestRecord) -> Result<Self, QueueError> {
+        validate_record_contents(&record)?;
+        Ok(Self(record))
+    }
+    pub fn record(&self) -> &RequestRecord {
+        &self.0
+    }
+}
+
+fn validate_record_contents(record: &RequestRecord) -> Result<(), QueueError> {
+    // Recovery validates accepted credentials at their original epoch.
+    if let Some(c) = &record.context {
+        c.validate(0).map_err(|_| QueueError::Invalid)?;
+        if record.context_bytes()? > crate::storage::context::MAX_CONTEXT_BYTES {
+            return Err(QueueError::Invalid);
+        }
+    }
+    let expired_identity =
+        record.result_expired && record.state.terminal() && record.body.is_empty();
+    if record.sequence == 0
+        || record.version == 0
+        || record.version == u64::MAX
+        || record.digest.len() != 64
+        || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
+        || (!expired_identity
+            && (record.digest != digest(&record.body)
+                || protocol::parse_request(&record.body)
+                    .map_err(|_| QueueError::Invalid)?
+                    .request_id
+                    != record.request_id))
+        || record
+            .pinned_catalog
+            .as_ref()
+            .is_some_and(|v| v.len() > protocol::MAX_CATALOG_BYTES + 4100)
+        || record
+            .response_body
+            .as_ref()
+            .is_some_and(|v| v.len() > protocol::MAX_BODY_BYTES)
+        || (record.state.terminal() != record.completed_at_ms.is_some())
+        || (!record.state.terminal()
+            && (record.response_status.is_some()
+                || record.response_body.is_some()
+                || record.result_expired))
+        || (!record.accepted && record.state != RequestState::Queued)
+        || (record.result_expired && record.response_body.is_some())
+        || (record.state.terminal() && record.response_status.is_none())
+    {
+        return Err(QueueError::Invalid);
+    }
+    if let Some(body) = &record.response_body {
+        validate_response(
+            record.request_id,
+            record.response_status.ok_or(QueueError::Invalid)?,
+            body,
+        )?;
+    }
+    if record.state.terminal() && !record.result_expired && record.response_body.is_none() {
+        return Err(QueueError::Invalid);
+    }
+    Ok(())
+}
 impl RequestQueue {
     pub fn new(
         run_id: Uuid,
@@ -303,6 +368,25 @@ impl RequestQueue {
         context: Option<RequestContext>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
+        self.propose_with_metadata(body, context, None, now_ms)
+    }
+    /// Install immutable snapshot/authorization bytes in the initial version,
+    /// before any replica can acknowledge its payload.
+    pub fn propose_pinned(
+        &mut self,
+        body: Vec<u8>,
+        pinned_metadata: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        self.propose_with_metadata(body, None, Some(pinned_metadata), now_ms)
+    }
+    fn propose_with_metadata(
+        &mut self,
+        body: Vec<u8>,
+        context: Option<RequestContext>,
+        pinned_catalog: Option<Vec<u8>>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
         if let Some(c) = &context {
             c.validate(now_ms / 1000).map_err(|_| QueueError::Invalid)?;
         }
@@ -338,7 +422,7 @@ impl RequestQueue {
             body,
             accepted: false,
             state: RequestState::Queued,
-            pinned_catalog: None,
+            pinned_catalog,
             response_status: None,
             response_body: None,
             completed_at_ms: None,
@@ -350,66 +434,22 @@ impl RequestQueue {
         Ok(record)
     }
     fn validate_record(&self, record: &RequestRecord) -> Result<(), QueueError> {
-        // Expiry is checked at admission/execution, not on replica recovery.
-        // A valid accepted snapshot remains recoverable after credentials expire.
-        if let Some(c) = &record.context {
-            c.validate(0).map_err(|_| QueueError::Invalid)?;
-            if record.context_bytes()? > crate::storage::context::MAX_CONTEXT_BYTES {
-                return Err(QueueError::Invalid);
-            }
-        }
         if record.run_id != self.run_id
             || record.scheduler_term != self.scheduler_term
             || record.membership_revision != self.membership_revision
         {
             return Err(QueueError::Stale);
         }
-        let expired_identity =
-            record.result_expired && record.state.terminal() && record.body.is_empty();
-        if record.sequence == 0
-            || record.version == 0
-            || record.version == u64::MAX
-            || record.digest.len() != 64
-            || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || (!expired_identity
-                && (record.digest != digest(&record.body)
-                    || protocol::parse_request(&record.body)
-                        .map_err(|_| QueueError::Invalid)?
-                        .request_id
-                        != record.request_id))
-            || !record.replicas.is_subset(&self.members)
-            || record
-                .pinned_catalog
-                .as_ref()
-                .is_some_and(|v| v.len() > protocol::MAX_CATALOG_BYTES + 4100)
-            || record
-                .response_body
-                .as_ref()
-                .is_some_and(|v| v.len() > protocol::MAX_BODY_BYTES)
-            || (record.state.terminal() != record.completed_at_ms.is_some())
-            || (!record.state.terminal()
-                && (record.response_status.is_some()
-                    || record.response_body.is_some()
-                    || record.result_expired))
-            || (!record.accepted && record.state != RequestState::Queued)
-            || (record.result_expired && record.response_body.is_some())
-            || (record.state.terminal() && record.response_status.is_none())
-        {
-            return Err(QueueError::Invalid);
-        }
-        if let Some(body) = &record.response_body {
-            validate_response(
-                record.request_id,
-                record.response_status.ok_or(QueueError::Invalid)?,
-                body,
-            )?;
-        }
-        if record.state.terminal() && !record.result_expired && record.response_body.is_none() {
+        if !record.replicas.is_subset(&self.members) {
             return Err(QueueError::Invalid);
         }
         Ok(())
     }
     pub fn install(&mut self, record: RequestRecord) -> Result<(), QueueError> {
+        self.install_validated(ValidatedRecord::prepare(record)?)
+    }
+    pub fn install_validated(&mut self, prepared: ValidatedRecord) -> Result<(), QueueError> {
+        let record = prepared.0;
         self.validate_record(&record)?;
         if let Some(old) = self.records.get(&record.identity()) {
             if old.context != record.context
@@ -620,8 +660,31 @@ impl RequestQueue {
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
-        let id = id.into();
-        self.expire(now_ms);
+        self.finish_inner(id.into(), status, body, now_ms, false)
+    }
+    /// Distributed readers must keep their pinned input and terminal bytes until
+    /// all required copies exist. Capacity failure leaves the original record
+    /// intact so the owner can wait for retention capacity without losing a pin.
+    pub fn finish_retained(
+        &mut self,
+        id: impl Into<RequestKey>,
+        status: u16,
+        body: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        self.finish_inner(id.into(), status, body, now_ms, true)
+    }
+    fn finish_inner(
+        &mut self,
+        id: RequestKey,
+        status: u16,
+        body: Vec<u8>,
+        now_ms: u64,
+        retain: bool,
+    ) -> Result<RequestRecord, QueueError> {
+        if !retain {
+            self.expire(now_ms);
+        }
         let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
         if !record.accepted || record.state.terminal() || !(200..600).contains(&status) {
             return Err(QueueError::Conflict);
@@ -639,6 +702,9 @@ impl RequestQueue {
         // cap. Never strand a committed mutation in Running; lookup explicitly
         // reports unavailable and durable history can recover its decision.
         if self.check_capacity(&record) == Err(QueueError::Overloaded) {
+            if retain {
+                return Err(QueueError::Overloaded);
+            }
             record.response_body = None;
             record.result_expired = true;
             record.body.clear();
@@ -783,16 +849,54 @@ impl RequestQueue {
         membership_revision: u64,
         members: BTreeSet<Uuid>,
     ) -> Result<QueueSnapshot, QueueError> {
+        self.takeover_in_place(term, membership_revision, members)?;
+        Ok(self.snapshot())
+    }
+    /// Rebase a complete RAM copy without cloning every queued payload. The
+    /// caller has already committed the run/owner/membership fence. All failure
+    /// checks precede mutation, including the larger ready set's ACK reserve.
+    pub fn takeover_in_place(
+        &mut self,
+        term: u64,
+        membership_revision: u64,
+        members: BTreeSet<Uuid>,
+    ) -> Result<(), QueueError> {
         if term < self.scheduler_term
             || membership_revision < self.membership_revision
             || term == self.scheduler_term && membership_revision == self.membership_revision
             || members.is_empty()
+            || members.iter().any(Uuid::is_nil)
         {
             return Err(QueueError::Stale);
         }
-        let mut replacement =
-            Self::new(self.run_id, term, membership_revision, self.limits, members)?;
-        for mut record in self.records.values().cloned() {
+        let mut queue_bytes = 0usize;
+        for record in self.records.values() {
+            if record.version.checked_add(1).is_none_or(|v| v == u64::MAX) {
+                return Err(QueueError::Invalid);
+            }
+            let old_ack_bytes = record
+                .replicas
+                .len()
+                .checked_mul(32)
+                .ok_or(QueueError::Overloaded)?;
+            let new_ack_bytes = members
+                .len()
+                .checked_mul(32)
+                .ok_or(QueueError::Overloaded)?;
+            queue_bytes = queue_bytes
+                .checked_add(
+                    record
+                        .queue_bytes()?
+                        .checked_sub(old_ack_bytes)
+                        .and_then(|n| n.checked_add(new_ack_bytes))
+                        .ok_or(QueueError::Overloaded)?,
+                )
+                .ok_or(QueueError::Overloaded)?;
+        }
+        if queue_bytes > self.limits.max_queue_bytes_per_replica {
+            return Err(QueueError::Overloaded);
+        }
+        for record in self.records.values_mut() {
             record.scheduler_term = term;
             record.membership_revision = membership_revision;
             record.replicas.clear();
@@ -803,10 +907,11 @@ impl RequestQueue {
                 record.state = RequestState::Reconciling;
             }
             record.version = record.version.checked_add(1).ok_or(QueueError::Invalid)?;
-            replacement.install(record)?;
         }
-        *self = replacement;
-        Ok(self.snapshot())
+        self.scheduler_term = term;
+        self.membership_revision = membership_revision;
+        self.members = members;
+        Ok(())
     }
 }
 fn validate_response(id: Uuid, status: u16, body: &[u8]) -> Result<(), QueueError> {

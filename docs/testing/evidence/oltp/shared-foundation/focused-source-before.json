@@ -1,0 +1,7 @@
+{
+  "head": "dbee65d667192470d86a24dc23a1434a51e20938",
+  "product_source_sha256": "56f1e40f10e54274692cafd36da0b01dfdc426221eb652f09b7a502b8dfde763",
+  "rust_test_source_sha256": "01a5feab7cd849842f3404838629368e9b453122f1f8a35e98b1c1e7ad43036d",
+  "product_file_count": 216,
+  "test_file_count": 42
+}

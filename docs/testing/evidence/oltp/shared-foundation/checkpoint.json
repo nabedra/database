@@ -1,0 +1,107 @@
+{
+  "base_commit": "dbee65d667192470d86a24dc23a1434a51e20938",
+  "input_sha256_before": "1d20f8d9d9a09f13c0d4ac30594b618e957b739c97bc8fc6e392d7674642685a",
+  "input_sha256_after": "1d20f8d9d9a09f13c0d4ac30594b618e957b739c97bc8fc6e392d7674642685a",
+  "source_unchanged": true,
+  "scope": "Frozen product Cargo/Rust/ORM plus queue process Rust fixtures; renderer hashes recorded separately by capture helper",
+  "stages": [
+    {
+      "name": "library",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "oltp",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 26.69797924600425
+    },
+    {
+      "name": "legacy-replication",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "oltp",
+        "--test",
+        "oltp_replication",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 94.1237868219905
+    },
+    {
+      "name": "storage-integration",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "oltp",
+        "--test",
+        "oltp_storage",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 35.493053978003445
+    },
+    {
+      "name": "process-build",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "oltp",
+        "--test",
+        "oltp_worker_queue",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 5.052586906007491
+    },
+    {
+      "name": "process-capture",
+      "command": [
+        "python3.11",
+        "server/tests/capture_worker_queue_evidence.py",
+        "--binary",
+        "/tmp/nabedra-worker-queue-final-dad0416350f63eab",
+        "--expected-input-sha",
+        "1d20f8d9d9a09f13c0d4ac30594b618e957b739c97bc8fc6e392d7674642685a",
+        "--output-dir",
+        "/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/docs/testing/evidence/oltp/shared-foundation/worker-process"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 18.386677574002533,
+      "binary_sha256": "dad0416350f63eab3f9f5d445888691341fd6dbdf273ecf5a3e562f50d694d41"
+    }
+  ],
+  "environment": {
+    "CARGO_TARGET_DIR": "/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "TOKIO_WORKER_THREADS": "2",
+    "RUST_TEST_THREADS": "1"
+  }
+}

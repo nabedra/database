@@ -1,6 +1,8 @@
 #![cfg(feature = "oltp")]
 //! O06/O10/O11/O15: real mutually authenticated TCP peers and durable stores.
 //! These are library consensus fixtures, not distributed API/worker acceptance.
+#[path = "support/tls.rs"]
+mod tls;
 use futures_util::StreamExt;
 use nabedra_database_server::{
     oltp::{OltpEngine, OltpResources, StateMachine},
@@ -16,14 +18,8 @@ use openraft::{
     storage::{IOFlushed, RaftLogStorage},
     type_config::alias::{EntryOf, LogIdOf, VoteOf},
 };
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, path::PathBuf, sync::Arc, time::Duration};
+use tls::certificates;
 use tokio::{
     net::TcpListener,
     sync::{RwLock, Semaphore, oneshot},
@@ -66,7 +62,7 @@ fn resources() -> OltpResources {
         // Match the CLI task budget, including decoded input and mutation buffers.
         query_memory_bytes: 512 * 1024 * 1024,
         executor_threads: 1,
-        background_threads: 1,
+        background_threads: 2,
     }
 }
 fn command(
@@ -190,108 +186,6 @@ async fn o06_o11_wide_log_append_is_durable_and_streamed_with_bounded_reads() {
     .expect("bounded log fixture");
 }
 
-fn openssl(directory: &Path, args: &[&str]) {
-    use std::io::Read;
-    let diagnostic = directory.join("openssl.stderr");
-    let mut child = Command::new("openssl")
-        .args(args)
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(fs::File::create(&diagnostic).unwrap()))
-        .spawn()
-        .unwrap();
-    let until = std::time::Instant::now() + Duration::from_secs(15);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if std::time::Instant::now() >= until {
-            let _ = child.kill();
-            child.wait().unwrap();
-            panic!("openssl fixture watchdog");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let mut output = String::new();
-    fs::File::open(diagnostic)
-        .unwrap()
-        .take(8192)
-        .read_to_string(&mut output)
-        .unwrap();
-    assert!(status.success(), "openssl: {output}");
-}
-
-fn certificates(directory: &Path) -> Vec<TlsMaterial> {
-    openssl(
-        directory,
-        &[
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-days",
-            "1",
-            "-subj",
-            "/CN=nabedra-test-ca",
-            "-keyout",
-            "ca.key",
-            "-out",
-            "ca.pem",
-        ],
-    );
-    fs::write(directory.join("extensions"),"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:localhost\n").unwrap();
-    let ca = fs::read(directory.join("ca.pem")).unwrap();
-    (1..=3)
-        .map(|id| {
-            let key = format!("node{id}.key");
-            let csr = format!("node{id}.csr");
-            let certificate = format!("node{id}.pem");
-            openssl(
-                directory,
-                &[
-                    "req",
-                    "-newkey",
-                    "rsa:2048",
-                    "-nodes",
-                    "-subj",
-                    "/CN=localhost",
-                    "-keyout",
-                    &key,
-                    "-out",
-                    &csr,
-                ],
-            );
-            openssl(
-                directory,
-                &[
-                    "x509",
-                    "-req",
-                    "-in",
-                    &csr,
-                    "-CA",
-                    "ca.pem",
-                    "-CAkey",
-                    "ca.key",
-                    "-CAcreateserial",
-                    "-out",
-                    &certificate,
-                    "-days",
-                    "1",
-                    "-extfile",
-                    "extensions",
-                ],
-            );
-            TlsMaterial::from_pem(
-                &fs::read(directory.join(certificate)).unwrap(),
-                &fs::read(directory.join(key)).unwrap(),
-                &ca,
-            )
-            .unwrap()
-        })
-        .collect()
-}
 struct Node {
     raft: Raft<TypeConfig, StateMachine>,
     state: StateMachine,
@@ -318,7 +212,7 @@ struct Cluster {
 impl Cluster {
     async fn new() -> Self {
         let directory = Temporary::new();
-        let tls = certificates(&directory.0);
+        let tls = certificates(&directory.0, 3);
         let cluster = Uuid::new_v4();
         let group = Uuid::new_v4();
         let mut peers = BTreeMap::new();
@@ -705,7 +599,7 @@ async fn o06_wide_append_prefix_acknowledges_only_sent_entries_and_conflicts_tru
     use openraft::raft::AppendEntriesRequest;
     let mut harness = timeout(Duration::from_secs(30), async {
         let directory = Temporary::new();
-        let tls = certificates(&directory.0);
+        let tls = certificates(&directory.0, 3);
         let cluster = Uuid::new_v4();
         let group = Uuid::new_v4();
         let mut peers = BTreeMap::new();

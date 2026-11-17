@@ -47,6 +47,16 @@ O11/O16 snapshot-activation regression: corrupt the incoming header's applied po
 
 O10/O29 unreadable-proof regression: commit an identified mutation, then make its stored decision encoding or namespace unreadable. Lookup and same-identity replay must report an unknown outcome, without changing the write sequence, recomputing the operation or generating another table UUID. Keep ordinary pre-publication validation certainty separate. Label corrupted-encoding models separately from actual native storage fault injection.
 
+O09/Q06 snapshot-pin regression: race snapshot allocation with garbage collection. Timestamp allocation and pin insertion must be one durable transition, and retries must recover the same pin. A reserved timestamp watermark cannot authorize deleting a version still needed by a surviving request. Release requires matching terminal-copy evidence or an explicitly authorized abandonment path.
+
+O09/Q06/R03 release-membership regression: interrupt a ready-set transition before and after fencing the timestamp group's release revision, then retry each phase. The new ready view cannot publish before that fence. Old copy evidence must fail after it, and an idempotent retry cannot substitute another worker set. Test bounded ACK pages across multiple pages, omissions, duplicates, stale enrollments, changed terminal/context digests, and actual worker transport provenance. Helper-only proof tests do not establish the service or transition assertions.
+
+O13/O14/Q06 terminal-retirement regression: complete and expire enough requests to exceed the RAM queue's historical-identity capacity, then admit new valid work. Retire RAM records only after an authoritative non-executable terminal identity/digest tombstone or another proved retention protocol preserves delayed retry and receipt semantics. No pending request body, query or authorization payload enters durable storage. Query result expiry remains explicit, and a delayed mutation UUID cannot execute again.
+
+O05/O23/C02 native-open regression: inspect the pinned dependency's option sanitization and observe native threads after opening several pools, with the minimum and a larger configured background budget. Database open must not silently increase HIGH/LOW execution pools beyond the advertised maintenance budget. Reject an impossible configuration before creating/opening storage. Count query, control and maintenance execution capacity accurately; separately bound and charge housekeeping timers, network threads and their metadata/stacks. Record OS-specific observation limits rather than claiming a total-process bound from Rust executor thread IDs.
+
+O13/M03 retained-reply regression: hold part of a reply arena, enqueue a reply requiring its full capacity, and repeatedly complete smaller fitting replies. Use deterministic release/dispatch barriers. Smaller work may bypass temporarily, but bounded aging must eventually protect enough headroom for the large eligible reply. No waiter holds CPU or a physical executor slot. Test cancellation and close without leaked reservations, and keep independent control replies progressing. General scheduler aging tests alone do not establish this separate allocator's fairness.
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |

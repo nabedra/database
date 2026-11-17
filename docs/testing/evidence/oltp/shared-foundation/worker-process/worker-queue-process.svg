@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="720" viewBox="0 0 960 720">
+<metadata>{&quot;artifact_sha256&quot;: &quot;0d2f058403533aa6c0455f1b5b0869ad8bfb995c365290d887b2135dbedb9b55&quot;, &quot;renderer_sha256&quot;: &quot;8142093fb1eda39d885ddc6247d9702f793d00d1f99b73e4c347b4bc6cfae57a&quot;}</metadata>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#365f6e"/></marker></defs>
+<rect width="960" height="720" fill="#fafcfb"/>
+<g font-family="system-ui,sans-serif" fill="#18333c">
+<text x="40" y="43" font-size="24" font-weight="650">Worker-memory queue process assertions</text>
+<text x="40" y="72" font-size="14">Real mTLS and OS-process failures. Authority and read backend are supplied by the fixture.</text>
+
+<rect x="40" y="135" width="180" height="95" rx="9" fill="#e4eff8" stroke="#aac0c4"/>
+<text x="53" y="161" font-size="16" font-weight="650">API process</text>
+<text x="53" y="184" font-size="12" font-weight="400">Owns no queue</text>
+<text x="53" y="205" font-size="12" font-weight="400">API restart tested</text>
+<rect x="290" y="135" width="240" height="95" rx="9" fill="#dcefe8" stroke="#aac0c4"/>
+<text x="303" y="161" font-size="16" font-weight="650">Owner worker RAM</text>
+<text x="303" y="184" font-size="12" font-weight="400">Original body + auth + pin</text>
+<text x="303" y="205" font-size="12" font-weight="400">Exact request/version identity</text>
+<rect x="650" y="135" width="240" height="95" rx="9" fill="#dcefe8" stroke="#aac0c4"/>
+<text x="663" y="161" font-size="16" font-weight="650">Every ready worker RAM</text>
+<text x="663" y="184" font-size="12" font-weight="400">Payload, then accepted version</text>
+<text x="663" y="205" font-size="12" font-weight="400">Same-run survivor takeover</text>
+<rect x="650" y="340" width="240" height="90" rx="9" fill="#e4eff8" stroke="#aac0c4"/>
+<text x="663" y="366" font-size="16" font-weight="650">Joining worker</text>
+<text x="663" y="389" font-size="12" font-weight="400">Paged snapshot + sealed delta</text>
+<text x="663" y="410" font-size="12" font-weight="400">Unready until published</text>
+<rect x="290" y="340" width="240" height="90" rx="9" fill="#fff0cf" stroke="#aac0c4"/>
+<text x="303" y="366" font-size="16" font-weight="650">Fixture authority + reads</text>
+<text x="303" y="389" font-size="12" font-weight="400">Explicit test-supplied fences</text>
+<text x="303" y="410" font-size="12" font-weight="400">Control/TSO/P5 not integrated</text>
+<path d="M220,154 L290,154" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="231" y="142" font-size="12">submit</text>
+<path d="M530,150 L650,150" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="535" y="122" font-size="12">1. install payload</text>
+<path d="M650,180 L530,180" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="550" y="171" font-size="12">all ACKs</text>
+<path d="M530,205 L650,205" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="534" y="254" font-size="12">2. accepted version</text>
+<path d="M650,220 L530,220" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="550" y="237" font-size="12">all ACKs</text>
+<path d="M290,211 L220,211" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="232" y="200" font-size="12">then 202</text>
+<path d="M770,230 L770,340" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="787" y="293" font-size="12">copy before readiness</text>
+<path d="M410,340 L410,230" fill="none" stroke="#365f6e" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="423" y="294" font-size="12">fresh authority</text>
+<text x="40" y="480" font-size="17" font-weight="650">Executed assertions</text>
+<text x="40" y="507" font-size="13">Q03/R01/Q06/C07: ACK barriers, owner kill, exact terminal replay, zero compute during network waits.</text>
+<text x="40" y="530" font-size="13">Q04: API-only process restart and lost submit reply preserve the worker request sequence and context.</text>
+<text x="40" y="553" font-size="13">R03/Q03: empty, single and multiple pages, live delta, readiness gate and last-holder takeover.</text>
+<text x="40" y="576" font-size="13">U02/M02: a valid full 8 MiB operation copies and joins under the default 512 MiB task budget.</text>
+<text x="40" y="599" font-size="13">U02: maximum logical predicate depth passes the real transport; one level over installs no record.</text>
+<text x="40" y="622" font-size="13">28 child processes started and reaped. Full-stop restart abandons old outstanding identities.</text>
+<text x="40" y="676" font-size="11">Test binary SHA-256: dad0416350f63eab3f9f5d445888691341fd6dbdf273ecf5a3e562f50d694d41</text>
+<text x="40" y="697" font-size="11">Correctness fixture. No production Control-Raft/P5, remote-command or performance claim.</text></g></svg>

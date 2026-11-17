@@ -92,7 +92,7 @@ impl LocalRuntime {
             .cache_bytes
             .checked_add(native.write_buffer_bytes)
             .and_then(|n| n.checked_add(64 << 20))
-            .and_then(|n| n.checked_add(native.executor_threads.checked_mul(4 << 20)?))
+            .and_then(|n| n.checked_add(engine.thread_budget().total_stack_reservation_bytes))
             .ok_or_else(unavailable)? as u64;
         let native_charge = scheduler.charge_memory(0, native_bytes)?;
         let charge = scheduler.charge_memory(0, reserved)?;
@@ -515,7 +515,7 @@ mod tests {
                 write_buffer_bytes: 4 << 20,
                 query_memory_bytes: 16 << 20,
                 executor_threads: 1,
-                background_threads: 1,
+                background_threads: 2,
             },
         )
         .unwrap()
@@ -528,7 +528,7 @@ mod tests {
                 ..Default::default()
             },
             WorkerResources {
-                max_threads: 2,
+                max_threads: 3,
                 ..Default::default()
             },
         )
@@ -544,7 +544,7 @@ mod tests {
         let data = Directory::new();
         let settings = Directory::new();
         let path = settings.0.join("resources.json");
-        for max_threads in [257, 1024] {
+        for max_threads in [1, 2, 257, 1024] {
             std::fs::write(
                 &path,
                 serde_json::to_vec(&WorkerResources {
@@ -750,7 +750,7 @@ mod tests {
             &dir.0,
             OltpResources {
                 executor_threads: 1,
-                background_threads: 1,
+                background_threads: 2,
                 ..Default::default()
             },
             Uuid::new_v4(),

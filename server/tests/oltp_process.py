@@ -53,7 +53,7 @@ class Server:
         env["NABEDRA_TOKEN"] = "test-token"
         command = [
             self.binary, "serve", "--data-dir", self.directory, "--database", "test",
-            "--host", "127.0.0.1", "--port", str(port), "--workers", "2", "--queue-size", "8",
+            "--host", "127.0.0.1", "--port", str(port), "--workers", "3", "--queue-size", "8",
         ]
         if tls:
             command += ["--tls-cert", self.directory + "/cert.pem", "--tls-key", self.directory + "/key.pem"]
@@ -255,7 +255,7 @@ def main(binary, evidence_dir, condition):
         "working_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"])).hexdigest(),
         "cpu_quota": "no CPU quota configured or measured by this fixture", "storage": "host temporary filesystem directory; no EBS/provider assertion",
         "clock": "perf_counter_ns monotonic client clock", "features": ["oltp"],
-        "config": {"workers": 2, "foreground_threads": 1, "storage_background_threads": 1, "network_threads": 2, "queue_size": 8, "max_pending_requests": 9, "memory_limit_bytes": 8589934592, "task_memory_limit_bytes": 536870912, "result_retention_ms": 300000, "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit", "topology": "standalone_rf1", "S3_credentials": "absent"},
+        "config": {"workers": 3, "foreground_threads": 1, "storage_background_threads": 2, "network_threads": 2, "queue_size": 8, "max_pending_requests": 9, "memory_limit_bytes": 8589934592, "task_memory_limit_bytes": 536870912, "result_retention_ms": 300000, "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit", "topology": "standalone_rf1", "S3_credentials": "absent"},
         "benchmark": measurement, "accepted_identity_assertions": {"durable_mutations": 1, "query_receipts": 1, "TLS_verified": True, "database_scope_rebind_rejected": True, "resources_override_257_rejected_before_storage_or_readiness": True, "ORM_growth_count_before_and_after_SIGKILL": 110001, "ORM_count_with_limit_above_100000": 100001, "duplicate_logical_mutations": 0, "missing_acknowledged_mutations_after_SIGKILL": 0}}
     if evidence_dir:
         path = Path(evidence_dir)

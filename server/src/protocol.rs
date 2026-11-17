@@ -780,6 +780,16 @@ pub(crate) enum JsonBoundsError {
     InvalidRecord,
 }
 pub(crate) fn json_input(bytes: &[u8], cap: usize) -> Result<(), JsonBoundsError> {
+    json_input_at_depth(bytes, cap, 32)
+}
+/// Logical predicate nodes may contain both an object and an args array.
+/// Preserve the public depth-32 predicate contract without relaxing internal
+/// storage/control JSON. This remains below serde_json's depth-128 stack guard.
+#[cfg(feature = "oltp")]
+pub(crate) fn request_json_input(bytes: &[u8]) -> Result<(), JsonBoundsError> {
+    json_input_at_depth(bytes, MAX_BODY_BYTES, (2 * MAX_PREDICATE_DEPTH + 8) as u32)
+}
+fn json_input_at_depth(bytes: &[u8], cap: usize, max_depth: u32) -> Result<(), JsonBoundsError> {
     if bytes.len() > cap {
         return Err(JsonBoundsError::LimitExceeded);
     }
@@ -798,7 +808,7 @@ pub(crate) fn json_input(bytes: &[u8], cap: usize) -> Result<(), JsonBoundsError
                 b'"' => string = true,
                 b'{' | b'[' => {
                     depth += 1;
-                    if depth > 32 {
+                    if depth > max_depth {
                         return Err(JsonBoundsError::InvalidRecord);
                     }
                 }

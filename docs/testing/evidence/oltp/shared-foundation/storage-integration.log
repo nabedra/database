@@ -1,0 +1,19 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 3.56s
+     Running tests/oltp_storage.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_storage-42f9b5e6c0419ccd)
+
+running 8 tests
+test o01_o03_o04_thirteen_operations_order_types_and_stale_handles ... ok
+test o02_foreign_nonempty_directory_manifest_and_resource_limits_are_rejected ... ok
+test o03_utf8_key_order_and_primary_range_boundaries ... ok
+test o04_seeded_scan_and_top_k_match_serial_oracle ... ok
+test o07_o08_o10_atomic_conflicts_stable_replays_and_database_binding ... ok
+test o11_process_crash_child ... ignored
+test o11_process_kill_preserves_acknowledged_batch_and_exact_decision ... 
+running 1 test
+test o11_process_crash_child ... ok
+test o21_growth_past_old_row_and_byte_limits_is_streamed_and_survives_reopen ... O21 standalone growth: rows=110001, raw_text_bytes=84480768, insertion_ms=21360
+ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 30.25s
+
