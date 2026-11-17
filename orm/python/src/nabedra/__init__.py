@@ -8,6 +8,9 @@ from .errors import (
     OverloadedError,
     ProtocolError,
     StorageError,
+    StreamAbandonedError,
+    StreamExpiredError,
+    StreamUnsupportedError,
     TransportError,
     UnknownOutcomeError,
     ValidationError,
@@ -15,6 +18,7 @@ from .errors import (
 from .validation import Key, Row, Scalar, Schema
 from .expr import Expr, col
 from .query import Query
+from .stream import BatchStream, StreamSnapshot
 from .table import Table
 from .client import Database, DB, RequestReceipt
 from .cluster import Cluster
@@ -25,6 +29,8 @@ __all__ = [
     "NabedraError", "ValidationError", "AuthenticationError", "NotFoundError",
     "ConflictError", "LimitExceededError", "OverloadedError", "StorageError",
     "TransportError", "ProtocolError", "UnknownOutcomeError",
+    "BatchStream", "StreamSnapshot", "StreamUnsupportedError",
+    "StreamExpiredError", "StreamAbandonedError",
 ]
 
 from .serve import serve

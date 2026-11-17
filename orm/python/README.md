@@ -62,6 +62,7 @@ the [repository installer](https://github.com/zPy52/nabedra-database/blob/main/s
 
 ## More documentation
 
+- [OLAP query streaming and PyTorch](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/streaming.md)
 - [Python API, CLI, receipts and limits](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md)
 - [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
 - [Application gateway setup](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
