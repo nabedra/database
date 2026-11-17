@@ -125,6 +125,7 @@ class GateForward:
                     claims = json.loads(bytes.fromhex(value.strip().decode()))
                     self.trace = {'command': claims['command'], 'class': claims['class'],
                                   'sender': claims['sender_node'], 'receiver': claims['receiver'],
+                                  'sender_process': claims['sender_process'], 'term': claims['scheduler_term'],
                                   'started': time.monotonic(), 'finished': None}
                     with self.server.lock:
                         self.server.queue_requests.append(self.trace)
@@ -149,7 +150,7 @@ class GateForward:
             stream_exchange = self.server.stream_exchange
             if path == '/internal/v1/streams' and stream_exchange is not None:
                 header, body = read_http_message(self.request, header, cap=3 * 1024 * 1024)
-                exchange = stream_exchange(json.loads(body), self.trace)
+                exchange = stream_exchange(json.loads(body), self.trace, header)
                 if exchange is not None and not exchange.before():
                     return
             with socket.create_connection(self.server.target, timeout=5) as upstream:

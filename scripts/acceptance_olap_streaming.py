@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 from pathlib import Path
 import signal
+import socket
 import sqlite3
 import sys
 import tempfile
@@ -18,7 +19,7 @@ import time
 import uuid
 
 from acceptance_nodes import FrontDoor, send, target
-from acceptance_scheduler import Cluster, Evidence, wait_for
+from acceptance_scheduler import Cluster, Evidence, read_http_message, wait_for
 
 
 OPEN = '/v1/streams'
@@ -89,7 +90,7 @@ class CheckpointGate:
         self.discard = False
         self.lock = threading.Lock()
 
-    def claim(self, command, trace):
+    def claim(self, command, trace, _request):
         if command['command'] != 'stream_install':
             return None
         entry = command['payload']['entry']
@@ -119,6 +120,39 @@ class CheckpointGate:
             self.ack = (status, control)
             self.entered.set()
             return self.release.wait(30)
+        return True
+
+
+class PublicRequestGate:
+    """Retain a real, untouched API request before the worker sees its nonce."""
+
+    def __init__(self, opened):
+        self.ids = {'run_id': opened['run_id'], 'stream_id': opened['stream_id'], 'sequence': 0}
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.lock = threading.Lock()
+        self.wire = None
+        self.trace = None
+        self.response = None
+
+    def claim(self, command, trace, request):
+        if command['command'] != 'stream_request':
+            return None
+        if command['payload']['request'] != {'operation': 'batch', 'payload': self.ids}:
+            return None
+        with self.lock:
+            if self.wire is not None:
+                return None
+            self.wire, self.trace = request, trace
+            return self
+
+    def before(self):
+        self.entered.set()
+        return self.release.wait(30)
+
+    def after(self, head, body):
+        status = int(head.split(b' ', 2)[1])
+        self.response = (status, json.loads(body[1:] if status == 200 else body))
         return True
 
 
@@ -194,6 +228,11 @@ class StreamCluster(Cluster):
     @contextmanager
     def checkpoint_gate(self, opened, sequence, phase):
         gate = CheckpointGate(opened, sequence, phase)
+        with self.gated(gate):
+            yield gate
+
+    @contextmanager
+    def gated(self, gate):
         self.lease_gates.append(gate)
         for _, door, _ in self.workers.values():
             door.stream_exchange = gate.claim
@@ -203,6 +242,7 @@ class StreamCluster(Cluster):
             gate.release.set()
             for _, door, _ in self.workers.values():
                 door.stream_exchange = None
+            self.lease_gates.remove(gate)
 
     def close(self):
         for gate in getattr(self, 'lease_gates', ()):
@@ -381,6 +421,69 @@ def overlapping_delivery(cluster, table, rows, extra, evidence):
     evidence.append('ST03/ST04/Q03/Q05: real second API refused overlapping same-sequence delivery while complete replica ACK was held')
 
 
+def unauthorized_signature(door, original):
+    head, body = original.split(b'\r\n\r\n', 1)
+    headers = head.split(b'\r\n')
+    for position, line in enumerate(headers[1:], 1):
+        name, value = line.split(b':', 1)
+        if name.lower() == b'x-nabedra-queue-signature':
+            signature = value.strip()
+            changed = (b'0' if signature[:1] != b'0' else b'1') + signature[1:]
+            headers[position] = name + b': ' + changed
+            break
+    else:
+        raise AssertionError('fixture did not capture a signed request')
+    with socket.create_connection(door.target, timeout=5) as worker:
+        worker.sendall(b'\r\n'.join(headers) + b'\r\n\r\n' + body)
+        reply, reply_body = read_http_message(worker, cap=16384)
+    status = int(reply.split(b' ', 2)[1])
+    assert status == 401, (status, reply_body)
+    assert json.loads(reply_body)['error']['code'] == 'unauthorized'
+
+
+def stale_signed_request(cluster, table, rows, extra, evidence):
+    opened = cluster.open(cluster.open_body(table))
+    old = cluster.control()
+    authority = old['scheduler']
+    worker = authority['coordinator_node']
+    gate = PublicRequestGate(opened)
+    primary_stopped = False
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with cluster.gated(gate):
+                stale = pool.submit(cluster.fetch, 'POST', batch_path(opened, 0), url=extra, timeout=28)
+                assert gate.entered.wait(8), 'worker did not receive the interceptable API request'
+                assert gate.trace['receiver'] == worker and gate.trace['term'] == authority['scheduler_term']
+                assert gate.trace['sender_process'] != old['controller']['owner_id']
+                door = cluster.workers[worker][1]
+                unauthorized_signature(door, gate.wire)
+                cluster.stop_api()
+                primary_stopped = True
+
+                def advanced():
+                    control = cluster.control()
+                    new = control['scheduler']
+                    fence = cluster.catalog_fence()
+                    if new['scheduler_term'] <= authority['scheduler_term'] or new['scheduler_term'] != fence['scheduler_term']:
+                        return None
+                    assert control['controller']['owner_id'] == gate.trace['sender_process']
+                    assert new['coordinator_node'] == worker and fence['run_id'] == opened['run_id']
+                    return control
+                wait_for(advanced, 'new API controller did not advance the live term', 23)
+
+            result = stale.result(28)
+            assert gate.response is not None, 'old request did not reach the original worker'
+            assert gate.response[0] == 503, gate.response
+            result.error(503, 'storage_unavailable')
+            unauthorized_signature(door, gate.wire)
+    finally:
+        if primary_stopped:
+            cluster.start_api()
+    assert cluster.batch(opened, 0, url=extra).json()['rows'] == rows[:3]
+    cluster.fetch('DELETE', batch_path(opened), url=extra).empty()
+    evidence.append('ST04/R05/U02: an untouched old-term API request returned retryable 503 from the same live worker, while a changed signature returned 401')
+
+
 def apis_and_failover(cluster, table, rows, extra, evidence):
     opened = cluster.open(cluster.open_body(table))
     first = cluster.batch(opened, 0)
@@ -514,7 +617,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--evidence', type=Path)
-    parser.add_argument('--scenario', choices=('all', 'leases', 'replies', 'overlap', 'failover', 'stale', 'cold'), default='all')
+    parser.add_argument('--scenario', choices=('all', 'leases', 'replies', 'overlap', 'failover', 'stale', 'stale-rpc', 'cold'), default='all')
     args = parser.parse_args()
     binary = args.binary.resolve()
     evidence = Evidence(binary)
@@ -528,7 +631,8 @@ def main():
                 extra, _, extra_channel = cluster.start_extra_api()
                 table, rows = seed(cluster)
                 for name, scenario in [('leases', lease_lifecycle), ('replies', sdk_faults),
-                                       ('overlap', overlapping_delivery), ('stale', stale_owner),
+                                       ('overlap', overlapping_delivery), ('stale-rpc', stale_signed_request),
+                                       ('stale', stale_owner),
                                        ('failover', apis_and_failover),
                                        ('cold', cold_start)]:
                     if args.scenario in ('all', name):
