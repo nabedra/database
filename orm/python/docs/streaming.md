@@ -18,7 +18,7 @@ with query.stream(batch_rows=64) as batches:
         consume(rows)
 ```
 
-Use the context manager so an early exit closes the server lease. The iterator is single-use. The SDK retries a lost response at the same sequence and raises an error if it cannot recover that response. It raises `StreamAbandonedError` when the worker run ends, `StreamExpiredError` when the lease expires, and `StreamUnsupportedError` when the server or the query lacks streaming support.
+Use the context manager so an early exit closes the server lease. The iterator is single-use. The SDK retries lost responses and temporary worker failures with the same run ID and batch sequence. The connection timeout and a fixed attempt limit bound the retry window. It raises `StreamAbandonedError` when the worker run ends, `StreamExpiredError` when the lease expires, and `StreamUnsupportedError` when the server or the query lacks streaming support.
 
 `prefetch_batches=1` is the default. Depth zero reads each batch on demand. Depth two requests another batch of lookahead and uses more worker RAM when available. The last batch can be short. Use `drop_last=True` to yield only full batches. For a batch that exceeds the server's byte cap, choose a smaller `batch_rows` or project fewer columns. You can stream projections, filters and a scan-wide limit in primary-key order. Other sorts require a prepared table.
 

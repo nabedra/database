@@ -11,15 +11,17 @@ from .client import _ERROR_STATUS, _ERROR_TYPES, _Transport
 from .client import _finite_float, _invalid_constant, _unique_object
 from .errors import (
     LimitExceededError, NabedraError, OverloadedError, ProtocolError,
-    StreamAbandonedError, StreamExpiredError, StreamUnsupportedError,
+    StorageError, StreamAbandonedError, StreamExpiredError, StreamUnsupportedError,
     TransportError, UnknownOutcomeError, ValidationError,
 )
 
 _REQUEST_BYTES = 128 * 1024
 _CONTROL_BYTES = 64 * 1024
-_ATTEMPTS = 3
+# The default worker expiry is 15 seconds. Leave enough attempts for takeover.
+_ATTEMPTS = 14
 _CLEANUP_TIMEOUT = 1.0
-_MAX_RETRY_AFTER = 1.0
+_INITIAL_BACKOFF = 0.25
+_MAX_BACKOFF = 2.0
 _ERROR_CODES = {
     **_ERROR_STATUS,
     'stream_expired': 410,
@@ -109,6 +111,8 @@ class _StreamChannel:
             headers = {**headers, 'Content-Type': 'application/json'}
         attempts = 1 if cleanup else _ATTEMPTS
         timeout = min(self._timeout, _CLEANUP_TIMEOUT) if cleanup else self._timeout
+        deadline = time.monotonic() + timeout
+        backoff = _INITIAL_BACKOFF
         for attempt in range(attempts):
             retry_after = 0.0
             try:
@@ -122,10 +126,15 @@ class _StreamChannel:
                                                  status_code=status)
                 retry_after = _retry_delay(hint)
                 _raise_response_error(status, content_type, raw, request_id)
-            except (TransportError, OverloadedError):
-                if attempt + 1 == attempts:
+            except (TransportError, OverloadedError, StorageError):
+                delay = max(retry_after, backoff)
+                if attempt + 1 == attempts or delay >= deadline - time.monotonic():
                     raise
-                time.sleep(max(retry_after, 0.05 * 2**attempt))
+                time.sleep(delay)
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise
+                backoff = min(2 * backoff, _MAX_BACKOFF)
         raise AssertionError('Stream exchange requires at least one attempt')
 
     def _exchange(
@@ -192,8 +201,8 @@ def _read_body(response: HTTPResponse, max_bytes: int, *, require_frame: bool) -
 
 
 def _retry_delay(hint: str | None) -> float:
-    if hint and hint.isascii() and hint.isdecimal():
-        return min(float(hint), _MAX_RETRY_AFTER)
+    if hint and len(hint) <= 10 and hint.isascii() and hint.isdecimal():
+        return min(float(hint), _MAX_BACKOFF)
     return 0.0
 
 
