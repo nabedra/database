@@ -58,6 +58,9 @@ hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ht
 tokio-util = { version = "=0.7.20", features = ["io"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 
+[dependencies.arrow-ipc]
+version = "=60.1.0"
+
 [target.'cfg(unix)'.dependencies]
 # Bounded startup material reads use O_NONBLOCK before opened-handle validation.
 libc = "=0.2.191"
@@ -198,6 +201,3 @@ required-features = ["olap"]
 [[example]]
 name = "resource_scheduler_benchmark"
 required-features = ["olap"]
-
-[dependencies.arrow-ipc]
-version = "=60.1.0"
