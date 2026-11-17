@@ -249,6 +249,25 @@ class StreamCluster(Cluster):
     def _initialize(self, execution):
         super()._initialize(execution)
         self.lease_gates = []
+        self.extra_api = None
+
+    def start_extra_api(self):
+        self.extra_api = super().start_extra_api()
+        return self.extra_api
+
+    def stop_extra_api(self):
+        if self.extra_api is not None:
+            _, process, channel = self.extra_api
+            send(channel, {'version': 1, 'type': 'shutdown'})
+            assert process.wait(40) == 0
+            channel.close()
+            self.extra_api = None
+
+    def start_worker(self, node, threads):
+        api_urls = [self.api_door.url]
+        if self.extra_api is not None:
+            api_urls.append(self.extra_api[0])
+        return super().start_worker(node, threads, api_urls=api_urls)
 
     def worker_resources(self, threads):
         return {'max_threads': threads, 'memory_limit_bytes': 1 << 30,
@@ -699,6 +718,7 @@ def cold_start(cluster, table, rows, extra, evidence):
         if process.poll() is None:
             process.kill()
             assert process.wait(8) == -signal.SIGKILL
+    cluster.stop_extra_api()
     cluster.stop_api()
     cluster.start_api(cold=True)
     cluster.start_worker(40, 1)
@@ -743,7 +763,7 @@ def main():
                 else:
                     for worker in (10, 20, 30):
                         cluster.start_worker(worker, 1)
-                    extra, _, extra_channel = cluster.start_extra_api()
+                    extra, _, _ = cluster.start_extra_api()
                     table, rows = seed(cluster)
                     for name, scenario in [('leases', lease_lifecycle), ('replies', sdk_faults),
                                            ('overlap', overlapping_delivery), ('stale-rpc', stale_signed_request),
@@ -753,7 +773,7 @@ def main():
                                            ('cold', cold_start)]:
                         if args.scenario in ('all', name):
                             scenario(cluster, table, rows, extra, evidence)
-                    send(extra_channel, {'version': 1, 'type': 'shutdown'})
+                    cluster.stop_extra_api()
             except BaseException:
                 cluster.diagnostics.flush()
                 sys.stderr.write((Path(directory) / 'diagnostics').read_text()[-24000:])

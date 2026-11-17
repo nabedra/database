@@ -311,12 +311,13 @@ class Cluster:
         return {'max_threads': threads, 'memory_limit_bytes': (threads + 1) * (4 << 30),
                 'task_memory_limit_bytes': 512 << 20, 'control_memory_reserve_bytes': 256 << 20}
 
-    def start_worker(self, node, threads):
+    def start_worker(self, node, threads, *, api_urls=None):
         identity = str(uuid.UUID(int=node))
         door = self.worker_door_type()
         self.doors.append(door)
         bootstrap = dict(self.template, partition_slots=threads, version=1, cluster_id=self.cluster,
-                         node_id=identity, request_id=None, api_urls=[self.api_door.url], advertise_url=door.url,
+                         node_id=identity, request_id=None,
+                         api_urls=[self.api_door.url] if api_urls is None else api_urls, advertise_url=door.url,
                          storage=self.backend, enrollment_token=self.auth['enrollment_token'], tls=None,
                          resources=self.worker_resources(threads))
         path = self.root / f'worker-{node}.json'
