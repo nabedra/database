@@ -27,6 +27,9 @@ use std::{
 };
 use uuid::Uuid;
 
+// The last possible cursor has no successor in a legacy queue snapshot.
+pub(super) const STREAM_CAPABILITY_CURSOR: u64 = u64::MAX;
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Command {
@@ -184,6 +187,7 @@ pub(crate) enum Reply {
         snapshot: QueueSnapshot,
         done: bool,
     },
+    StreamCapable,
     Stats {
         pending: u64,
         running: u64,
@@ -685,12 +689,6 @@ impl Worker {
             if copied.is_some() {
                 match self.load_stream_replicas(&root, node, fence.run_id).await {
                     Ok(()) => {
-                        restored = copied;
-                        break;
-                    }
-                    // An older ready worker has no stream endpoint. Its ordinary
-                    // queue can still join a rolling upgrade before streams open.
-                    Err(error) if error.code == crate::protocol::ErrorCode::NotFound => {
                         restored = copied;
                         break;
                     }
@@ -1277,6 +1275,9 @@ impl Worker {
                     done: true,
                 })
             }
+            Command::Snapshot {
+                after: Some(STREAM_CAPABILITY_CURSOR),
+            } => Ok(Reply::StreamCapable),
             Command::Snapshot { after } => {
                 let q = self.queue.queue.lock().unwrap();
                 let (snapshot, done) = q.as_ref().ok_or_else(unavailable)?.snapshot_page(after);

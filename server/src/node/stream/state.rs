@@ -1,6 +1,7 @@
 //! Live-run leases, replay checkpoints and worker-local caches.
 use super::wire::{self, Error, Format, Opened, SnapshotOpened};
 use crate::{
+    cluster::state::MAX_NODES,
     engine::stream::{Cursor, PinnedScan, ScanReader},
     protocol::{ErrorCode, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
@@ -246,6 +247,12 @@ pub(in crate::node) struct RecoveryView {
     pub(super) ready: [u8; 32],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryStatus {
+    AllPeers,
+    LegacyPeers,
+}
+
 #[derive(Default)]
 pub(super) struct RecoveryCursor {
     pub(super) peer: usize,
@@ -276,6 +283,7 @@ pub(super) struct Recovery {
     pub(super) view: RecoveryView,
     pub(super) merge: Option<RecoveryCursor>,
     pub(super) repair: RecoveryCursor,
+    pub(super) legacy_peers: [bool; MAX_NODES],
     _charge: MemoryCharge,
 }
 impl Recovery {
@@ -284,6 +292,7 @@ impl Recovery {
             view,
             merge: Some(RecoveryCursor::default()),
             repair: RecoveryCursor::default(),
+            legacy_peers: [false; MAX_NODES],
             _charge: charge,
         }
     }
@@ -302,7 +311,7 @@ pub(in crate::node) struct Registry {
 }
 struct State {
     run: Option<Uuid>,
-    recovered_view: Option<RecoveryView>,
+    recovered_view: Option<(RecoveryView, RecoveryStatus)>,
     entries: BTreeMap<Key, Arc<Stored>>,
     deliveries: BTreeMap<Uuid, DeliveryHold>,
 }
@@ -435,9 +444,25 @@ impl Registry {
         Ok(())
     }
 
-    pub(super) fn recovered(&self, view: RecoveryView) -> bool {
+    pub(super) fn recovery_status(&self, view: RecoveryView) -> Option<RecoveryStatus> {
         let state = self.state.lock().unwrap();
-        state.run == Some(view.run) && state.recovered_view == Some(view)
+        let (recovered, status) = state.recovered_view?;
+        (state.run == Some(view.run) && recovered == view).then_some(status)
+    }
+
+    pub(super) fn handoff_ready(&self, view: RecoveryView, now: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let Some((recovered, status)) = state.recovered_view else {
+            return false;
+        };
+        if state.run != Some(view.run) || recovered != view {
+            return false;
+        }
+        if status == RecoveryStatus::AllPeers {
+            return true;
+        }
+        state.reap(now);
+        state.entries.is_empty()
     }
 
     pub(super) fn begin_recovery(&self, view: RecoveryView) -> Result<(), ProtocolError> {
@@ -450,12 +475,16 @@ impl Registry {
         Ok(())
     }
 
-    pub(super) fn mark_recovered(&self, view: RecoveryView) -> Result<(), ProtocolError> {
+    pub(super) fn mark_recovered(
+        &self,
+        view: RecoveryView,
+        status: RecoveryStatus,
+    ) -> Result<(), ProtocolError> {
         let mut state = self.state.lock().unwrap();
         if self.stopped.load(Ordering::Acquire) || state.run != Some(view.run) {
             return Err(wire::unavailable());
         }
-        state.recovered_view = Some(view);
+        state.recovered_view = Some((view, status));
         Ok(())
     }
 
@@ -844,7 +873,7 @@ mod tests {
             term: 2,
             ready: [7; 32],
         };
-        assert!(!new_owner.recovered(view));
+        assert!(new_owner.recovery_status(view).is_none());
 
         let page = holder.get(&key).unwrap().entry.clone();
         let encoded = serde_json::to_vec(&page).unwrap();
@@ -856,12 +885,19 @@ mod tests {
         install(&new_owner, compacted).unwrap();
         let merged = new_owner.get(&key).unwrap();
         install(&holder, merged.entry.clone()).unwrap();
-        new_owner.mark_recovered(view).unwrap();
-        assert!(new_owner.recovered(view));
-        assert!(!new_owner.recovered(RecoveryView {
-            ready: [8; 32],
-            ..view
-        }));
+        new_owner
+            .mark_recovered(view, RecoveryStatus::AllPeers)
+            .unwrap();
+        assert!(new_owner.recovery_status(view) == Some(RecoveryStatus::AllPeers));
+        assert!(new_owner.handoff_ready(view, 100));
+        assert!(
+            new_owner
+                .recovery_status(RecoveryView {
+                    ready: [8; 32],
+                    ..view
+                })
+                .is_none()
+        );
         assert!(merged.entry == latest);
         assert!(holder.get(&key).unwrap().entry == latest);
         let Kind::Stream(stream) = &merged.entry.kind else {
@@ -880,5 +916,21 @@ mod tests {
         let error = install(&new_owner, conflicting).err().unwrap();
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(new_owner.get(&key).unwrap().entry == latest);
+
+        // R03: a legacy cohort may hand off ordinary work once the last
+        // stream identity expires, including its retry retention window.
+        let legacy_view = RecoveryView {
+            ready: [9; 32],
+            ..view
+        };
+        new_owner
+            .mark_recovered(legacy_view, RecoveryStatus::LegacyPeers)
+            .unwrap();
+        assert!(!new_owner.handoff_ready(legacy_view, 100));
+        assert!(!new_owner.handoff_ready(legacy_view, latest.idle_at));
+        assert!(new_owner.get(&key).unwrap().entry.scan.is_none());
+        assert!(new_owner.handoff_ready(legacy_view, latest.idle_at + RETRY_MS));
+        assert!(new_owner.get(&key).is_none());
+        assert!(new_owner.recovery_status(legacy_view) == Some(RecoveryStatus::LegacyPeers));
     }
 }

@@ -2,18 +2,21 @@
 use super::{
     Authority, Dependency, Driver, Entry, FENCE_READ_BYTES, Key, Registry, Source, Stored, Version,
     call, check_dependency, install, now_ms, record_bytes,
-    state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryView},
+    state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryStatus, RecoveryView},
     wire::{self, Batch, Capabilities, Error, Format, Opened, Reply, Request, SnapshotOpened},
 };
 use crate::{
     cluster::{
         member::{Node, NodeState, Registration},
-        state::Control,
+        state::{Control, MAX_NODES},
     },
     engine::stream::MAX_PINNED_QUERY_BYTES,
     node::{
         http,
-        queue_runtime::{members, scheduler},
+        queue_runtime::{
+            Command as QueueCommand, Reply as QueueReply, STREAM_CAPABILITY_CURSOR, members,
+            scheduler,
+        },
         queue_transport,
         runtime::Worker,
     },
@@ -42,7 +45,8 @@ const CONTROL_REPLY_BYTES: usize = 16 << 10;
 const CONTROL_REQUEST_BYTES: usize = wire::MAX_REQUEST_BYTES + (64 << 10);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RECOVERY_KEY_BYTES: usize = 4 << 10;
-const RECOVERY_CURSOR_BYTES: u64 = 4 * MAX_RECOVERY_KEY_BYTES as u64;
+const RECOVERY_CURSOR_BYTES: u64 = (4 * MAX_RECOVERY_KEY_BYTES + MAX_NODES) as u64;
+const LEGACY_PROBE_REPLY_BYTES: usize = 40 * MAX_NODES + 4096;
 
 fn ready_stream_worker(node: &Node) -> bool {
     node.state == NodeState::Ready && node.registration == Registration::Verified
@@ -151,6 +155,12 @@ enum WorkerReply {
 struct StagedReply {
     reply: ControlReply,
     _charge: MemoryCharge,
+}
+
+enum StreamPage {
+    Entry(Box<Entry>, MemoryCharge),
+    End,
+    Legacy,
 }
 
 impl From<Reply> for WorkerReply {
@@ -320,9 +330,14 @@ impl Driver for WorkerDriver {
         if authority.term != self.1 {
             return Err(wire::unavailable());
         }
-        self.0
+        if self
+            .0
             .ensure_stream_recovered(stream_recovery_view(authority, &root))
-            .await?;
+            .await?
+            != RecoveryStatus::AllPeers
+        {
+            return Err(wire::unavailable());
+        }
         Ok(authority)
     }
 
@@ -380,7 +395,9 @@ impl Driver for WorkerDriver {
             return Err(Error::abandoned());
         }
         let view = stream_recovery_view(observed, &root);
-        if observed.term != authority.term || !self.registry().recovered(view) {
+        if observed.term != authority.term
+            || self.registry().recovery_status(view) != Some(RecoveryStatus::AllPeers)
+        {
             return Err(wire::unavailable().into());
         }
         check_dependency(self.registry(), dependency)?;
@@ -431,6 +448,9 @@ impl Worker {
         let authority = self.stream_fence(root).await?;
         let view = stream_recovery_view(authority, root);
         self.ensure_stream_recovered(view).await?;
+        if !self.queue.streams.handoff_ready(view, now_ms()) {
+            return Err(wire::unavailable());
+        }
         Ok(view)
     }
 
@@ -440,21 +460,24 @@ impl Worker {
         expected: RecoveryView,
     ) -> Result<(), ProtocolError> {
         self.check_stream_view(expected).await?;
-        if !self.queue.streams.recovered(expected) {
+        if !self.queue.streams.handoff_ready(expected, now_ms()) {
             return Err(wire::unavailable());
         }
         Ok(())
     }
 
-    async fn ensure_stream_recovered(&self, expected: RecoveryView) -> Result<(), ProtocolError> {
+    async fn ensure_stream_recovered(
+        &self,
+        expected: RecoveryView,
+    ) -> Result<RecoveryStatus, ProtocolError> {
         let registry = &self.queue.streams;
-        if registry.recovered(expected) {
-            return Ok(());
+        if let Some(status) = registry.recovery_status(expected) {
+            return Ok(status);
         }
         tokio::time::timeout(TRANSACTION_TIMEOUT, async {
             let mut progress = registry.recovery.lock().await;
-            if registry.recovered(expected) {
-                return Ok(());
+            if let Some(status) = registry.recovery_status(expected) {
+                return Ok(status);
             }
             let root = self.check_stream_view(expected).await?;
             if progress
@@ -473,9 +496,14 @@ impl Worker {
             self.repair_stream_replicas(&root, recovery).await?;
             let _change = self.queue.lock_changes().await;
             self.check_stream_view(expected).await?;
-            registry.mark_recovered(expected)?;
+            let status = if recovery.legacy_peers.contains(&true) {
+                RecoveryStatus::LegacyPeers
+            } else {
+                RecoveryStatus::AllPeers
+            };
+            registry.mark_recovered(expected, status)?;
             *progress = None;
-            Ok(())
+            Ok(status)
         })
         .await
         .map_err(|_| wire::unavailable())?
@@ -501,18 +529,23 @@ impl Worker {
         let run = recovery.view.run;
         if let Some(cursor) = recovery.merge.as_mut() {
             while let Some(node) = peers.clone().nth(cursor.peer) {
-                let page = self
+                match self
                     .fetch_stream_page(root, node, run, cursor.after.as_ref())
-                    .await?;
-                if let Some((entry, _charge)) = page {
-                    cursor.check_page()?;
-                    queue_transport::encoded_len(&entry.key, MAX_RECOVERY_KEY_BYTES)?;
-                    let key = entry.key.clone();
-                    let _change = self.queue.lock_changes().await;
-                    self.install_stream_replica(*entry)?;
-                    cursor.finish_page(key);
-                } else {
-                    cursor.finish_peer();
+                    .await?
+                {
+                    StreamPage::Entry(entry, _charge) => {
+                        cursor.check_page()?;
+                        queue_transport::encoded_len(&entry.key, MAX_RECOVERY_KEY_BYTES)?;
+                        let key = entry.key.clone();
+                        let _change = self.queue.lock_changes().await;
+                        self.install_stream_replica(*entry)?;
+                        cursor.finish_page(key);
+                    }
+                    StreamPage::End => cursor.finish_peer(),
+                    StreamPage::Legacy => {
+                        recovery.legacy_peers[cursor.peer] = true;
+                        cursor.finish_peer();
+                    }
                 }
             }
             recovery.merge = None;
@@ -520,7 +553,9 @@ impl Worker {
 
         let cursor = &mut recovery.repair;
         while let Some(node) = peers.clone().nth(cursor.peer) {
-            if let Some(stored) = self.queue.streams.page(run, cursor.after.as_ref())? {
+            if recovery.legacy_peers[cursor.peer] {
+                cursor.finish_peer();
+            } else if let Some(stored) = self.queue.streams.page(run, cursor.after.as_ref())? {
                 queue_transport::encoded_len(&stored.entry.key, MAX_RECOVERY_KEY_BYTES)?;
                 self.transfer_stream(root, node, &stored, true).await?;
                 cursor.finish_page(stored.entry.key.clone());
@@ -664,7 +699,7 @@ impl Worker {
     ) -> Result<(), ProtocolError> {
         let mut after = None;
         for _ in 0..MAX_IDENTITIES {
-            let Some((entry, _charge)) = self
+            let StreamPage::Entry(entry, _charge) = self
                 .fetch_stream_page(root, node, run, after.as_ref())
                 .await?
             else {
@@ -673,14 +708,49 @@ impl Worker {
             after = Some(entry.key.clone());
             self.install_stream_replica(*entry)?;
         }
-        if self
+        match self
             .fetch_stream_page(root, node, run, after.as_ref())
             .await?
-            .is_some()
         {
-            return Err(wire::invalid());
+            StreamPage::End => Ok(()),
+            _ => Err(wire::invalid()),
         }
-        Ok(())
+    }
+
+    async fn confirm_legacy_stream_peer(
+        &self,
+        root: &Control,
+        node: &Node,
+        run: Uuid,
+    ) -> Result<(), ProtocolError> {
+        // A missing route could hide a modern replica. Probe the authenticated
+        // queue with a cursor that only a legacy worker answers with a snapshot.
+        let probe = QueueCommand::Snapshot {
+            after: Some(STREAM_CAPABILITY_CURSOR),
+        };
+        let encoded = queue_transport::encoded_len(&probe, CONTROL_REPLY_BYTES)?;
+        let _request = self.charge_stream_bootstrap(encoded as u64 + 64 * 1024)?;
+        let body = queue_transport::encode_exact(&probe, encoded)?;
+        let (bytes, _reply) = queue_transport::exchange_accounted(
+            &self.client,
+            &self.signer,
+            root,
+            node,
+            body,
+            LEGACY_PROBE_REPLY_BYTES,
+            None,
+            |length| self.charge_stream_bootstrap(4 * length as u64 + 4096),
+        )
+        .await?;
+        match serde_json::from_slice::<QueueReply>(&bytes).map_err(|_| wire::invalid())? {
+            QueueReply::Snapshot {
+                snapshot,
+                done: true,
+            } if snapshot.run_id == run && snapshot.records.is_empty() => Ok(()),
+            QueueReply::StreamCapable => Err(wire::unavailable()),
+            QueueReply::Error { error } => Err(error),
+            _ => Err(wire::invalid()),
+        }
     }
 
     async fn fetch_stream_page(
@@ -689,23 +759,30 @@ impl Worker {
         node: &Node,
         run: Uuid,
         after: Option<&Key>,
-    ) -> Result<Option<(Box<Entry>, MemoryCharge)>, ProtocolError> {
+    ) -> Result<StreamPage, ProtocolError> {
         let command = Command::StreamPage {
             run,
             after: after.cloned(),
         };
-        let StagedReply { reply, _charge } = self
+        let result = self
             .stream_exchange(root, node, &command, MAX_RECORD_BYTES + 4096, true)
-            .await?;
+            .await;
+        let StagedReply { reply, _charge } = match result {
+            Err(error) if error.code == ErrorCode::NotFound && after.is_none() => {
+                self.confirm_legacy_stream_peer(root, node, run).await?;
+                return Ok(StreamPage::Legacy);
+            }
+            result => result?,
+        };
         match reply {
             ControlReply::Page { entry: Some(entry) }
                 if entry.run == run
                     && entry.version.term <= root.scheduler.scheduler_term
                     && after.is_none_or(|after| after < &entry.key) =>
             {
-                Ok(Some((entry, _charge)))
+                Ok(StreamPage::Entry(entry, _charge))
             }
-            ControlReply::Page { entry: None } => Ok(None),
+            ControlReply::Page { entry: None } => Ok(StreamPage::End),
             _ => Err(wire::invalid()),
         }
     }
@@ -736,7 +813,7 @@ impl Worker {
                 if error.code == ErrorCode::NotFound
                     && self.queue.streams.page(run, None)?.is_none() =>
             {
-                return Ok(());
+                return self.confirm_legacy_stream_peer(root, node, run).await;
             }
             Err(error) => return Err(error),
             _ => return Err(wire::invalid()),
