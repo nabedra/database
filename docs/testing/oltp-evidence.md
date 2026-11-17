@@ -69,6 +69,8 @@ The initial OLAP run found an inaccessible tuple field after extracting shared s
 
 ## Minimum Rust compatibility
 
+The [Docker target guard check](evidence/oltp/docker-target-guards/README.md) executes all four named-stage/binary combinations. Matching engines pass; mismatches exit two and name the required build argument. The matching OLTP Docker definition check also passes. This covers the guard correction, not a complete production-image build.
+
 All four feature selections passed native macOS all-target compilation with Rust 1.94.1, with one test-import correction for OLAP. Both OLTP selections passed on immutable checkpoint `f958c73`. Its default and OLAP-without-S3 checks failed at the inherited `use super as query;` test import. A separate immutable copy changes only that import to `use crate::engine::query;`; both OLAP selections then pass. The [minimum-version evidence](evidence/oltp/msrv-f958c73/README.md) retains original failures, successful reruns, source hashes and commands. These are compilation checks, not test execution, Linux/Docker acceptance or validation of subsequent distributed changes.
 
 ## Decision-proof correction

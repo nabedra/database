@@ -23,10 +23,12 @@ COPY --from=build /src/server/target/release/nabedra-db /usr/local/bin/nabedra-d
 USER nabedra
 WORKDIR /home/nabedra
 FROM runtime AS olap
+RUN nabedra-db --version | grep -w olap || { echo 'The olap target requires --build-arg NABEDRA_ENGINE=olap' >&2; exit 2; }
 ENTRYPOINT ["nabedra"]
 CMD ["database", "serve", "--config", "/etc/nabedra/nabedra-database.json"]
 
 FROM runtime AS oltp
+RUN nabedra-db --version | grep -w oltp || { echo 'The oltp target requires --build-arg NABEDRA_ENGINE=oltp' >&2; exit 2; }
 ENTRYPOINT ["nabedra-db"]
 CMD ["serve"]
 
