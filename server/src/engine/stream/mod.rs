@@ -1,6 +1,8 @@
 //! Bounded batch scans of immutable OLAP table manifests.
 mod encoding;
 mod file;
+#[cfg(test)]
+mod tests;
 
 use crate::{
     protocol::{
