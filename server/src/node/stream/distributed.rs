@@ -2,7 +2,7 @@
 use super::{
     Authority, Dependency, Driver, Entry, FENCE_READ_BYTES, Key, Registry, Source, Stored, Version,
     call, check_dependency, install, now_ms, record_bytes,
-    state::{MAX_IDENTITIES, MAX_RECORD_BYTES},
+    state::{MAX_IDENTITIES, MAX_RECORD_BYTES, Recovery, RecoveryView},
     wire::{self, Batch, Capabilities, Error, Format, Opened, Reply, Request, SnapshotOpened},
 };
 use crate::{
@@ -10,6 +10,7 @@ use crate::{
         member::{Node, NodeState, Registration},
         state::Control,
     },
+    engine::stream::MAX_PINNED_QUERY_BYTES,
     node::{
         http,
         queue_runtime::{members, scheduler},
@@ -17,7 +18,7 @@ use crate::{
         runtime::Worker,
     },
     protocol::{ErrorCode, MAX_PREDICATE_DEPTH, ProtocolError},
-    scheduling::MemoryCharge,
+    scheduling::{MemoryCharge, ResourceScheduler},
     storage::{LoadedClusterCatalog, RuntimeStore, context::RequestContext},
     worker_pool::WorkerPool,
 };
@@ -28,6 +29,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
@@ -39,11 +41,48 @@ pub(crate) const PATH: &str = "/internal/v1/streams";
 const CONTROL_REPLY_BYTES: usize = 16 << 10;
 const CONTROL_REQUEST_BYTES: usize = wire::MAX_REQUEST_BYTES + (64 << 10);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_RECOVERY_KEY_BYTES: usize = 4 << 10;
+const RECOVERY_CURSOR_BYTES: u64 = 4 * MAX_RECOVERY_KEY_BYTES as u64;
+
+fn ready_stream_worker(node: &Node) -> bool {
+    node.state == NodeState::Ready && node.registration == Registration::Verified
+}
+
+fn stream_recovery_view(authority: Authority, root: &Control) -> RecoveryView {
+    let mut ready = Sha256::new();
+    for node in root.nodes.iter().filter(|node| ready_stream_worker(node)) {
+        ready.update(node.node_id.as_bytes());
+        ready.update(node.incarnation.unwrap_or_default().as_bytes());
+        ready.update(
+            node.session
+                .as_ref()
+                .map_or(Uuid::nil(), |session| session.id)
+                .as_bytes(),
+        );
+    }
+    RecoveryView {
+        run: authority.run,
+        term: authority.term,
+        ready: ready.finalize().into(),
+    }
+}
+
+fn charge_stream_staging(
+    control: &ResourceScheduler,
+    working: &ResourceScheduler,
+    bytes: u64,
+) -> Result<MemoryCharge, ProtocolError> {
+    control
+        .charge_memory(0, bytes)
+        .or_else(|_| working.charge_memory(0, bytes))
+        .map_err(|_| wire::overloaded())
+}
 
 fn predicate_decode_bytes(wire_bytes: usize) -> u64 {
     // A stream record may contain a large manifest. Only the bounded query
     // inside it can retain a raw predicate copy at each decoding level.
-    (wire_bytes.min(wire::MAX_REQUEST_BYTES) * (MAX_PREDICATE_DEPTH + 8)) as u64
+    (wire_bytes.min(wire::MAX_REQUEST_BYTES.max(MAX_PINNED_QUERY_BYTES))
+        * (MAX_PREDICATE_DEPTH + 8)) as u64
 }
 
 #[derive(Serialize, Deserialize)]
@@ -277,12 +316,13 @@ impl Driver for WorkerDriver {
         if self.registry().stopped.load(Ordering::Acquire) {
             return Err(wire::unavailable());
         }
-        let (authority, _) = self.0.stream_authority().await?;
+        let (authority, root) = self.0.stream_authority().await?;
         if authority.term != self.1 {
             return Err(wire::unavailable());
         }
-        self.registry().set_run(authority.run, false)?;
-        self.0.ensure_stream_recovered(authority).await?;
+        self.0
+            .ensure_stream_recovered(stream_recovery_view(authority, &root))
+            .await?;
         Ok(authority)
     }
 
@@ -339,7 +379,8 @@ impl Driver for WorkerDriver {
         if observed.run != authority.run {
             return Err(Error::abandoned());
         }
-        if observed.term != authority.term {
+        let view = stream_recovery_view(observed, &root);
+        if observed.term != authority.term || !self.registry().recovered(view) {
             return Err(wire::unavailable().into());
         }
         check_dependency(self.registry(), dependency)?;
@@ -368,7 +409,7 @@ impl Driver for WorkerDriver {
         if current.run != observed.run {
             return Err(Error::abandoned());
         }
-        if current.term != observed.term || members(&fresh) != ready {
+        if stream_recovery_view(current, &fresh) != view {
             return Err(wire::unavailable().into());
         }
         Ok(stored)
@@ -383,70 +424,119 @@ impl Driver for WorkerDriver {
 }
 
 impl Worker {
-    async fn ensure_stream_recovered(&self, expected: Authority) -> Result<(), ProtocolError> {
-        if self.queue.streams.recovered(expected.run, expected.term) {
+    pub(in crate::node) async fn recover_streams_before_handoff(
+        &self,
+        root: &Control,
+    ) -> Result<RecoveryView, ProtocolError> {
+        let authority = self.stream_fence(root).await?;
+        let view = stream_recovery_view(authority, root);
+        self.ensure_stream_recovered(view).await?;
+        Ok(view)
+    }
+
+    /// Called with the ordinary queue sealed, after recovery has completed.
+    pub(in crate::node) async fn verify_stream_handoff(
+        &self,
+        expected: RecoveryView,
+    ) -> Result<(), ProtocolError> {
+        self.check_stream_view(expected).await?;
+        if !self.queue.streams.recovered(expected) {
+            return Err(wire::unavailable());
+        }
+        Ok(())
+    }
+
+    async fn ensure_stream_recovered(&self, expected: RecoveryView) -> Result<(), ProtocolError> {
+        let registry = &self.queue.streams;
+        if registry.recovered(expected) {
             return Ok(());
         }
         tokio::time::timeout(TRANSACTION_TIMEOUT, async {
-            let _change = self.queue.lock_changes().await;
-            if self.queue.streams.recovered(expected.run, expected.term) {
+            let mut progress = registry.recovery.lock().await;
+            if registry.recovered(expected) {
                 return Ok(());
             }
-            let (authority, root) = self.stream_authority().await?;
-            if authority != expected {
-                return Err(wire::unavailable());
+            let root = self.check_stream_view(expected).await?;
+            if progress
+                .as_ref()
+                .is_none_or(|recovery| recovery.view != expected)
+            {
+                *progress = None;
+                let charge = self
+                    .cpu
+                    .scheduler()
+                    .charge_memory(0, RECOVERY_CURSOR_BYTES)?;
+                registry.begin_recovery(expected)?;
+                *progress = Some(Recovery::new(expected, charge));
             }
-            self.repair_stream_replicas(&root, authority).await
+            let recovery = progress.as_mut().unwrap();
+            self.repair_stream_replicas(&root, recovery).await?;
+            let _change = self.queue.lock_changes().await;
+            self.check_stream_view(expected).await?;
+            registry.mark_recovered(expected)?;
+            *progress = None;
+            Ok(())
         })
         .await
         .map_err(|_| wire::unavailable())?
     }
 
-    /// A fenced predecessor may have lost its reply mid-installation. Recover
-    /// complete records from every ready holder before accepting new work.
+    /// A fenced predecessor can leave a complete record on any surviving
+    /// holder. Preserve page progress across request deadlines and restore
+    /// all ready copies before admitting stream work in this view.
     async fn repair_stream_replicas(
         &self,
         root: &Control,
-        authority: Authority,
+        recovery: &mut Recovery,
     ) -> Result<(), ProtocolError> {
         let own = self
             .signer
             .sender()
             .node_id()
             .ok_or_else(wire::unavailable)?;
-        let ready = members(root);
         let peers = root
             .nodes
             .iter()
-            .filter(|node| node.node_id != own && ready.contains(&node.node_id));
-        for node in peers.clone() {
-            self.merge_stream_pages(root, node, authority.run).await?;
-        }
-        self.check_stream_view(root, authority).await?;
-
-        let mut after = None;
-        while let Some(stored) = self.queue.streams.page(authority.run, after.as_ref())? {
-            for node in peers.clone() {
-                self.transfer_stream(root, node, &stored, true).await?;
+            .filter(|node| node.node_id != own && ready_stream_worker(node));
+        let run = recovery.view.run;
+        if let Some(cursor) = recovery.merge.as_mut() {
+            while let Some(node) = peers.clone().nth(cursor.peer) {
+                let page = self
+                    .fetch_stream_page(root, node, run, cursor.after.as_ref())
+                    .await?;
+                if let Some((entry, _charge)) = page {
+                    cursor.check_page()?;
+                    queue_transport::encoded_len(&entry.key, MAX_RECOVERY_KEY_BYTES)?;
+                    let key = entry.key.clone();
+                    let _change = self.queue.lock_changes().await;
+                    self.install_stream_replica(*entry)?;
+                    cursor.finish_page(key);
+                } else {
+                    cursor.finish_peer();
+                }
             }
-            after = Some(stored.entry.key.clone());
+            recovery.merge = None;
         }
-        self.check_stream_view(root, authority).await?;
-        self.queue
-            .streams
-            .mark_recovered(authority.run, authority.term)
-    }
 
-    async fn check_stream_view(
-        &self,
-        root: &Control,
-        expected: Authority,
-    ) -> Result<(), ProtocolError> {
-        let (authority, fresh) = self.stream_authority().await?;
-        if authority != expected || members(root) != members(&fresh) {
-            return Err(wire::unavailable());
+        let cursor = &mut recovery.repair;
+        while let Some(node) = peers.clone().nth(cursor.peer) {
+            if let Some(stored) = self.queue.streams.page(run, cursor.after.as_ref())? {
+                queue_transport::encoded_len(&stored.entry.key, MAX_RECOVERY_KEY_BYTES)?;
+                self.transfer_stream(root, node, &stored, true).await?;
+                cursor.finish_page(stored.entry.key.clone());
+            } else {
+                cursor.finish_peer();
+            }
         }
         Ok(())
+    }
+
+    async fn check_stream_view(&self, expected: RecoveryView) -> Result<Control, ProtocolError> {
+        let (authority, root) = self.stream_authority().await?;
+        if stream_recovery_view(authority, &root) != expected {
+            return Err(wire::unavailable());
+        }
+        Ok(root)
     }
 
     async fn stream_authority(&self) -> Result<(Authority, Control), ProtocolError> {
@@ -464,10 +554,7 @@ impl Worker {
     }
 
     async fn stream_fence(&self, root: &Control) -> Result<Authority, ProtocolError> {
-        let _catalog = self
-            .control_budget
-            .charge_memory(0, FENCE_READ_BYTES)
-            .map_err(|_| wire::overloaded())?;
+        let _catalog = self.charge_stream_bootstrap(FENCE_READ_BYTES)?;
         let loaded = self
             .storage
             .load_cluster_catalog()
@@ -483,6 +570,10 @@ impl Worker {
         })
     }
 
+    fn charge_stream_bootstrap(&self, bytes: u64) -> Result<MemoryCharge, ProtocolError> {
+        charge_stream_staging(&self.control_budget, self.cpu.scheduler(), bytes)
+    }
+
     async fn stream_exchange(
         &self,
         root: &Control,
@@ -492,14 +583,17 @@ impl Worker {
         bootstrap: bool,
     ) -> Result<StagedReply, ProtocolError> {
         let encoded = queue_transport::encoded_len(command, MAX_RECORD_BYTES + 4096)? as u64;
-        let budget = if bootstrap {
-            &self.control_budget
-        } else {
-            self.cpu.scheduler()
+        let reserve = |bytes| {
+            if bootstrap {
+                self.charge_stream_bootstrap(bytes)
+            } else {
+                self.cpu
+                    .scheduler()
+                    .charge_memory(0, bytes)
+                    .map_err(|_| wire::overloaded())
+            }
         };
-        let _request = budget
-            .charge_memory(0, encoded + 64 * 1024)
-            .map_err(|_| wire::overloaded())?;
+        let _request = reserve(encoded + 64 * 1024)?;
         let (reply, charge) = exchange(
             &self.client,
             &self.signer,
@@ -512,9 +606,7 @@ impl Worker {
                     Command::StreamPage { .. } => predicate_decode_bytes(length),
                     _ => 0,
                 };
-                budget
-                    .charge_memory(0, 4 * length as u64 + 4096 + decode)
-                    .map_err(|_| wire::overloaded())
+                reserve(4 * length as u64 + 4096 + decode)
             },
         )
         .await?;
@@ -571,30 +663,51 @@ impl Worker {
         run: Uuid,
     ) -> Result<(), ProtocolError> {
         let mut after = None;
-        for _ in 0..=MAX_IDENTITIES {
-            let command = Command::StreamPage {
-                run,
-                after: after.clone(),
+        for _ in 0..MAX_IDENTITIES {
+            let Some((entry, _charge)) = self
+                .fetch_stream_page(root, node, run, after.as_ref())
+                .await?
+            else {
+                return Ok(());
             };
-            let StagedReply { reply, _charge } = self
-                .stream_exchange(root, node, &command, MAX_RECORD_BYTES + 4096, true)
-                .await?;
-            match reply {
-                ControlReply::Page { entry: Some(entry) } => {
-                    if entry.run != run
-                        || entry.version.term > root.scheduler.scheduler_term
-                        || after.as_ref().is_some_and(|after| after >= &entry.key)
-                    {
-                        return Err(wire::invalid());
-                    }
-                    after = Some(entry.key.clone());
-                    self.install_stream_replica(*entry)?;
-                }
-                ControlReply::Page { entry: None } => return Ok(()),
-                _ => return Err(wire::invalid()),
-            }
+            after = Some(entry.key.clone());
+            self.install_stream_replica(*entry)?;
         }
-        Err(wire::invalid())
+        if self
+            .fetch_stream_page(root, node, run, after.as_ref())
+            .await?
+            .is_some()
+        {
+            return Err(wire::invalid());
+        }
+        Ok(())
+    }
+
+    async fn fetch_stream_page(
+        &self,
+        root: &Control,
+        node: &Node,
+        run: Uuid,
+        after: Option<&Key>,
+    ) -> Result<Option<(Box<Entry>, MemoryCharge)>, ProtocolError> {
+        let command = Command::StreamPage {
+            run,
+            after: after.cloned(),
+        };
+        let StagedReply { reply, _charge } = self
+            .stream_exchange(root, node, &command, MAX_RECORD_BYTES + 4096, true)
+            .await?;
+        match reply {
+            ControlReply::Page { entry: Some(entry) }
+                if entry.run == run
+                    && entry.version.term <= root.scheduler.scheduler_term
+                    && after.is_none_or(|after| after < &entry.key) =>
+            {
+                Ok(Some((entry, _charge)))
+            }
+            ControlReply::Page { entry: None } => Ok(None),
+            _ => Err(wire::invalid()),
+        }
     }
 
     pub(in crate::node) async fn copy_stream_replicas(
@@ -687,18 +800,17 @@ async fn handle(
     };
     let transport = worker.queue.transport(&class)?;
     let length = http::framing(&headers, cap, false)?.ok_or_else(wire::invalid)?;
-    let budget = match class.as_str() {
-        "bootstrap" => &worker.control_budget,
-        "progress" => &worker.progress_budget,
-        _ => worker.cpu.scheduler(),
+    let reserve = |bytes| match class.as_str() {
+        "bootstrap" => worker.charge_stream_bootstrap(bytes),
+        "progress" => worker.progress_budget.charge_memory(0, bytes),
+        _ => worker.cpu.scheduler().charge_memory(0, bytes),
     };
     let decode = match expected.as_str() {
         "stream_request" | "stream_install" => predicate_decode_bytes(length),
         _ => 0,
     };
-    let _ingress = budget
-        .charge_memory(0, 64 * 1024 + length as u64 * 5 + decode)
-        .map_err(|_| wire::overloaded())?;
+    let _ingress =
+        reserve(64 * 1024 + length as u64 * 5 + decode).map_err(|_| wire::overloaded())?;
     let bytes = http::read_small(
         request.into_body(),
         length,
@@ -731,7 +843,9 @@ async fn handle(
         .unwrap_or_else(|error| WorkerReply::Control(ControlReply::Error { error }));
     if expected == "stream_request" {
         let (authority, current) = worker.stream_authority().await?;
-        if authority.term != root.scheduler.scheduler_term || members(&current) != members(&root) {
+        if authority.term != root.scheduler.scheduler_term
+            || stream_recovery_view(authority, &current) != stream_recovery_view(authority, &root)
+        {
             return Err(wire::unavailable());
         }
         // Reading or replicating a batch can outlast its storage credentials.
@@ -752,7 +866,7 @@ async fn handle(
     let (marker, body) = match reply {
         WorkerReply::Control(control) => {
             let len = queue_transport::encoded_len(&control, MAX_RECORD_BYTES + 4096)?;
-            let charge = budget.charge_memory(0, len as u64 + 4096)?;
+            let charge = reserve(len as u64 + 4096)?;
             let bytes = queue_transport::encode_exact(&control, len)?;
             (
                 0,
@@ -901,4 +1015,43 @@ async fn accept(
         }
     };
     Ok(WorkerReply::Control(reply))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WorkerResources;
+
+    fn memory_budget(bytes: u64) -> ResourceScheduler {
+        ResourceScheduler::new(vec![(
+            0,
+            WorkerResources {
+                max_threads: 1,
+                memory_limit_bytes: bytes,
+                task_memory_limit_bytes: bytes - 1,
+                control_memory_reserve_bytes: 1,
+            },
+        )])
+        .unwrap()
+    }
+
+    #[test]
+    fn st03_small_control_reserve_charges_fence_reads_to_working_memory() {
+        let control = memory_budget(4 << 20);
+        let working = memory_budget(16 << 20);
+        let existing = control.charge_memory(0, 3 << 20).unwrap();
+
+        let page = charge_stream_staging(&control, &working, 64 << 10).unwrap();
+        let fence = charge_stream_staging(&control, &working, FENCE_READ_BYTES).unwrap();
+        assert_eq!(control.usage()[0].2, (3 << 20) + (64 << 10));
+        assert_eq!(working.usage()[0].2, FENCE_READ_BYTES);
+        let error = charge_stream_staging(&control, &working, FENCE_READ_BYTES)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::Overloaded);
+
+        drop((existing, page, fence));
+        assert_eq!(control.usage()[0].2, 0);
+        assert_eq!(working.usage()[0].2, 0);
+    }
 }

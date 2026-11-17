@@ -239,8 +239,59 @@ pub(super) enum Frame {
     Error(ProtocolError),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::node) struct RecoveryView {
+    pub(super) run: Uuid,
+    pub(super) term: u64,
+    pub(super) ready: [u8; 32],
+}
+
+#[derive(Default)]
+pub(super) struct RecoveryCursor {
+    pub(super) peer: usize,
+    pub(super) after: Option<Key>,
+    pages: usize,
+}
+impl RecoveryCursor {
+    pub(super) fn check_page(&self) -> Result<(), ProtocolError> {
+        if self.pages >= MAX_IDENTITIES {
+            return Err(wire::invalid());
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_page(&mut self, key: Key) {
+        self.after = Some(key);
+        self.pages += 1;
+    }
+
+    pub(super) fn finish_peer(&mut self) {
+        self.peer += 1;
+        self.after = None;
+        self.pages = 0;
+    }
+}
+
+pub(super) struct Recovery {
+    pub(super) view: RecoveryView,
+    pub(super) merge: Option<RecoveryCursor>,
+    pub(super) repair: RecoveryCursor,
+    _charge: MemoryCharge,
+}
+impl Recovery {
+    pub(super) fn new(view: RecoveryView, charge: MemoryCharge) -> Self {
+        Self {
+            view,
+            merge: Some(RecoveryCursor::default()),
+            repair: RecoveryCursor::default(),
+            _charge: charge,
+        }
+    }
+}
+
 pub(in crate::node) struct Registry {
     state: Mutex<State>,
+    pub(super) recovery: tokio::sync::Mutex<Option<Recovery>>,
     pub speculation: Arc<Semaphore>,
     pub outputs: Arc<Semaphore>,
     pub speculative_outputs: Arc<Semaphore>,
@@ -251,7 +302,7 @@ pub(in crate::node) struct Registry {
 }
 struct State {
     run: Option<Uuid>,
-    recovered_term: Option<u64>,
+    recovered_view: Option<RecoveryView>,
     entries: BTreeMap<Key, Arc<Stored>>,
     deliveries: BTreeMap<Uuid, DeliveryHold>,
 }
@@ -354,10 +405,11 @@ impl Registry {
         Self {
             state: Mutex::new(State {
                 run: None,
-                recovered_term: None,
+                recovered_view: None,
                 entries: BTreeMap::new(),
                 deliveries: BTreeMap::new(),
             }),
+            recovery: tokio::sync::Mutex::new(None),
             speculation: Arc::new(Semaphore::new(1)),
             outputs: Arc::new(Semaphore::new(MAX_OUTPUT_SLOTS)),
             speculative_outputs: Arc::new(Semaphore::new(MAX_SPECULATIVE_SLOTS)),
@@ -376,31 +428,41 @@ impl Registry {
             Some(_) => return Err(wire::unavailable()),
         }
         if clear {
-            state.recovered_term = None;
+            state.recovered_view = None;
             state.entries.clear();
             state.deliveries.clear();
         }
         Ok(())
     }
 
-    pub(super) fn recovered(&self, run: Uuid, term: u64) -> bool {
+    pub(super) fn recovered(&self, view: RecoveryView) -> bool {
         let state = self.state.lock().unwrap();
-        state.run == Some(run) && state.recovered_term == Some(term)
+        state.run == Some(view.run) && state.recovered_view == Some(view)
     }
 
-    pub(super) fn mark_recovered(&self, run: Uuid, term: u64) -> Result<(), ProtocolError> {
+    pub(super) fn begin_recovery(&self, view: RecoveryView) -> Result<(), ProtocolError> {
+        self.set_run(view.run, false)?;
         let mut state = self.state.lock().unwrap();
-        if self.stopped.load(Ordering::Acquire) || state.run != Some(run) {
+        if self.stopped.load(Ordering::Acquire) {
             return Err(wire::unavailable());
         }
-        state.recovered_term = Some(term);
+        state.recovered_view = None;
+        Ok(())
+    }
+
+    pub(super) fn mark_recovered(&self, view: RecoveryView) -> Result<(), ProtocolError> {
+        let mut state = self.state.lock().unwrap();
+        if self.stopped.load(Ordering::Acquire) || state.run != Some(view.run) {
+            return Err(wire::unavailable());
+        }
+        state.recovered_view = Some(view);
         Ok(())
     }
 
     pub(in crate::node) fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         let mut state = self.state.lock().unwrap();
-        state.recovered_term = None;
+        state.recovered_view = None;
         state.entries.clear();
         state.deliveries.clear();
     }
@@ -777,7 +839,12 @@ mod tests {
         install(&holder, latest.clone()).unwrap();
         old_owner.stop();
         assert!(new_owner.get(&key).is_none());
-        assert!(!new_owner.recovered(run, 2));
+        let view = RecoveryView {
+            run,
+            term: 2,
+            ready: [7; 32],
+        };
+        assert!(!new_owner.recovered(view));
 
         let page = holder.get(&key).unwrap().entry.clone();
         let encoded = serde_json::to_vec(&page).unwrap();
@@ -789,8 +856,12 @@ mod tests {
         install(&new_owner, compacted).unwrap();
         let merged = new_owner.get(&key).unwrap();
         install(&holder, merged.entry.clone()).unwrap();
-        new_owner.mark_recovered(run, 2).unwrap();
-        assert!(new_owner.recovered(run, 2));
+        new_owner.mark_recovered(view).unwrap();
+        assert!(new_owner.recovered(view));
+        assert!(!new_owner.recovered(RecoveryView {
+            ready: [8; 32],
+            ..view
+        }));
         assert!(merged.entry == latest);
         assert!(holder.get(&key).unwrap().entry == latest);
         let Kind::Stream(stream) = &merged.entry.kind else {

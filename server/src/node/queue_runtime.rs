@@ -1110,12 +1110,14 @@ impl Worker {
                 {
                     return Err(unavailable());
                 }
+                let stream_view = self.recover_streams_before_handoff(root).await?;
                 self.queue
                     .seals
                     .lock()
                     .unwrap()
                     .retain(|_, (until, _)| *until > tokio::time::Instant::now());
                 let seal = self.queue.lock_changes().await;
+                self.verify_stream_handoff(stream_view).await?;
                 let token = Uuid::new_v4();
                 self.queue.seals.lock().unwrap().insert(
                     token,
@@ -1130,12 +1132,14 @@ impl Worker {
                 {
                     return Err(unavailable());
                 }
+                let stream_view = self.recover_streams_before_handoff(root).await?;
                 self.queue
                     .seals
                     .lock()
                     .unwrap()
                     .retain(|_, (until, _)| *until > tokio::time::Instant::now());
                 let seal = self.queue.lock_changes().await;
+                self.verify_stream_handoff(stream_view).await?;
                 self.refresh_queue(root).await?;
                 let node = root
                     .nodes

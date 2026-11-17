@@ -15,14 +15,18 @@ use crate::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::{self, Write},
     sync::Arc,
 };
 use uuid::Uuid;
 
 use encoding::BatchEncoder;
 use file::OpenFile;
+
+pub(crate) const MAX_PINNED_QUERY_BYTES: usize = 128 * 1024;
 
 /// The worker can transfer this descriptor through its replicated RAM queue.
 /// The manifest and query come from a validated catalog and stream request.
@@ -32,11 +36,38 @@ pub(crate) struct PinnedScan {
     catalog_revision: u64,
     catalog_commit: Uuid,
     table: TableDescriptor,
+    #[serde(deserialize_with = "decode_pinned_query")]
     query: Query,
     data: TableData,
     /// One prefix per file, followed by the full raw row count.
     file_starts: Vec<u64>,
 }
+
+fn decode_pinned_query<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Query, D::Error> {
+    let raw = Box::<RawValue>::deserialize(decoder)?;
+    if raw.get().len() > MAX_PINNED_QUERY_BYTES {
+        return Err(serde::de::Error::custom(
+            "pinned stream query exceeds the byte limit",
+        ));
+    }
+    serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)
+}
+
+struct QueryBytesLeft(usize);
+impl Write for QueryBytesLeft {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(io::ErrorKind::WriteZero)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl PinnedScan {
     pub(crate) fn capture(
         catalog: &Catalog,
@@ -79,6 +110,12 @@ impl PinnedScan {
             .ok_or_else(|| error(ErrorCode::NotFound, "table not found"))?;
         let table = entry.descriptor(name);
         let query = normalize_query(&table, query)?;
+        serde_json::to_writer(QueryBytesLeft(MAX_PINNED_QUERY_BYTES), &query).map_err(|_| {
+            error(
+                ErrorCode::LimitExceeded,
+                "pinned stream query exceeds the byte limit",
+            )
+        })?;
         let mut file_starts = vec![0_u64];
         match &entry.data {
             TableData::Legacy { .. } => file_starts.push(entry.row_count),
@@ -375,4 +412,17 @@ fn resource() -> ProtocolError {
         ErrorCode::LimitExceeded,
         "stream exceeds the worker task memory limit",
     )
+}
+
+#[cfg(test)]
+#[test]
+fn st03_rejects_an_over_cap_pinned_query_before_typed_decode() {
+    let input = format!(r#"{{"unknown":"{}"}}"#, "x".repeat(MAX_PINNED_QUERY_BYTES));
+    let mut decoder = serde_json::Deserializer::from_str(&input);
+    let error = decode_pinned_query(&mut decoder).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("pinned stream query exceeds the byte limit")
+    );
 }
