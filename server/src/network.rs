@@ -9,11 +9,90 @@ use axum_server::{
     tls_rustls::{RustlsAcceptor, RustlsConfig},
 };
 use std::{future::Future, io};
+#[cfg(feature = "olap")]
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex, Weak},
+    task::Context,
+};
 use tokio::net::TcpListener;
+#[cfg(feature = "olap")]
+use tokio::time::{Instant, Sleep};
+
+#[cfg(feature = "olap")]
+#[derive(Clone, Default)]
+pub(crate) struct StreamWriteDeadline(Arc<Mutex<Option<ActiveStreamWrite>>>);
+
+#[cfg(feature = "olap")]
+struct ActiveStreamWrite {
+    deadline: Instant,
+    response: Weak<()>,
+}
+
+#[cfg(feature = "olap")]
+impl StreamWriteDeadline {
+    pub(crate) fn arm(&self, deadline: Instant) -> Arc<()> {
+        let response = Arc::new(());
+        *self.0.lock().unwrap() = Some(ActiveStreamWrite {
+            deadline,
+            response: Arc::downgrade(&response),
+        });
+        response
+    }
+
+    fn clear_flushed(&self) -> bool {
+        let mut active = self.0.lock().unwrap();
+        // Hyper or TLS can buffer the last bytes after dropping the body.
+        // Keep the deadline until those bytes flush.
+        if active
+            .as_ref()
+            .is_some_and(|write| write.response.strong_count() == 0)
+        {
+            *active = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 struct Connection<I> {
     io: I,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    #[cfg(feature = "olap")]
+    write_deadline: StreamWriteDeadline,
+    #[cfg(feature = "olap")]
+    write_timer: Option<Pin<Box<Sleep>>>,
+}
+
+#[cfg(feature = "olap")]
+impl<I> Connection<I> {
+    fn check_write_deadline(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        let deadline = self
+            .write_deadline
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|write| write.deadline);
+        let Some(deadline) = deadline else {
+            self.write_timer = None;
+            return Ok(());
+        };
+        let timer = self
+            .write_timer
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if timer.deadline() != deadline {
+            timer.as_mut().reset(deadline);
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "stream delivery expired",
+            ));
+        }
+        Ok(())
+    }
 }
 impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Connection<I> {
     fn poll_read(
@@ -30,18 +109,32 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Connection<I> {
         cx: &mut std::task::Context<'_>,
         buffer: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
+        #[cfg(feature = "olap")]
+        self.check_write_deadline(cx)?;
         std::pin::Pin::new(&mut self.io).poll_write(cx, buffer)
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+        #[cfg(feature = "olap")]
+        self.check_write_deadline(cx)?;
+        let result = std::pin::Pin::new(&mut self.io).poll_flush(cx);
+        #[cfg(feature = "olap")]
+        if self.write_timer.is_some()
+            && matches!(result, std::task::Poll::Ready(Ok(())))
+            && self.write_deadline.clear_flushed()
+        {
+            self.write_timer = None;
+        }
+        result
     }
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        #[cfg(feature = "olap")]
+        self.check_write_deadline(cx)?;
         std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
@@ -74,6 +167,10 @@ where
             let service = service.layer(axum::Extension(HeaderCharge(std::sync::Arc::new(
                 std::sync::Mutex::new(Some(header)),
             ))));
+            #[cfg(feature = "olap")]
+            let write_deadline = StreamWriteDeadline::default();
+            #[cfg(feature = "olap")]
+            let service = service.layer(axum::Extension(write_deadline.clone()));
             let (io, service) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 inner.accept(stream, service),
@@ -84,6 +181,10 @@ where
                 Connection {
                     io,
                     _permit: permit,
+                    #[cfg(feature = "olap")]
+                    write_deadline,
+                    #[cfg(feature = "olap")]
+                    write_timer: None,
                 },
                 service,
             ))
@@ -279,4 +380,116 @@ pub(crate) async fn serve_router_with_budget(
     };
     tokio::pin!(serve);
     tokio::select! { result = &mut serve => result, _ = shutdown => { handle.graceful_shutdown(None); serve.await } }
+}
+
+#[cfg(all(test, feature = "olap"))]
+mod tests {
+    use super::*;
+    use std::{task::Poll, time::Duration};
+    use tokio::{
+        io::{AsyncWrite, AsyncWriteExt},
+        sync::{Semaphore, oneshot},
+    };
+
+    struct TestSocket {
+        blocked: bool,
+        first_poll: Option<oneshot::Sender<()>>,
+    }
+
+    impl TestSocket {
+        fn poll<T>(&mut self, result: T) -> Poll<io::Result<T>> {
+            if let Some(first_poll) = self.first_poll.take() {
+                first_poll.send(()).unwrap();
+            }
+            if self.blocked {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(result))
+            }
+        }
+    }
+
+    impl AsyncWrite for TestSocket {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.poll(buffer.len())
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll(())
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn connection(io: TestSocket, write_deadline: StreamWriteDeadline) -> Connection<TestSocket> {
+        Connection {
+            io,
+            _permit: Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            write_deadline,
+            write_timer: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn st03_blocked_stream_socket_expires_writes_and_final_flush() {
+        for writing in [true, false] {
+            let deadline = StreamWriteDeadline::default();
+            let response = deadline.arm(Instant::now() + Duration::from_secs(1));
+            let (first_poll, started) = oneshot::channel();
+            let mut connection = connection(
+                TestSocket {
+                    blocked: true,
+                    first_poll: Some(first_poll),
+                },
+                deadline,
+            );
+            let writer = tokio::spawn(async move {
+                if writing {
+                    let _response = response;
+                    connection.write_all(b"batch").await
+                } else {
+                    drop(response);
+                    connection.flush().await
+                }
+            });
+            started.await.unwrap();
+            // The blocked socket never wakes the task. The write deadline must.
+            let error = tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .expect("the stream write deadline did not wake the socket task")
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn st03_flushed_stream_allows_the_next_keep_alive_response() {
+        let deadline = StreamWriteDeadline::default();
+        let response = deadline.arm(Instant::now() + Duration::from_secs(1));
+        let mut connection = connection(
+            TestSocket {
+                blocked: false,
+                first_poll: None,
+            },
+            deadline.clone(),
+        );
+        connection.write_all(b"batch").await.unwrap();
+        connection.flush().await.unwrap();
+        assert!(deadline.0.lock().unwrap().is_some());
+
+        drop(response);
+        connection.flush().await.unwrap();
+        assert!(deadline.0.lock().unwrap().is_none());
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        connection.write_all(b"next response").await.unwrap();
+        connection.flush().await.unwrap();
+    }
 }

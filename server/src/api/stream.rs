@@ -1,6 +1,7 @@
 //! Public OLAP stream routes shared by the local and distributed APIs.
 use crate::{
     executor::{Admission, Executor},
+    network::StreamWriteDeadline,
     node::{http, stream::wire},
     protocol::{ErrorCode, MAX_PREDICATE_DEPTH, Outcome, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
@@ -274,6 +275,7 @@ async fn execute<B: Backend>(
                     Outcome::NotApplied,
                 )
             })?;
+        let write_deadline = request.extensions_mut().remove::<StreamWriteDeadline>();
         let body =
             http::read_small(request.into_body(), length, Instant::now() + BODY_TIMEOUT).await?;
         let command = match input {
@@ -319,6 +321,7 @@ async fn execute<B: Backend>(
                     _memory: charge,
                     _permit: egress.ok_or_else(internal)?,
                     _delivery: delivery,
+                    _write_deadline: write_deadline.map(|socket| socket.arm(deadline)),
                 });
                 let chunks = futures_util::stream::unfold(
                     (bytes, live),
@@ -362,6 +365,7 @@ struct Egress {
     _memory: MemoryCharge,
     _permit: OwnedSemaphorePermit,
     _delivery: Option<DeliveryLease>,
+    _write_deadline: Option<Arc<()>>,
 }
 
 impl AsRef<[u8]> for Egress {
