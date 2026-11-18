@@ -25,10 +25,10 @@ Documentation = "https://github.com/zPy52/nabedra-database/blob/main/orm/python/
 Issues = "https://github.com/zPy52/nabedra-database/issues"
 
 [project.optional-dependencies]
+arrow = ["pyarrow>=14"]
 database = []
 gateway = ["httpx>=0.27,<1"]
 aws = ["boto3>=1.34,<2"]
-arrow = ["pyarrow>=14"]
 
 [project.scripts]
 nabedra = "nabedra.cli:main"
