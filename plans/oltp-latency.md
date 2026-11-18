@@ -31,6 +31,8 @@ After each isolated measurement, keep the candidate only when a repeatable impro
 
 The trace measured median gateway ingress connect and TLS durations of 0.256 and 1.091 ms, and a median worker handler duration of 336.058 ms. In the aligned write windows, directly linked child RPCs overlapped a median 5.537 ms of a 5.737 ms cross-worker ServiceAuthority preflight. Prioritize reducing nested requests and quorum operations. Keep the isolated local Authority shortcut pending a safe fallback and capacity check. [Transport timing evidence](../docs/testing/evidence/oltp-latency/README.md#transport-timing-diagnostic)
 
+In two traced RF3 serial runs, quorum confirmation dominated the measured Control ReadIndex stages. Evaluate sharing a fresh barrier among Control reads already waiting on the same local group when the barrier starts. Keep each metadata snapshot, authority check, deadline, and result exact. Measure the number of barriers and successful outcomes under load. [ReadIndex timing evidence](../docs/testing/evidence/oltp-latency/README.md#quorum-confirmation-and-local-apply-timing)
+
 ## Durable protocol changes
 
 Enable new Raft commands only when every voter and learner that can receive or replay them supports their format. A service capability check establishes support at one endpoint. Compound applies need one bounded state batch that includes the applied log position. The existing batch reads use the pre-write snapshot, so pass intermediate state between steps explicitly. Check old checkpoints and partial manifests, retry with a changed digest, and inject failures before and after log sync, batch apply, and quorum acknowledgment. Keep synchronous durability and exercise O06, O07, O10, O11, O15, and O29.

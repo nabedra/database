@@ -274,6 +274,19 @@ The table includes startup, seeding, snapshots, and background traffic. The repe
 
 These are traced O24 and B02 serial-workload subsets. O22 progress under mixed saturation remains unverified. The diagnostic binary SHA-256 was `076642f751de41978ad208a53561d31bad4fed1ea76ee5a40c4ef2e249338839`. The initial and repeat result SHA-256 hashes were `8b831418727ec70b04f8112a1a901cacfbad16d381d0f47ca4e9d382526a4348` and `7646b06fdda457d42606baaa5be32f10d8e02611e4ce31632e6d8bd35b565b74`.
 
+## Quorum confirmation and local apply timing
+
+An isolated optimized diagnostic extended the previous transport trace with OpenRaft client roles and separate ReadIndex stages. Two fresh RF3 runs used the same serial workload, 16 rows, and the 4 CPU and 7.90 GB caps. All eight measured writes succeeded, all 12 snapshots matched, and all eight gateway windows passed clock alignment. Sixty-seven completed Control ReadIndex calls linked through exact endpoint nonces to those timed requests.
+
+| Capture | Gateway-linked reads | Median quorum confirmation | Median local Raft apply wait | Median durable marker check |
+| --- | ---: | ---: | ---: | ---: |
+| Initial | 40 | 3.856 ms | 0.001 ms | 0.497 ms |
+| Repeat | 27 | 4.783 ms | 0.001 ms | 0.748 ms |
+
+Quorum confirmation includes time in the local Raft API queue. These intervals cover directly linked reads and can overlap other work. They cannot establish a total latency saving from reducing quorum checks. Across the full captures, 9,900 of 10,838 and 7,632 of 8,385 matched successful Raft replies came from the dedicated heartbeat client. That client combines periodic and ReadIndex-triggered work. No outgoing Raft trace carried a direct endpoint parent, so individual heartbeats remain unattributed.
+
+The measured O24/B02 subset covers serial point writes. Mixed-load saturation and the O22 progress assertions remain open. The optimized diagnostic binary SHA-256 was `d2f5952e09f2a9b1cc4752e56efa2b6cb7da13dbc1a9d41baebb1ddb4c13e100`. The shell wrapper missed its exit record after compilation. Cargo completion, the copied executable's matching digest, and cgroup measurements verified the build.
+
 ## Focused metadata regression checks
 
 Five exact Rust tests passed on the metadata source in `c7f2a90`. The Linux Docker test container used a four-CPU quota, a 7,235,174,400-byte memory limit, and no swap. Its cgroup memory peak was 5,131,698,176 bytes, with zero memory-limit or OOM events. The checks used the pinned Rust 1.94.1 builder and RocksDB archive listed above, with `--no-default-features --features oltp --lib` and one test thread.
