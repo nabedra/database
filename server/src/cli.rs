@@ -15,6 +15,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    #[cfg(not(feature = "cache"))]
     /// Validate local configuration and perform a read-only storage probe.
     Doctor {
         #[arg(long)]
@@ -22,13 +23,22 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    #[cfg(not(feature = "cache"))]
     /// Explicit catalog maintenance after stopping incompatible writers.
     Database {
         #[command(subcommand)]
         command: DatabaseCommand,
     },
+    #[cfg(not(feature = "cache"))]
     /// Serve the Nabedra Database API.
     Serve(ServeOptions),
+    /// Serve the standalone RESP cache.
+    #[cfg(feature = "cache")]
+    Serve {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    #[cfg(not(feature = "cache"))]
     /// Run the supervised cluster API.
     Api {
         #[arg(long)]
@@ -40,6 +50,7 @@ pub enum Command {
         #[arg(long)]
         migrate_catalog: bool,
     },
+    #[cfg(not(feature = "cache"))]
     /// Enroll and run a manually provisioned worker.
     Worker {
         #[arg(long)]
@@ -56,6 +67,7 @@ pub enum Command {
     GrowthPlan,
 }
 
+#[cfg(not(feature = "cache"))]
 #[derive(Debug, Subcommand)]
 pub enum DatabaseCommand {
     #[cfg(feature = "olap")]
@@ -103,7 +115,9 @@ pub enum DatabaseCommand {
 }
 
 fn engine_version() -> &'static str {
-    if cfg!(feature = "oltp") {
+    if cfg!(feature = "cache") {
+        concat!(env!("CARGO_PKG_VERSION"), " cache")
+    } else if cfg!(feature = "oltp") {
         concat!(env!("CARGO_PKG_VERSION"), " oltp")
     } else {
         concat!(env!("CARGO_PKG_VERSION"), " olap")

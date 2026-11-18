@@ -6,7 +6,7 @@ ARG NABEDRA_S3=auto
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY server/ ./server/
-RUN case "$NABEDRA_ENGINE" in olap|oltp) ;; *) exit 2 ;; esac && \
+RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
     if [ "$NABEDRA_S3" = auto ]; then if [ "$NABEDRA_ENGINE" = olap ]; then NABEDRA_S3=true; else NABEDRA_S3=false; fi; fi && \
     case "$NABEDRA_ENGINE:$NABEDRA_S3" in oltp:true) selected_features=oltp-backup-s3 ;; olap:true) selected_features=olap,s3 ;; *:false) selected_features="$NABEDRA_ENGINE" ;; *) exit 2 ;; esac && \
     cargo build --manifest-path server/Cargo.toml --locked --release --bin nabedra-db --no-default-features --features "$selected_features" && \
@@ -31,5 +31,19 @@ FROM runtime AS oltp
 RUN nabedra-db --version | grep -w oltp || { echo 'The oltp target requires --build-arg NABEDRA_ENGINE=oltp' >&2; exit 2; }
 ENTRYPOINT ["nabedra-db"]
 CMD ["serve"]
+
+FROM debian:bookworm-slim AS cache
+LABEL io.nabedra.engine=cache io.nabedra.s3=false
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home nabedra
+COPY --from=build /src/server/target/release/nabedra-db /usr/local/bin/nabedra-db
+RUN nabedra-db --version | grep -w cache || { echo 'The cache target requires --build-arg NABEDRA_ENGINE=cache' >&2; exit 2; }
+USER nabedra
+WORKDIR /home/nabedra
+ENTRYPOINT ["nabedra-db"]
+CMD ["serve", "--config", "/etc/nabedra/cache.toml"]
+
+FROM scratch AS cache-release
+COPY --from=cache /usr/local/bin/nabedra-db /nabedra-db
 
 FROM ${NABEDRA_ENGINE} AS final

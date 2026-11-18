@@ -12,6 +12,7 @@ CASES = (
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
     ('oltp', 'oltp', False, ['--no-default-features', '--features', 'oltp']),
     ('oltp-s3', 'oltp', True, ['--no-default-features', '--features', 'oltp-backup-s3']),
+    ('cache', 'cache', False, ['--no-default-features', '--features', 'cache']),
 )
 
 
@@ -34,7 +35,7 @@ def assert_dependency_packages(name, engine, s3, tree):
     assert bool(aws) == s3, (name, 'AWS dependencies', sorted(aws))
     assert bool(olap) == (engine == 'olap'), (name, 'OLAP dependencies', sorted(olap))
     assert native == ({'rocksdb', 'librocksdb-sys'} if engine == 'oltp' else set()), (name, 'native dependencies', sorted(native))
-    assert ('openraft' in packages) == (engine == 'oltp'), (name, 'consensus dependency')
+    assert ('openraft' in packages) == (engine in ('oltp', 'cache')), (name, 'consensus dependency')
     if engine == 'olap':
         assert {'arrow-array', 'arrow-schema', 'parquet'} <= packages, (name, 'required OLAP codecs')
     if s3:
@@ -62,10 +63,19 @@ def main():
             print(result.stdout, end='')
             print(f'O02 {name}: {command} passed', flush=True)
     if not args.dependencies_only:
-        for name, features in [('neither', []), ('both', ['--features', 'olap,oltp'])]:
+        exclusive_engine = 'select exactly one engine: olap, oltp, or cache'
+        invalid = (
+            ('no-engine', [], exclusive_engine),
+            ('olap-oltp', ['--features', 'olap,oltp'], exclusive_engine),
+            ('olap-cache', ['--features', 'olap,cache'], exclusive_engine),
+            ('oltp-cache', ['--features', 'oltp,cache'], exclusive_engine),
+            ('all-engines', ['--features', 'olap,oltp,cache'], exclusive_engine),
+            ('cache-s3', ['--features', 'cache,s3'], 'the cache engine does not support S3'),
+        )
+        for name, features, diagnostic in invalid:
             result = cargo('check', ['--no-default-features', *features], '--lib', check=False)
             assert result.returncode != 0, f'O02 {name} unexpectedly compiled'
-            assert 'select exactly one engine: olap or oltp' in result.stderr, result.stderr
+            assert diagnostic in result.stderr, result.stderr
             print(f'O02 {name}: explicit compile guard passed', flush=True)
     return 0
 

@@ -11,11 +11,15 @@ use nabedra_database_server::{
     storage::{S3Store, Storage},
     worker_pool::WorkerPool,
 };
+#[cfg(not(feature = "cache"))]
+use std::io;
 #[cfg(all(feature = "olap", feature = "s3"))]
 use std::net::SocketAddr;
-use std::{io, process::ExitCode};
+use std::process::ExitCode;
+#[cfg(not(feature = "cache"))]
 use tracing_subscriber::{filter::Targets, prelude::*};
 
+#[cfg(not(feature = "cache"))]
 fn main() -> ExitCode {
     #[cfg(feature = "oltp")]
     let runtime = nabedra_database_server::oltp_runtime::standalone_network_runtime();
@@ -35,6 +39,7 @@ fn main() -> ExitCode {
     runtime.block_on(run_cli())
 }
 
+#[cfg(not(feature = "cache"))]
 async fn run_cli() -> ExitCode {
     let command = Cli::parse().command;
     let rpc_trace = if std::env::var("NABEDRA_OLTP_RPC_TRACE").as_deref() == Ok("1") {
@@ -346,4 +351,16 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
             .map_err(|_| "TLS configuration invalid")?;
     }
     Err("unsupported configuration: legacy serve requires the s3 feature")
+}
+
+#[cfg(feature = "cache")]
+fn main() -> ExitCode {
+    let Command::Serve { config } = Cli::parse().command;
+    match nabedra_database_server::cache::run_standalone(&config) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("nabedra-db: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }

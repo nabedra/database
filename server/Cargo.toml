@@ -3,7 +3,7 @@ name = "nabedra-database"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.94.1"
-description = "Database with mutually exclusive Parquet OLAP and indexed OLTP server builds"
+description = "Database with mutually exclusive OLAP, OLTP, and native cache server builds"
 license = "MIT"
 repository = "https://github.com/zPy52/nabedra-database"
 readme = "README.md"
@@ -23,6 +23,7 @@ path = "src/main.rs"
 default = ["olap", "s3"]
 olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
 oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
+cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 
@@ -51,6 +52,9 @@ openraft = { version = "=0.10.0", optional = true, default-features = false, fea
 tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["tls12", "aws_lc_rs"] }
 rocksdb = { version = "=0.25.0", optional = true, default-features = false, features = ["bindgen-runtime"] }
 bytes = "=1.12.1"
+hashbrown = { version = "=0.17.1", default-features = false, optional = true }
+smallvec = { version = "=1.16.5", optional = true }
+toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }
 
 # Cached HTTP transport; explicit TLS, no proxy or retry middleware.
 hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
@@ -62,6 +66,9 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 [dependencies.arrow-ipc]
 version = "=60.1.0"
 optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+clock-bound-client = { version = "=2.0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Bounded startup material reads use O_NONBLOCK before opened-handle validation.
