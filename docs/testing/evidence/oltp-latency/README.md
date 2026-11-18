@@ -290,6 +290,12 @@ The output log SHA-256 was `bba718e6bcc75c7525d1541ee97b15d66d9868058785921d8a85
 
 The follow-up bounded the optional receiver probe and repeatable hinted reads, then moved a failed same-generation receiver behind other candidates in the verified route order. All five exact tests passed again. The expanded O06/O14 assertion held each marked request until its unmarked fallback reached the same Status endpoint. The timed-out probe did not confirm a receiver. This exercised the only-replica fallback. Attempt ordering with multiple live voters remains unverified. The same Docker quotas applied, with 5,322,690,560 bytes peak memory and zero memory-limit or OOM events. The output log SHA-256 was `f7aa436e43ccd4cb57584dfa30e2f3065a5db1890df3fdd78b3cbadcc490aa15`. The timing sweeps above used `c7f2a90` before this follow-up.
 
+## Fixed-ready terminal receipt check
+
+Separate RF3 runs used an ordinary HTTPS gateway and three registered workers. A test hook paused the final ready follower before it installed one point update's terminal record. The stock gateway exposed the successful result in GET and completed the synchronous POST while that follower was still paused. The isolated gateway gate returned `committing` without a result and kept POST pending. Both runs then released the follower, matched the original decision, terminal version and accepted context on all three workers, verified release of the original snapshot pin, and read back the exact updated row.
+
+The stock fixture reached the final receipt assertion and failed it. The gated fixture passed. Both used matching unoptimized Linux builds and the same 4 CPU and 7.90 GB runtime allocation including the driver, with swap disabled. This exercises Q06/T04 and the fixed-ready subsets of O10 and O23. Deadline expiry, result expiry, direct worker HTTP, membership churn, and throughput remain unverified. The gate remains an isolated candidate while its request-path Control cost is evaluated.
+
 ## Reproduce
 
 Build or obtain a pinned Nabedra Linux release image. Use an idle Docker host and empty result directories. Run one engine at a time.

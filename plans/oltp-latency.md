@@ -57,3 +57,5 @@ For a deeper experiment, place the logical Status and Timestamp roles on one phy
 ## Validate
 
 The performance loop exercises a subset of O03, O08, O23–O25 and B01–B02. Report each executed subset and its limits. Post-optimization checks cover O01, O03–O11, O13–O16, O22–O23, O29 and mapped C07, M02, Q01–Q06, R01–R06, F03, T04, U01–U03. Run targeted barrier tests for changes to the queue and observation path. Also run the existing OLTP library and integration suite and production ORM compatibility tests with the same resource cap. Keep provider-specific assertions separate from local Docker evidence. [OLTP contract](../docs/testing/oltp-contract.md) · [Scheduler contract](../docs/testing/scheduler-contract.md)
+
+The fixed-ready gateway fixture reproduced success before the last ready follower received its terminal copy. The isolated gate passed the same fixture. Compare any retained gate with the normal workload and preserve bounded observation and durable mutation lookup after receipt expiration. [Terminal receipt evidence](../docs/testing/evidence/oltp-latency/README.md#fixed-ready-terminal-receipt-check)
