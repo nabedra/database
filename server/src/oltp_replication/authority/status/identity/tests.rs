@@ -886,35 +886,22 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         proof::ReadySetHasher,
     };
     let mut fixture = Fixture::new().await;
-    let authority = Authority {
-        run_id: Uuid::new_v4(),
-        owner_term: 1,
-    };
-    fixture
-        .apply(StatusCommand::Fence {
-            transition_id: Uuid::new_v4(),
-            expected: None,
-            next: authority,
-        })
-        .await;
-    let workers: Vec<_> = (1..=3u128)
-        .map(|id| WorkerIdentity {
-            worker_id: Uuid::from_u128(id),
-            incarnation: Uuid::new_v4(),
-            certificate_sha256: Digest::from_bytes([7; 32]),
-            enrollment_revision: 1,
-        })
-        .collect();
+    let authority = Authority { run_id: Uuid::new_v4(), owner_term: 1 };
+    fixture.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(), expected: None, next: authority,
+    }).await;
+    let workers: Vec<_> = (1..=3u128).map(|id| WorkerIdentity {
+        worker_id: Uuid::from_u128(id),
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: Digest::from_bytes([7; 32]),
+        enrollment_revision: 1,
+    }).collect();
     let mut ready_set = ReadySetHasher::default();
     for worker in &workers {
         ready_set.push(*worker).unwrap();
     }
     let ready = ReadyMembership {
-        view: AuthorityView {
-            run_id: authority.run_id,
-            owner_term: 1,
-            membership_revision: 8,
-        },
+        view: AuthorityView { run_id: authority.run_id, owner_term: 1, membership_revision: 8 },
         ready_root: ready_set.finish(),
         ready_count: 3,
     };
@@ -922,91 +909,39 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     let request_id = Uuid::new_v4();
     let reservation_id = Uuid::new_v4();
     let request = RequestBinding {
-        run_id: authority.run_id,
-        request_id,
-        digest,
-        accepted_context: Digest::from_bytes([19; 32]),
+        run_id: authority.run_id, request_id, digest, accepted_context: Digest::from_bytes([19; 32]),
     };
     let outcome = MutationOutcome::failure(ProtocolError::new(
-        ErrorCode::Conflict,
-        "deterministic terminal mutation",
-        Outcome::NotApplied,
-    ))
-    .unwrap();
+        ErrorCode::Conflict, "deterministic terminal mutation", Outcome::NotApplied,
+    )).unwrap();
     let original = TerminalCopyStatement {
-        request,
-        ready,
-        terminal_version: 5,
+        request, ready, terminal_version: 5,
         response_hash: outcome.response_hash(request_id).unwrap(),
         terminal_digest: Some(Digest::from_bytes([17; 32])),
-        pin_identity: PinIdentity {
-            run_id: authority.run_id,
-            request_id,
-            digest,
-            nonce: reservation_id,
-        },
-        storage_pin: StoragePin {
-            pin_id: Uuid::new_v4(),
-            read_ts: Timestamp::new(11).unwrap(),
-            allocator_epoch: 1,
-        },
+        pin_identity: PinIdentity { run_id: authority.run_id, request_id, digest, nonce: reservation_id },
+        storage_pin: StoragePin { pin_id: Uuid::new_v4(), read_ts: Timestamp::new(11).unwrap(), allocator_epoch: 1 },
     };
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     let digest_for_ack = statement_digest(&original).unwrap();
     for worker in workers.iter().take(2) {
-        verifier
-            .accept(
-                *worker,
-                &AuthenticatedAck::from_transport(*worker, digest_for_ack, Uuid::new_v4()),
-            )
-            .unwrap();
+        verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest_for_ack, Uuid::new_v4())).unwrap();
     }
-    assert!(
-        verifier.finish(ready).is_err(),
-        "quorum alone cannot certify retirement"
-    );
+    assert!(verifier.finish(ready).is_err(), "quorum alone cannot certify retirement");
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     for worker in workers {
-        verifier
-            .accept(
-                worker,
-                &AuthenticatedAck::from_transport(worker, digest_for_ack, Uuid::new_v4()),
-            )
-            .unwrap();
+        verifier.accept(worker, &AuthenticatedAck::from_transport(worker, digest_for_ack, Uuid::new_v4())).unwrap();
     }
     let command = StatusCommand::RetireTerminal {
-        authority,
-        proof: verifier.finish(ready).unwrap().into_sealed(),
-        timestamp_position: AppliedPosition {
-            term: 2,
-            node_id: 1,
-            index: 11,
-        },
+        authority, proof: verifier.finish(ready).unwrap().into_sealed(),
+        timestamp_position: AppliedPosition { term: 2, node_id: 1, index: 11 },
     };
-    fixture
-        .apply(StatusCommand::ReserveIdentity {
-            authority,
-            request_id,
-            digest,
-            kind: RequestKind::Mutation,
-            reservation_id,
-        })
-        .await;
-    assert_eq!(
-        fixture.apply(command.clone()).await,
-        StatusReply::Rejected(StatusFault::TerminalConflict)
-    );
-    let terminal = fixture
-        .apply(StatusCommand::TerminalFailure {
-            authority,
-            request,
-            outcome,
-        })
-        .await;
+    fixture.apply(StatusCommand::ReserveIdentity {
+        authority, request_id, digest, kind: RequestKind::Mutation, reservation_id,
+    }).await;
+    assert_eq!(fixture.apply(command.clone()).await, StatusReply::Rejected(StatusFault::TerminalConflict));
+    let terminal = fixture.apply(StatusCommand::TerminalFailure { authority, request, outcome }).await;
     let first = fixture.apply(command.clone()).await;
-    let StatusReply::Retired(ref certificate) = first else {
-        panic!("retirement certificate")
-    };
+    let StatusReply::Retired(ref certificate) = first else { panic!("retirement certificate") };
     let mut newer = original.clone();
     newer.ready.view.membership_revision += 1;
     newer.terminal_version += 1;
@@ -1022,45 +957,20 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     // certificate and exact failure, with only non-executable identity data.
     let mut fixture = fixture.reopen().await;
     assert_eq!(fixture.apply(command.clone()).await, first);
-    let stored = fixture
-        .machine
-        .store()
-        .read_metadata(BUDGET, move |view| {
-            let record: IdentityRecord = read(view, &key(IDENTITIES, request_id))?.unwrap();
-            view.encode(&record)
-        })
-        .await
-        .unwrap();
+    let stored = fixture.machine.store().read_metadata(BUDGET, move |view| {
+        let record: IdentityRecord = read(view, &key(IDENTITIES, request_id))?.unwrap();
+        view.encode(&record)
+    }).await.unwrap();
     let record: IdentityRecord = serde_json::from_slice(stored.as_slice()).unwrap();
     assert_eq!(record.retirement.as_ref(), Some(certificate));
     let encoded = std::str::from_utf8(stored.as_slice()).unwrap();
-    for forbidden in [
-        "operation",
-        "payload",
-        "authorization",
-        "token",
-        "queue_order",
-        "sequence",
-    ] {
+    for forbidden in ["operation", "payload", "authorization", "token", "queue_order", "sequence"] {
         assert!(!encoded.contains(&format!("\"{forbidden}\"")), "{encoded}");
     }
-    let cold = Authority {
-        run_id: Uuid::new_v4(),
-        owner_term: 2,
-    };
-    fixture
-        .apply(StatusCommand::Fence {
-            transition_id: Uuid::new_v4(),
-            expected: Some(authority),
-            next: cold,
-        })
-        .await;
-    assert_eq!(
-        fixture.apply(command).await,
-        StatusReply::Rejected(StatusFault::StaleAuthority)
-    );
-    assert_eq!(
-        fixture.apply(reserve(cold, request_id, digest)).await,
-        terminal
-    );
+    let cold = Authority { run_id: Uuid::new_v4(), owner_term: 2 };
+    fixture.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(), expected: Some(authority), next: cold,
+    }).await;
+    assert_eq!(fixture.apply(command).await, StatusReply::Rejected(StatusFault::StaleAuthority));
+    assert_eq!(fixture.apply(reserve(cold, request_id, digest)).await, terminal);
 }

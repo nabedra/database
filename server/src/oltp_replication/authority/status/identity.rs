@@ -720,17 +720,13 @@ fn apply(
                     && *terminal_version <= statement.terminal_version
                     && *response_hash == statement.response_hash => {}
                 (
-                    Some(TerminalIdentity::Committed {
-                        decision, outcome, ..
-                    }),
+                    Some(TerminalIdentity::Committed { decision, outcome, .. }),
                     RequestKind::Mutation,
                 ) if decision.request == statement.request
                     && outcome.response_hash(statement.request.request_id)?
                         == statement.response_hash => {}
                 (
-                    Some(TerminalIdentity::Failed {
-                        request, outcome, ..
-                    }),
+                    Some(TerminalIdentity::Failed { request, outcome, .. }),
                     RequestKind::Mutation,
                 ) if *request == statement.request
                     && outcome.response_hash(statement.request.request_id)?
@@ -1187,18 +1183,12 @@ impl RetirementCertificate {
         let Some(term_advance) = after.owner_term.checked_sub(before.owner_term) else {
             return false;
         };
-        let Some(revision_advance) = after
-            .membership_revision
-            .checked_sub(before.membership_revision)
-        else {
+        let Some(revision_advance) = after.membership_revision.checked_sub(before.membership_revision) else {
             return false;
         };
-        current
-            .terminal_version
-            .checked_sub(original.terminal_version)
-            .is_some_and(|advance| {
-                advance != 0 && advance <= term_advance.saturating_add(revision_advance)
-            })
+        current.terminal_version.checked_sub(original.terminal_version).is_some_and(|advance| {
+            advance != 0 && advance <= term_advance.saturating_add(revision_advance)
+        })
     }
 }
 
@@ -1247,27 +1237,15 @@ impl VerifiedTerminalRetirement {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_certificate(
-        statement: TerminalCopyStatement,
-        workers: &[WorkerIdentity],
-    ) -> Self {
+    pub(crate) fn test_certificate(statement: TerminalCopyStatement, workers: &[WorkerIdentity]) -> Self {
         use crate::oltp_replication::authority::proof::{AuthenticatedAck, TerminalVerifier};
         let ready = statement.ready;
         let digest = statement_digest(&statement).unwrap();
         let mut verifier = TerminalVerifier::begin(statement, ready).unwrap();
         for worker in workers {
-            verifier
-                .accept(
-                    *worker,
-                    &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4()),
-                )
-                .unwrap();
+            verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4())).unwrap();
         }
-        let position = AppliedPosition {
-            term: 1,
-            node_id: 1,
-            index: 2,
-        };
+        let position = AppliedPosition { term: 1, node_id: 1, index: 2 };
         let certificate = RetirementCertificate {
             proof: verifier.finish(ready).unwrap().into_sealed(),
             timestamp_position: position,
