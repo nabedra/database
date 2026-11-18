@@ -2,12 +2,14 @@
 """Run the shared point-update workload against the production RF3 OLTP topology."""
 
 import argparse
+from decimal import Decimal
 import hashlib
 import http.client
 from io import SEEK_END
 import json
 import math
 from pathlib import Path
+import re
 import secrets
 import ssl
 import subprocess
@@ -24,10 +26,18 @@ ROOT = Path(__file__).resolve().parents[1]
 DATABASE = 'test'
 MIB = 1 << 20
 TRACE_LOG_BYTES = 16 * MIB
-WORKER_CPU, WORKER_MEMORY = '1', 2_150_000_000
+NANO_CPUS = 1_000_000_000
+WORKER_MEMORY = 2_150_000_000
 API_CPU, API_MEMORY = '0.35', 550_000_000
 DRIVER_CPU, DRIVER_MEMORY = '0.65', 900_000_000
 WORKERS = ('w1', 'w2', 'w3')
+DEFAULT_WORKER_CPUS = (NANO_CPUS,) * len(WORKERS)
+STATUS_LEADER_HINT = re.compile(
+    r'^(\S+)\s+WARN\s+nabedra_database_server::oltp_replication::hosted: '
+    r'typed ReadIndex failed group=(\S+) kind=Status \{ bucket: 0 \} node=(\d+) '
+    r'error=has to forward request to: Some\((\d+)\)',
+    re.MULTILINE,
+)
 EXECUTION = {
     'max_workers_per_request': 1,
     'max_pending_requests': 128,
@@ -38,6 +48,18 @@ EXECUTION = {
     'queue_lifetime': 'live_cluster',
     'partition_size': '64 MiB',
 }
+
+
+def worker_cpu_quotas(value):
+    quotas = [field.strip() for field in value.split(',')]
+    if len(quotas) != len(WORKERS) or any(
+        not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]{1,9})?|\.[0-9]{1,9})', field) for field in quotas
+    ):
+        raise argparse.ArgumentTypeError('supply three decimal CPU quotas with up to nine fractional digits')
+    nanocpus = tuple(int(Decimal(field) * NANO_CPUS) for field in quotas)
+    if min(nanocpus) <= 0 or sum(nanocpus) != sum(DEFAULT_WORKER_CPUS):
+        raise argparse.ArgumentTypeError('worker CPU quotas must be positive and sum to 3')
+    return nanocpus
 
 
 def uid():
@@ -287,6 +309,7 @@ class Nabedra:
 class Cluster:
     def __init__(self, args, directory):
         self.args, self.directory = args, directory
+        self.worker_nano_cpus = dict(zip(WORKERS, args.worker_cpus, strict=True))
         self.prefix = 'nabedra-oltp-bench-' + uuid4().hex[:10]
         self.cluster_id, self.run_id, self.bootstrap_id = uid(), uid(), uid()
         self.containers, self.volumes = [], []
@@ -401,10 +424,18 @@ class Cluster:
         for offset, (label, kind) in enumerate((('control', 'control'), ('timestamps', 'timestamps'),
                                                 ('status', {'status': {'bucket': 0}}), ('catalog', 'catalog'))):
             order = WORKERS[offset % len(WORKERS):] + WORKERS[:offset % len(WORKERS)]
+            if label == 'status' and self.args.status_seed_worker:
+                seed = self.args.status_seed_worker
+                order = (seed, *(worker for worker in order if worker != seed))
+                self.metadata['status_seed_placement'] = {
+                    'seed_worker': seed, 'workers_by_node_id': dict(enumerate(order, start=1)),
+                }
             placements[label] = dict(identity=dict(cluster_id=self.cluster_id, database=DATABASE, group_id=uid(),
                                 kind=kind, group_format_version=1), voters=[dict(node_id=index,
                                 worker_id=enrollment[name]['worker_id'], pool_id=pool[name])
                                 for index, name in enumerate(order, start=1)])
+        if self.args.status_seed_worker:
+            self.metadata['status_seed_placement']['group_id'] = placements['status']['identity']['group_id']
         enrollments = sorted(enrollment.values(), key=lambda record: record['worker_id'])
         operator_pins = sorted(record['certificate_sha256'] for record in enrollments)
         for index, name in enumerate(WORKERS, start=1):
@@ -435,7 +466,8 @@ cp /fixture/auth.json /fixture/ca.pem "/fixture/$1.json" "/fixture/$1.pem" "/fix
 cp "/fixture/$1-volume.json" /data/.nabedra-docker-volume.json
 exec "$2" worker --bootstrap "/tmp/config/$1.json"
 '''
-            self.launch(name, WORKER_CPU, WORKER_MEMORY, 'sh', ['-c', script, 'worker', name, self.binary],
+            cpu = format(Decimal(self.worker_nano_cpus[name]).scaleb(-9).normalize(), 'f')
+            self.launch(name, cpu, WORKER_MEMORY, 'sh', ['-c', script, 'worker', name, self.binary],
                         options=('-p', '127.0.0.1::8000', '--mount', f'type=volume,source={volume},target=/data'))
         worker_urls = {name: self.host_url(name) for name in WORKERS}
         print('Waiting for three OLTP workers', flush=True)
@@ -500,9 +532,15 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         host = json.loads(manifest)
         self.metadata['docker_environment'] = {key: host.get(key) for key in (
             'ServerVersion', 'OperatingSystem', 'Architecture', 'KernelVersion', 'NCPU', 'MemTotal', 'CgroupVersion')}
-        self.metadata['allocations'] = {'worker_cpu': float(WORKER_CPU), 'worker_bytes': WORKER_MEMORY,
+        self.metadata['allocations'] = {'worker_bytes': WORKER_MEMORY,
             'api_cpu': float(API_CPU), 'api_bytes': API_MEMORY, 'driver_cpu': float(DRIVER_CPU),
             'driver_bytes': DRIVER_MEMORY, 'total_cpu': 4, 'total_bytes': 7_900_000_000}
+        allocations = self.metadata['allocations']
+        if args.worker_cpus == DEFAULT_WORKER_CPUS:
+            allocations['worker_cpu'] = 1.0
+        else:
+            allocations['worker_cpu_by_role'] = {worker: quota / NANO_CPUS
+                                                for worker, quota in self.worker_nano_cpus.items()}
         write_json(self.directory / 'metadata.json', self.metadata)
         settings = ['--rates', ','.join(map(str, args.rates))]
         for field in ('seconds', 'warmup_seconds', 'repetitions', 'clients', 'rows', 'seed', 'timeout'):
@@ -514,6 +552,28 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                     + args.repetitions * args.seconds + (args.repetitions + 1) * (args.timeout + 30)) + 120))
         self.docker('cp', f'{driver}:/results/.', str(args.output), timeout=120)
         return state
+
+    def record_status_leader_hints(self):
+        placement = self.metadata['status_seed_placement']
+        workers = placement['workers_by_node_id']
+        observations = {}
+        for role in WORKERS:
+            log_path = self.args.output / f'{self.prefix}-{role}.log'
+            if not log_path.is_file():
+                continue
+            for timestamp, group_id, observer_id, leader_id in STATUS_LEADER_HINT.findall(
+                    log_path.read_text(errors='replace')):
+                leader = workers.get(int(leader_id))
+                if group_id != placement['group_id'] or workers.get(int(observer_id)) != role or leader is None:
+                    continue
+                observation = observations.setdefault((role, leader), {
+                    'observer': role, 'hinted_leader': leader, 'count': 0,
+                    'first_timestamp': timestamp, 'last_timestamp': timestamp,
+                })
+                observation['count'] += 1
+                observation['first_timestamp'] = min(observation['first_timestamp'], timestamp)
+                observation['last_timestamp'] = max(observation['last_timestamp'], timestamp)
+        placement['observed_follower_hints'] = list(observations.values())
 
     def finish(self):
         errors, runtime = [], {}
@@ -527,8 +587,10 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                     errors.append(f'{name} was OOM-killed')
                 if item['State']['Running']:
                     runtime[name]['cgroup_final'] = self.docker('exec', name, 'sh', '-c',
-                        'for f in /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/io.stat /sys/fs/cgroup/memory.current '
-                        '/sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events /proc/net/dev; do '
+                        'for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/io.stat '
+                        '/sys/fs/cgroup/memory.current '
+                        '/sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events '
+                        '/proc/net/dev /proc/net/snmp /proc/net/netstat; do '
                         'if [ -f "$f" ]; then echo "$f"; cat "$f"; fi; done')
                 log_path = self.args.output / f'{name}.log'
                 if self.args.rpc_trace and not name.endswith('-driver'):
@@ -562,15 +624,12 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                 self.docker('network', 'rm', self.prefix)
             except (RuntimeError, subprocess.SubprocessError) as error:
                 errors.append(str(error))
-        limits = {
-            'worker': (1_000_000_000, WORKER_MEMORY),
-            'api': (350_000_000, API_MEMORY),
-            'driver': (650_000_000, DRIVER_MEMORY),
-        }
+        limits = {worker: (cpu, WORKER_MEMORY) for worker, cpu in self.worker_nano_cpus.items()}
+        limits.update(api=(350_000_000, API_MEMORY), driver=(650_000_000, DRIVER_MEMORY))
         cap_errors = []
         for name, record in runtime.items():
             role = name.rsplit('-', 1)[-1]
-            cpu, memory = limits['worker' if role in WORKERS else role]
+            cpu, memory = limits[role]
             if (record['nano_cpus'], record['memory'], record['memory_swap']) != (cpu, memory, memory):
                 cap_errors.append(f'{name} did not have the requested CPU, memory and swap caps')
         total_cpu = sum(item['nano_cpus'] for item in runtime.values())
@@ -580,6 +639,11 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         errors.extend(cap_errors)
         if not budget_verified:
             errors.append('could not verify the complete cluster and driver resource budget')
+        if 'status_seed_placement' in self.metadata:
+            try:
+                self.record_status_leader_hints()
+            except OSError as error:
+                errors.append(f'could not read Status leader hints: {error}')
         write_json(self.args.output / 'container-runtime.json', {'containers': runtime, 'errors': errors,
                    'total_nano_cpus': total_cpu, 'total_memory_bytes': total_memory, 'budget_verified': budget_verified})
         return errors
@@ -590,6 +654,10 @@ def main():
     parser.add_argument('--image', help='locally available Docker image containing Python 3.11 and nabedra-db')
     parser.add_argument('--binary', type=Path, help='use this release Linux binary with the image instead')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--worker-cpus', type=worker_cpu_quotas, default=DEFAULT_WORKER_CPUS,
+                        help='comma-separated CPU quotas for w1, w2 and w3 (default: 1,1,1)')
+    parser.add_argument('--status-seed-worker', choices=WORKERS,
+                        help='select the first voter that initializes the fresh RF3 Status group (default: w3)')
     parser.add_argument('--rpc-trace', action='store_true', help='capture bounded native RPC logs for a diagnostic run')
     parser.add_argument('--tls-key-type', choices=('rsa', 'ed25519'), default='rsa',
                         help='key type for fixture certificates, including the CA (default: rsa)')

@@ -3,6 +3,7 @@
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -18,15 +19,25 @@ TABLE = 'benchmark_points'
 
 
 def parse_rates(value):
-    rates = [int(rate) for rate in value.split(',')]
-    if not rates or min(rates) <= 0 or len(set(rates)) != len(rates):
-        raise ValueError('rates must be distinct positive integers')
+    rates = []
+    for text in value.split(','):
+        try:
+            rate = int(text)
+        except ValueError:
+            rate = float(text)
+            if not math.isfinite(rate):
+                raise ValueError('rates must be finite')
+            if rate.is_integer():
+                rate = int(rate)
+        rates.append(rate)
+    if min(rates) <= 0 or len(set(rates)) != len(rates):
+        raise ValueError('rates must be distinct and positive')
     return rates
 
 
 def add_workload_args(parser):
     parser.add_argument('--rates', type=parse_rates, default='5,20,50,100,200',
-                        help='comma-separated offered updates per second')
+                        help='comma-separated offered updates per second, including fractional rates')
     parser.add_argument('--seconds', type=float, default=5)
     parser.add_argument('--warmup-seconds', type=float, default=3)
     parser.add_argument('--repetitions', type=int, default=3)
@@ -37,13 +48,23 @@ def add_workload_args(parser):
                         help='client socket or operation timeout in seconds')
 
 
+def _offered_updates(rate, seconds):
+    if isinstance(rate, int):
+        try:
+            return int(rate * seconds)
+        except OverflowError as error:
+            raise ValueError('the phase update count exceeds the supported range') from error
+    # Multiply the normalized decimal strings to preserve counts such as 0.29 × 100.
+    return int(Fraction(str(rate)) * Fraction(str(seconds)))
+
+
 def validate_args(args):
     if not all(math.isfinite(value) and value > 0 for value in
                (args.seconds, args.warmup_seconds, args.timeout)):
         raise ValueError('measurement, warmup and timeout durations must be finite and positive')
     if min(args.clients, args.repetitions, args.rows) < 1 or args.rows > 10_000:
         raise ValueError('clients and repetitions must be positive and rows must be 1–10000')
-    counts = [int(rate * seconds) for rate in args.rates
+    counts = [_offered_updates(rate, seconds) for rate in args.rates
               for seconds in (args.seconds, args.warmup_seconds)]
     if min(counts) < 1 or max(counts) > args.rows:
         raise ValueError('each phase must offer between 1 and --rows unique updates')
@@ -69,7 +90,7 @@ def observe(adapter, work):
 
 
 def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
-    count = int(rate * seconds)
+    count = _offered_updates(rate, seconds)
     rng = random.Random(phase_seed)
     # Ordered uniform times are Poisson arrivals conditioned on the phase count.
     offsets = sorted(round(rng.random() * seconds * 1e9) for _ in range(count))
