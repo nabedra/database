@@ -39,7 +39,16 @@ The earlier OLAP process run completed ten assertion groups in 125.9 seconds. Be
 - At `9c37b68` the full OLAP Rust run passed 765 tests. Python passed 183 tests and skipped one Arrow case in the base environment. A separate five-test Python stream run at `3696d63` passed with PyArrow installed, including IPC validation. The default, OLAP-only, OLTP-only, and OLTP with S3 dependency graph checks passed (O02). The OLAP-only dependency graph included Arrow IPC 60.1.0. The OLTP-only graph excluded it.
 - The OLTP build at `9c37b68` linked a cached native RocksDB archive after checking the exact `librocksdb-sys` lock entry, target and compiler settings, and byte-for-byte matches for six newly compiled object files. The build compiled the Rust crate, wrappers and tests from the pinned source. The OLTP library suite passed 146 of 147 tests and 15 integration tests passed in four test executables before handoff. `c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory` panicked on a subtraction underflow at `src/oltp/pool/tests.rs:722:28`. A Docker rerun of that exact selector on the earlier `6dfc713` baseline used the same Rust toolchain and verified RocksDB archive. It reproduced the same panic and exit code 101.
 - The pinned OLTP single-node probe required four workers in its local fixture. All 13 unchanged ORM operations passed at 1 and 100 rows. The 1,000-row `insert_many` exceeded the 20-second SDK deadline and returned `UnknownOutcomeError`. The separate retry measured 20,049 ms and the owned process was reaped after its 15-second graceful shutdown watchdog. The trace leaves the mutation outcome unknown.
-- GPU performance, live S3 permissions, autoscaling and provider tests, and verification against the published OLTP branch remain open. The cgroup evidence covers local Docker execution.
+- GPU performance and live S3 and infrastructure provider tests remain open. The cgroup evidence covers local Docker execution.
+
+## Verification after OLTP merged
+
+The streaming branch and published OLTP branch merged cleanly in both orders. The merged source is `70f14f6fc9545377b358af260d1e20ff300ff02f`. A Linux x86-64 Docker container with 2 CPUs, 5 GiB of RAM, and zero swap ran the checks below. [OLTP PR #13](https://github.com/zPy52/nabedra-database/pull/13)
+
+- The locked OLAP build produced SHA-256 `786ceecfa691444548ba1deab24ea1fbfa19a8585660ee1ff408445e25a4627e`. All 13 modern process assertion groups passed in 156.2 seconds. All 190 Python tests passed with PyArrow 20.0.0, and all four O02 dependency graphs passed, including `oltp-backup-s3`.
+- The merged binary overflowed a Tokio thread's default stack in the provider drain test, both with a stream open and with the unchanged provider fixture. The larger-stack diagnostic passed the live-stream removal check. Source `0fd10e64d0932681dd23515353c3acdc170ebf3f` moved the drain future to the heap at both provider tick call sites. The new OLAP binary, SHA-256 `23e45fd3145102e973d53c89dfc702b41f0140ae57893b73e3938c32c9acd5ab`, passed at the default stack size. The local callback fixture exercised A01/A02, including explicit scale to zero and restart. After the earlier worker removal the original stream replayed batch zero byte for byte, yielded the exact next row, then returned EOF and closed (ST05/A02).
+- The final OLAP binary reran all 13 modern process assertion groups in 233.7 seconds. The Docker cap was 2.5 CPUs and 5 GiB while the RocksDB compile shared the container. The cgroup reported zero OOM events. The final OLAP Rust `stream` selector passed all 29 tests in 7.3 seconds.
+- The locked OLTP build at `70f14f6` compiled the merged Rust code and linked the verified native RocksDB 11.8.1 archive. The resulting binary reported `nabedra-db 0.1.1 oltp` with SHA-256 `e3c6434113e3be8ff31b180fa61917cae38809ca2ac2a2d8305d5554babd8ec4`. The single-replica ORM smoke passed all 13 operations and the 1-, 100-, and 1,000-row cases in 43 seconds. Both client mode preferences returned `StreamUnsupportedError` on that server (ST05/O01/O02). The later provider fix compiles only for OLAP.
 
 ## Reproduce
 
@@ -61,7 +70,9 @@ python3.11 -m unittest discover -s orm/python/tests
 python3.11 -m unittest discover -s orm/python/tests -p test_streaming.py
 python3.11 scripts/acceptance_olap_streaming.py --binary "$OLAP_BINARY" --evidence process.json
 python3.11 scripts/acceptance_olap_streaming.py --binary "$OLAP_BINARY" --legacy-binary "$OLD_OLAP_BINARY" --scenario legacy-join --evidence mixed.json
+python3.11 scripts/acceptance_providers.py --binary "$OLAP_BINARY" --stream-drain
 python3.11 scripts/acceptance_olap_stream_pytorch.py --olap-binary "$OLAP_BINARY" --old-olap-binary "$OLD_OLAP_BINARY"
+python3.11 scripts/acceptance_olap_stream_pytorch.py --oltp-binary "$OLTP_BINARY"
 ```
 
 The PyTorch fixture uses CPU PyTorch 2.7.1+cpu, PyArrow 20.0.0, and NumPy 2.2.6. For the narrowed OLTP probe, start the pinned binary with four workers, call `unsupported` against its URL, then call `exercise` from `server/tests/oltp_orm_contract.py` separately with `scales=(1, 100)` and `scales=(1000,)`. [Stream process fixture](../../../../scripts/acceptance_olap_streaming.py) · [PyTorch fixture](../../../../scripts/acceptance_olap_stream_pytorch.py)
