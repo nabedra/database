@@ -443,7 +443,15 @@ impl TimestampEndpoint {
                 encode(shared, self.handle.confirmed_allocation(permit).await?).await
             }
             Request::Release { statement } => {
-                encode(shared, self.handle.release(statement).await?.wire_parts()).await
+                let release = self.handle.release(statement).await?;
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                    "terminal-pin-release",
+                    release.statement().request.request_id,
+                    &release.wire_parts(),
+                )
+                .await;
+                encode(shared, release.wire_parts()).await
             }
             Request::Released { statement } => {
                 encode(

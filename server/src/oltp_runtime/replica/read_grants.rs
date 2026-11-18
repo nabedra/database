@@ -174,6 +174,7 @@ impl WorkerReplica {
         if self.read_grant_set(id) == set {
             return false;
         }
+        self.invalidate_terminal_barrier(id);
         self.read_grants.insert(
             id,
             GrantEntry {
@@ -260,6 +261,7 @@ impl WorkerReplica {
             set.revision = set.revision.checked_add(1).ok_or(QueueError::Overloaded)?;
             self.validate_grant_set(id, &set)?;
             self.changed(id)?;
+            self.invalidate_terminal_barrier(id);
             self.read_grants.insert(
                 id,
                 GrantEntry {
@@ -273,6 +275,14 @@ impl WorkerReplica {
             .get(&id)
             .filter(|entry| entry.copying)
             .map(|_| set))
+    }
+
+    fn invalidate_terminal_barrier(&mut self, id: Uuid) {
+        // A grant revision is part of the frame digest, even if the queue
+        // record's numeric version did not change.
+        if self.record(id).is_some_and(|record| record.state.terminal()) {
+            self.barriers.remove(&id);
+        }
     }
 
     pub(crate) fn pending_read_grants(&self, id: Uuid) -> Vec<ReadGrant> {

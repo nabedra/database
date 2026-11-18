@@ -17,7 +17,9 @@ pub(super) mod retirement;
 mod split;
 use super::{
     admission::{DurableAdmission, ReservationResult},
-    application::{ApplicationObservation, INLINE_RECEIPT_BYTES, ObservedApplication},
+    application::{
+        ApplicationObservation, ApplicationReadView, INLINE_RECEIPT_BYTES, ObservedApplication,
+    },
     bootstrap::LocalServices,
     http_runtime::{HttpRuntime, OwnedReceipt},
     replica::*,
@@ -415,7 +417,7 @@ impl WorkerRuntime {
     pub(crate) async fn authorize_api(
         &self,
         identity: WorkerIdentity,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<QueueAuthority, ProtocolError> {
         let grant = self
             .services
             .control
@@ -429,7 +431,10 @@ impl WorkerRuntime {
         if grant.owner != Some(self.services.local) || !self.accepting.load(Ordering::Acquire) {
             return Err(unavailable());
         }
-        Ok(())
+        Ok(QueueAuthority {
+            ready: grant.ready,
+            owner: self.services.local,
+        })
     }
     pub(crate) async fn submit_charged(
         self: &Arc<Self>,
@@ -454,8 +459,20 @@ impl WorkerRuntime {
             .receive()
             .await
     }
-    pub(crate) async fn application_observation(
+    pub(super) fn application_copy_confirmation(
         &self,
+        run: Uuid,
+        id: Uuid,
+    ) -> Result<Option<RecordVersion>, ProtocolError> {
+        let replica = self.services.replica.lock().map_err(|_| unknown())?;
+        Ok(replica
+            .record(id)
+            .filter(|record| record.run_id == run)
+            .and_then(|record| replica.terminal_copy_confirmation(replica.authority(), record)))
+    }
+    pub(super) async fn application_observation(
+        &self,
+        view: ApplicationReadView,
         run: Uuid,
         id: Uuid,
         include_result: bool,
@@ -465,19 +482,27 @@ impl WorkerRuntime {
         } else {
             0
         };
-        self.application_snapshot(run, id, limit, ByteClass::Progress, None)
+        self.application_snapshot(view, run, id, limit, ByteClass::Progress, None)
             .await
     }
     async fn application_snapshot(
         &self,
+        view: ApplicationReadView,
         run: Uuid,
         id: Uuid,
         result_limit: usize,
         result_class: ByteClass,
         expected: Option<&ApplicationObservation>,
     ) -> Result<ObservedApplication, ProtocolError> {
+        let ApplicationReadView { authority, terminal } = view;
+        let confirmed = |replica: &WorkerReplica, record: &RequestRecord| {
+            terminal.is_some() && replica.terminal_copy_confirmation(authority, record) == terminal
+        };
         let (local_error, reconciling) = {
             let replica = self.services.replica.lock().map_err(|_| unknown())?;
+            if replica.authority() != authority {
+                return Err(unknown());
+            }
             let local = replica.retained_record(id, now()).and_then(|record| {
                 if record.run_id != run {
                     return Err(QueueError::Abandoned);
@@ -497,6 +522,9 @@ impl WorkerRuntime {
             });
             match local {
                 Ok((record, metadata)) if record.state != RequestState::Reconciling => {
+                    if record.state.terminal() && !confirmed(&replica, record) {
+                        return pending_terminal_copy(metadata.record, expected);
+                    }
                     return attach_result(metadata, expected, || {
                         receipt_body(
                             result_class,
@@ -522,6 +550,21 @@ impl WorkerRuntime {
                 let reservation = terminal_reservation(&terminal)?;
                 if reservation.original_run != run {
                     return Err(QueueError::Abandoned.protocol());
+                }
+                {
+                    let replica = self.services.replica.lock().map_err(|_| unknown())?;
+                    if replica.authority() != authority {
+                        return Err(unknown());
+                    }
+                    if let Ok(record) = replica.retained_record(id, now())
+                        && record.run_id == run
+                        && !confirmed(&replica, record)
+                    {
+                        // A live record retains its version and the worker's
+                        // replication task advances it under the current view.
+                        let record = replica.observation(id).map_err(QueueError::protocol)?;
+                        return pending_terminal_copy(record, expected);
+                    }
                 }
                 let encoded = terminal_response(id, &terminal)?;
                 attach_result(
@@ -554,12 +597,14 @@ impl WorkerRuntime {
             status => attach_reconciling_read(reconciling, status, local_error, expected),
         }
     }
-    pub(crate) async fn application_result(
+    pub(super) async fn application_result(
         &self,
+        view: ApplicationReadView,
         observed: &ApplicationObservation,
     ) -> Result<ChargedBytes, ProtocolError> {
         let current = self
             .application_snapshot(
+                view,
                 observed.record.run_id,
                 observed.record.request_id,
                 crate::protocol::MAX_BODY_BYTES,
@@ -1455,6 +1500,24 @@ fn attach_reconciling_read(
         })
         .ok_or_else(|| local_error.protocol())?;
     attach_result(metadata, expected, || Ok(None))
+}
+
+fn pending_terminal_copy(
+    mut record: RequestRecord,
+    expected: Option<&ApplicationObservation>,
+) -> Result<ObservedApplication, ProtocolError> {
+    record.state = RequestState::Committing;
+    record.response_status = None;
+    record.completed_at_ms = None;
+    attach_result(
+        ApplicationObservation {
+            record,
+            response_hash: None,
+            durable_proof: false,
+        },
+        expected,
+        || Ok(None),
+    )
 }
 
 fn attach_result(

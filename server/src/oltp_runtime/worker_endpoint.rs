@@ -1582,6 +1582,10 @@ impl Endpoint for QueueEndpoint {
                         .prepare_payload(&session, current, &record, &sections)
                         .await?;
                     #[cfg(test)]
+                    if record.state.terminal() {
+                        super::recovery_tests::pause("before-terminal-copy", record.request_id).await;
+                    }
+                    #[cfg(test)]
                     if record.ready.view.owner_term > 1 {
                         super::recovery_tests::pause("removal_install", record.request_id).await;
                     }

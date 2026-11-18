@@ -108,6 +108,8 @@ fn write_record(replica: &super::replica::WorkerReplica, directory: &std::path::
         "digest":record.digest,"context":context,
         "context_hash":crate::oltp_replication::types::Digest::from_bytes(Sha256::digest(context_bytes).into()).to_string(),
         "accepted":record.accepted,
+        "copies_complete":replica.copies_complete(id),
+        "terminal":replica.terminal_copy_statement(id).ok(),
         "state":record.state,"version":record.version,"sequence":record.sequence,
         "observed_at_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()});
     let path = directory.join(format!("record-{id}.json"));
@@ -263,7 +265,7 @@ pub(crate) async fn pause(stage: &str, request: Uuid) {
 
 /// Each selected checkpoint belongs to the first actor that reaches it.
 /// A reader helping the same transaction must be able to pass a paused actor.
-pub(super) async fn transaction_checkpoint(
+pub(crate) async fn transaction_checkpoint(
     stage: &str,
     request: Uuid,
     observed: &impl serde::Serialize,

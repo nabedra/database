@@ -1,6 +1,10 @@
 //! API ingress is a Control-enrolled service, never a queue holder or voter.
 //! The current owner authenticates the original bearer and database again.
-use super::{http_runtime::HttpRuntime, replica::QueueScope, worker_runtime::WorkerRuntime};
+use super::{
+    http_runtime::HttpRuntime,
+    replica::{QueueAuthority, QueueScope, RecordVersion},
+    worker_runtime::WorkerRuntime,
+};
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, WorkerSharedResources},
     oltp_replication::{
@@ -29,6 +33,11 @@ pub(crate) struct ApplicationObservation {
 pub(crate) struct ObservedApplication {
     pub metadata: ApplicationObservation,
     pub body: Option<ChargedBytes>,
+}
+
+pub(super) struct ApplicationReadView {
+    pub(super) authority: QueueAuthority,
+    pub(super) terminal: Option<RecordVersion>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -138,9 +147,24 @@ impl Endpoint for ApplicationEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let (runtime, request) = self.parse(&session, header.as_ref())?;
+            // Bind the terminal version before the Control role check. A
+            // confirmation posted during that check needs a fresh observation.
+            let terminal = match &request.method {
+                Method::Observe { run_id, request_id, .. } => {
+                    runtime.application_copy_confirmation(*run_id, *request_id)?
+                }
+                Method::Result { observed } => runtime.application_copy_confirmation(
+                    observed.record.run_id,
+                    observed.record.request_id,
+                )?,
+                _ => None,
+            };
             // Every action checks current authority. Submit also checks before
             // it can reserve or transfer its request body.
-            runtime.authorize_api(session.remote()).await?;
+            let view = ApplicationReadView {
+                authority: runtime.authorize_api(session.remote()).await?,
+                terminal,
+            };
             let shared = runtime.resources().clone();
             let data = session.purpose() == Purpose::ApiIngress;
             let result: Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError> = async {
@@ -165,7 +189,7 @@ impl Endpoint for ApplicationEndpoint {
                             return Err(invalid());
                         }
                         let observed = runtime
-                            .application_observation(run_id, request_id, include_result)
+                            .application_observation(view, run_id, request_id, include_result)
                             .await?;
                         Ok((
                             shared.encode_in(ByteClass::Progress, &observed.metadata, 16 << 10)?,
@@ -176,7 +200,8 @@ impl Endpoint for ApplicationEndpoint {
                         if (0..3).any(|i| sections.section(i).is_some()) {
                             return Err(invalid());
                         }
-                        Ok((runtime.application_result(&observed).await?, None))
+                        let result = runtime.application_result(view, &observed).await?;
+                        Ok((result, None))
                     }
                     Method::Stats => {
                         if (0..3).any(|i| sections.section(i).is_some()) {

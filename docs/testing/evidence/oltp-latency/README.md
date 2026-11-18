@@ -307,7 +307,9 @@ The follow-up bounded the optional receiver probe and repeatable hinted reads, t
 
 Separate RF3 runs used an ordinary HTTPS gateway and three registered workers. A test hook paused the final ready follower before it installed one point update's terminal record. The stock gateway exposed the successful result in GET and completed the synchronous POST while that follower was still paused. The isolated gateway gate returned `committing` without a result and kept POST pending. Both runs then released the follower, matched the original decision, terminal version and accepted context on all three workers, verified release of the original snapshot pin, and read back the exact updated row.
 
-The stock fixture reached the final receipt assertion and failed it. The gated fixture passed. Both used matching unoptimized Linux builds and the same 4 CPU and 7.90 GB runtime allocation including the driver, with swap disabled. This exercises Q06/T04 and the fixed-ready subsets of O10 and O23. Deadline expiry, result expiry, direct worker HTTP, membership churn, and throughput remain unverified. The gate remains an isolated candidate while its request-path Control cost is evaluated.
+The stock fixture reached the final receipt assertion and failed it. The gated fixture passed. Both used matching unoptimized Linux builds and the same 4 CPU and 7.90 GB runtime allocation including the driver, with swap disabled. This exercises Q06/T04 and the fixed-ready subsets of O10 and O23.
+
+The retained gateway change uses the coordinator's existing Control confirmation of the exact terminal copy. It passed the same RF3 fixture and two native checks for exact ready-view and version matching, recovery selection, and result expiry. A separate capped RF3 run held the follower through the bounded POST deadline. POST returned HTTP 503 with an unknown outcome, GET stayed `committing` while the follower was paused, and GET returned the exact original success after release. The driver submitted once. All three terminal copies, the original pin release, and the final row verified. Live expiry, direct worker HTTP, membership churn, and throughput remain open.
 
 ## Reproduce
 

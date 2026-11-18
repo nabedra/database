@@ -451,6 +451,7 @@ struct CopyBarrier {
     version: RecordVersion,
     ready: ReadySetHasher,
     complete: bool,
+    terminal_confirmed: bool,
     acceptance_timing: AcceptanceTiming,
 }
 
@@ -864,7 +865,8 @@ impl WorkerReplica {
     fn needs_recovery(&self, record: &RequestRecord, now: u64) -> bool {
         self.has_read_grants(record.request_id)
             || !record.state.terminal()
-            || (!self.terminal_expired(record, now) && !self.copies_complete(record.request_id))
+            || (!self.terminal_expired(record, now)
+                && self.terminal_copy_confirmation(self.authority, record).is_none())
     }
     pub(crate) fn has_recovery_work(&self, now: u64, active: &BTreeSet<Uuid>) -> bool {
         self.queue
@@ -1187,12 +1189,14 @@ impl WorkerReplica {
                     barrier.version = version;
                     barrier.ready = ReadySetHasher::default();
                     barrier.complete = false;
+                    barrier.terminal_confirmed = false;
                 }
             })
             .or_insert_with(|| CopyBarrier {
                 version,
                 ready: ReadySetHasher::default(),
                 complete: false,
+                terminal_confirmed: false,
                 acceptance_timing: AcceptanceTiming::Untracked,
             });
         Ok(frame)
@@ -1303,6 +1307,48 @@ impl WorkerReplica {
                     barrier.complete && barrier.version.version == record.version
                 })
         })
+    }
+
+    /// Record the coordinator's final Control check on the exact copied version.
+    pub(super) fn confirm_terminal_copy(
+        &mut self,
+        current: QueueAuthority,
+        copied: RecordVersion,
+    ) -> Result<(), QueueError> {
+        self.check_owner(current, self.local)?;
+        let record = self
+            .queue
+            .record(copied.request_id)
+            .ok_or(QueueError::NotFound)?;
+        if !record.accepted || !record.state.terminal() || record.version != copied.version {
+            return Err(QueueError::Stale);
+        }
+        let barrier = self
+            .barriers
+            .get_mut(&copied.request_id)
+            .ok_or(QueueError::Stale)?;
+        if !barrier.complete || barrier.version != copied {
+            return Err(QueueError::Stale);
+        }
+        barrier.terminal_confirmed = true;
+        Ok(())
+    }
+
+    pub(super) fn terminal_copy_confirmation(
+        &self,
+        current: QueueAuthority,
+        record: &RequestRecord,
+    ) -> Option<RecordVersion> {
+        if current != self.authority
+            || current.owner != self.local
+            || !record.accepted
+            || !record.state.terminal()
+        {
+            return None;
+        }
+        let barrier = self.barriers.get(&record.request_id)?;
+        (barrier.complete && barrier.terminal_confirmed && barrier.version.version == record.version)
+            .then_some(barrier.version)
     }
 
     pub fn start(&mut self, current: QueueAuthority, id: Uuid) -> Result<RecordFrame, QueueError> {

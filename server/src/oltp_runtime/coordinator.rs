@@ -500,9 +500,18 @@ impl QueueCoordinator {
                 if self.current().await? != current {
                     return Err(QueueError::Stale.protocol());
                 }
+                let version = frame.record_version().map_err(QueueError::protocol)?;
+                // The result section is present only on terminal frames.
+                if promote && frame.sections[2].is_some() {
+                    self.replica
+                        .lock()
+                        .map_err(|_| QueueError::Unavailable.protocol())?
+                        .confirm_terminal_copy(current, version)
+                        .map_err(QueueError::protocol)?;
+                }
                 #[cfg(test)]
                 super::recovery_tests::observe_load_copy(id, &frame, None);
-                return frame.record_version().map_err(QueueError::protocol);
+                return Ok(version);
             };
             // No queue lock, compute grant or native execution slot crosses
             // this network wait. The exact raw frame retains only byte charges.

@@ -329,11 +329,15 @@ impl HttpRuntime for RemoteRuntime {
             // making a long-running request generate a stream of quorum reads.
             // The caller's observation timeout remains independent of execution.
             let mut interval = std::time::Duration::from_millis(50);
+            let mut copy_deadline = None;
             loop {
-                let observed = self
-                    .client
-                    .observe(record.run_id, record.request_id)
-                    .await?;
+                let observe = self.client.observe(record.run_id, record.request_id);
+                let observed = match copy_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, observe)
+                        .await
+                        .map_err(|_| unavailable())?,
+                    None => observe.await,
+                }?;
                 let metadata = &observed.metadata.record;
                 if metadata.digest != record.digest || metadata.state == RequestState::Reconciling {
                     return Err(unavailable());
@@ -346,7 +350,13 @@ impl HttpRuntime for RemoteRuntime {
                         body: body.as_ref().to_vec(),
                     });
                 }
-                tokio::time::sleep(interval).await;
+                let now = tokio::time::Instant::now();
+                if metadata.state == RequestState::Committing && copy_deadline.is_none() {
+                    copy_deadline = Some(now + super::RECEIPT_OBSERVATION_TIMEOUT);
+                }
+                let next_poll = now + interval;
+                tokio::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))
+                    .await;
                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
             }
         })
