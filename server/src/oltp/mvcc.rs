@@ -2,6 +2,7 @@
 //! evaluate application operations during recovery or resolve a transaction by
 //! guessing its status. The coordinator/status protocol supplies those proofs.
 pub(crate) mod catalog;
+pub mod index;
 pub(crate) mod planner;
 pub(crate) mod store;
 use super::{
@@ -254,17 +255,75 @@ fn invalid_json() -> ProtocolError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum MvccKey {
-    Row { table_id: Uuid, primary_key: Key },
-    CatalogName { name: Text<128> },
-    CatalogTable { table_id: Uuid },
-    CatalogIndex { table_id: Uuid, index_id: Uuid },
-    CatalogIndexName { table_id: Uuid, name: Text<128> },
-    CatalogRoutingRoot { table_id: Uuid },
-    CatalogRoutingPage { table_id: Uuid, page_id: Uuid },
+    Row {
+        table_id: Uuid,
+        primary_key: Key,
+    },
+    CatalogName {
+        name: Text<128>,
+    },
+    CatalogTable {
+        table_id: Uuid,
+    },
+    CatalogIndex {
+        table_id: Uuid,
+        index_id: Uuid,
+    },
+    CatalogIndexName {
+        table_id: Uuid,
+        name: Text<128>,
+    },
+    CatalogRoutingRoot {
+        table_id: Uuid,
+    },
+    CatalogRoutingPage {
+        table_id: Uuid,
+        page_id: Uuid,
+    },
+    CatalogIndexesRoot {
+        table_id: Uuid,
+    },
+    CatalogIndexesPage {
+        table_id: Uuid,
+        page_id: Uuid,
+    },
+    CatalogIndexProgress {
+        table_id: Uuid,
+        progress_id: Uuid,
+    },
+    CatalogIndexClosed {
+        table_id: Uuid,
+        closure_id: Uuid,
+    },
+    CatalogSplitClosed {
+        table_id: Uuid,
+        split_id: Uuid,
+    },
+    IndexEntry {
+        table_id: Uuid,
+        index_id: Uuid,
+        values: crate::oltp_replication::types::Page<index::IndexValue>,
+        primary_key: Key,
+    },
 }
 impl MvccKey {
     pub fn heap_bytes(&self) -> usize {
         match self {
+            Self::IndexEntry {
+                values,
+                primary_key,
+                ..
+            } => {
+                values.capacity() * std::mem::size_of::<index::IndexValue>()
+                    + values
+                        .iter()
+                        .map(index::IndexValue::heap_bytes)
+                        .sum::<usize>()
+                    + match primary_key {
+                        Key::Utf8(v) => v.capacity(),
+                        _ => 0,
+                    }
+            }
             Self::Row {
                 primary_key: Key::Utf8(value),
                 ..

@@ -2,11 +2,23 @@
 //! records own a working-memory lease; no native apply buffer escapes its slot.
 use super::*;
 use crate::oltp::pool::{ByteClass, ScratchLease};
+pub(crate) const SCAN_RECORD_TOO_WIDE: &str = "scan record exceeds page byte budget";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ScanDomain {
-    Rows { table_id: Uuid },
+    Rows {
+        table_id: Uuid,
+    },
     CatalogNames,
+    CatalogSplits,
+    Index {
+        table_id: Uuid,
+        index_id: Uuid,
+        equality: Page<super::super::index::IndexValue>,
+        complete: bool,
+        lower: Option<(super::super::index::IndexValue, bool)>,
+        upper: Option<(super::super::index::IndexValue, bool)>,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +57,14 @@ impl ParticipantMachine {
         &self,
         request: ScanRequest,
     ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
+        self.scan_page_with_budget(request, false).await
+    }
+
+    async fn scan_page_with_budget(
+        &self,
+        request: ScanRequest,
+        scheduled: bool,
+    ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
         if request.max_items == 0
             || request.max_items > 128
             || request.max_bytes == 0
@@ -57,11 +77,16 @@ impl ParticipantMachine {
             .checked_mul(2)
             .and_then(|n| n.checked_add(128 << 10))
             .ok_or_else(invalid)?;
-        let owner = Arc::new(
-            self.store
-                .resources()
-                .reserve_scratch(ByteClass::Data, bytes)?,
-        );
+        let resources = self.store.resources();
+        let owner = Arc::new(if scheduled {
+            // Await working memory before opening the native snapshot or
+            // taking either physical or scheduler compute capacity.
+            resources
+                .reserve_scratch_wait(ByteClass::Data, bytes, resources.next_native_request_id()?)
+                .await?
+        } else {
+            resources.reserve_scratch(ByteClass::Data, bytes)?
+        });
         let group = self.store.identity().clone();
         self.store
             .read_owned(
@@ -78,23 +103,29 @@ impl ParticipantMachine {
                     }
                     let config: Config =
                         serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
-                    if request.read_ts.get() < config.gc_floor {
-                        return Err(invalid());
-                    }
+                    lineage::validate_read(&config, request.read_ts)?;
                     if let (
                         GroupKind::Data { table_id, .. },
-                        ScanDomain::Rows { table_id: target },
+                        ScanDomain::Rows { table_id: target }
+                        | ScanDomain::Index {
+                            table_id: target, ..
+                        },
                     ) = (&group.kind, &request.domain)
                     {
                         if table_id != target {
                             return Err(invalid());
                         }
                     }
-                    let prefix = domain_prefix(&request.domain);
+                    let prefix = domain_prefix(&request.domain)?;
                     if !matches!(
                         (&group.kind, &request.domain),
-                        (GroupKind::Catalog, ScanDomain::CatalogNames)
-                            | (GroupKind::Data { .. }, ScanDomain::Rows { .. })
+                        (
+                            GroupKind::Catalog,
+                            ScanDomain::CatalogNames | ScanDomain::CatalogSplits
+                        ) | (
+                            GroupKind::Data { .. },
+                            ScanDomain::Rows { .. } | ScanDomain::Index { .. }
+                        )
                     ) {
                         return Err(invalid());
                     }
@@ -141,13 +172,48 @@ impl ParticipantMachine {
                             start = lower;
                         }
                     }
-                    let upper = request
+                    let mut upper = request
                         .upper
                         .as_ref()
                         .map(|(key, inclusive)| {
                             bound(key, *inclusive, false).map(|key| (key, *inclusive))
                         })
                         .transpose()?;
+                    if let ScanDomain::Index {
+                        lower: index_lower,
+                        upper: index_upper,
+                        ..
+                    } = &request.domain
+                    {
+                        let bound = |value: &super::super::index::IndexValue,
+                                     inclusive: bool,
+                                     is_lower: bool|
+                         -> Result<Vec<u8>, ProtocolError> {
+                            if !value.valid() {
+                                return Err(invalid());
+                            }
+                            let mut bytes = prefix.clone();
+                            let offset = bytes.len();
+                            bytes
+                                .try_reserve_exact(value.encoded_len())
+                                .map_err(|_| invalid())?;
+                            bytes.resize(offset + value.encoded_len(), 0);
+                            value.encode(&mut bytes[offset..]);
+                            if (is_lower && !inclusive) || (!is_lower && inclusive) {
+                                bytes = crate::oltp::codec::end(&bytes)
+                            }
+                            Ok(bytes)
+                        };
+                        if let Some((value, inclusive)) = index_lower {
+                            let lower = bound(value, *inclusive, true)?;
+                            if lower > start {
+                                start = lower
+                            }
+                        }
+                        if let Some((value, inclusive)) = index_upper {
+                            upper = Some((bound(value, *inclusive, false)?, false));
+                        }
+                    }
                     if !start.starts_with(&prefix) {
                         return Err(invalid());
                     }
@@ -219,6 +285,13 @@ impl ParticipantMachine {
                             let cost = logical
                                 .len()
                                 .checked_add(value.map_or(0, |v| v.get().len()))
+                                .and_then(|n| {
+                                    n.checked_add(if logical.first() == Some(&10) {
+                                        128 * std::mem::size_of::<super::super::index::IndexValue>()
+                                    } else {
+                                        0
+                                    })
+                                })
                                 .and_then(|n| n.checked_add(512))
                                 .ok_or_else(invalid)?;
                             if used.checked_add(cost).is_none_or(|n| n > request.max_bytes) {
@@ -254,7 +327,7 @@ impl ParticipantMachine {
                                 if records.is_empty() {
                                     return Err(failure(
                                         ErrorCode::LimitExceeded,
-                                        "scan record exceeds page byte budget",
+                                        SCAN_RECORD_TOO_WIDE,
                                     ));
                                 }
                                 break;
@@ -288,16 +361,42 @@ impl ParticipantMachine {
     }
 }
 impl ParticipantHandle {
+    pub(crate) async fn scheduled_scan_page(
+        &self,
+        scope: crate::oltp_replication::service_rpc::ReadScope,
+        request: ScanRequest,
+    ) -> Result<OwnedCommand<ScanPage>, crate::oltp_replication::service_rpc::ScheduledReadError>
+    {
+        if let Some(remote) = &self.remote {
+            return remote.scheduled_scan_page(scope, request).await;
+        }
+        Ok(self.scan_page_wait(request).await?)
+    }
+    pub(crate) async fn scan_page_wait(
+        &self,
+        request: ScanRequest,
+    ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
+        let _barrier = self.local_consensus().ensure_linearizable().await?;
+        #[cfg(test)]
+        crate::oltp_replication::service_rpc::continuation_fixture::applied(_barrier.applied);
+        self.local_machine()
+            .scan_page_with_budget(request, true)
+            .await
+    }
     pub(crate) async fn scan_page(
         &self,
         request: ScanRequest,
     ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        self.machine.scan_page(request).await
+        if let Some(remote) = &self.remote {
+            return remote.scan_page(request).await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
+        self.local_machine().scan_page(request).await
     }
 }
-fn domain_prefix(domain: &ScanDomain) -> Vec<u8> {
-    match domain {
+fn domain_prefix(domain: &ScanDomain) -> Result<Vec<u8>, ProtocolError> {
+    Ok(match domain {
         ScanDomain::Rows { table_id } => {
             let mut p = vec![HEAD, 1];
             p.extend_from_slice(table_id.as_bytes());
@@ -309,9 +408,45 @@ fn domain_prefix(domain: &ScanDomain) -> Vec<u8> {
             p.extend_from_slice(&[0; 32]);
             p
         }
-    }
+        ScanDomain::CatalogSplits => vec![HEAD, 13],
+        ScanDomain::Index {
+            table_id,
+            index_id,
+            equality,
+            complete,
+            ..
+        } => {
+            if equality.iter().any(|v| !v.valid()) {
+                return Err(invalid());
+            }
+            let length = equality
+                .iter()
+                .try_fold(34usize, |n, v| n.checked_add(v.encoded_len()))
+                .and_then(|n| n.checked_add(usize::from(*complete)))
+                .filter(|n| *n <= 2 * crate::protocol::MAX_BODY_BYTES + 128)
+                .ok_or_else(invalid)?;
+            let mut p = Vec::new();
+            p.try_reserve_exact(length).map_err(|_| invalid())?;
+            p.resize(length, 0);
+            p[0] = HEAD;
+            p[1] = 10;
+            p[2..18].copy_from_slice(table_id.as_bytes());
+            p[18..34].copy_from_slice(index_id.as_bytes());
+            let mut cursor = 34;
+            for v in equality.iter() {
+                cursor += v.encode(&mut p[cursor..]);
+            }
+            if *complete {
+                p[cursor] = 0;
+            }
+            p
+        }
+    })
 }
-fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
+pub(super) fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
+    if bytes.first() == Some(&13) {
+        return super::archive::decode_logical(bytes);
+    }
     if bytes.len() < 33 {
         return Err(recovery_unknown());
     }
@@ -332,6 +467,37 @@ fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
                 primary_key,
             })
         }
+        10 => {
+            let index_id = Uuid::from_slice(&bytes[17..33]).map_err(|_| recovery_unknown())?;
+            let mut offset = 33;
+            let mut values = Vec::new();
+            while bytes.get(offset) != Some(&0) {
+                if values.len() == 128 {
+                    return Err(recovery_unknown());
+                }
+                let (v, n) = super::super::index::IndexValue::decode(
+                    bytes.get(offset..).ok_or_else(recovery_unknown)?,
+                )?;
+                values.push(v);
+                offset += n;
+            }
+            offset += 1;
+            let p = bytes.get(offset..).ok_or_else(recovery_unknown)?;
+            let primary_key = match p.first() {
+                Some(1) if p.len() == 9 => Key::Int64(
+                    (u64::from_be_bytes(p[1..].try_into().map_err(|_| recovery_unknown())?)
+                        ^ (1 << 63)) as i64,
+                ),
+                Some(2) => Key::Utf8(decode_text(&p[1..])?),
+                _ => return Err(recovery_unknown()),
+            };
+            Ok(MvccKey::IndexEntry {
+                table_id: table,
+                index_id,
+                values: Page::new(values).map_err(|_| recovery_unknown())?,
+                primary_key,
+            })
+        }
         2 => Ok(MvccKey::CatalogName {
             name: crate::oltp_replication::types::Text::new(decode_text(&bytes[33..])?)
                 .map_err(|_| recovery_unknown())?,
@@ -339,7 +505,7 @@ fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
         _ => Err(recovery_unknown()),
     }
 }
-fn decode_text(bytes: &[u8]) -> Result<String, ProtocolError> {
+pub(super) fn decode_text(bytes: &[u8]) -> Result<String, ProtocolError> {
     let mut out = Vec::new();
     out.try_reserve_exact(bytes.len()).map_err(|_| invalid())?;
     let mut i = 0;
@@ -392,6 +558,29 @@ impl OwnedPayload for ScanPage {
             Self::Records { records, .. } => records
                 .iter()
                 .all(|r| r.value.as_ref().is_none_or(|v| v.is_charged())),
+        }
+    }
+}
+
+/// A streaming consumer retains its continuation until a page succeeds, so a
+/// blocked intent can retry that exact page. Charge the one temporary key clone
+/// before it grows; the previous page owner remains attached through dispatch.
+pub(crate) fn clone_scan_cursor(
+    shared: &crate::oltp::pool::WorkerSharedResources,
+    key: &Option<MvccKey>,
+    owner: &Option<Arc<ScratchLease>>,
+) -> Result<(Option<MvccKey>, Option<Arc<ScratchLease>>), ProtocolError> {
+    match key {
+        None => Ok((None, None)),
+        Some(key) => {
+            let held = owner.as_ref().ok_or_else(invalid)?;
+            let bytes = held
+                .bytes()
+                .checked_add(key.heap_bytes())
+                .and_then(|n| n.checked_add(1024))
+                .ok_or_else(invalid)?;
+            let charge = shared.ensure_scratch_budget(held.clone(), bytes)?;
+            Ok((Some(key.clone()), Some(charge)))
         }
     }
 }

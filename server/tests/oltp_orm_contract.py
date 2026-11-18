@@ -107,11 +107,18 @@ def exercise(url, token, database, *, ca_file=None, unauthorized_database=None, 
         assert replacement.id != original_id
         return observations
     finally:
+        original_failure = sys.exc_info()[0] is not None
         for table in reversed(owned):
             try:
                 table.drop()
             except NotFoundError:
                 pass
+            except BaseException:
+                if not original_failure:
+                    raise
+                print("ORM cleanup failed while preserving original exception", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
 
 
 def main():

@@ -560,6 +560,12 @@ impl ResourceScheduler {
             .map(|(&id, n)| (id, n.threads, n.bytes + n.retained))
             .collect()
     }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn oltp_capacity(&self, id: u64) -> Option<(u64, u64, WorkerResources)> {
+        let state = self.shared.state.lock().ok()?;
+        let node = state.nodes.get(&id)?;
+        Some((node.threads, node.bytes.checked_add(node.retained)?, node.limits))
+    }
     /// Stop new reservations and wake all waiters, including storage downloads
     /// waiting only for memory. Existing owners retain their charges until drop.
     pub fn close(&self) {

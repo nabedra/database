@@ -8,7 +8,7 @@ WORKDIR /src
 COPY server/ ./server/
 RUN case "$NABEDRA_ENGINE" in olap|oltp) ;; *) exit 2 ;; esac && \
     if [ "$NABEDRA_S3" = auto ]; then if [ "$NABEDRA_ENGINE" = olap ]; then NABEDRA_S3=true; else NABEDRA_S3=false; fi; fi && \
-    case "$NABEDRA_S3" in true) selected_features="$NABEDRA_ENGINE,s3" ;; false) selected_features="$NABEDRA_ENGINE" ;; *) exit 2 ;; esac && \
+    case "$NABEDRA_ENGINE:$NABEDRA_S3" in oltp:true) selected_features=oltp-backup-s3 ;; olap:true) selected_features=olap,s3 ;; *:false) selected_features="$NABEDRA_ENGINE" ;; *) exit 2 ;; esac && \
     cargo build --manifest-path server/Cargo.toml --locked --release --bin nabedra-db --no-default-features --features "$selected_features" && \
     ./server/target/release/nabedra-db --version | grep -w "$NABEDRA_ENGINE"
 

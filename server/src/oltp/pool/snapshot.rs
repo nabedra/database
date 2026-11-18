@@ -21,13 +21,115 @@ pub struct GroupSnapshotHeader {
 }
 #[derive(Clone, Debug)]
 pub struct GroupSnapshot {
-    pub file: Arc<File>,
+    pub file: Arc<PoolSnapshotFile>,
     pub path: PathBuf,
     pub bytes: u64,
     pub header: GroupSnapshotHeader,
 }
+/// The actual file owner carries the pool, so cloning only `.file` for a
+/// cancelled native transfer still excludes closing/detaching its volume.
+pub struct PoolSnapshotFile {
+    file: File,
+    _pool: OltpPool,
+}
+impl PoolSnapshotFile {
+    pub(crate) fn new(file: File, pool: OltpPool) -> Arc<Self> {
+        Arc::new(Self { file, _pool: pool })
+    }
+}
+impl std::ops::Deref for PoolSnapshotFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+impl std::fmt::Debug for PoolSnapshotFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolSnapshotFile").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub struct IncomingSnapshot {
+    pub file: Arc<PoolSnapshotFile>,
+    pub path: PathBuf,
+    _cleanup: Arc<IncomingCleanup>,
+}
+impl std::fmt::Debug for IncomingSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingSnapshot")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+struct IncomingCleanup {
+    path: PathBuf,
+    _group: GroupStore,
+}
+impl Drop for IncomingCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
 
 impl GroupStore {
+    /// The transport receives only a pool-scoped create_new file. Final handle
+    /// drop unlinks the name; retained FileArc readers keep their inode pinned.
+    pub async fn new_incoming_snapshot(
+        &self,
+        node_id: u64,
+        transfer_id: Uuid,
+    ) -> Result<IncomingSnapshot, ProtocolError> {
+        if node_id == 0 || transfer_id.is_nil() {
+            return Err(failure(
+                ErrorCode::ValidationError,
+                "invalid incoming snapshot identity",
+            ));
+        }
+        let group = self.clone();
+        self.resources()
+            .execute(ExecutionClass::Control, 0, 0, move || {
+                group.pool().healthy()?;
+                let mut directory = group.pool().inner.path.clone();
+                for component in [
+                    "snapshots".to_owned(),
+                    group.identity().group_id.to_string(),
+                    "incoming".to_owned(),
+                ] {
+                    directory.push(component);
+                    match fs::create_dir(&directory) {
+                        Ok(()) => {
+                            sync_directory(directory.parent().ok_or_else(storage_error_message)?)?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(_) => return Err(storage_error_message()),
+                    }
+                    let metadata =
+                        fs::symlink_metadata(&directory).map_err(|_| storage_error_message())?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                        return Err(storage_error_message());
+                    }
+                }
+                let path = directory.join(format!("recv-{node_id}-{transfer_id}.bin"));
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|_| storage_error_message())?;
+                sync_directory(&directory)?;
+                Ok(IncomingSnapshot {
+                    file: PoolSnapshotFile::new(file, group.pool().clone()),
+                    path: path.clone(),
+                    _cleanup: Arc::new(IncomingCleanup {
+                        path,
+                        _group: group,
+                    }),
+                })
+            })
+            .await
+    }
+
     /// Read membership from the immutable export cut, never from current DB
     /// state. The replica must transfer decoded metadata to its resident owner
     /// before retaining it in cached SnapshotMeta or transfer state.
@@ -216,7 +318,7 @@ impl GroupStore {
                 }
                 group.pool().healthy()?;
                 Ok(Some(GroupSnapshot {
-                    file: Arc::new(file),
+                    file: PoolSnapshotFile::new(file, group.pool().clone()),
                     path,
                     bytes,
                     header,
@@ -332,7 +434,7 @@ impl GroupStore {
                     )?;
                     let bytes = file.metadata().map_err(|_| storage_error_message())?.len();
                     Ok(GroupSnapshot {
-                        file: Arc::new(file),
+                        file: PoolSnapshotFile::new(file, group.pool().clone()),
                         path: path.clone(),
                         bytes,
                         header,
@@ -359,6 +461,7 @@ impl GroupStore {
         budget: TransactionBudget,
         mut hook: impl FnMut(InstallPoint) -> Result<(), ProtocolError> + Send + 'static,
     ) -> Result<(), ProtocolError> {
+        let generation_owner = self.inner.generation.clone().write_owned().await;
         let owner = self.inner.order.clone().lock_owned().await;
         let group = self.clone();
         let output = self
@@ -376,6 +479,7 @@ impl GroupStore {
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;
+                let _generation_owner = generation_owner;
                 group.pool().healthy()?;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     group.install_sync(source, budget, reservations, &mut hook)
@@ -770,6 +874,57 @@ pub(super) fn recover_group(
     pool: &OltpPool,
     identity: &GroupIdentity,
 ) -> Result<(), ProtocolError> {
+    let mut ancestor = pool.inner.path.clone();
+    for component in [
+        "snapshots".to_owned(),
+        identity.group_id.to_string(),
+        "incoming".to_owned(),
+    ] {
+        ancestor.push(component);
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            _ => return Err(storage_error_message()),
+        }
+    }
+    let incoming = pool
+        .inner
+        .path
+        .join("snapshots")
+        .join(identity.group_id.to_string())
+        .join("incoming");
+    if incoming.exists() {
+        let metadata = fs::symlink_metadata(&incoming).map_err(|_| storage_error_message())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(storage_error_message());
+        }
+        for item in fs::read_dir(&incoming).map_err(|_| storage_error_message())? {
+            let item = item.map_err(|_| storage_error_message())?;
+            let name = item.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(storage_error_message());
+            };
+            let valid = name
+                .strip_prefix("recv-")
+                .and_then(|n| n.strip_suffix(".bin"))
+                .and_then(|n| n.split_once('-'))
+                .is_some_and(|(node, id)| {
+                    node.parse::<u64>().is_ok_and(|n| n != 0)
+                        && Uuid::parse_str(id).is_ok_and(|id| !id.is_nil())
+                });
+            if !valid
+                || !item
+                    .file_type()
+                    .map_err(|_| storage_error_message())?
+                    .is_file()
+            {
+                return Err(storage_error_message());
+            }
+            fs::remove_file(item.path()).map_err(|_| storage_error_message())?;
+        }
+        sync_directory(&incoming)?;
+    }
+
     if pool
         .inner
         .db

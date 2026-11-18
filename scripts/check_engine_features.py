@@ -11,7 +11,7 @@ CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
     ('oltp', 'oltp', False, ['--no-default-features', '--features', 'oltp']),
-    ('oltp-s3', 'oltp', True, ['--no-default-features', '--features', 'oltp,s3']),
+    ('oltp-s3', 'oltp', True, ['--no-default-features', '--features', 'oltp-backup-s3']),
 )
 
 
@@ -26,6 +26,22 @@ def cargo(command, selection, *extra, check=True):
     return result
 
 
+def assert_dependency_packages(name, engine, s3, tree):
+    packages = {line.split()[0] for line in tree.splitlines() if line.strip()}
+    aws = {p for p in packages if p.startswith('aws-') and not p.startswith('aws-lc-')}
+    olap = {p for p in packages if p.startswith('arrow-') or p == 'parquet'}
+    native = {'rocksdb', 'librocksdb-sys'} & packages
+    assert bool(aws) == s3, (name, 'AWS dependencies', sorted(aws))
+    assert bool(olap) == (engine == 'olap'), (name, 'OLAP dependencies', sorted(olap))
+    assert native == ({'rocksdb', 'librocksdb-sys'} if engine == 'oltp' else set()), (name, 'native dependencies', sorted(native))
+    assert ('openraft' in packages) == (engine == 'oltp'), (name, 'consensus dependency')
+    if engine == 'olap':
+        assert {'arrow-array', 'arrow-schema', 'parquet'} <= packages, (name, 'required OLAP codecs')
+    if s3:
+        assert {'aws-config', 'aws-sdk-s3'} <= packages, (name, 'required S3 transport')
+    return sorted(packages)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dependencies-only', action='store_true',
@@ -34,18 +50,7 @@ def main():
     for name, engine, s3, selection in CASES:
         result = cargo('tree', selection, '--edges', 'normal,build', '--prefix', 'none',
                        '--format', '{p}')
-        packages = {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
-        aws = {p for p in packages if p.startswith('aws-') and not p.startswith('aws-lc-')}
-        olap = {p for p in packages if p.startswith('arrow-') or p == 'parquet'}
-        native = {'rocksdb', 'librocksdb-sys'} & packages
-        assert bool(aws) == s3, (name, 'AWS dependencies', sorted(aws))
-        assert bool(olap) == (engine == 'olap'), (name, 'OLAP dependencies', sorted(olap))
-        assert native == ({'rocksdb', 'librocksdb-sys'} if engine == 'oltp' else set()), (name, 'native dependencies', sorted(native))
-        assert ('openraft' in packages) == (engine == 'oltp'), (name, 'consensus dependency')
-        if engine == 'olap':
-            assert {'arrow-array', 'arrow-schema', 'parquet'} <= packages, (name, 'required OLAP codecs')
-        if s3:
-            assert {'aws-config', 'aws-sdk-s3'} <= packages, (name, 'required S3 transport')
+        assert_dependency_packages(name, engine, s3, result.stdout)
         print(f'O02 {name}: dependency graph passed', flush=True)
         if args.dependencies_only:
             continue

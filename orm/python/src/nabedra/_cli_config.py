@@ -104,7 +104,94 @@ def s3_storage(uri, region):
     return dict(driver='s3', options=dict(bucket=bucket, namespace=prefix, region=region))
 
 
+def _validate_oltp(config):
+    fields(config, ('version', 'engine', 'bind', 'database', 'auth_file', 'topology'),
+           ('tls', 'worker', 'cluster_name'))
+    integer(config['version'], 1, 1)
+    from .validation import validate_identifier
+    if type(config['database']) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', config['database']):
+        raise ConfigError('Invalid OLTP database selector')
+    if 'cluster_name' in config:
+        validate_identifier(config['cluster_name'])
+    text(config['auth_file'])
+    tls = config.get('tls')
+    if tls is not None:
+        fields(tls, ('cert_file', 'key_file'), ('ca_file',))
+        for path in tls.values():
+            if path is not None:
+                text(path)
+    listen(config['bind'], tls)
+    topology = config['topology']
+    fields(topology, ('mode',), ('data_dir', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'))
+    if topology['mode'] == 'local':
+        fields(topology, ('mode', 'data_dir'))
+        text(topology['data_dir'])
+    elif topology['mode'] == 'remote':
+        fields(topology, ('mode', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'))
+        for key in ('cluster_id', 'control_group_id'):
+            if str(UUID(topology[key])) != topology[key] or not UUID(topology[key]).int:
+                raise ConfigError('Invalid OLTP group identity')
+        fields(topology['worker_tls'], ('cert_file', 'key_file', 'ca_file'))
+        for path in topology['worker_tls'].values():
+            text(path)
+        api = topology['enrollment']
+        fields(api, ('database', 'enrollment'))
+        if api['database'] != config['database']:
+            raise ConfigError('API enrollment database differs')
+        _validate_enrollment(api['enrollment'])
+        peers = topology['control_peers']
+        if type(peers) is not list or not 1 <= len(peers) <= 128:
+            raise ConfigError('Invalid Control bootstrap peers')
+        for peer in peers:
+            _validate_enrollment(peer)
+        if len({peer['worker_id'] for peer in peers}) != len(peers):
+            raise ConfigError('Duplicate Control bootstrap peer')
+    else:
+        raise ConfigError('Unsupported OLTP topology')
+    worker = config.get('worker', {})
+    fields(worker, (), ('resources', 'execution', 'queue_size'))
+    if 'queue_size' in worker:
+        integer(worker['queue_size'], 1, 65536)
+    _validate_worker_limits(worker)
+    return config
+
+
+def _validate_enrollment(value):
+    fields(value, ('worker_id', 'incarnation', 'certificate_sha256', 'endpoint', 'server_name', 'enrollment_revision'))
+    for key in ('worker_id', 'incarnation'):
+        if type(value[key]) is not str or str(UUID(value[key])) != value[key] or not UUID(value[key]).int:
+            raise ConfigError('Invalid process enrollment identity')
+    if type(value['certificate_sha256']) is not str or not re.fullmatch('[0-9a-fA-F]{64}', value['certificate_sha256']):
+        raise ConfigError('Invalid certificate fingerprint')
+    integer(value['enrollment_revision'], 1, 2**63 - 1)
+    text(value['endpoint'])
+    text(value['server_name'])
+    if any(char.isspace() for char in value['endpoint'] + value['server_name']):
+        raise ConfigError('Invalid enrollment endpoint')
+
+
+def _validate_worker_limits(worker, minimum_threads=1):
+    if 'resources' in worker:
+        r = worker['resources']
+        fields(r, 'max_threads memory_limit_bytes task_memory_limit_bytes control_memory_reserve_bytes'.split())
+        integer(r['max_threads'], minimum_threads, 256)
+        for key in set(r) - {'max_threads'}:
+            integer(r[key], 1, 2**63 - 1)
+        if r['task_memory_limit_bytes'] + r['control_memory_reserve_bytes'] > r['memory_limit_bytes']:
+            raise ConfigError('Worker memory limits contradict each other')
+    if 'execution' in worker:
+        e = worker['execution']
+        fields(e, 'max_workers_per_request max_pending_requests max_queue_bytes_per_replica max_retained_result_bytes_per_worker result_retention_ms queue_replication queue_lifetime partition_size'.split())
+        for key in ('max_workers_per_request', 'max_pending_requests', 'max_queue_bytes_per_replica', 'max_retained_result_bytes_per_worker', 'result_retention_ms'):
+            integer(e[key], 1, 2**63 - 1)
+        if e['queue_replication'] != 'all_ready_workers' or e['queue_lifetime'] != 'live_cluster':
+            raise ConfigError('Unsupported queue policy')
+        text(e['partition_size'])
+
+
 def validate(config):
+    if type(config) is dict and config.get('engine') == 'oltp':
+        return _validate_oltp(config)
     fields(config, 'version cluster_id bind advertise_url api_urls storage auth_file tls worker'.split(), ('mode', 'lifecycle'))
     integer(config['version'], 1, 2)
     if config['version'] == 2:
@@ -148,22 +235,7 @@ def validate(config):
     for key in ('operation_slots', 'partition_slots', 'queue_size'):
         integer(worker[key], 1, 65536)
     text(worker['partition_size'])
-    if 'resources' in worker:
-        r = worker['resources']
-        fields(r, 'max_threads memory_limit_bytes task_memory_limit_bytes control_memory_reserve_bytes'.split())
-        integer(r['max_threads'], 1, 256)
-        for key in set(r) - {'max_threads'}:
-            integer(r[key], 1, 2**63 - 1)
-        if r['task_memory_limit_bytes'] + r['control_memory_reserve_bytes'] > r['memory_limit_bytes']:
-            raise ConfigError('Worker memory limits contradict each other')
-    if 'execution' in worker:
-        e = worker['execution']
-        fields(e, 'max_workers_per_request max_pending_requests max_queue_bytes_per_replica max_retained_result_bytes_per_worker result_retention_ms queue_replication queue_lifetime partition_size'.split())
-        for key in ('max_workers_per_request', 'max_pending_requests', 'max_queue_bytes_per_replica', 'max_retained_result_bytes_per_worker', 'result_retention_ms'):
-            integer(e[key], 1, 2**63 - 1)
-        if e['queue_replication'] != 'all_ready_workers' or e['queue_lifetime'] != 'live_cluster':
-            raise ConfigError('Unsupported queue policy')
-        text(e['partition_size'])
+    _validate_worker_limits(worker)
     if 'lifecycle' in config:
         fields(config['lifecycle'], (), 'heartbeat_ms expiry_ms readiness_ms drain_ms lease_ms renew_ms stabilization_ms cooldown_ms retry_initial_ms retry_max_ms max_attempts'.split())
         for number in config['lifecycle'].values():

@@ -45,10 +45,51 @@ pub enum Command {
         #[arg(long)]
         bootstrap: std::path::PathBuf,
     },
+    /// Start a provisioned OLTP data and queue worker.
+    #[cfg(feature = "oltp")]
+    DataWorker {
+        #[arg(long)]
+        bootstrap: std::path::PathBuf,
+    },
+    /// Fold a local automatic growth inventory. Makes no provider or database changes.
+    #[cfg(feature = "oltp")]
+    GrowthPlan,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum DatabaseCommand {
+    #[cfg(feature = "olap")]
+    Export {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long, required = true)]
+        confirm_writers_stopped: bool,
+    },
+    #[cfg(feature = "oltp")]
+    Import(ArchiveImportOptions),
+    #[cfg(feature = "oltp")]
+    Restore(ArchiveImportOptions),
+    #[cfg(feature = "oltp")]
+    Backup {
+        #[arg(long)]
+        previous: Option<std::path::PathBuf>,
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+        #[arg(long)]
+        output: std::path::PathBuf,
+        #[arg(long, default_value = "default")]
+        database: String,
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        #[arg(long)]
+        resources_config: Option<std::path::PathBuf>,
+        #[arg(long)]
+        execution_config: Option<std::path::PathBuf>,
+        #[arg(long, required = true)]
+        cold_start: bool,
+    },
     Migrate {
         #[arg(long)]
         storage: String,
@@ -67,4 +108,25 @@ fn engine_version() -> &'static str {
     } else {
         concat!(env!("CARGO_PKG_VERSION"), " olap")
     }
+}
+
+#[cfg(feature = "oltp")]
+#[derive(Debug, clap::Args)]
+pub struct ArchiveImportOptions {
+    #[arg(long = "archive")]
+    pub archives: Vec<std::path::PathBuf>,
+    #[arg(long)]
+    pub restore_ts: Option<u64>,
+    #[arg(long)]
+    pub input: std::path::PathBuf,
+    #[arg(long)]
+    pub data_dir: std::path::PathBuf,
+    #[arg(long, default_value = "default")]
+    pub database: String,
+    #[arg(long, default_value_t = 4)]
+    pub workers: usize,
+    #[arg(long)]
+    pub resources_config: Option<std::path::PathBuf>,
+    #[arg(long)]
+    pub execution_config: Option<std::path::PathBuf>,
 }

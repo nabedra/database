@@ -128,6 +128,8 @@ class _ControlTransport(_Transport):
     also interrupts the whole exchange. DNS under a deadline runs in a reaped
     subprocess so blocked name resolution cannot strand a resolver thread.
     """
+    _operations = _OPERATIONS
+    _mutations = _MUTATIONS
 
     def __init__(self, api_url: str, admin_token: str, *, timeout: float = 30.0,
                  ca_file: str | None = None) -> None:
@@ -140,7 +142,7 @@ class _ControlTransport(_Transport):
 
     def request(self, operation: str, payload: dict, *, request_id: str | None = None,
                 deadline: float | None = None) -> tuple[str, object]:
-        if not isinstance(operation, str) or operation not in _OPERATIONS:
+        if not isinstance(operation, str) or operation not in self._operations:
             raise ValidationError('Unsupported control operation')
         if not isinstance(payload, dict):
             raise ValidationError('Operation payload must be a dictionary')
@@ -180,7 +182,7 @@ class _ControlTransport(_Transport):
         response = None
 
         def failure(message, *, network=False):
-            error_type = (UnknownOutcomeError if possibly_sent and operation in _MUTATIONS
+            error_type = (UnknownOutcomeError if possibly_sent and operation in self._mutations
                           else TransportError if network else ProtocolError)
             return error_type(message, request_id=request_id, status_code=status)
 

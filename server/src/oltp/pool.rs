@@ -1,15 +1,23 @@
 //! Typed multi-group pool format. Legacy RF1 and experimental group stores are
 //! deliberately separate directory formats and are never silently adopted.
+mod activation;
+mod closed;
+pub(crate) use activation::{ReplicaActivationStatement, VerifiedReplicaActivation};
+pub(crate) mod mount;
+pub(crate) use closed::{PoolCloseOutcome, PoolClosedStatement, VerifiedPoolClosed};
+mod placement;
 mod resources;
+pub(crate) mod restore;
 mod snapshot;
-pub use snapshot::{GroupSnapshot, GroupSnapshotHeader};
+pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
 #[cfg(test)]
 mod tests;
 pub use resources::{
-    ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, PreparedNative, QueueLease,
-    ScratchLease, SharedResourceConfig, WorkerSharedResources,
+    ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
+    QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
+pub(crate) use resources::{GroupCapacityLease, RAFT_REPLICA_BYTES};
 
 use super::{failure, recovery_unknown, storage_error, sync_options};
 use crate::{
@@ -76,6 +84,7 @@ struct PoolInner {
     groups: Arc<tokio::sync::Mutex<BTreeMap<Uuid, Weak<GroupInner>>>>,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
+    _mount: Option<VerifiedPoolMount>,
 }
 #[derive(Clone)]
 pub struct OltpPool {
@@ -85,13 +94,15 @@ struct GroupInner {
     pool: OltpPool,
     identity: GroupIdentity,
     order: Arc<tokio::sync::Mutex<()>>,
+    generation: Arc<tokio::sync::RwLock<()>>,
     log_order: Arc<tokio::sync::Mutex<()>>,
     log_metadata_order: Arc<tokio::sync::Mutex<()>>,
-    _handle_slot: OwnedSemaphorePermit,
+    _handle_slot: GroupCapacityLease,
 }
 #[derive(Clone, Copy)]
 enum MutationLane {
     State,
+    Restore,
     Log,
     LogMetadata,
 }
@@ -114,12 +125,7 @@ pub struct GroupStore {
     inner: Arc<GroupInner>,
 }
 
-/// A registered mount can only be created by the platform verifier. There is no
-/// raw-path registered constructor or root-disk directory fallback. Provider
-/// enrollment and anchored mount verification are not implemented here yet.
-pub struct VerifiedPoolMount {
-    _private: (),
-}
+pub use mount::VerifiedPoolMount;
 
 impl OltpPool {
     /// Explicit development directory profile. It proves local identity and
@@ -128,6 +134,14 @@ impl OltpPool {
         path: impl AsRef<Path>,
         identity: PoolIdentity,
         shared: Arc<WorkerSharedResources>,
+    ) -> Result<Self, ProtocolError> {
+        Self::open_path(path.as_ref(), identity, shared, None)
+    }
+    fn open_path(
+        path: &Path,
+        identity: PoolIdentity,
+        shared: Arc<WorkerSharedResources>,
+        mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
         identity.validate()?;
         super::native::validate_thread_defaults(shared.thread_budget())?;
@@ -138,7 +152,6 @@ impl OltpPool {
             .try_acquire_owned()
             .map_err(|_| capacity())?;
         let overhead = shared.pool_overhead()?;
-        let path = path.as_ref();
         open_pool_manifest(path, &identity)?;
         let mut options = Options::default();
         options.create_if_missing(true);
@@ -194,25 +207,46 @@ impl OltpPool {
                 groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
                 _pool_slot: pool_slot,
                 _overhead: overhead,
+                _mount: mount,
             }),
         })
     }
 
     pub fn open_registered(
-        _mount: VerifiedPoolMount,
-        _identity: PoolIdentity,
-        _shared: Arc<WorkerSharedResources>,
+        mount: VerifiedPoolMount,
+        identity: PoolIdentity,
+        shared: Arc<WorkerSharedResources>,
     ) -> Result<Self, ProtocolError> {
-        Err(failure(
-            ErrorCode::UnsupportedOperation,
-            "registered volume verifier is not implemented",
-        ))
+        let path = mount.open_path(&identity)?;
+        Self::open_path(&path, identity, shared, Some(mount))
     }
     pub fn identity(&self) -> &PoolIdentity {
         &self.inner.identity
     }
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.inner.shared
+    }
+    pub(crate) fn observe_registered_mount(
+        &self,
+    ) -> Result<mount::MountedPoolObservation, ProtocolError> {
+        self.healthy()?;
+        let observed = self
+            .inner
+            ._mount
+            .as_ref()
+            .ok_or_else(|| {
+                failure(
+                    ErrorCode::UnsupportedOperation,
+                    "development directory is not a registered mounted pool",
+                )
+            })?
+            .reobserve()?;
+        if observed.expected.identity != self.inner.identity
+            || self.inner.shared.worker_id() != Some(observed.expected.worker.worker_id)
+        {
+            return Err(storage_error_message());
+        }
+        Ok(observed)
     }
     pub fn requires_recovery(&self) -> bool {
         self.inner.recovery.load(Ordering::Acquire)
@@ -235,6 +269,20 @@ impl OltpPool {
             })
     }
     pub async fn group(&self, identity: GroupIdentity) -> Result<GroupStore, ProtocolError> {
+        self.open_group(identity, true, None).await
+    }
+    pub(crate) async fn retained_group(
+        &self,
+        identity: GroupIdentity,
+    ) -> Result<GroupStore, ProtocolError> {
+        self.open_group(identity, false, None).await
+    }
+    async fn open_group(
+        &self,
+        identity: GroupIdentity,
+        create: bool,
+        learner: Option<Digest>,
+    ) -> Result<GroupStore, ProtocolError> {
         identity
             .validate()
             .map_err(|_| failure(ErrorCode::ValidationError, "invalid group identity"))?;
@@ -251,6 +299,9 @@ impl OltpPool {
         shared
             .execute(ExecutionClass::Control, 0, 0, move || {
                 pool.healthy()?;
+                if let Some(binding) = learner {
+                    pool.check_placement_learner(&identity, binding)?;
+                }
 
                 groups.retain(|_, group| group.strong_count() > 0);
                 if let Some(group) = groups.get(&identity.group_id).and_then(Weak::upgrade) {
@@ -262,13 +313,7 @@ impl OltpPool {
                     }
                     return Ok(GroupStore { inner: group });
                 }
-                let slot = pool
-                    .inner
-                    .shared
-                    .handle_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| capacity())?;
+                let slot = pool.inner.shared.reserve_group_handle()?;
                 let key = identity_key(identity.group_id);
                 match pool.inner.db.get_pinned(&key).map_err(storage_error)? {
                     Some(bytes)
@@ -282,7 +327,7 @@ impl OltpPool {
                             "immutable group identity mismatch",
                         ));
                     }
-                    None => {
+                    None if create => {
                         let value = pool
                             .inner
                             .shared
@@ -290,7 +335,16 @@ impl OltpPool {
                         let mut batch = WriteBatch::default();
                         batch.put(&key, value.as_slice());
                         batch.put(group_key(identity.group_id, b'a', &[]), 0u64.to_be_bytes());
+                        if let Some(binding) = learner {
+                            batch.put(placement::learner_key(identity.group_id), binding.as_bytes());
+                        }
                         pool.durable_write(batch)?;
+                    }
+                    None => {
+                        return Err(failure(
+                            ErrorCode::StorageUnavailable,
+                            "retained group identity is missing from the mounted pool",
+                        ));
                     }
                 }
                 snapshot::recover_group(&pool, &identity)?;
@@ -298,6 +352,7 @@ impl OltpPool {
                     pool: pool.clone(),
                     identity,
                     order: Arc::new(tokio::sync::Mutex::new(())),
+                    generation: Arc::new(tokio::sync::RwLock::new(())),
                     log_order: Arc::new(tokio::sync::Mutex::new(())),
                     log_metadata_order: Arc::new(tokio::sync::Mutex::new(())),
                     _handle_slot: slot,
@@ -512,12 +567,23 @@ impl GroupStore {
     ) -> Result<ChargedBytes, ProtocolError> {
         let (order, log, execution_class) = match lane {
             MutationLane::State => (&self.inner.order, false, self.execution_class()),
+            MutationLane::Restore => (&self.inner.order, false, ExecutionClass::Query),
             MutationLane::Log => (&self.inner.log_order, true, self.execution_class()),
             MutationLane::LogMetadata => (
                 &self.inner.log_metadata_order,
                 true,
                 ExecutionClass::Control,
             ),
+        };
+        // A placement activation lease pins both the native generation and
+        // its stable voter set through the Control publication. Ordinary Data
+        // entries still advance while that bounded lease is held.
+        let generation_owner = if !log
+            && (membership.is_some() || meta.as_ref().is_some_and(|meta| meta.membership.is_some()))
+        {
+            Some(self.inner.generation.clone().write_owned().await)
+        } else {
+            None
         };
         let owner = order.clone().lock_owned().await;
         let group = self.clone();
@@ -538,6 +604,7 @@ impl GroupStore {
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;
+                let _generation_owner = generation_owner;
                 group.pool().healthy()?;
                 let write_started = std::cell::Cell::new(false);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -652,6 +719,55 @@ impl GroupStore {
             move |view| {
                 let result = work(view)?;
                 view.output.rehome(result)
+            },
+        )
+        .await
+    }
+    /// Bulk backup/history traversal uses query execution and reply budgets,
+    /// even for Status/TSO groups. It cannot consume their protected metadata
+    /// lane while waiting for an owned working-memory decode reservation.
+    pub(crate) async fn read_archive(
+        &self,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut GroupRead<'_>, AppliedPosition) -> Result<ChargedBytes, ProtocolError>
+        + Send
+        + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let group = self.clone();
+        self.read_namespace(
+            false,
+            ExecutionClass::Query,
+            ReplyLane::Query,
+            budget,
+            move |view| {
+                let applied = group
+                    .read_applied(view.snapshot, &mut view.scratch)?
+                    .ok_or_else(recovery_unknown)?
+                    .position;
+                let result = work(view, applied)?;
+                view.output.rehome(result)
+            },
+        )
+        .await
+    }
+    pub(crate) async fn read_shard_usage<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut GroupRead<'_>, u64) -> Result<T, ProtocolError> + Send + 'static,
+    ) -> Result<T, ProtocolError> {
+        self.read_namespace(
+            false,
+            ExecutionClass::Query,
+            ReplyLane::Query,
+            TransactionBudget {
+                scratch_bytes: 40 << 20,
+                batch_bytes: 0,
+                output_bytes: 0,
+            },
+            move |view| {
+                let generation = u64::from_be_bytes(
+                    view.prefix[18..].try_into().map_err(|_| recovery_unknown())?,
+                );
+                work(view, generation)
             },
         )
         .await
@@ -1056,6 +1172,18 @@ impl<'a> GroupRead<'a> {
         max_items: usize,
         mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), ProtocolError>,
     ) -> Result<ScanProgress, ProtocolError> {
+        self.scan_page_until(prefix, after, max_items, |key, value| {
+            visit(key, value)?;
+            Ok(false)
+        })
+    }
+    pub(crate) fn scan_page_until(
+        &mut self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        max_items: usize,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<bool, ProtocolError>,
+    ) -> Result<ScanProgress, ProtocolError> {
         if max_items == 0 || max_items > 128 || prefix.len() > MAX_KEY_BYTES {
             return Err(capacity());
         }
@@ -1084,12 +1212,12 @@ impl<'a> GroupRead<'a> {
             if !key.starts_with(lower.as_slice()) {
                 break;
             }
-            visit(
+            let stop = visit(
                 &key[scope_length..],
                 iterator.value().ok_or_else(recovery_unknown)?,
             )?;
             progress.visited += 1;
-            if progress.visited == max_items {
+            if stop || progress.visited == max_items {
                 let cursor = self.scratch.copy(&key[scope_length..])?;
                 iterator.next();
                 iterator.status().map_err(storage_error)?;

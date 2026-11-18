@@ -10,14 +10,24 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-mod identity;
+pub(crate) mod identity;
 mod outcome;
+mod routing;
+mod service;
 pub(crate) use identity::{
-    IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage,TransactionInspection,RequestKind, StatusCommand, StatusFault,
-    StatusHandle, StatusMachine, StatusReply, TerminalIdentity,
-    VerifiedReadRetirement,
+    ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
+    CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
+    VerifiedStatusArchiveCut,
+};
+pub(crate) use identity::{
+    IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage, RejectedIdentity,
+    RequestKind, SealedAdmissionRejection, StatusCommand, StatusFault, StatusHandle, StatusMachine,
+    StatusReply, TerminalIdentity, TransactionInspection, VerifiedAdmissionRejection,
+    RetirementCertificate, VerifiedTerminalRetirement,
 };
 pub(crate) use outcome::MutationOutcome;
+pub(crate) use routing::{PartitionedStatus, StatusTopology};
+pub(crate) use service::StatusService;
 
 /// Produced only after the Status leader has strongly read every participant's
 /// immutable sealed evidence. A timestamp allocation is not itself COMMIT.
@@ -85,6 +95,16 @@ impl SealedCommitPermit {
         }
         Ok(())
     }
+    pub(crate) fn from_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        statement: CommitPermitStatement,
+    ) -> Result<Self, ProtocolError> {
+        context.status(12, &statement)?;
+        if context.group().group_id != statement.manifest.status_group_id {
+            return Err(invalid());
+        }
+        Self::from_strong_prepared_read(statement)
+    }
     fn from_strong_prepared_read(statement: CommitPermitStatement) -> Result<Self, ProtocolError> {
         let digest = metadata_digest(b"nabedra/sealed-commit-permit/v1\0", &statement)?;
         let permit = Self { statement, digest };
@@ -147,6 +167,34 @@ impl SealedSettlement {
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedSettlement(SealedSettlement);
 impl VerifiedSettlement {
+    pub(crate) fn from_failure_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        statement: SettlementStatement,
+        txn: TxnId,
+        request: RequestBinding,
+    ) -> Result<Self, ProtocolError> {
+        context.status(16, &statement)?;
+        if context.group().group_id != statement.manifest.status_group_id
+            || statement.txn != txn
+            || statement.request != request
+            || statement.manifest.participant_count != 0
+        {
+            return Err(invalid());
+        }
+        Self::from_strong_settled_read(statement)
+    }
+    pub(crate) fn from_authenticated(
+        context: crate::oltp_replication::service_rpc::AuthenticatedStatusReplyContext,
+        statement: SettlementStatement,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Self, ProtocolError> {
+        context.settlement(txn, manifest, &statement)?;
+        if statement.txn != txn || statement.manifest != manifest {
+            return Err(invalid());
+        }
+        Self::from_strong_settled_read(statement)
+    }
     pub(crate) fn into_sealed(self) -> SealedSettlement {
         self.0
     }
@@ -163,6 +211,11 @@ impl VerifiedSettlement {
     #[cfg(test)]
     pub(crate) fn model_for_test(statement: SettlementStatement) -> Result<Self, ProtocolError> {
         Self::from_strong_settled_read(statement)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn statement(&self) -> &SettlementStatement {
+        self.0.statement()
     }
 }
 
@@ -191,6 +244,9 @@ impl SealedStatusDecision {
     pub(crate) fn statement(&self) -> &DecisionStatement {
         &self.statement
     }
+    pub(crate) fn digest(&self) -> Digest {
+        self.proof_digest
+    }
 }
 
 /// Not Deserialize. Parsing a matching wire shape cannot create permission to
@@ -202,8 +258,29 @@ pub(crate) struct VerifiedStatusDecision {
     outcome: Option<MutationOutcome>,
     _owner: Option<std::sync::Arc<crate::oltp::pool::ScratchLease>>,
 }
-impl std::fmt::Debug for VerifiedStatusDecision {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("VerifiedStatusDecision").field("statement",self.statement()).finish_non_exhaustive()}}
+impl std::fmt::Debug for VerifiedStatusDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedStatusDecision")
+            .field("statement", self.statement())
+            .finish_non_exhaustive()
+    }
+}
 impl VerifiedStatusDecision {
+    pub(crate) fn from_authenticated(
+        context: crate::oltp_replication::service_rpc::AuthenticatedStatusReplyContext,
+        statement: DecisionStatement,
+        mut outcome: MutationOutcome,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Self, ProtocolError> {
+        context.decision(txn, manifest, &Some((&statement, &outcome)))?;
+        if statement.txn != txn || statement.manifest != manifest {
+            return Err(invalid());
+        }
+        let owner = context.owner();
+        outcome.retain_owner(owner.clone());
+        Self::with_outcome(statement, outcome, Some(owner))
+    }
     /// Deterministic storage-adapter model only. This is absent from production
     /// and does not establish authenticated Status authority in a fixture.
     #[cfg(test)]

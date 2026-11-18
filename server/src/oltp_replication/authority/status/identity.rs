@@ -66,18 +66,138 @@ pub(crate) enum TerminalIdentity {
         recorded_at: AppliedPosition,
     },
 }
+impl TerminalIdentity {
+    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
+        if let Self::Committed { outcome, .. } | Self::Failed { outcome, .. } = self {
+            outcome.retain_owner(owner);
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum IdentityLookup {
     Reserved(IdentityReservation),
     Abandoned(IdentityReservation),
     Terminal(TerminalIdentity),
+    Rejected(RejectedIdentity),
+}
+impl IdentityLookup {
+    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
+        if let Self::Terminal(
+            TerminalIdentity::Committed { outcome, .. } | TerminalIdentity::Failed { outcome, .. },
+        ) = self
+        {
+            outcome.retain_owner(owner);
+        } else if let Self::Rejected(rejection) = self {
+            rejection.failure.retain_owner(owner);
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RestoredHistoryOrigin {
+    pub restore_id: Uuid,
+    pub source_cluster: Uuid,
+    pub source_archive: Uuid,
+    pub source_root: Digest,
+    pub through_cut: CommitTs,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityRecord {
     reservation: IdentityReservation,
+    #[serde(default)]
+    restore_origin: Option<RestoredHistoryOrigin>,
+    #[serde(default)]
+    reserved_at: Option<AppliedPosition>,
     terminal: Option<TerminalIdentity>,
+    #[serde(default)]
+    rejection: Option<RejectedIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement: Option<RetirementCertificate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetirementCertificate {
+    proof: SealedTerminalProof,
+    timestamp_position: AppliedPosition,
+    recorded_at: AppliedPosition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RejectedIdentity {
+    pub reservation: IdentityReservation,
+    pub view: AuthorityView,
+    pub identity: PinIdentity,
+    pub pin: Option<StoragePin>,
+    pub request: Option<RequestBinding>,
+    pub failure: super::MutationOutcome,
+    pub recorded_at: AppliedPosition,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SealedAdmissionRejection {
+    pub(super) status_group: GroupIdentity,
+    pub(super) rejection: RejectedIdentity,
+    digest: Digest,
+}
+impl SealedAdmissionRejection {
+    pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
+        if !matches!(self.status_group.kind, GroupKind::Status { .. })
+            || self.digest != serialized_digest(&(&self.status_group, &self.rejection))?
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub(crate) fn rejection(&self) -> &RejectedIdentity {
+        &self.rejection
+    }
+    pub(crate) fn status_group(&self) -> &GroupIdentity {
+        &self.status_group
+    }
+}
+pub(crate) struct VerifiedAdmissionRejection {
+    sealed: SealedAdmissionRejection,
+}
+impl VerifiedAdmissionRejection {
+    pub(crate) fn from_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        mut sealed: SealedAdmissionRejection,
+        operation: u8,
+    ) -> Result<Self, ProtocolError> {
+        if operation != 18 {
+            return Err(invalid());
+        }
+        context.status(operation, &sealed)?;
+        if context.group() != sealed.status_group() {
+            return Err(invalid());
+        }
+        sealed.validate()?;
+        sealed.rejection.failure.retain_owner(context.owner());
+        Ok(Self { sealed })
+    }
+    pub(crate) fn from_lookup_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        mut rejection: RejectedIdentity,
+    ) -> Result<Self, ProtocolError> {
+        context.status(1, &Some(IdentityLookup::Rejected(rejection.clone())))?;
+        let status_group = context.group().clone();
+        let digest = serialized_digest(&(&status_group, &rejection))?;
+        rejection.failure.retain_owner(context.owner());
+        Ok(Self {
+            sealed: SealedAdmissionRejection {
+                status_group,
+                rejection,
+                digest,
+            },
+        })
+    }
+    pub(crate) fn into_sealed(self) -> SealedAdmissionRejection {
+        self.sealed
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +218,19 @@ pub(crate) enum StatusCommand {
     RetireRead {
         authority: Authority,
         proof: SealedTerminalProof,
+    },
+    RetireTerminal {
+        authority: Authority,
+        proof: SealedTerminalProof,
+        timestamp_position: AppliedPosition,
+    },
+    RejectUnaccepted {
+        view: AuthorityView,
+        reservation: IdentityReservation,
+        identity: PinIdentity,
+        pin: Option<StoragePin>,
+        request: Option<RequestBinding>,
+        failure: super::MutationOutcome,
     },
     BeginManifest {
         authority: Authority,
@@ -150,6 +283,8 @@ impl fmt::Display for StatusCommand {
             Self::Fence { .. } => "status.fence",
             Self::ReserveIdentity { .. } => "status.reserve_identity",
             Self::RetireRead { .. } => "status.retire_read",
+            Self::RetireTerminal { .. } => "status.retire_terminal",
+            Self::RejectUnaccepted { .. } => "status.reject_unaccepted",
             Self::BeginManifest { .. } => "status.begin_manifest",
             Self::ManifestPage { .. } => "status.manifest_page",
             Self::SealManifest { .. } => "status.seal_manifest",
@@ -167,6 +302,7 @@ impl OwnedPayload for StatusCommand {
             Self::BeginManifest { outcome, .. }
             | Self::Abort { outcome, .. }
             | Self::TerminalFailure { outcome, .. } => outcome.heap_bytes(),
+            Self::RejectUnaccepted { failure, .. } => failure.heap_bytes(),
             Self::ManifestPage { participants, .. } => {
                 participants.capacity() * std::mem::size_of::<ParticipantPlan>()
                     + participants
@@ -215,6 +351,16 @@ pub(crate) enum StatusReply {
     Prepared { count: u64, complete: bool },
     Decided(DecisionStatement),
     Resolved { count: u64, complete: bool },
+    Retired(RetirementCertificate),
+}
+impl StatusReply {
+    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
+        match self {
+            Self::Identity(identity) => identity.retain_owner(owner),
+            Self::Manifest(draft) => draft.outcome.retain_owner(owner),
+            _ => {}
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct FenceRecord {
@@ -356,13 +502,83 @@ fn apply(
                 tx,
                 &identity_key,
                 &IdentityRecord {
+                    restore_origin: None,
                     reservation,
+                    reserved_at: Some(position),
                     terminal: None,
+                    rejection: None,
+                    retirement: None,
                 },
             )?;
             commit(
                 tx,
                 StatusReply::Identity(IdentityLookup::Reserved(reservation)),
+            )
+        }
+        StatusCommand::RejectUnaccepted {
+            view,
+            reservation,
+            identity,
+            pin,
+            request,
+            failure,
+        } => {
+            if current != Some(view.authority()) {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            if view.run_id != reservation.original_run
+                || identity.run_id != view.run_id
+                || identity.request_id != reservation.request_id
+                || identity.digest != reservation.digest
+                || identity.nonce != reservation.reservation_id
+                || request.is_some_and(|request| {
+                    request.run_id != identity.run_id
+                        || request.request_id != identity.request_id
+                        || request.digest != identity.digest
+                })
+                || !failure.is_not_applied()
+            {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+            let identity_key = key(IDENTITIES, reservation.request_id);
+            let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
+                return reject(tx, StatusFault::UnknownIdentity);
+            };
+            if record.reservation != *reservation
+                || record.terminal.is_some()
+                || transaction::has_transaction(tx, reservation.request_id)?
+            {
+                return reject(tx, StatusFault::TerminalConflict);
+            }
+            let candidate = RejectedIdentity {
+                reservation: *reservation,
+                view: *view,
+                identity: identity.clone(),
+                pin: *pin,
+                request: *request,
+                failure: failure.clone(),
+                recorded_at: position,
+            };
+            if let Some(existing) = record.rejection {
+                if existing.reservation != candidate.reservation
+                    || existing.view != candidate.view
+                    || existing.identity != candidate.identity
+                    || existing.pin != candidate.pin
+                    || existing.request != candidate.request
+                    || existing.failure != candidate.failure
+                {
+                    return reject(tx, StatusFault::TerminalConflict);
+                }
+                return commit(
+                    tx,
+                    StatusReply::Identity(IdentityLookup::Rejected(existing)),
+                );
+            }
+            record.rejection = Some(candidate.clone());
+            put(tx, &identity_key, &record)?;
+            commit(
+                tx,
+                StatusReply::Identity(IdentityLookup::Rejected(candidate)),
             )
         }
         StatusCommand::RetireRead { authority, proof } => {
@@ -426,13 +642,110 @@ fn apply(
                 StatusReply::Identity(IdentityLookup::Terminal(terminal)),
             )
         }
+        StatusCommand::RetireTerminal {
+            authority,
+            proof,
+            timestamp_position,
+        } => {
+            if current != Some(*authority) {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            let statement = &proof.statement;
+            if statement.validate().is_err()
+                || statement.ready.view.authority() != *authority
+                || statement.terminal_digest.is_none()
+                || statement_digest(statement).map_err(|_| invalid())? != proof.statement_digest
+                || proof.acknowledgement_count != statement.ready.ready_count
+                || timestamp_position.term == 0
+                || timestamp_position.index == 0
+            {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+            let identity_key = key(IDENTITIES, statement.request.request_id);
+            let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
+                return reject(tx, StatusFault::UnknownIdentity);
+            };
+            if record.reservation.original_run != statement.request.run_id
+                || record.reservation.digest != statement.request.digest
+                || record.rejection.is_some()
+            {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+            if let Some(existing) = record.retirement {
+                return if existing.matches(statement) {
+                    commit(tx, StatusReply::Retired(existing))
+                } else {
+                    reject(tx, StatusFault::TerminalConflict)
+                };
+            }
+            match (&record.terminal, record.reservation.kind) {
+                (None, RequestKind::Read) => {
+                    record.terminal = Some(TerminalIdentity::ReadExpired {
+                        reservation: record.reservation,
+                        request: statement.request,
+                        terminal_version: statement.terminal_version,
+                        response_hash: statement.response_hash,
+                        recorded_at: position,
+                    });
+                }
+                (
+                    Some(TerminalIdentity::ReadExpired {
+                        request,
+                        terminal_version,
+                        response_hash,
+                        ..
+                    }),
+                    RequestKind::Read,
+                ) if *request == statement.request
+                    && *terminal_version <= statement.terminal_version
+                    && *response_hash == statement.response_hash => {}
+                (
+                    Some(TerminalIdentity::Committed { decision, outcome, .. }),
+                    RequestKind::Mutation,
+                ) if decision.request == statement.request
+                    && outcome.response_hash(statement.request.request_id)?
+                        == statement.response_hash => {}
+                (
+                    Some(TerminalIdentity::Failed { request, outcome, .. }),
+                    RequestKind::Mutation,
+                ) if *request == statement.request
+                    && outcome.response_hash(statement.request.request_id)?
+                        == statement.response_hash => {}
+                _ => return reject(tx, StatusFault::TerminalConflict),
+            }
+            let certificate = RetirementCertificate {
+                proof: proof.clone(),
+                timestamp_position: *timestamp_position,
+                recorded_at: position,
+            };
+            record.retirement = Some(certificate.clone());
+            put(tx, &identity_key, &record)?;
+            commit(tx, StatusReply::Retired(certificate))
+        }
         command => transaction::apply(tx, scope, position, current, command),
     }
 }
 fn lookup(authority: Authority, record: IdentityRecord) -> IdentityLookup {
+    let restored = record.restore_origin.is_some();
+    if let Some(rejection) = record.rejection {
+        return IdentityLookup::Rejected(rejection);
+    }
     match record.terminal {
+        Some(TerminalIdentity::Committed { ref decision, .. })
+            if record.reservation.original_run != authority.run_id
+                && matches!(
+                    decision.decision,
+                    TxnDecision::Abort {
+                        reason: AbortReason::AbandonedByFence
+                    }
+                ) =>
+        {
+            // Resolving an abandoned preparation is cleanup, not a new
+            // user-visible outcome. Preserve durable COMMIT and real failures.
+            IdentityLookup::Abandoned(record.reservation)
+        }
         Some(terminal) => IdentityLookup::Terminal(terminal),
-        None if record.reservation.original_run == authority.run_id => {
+        None if !restored && record.reservation.original_run == authority.run_id => {
             IdentityLookup::Reserved(record.reservation)
         }
         None => IdentityLookup::Abandoned(record.reservation),
@@ -483,17 +796,197 @@ pub(crate) struct StatusHandle {
     consensus: Arc<dyn Consensus<StatusCommand, StatusReply>>,
 }
 impl StatusHandle {
-    pub(crate) async fn retire_read(&self,authority:Authority,release:super::super::timestamp::VerifiedPinRelease)->Result<VerifiedReadRetirement,ProtocolError>{
-        let proof=release.into_proof();
-        match self.submit(StatusCommand::RetireRead{authority,proof}).await?.reply{
-            StatusReply::Identity(IdentityLookup::Terminal(TerminalIdentity::ReadExpired{request,terminal_version,response_hash,recorded_at,..}))=>Ok(VerifiedReadRetirement{request,terminal_version,response_hash,recorded_at}),
-            _=>Err(invalid()),
+    /// The caller retains the actual admission gate through uncertainty. An
+    /// error never grants permission to release its pin or admit the UUID again.
+    pub(crate) async fn reject_unaccepted(
+        &self,
+        cap: &crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
+    ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
+        if cap.scope().cluster_id != self.identity().cluster_id
+            || cap.scope().database != self.identity().database
+        {
+            return Err(invalid());
+        }
+        let failure = super::MutationOutcome::failure(cap.failure().clone())?;
+        if !failure.is_not_applied() {
+            return Err(invalid());
+        }
+        let expected = RejectedIdentity {
+            reservation: cap.reservation(),
+            view: cap.view(),
+            identity: cap.identity().clone(),
+            pin: cap.pin(),
+            request: cap.request(),
+            failure: failure.clone(),
+            recorded_at: AppliedPosition {
+                term: 0,
+                node_id: 0,
+                index: 0,
+            },
+        };
+        self.reject_expected(expected).await
+    }
+    pub(crate) async fn reject_owner_observation(
+        &self,
+        proof: crate::oltp_replication::service_rpc::OwnerAdmissionObservation,
+    ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
+        if proof.status_group() != self.identity() || !proof.expected().failure.is_not_applied() {
+            return Err(invalid());
+        }
+        self.reject_expected(proof.expected().clone()).await
+    }
+    async fn reject_expected(
+        &self,
+        expected: RejectedIdentity,
+    ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
+        match self
+            .submit(StatusCommand::RejectUnaccepted {
+                view: expected.view,
+                reservation: expected.reservation,
+                identity: expected.identity.clone(),
+                pin: expected.pin,
+                request: expected.request,
+                failure: expected.failure.clone(),
+            })
+            .await?
+            .reply
+        {
+            StatusReply::Identity(IdentityLookup::Rejected(_)) => {}
+            _ => return Err(invalid()),
+        }
+        let Some(IdentityLookup::Rejected(rejection)) = self
+            .lookup_identity(
+                expected.reservation.request_id,
+                Some(expected.reservation.digest),
+            )
+            .await?
+        else {
+            return Err(unknown());
+        };
+        if rejection.reservation != expected.reservation
+            || rejection.view != expected.view
+            || rejection.identity != expected.identity
+            || rejection.pin != expected.pin
+            || rejection.request != expected.request
+            || rejection.failure != expected.failure
+        {
+            return Err(unknown());
+        }
+        self.seal_rejection(rejection)
+    }
+    pub(crate) async fn rejected_identity(
+        &self,
+        expected: &RejectedIdentity,
+    ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
+        let Some(IdentityLookup::Rejected(rejection)) = self
+            .lookup_identity(
+                expected.reservation.request_id,
+                Some(expected.reservation.digest),
+            )
+            .await?
+        else {
+            return Err(unknown());
+        };
+        if rejection != *expected {
+            return Err(invalid());
+        }
+        self.seal_rejection(rejection)
+    }
+    fn seal_rejection(
+        &self,
+        rejection: RejectedIdentity,
+    ) -> Result<VerifiedAdmissionRejection, ProtocolError> {
+        let status_group = self.identity().clone();
+        let digest = serialized_digest(&(&status_group, &rejection))?;
+        Ok(VerifiedAdmissionRejection {
+            sealed: SealedAdmissionRejection {
+                status_group,
+                rejection,
+                digest,
+            },
+        })
+    }
+    pub(crate) async fn retire_terminal(
+        &self,
+        release: super::super::timestamp::VerifiedPinRelease,
+    ) -> Result<VerifiedTerminalRetirement, ProtocolError> {
+        let expected = release.statement().clone();
+        let timestamp_position = release.confirmed_at();
+        match self
+            .submit(StatusCommand::RetireTerminal {
+                authority: expected.ready.view.authority(),
+                proof: release.into_proof(),
+                timestamp_position,
+            })
+            .await?
+            .reply
+        {
+            StatusReply::Retired(certificate) if certificate.matches(&expected) => {
+                Ok(VerifiedTerminalRetirement(certificate))
+            }
+            _ => Err(unknown()),
         }
     }
-    pub(crate) async fn current_authority(&self)->Result<Option<Authority>,ProtocolError>{self.consensus.ensure_linearizable().await?;let raw=self.machine.store().read_metadata(BUDGET,|view|{let authority:Option<Authority>=read(view,STATE)?;view.encode(&authority)}).await?;serde_json::from_slice(raw.as_slice()).map_err(|_|unknown())}
-    pub(crate) async fn fence(&self,transition_id:Uuid,expected:Option<Authority>,next:Authority)->Result<Applied<StatusReply>,ProtocolError>{self.submit(StatusCommand::Fence{transition_id,expected,next}).await}
+    pub(crate) async fn retirement(
+        &self,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> Result<Option<VerifiedTerminalRetirement>, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let record: Option<IdentityRecord> = read(view, &key(IDENTITIES, request_id))?;
+                let certificate = record.and_then(|record| record.retirement);
+                if certificate.as_ref().is_some_and(|certificate| {
+                    certificate.proof.statement.request.request_id != request_id
+                        || certificate.proof.statement.request.digest != digest
+                }) {
+                    return Err(invalid());
+                }
+                view.encode(&certificate)
+            })
+            .await?;
+        let certificate = serde_json::from_slice::<Option<RetirementCertificate>>(raw.as_slice())
+            .map_err(|_| unknown())?;
+        certificate
+            .map(|certificate| {
+                certificate.validate()?;
+                Ok(VerifiedTerminalRetirement(certificate))
+            })
+            .transpose()
+    }
+    pub(crate) async fn current_authority(&self) -> Result<Option<Authority>, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, |view| {
+                let authority: Option<Authority> = read(view, STATE)?;
+                view.encode(&authority)
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())
+    }
+    pub(crate) async fn fence(
+        &self,
+        transition_id: Uuid,
+        expected: Option<Authority>,
+        next: Authority,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
+        self.submit(StatusCommand::Fence {
+            transition_id,
+            expected,
+            next,
+        })
+        .await
+    }
     pub(crate) fn identity(&self) -> &GroupIdentity {
         self.machine.store().identity()
+    }
+    pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
+        self.machine.store().resources()
     }
     pub(crate) fn new(
         machine: StatusMachine,
@@ -519,7 +1012,7 @@ impl StatusHandle {
             self.machine.store().resources(),
             ByteClass::Progress,
         )?;
-        self.consensus.propose(command).await
+        self.propose_owned(command).await
     }
     pub(crate) async fn lookup(
         &self,
@@ -541,14 +1034,152 @@ impl StatusHandle {
             })
             .await
     }
+    pub(crate) async fn lookup_identity(
+        &self,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> Result<Option<IdentityLookup>, ProtocolError> {
+        let raw = self.lookup(request_id, digest).await?;
+        let shared = self.machine.store().resources().clone();
+        let owner = Arc::new(
+            shared
+                .reserve_reply_decode(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?)
+                .await?,
+        );
+        shared
+            .execute(
+                crate::oltp::pool::ExecutionClass::Control,
+                0,
+                0,
+                move || {
+                    let mut identity: Option<IdentityLookup> =
+                        serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
+                    if let Some(identity) = &mut identity {
+                        identity.retain_owner(owner);
+                    }
+                    Ok(identity)
+                },
+            )
+            .await
+    }
+    async fn propose_owned(
+        &self,
+        command: OwnedCommand<StatusCommand>,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
+        let (position, mut reply, owner) = self.consensus.propose(command).await?.into_parts()?;
+        reply.retain_owner(owner.clone());
+        Ok(Applied::owned(position, reply, owner))
+    }
 }
-#[derive(Clone,Copy,Debug)]
-pub(crate) struct VerifiedReadRetirement {request:RequestBinding,terminal_version:u64,response_hash:Digest,recorded_at:AppliedPosition}
-impl VerifiedReadRetirement {
-    pub(crate) fn request(&self)->&RequestBinding{&self.request}
-    pub(crate) fn terminal_version(&self)->u64{self.terminal_version}
-    pub(crate) fn response_hash(&self)->Digest{self.response_hash}
-    pub(crate) fn recorded_at(&self)->AppliedPosition{self.recorded_at}
+impl RetirementCertificate {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        let statement = &self.proof.statement;
+        statement.validate().map_err(|_| invalid())?;
+        if statement.terminal_digest.is_none()
+            || self.proof.statement_digest != statement_digest(statement).map_err(|_| invalid())?
+            || self.proof.acknowledgement_count != statement.ready.ready_count
+            || self.timestamp_position.term == 0
+            || self.timestamp_position.index == 0
+            || self.recorded_at.term == 0
+            || self.recorded_at.index == 0
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn matches(&self, current: &TerminalCopyStatement) -> bool {
+        let original = &self.proof.statement;
+        let before = original.ready.view;
+        let after = current.ready.view;
+        if original.request != current.request
+            || original.pin_identity != current.pin_identity
+            || original.storage_pin != current.storage_pin
+            || original.response_hash != current.response_hash
+            || original.terminal_digest != current.terminal_digest
+            || before.run_id != after.run_id
+        {
+            return false;
+        }
+        if original.ready == current.ready {
+            return original.terminal_version == current.terminal_version;
+        }
+        // A ready transition can rebase the physical version of an immutable
+        // terminal copy. It cannot change the result or original acceptance.
+        let Some(term_advance) = after.owner_term.checked_sub(before.owner_term) else {
+            return false;
+        };
+        let Some(revision_advance) = after.membership_revision.checked_sub(before.membership_revision) else {
+            return false;
+        };
+        current.terminal_version.checked_sub(original.terminal_version).is_some_and(|advance| {
+            advance != 0 && advance <= term_advance.saturating_add(revision_advance)
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedTerminalRetirement(RetirementCertificate);
+impl VerifiedTerminalRetirement {
+    pub(crate) fn into_certificate(self) -> RetirementCertificate {
+        self.0
+    }
+    pub(crate) fn from_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        value: RetirementCertificate,
+        expected: &TerminalCopyStatement,
+    ) -> Result<Self, ProtocolError> {
+        context.status(17, &value)?;
+        value.validate()?;
+        if !value.matches(expected) {
+            return Err(invalid());
+        }
+        Ok(Self(value))
+    }
+    pub(crate) fn from_lookup_service(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        value: Option<RetirementCertificate>,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> Result<Option<Self>, ProtocolError> {
+        context.status(24, &value)?;
+        value
+            .map(|certificate| {
+                certificate.validate()?;
+                if certificate.proof.statement.request.request_id != request_id
+                    || certificate.proof.statement.request.digest != digest
+                {
+                    return Err(invalid());
+                }
+                Ok(Self(certificate))
+            })
+            .transpose()
+    }
+    pub(crate) fn request_id(&self) -> Uuid {
+        self.0.proof.statement.request.request_id
+    }
+    pub(crate) fn matches(&self, current: &TerminalCopyStatement) -> bool {
+        self.0.matches(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_certificate(statement: TerminalCopyStatement, workers: &[WorkerIdentity]) -> Self {
+        use crate::oltp_replication::authority::proof::{AuthenticatedAck, TerminalVerifier};
+        let ready = statement.ready;
+        let digest = statement_digest(&statement).unwrap();
+        let mut verifier = TerminalVerifier::begin(statement, ready).unwrap();
+        for worker in workers {
+            verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4())).unwrap();
+        }
+        let position = AppliedPosition { term: 1, node_id: 1, index: 2 };
+        let certificate = RetirementCertificate {
+            proof: verifier.finish(ready).unwrap().into_sealed(),
+            timestamp_position: position,
+            recorded_at: position,
+        };
+        certificate.validate().unwrap();
+        Self(certificate)
+    }
 }
 fn read<T: DeserializeOwned>(
     view: &mut GroupRead<'_>,
@@ -562,5 +1193,10 @@ fn read<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests;
 
-mod transaction;
-pub(crate) use transaction::{ManifestDraft,ManifestInventoryPage,TransactionInspection};
+pub(crate) mod transaction;
+pub(crate) use transaction::{
+    ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
+    CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
+    VerifiedStatusArchiveCut,
+};
+pub(crate) use transaction::{ManifestDraft, ManifestInventoryPage, TransactionInspection};

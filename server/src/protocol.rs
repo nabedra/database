@@ -29,6 +29,8 @@ pub enum ErrorCode {
     LimitExceeded,
     Overloaded,
     StorageUnavailable,
+    #[doc(hidden)]
+    SplitPublicationPending,
     OutcomeUnknown,
     InternalError,
 }
@@ -41,7 +43,7 @@ impl ErrorCode {
             Self::Conflict => 409,
             Self::LimitExceeded => 413,
             Self::Overloaded => 429,
-            Self::StorageUnavailable | Self::OutcomeUnknown => 503,
+            Self::StorageUnavailable | Self::SplitPublicationPending | Self::OutcomeUnknown => 503,
             Self::InternalError => 500,
         }
     }

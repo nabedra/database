@@ -3,7 +3,7 @@
 //! scope/UUID/digest/run/class and non-executable state survive.
 use super::{
     coordinator::QueueCoordinator,
-    replica::{AcceptedContext, OriginalAuthorization, QueueReadToken, QueueScope, RecordVersion},
+    replica::{AcceptedContext, OriginalAuthorization, QueueReadToken, QueueScope},
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, WorkerSharedResources},
@@ -11,17 +11,18 @@ use crate::{
         authority::{
             control::ControlHandle,
             status::{
-                IdentityLookup, IdentityReservation, RequestKind, StatusFault, StatusHandle,
-                StatusReply, TerminalIdentity,
+                IdentityLookup, IdentityReservation, RequestKind, StatusFault, StatusReply,
+                StatusService, TerminalIdentity,
             },
-            timestamp::TimestampHandle,
+            timestamp::TimestampService,
         },
-        types::{Digest, PinIdentity, RequestBinding, StoragePin},
+        types::{Authority, AuthorityView, Digest, PinIdentity, RequestBinding, StoragePin},
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// No Deserialize implementation. The original durable reservation, exact raw
 /// bytes and authorized ingress context travel together until RAM installation.
@@ -31,6 +32,21 @@ pub(crate) struct ReservedSubmission {
     pub(super) authorization: OriginalAuthorization,
 }
 impl ReservedSubmission {
+    pub(crate) fn request_binding(
+        &self,
+        read: &QueueReadToken,
+    ) -> Result<RequestBinding, ProtocolError> {
+        let context = AcceptedContext {
+            authorization: self.authorization.clone(),
+            read: Some(read.clone()),
+        };
+        Ok(RequestBinding {
+            run_id: self.reservation.original_run,
+            request_id: self.reservation.request_id,
+            digest: self.reservation.digest,
+            accepted_context: crate::oltp_replication::owned::serialized_digest(&context)?,
+        })
+    }
     pub(crate) fn pin_identity(&self) -> PinIdentity {
         PinIdentity {
             run_id: self.reservation.original_run,
@@ -39,6 +55,13 @@ impl ReservedSubmission {
             nonce: self.reservation.reservation_id,
         }
     }
+}
+pub(super) struct PreparedSubmission {
+    pub request_id: Uuid,
+    pub digest: Digest,
+    kind: RequestKind,
+    body: ChargedBytes,
+    authorization: OriginalAuthorization,
 }
 pub(crate) enum ReservationResult {
     Reserved(ReservedSubmission),
@@ -49,8 +72,8 @@ pub(crate) enum ReservationResult {
 pub(crate) struct DurableAdmission {
     shared: Arc<WorkerSharedResources>,
     control: Arc<ControlHandle>,
-    status: Arc<StatusHandle>,
-    timestamps: Arc<TimestampHandle>,
+    status: Arc<dyn StatusService>,
+    timestamps: Arc<dyn TimestampService>,
     scope: QueueScope,
     queue: Arc<QueueCoordinator>,
 }
@@ -58,8 +81,8 @@ impl DurableAdmission {
     pub(crate) fn new(
         shared: Arc<WorkerSharedResources>,
         control: Arc<ControlHandle>,
-        status: Arc<StatusHandle>,
-        timestamps: Arc<TimestampHandle>,
+        status: Arc<dyn StatusService>,
+        timestamps: Arc<dyn TimestampService>,
         scope: QueueScope,
         queue: Arc<QueueCoordinator>,
     ) -> Result<Self, ProtocolError> {
@@ -81,13 +104,12 @@ impl DurableAdmission {
             queue,
         })
     }
-    pub(crate) async fn reserve(
+    pub(super) async fn prepare(
         &self,
         body: Vec<u8>,
         authorization: OriginalAuthorization,
         now_ms: u64,
-    ) -> Result<ReservationResult, ProtocolError> {
-        use super::worker_endpoint::AuthorityReader;
+    ) -> Result<PreparedSubmission, ProtocolError> {
         if body.is_empty()
             || body.len() > crate::protocol::MAX_BODY_BYTES
             || authorization.database != self.scope.database
@@ -100,7 +122,6 @@ impl DurableAdmission {
         {
             return Err(invalid("invalid original admission context"));
         }
-        let current = self.control.current(&self.scope).await?;
         let raw = self.shared.copy_bytes(&body)?;
         drop(body);
         let held = raw.clone();
@@ -133,6 +154,34 @@ impl DurableAdmission {
                 ))
             })
             .await?;
+        Ok(PreparedSubmission {
+            request_id,
+            digest,
+            kind,
+            body: raw,
+            authorization,
+        })
+    }
+    pub(super) async fn reserve(
+        &self,
+        prepared: PreparedSubmission,
+        expected: Option<Authority>,
+    ) -> Result<ReservationResult, ProtocolError> {
+        let current = self.control.admission_authority(&self.scope).await?;
+        if expected.is_some_and(|expected| current.ready.view.authority() != expected) {
+            return Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "index build owner changed before refresh reservation",
+                Outcome::NotApplied,
+            ));
+        }
+        let PreparedSubmission {
+            request_id,
+            digest,
+            kind,
+            body,
+            authorization,
+        } = prepared;
         // A lost response never establishes certain absence. The native/consensus
         // error propagates, and the same UUID+digest retry reconciles this entry.
         let applied = self
@@ -153,7 +202,7 @@ impl DurableAdmission {
                 }
                 Ok(ReservationResult::Reserved(ReservedSubmission {
                     reservation,
-                    body: raw,
+                    body,
                     authorization,
                 }))
             }
@@ -163,6 +212,11 @@ impl DurableAdmission {
             StatusReply::Identity(IdentityLookup::Terminal(terminal)) => {
                 Ok(ReservationResult::Terminal(terminal))
             }
+            StatusReply::Identity(IdentityLookup::Rejected(rejection)) => Err(rejection
+                .failure
+                .result()
+                .err()
+                .ok_or_else(|| unknown("invalid rejected identity outcome"))?),
             StatusReply::Rejected(StatusFault::DigestConflict | StatusFault::TerminalConflict) => {
                 Err(ProtocolError::new(
                     ErrorCode::Conflict,
@@ -202,41 +256,46 @@ impl DurableAdmission {
     }
     /// Catalog resolves the immutable lineage at this token's read timestamp.
     /// The TSO then binds its final hash before either RAM acceptance phase.
-    pub(crate) async fn accept(
+    pub(crate) fn context(
         &self,
-        reserved: ReservedSubmission,
+        reserved: &ReservedSubmission,
         read: QueueReadToken,
-        now_ms: u64,
-    ) -> Result<RecordVersion, ProtocolError> {
-        use super::worker_endpoint::AuthorityReader;
-        let current = self.control.current(&self.scope).await?;
-        if current.ready.view.run_id != reserved.reservation.original_run
-            || read.identity != reserved.pin_identity()
-        {
-            return Err(invalid("snapshot token differs from original reservation"));
+    ) -> Result<AcceptedContext, ProtocolError> {
+        if read.identity != reserved.pin_identity() {
+            return Err(invalid("snapshot identity differs"));
         }
-        let context = AcceptedContext {
-            authorization: reserved.authorization,
+        Ok(AcceptedContext {
+            authorization: reserved.authorization.clone(),
             read: Some(read),
+        })
+    }
+    pub(crate) async fn bind_staged(
+        &self,
+        view: AuthorityView,
+        context: &AcceptedContext,
+    ) -> Result<RequestBinding, ProtocolError> {
+        let read = context
+            .read
+            .as_ref()
+            .ok_or_else(|| invalid("missing original snapshot token"))?;
+        if view.run_id != read.identity.run_id {
+            return Err(invalid("original request run was abandoned"));
+        }
+        let binding = RequestBinding {
+            run_id: read.identity.run_id,
+            request_id: read.identity.request_id,
+            digest: read.identity.digest,
+            accepted_context: crate::oltp_replication::owned::serialized_digest(context)?,
         };
-        let request = RequestBinding {
-            run_id: reserved.reservation.original_run,
-            request_id: reserved.reservation.request_id,
-            digest: reserved.reservation.digest,
-            accepted_context: crate::oltp_replication::owned::serialized_digest(&context)?,
-        };
-        let read = context.read.as_ref().expect("constructed read token");
         self.timestamps
             .bind_snapshot_context(
-                current.ready.view,
+                view,
                 read.identity.clone(),
                 read.storage_pin,
-                request,
+                binding,
             )
             .await?;
-        self.queue
-            .admit(reserved.body.as_ref().to_vec(), context, now_ms)
-            .await
+        Ok(binding)
     }
     pub(super) fn queue(&self) -> &Arc<QueueCoordinator> {
         &self.queue

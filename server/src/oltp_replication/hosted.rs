@@ -91,7 +91,13 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     pub(crate) fn store(&self) -> &GroupStore {
         self.machine.store()
     }
-    async fn snapshot(&self, file: GroupSnapshot) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
+    pub(crate) fn resident(&self) -> ReplicaLease {
+        self._resident.clone()
+    }
+    pub(crate) async fn snapshot(
+        &self,
+        file: GroupSnapshot,
+    ) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
         let raw = self
             .store()
             .snapshot_membership(file.clone(), META)
@@ -203,7 +209,10 @@ where
                     self.machine
                         .apply(meta, command.clone())
                         .await
-                        .map_err(disk)?,
+                        .map_err(|error| {
+                            tracing::error!(group=%self.store().identity().group_id,kind=?self.store().identity().kind,node=self._resident.node_id(),index=position.index,code=?error.code,outcome=?error.outcome,"typed state application failed");
+                            disk(error)
+                        })?,
                 ),
                 Payload::Membership(membership) => {
                     self.store()
@@ -230,6 +239,10 @@ where
                     None
                 }
             };
+            if matches!(self.store().identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+                tracing::debug!(group=%self.store().identity().group_id, node=self._resident.node_id(),
+                    index=position.index, "typed Raft state applied");
+            }
             if let Some(responder) = responder {
                 let required = if let Some(raw) = &raw {
                     let input = raw.clone();
@@ -305,6 +318,7 @@ where
     pub(crate) raft: Raft<C, HostedState<C, M>>,
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
+    pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
 }
 /// Single-entry batching is the initial typed storage/transport contract. It
 /// bounds transient batches independently of total retained log/table size.
@@ -335,6 +349,7 @@ where
         if config.max_payload_entries != 1
             || config.max_append_entries != Some(1)
             || config.api_batch_capacity != Some(1)
+            || !log.has_resident()
             || state.store().identity() != log.group().identity()
             || !Arc::ptr_eq(state.store().resources(), log.group().resources())
         {
@@ -351,7 +366,12 @@ where
         )
         .await
         .map_err(|_| unavailable())?;
-        Ok(Arc::new(Self { raft, log, state }))
+        Ok(Arc::new(Self {
+            raft,
+            log,
+            state,
+            membership_changes: tokio::sync::Mutex::new(()),
+        }))
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
         let stopped = self.raft.shutdown().await;
@@ -367,11 +387,20 @@ where
     fn propose(&self, command: OwnedCommand<C::Command>) -> ConsensusFuture<'_, Applied<C::Reply>> {
         Box::pin(async move {
             command.ensure_charged()?;
+            // Reserve before client_write: saturation is a typed pre-proposal
+            // outcome, never a fatal WriteLogs error after Raft accepts it.
+            command.reserve_raft_metadata(
+                &self.state._resident,
+                super::entry::OwnedRaftEntry::<C::Command>::normal_metadata_bytes(),
+            )?;
             let response = self
                 .raft
                 .client_write(command)
                 .await
-                .map_err(|_| unavailable())?;
+                .map_err(|error| {
+                    tracing::error!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed client_write failed");
+                    unavailable()
+                })?;
             let (position, reply, owner) = response.data.into_parts()?;
             Ok(Applied::owned(
                 position,
@@ -386,7 +415,10 @@ where
                 .raft
                 .ensure_linearizable(ReadPolicy::ReadIndex)
                 .await
-                .map_err(|_| unavailable())?;
+                .map_err(|error| {
+                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed ReadIndex failed");
+                    unavailable()
+                })?;
             let applied = self
                 .state
                 .store()
@@ -394,6 +426,7 @@ where
                 .await?
                 .ok_or_else(unavailable)?;
             if applied.position.index < barrier.index() {
+                tracing::error!(group=%self.state.store().identity().group_id,node=self.state._resident.node_id(),applied=applied.position.index,required=barrier.index(),"typed ReadIndex application barrier incomplete");
                 return Err(unavailable());
             }
             Ok(ReadBarrier {

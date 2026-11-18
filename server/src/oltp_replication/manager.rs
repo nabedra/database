@@ -29,8 +29,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+mod data_factory;
+mod lifecycle;
+pub(crate) use lifecycle::{AppliedPlacementMembership, ReplicatedLearner};
+mod retirement;
+pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
-pub(crate) use local::{LocalOperatorPermit, LocalWorker};
+pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
+pub(crate) use data_factory::split as shard_split;
+pub(crate) use data_factory::placement::{PlacementCatalog, RemotePlacementTarget, ReplicaPlacement};
+pub(crate) use local::{
+    GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredSystemGroups,
+    RegisteredWorker, SystemPlacement,
+};
 pub(crate) type Managed<C, M> = Arc<RaftConsensus<C, M>>;
 pub(crate) type ManagedControl = Managed<ControlConfig, ControlMachine>;
 pub(crate) type ManagedTimestamps = Managed<TimestampConfig, TimestampMachine>;
@@ -42,6 +53,11 @@ trait Running: Send + Sync {
     fn leader(&self) -> Option<u64>;
     fn members(&self) -> Vec<ReplicaMember>;
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + '_>>;
+    fn removed_applied(
+        &self,
+        removed: ReplicaMember,
+        published: super::authority::control::GroupRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<AppliedPosition, ProtocolError>> + Send + '_>>;
 }
 impl<C, M> Running for RaftConsensus<C, M>
 where
@@ -64,9 +80,17 @@ where
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + '_>> {
         Box::pin(self.shutdown())
     }
+    fn removed_applied(
+        &self,
+        removed: ReplicaMember,
+        published: super::authority::control::GroupRecord,
+    ) -> Pin<Box<dyn Future<Output = Result<AppliedPosition, ProtocolError>> + Send + '_>> {
+        Box::pin(self.verify_removed(removed, published))
+    }
 }
 struct GroupRoutes {
     dispatcher: Arc<ReplicaDispatcher>,
+    services: Option<Arc<ReplicaDispatcher>>,
     replicas: BTreeMap<u64, ReplicaRoute>,
 }
 struct ReplicaRoute {
@@ -75,6 +99,7 @@ struct ReplicaRoute {
     typed: Arc<dyn std::any::Any + Send + Sync>,
     bootstrap: BTreeMap<u64, ReplicaMember>,
     config: Digest,
+    retiring: bool,
 }
 pub(crate) struct HostedGroupManager {
     shared: Arc<WorkerSharedResources>,
@@ -85,6 +110,26 @@ pub(crate) struct HostedGroupManager {
     starts: tokio::sync::Mutex<()>,
 }
 impl HostedGroupManager {
+    fn hosted_data(
+        &self,
+        identity: &GroupIdentity,
+        node: u64,
+    ) -> Result<ManagedData, ProtocolError> {
+        let routes = self.routes.lock().map_err(|_| unavailable())?;
+        let route = routes
+            .get(&identity.group_id)
+            .and_then(|group| group.replicas.get(&node))
+            .ok_or_else(unavailable)?;
+        let running = route
+            .typed
+            .clone()
+            .downcast::<RaftConsensus<DataConfig, ParticipantMachine>>()
+            .map_err(|_| invalid())?;
+        if running.state.store().identity() != identity {
+            return Err(invalid());
+        }
+        Ok(running)
+    }
     pub(crate) fn new(
         shared: Arc<WorkerSharedResources>,
         client: WorkerClient,
@@ -107,6 +152,43 @@ impl HostedGroupManager {
     }
     pub(crate) fn registry(&self) -> &Arc<EndpointRegistry> {
         &self.registry
+    }
+    /// Service routing includes the permanent local node ID, so a colocated
+    /// replacement learner cannot overwrite the old replica's service route.
+    pub(crate) fn bind_service(
+        &self,
+        identity: &GroupIdentity,
+        node: u64,
+        endpoint: Arc<dyn super::multiplex::Endpoint>,
+    ) -> Result<(), ProtocolError> {
+        let routes = self.routes.lock().map_err(|_| unavailable())?;
+        let group = routes.get(&identity.group_id).ok_or_else(invalid)?;
+        if group.replicas.get(&node).is_none_or(|route| route.retiring) {
+            return Err(invalid());
+        }
+        self.registry.reserve(identity.clone())?;
+        group
+            .services
+            .as_ref()
+            .ok_or_else(invalid)?
+            .add(node, endpoint)
+    }
+    #[cfg(test)]
+    pub(crate) async fn replace_service_for_test(
+        &self,
+        identity: &GroupIdentity,
+        node: u64,
+        endpoint: Arc<dyn super::multiplex::Endpoint>,
+    ) -> Result<(), ProtocolError> {
+        let dispatcher = self
+            .routes
+            .lock()
+            .map_err(|_| unavailable())?
+            .get(&identity.group_id)
+            .and_then(|group| group.services.clone())
+            .ok_or_else(invalid)?;
+        dispatcher.retire(node).await?;
+        self.bind_service(identity, node, endpoint)
     }
     pub(crate) fn leader_candidates(
         &self,
@@ -176,8 +258,9 @@ impl HostedGroupManager {
             return Ok(existing);
         }
         let identity = machine.store().identity().clone();
-        let group = self.registry.reserve(identity.clone())?;
-        let resident = group.activate_replica(local.node_id, &self.shared)?;
+        let (group, resident) = self
+            .registry
+            .reserve_replica(identity.clone(), local.node_id)?;
         if let Some(owner) = &self.ownership {
             resident.retain_owner(owner.clone())?;
         }
@@ -188,10 +271,28 @@ impl HostedGroupManager {
             } else {
                 let dispatcher = Arc::new(ReplicaDispatcher::new());
                 group.bind(Purpose::Raft, dispatcher.clone())?;
+                if matches!(identity.kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+                    group.bind(Purpose::RaftProgress, dispatcher.clone())?;
+                }
+                group.bind(Purpose::Snapshot, dispatcher.clone())?;
+                let services = if identity.kind == GroupKind::Control {
+                    None
+                } else {
+                    let services = Arc::new(ReplicaDispatcher::new());
+                    group.bind(Purpose::Authority, services.clone())?;
+                    if matches!(identity.kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+                        group.bind(Purpose::Storage, services.clone())?;
+                        group.bind(Purpose::Settlement, services.clone())?;
+                    } else {
+                        group.bind(Purpose::ServiceMutation, services.clone())?;
+                    }
+                    Some(services)
+                };
                 routes.insert(
                     identity.group_id,
                     GroupRoutes {
                         dispatcher: dispatcher.clone(),
+                        services,
                         replicas: BTreeMap::new(),
                     },
                 );
@@ -206,11 +307,13 @@ impl HostedGroupManager {
         )?;
         let log = TypedLogStore::<C>::new(machine.store().clone(), local.node_id)
             .await
-            .map_err(|_| unavailable())?;
+            .map_err(|_| unavailable())?
+            .with_resident(resident.clone())?;
         let state = HostedState::new(machine, resident.clone())?;
         let running = RaftConsensus::start(config, network, log, state).await?;
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
+            running.state.clone(),
             resident,
             self.shared.clone(),
             bootstrap.clone(),
@@ -233,6 +336,7 @@ impl HostedGroupManager {
                     typed: running.clone(),
                     bootstrap,
                     config: config_digest,
+                    retiring: false,
                 },
             );
         Ok(running)
@@ -255,6 +359,9 @@ impl HostedGroupManager {
         else {
             return Ok(None);
         };
+        if route.retiring {
+            return Err(unavailable());
+        }
         if route.member != *local || route.bootstrap != *bootstrap || route.config != config {
             return Err(invalid());
         }
@@ -324,6 +431,7 @@ impl HostedGroupManager {
             .await
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
+        let _starts = self.starts.lock().await;
         let running: Vec<_> = self
             .routes
             .lock()
@@ -331,10 +439,20 @@ impl HostedGroupManager {
             .values()
             .flat_map(|routes| routes.replicas.values().map(|route| route.running.clone()))
             .collect();
+        let mut failed = None;
         for replica in running {
-            replica.stop().await?;
+            if let Err(error) = replica.stop().await {
+                failed.get_or_insert(error);
+            }
         }
-        Ok(())
+        // Endpoints can own service clients whose route providers retain this
+        // manager. Closing the whole worker must break those cycles after the
+        // Raft tasks join, otherwise their directory ownership survives drain.
+        if let Err(error) = self.registry.close_worker() {
+            failed.get_or_insert(error);
+        }
+        self.routes.lock().map_err(|_| unavailable())?.clear();
+        failed.map_or(Ok(()), Err)
     }
 }
 /// A quorum barrier plus the durable membership from that same hosted replica.
@@ -343,6 +461,7 @@ pub(crate) struct GroupMembershipObservation {
     group: GroupIdentity,
     replicas: Page<ReplicaMember>,
     applied_at: AppliedPosition,
+    _owner: Arc<crate::oltp::pool::ScratchLease>,
 }
 impl GroupMembershipObservation {
     pub(crate) fn group(&self) -> &GroupIdentity {
@@ -363,13 +482,38 @@ where
     pub(crate) async fn observe_membership(
         &self,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
+        self.observe_group_membership(false).await
+    }
+
+    pub(crate) async fn observe_stable_membership(
+        &self,
+    ) -> Result<GroupMembershipObservation, ProtocolError> {
+        self.observe_group_membership(true).await
+    }
+
+    async fn observe_group_membership(
+        &self,
+        membership_position_only: bool,
+    ) -> Result<GroupMembershipObservation, ProtocolError> {
         self.ensure_linearizable().await?;
         let mut state = self.state.clone();
         let (applied, membership) =
             openraft::storage::RaftStateMachine::<C>::applied_state(&mut state)
                 .await
                 .map_err(|_| unavailable())?;
+        let position = if membership_position_only {
+            *membership.log_id()
+        } else {
+            applied
+        };
         let membership = membership.membership();
+        // A route is a stable voting placement. Learners cannot become read or
+        // write destinations merely by appearing in Raft's node metadata, and
+        // a joint configuration must finish before publishing its new epoch.
+        if membership.get_joint_config().len() != 1 {
+            return Err(unavailable());
+        }
+        let voters = &membership.get_joint_config()[0];
         for voters in membership.get_joint_config() {
             let members = voters
                 .iter()
@@ -383,9 +527,14 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             validate_voters(&members).map_err(|_| invalid())?;
         }
+        let owner = Arc::new(self.state.store().resources().reserve_scratch(
+            crate::oltp::pool::ByteClass::Progress,
+            membership.nodes().count() * std::mem::size_of::<ReplicaMember>() + 4096,
+        )?);
         let replicas = Page::new(
             membership
                 .nodes()
+                .filter(|(node, _)| voters.contains(node))
                 .map(|(_, member)| member.clone())
                 .collect(),
         )
@@ -393,7 +542,8 @@ where
         Ok(GroupMembershipObservation {
             group: self.state.store().identity().clone(),
             replicas,
-            applied_at: super::hosted::position(applied.ok_or_else(unavailable)?),
+            applied_at: super::hosted::position(position.ok_or_else(unavailable)?),
+            _owner: owner,
         })
     }
 }

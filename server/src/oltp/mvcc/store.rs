@@ -26,16 +26,26 @@ use sha2::{Digest as _, Sha256};
 use std::{cmp::Ordering, io, sync::Arc};
 use uuid::Uuid;
 
+pub(crate) mod archive;
 mod handle;
+pub(crate) mod image_archive;
+pub(crate) mod index;
 pub(crate) mod lifecycle;
+pub(crate) mod lineage;
+pub(crate) mod point;
+pub(crate) mod restore;
 pub(crate) mod scan;
+pub(crate) mod split_closure;
+pub(crate) mod split_usage;
 pub(crate) use handle::{
-    ParticipantEpochs, ParticipantHandle, VerifiedParticipantResolution, VerifiedParticipantSeal,
+    ParticipantEpochs, ParticipantFuture, ParticipantHandle, RemoteParticipant,
+    ScheduledReadFuture, VerifiedParticipantResolution, VerifiedParticipantSeal,
 };
 const CONFIG: &[u8] = b"mvcc/config/v1";
 const HEAD: u8 = b'h';
 const VALUE: u8 = b'v';
-const INTENT: u8 = b'i';
+const RESOLUTION_WITNESS: u8 = b'q';
+pub(in crate::oltp) const INTENT: u8 = b'i';
 const APPLY: TransactionBudget = TransactionBudget {
     scratch_bytes: (32 << 20) + (128 << 10),
     batch_bytes: (32 << 20) + (128 << 10),
@@ -58,6 +68,10 @@ struct Config {
     routing_epoch: u64,
     span: KeySpan,
     gc_floor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_source: Option<lineage::SplitSourceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    split_child: Option<lineage::SplitChildVisibility>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -72,6 +86,23 @@ pub(crate) enum ParticipantCommand {
         catalog_group_id: Uuid,
     },
     Lifecycle(lifecycle::LifecycleCommand),
+    SplitFreeze {
+        authority: Authority,
+        children: Box<[lineage::SplitBinding; 2]>,
+    },
+    SplitFinishSource {
+        authority: Authority,
+        split_id: Uuid,
+        settled: crate::oltp_replication::authority::status::SealedSettlement,
+    },
+    SplitStage {
+        authority: Authority,
+        binding: Box<lineage::SplitBinding>,
+    },
+    SplitImportPage {
+        authority: Authority,
+        page: Box<lineage::SplitPage>,
+    },
     PreparePage {
         authority: Authority,
         txn: TxnId,
@@ -102,9 +133,25 @@ pub(crate) enum ParticipantCommand {
 pub(crate) enum ParticipantReply {
     Fenced(crate::oltp_replication::types::GroupFenceReceipt),
     Lifecycle(lifecycle::LifecycleReply),
-    PreparedPage { next_page: u64, writes: u64 },
+    SplitSourceFrozen(lineage::SplitSourceStatement),
+    SplitSourceFinished(TxnDecision),
+    SplitStaged,
+    PreparedPage {
+        next_page: u64,
+        writes: u64,
+    },
     Sealed(PreparedParticipant),
-    Resolved { next_ordinal: u64, complete: bool },
+    Resolved {
+        next_ordinal: u64,
+        complete: bool,
+    },
+    SplitImported {
+        pages: u64,
+        images: u64,
+        source_images: u64,
+        root: Digest,
+        complete: bool,
+    },
     Rejected(Fault),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +169,10 @@ pub(crate) enum Fault {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Txn {
+    /// Earlier records remain readable, but cannot claim complete archive
+    /// coverage for effects whose preparation did not persist an audit.
+    #[serde(default)]
+    archive_audit_version: Option<u32>,
     request: RequestBinding,
     manifest: ManifestRef,
     plan: ParticipantPlan,
@@ -244,7 +295,8 @@ impl ParticipantMachine {
                     }
                     let config: Config =
                         serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
-                    if read_ts.get() < config.gc_floor || !owns(&group, &config.span, &key) {
+                    lineage::validate_read(&config, read_ts)?;
+                    if !owns(&group, &config.span, &key) {
                         return Err(invalid());
                     }
                     let length = key_length(&key)?;
@@ -369,13 +421,27 @@ fn apply(
         } else if expected.is_some() {
             return reject(tx, Fault::StaleAuthority);
         }
+        let imported_floor = if config.is_none() {
+            restore::validate_initial_fence(
+                tx,
+                group,
+                catalog_group_id,
+                schema_epoch,
+                routing_epoch,
+                span,
+            )?
+        } else {
+            0
+        };
         let next_config = Config {
             catalog_group_id: *catalog_group_id,
             authority: *next,
             schema_epoch: *schema_epoch,
             routing_epoch: *routing_epoch,
             span: span.clone(),
-            gc_floor: config.as_ref().map_or(0, |c| c.gc_floor),
+            gc_floor: config.as_ref().map_or(imported_floor, |c| c.gc_floor),
+            split_source: config.as_ref().and_then(|c| c.split_source.clone()),
+            split_child: config.as_ref().and_then(|c| c.split_child),
         };
         if encoded_length(&next_config, METADATA_BYTES).is_err() {
             return reject(tx, Fault::ResourceLimit);
@@ -401,13 +467,29 @@ fn apply(
     let authority = match command {
         ParticipantCommand::PreparePage { authority, .. }
         | ParticipantCommand::Seal { authority, .. }
-        | ParticipantCommand::Resolve { authority, .. } => *authority,
+        | ParticipantCommand::Resolve { authority, .. }
+        | ParticipantCommand::SplitFreeze { authority, .. }
+        | ParticipantCommand::SplitFinishSource { authority, .. }
+        | ParticipantCommand::SplitStage { authority, .. }
+        | ParticipantCommand::SplitImportPage { authority, .. } => *authority,
         _ => unreachable!(),
     };
     if config.authority != authority {
         return reject(tx, Fault::StaleAuthority);
     }
     match command {
+        ParticipantCommand::SplitFreeze { children, .. } => {
+            lineage::freeze_source(tx, group, &config, position, children)
+        }
+        ParticipantCommand::SplitFinishSource {
+            split_id, settled, ..
+        } => lineage::finish_source(tx, config, *split_id, settled),
+        ParticipantCommand::SplitStage { binding, .. } => {
+            lineage::stage_child(tx, group, config, binding)
+        }
+        ParticipantCommand::SplitImportPage { page, .. } => {
+            lineage::apply(tx, group, config, position, command_digest, page)
+        }
         ParticipantCommand::PreparePage {
             txn,
             request,
@@ -419,6 +501,13 @@ fn apply(
             guards,
             ..
         } => {
+            if config.split_source.is_some()
+                || config
+                    .split_child
+                    .is_some_and(|child| !child.complete || plan.read_ts < child.read_ts)
+            {
+                return reject(tx, Fault::Incomplete);
+            }
             if plan.validate().is_err()
                 || &plan.group != group
                 || plan.schema_epoch != config.schema_epoch
@@ -451,6 +540,7 @@ fn apply(
                 }
                 Some(_) => return reject(tx, Fault::InvalidBinding),
                 None => Txn {
+                    archive_audit_version: Some(1),
                     request: *request,
                     manifest: *manifest,
                     plan: plan.clone(),
@@ -558,6 +648,22 @@ fn apply(
                         &ordinal_key(b'w', *txn, state.writes + offset as u64),
                         &buffer[1..end],
                     )?;
+                    #[derive(Serialize)]
+                    struct Audit {
+                        change: IntentChange,
+                        expected_version: Option<CommitTs>,
+                        value_digest: Option<Digest>,
+                    }
+                    tx.put_serialized(
+                        &ordinal_key(b'a', *txn, state.writes + offset as u64),
+                        &Audit {
+                            change,
+                            expected_version: write.expected_version,
+                            value_digest: value.map(|value| {
+                                Digest::from_bytes(Sha256::digest(value.get().as_bytes()).into())
+                            }),
+                        },
+                    )?;
                     Ok(None)
                 })?;
                 if let Some(fault) = fault {
@@ -627,11 +733,22 @@ fn apply(
             }
             let statement = proof.statement();
             // Validation binds the sealed status DTO even on an early ABORT.
-            proof.validate_for(statement.txn, &statement.manifest, &statement.request)?;
             let txn = statement.txn;
             let key = txn_key(b't', txn);
+            let witness_key = txn_key(RESOLUTION_WITNESS, txn);
+            let known_digest = tx
+                .pinned(&witness_key)?
+                .map(|value| decode_resolution_witness(&value))
+                .transpose()?;
+            if known_digest.is_some_and(|digest| digest != proof.digest()) {
+                return reject(tx, Fault::InvalidBinding);
+            }
             let old = load::<Txn>(tx, &key)?;
             let Some(mut state) = old else {
+                if known_digest.is_some() {
+                    return Err(recovery_unknown());
+                }
+                proof.validate_for(txn, &statement.manifest, &statement.request)?;
                 if matches!(statement.decision, TxnDecision::Commit { .. }) {
                     return reject(tx, Fault::Incomplete);
                 }
@@ -668,6 +785,11 @@ fn apply(
                 );
             };
             proof.validate_for(txn, &state.manifest, &state.request)?;
+            if known_digest.is_some()
+                && (state.decision.is_none() || state.resolved == 0 || state.resolved > state.writes)
+            {
+                return Err(recovery_unknown());
+            }
             if let Some(decision) = state.decision {
                 if decision != statement.decision {
                     return reject(tx, Fault::InvalidBinding);
@@ -761,6 +883,15 @@ fn apply(
             }
             state.resolved = until;
             state.decision = Some(statement.decision);
+            // Record the exact Status proof only while the participant has
+            // more pages. It becomes visible atomically with this progress.
+            if until == state.writes {
+                if known_digest.is_some() {
+                    tx.delete(&witness_key)?;
+                }
+            } else if known_digest.is_none() {
+                tx.put(&witness_key, proof.digest().as_bytes())?;
+            }
             tx.put_serialized(&key, &state)?;
             commit(
                 tx,
@@ -782,8 +913,31 @@ pub(crate) fn page_fits(
     manifest: &ManifestRef,
     writes: &[PreparedWrite],
 ) -> Result<bool, ProtocolError> {
-    let mut batch: usize = 16 << 10; // transaction/page metadata, response and framing
+    let mut budget = PreparePageBudget::new(txn, manifest);
     for write in writes {
+        if !budget.try_add(write)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) struct PreparePageBudget<'a> {
+    txn: &'a TxnId,
+    manifest: &'a ManifestRef,
+    batch_bytes: usize,
+}
+impl<'a> PreparePageBudget<'a> {
+    pub(crate) fn new(txn: &'a TxnId, manifest: &'a ManifestRef) -> Self {
+        Self {
+            txn,
+            manifest,
+            // Transaction/page metadata, response and framing.
+            batch_bytes: 16 << 10,
+        }
+    }
+
+    pub(crate) fn try_add(&mut self, write: &PreparedWrite) -> Result<bool, ProtocolError> {
         let length = key_length(&write.key)?;
         let value = match &write.change {
             Change::Put(v) => {
@@ -799,8 +953,8 @@ pub(crate) fn page_fits(
         let intent = encoded_length(
             &Intent {
                 read_ts: ReadTs::new(u64::MAX).map_err(|_| invalid())?,
-                txn: *txn,
-                manifest: *manifest,
+                txn: *self.txn,
+                manifest: *self.manifest,
                 change,
                 value,
             },
@@ -808,10 +962,11 @@ pub(crate) fn page_fits(
         )?;
         // Intent key, latest-head key, ordinal's logical-key value. Head
         // metadata, three scoped native prefixes and record framing fit512B.
-        batch = batch
+        let batch = self
+            .batch_bytes
             .checked_add(length.checked_mul(3).ok_or_else(invalid)?)
             .and_then(|n| n.checked_add(intent))
-            .and_then(|n| n.checked_add(512))
+            .and_then(|n| n.checked_add(1024))
             .ok_or_else(invalid)?;
         // One temporary logical key, the reused native key, and one temporary
         // intent encoding must also coexist. Metadata is bounded separately.
@@ -823,10 +978,11 @@ pub(crate) fn page_fits(
         if batch > APPLY.batch_bytes || scratch > APPLY.scratch_bytes {
             return Ok(false);
         }
+        self.batch_bytes = batch;
+        Ok(true)
     }
-    Ok(true)
 }
-fn encoded_length(value: &impl Serialize, limit: usize) -> Result<usize, ProtocolError> {
+pub(crate) fn encoded_length(value: &impl Serialize, limit: usize) -> Result<usize, ProtocolError> {
     struct Count {
         bytes: usize,
         limit: usize,
@@ -853,6 +1009,10 @@ impl std::fmt::Display for ParticipantCommand {
         f.write_str(match self {
             Self::Fence { .. } => "participant-fence",
             Self::Lifecycle(_) => "catalog-lifecycle",
+            Self::SplitFreeze { .. } => "participant-split-freeze",
+            Self::SplitFinishSource { .. } => "participant-split-finish-source",
+            Self::SplitStage { .. } => "participant-split-stage",
+            Self::SplitImportPage { .. } => "participant-split-image-page",
             Self::PreparePage { .. } => "participant-prepare-page",
             Self::Seal { .. } => "participant-seal",
             Self::Resolve { .. } => "participant-resolve",
@@ -946,6 +1106,12 @@ fn invalid() -> ProtocolError {
         "invalid fixed MVCC participant binding",
     )
 }
+fn decode_resolution_witness(bytes: &[u8]) -> Result<Digest, ProtocolError> {
+    bytes
+        .try_into()
+        .map(Digest::from_bytes)
+        .map_err(|_| recovery_unknown())
+}
 fn txn_key(tag: u8, txn: TxnId) -> [u8; 25] {
     let mut key = [0; 25];
     key[0] = tag;
@@ -974,12 +1140,23 @@ fn valid_span(span: &KeySpan) -> bool {
     }
 }
 fn owns(group: &GroupIdentity, span: &KeySpan, key: &MvccKey) -> bool {
+    if let MvccKey::IndexEntry { values, .. } = key {
+        if values.iter().any(|v| !v.valid()) {
+            return false;
+        }
+    }
+
     match (&group.kind, key) {
         (
             GroupKind::Data { table_id, .. },
             MvccKey::Row {
                 table_id: table,
                 primary_key,
+            }
+            | MvccKey::IndexEntry {
+                table_id: table,
+                primary_key,
+                ..
             },
         ) => {
             table == table_id
@@ -992,7 +1169,7 @@ fn owns(group: &GroupIdentity, span: &KeySpan, key: &MvccKey) -> bool {
                     .as_ref()
                     .is_none_or(|k| compare_primary(primary_key, k) == Ordering::Less)
         }
-        (GroupKind::Catalog, MvccKey::Row { .. }) => false,
+        (GroupKind::Catalog, MvccKey::Row { .. } | MvccKey::IndexEntry { .. }) => false,
         (GroupKind::Catalog, _) => true,
         _ => false,
     }
@@ -1011,15 +1188,41 @@ fn components(key: &MvccKey) -> (u8, Uuid, Uuid, Option<&str>, Option<&Key>) {
         }
         MvccKey::CatalogRoutingRoot { table_id } => (6, *table_id, Uuid::nil(), None, None),
         MvccKey::CatalogRoutingPage { table_id, page_id } => (7, *table_id, *page_id, None, None),
+        MvccKey::CatalogIndexesRoot { table_id } => (8, *table_id, Uuid::nil(), None, None),
+        MvccKey::CatalogIndexesPage { table_id, page_id } => (9, *table_id, *page_id, None, None),
+        MvccKey::IndexEntry {
+            table_id,
+            index_id,
+            primary_key,
+            ..
+        } => (10, *table_id, *index_id, None, Some(primary_key)),
+        MvccKey::CatalogIndexProgress {
+            table_id,
+            progress_id,
+        } => (11, *table_id, *progress_id, None, None),
+        MvccKey::CatalogIndexClosed {
+            table_id,
+            closure_id,
+        } => (12, *table_id, *closure_id, None, None),
+        MvccKey::CatalogSplitClosed { table_id, split_id } => {
+            (13, *table_id, *split_id, None, None)
+        }
     }
 }
 pub(crate) fn compare_keys(a: &MvccKey, b: &MvccKey) -> Ordering {
+    let index_order = match (a, b) {
+        (MvccKey::IndexEntry { values: a, .. }, MvccKey::IndexEntry { values: b, .. }) => {
+            a[..].cmp(&b[..])
+        }
+        _ => Ordering::Equal,
+    };
     let a = components(a);
     let b = components(b);
     a.0.cmp(&b.0)
         .then(a.1.cmp(&b.1))
         .then(a.2.cmp(&b.2))
         .then(a.3.cmp(&b.3))
+        .then(index_order)
         .then_with(|| match (a.4, b.4) {
             (Some(a), Some(b)) => compare_primary(a, b),
             _ => Ordering::Equal,
@@ -1032,7 +1235,16 @@ fn key_length(key: &MvccKey) -> Result<usize, ProtocolError> {
         Some(Key::Utf8(s)) => 1 + s.len() + s.bytes().filter(|b| *b == 0).count() + 2,
         None => text.map_or(0, |s| s.len() + s.bytes().filter(|b| *b == 0).count() + 2),
     };
+    let tuple = match key {
+        MvccKey::IndexEntry { values, .. } => values
+            .iter()
+            .try_fold(1usize, |n, v| n.checked_add(v.encoded_len()))
+            .ok_or_else(invalid)?,
+        _ => 0,
+    };
     33usize
+        .checked_add(tuple)
+        .ok_or_else(invalid)?
         .checked_add(variable)
         .filter(|n| *n <= 2 * crate::protocol::MAX_BODY_BYTES + 128)
         .ok_or_else(invalid)
@@ -1043,10 +1255,18 @@ fn encode_key(key: &MvccKey, out: &mut [u8]) {
     out[1..17].copy_from_slice(table.as_bytes());
     out[17..33].copy_from_slice(id.as_bytes());
     let mut cursor = 33;
+    if let MvccKey::IndexEntry { values, .. } = key {
+        for value in values.iter() {
+            cursor += value.encode(&mut out[cursor..]);
+        }
+        out[cursor] = 0;
+        cursor += 1;
+    }
     let string = match primary {
         Some(Key::Int64(value)) => {
             out[cursor] = 1;
-            out[cursor + 1..].copy_from_slice(&((*value as u64) ^ (1 << 63)).to_be_bytes());
+            out[cursor + 1..cursor + 9]
+                .copy_from_slice(&((*value as u64) ^ (1 << 63)).to_be_bytes());
             return;
         }
         Some(Key::Utf8(s)) => {
@@ -1077,6 +1297,20 @@ impl OwnedPayload for ParticipantCommand {
             Ok(())
         };
         match self {
+            Self::SplitFreeze { children, .. } => {
+                add(std::mem::size_of_val(children.as_ref()))?;
+                for child in children.iter() {
+                    add(child.heap_bytes()?)?;
+                }
+            }
+            Self::SplitStage { binding, .. } => {
+                add(std::mem::size_of_val(binding.as_ref()))?;
+                add(binding.heap_bytes()?)?;
+            }
+            Self::SplitImportPage { page, .. } => {
+                add(std::mem::size_of::<lineage::SplitPage>())?;
+                add(page.heap_bytes()?)?;
+            }
             Self::Fence { span, .. } => {
                 for key in [&span.start, &span.end].into_iter().flatten() {
                     if let Key::Utf8(s) = key {
@@ -1105,6 +1339,9 @@ impl OwnedPayload for ParticipantCommand {
         &self,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<(), ProtocolError> {
+        if let Self::SplitImportPage { page, .. } = self {
+            page.attach_fields(owner.clone())?;
+        }
         if let Self::PreparePage { writes, .. } = self {
             for write in writes.iter() {
                 write.attach_charge(owner.clone())?;
@@ -1114,6 +1351,7 @@ impl OwnedPayload for ParticipantCommand {
     }
     fn fields_attached(&self) -> bool {
         match self {
+            Self::SplitImportPage { page, .. } => page.fields_attached(),
             Self::PreparePage { writes, .. } => writes.iter().all(PreparedWrite::fields_attached),
             _ => true,
         }

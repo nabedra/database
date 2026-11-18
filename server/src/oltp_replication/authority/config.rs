@@ -40,7 +40,7 @@ openraft::declare_raft_types!(
         NodeId=u64,Node=ReplicaMember,Entry=OwnedRaftEntry<StatusCommand>,
 );
 impl TypedConfig for StatusConfig {
-    const MAX_REPLY_DECODE_BYTES:usize=512<<10;
+    const MAX_REPLY_DECODE_BYTES: usize = 512 << 10;
     type Command = StatusCommand;
     type Reply = StatusReply;
     fn accepts(kind: &crate::oltp_replication::types::GroupKind) -> bool {

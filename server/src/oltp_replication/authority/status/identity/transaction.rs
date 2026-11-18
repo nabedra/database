@@ -14,6 +14,15 @@ use crate::oltp::{
 };
 
 const TXNS: &[u8] = b"status/txn/";
+mod archive;
+pub(crate) mod archive_images;
+mod cold;
+pub(crate) use cold::ColdRecoveryPage;
+pub(crate) use archive::{
+    ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
+    CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
+    VerifiedStatusArchiveCut,
+};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManifestDraft {
@@ -30,7 +39,7 @@ pub(crate) struct ManifestDraft {
 #[serde(deny_unknown_fields)]
 struct Transaction {
     txn: TxnId,
-    created_authority:Authority,
+    created_authority: Authority,
     request: RequestBinding,
     read_ts: ReadTs,
     expected: u64,
@@ -77,6 +86,26 @@ fn txn_key(kind: u8, txn: TxnId, suffix: &[u8]) -> Vec<u8> {
     key.extend_from_slice(&txn.attempt.to_be_bytes());
     key.extend_from_slice(suffix);
     key
+}
+pub(super) fn has_transaction(
+    tx: &mut GroupTransaction<'_>,
+    request_id: Uuid,
+) -> Result<bool, ProtocolError> {
+    let mut prefix = txn_key(
+        b't',
+        TxnId {
+            request_id,
+            attempt: 0,
+        },
+        &[],
+    );
+    prefix.truncate(prefix.len() - 8);
+    let mut found = false;
+    tx.scan_page(&prefix, None, 1, |_, _| {
+        found = true;
+        Ok(())
+    })?;
+    Ok(found)
 }
 fn root_step(prior: Digest, participant: &ParticipantPlan) -> Result<Digest, ProtocolError> {
     super::super::metadata_digest(
@@ -129,6 +158,9 @@ pub(super) fn apply(
         let Some(identity) = load::<IdentityRecord>(tx, &key(IDENTITIES, txn.request_id))? else {
             return reject(tx, StatusFault::IdentityNotReserved);
         };
+        if identity.rejection.is_some() {
+            return reject(tx, StatusFault::TerminalConflict);
+        }
         if identity.reservation.kind != RequestKind::Mutation
             || identity.reservation.digest != request.digest
             || identity.reservation.original_run != request.run_id
@@ -165,7 +197,7 @@ pub(super) fn apply(
         )?;
         let state = Transaction {
             txn: *txn,
-            created_authority:current,
+            created_authority: current,
             request: *request,
             read_ts: *read_ts,
             expected: *participant_count,
@@ -195,6 +227,9 @@ pub(super) fn apply(
         let Some(mut identity) = load::<IdentityRecord>(tx, &identity_key)? else {
             return reject(tx, StatusFault::IdentityNotReserved);
         };
+        if identity.rejection.is_some() {
+            return reject(tx, StatusFault::TerminalConflict);
+        }
         if identity.reservation.original_run != current.run_id || request.run_id != current.run_id {
             return reject(tx, StatusFault::Abandoned);
         }
@@ -253,7 +288,19 @@ pub(super) fn apply(
     let Some(mut state) = load::<Transaction>(tx, &record_key)? else {
         return reject(tx, StatusFault::UnknownIdentity);
     };
-    if state.request.run_id != current.run_id {
+    // Cold fencing abandons execution, not an immutable decision. Current
+    // authority may finish resolving an already decided old-run transaction.
+    let fenced_abandon = matches!(
+        command,
+        StatusCommand::Abort {
+            reason: AbortReason::AbandonedByFence,
+            ..
+        }
+    ) && current.owner_term > state.created_authority.owner_term;
+    if state.request.run_id != current.run_id
+        && !(matches!(command, StatusCommand::RecordResolved { .. }) && state.decision.is_some())
+        && !fenced_abandon
+    {
         return reject(tx, StatusFault::Abandoned);
     }
     match command {
@@ -302,7 +349,11 @@ pub(super) fn apply(
                     &txn_key(b'g', txn, plan.group.group_id.as_bytes()),
                     plan,
                 )?;
-                put(tx,&txn_key(b'o',txn,&(state.count-1).to_be_bytes()),plan)?;
+                put(
+                    tx,
+                    &txn_key(b'o', txn, &(state.count - 1).to_be_bytes()),
+                    plan,
+                )?;
             }
             state.pages = state.pages.checked_add(1).ok_or_else(unknown)?;
             let draft = state.draft();
@@ -416,8 +467,31 @@ pub(super) fn apply(
             if !matches!(outcome, MutationOutcome::Failure(_)) {
                 return reject(tx, StatusFault::InvalidBinding);
             }
-            let Some(manifest) = state.manifest else {
-                return reject(tx, StatusFault::Incomplete);
+            let manifest = if let Some(manifest) = state.manifest {
+                manifest
+            } else {
+                // No participant can prepare before the complete manifest is
+                // sealed. A strictly newer fenced owner may terminate this
+                // draft without inventing its missing participant pages.
+                if !fenced_abandon {
+                    return reject(tx, StatusFault::Incomplete);
+                }
+                let digest = super::super::metadata_digest(
+                    b"nabedra/abandoned-unsealed-manifest/v1\0",
+                    &(scope.group_id, txn, state.request, state.root),
+                )?;
+                let manifest = ManifestRef {
+                    status_group_id: scope.group_id,
+                    digest,
+                    participant_count: 0,
+                };
+                state.manifest = Some(manifest);
+                state.expected = 0;
+                state.count = 0;
+                state.prepared = 0;
+                state.resolved = 0;
+                state.settled_at = Some(position);
+                manifest
             };
             let decision = DecisionStatement {
                 txn,
@@ -489,13 +563,77 @@ fn decide(
 }
 
 impl StatusHandle {
-    pub(super) async fn submit(&self, command: StatusCommand) -> Result<Applied<StatusReply>, ProtocolError> {
+    pub(crate) async fn participant_plan_bytes(
+        &self,
+        txn: TxnId,
+        manifest: ManifestRef,
+        group_id: Uuid,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        self.machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: Transaction =
+                    read(view, &txn_key(b't', txn, &[]))?.ok_or_else(unknown)?;
+                if state.manifest != Some(manifest) {
+                    return Err(invalid());
+                }
+                let plan: Option<ParticipantPlan> = if state.expected == 0 {
+                    None
+                } else {
+                    read(view, &txn_key(b'g', txn, group_id.as_bytes()))?
+                };
+                view.encode(&plan)
+            })
+            .await
+    }
+    pub(crate) async fn abandon_fenced(
+        &self,
+        authority: Authority,
+        txn: TxnId,
+    ) -> Result<VerifiedStatusDecision, ProtocolError> {
+        let (current, state) = self.read_transaction(txn).await?;
+        if current != authority {
+            return Err(invalid());
+        }
+        if let Some(decision) = state.decision {
+            return VerifiedStatusDecision::with_outcome(
+                decision,
+                state.outcome,
+                state.decode_owner,
+            );
+        }
+        if current.owner_term <= state.created_authority.owner_term {
+            return Err(invalid());
+        }
+        self.submit(StatusCommand::Abort {
+            authority,
+            txn,
+            reason: AbortReason::AbandonedByFence,
+            outcome: MutationOutcome::failure(ProtocolError::new(
+                ErrorCode::Conflict,
+                "original execution authority was fenced",
+                Outcome::NotApplied,
+            ))?,
+        })
+        .await?;
+        let (_, state) = self.read_transaction(txn).await?;
+        VerifiedStatusDecision::with_outcome(
+            state.decision.ok_or_else(unknown)?,
+            state.outcome,
+            state.decode_owner,
+        )
+    }
+    pub(super) async fn submit(
+        &self,
+        command: StatusCommand,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
         let command = OwnedCommand::new_owned(
             command,
             self.machine.store().resources(),
             ByteClass::Progress,
         )?;
-        self.consensus.propose(command).await
+        self.propose_owned(command).await
     }
     pub(crate) async fn begin_manifest(
         &self,
@@ -625,6 +763,7 @@ impl StatusHandle {
             .execute(ExecutionClass::Control, 0, 0, move || {
                 let (authority, mut state): (Authority, Transaction) =
                     serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
+                state.outcome.retain_owner(owner.clone());
                 state.decode_owner = Some(owner);
                 Ok((authority, state))
             })
@@ -713,6 +852,20 @@ impl StatusHandle {
         txn: TxnId,
         manifest: ManifestRef,
     ) -> Result<VerifiedSettlement, ProtocolError> {
+        // A planning failure becomes durable before any participant manifest.
+        // Its identity CAS forbids a later BeginManifest, so this exact native
+        // terminal record proves there was no executable preparation to await.
+        if manifest.participant_count == 0 {
+            if let Some(IdentityLookup::Terminal(TerminalIdentity::Failed { request, .. })) =
+                self.lookup_identity(txn.request_id, None).await?
+            {
+                let proof = self.failure_settled_proof(txn, request).await?;
+                if proof.clone().into_sealed().statement().manifest != manifest {
+                    return Err(invalid());
+                }
+                return Ok(proof);
+            }
+        }
         let (_, state) = self.read_transaction(txn).await?;
         if state.manifest != Some(manifest) || state.resolved != state.expected {
             return Err(invalid());
@@ -747,63 +900,214 @@ impl StatusHandle {
     }
 }
 
-#[derive(Clone,Debug,Serialize,Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ManifestInventoryPage{pub items:Page<ParticipantPlan>,pub after:Option<u64>,pub done:bool}
-impl StatusHandle {
-    pub(crate) async fn manifest_page(&self,txn:TxnId,manifest:ManifestRef,after:Option<u64>)->Result<ManifestInventoryPage,ProtocolError>{
-        self.consensus.ensure_linearizable().await?;
-        let raw=self.machine.store().read_metadata(BUDGET,move|view|{
-            let state:Transaction=read(view,&txn_key(b't',txn,&[]))?.ok_or_else(unknown)?;
-            if state.manifest!=Some(manifest){return Err(invalid())}
-            let prefix=txn_key(b'o',txn,&[]);let cursor=after.map(|after|txn_key(b'o',txn,&after.to_be_bytes()));
-            let mut items=Vec::new();let mut after=after;
-            let progress=view.scan_page(&prefix,cursor.as_deref(),64,|key,bytes|{
-                let index=key.strip_prefix(prefix.as_slice()).ok_or_else(unknown)?;
-                if index.len()!=8{return Err(unknown())}
-                after=Some(u64::from_be_bytes(index.try_into().map_err(|_|unknown())?));
-                let plan:ParticipantPlan=serde_json::from_slice(bytes).map_err(|_|unknown())?;items.push(plan);Ok(())
-            })?;
-            view.encode(&ManifestInventoryPage{items:Page::new(items).map_err(|_|invalid())?,after,done:progress.exhausted})
-        }).await?;
-        let shared=self.machine.store().resources().clone();let owner=Arc::new(shared.reserve_reply_decode(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?).await?);
-        shared.execute(ExecutionClass::Control,0,0,move||{let _owner=owner;serde_json::from_slice(raw.as_slice()).map_err(|_|unknown())}).await
+pub(crate) struct ManifestInventoryPage {
+    pub items: Page<ParticipantPlan>,
+    pub after: Option<u64>,
+    pub done: bool,
+    #[serde(skip)]
+    owner: Option<Arc<ScratchLease>>,
+}
+impl ManifestInventoryPage {
+    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
+        self.owner = Some(owner);
     }
-    pub(crate) async fn failure_settled_proof(&self,txn:TxnId,request:RequestBinding)->Result<VerifiedSettlement,ProtocolError>{
-        if txn.request_id!=request.request_id{return Err(invalid())}
+}
+impl std::fmt::Debug for ManifestInventoryPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManifestInventoryPage")
+            .field("items", &self.items)
+            .field("after", &self.after)
+            .field("done", &self.done)
+            .finish()
+    }
+}
+impl StatusHandle {
+    pub(crate) async fn manifest_page(
+        &self,
+        txn: TxnId,
+        manifest: ManifestRef,
+        after: Option<u64>,
+    ) -> Result<ManifestInventoryPage, ProtocolError> {
         self.consensus.ensure_linearizable().await?;
-        let status_group=self.identity().group_id;
-        let raw=self.machine.store().read_metadata(BUDGET,move|view|{
-            let identity:IdentityRecord=read(view,&key(IDENTITIES,request.request_id))?.ok_or_else(unknown)?;
-            let Some(TerminalIdentity::Failed{request:original,outcome,recorded_at,..})=identity.terminal else{return Err(invalid())};
-            if original!=request{return Err(invalid())}
-            let digest=super::super::metadata_digest(b"nabedra/failed-plan-settlement/v1\0",&(txn,request,recorded_at,outcome.digest()?))?;
-            let manifest=ManifestRef{status_group_id:status_group,digest,participant_count:0};
-            let decision=DecisionStatement{txn,request,manifest,decided_at:recorded_at,decision:TxnDecision::Abort{reason:AbortReason::Validation}};
-            view.encode(&SettlementStatement{txn,request,manifest,decision,resolved_count:0,settled_at:recorded_at})
-        }).await?;
-        let statement: SettlementStatement=serde_json::from_slice(raw.as_slice()).map_err(|_|unknown())?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: Transaction =
+                    read(view, &txn_key(b't', txn, &[]))?.ok_or_else(unknown)?;
+                if state.manifest != Some(manifest) {
+                    return Err(invalid());
+                }
+                if state.expected == 0 {
+                    return view.encode(&ManifestInventoryPage {
+                        items: Page::new(Vec::new()).map_err(|_| invalid())?,
+                        after: None,
+                        done: true,
+                        owner: None,
+                    });
+                }
+                let prefix = txn_key(b'o', txn, &[]);
+                let cursor = after.map(|after| txn_key(b'o', txn, &after.to_be_bytes()));
+                let mut items = Vec::new();
+                let mut after = after;
+                let progress = view.scan_page(&prefix, cursor.as_deref(), 64, |key, bytes| {
+                    let index = key.strip_prefix(prefix.as_slice()).ok_or_else(unknown)?;
+                    if index.len() != 8 {
+                        return Err(unknown());
+                    }
+                    after = Some(u64::from_be_bytes(index.try_into().map_err(|_| unknown())?));
+                    let plan: ParticipantPlan =
+                        serde_json::from_slice(bytes).map_err(|_| unknown())?;
+                    items.push(plan);
+                    Ok(())
+                })?;
+                view.encode(&ManifestInventoryPage {
+                    items: Page::new(items).map_err(|_| invalid())?,
+                    after,
+                    done: progress.exhausted,
+                    owner: None,
+                })
+            })
+            .await?;
+        let shared = self.machine.store().resources().clone();
+        let owner = Arc::new(
+            shared
+                .reserve_reply_decode(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?)
+                .await?,
+        );
+        shared
+            .execute(ExecutionClass::Control, 0, 0, move || {
+                let mut page: ManifestInventoryPage =
+                    serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
+                page.owner = Some(owner);
+                Ok(page)
+            })
+            .await
+    }
+    pub(crate) async fn failure_settled_proof(
+        &self,
+        txn: TxnId,
+        request: RequestBinding,
+    ) -> Result<VerifiedSettlement, ProtocolError> {
+        if txn.request_id != request.request_id {
+            return Err(invalid());
+        }
+        self.consensus.ensure_linearizable().await?;
+        let status_group = self.identity().group_id;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let identity: IdentityRecord =
+                    read(view, &key(IDENTITIES, request.request_id))?.ok_or_else(unknown)?;
+                let Some(TerminalIdentity::Failed {
+                    request: original,
+                    outcome,
+                    recorded_at,
+                    ..
+                }) = identity.terminal
+                else {
+                    return Err(invalid());
+                };
+                if original != request {
+                    return Err(invalid());
+                }
+                let digest = super::super::metadata_digest(
+                    b"nabedra/failed-plan-settlement/v1\0",
+                    &(txn, request, recorded_at, outcome.digest()?),
+                )?;
+                let manifest = ManifestRef {
+                    status_group_id: status_group,
+                    digest,
+                    participant_count: 0,
+                };
+                let decision = DecisionStatement {
+                    txn,
+                    request,
+                    manifest,
+                    decided_at: recorded_at,
+                    decision: TxnDecision::Abort {
+                        reason: AbortReason::Validation,
+                    },
+                };
+                view.encode(&SettlementStatement {
+                    txn,
+                    request,
+                    manifest,
+                    decision,
+                    resolved_count: 0,
+                    settled_at: recorded_at,
+                })
+            })
+            .await?;
+        let statement: SettlementStatement =
+            serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
         VerifiedSettlement::from_strong_settled_read(statement)
     }
 }
 
-#[derive(Clone,Serialize,Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TransactionInspection {
-    pub current_authority:Authority,pub created_authority:Authority,pub draft:ManifestDraft,
-    pub manifest:Option<ManifestRef>,pub prepared_count:u64,pub resolved_count:u64,pub decision:Option<DecisionStatement>,
-    #[serde(skip)] owner:Option<Arc<ScratchLease>>,
+    pub current_authority: Authority,
+    pub created_authority: Authority,
+    pub draft: ManifestDraft,
+    pub manifest: Option<ManifestRef>,
+    pub prepared_count: u64,
+    pub resolved_count: u64,
+    pub decision: Option<DecisionStatement>,
+    #[serde(skip)]
+    owner: Option<Arc<ScratchLease>>,
+}
+impl TransactionInspection {
+    pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
+        self.draft.outcome.retain_owner(owner.clone());
+        self.owner = Some(owner);
+    }
 }
 impl StatusHandle {
-    pub(crate) async fn inspect_transaction(&self,txn:TxnId)->Result<Option<TransactionInspection>,ProtocolError>{
+    pub(crate) async fn inspect_transaction(
+        &self,
+        txn: TxnId,
+    ) -> Result<Option<TransactionInspection>, ProtocolError> {
         self.consensus.ensure_linearizable().await?;
-        let raw=self.machine.store().read_metadata(BUDGET,move|view|{
-            let current_authority:Authority=read(view,STATE)?.ok_or_else(unknown)?;
-            let state:Option<Transaction>=read(view,&txn_key(b't',txn,&[]))?;
-            let inspection=state.map(|state|TransactionInspection{current_authority,created_authority:state.created_authority,draft:state.draft(),manifest:state.manifest,prepared_count:state.prepared,resolved_count:state.resolved,decision:state.decision,owner:None});
-            view.encode(&inspection)
-        }).await?;
-        let shared=self.machine.store().resources().clone();let owner=Arc::new(shared.reserve_reply_decode(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?).await?);
-        shared.execute(ExecutionClass::Control,0,0,move||{let mut state:Option<TransactionInspection>=serde_json::from_slice(raw.as_slice()).map_err(|_|unknown())?;if let Some(state)=&mut state{state.owner=Some(owner)}Ok(state)}).await
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let current_authority: Authority = read(view, STATE)?.ok_or_else(unknown)?;
+                let state: Option<Transaction> = read(view, &txn_key(b't', txn, &[]))?;
+                let inspection = state.map(|state| TransactionInspection {
+                    current_authority,
+                    created_authority: state.created_authority,
+                    draft: state.draft(),
+                    manifest: state.manifest,
+                    prepared_count: state.prepared,
+                    resolved_count: state.resolved,
+                    decision: state.decision,
+                    owner: None,
+                });
+                view.encode(&inspection)
+            })
+            .await?;
+        let shared = self.machine.store().resources().clone();
+        let owner = Arc::new(
+            shared
+                .reserve_reply_decode(crate::oltp::mvcc::json_decode_budget(raw.as_slice())?)
+                .await?,
+        );
+        shared
+            .execute(ExecutionClass::Control, 0, 0, move || {
+                let mut state: Option<TransactionInspection> =
+                    serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
+                if let Some(state) = &mut state {
+                    state.draft.outcome.retain_owner(owner.clone());
+                    state.owner = Some(owner)
+                }
+                Ok(state)
+            })
+            .await
     }
 }

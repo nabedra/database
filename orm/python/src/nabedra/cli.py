@@ -173,10 +173,16 @@ def _absolute_config(config, source):
         if record.get(key) is not None:
             record[key] = str(base / record[key])
     absolute(result, 'auth_file')
-    if result['tls']:
+    if result.get('tls'):
         for key in result['tls']:
             absolute(result['tls'], key)
-    if result['storage']['driver'] == 'http':
+    if result.get('engine') == 'oltp':
+        if result['topology']['mode'] == 'local':
+            absolute(result['topology'], 'data_dir')
+        else:
+            for key in ('cert_file', 'key_file', 'ca_file'):
+                absolute(result['topology']['worker_tls'], key)
+    elif result['storage']['driver'] == 'http':
         for key in ('token_file', 'ca_file'):
             absolute(result['storage']['options'], key)
     return result
@@ -204,9 +210,11 @@ def _serve(args, binary):
     config = _absolute_config(load(source), source)
     _auth(config)
     if args.threads_per_worker:
-        resources = config['worker'].setdefault('resources', dict(memory_limit_bytes=8 << 30, task_memory_limit_bytes=512 << 20, control_memory_reserve_bytes=256 << 20))
+        resources = config.setdefault('worker', {}).setdefault('resources', dict(memory_limit_bytes=8 << 30, task_memory_limit_bytes=512 << 20, control_memory_reserve_bytes=256 << 20))
         resources['max_threads'] = args.threads_per_worker
-        config['worker']['partition_slots'] = args.threads_per_worker
+        if config.get('engine') != 'oltp':
+            config['worker']['partition_slots'] = args.threads_per_worker
+        validate(config)
     return supervise(binary, config, args.local_workers, cold_start=args.cold_start,
                      cluster_name=args.cluster_name)
 

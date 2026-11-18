@@ -1,6 +1,6 @@
 use super::{
     ControlMachine,
-    machine::{self, BUDGET, GROUPS, STATE, WORKERS},
+    machine::{self, APIS, BUDGET, GROUPS, STATE, WORKERS},
     model::*,
 };
 use crate::{
@@ -20,6 +20,13 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
+mod data_worker;
+mod growth;
+mod placement;
+mod pool_drain;
+mod restart;
+mod replacement;
+mod worker_drain;
 
 /// Authentication configuration, supplied by the operator rather than a worker
 /// payload. Empty pins deny every administration operation.
@@ -36,6 +43,40 @@ pub(crate) struct LocalOperatorPermit {
     _ownership: Arc<dyn Send + Sync>,
 }
 impl LocalOperatorPermit {
+    /// For a local Docker/directory restart, a manager-held lifetime directory
+    /// lock excludes the prior process before its database can be reopened.
+    /// This is not an EC2/CSI or remote-host exclusion capability.
+    pub(in crate::oltp_replication) fn exclude_previous_before_open(
+        &self,
+        policy: &OperatorPolicy,
+        operation_id: Uuid,
+        previous: WorkerIdentity,
+    ) -> Result<VerifiedExclusion, ProtocolError> {
+        if operation_id.is_nil()
+            || previous.worker_id != self.local.worker_id
+            || previous.incarnation == self.local.incarnation
+            || previous.enrollment_revision >= self.local.enrollment_revision
+            || !policy
+                .certificate_pins
+                .contains(&self.local.certificate_sha256)
+            || self.shared.worker_id() != Some(self.local.worker_id)
+        {
+            return Err(unauthorized());
+        }
+        let evidence = crate::oltp_replication::owned::serialized_digest(&(previous, self.local))?;
+        Ok(VerifiedExclusion {
+            stamp: ExclusionStamp {
+                worker: previous,
+                authorization: AuthorizationStamp {
+                    authorization_id: operation_id,
+                    policy: policy.policy,
+                    subject: self.local.certificate_sha256,
+                    evidence,
+                },
+                ownership_fence: evidence,
+            },
+        })
+    }
     pub(in crate::oltp_replication) fn from_local_bootstrap(
         local: WorkerIdentity,
         shared: Arc<crate::oltp::pool::WorkerSharedResources>,
@@ -97,7 +138,91 @@ impl VerifiedMembership {
 pub(crate) struct VerifiedQueueCopy {
     statement: QueueCopyStatement,
 }
+pub(crate) struct RemovalCopyVerifier {
+    statement: QueueCopyStatement,
+    ready: crate::oltp_replication::ReadySetHasher,
+}
+impl RemovalCopyVerifier {
+    pub(crate) fn observe_local(
+        &mut self,
+        replica: &crate::oltp_runtime::replica::WorkerReplica,
+    ) -> Result<(), ProtocolError> {
+        if replica
+            .removal_statement(self.statement.ticket)
+            .map_err(crate::request_queue::QueueError::protocol)?
+            != self.statement
+        {
+            return Err(unauthorized());
+        }
+        self.ready
+            .push(replica.local_identity())
+            .map_err(|_| unauthorized())
+    }
+    pub(crate) fn observe(
+        &mut self,
+        observation: crate::oltp_runtime::worker_endpoint::RemovalObservation,
+    ) -> Result<(), ProtocolError> {
+        let (worker, statement, nonce) = observation.into_parts();
+        if nonce.is_nil() || statement != self.statement {
+            return Err(unauthorized());
+        }
+        self.ready.push(worker).map_err(|_| unauthorized())
+    }
+    pub(crate) fn finish(
+        self,
+        source: &crate::oltp_runtime::replica::WorkerReplica,
+    ) -> Result<VerifiedQueueCopy, ProtocolError> {
+        let (root, count) = source
+            .removal_ready_root(self.statement.ticket)
+            .map_err(crate::request_queue::QueueError::protocol)?;
+        if !source.removal_frozen(self.statement.ticket)
+            || source
+                .removal_statement(self.statement.ticket)
+                .map_err(crate::request_queue::QueueError::protocol)?
+                != self.statement
+            || self.ready.finish() != root
+            || self.ready.count() != count
+        {
+            return Err(unauthorized());
+        }
+        Ok(VerifiedQueueCopy {
+            statement: self.statement,
+        })
+    }
+}
 impl VerifiedQueueCopy {
+    pub(crate) fn begin_removal(
+        source: &crate::oltp_runtime::replica::WorkerReplica,
+        ticket: JoinTicket,
+    ) -> Result<RemovalCopyVerifier, ProtocolError> {
+        if source.local_identity() != source.authority().owner || !source.removal_frozen(ticket) {
+            return Err(unauthorized());
+        }
+        Ok(RemovalCopyVerifier {
+            statement: source
+                .removal_statement(ticket)
+                .map_err(crate::request_queue::QueueError::protocol)?,
+            ready: crate::oltp_replication::ReadySetHasher::default(),
+        })
+    }
+    pub(crate) fn from_join(
+        source: &crate::oltp_runtime::replica::WorkerReplica,
+        current: crate::oltp_runtime::replica::QueueAuthority,
+        target: crate::oltp_runtime::worker_endpoint::JoinObservation,
+    ) -> Result<Self, ProtocolError> {
+        let statement = source
+            .join_statement(current)
+            .map_err(crate::request_queue::QueueError::protocol)?;
+        let (worker, observed, nonce) = target.into_parts();
+        if nonce.is_nil()
+            || source.local_identity() != statement.source
+            || worker != statement.ticket.target
+            || statement != observed
+        {
+            return Err(unauthorized());
+        }
+        Ok(Self { statement })
+    }
     pub(crate) fn from_empty_worker(
         ticket: JoinTicket,
         replica: &crate::oltp_runtime::replica::WorkerReplica,
@@ -309,6 +434,46 @@ impl ControlHandle {
         })
         .await
     }
+    pub(crate) async fn register_initial_data_local(
+        &self,
+        permit: &LocalOperatorPermit,
+        generation: Uuid,
+        authority: Authority,
+        observation: crate::oltp_replication::manager::GroupMembershipObservation,
+    ) -> Result<Applied<ControlReply>, ProtocolError> {
+        let replicas = Page::new(observation.replicas().to_vec()).map_err(|_| unauthorized())?;
+        let proof = VerifiedMembership::from_consensus(observation, generation, authority)?.stamp;
+        let operation_id = Uuid::new_v4();
+        let authorization = self.local_operator(
+            permit,
+            operation_id,
+            crate::oltp_replication::owned::serialized_digest(&proof)?,
+        )?;
+        self.submit(ControlCommand::RegisterInitialData {
+            operation_id,
+            proof,
+            replicas,
+            authorization,
+        })
+        .await
+    }
+    pub(crate) async fn begin_group_replacement_local(
+        &self,
+        permit: &LocalOperatorPermit,
+        operation_id: Uuid,
+        generation: Uuid,
+        expected: GroupRecord,
+    ) -> Result<Applied<ControlReply>, ProtocolError> {
+        let evidence = crate::oltp_replication::owned::serialized_digest(&expected)?;
+        let authorization = self.local_operator(permit, operation_id, evidence)?;
+        self.submit(ControlCommand::BeginGroupReplacement {
+            operation_id,
+            generation,
+            expected,
+            authorization,
+        })
+        .await
+    }
     pub(crate) async fn group_page_local(
         &self,
         permit: &LocalOperatorPermit,
@@ -417,6 +582,28 @@ impl ControlHandle {
         })
         .await
     }
+    pub(crate) async fn begin_queue_removal_local(
+        &self,
+        permit: &LocalOperatorPermit,
+        operation_id: Uuid,
+        expected: AuthorityView,
+        target: WorkerIdentity,
+        owner_fence: Uuid,
+    ) -> Result<Applied<ControlReply>, ProtocolError> {
+        let authorization = self.local_operator(
+            permit,
+            operation_id,
+            crate::oltp_replication::owned::serialized_digest(&(expected, target, owner_fence))?,
+        )?;
+        self.submit(ControlCommand::BeginQueueRemoval {
+            operation_id,
+            expected,
+            target,
+            owner_fence,
+            authorization,
+        })
+        .await
+    }
     pub(crate) async fn begin_cold_fence_local(
         &self,
         permit: &LocalOperatorPermit,
@@ -473,6 +660,46 @@ impl ControlHandle {
         self.submit(ControlCommand::Initialize {
             operation_id,
             run_id,
+            authorization,
+        })
+        .await
+    }
+    pub(crate) async fn enroll_api(
+        &self,
+        session: &AuthenticatedSession,
+        operation_id: Uuid,
+        expected: Option<WorkerIdentity>,
+        next: ApiEnrollment,
+    ) -> Result<Applied<ControlReply>, ProtocolError> {
+        let authorization = self.operator(
+            session,
+            crate::oltp_replication::owned::serialized_digest(&next)?,
+            operation_id,
+        )?;
+        self.submit(ControlCommand::EnrollApi {
+            operation_id,
+            expected,
+            next,
+            authorization,
+        })
+        .await
+    }
+    pub(crate) async fn enroll_api_local(
+        &self,
+        permit: &LocalOperatorPermit,
+        operation_id: Uuid,
+        expected: Option<WorkerIdentity>,
+        next: ApiEnrollment,
+    ) -> Result<Applied<ControlReply>, ProtocolError> {
+        let authorization = self.local_operator(
+            permit,
+            operation_id,
+            crate::oltp_replication::owned::serialized_digest(&next)?,
+        )?;
+        self.submit(ControlCommand::EnrollApi {
+            operation_id,
+            expected,
+            next,
             authorization,
         })
         .await
@@ -655,6 +882,27 @@ impl ControlHandle {
             .await?;
         machine::decode(raw.as_ref())
     }
+    pub(crate) async fn worker_replaced(
+        &self,
+        worker: WorkerIdentity,
+    ) -> Result<bool, ProtocolError> {
+        let raw = self
+            .read(move |view| {
+                if load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))? == Some(worker) {
+                    return view.encode(&true);
+                }
+                let record: Option<WorkerRecord> =
+                    load(view, &machine::key(WORKERS, worker.worker_id))?;
+                view.encode(&record.is_some_and(|record| {
+                    record.enrollment.enrollment_revision > worker.enrollment_revision
+                        && record
+                            .previous_process
+                            .is_some_and(|excluded| excluded.worker == worker)
+                }))
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
     pub(crate) async fn worker(
         &self,
         worker_id: Uuid,
@@ -684,6 +932,79 @@ impl ControlHandle {
             })
             .await?;
         machine::decode(bytes.as_ref())
+    }
+    pub(crate) async fn published_cold_fence(
+        &self,
+        authority: Authority,
+        prior_run: Option<Uuid>,
+    ) -> Result<Option<Uuid>, ProtocolError> {
+        let raw = self
+            .read(move |view| {
+                let state = state(view)?;
+                if state.ready.view.authority() != authority || state.pending.is_some() {
+                    return Err(stale());
+                }
+                let published: Option<(Uuid, Authority, Authority)> =
+                    load(view, machine::COLD_PUBLICATION)?;
+                let published = published.filter(|(id, prior, next)| {
+                    !id.is_nil()
+                        && prior.run_id != next.run_id
+                        && prior.owner_term.checked_add(1) == Some(next.owner_term)
+                        && next.run_id == authority.run_id
+                        && next.owner_term <= authority.owner_term
+                });
+                if let Some(prior) = prior_run.filter(|_| published.is_some()) {
+                    // The caller also verifies this pin came from an earlier applied
+                    // allocator epoch. Used runs cannot be resurrected by Control.
+                    if prior == authority.run_id
+                        || load::<bool>(view, &machine::key(machine::RUNS, prior))? != Some(true)
+                    {
+                        return view.encode(&None::<Uuid>);
+                    }
+                }
+                view.encode(&published.map(|(transition_id, _, _)| transition_id))
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+    pub(crate) async fn apis(
+        &self,
+        revision: u64,
+        after: Option<Uuid>,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.read(move |view| {
+            let state = state(view)?;
+            if state.enrollment_revision != revision {
+                return Err(stale());
+            }
+            let mut items = Vec::new();
+            let mut cursor = after;
+            let mut bytes = 4096usize;
+            let mut skipped = false;
+            let progress = view.scan_page(
+                APIS,
+                after.map(|id| machine::key(APIS, id)).as_deref(),
+                128,
+                |key, raw| {
+                    if skipped || bytes.checked_add(raw.len()).is_none_or(|n| n > 60 << 10) {
+                        skipped = true;
+                        return Ok(());
+                    }
+                    bytes += raw.len();
+                    let api: ApiEnrollment = machine::decode(raw)?;
+                    cursor = Some(Uuid::from_slice(&key[APIS.len()..]).map_err(|_| stale())?);
+                    items.push(api);
+                    Ok(())
+                },
+            )?;
+            view.encode(&InventoryPage {
+                revision,
+                items: Page::new(items).map_err(|_| stale())?,
+                after: cursor,
+                done: progress.exhausted && !skipped,
+            })
+        })
+        .await
     }
     pub(crate) async fn workers(
         &self,
@@ -826,10 +1147,162 @@ impl ControlHandle {
         })
         .await
     }
+    pub(crate) async fn service_role(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        action: ServiceAction,
+        target: GroupIdentity,
+    ) -> Result<ServiceAuthorization, ProtocolError> {
+        if scope.cluster_id != self.identity().cluster_id
+            || scope.database != self.identity().database
+            || target.cluster_id != scope.cluster_id
+            || target.database != scope.database
+            || target.validate().is_err()
+        {
+            return Err(unauthorized());
+        }
+        let control = self.identity().clone();
+        let database = scope.database.clone();
+        let operator = self
+            .policy
+            .certificate_pins
+            .contains(&remote.certificate_sha256);
+        let raw = self
+            .read(move |view| {
+                let state = state(view)?;
+                if action == ServiceAction::ApiIngress {
+                    let api: ApiEnrollment = load(view, &machine::key(APIS, remote.worker_id))?
+                        .ok_or_else(unauthorized)?;
+                    if WorkerIdentity::from(api.transport()) != remote
+                        || api.database != database
+                        || target != control
+                        || state.owner.is_none()
+                        || state.ready.ready_count == 0
+                        || state.invalid_ready != 0
+                        || state.pending.is_some()
+                    {
+                        return Err(unauthorized());
+                    }
+                    return view.encode(&ServiceAuthorization {
+                        ready: state.ready,
+                        owner: state.owner,
+                        effective_authority: state.ready.view.authority(),
+                        pending_ready: None,
+                    });
+                }
+                let worker: WorkerRecord = load(view, &machine::key(WORKERS, remote.worker_id))?
+                    .ok_or_else(unauthorized)?;
+                if WorkerIdentity::from(&worker.enrollment) != remote {
+                    return Err(unauthorized());
+                }
+                let target_record: Option<GroupRecord> =
+                    load(view, &machine::key(GROUPS, target.group_id))?;
+                if action != ServiceAction::Operator
+                    && target_record
+                        .as_ref()
+                        .is_none_or(|record| record.identity != target)
+                {
+                    return Err(unauthorized());
+                }
+                let mut grant = ServiceAuthorization {
+                    ready: state.ready,
+                    owner: state.owner,
+                    effective_authority: state.ready.view.authority(),
+                    pending_ready: None,
+                };
+                let source = match action {
+                    ServiceAction::ApiIngress => return Err(unauthorized()),
+                    ServiceAction::Owner => {
+                        if state.owner != Some(remote)
+                            || state.ready.ready_count == 0
+                            || state.invalid_ready != 0
+                            || state.pending.is_some()
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
+                    }
+                    ServiceAction::QueueRetirement => {
+                        let member: Option<WorkerIdentity> = load(
+                            view,
+                            &machine::ready_key(state.ready_generation, remote.worker_id),
+                        )?;
+                        if !matches!(target.kind, GroupKind::Status { .. })
+                            || state.owner.is_none()
+                            || state.invalid_ready != 0
+                            || matches!(state.pending, Some(Pending::Fence(_)))
+                            || member != Some(remote)
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
+                    }
+                    ServiceAction::StatusProof { source_group } => Some((source_group, 0)),
+                    ServiceAction::TimestampProof { source_group } => Some((source_group, 1)),
+                    ServiceAction::ParticipantProof { source_group } => Some((source_group, 2)),
+                    ServiceAction::ControlFence { transition_id } => {
+                        match &state.pending {
+                            Some(Pending::Fence(pending))
+                                if pending.transition_id == transition_id =>
+                            {
+                                grant.effective_authority = pending.next.view.authority();
+                                grant.pending_ready = Some(pending.next);
+                            }
+                            Some(Pending::Ready(pending))
+                                if pending.transition_id == transition_id
+                                    && target.kind == GroupKind::Timestamps =>
+                            {
+                                let next = pending.next.ok_or_else(unauthorized)?;
+                                grant.effective_authority = next.view.authority();
+                                grant.pending_ready = Some(next);
+                            }
+                            _ => return Err(unauthorized()),
+                        }
+                        Some((control.group_id, 3))
+                    }
+                    ServiceAction::Operator => {
+                        if !operator
+                            || view.get(&machine::key(machine::data_worker::REGISTERED, remote.worker_id))?.is_some()
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
+                    }
+                };
+                if let Some((source, kind)) = source {
+                    let record: GroupRecord =
+                        load(view, &machine::key(GROUPS, source))?.ok_or_else(unauthorized)?;
+                    let permitted = match kind {
+                        0 => matches!(record.identity.kind, GroupKind::Status { .. }),
+                        1 => record.identity.kind == GroupKind::Timestamps,
+                        2 => matches!(
+                            record.identity.kind,
+                            GroupKind::Catalog | GroupKind::Data { .. }
+                        ),
+                        _ => record.identity == control,
+                    };
+                    if !permitted
+                        || record.replica_count == 0
+                        || load::<ReplicaMember>(
+                            view,
+                            &machine::member_worker_key(record.generation, remote.worker_id),
+                        )?
+                        .is_none()
+                    {
+                        return Err(unauthorized());
+                    }
+                }
+                view.encode(&grant)
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
     async fn authority(
         &self,
         scope: &QueueScope,
         reader: Option<(WorkerIdentity, Uuid)>,
+        admitting: bool,
     ) -> Result<QueueAuthority, ProtocolError> {
         if scope.cluster_id != self.identity().cluster_id
             || scope.database != self.identity().database
@@ -839,6 +1312,20 @@ impl ControlHandle {
         let bytes = self
             .read(move |view| {
                 let state = state(view)?;
+                if admitting && matches!(state.pending, Some(Pending::Ready(ref pending)) if pending.change == ReadyChange::Remove) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "worker removal is fencing ready admission",
+                        Outcome::Unknown,
+                    ));
+                }
+                if admitting && state.restart.is_some() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "retained worker is joining the current queue",
+                        Outcome::Unknown,
+                    ));
+                }
                 let owner = state.owner.ok_or_else(stale)?;
                 if state.ready.ready_count == 0
                     || state.invalid_ready != 0
@@ -870,10 +1357,56 @@ impl ControlHandle {
         let (ready, owner) = machine::decode(bytes.as_ref())?;
         Ok(QueueAuthority { ready, owner })
     }
+
+    async fn queue_removal_view(
+        &self,
+        scope: &QueueScope,
+        owner: WorkerIdentity,
+        ticket: JoinTicket,
+    ) -> Result<QueueAuthority, ProtocolError> {
+        if scope.cluster_id != self.identity().cluster_id
+            || scope.database != self.identity().database
+        {
+            return Err(unauthorized());
+        }
+        let bytes = self
+            .read(move |view| {
+                let state = state(view)?;
+                if state.owner != Some(owner)
+                    || state.ready != ticket.source_ready
+                    || state.invalid_ready != 0
+                    || !matches!(state.pending, Some(Pending::Ready(pending))
+                    if pending.change == ReadyChange::Remove
+                        && pending.phase == ReadyPhase::AwaitingQueueProof
+                        && pending.transition_id == ticket.ticket_id
+                        && pending.target == ticket.target
+                        && pending.expected == ticket.source_ready)
+                {
+                    return Err(stale());
+                }
+                view.encode(&QueueAuthority {
+                    ready: state.ready,
+                    owner,
+                })
+            })
+            .await?;
+        machine::decode(bytes.as_ref())
+    }
 }
 impl AuthorityReader for ControlHandle {
     fn current<'a>(&'a self, scope: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority> {
-        Box::pin(self.authority(scope, None))
+        Box::pin(self.authority(scope, None, false))
+    }
+    fn removal_view<'a>(
+        &'a self,
+        scope: &'a QueueScope,
+        owner: WorkerIdentity,
+        ticket: JoinTicket,
+    ) -> EndpointFuture<'a, QueueAuthority> {
+        Box::pin(self.queue_removal_view(scope, owner, ticket))
+    }
+    fn excludes_process(&self, worker: WorkerIdentity) -> EndpointFuture<'_, bool> {
+        Box::pin(self.worker_replaced(worker))
     }
     fn terminal_reader_view<'a>(
         &'a self,
@@ -881,7 +1414,7 @@ impl AuthorityReader for ControlHandle {
         remote: WorkerIdentity,
         timestamps_group_id: Uuid,
     ) -> EndpointFuture<'a, QueueAuthority> {
-        Box::pin(self.authority(scope, Some((remote, timestamps_group_id))))
+        Box::pin(self.authority(scope, Some((remote, timestamps_group_id)), false))
     }
 }
 fn load<T: serde::de::DeserializeOwned>(

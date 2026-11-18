@@ -33,7 +33,9 @@ def main(argv=None):
     try:
         # Cargo resolves any repository toolchain override from the server directory.
         use_s3 = args.s3 if args.s3 is not None else args.engine == 'olap'
-        features = args.engine + (',s3' if use_s3 else '')
+        features = args.engine
+        if use_s3:
+            features = 'oltp-backup-s3' if args.engine == 'oltp' else 'olap,s3'
         subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db',
                         '--no-default-features', '--features', features],
                        cwd=root / 'server', check=True)

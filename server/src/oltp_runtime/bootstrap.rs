@@ -19,11 +19,12 @@ use crate::{
         authority::{
             consensus::{Applied, Consensus},
             control::{
-                ControlEndpoint, ControlHandle, ControlReply, LocalOperatorPermit, OperatorPolicy,
-                Pending, VerifiedMembership, VerifiedQueueCopy,
+                ControlClient, ControlEndpoint, ControlHandle, ControlReply, ControlRoutes,
+                LocalOperatorPermit, OperatorPolicy, Pending, VerifiedMembership,
+                VerifiedQueueCopy,
             },
-            status::{StatusCommand, StatusHandle, StatusMachine, StatusReply},
-            timestamp::{TimestampHandle, TimestampMachine, TimestampReply},
+            status::{StatusCommand, StatusHandle, StatusMachine, StatusReply, StatusService},
+            timestamp::{TimestampHandle, TimestampMachine, TimestampReply, TimestampService},
         },
         hosted::{RaftConsensus, TypedMachine},
         manager::{
@@ -35,6 +36,7 @@ use crate::{
         typed_log::TypedConfig,
         types::*,
     },
+    oltp_deployment::inventory::WorkerPools,
     protocol::{ErrorCode, Outcome, ProtocolError, TableDescriptor},
     request_queue::{QueueError, QueueLimits},
 };
@@ -42,23 +44,38 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex, RwLock, Weak},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
 };
 use tokio::{sync::watch, task::JoinHandle};
 use uuid::Uuid;
+pub(super) mod registered;
+mod restore;
 
 pub(crate) struct LocalServices {
     pub shared: Arc<WorkerSharedResources>,
+    pub pools: Arc<WorkerPools>,
     pub scope: QueueScope,
     pub local: WorkerIdentity,
+    pub replication_factor: u8,
+    pub(super) cold_history: Option<super::worker_runtime::cold_history::Sources>,
     pub control: Arc<ControlHandle>,
-    pub timestamps: Arc<TimestampHandle>,
-    pub status: Arc<StatusHandle>,
+    pub operator: Arc<LocalOperatorPermit>,
+    pub timestamps: Arc<dyn TimestampService>,
+    pub status: Arc<dyn StatusService>,
     pub catalog: CatalogHandle,
-    pub resolver: Arc<LocalParticipants>,
+    pub resolver: Arc<dyn ParticipantResolver>,
+    pub control_client: Arc<ControlClient>,
+    pub admission_issuer: Option<Arc<super::admission_tickets::AdmissionTickets>>,
+    pub remote_status: Vec<Arc<crate::oltp_replication::service_rpc::StatusClient>>,
+    pub archive_repository: Option<Arc<super::worker_runtime::archive::NativeBackupPublication>>,
+    pub split: Option<crate::oltp_replication::manager::shard_split::SplitClient>,
+    pub placement: Option<Arc<crate::oltp_replication::manager::ReplicaPlacement>>,
     pub replica: Arc<Mutex<WorkerReplica>>,
     pub queue: Arc<QueueCoordinator>,
     pub manager: Arc<HostedGroupManager>,
+    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    refresh: Mutex<Option<JoinHandle<()>>>,
+    membership: Mutex<Option<JoinHandle<()>>>,
     stop: watch::Sender<bool>,
     transport: Mutex<Option<JoinHandle<Result<(), ProtocolError>>>>,
 }
@@ -73,13 +90,14 @@ impl LocalServices {
         database: &str,
         resources: WorkerResources,
         execution: &ExecutionConfig,
+        cold_start: bool,
     ) -> Result<Self, ProtocolError> {
         let worker = LocalWorker::open(
             path,
             database,
             resources,
             SharedResourceConfig {
-                query_threads: resources.max_threads.saturating_sub(3) as usize,
+                query_threads: resources.max_threads as usize,
                 ..Default::default()
             },
         )
@@ -93,6 +111,7 @@ impl LocalServices {
             operator,
             transport,
             listener,
+            directory,
             ..
         } = worker;
         let operator = Arc::new(operator);
@@ -105,6 +124,7 @@ impl LocalServices {
             cluster_id: topology.cluster_id,
             database: topology.database.clone(),
         };
+        let pools = WorkerPools::new(pool.clone(), local, None)?;
         let (stop, mut stopped) = watch::channel(false);
         let transport_owner = transport.clone();
         let task = tokio::spawn(async move {
@@ -118,6 +138,7 @@ impl LocalServices {
                 })
                 .await
         });
+        let mut directory_refresh = None;
         let result = async {
             let control_store = pool.group(topology.group(GroupKind::Control)?).await?;
             let control_raft = manager
@@ -139,6 +160,13 @@ impl LocalServices {
                 },
             );
             let initial = control.inspect().await?;
+            if initial.is_some() && !cold_start {
+                return Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "--cold-start is required after the previous local worker stopped",
+                    Outcome::NotApplied,
+                ));
+            }
             if initial.is_none() {
                 accepted(
                     control
@@ -236,11 +264,12 @@ impl LocalServices {
                 )
                 .await?;
             initialize(&catalog_raft, &peers).await?;
+            let catalog_machine = ParticipantMachine::new(catalog_store)?;
+            let catalog_seed = catalog_machine.restore_seed().await?;
             let catalog_participant = Arc::new(ParticipantHandle::new(
-                ParticipantMachine::new(catalog_store)?,
+                catalog_machine,
                 catalog_raft.clone(),
             ));
-            let catalog = CatalogHandle::new(catalog_participant.clone())?;
             let old = state.ready.view.authority();
             // A newly opened group must first be enrolled at the current
             // authority. Existing groups replay the exact persisted transition.
@@ -276,12 +305,15 @@ impl LocalServices {
                         id(topology.catalog, b"initial-fence"),
                         old,
                         topology.catalog,
-                        1,
-                        1,
-                        KeySpan {
-                            start: None,
-                            end: None,
-                        },
+                        catalog_seed.as_ref().map_or(1, |seed| seed.schema_epoch),
+                        catalog_seed.as_ref().map_or(1, |seed| seed.routing_epoch),
+                        catalog_seed.as_ref().map_or(
+                            KeySpan {
+                                start: None,
+                                end: None,
+                            },
+                            |seed| seed.span.clone(),
+                        ),
                     )
                     .await?;
             }
@@ -303,7 +335,11 @@ impl LocalServices {
                 catalog_participant: catalog_participant.clone(),
                 authority: authority.clone(),
                 cache: Mutex::new(BTreeMap::new()),
+                remote_cache: Mutex::new(BTreeMap::new()),
+                rpc: OnceLock::new(),
+                wired: Mutex::new(std::collections::BTreeSet::new()),
             });
+            restore::activate(&resolver).await?;
             if let Some(fence) = pending_cold {
                 let next = fence.next.view.authority();
                 let timestamp = timestamps
@@ -499,6 +535,7 @@ impl LocalServices {
                 .activate_empty_bootstrap(control.current(&scope).await?)
                 .map_err(QueueError::protocol)?;
             let replica = Arc::new(Mutex::new(replica));
+            shared.bind_read_replica(&replica)?;
             let group = topology.group(GroupKind::Control)?;
             let registration = manager.registry().reserve(group.clone())?;
             registration.bind(
@@ -512,20 +549,48 @@ impl LocalServices {
                 control.clone(),
                 resources.task_memory_limit_bytes,
             )?;
+            endpoint.install_retirement_reader(status.clone())?;
             registration.bind(Purpose::QueueControl, endpoint.clone())?;
             registration.bind(Purpose::QueueData, endpoint)?;
-            let peer = QueuePeerClient::new(manager.client(), shared.clone(), group)?;
-            let queue = QueueCoordinator::new(replica.clone(), control.clone(), Arc::new(peer));
+            let routes = Arc::new(LocalControlRoutes {
+                manager: manager.clone(),
+                group: group.group_id,
+            });
+            let control_client =
+                ControlClient::new(manager.client(), shared.clone(), group.clone(), routes)?;
+            directory.refresh(&control_client).await?;
+            directory_refresh = Some(tokio::spawn(
+                directory
+                    .clone()
+                    .run_refresh(control_client.clone(), stop.subscribe()),
+            ));
+            let peer = Arc::new(QueuePeerClient::new(
+                manager.client(),
+                shared.clone(),
+                group,
+            )?);
+            manager.bind_service(
+                status.identity(),
+                member.node_id,
+                crate::oltp_replication::service_rpc::StatusProofEndpoint::new(
+                    status.clone(),
+                    member.node_id,
+                    control_client.clone(),
+                    shared.clone(),
+                    None,
+                )?,
+            )?;
+            resolver
+                .rpc
+                .set(control_client.clone())
+                .map_err(|_| unavailable())?;
+            resolver.bind_native(catalog_participant.clone()).await?;
+            let catalog =
+                CatalogHandle::new(resolver.participant(catalog_participant.identity()).await?)?;
+            timestamps.install_release_reader(control_client.clone(), peer.clone())?;
+            let queue = QueueCoordinator::new(replica.clone(), control.clone(), peer);
+            shared.bind_read_queue(&queue)?;
             Ok((
-                control, timestamps, status, catalog, resolver, replica, queue,
-            ))
-        }
-        .await;
-        match result {
-            Ok((control, timestamps, status, catalog, resolver, replica, queue)) => Ok(Self {
-                shared,
-                scope,
-                local,
                 control,
                 timestamps,
                 status,
@@ -533,7 +598,50 @@ impl LocalServices {
                 resolver,
                 replica,
                 queue,
+                control_client,
+            ))
+        }
+        .await;
+        match result {
+            Ok((
+                control,
+                timestamps,
+                status,
+                catalog,
+                resolver,
+                replica,
+                queue,
+                control_client,
+            )) => Ok(Self {
+                shared,
+                pools,
+                scope,
+                local,
+                replication_factor: 1,
+                cold_history: cold_start.then(|| {
+                    super::worker_runtime::cold_history::Sources::Local {
+                        timestamps: timestamps.clone(),
+                        status: status.clone(),
+                    }
+                }),
+                control,
+                operator,
+                timestamps,
+                status,
+                catalog,
+                resolver,
+                control_client,
+                admission_issuer: None,
+                remote_status: Vec::new(),
+                archive_repository: None,
+                split: None,
+                placement: None,
+                replica,
+                queue,
                 manager,
+                directory,
+                refresh: Mutex::new(directory_refresh),
+                membership: Mutex::new(None),
                 stop,
                 transport: Mutex::new(Some(task)),
             }),
@@ -545,14 +653,50 @@ impl LocalServices {
             }
         }
     }
+    pub(crate) async fn refresh_enrollment(&self) -> Result<(), ProtocolError> {
+        self.directory
+            .refresh(&self.control_client)
+            .await
+            .map(|_| ())
+    }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
         self.manager.shutdown().await?;
         let _ = self.stop.send(true);
+        let membership = self.membership.lock().map_err(|_| unavailable())?.take();
+        if let Some(membership) = membership {
+            membership.await.map_err(|_| unavailable())?;
+        }
+        let refresh = self.refresh.lock().map_err(|_| unavailable())?.take();
+        if let Some(refresh) = refresh {
+            refresh.await.map_err(|_| unavailable())?;
+        }
         let task = self.transport.lock().map_err(|_| unavailable())?.take();
         if let Some(task) = task {
             task.await.map_err(|_| unavailable())??;
         }
         Ok(())
+    }
+}
+
+struct LocalControlRoutes {
+    manager: Arc<HostedGroupManager>,
+    group: Uuid,
+}
+impl ControlRoutes for LocalControlRoutes {
+    fn preferred(&self) -> Option<Uuid> {
+        self.manager
+            .leader_candidates(self.group)
+            .ok()
+            .and_then(|members| members.first().map(|member| member.worker_id))
+    }
+    fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError> {
+        Ok(self
+            .manager
+            .leader_candidates(self.group)?
+            .into_iter()
+            .map(|member| member.worker_id)
+            .filter(|worker| after.is_none_or(|after| *worker > after))
+            .min())
     }
 }
 
@@ -567,6 +711,76 @@ pub(crate) struct LocalParticipants {
     catalog_participant: Arc<ParticipantHandle>,
     authority: Arc<RwLock<Authority>>,
     cache: Mutex<BTreeMap<Uuid, Weak<ParticipantHandle>>>,
+    remote_cache: Mutex<BTreeMap<Uuid, Weak<ParticipantHandle>>>,
+    rpc: OnceLock<Arc<ControlClient>>,
+    wired: Mutex<std::collections::BTreeSet<Uuid>>,
+}
+impl LocalParticipants {
+    async fn native_participant(
+        &self,
+        group: &GroupIdentity,
+    ) -> Result<Arc<ParticipantHandle>, ProtocolError> {
+        if group == self.catalog_participant.identity() {
+            return Ok(self.catalog_participant.clone());
+        }
+        if let Some(participant) = self
+            .cache
+            .lock()
+            .map_err(|_| unavailable())?
+            .get(&group.group_id)
+            .and_then(Weak::upgrade)
+        {
+            return Ok(participant);
+        }
+        if group.cluster_id != self.control.identity().cluster_id
+            || group.database != self.control.identity().database
+            || !matches!(group.kind, GroupKind::Data { .. })
+        {
+            return Err(unavailable());
+        }
+        let store = self.pool.group(group.clone()).await?;
+        let running = self
+            .manager
+            .start_data(
+                store.clone(),
+                self.member.clone(),
+                self.peers.clone(),
+                raft_config(),
+            )
+            .await?;
+        initialize(&running, &self.peers).await?;
+        let participant = Arc::new(ParticipantHandle::new(
+            ParticipantMachine::new(store)?,
+            running,
+        ));
+        self.cache
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(group.group_id, Arc::downgrade(&participant));
+        Ok(participant)
+    }
+    async fn bind_native(&self, participant: Arc<ParticipantHandle>) -> Result<(), ProtocolError> {
+        let Some(control) = self.rpc.get() else {
+            return Ok(());
+        };
+        let mut wired = self.wired.lock().map_err(|_| unavailable())?;
+        if wired.contains(&participant.identity().group_id) {
+            return Ok(());
+        }
+        self.manager.bind_service(
+            participant.identity(),
+            self.member.node_id,
+            crate::oltp_replication::service_rpc::ParticipantEndpoint::new(
+                participant.clone(),
+                self.member.node_id,
+                control.clone(),
+                self.manager.client(),
+                None,
+            )?,
+        )?;
+        wired.insert(participant.identity().group_id);
+        Ok(())
+    }
 }
 impl ParticipantResolver for LocalParticipants {
     fn participant<'a>(
@@ -574,11 +788,11 @@ impl ParticipantResolver for LocalParticipants {
         group: &'a GroupIdentity,
     ) -> ResolveFuture<'a, Arc<ParticipantHandle>> {
         Box::pin(async move {
-            if group == self.catalog_participant.identity() {
-                return Ok(self.catalog_participant.clone());
-            }
+            let Some(control) = self.rpc.get() else {
+                return self.native_participant(group).await;
+            };
             if let Some(participant) = self
-                .cache
+                .remote_cache
                 .lock()
                 .map_err(|_| unavailable())?
                 .get(&group.group_id)
@@ -586,31 +800,30 @@ impl ParticipantResolver for LocalParticipants {
             {
                 return Ok(participant);
             }
-            if group.cluster_id != self.control.identity().cluster_id
-                || group.database != self.control.identity().database
-                || !matches!(group.kind, GroupKind::Data { .. })
-            {
-                return Err(unavailable());
+            let routes = control.replica_routes(group).await?;
+            if routes.members.iter().any(|member| {
+                member.worker_id == self.member.worker_id
+                    && member.pool_id == self.member.pool_id
+                    && member.node_id == self.member.node_id
+            }) {
+                let native = self.native_participant(group).await?;
+                self.bind_native(native).await?;
             }
-            let store = self.pool.group(group.clone()).await?;
-            let running = self
-                .manager
-                .start_data(
-                    store.clone(),
-                    self.member.clone(),
-                    self.peers.clone(),
-                    raft_config(),
-                )
-                .await?;
-            initialize(&running, &self.peers).await?;
-            let participant = Arc::new(ParticipantHandle::new(
-                ParticipantMachine::new(store)?,
-                running,
-            ));
-            self.cache
-                .lock()
-                .map_err(|_| unavailable())?
-                .insert(group.group_id, Arc::downgrade(&participant));
+            let client = crate::oltp_replication::service_rpc::ParticipantClient::new(
+                group.clone(),
+                self.pool.resources().clone(),
+                self.manager.client(),
+                control.clone(),
+                crate::oltp_replication::authority::control::ServiceAction::Owner,
+            )?;
+            let participant = Arc::new(ParticipantHandle::remote(
+                group.clone(),
+                self.pool.resources().clone(),
+                client,
+            )?);
+            let mut cache = self.remote_cache.lock().map_err(|_| unavailable())?;
+            cache.retain(|_, value| value.strong_count() != 0);
+            cache.insert(group.group_id, Arc::downgrade(&participant));
             Ok(participant)
         })
     }
@@ -631,7 +844,7 @@ impl ParticipantResolver for LocalParticipants {
                 },
                 group_format_version: GROUP_FORMAT_VERSION,
             };
-            let participant = self.participant(&group).await?;
+            let participant = self.native_participant(&group).await?;
             let authority = *self.authority.read().map_err(|_| unavailable())?;
             if participant.activation().await?.is_none() {
                 participant
@@ -661,6 +874,7 @@ impl ParticipantResolver for LocalParticipants {
                     .await?;
                 register(&self.control, &self.operator, &running, authority).await?;
             }
+            self.bind_native(participant.clone()).await?;
             let epochs = participant.epochs().await?;
             Ok(ShardRoute {
                 group,
@@ -761,6 +975,18 @@ where
             .reply,
     )
 }
+// Static peers share this profile. The RF1/component profile remains explicit
+// in bootstrap::raft_config; a throttled one-CPU worker needs time to schedule
+// all metadata groups without repeatedly electing a new leader.
+pub(super) fn registered_raft_config() -> openraft::Config {
+    openraft::Config {
+        heartbeat_interval: 500,
+        election_timeout_min: 1500,
+        election_timeout_max: 3000,
+        ..Default::default()
+    }
+}
+
 fn raft_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 100,
@@ -769,7 +995,7 @@ fn raft_config() -> openraft::Config {
         ..Default::default()
     }
 }
-fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
+pub(super) fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
     QueueLimits {
         max_pending_requests: execution.max_pending_requests as usize,
         max_queue_bytes_per_replica: execution.max_queue_bytes_per_replica as usize,
@@ -779,11 +1005,22 @@ fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
     }
 }
 fn accepted(reply: ControlReply) -> Result<(), ProtocolError> {
-    if matches!(reply, ControlReply::Rejected(_)) {
-        Err(unavailable())
-    } else {
-        Ok(())
-    }
+    use crate::oltp_replication::authority::control::Fault;
+    let ControlReply::Rejected(fault) = reply else {
+        return Ok(());
+    };
+    let code = match fault {
+        Fault::Unauthorized => ErrorCode::Unauthorized,
+        Fault::Invalid => ErrorCode::ValidationError,
+        Fault::Stale | Fault::Conflict | Fault::Incomplete => ErrorCode::Conflict,
+        Fault::NotFound => ErrorCode::NotFound,
+        Fault::NotInitialized | Fault::Busy | Fault::NotReady => ErrorCode::StorageUnavailable,
+    };
+    Err(ProtocolError::new(
+        code,
+        format!("Control bootstrap transition rejected: {fault:?}"),
+        Outcome::NotApplied,
+    ))
 }
 fn digest(value: &impl serde::Serialize) -> Result<Digest, ProtocolError> {
     crate::oltp_replication::owned::serialized_digest(value)

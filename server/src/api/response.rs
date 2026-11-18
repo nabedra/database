@@ -33,7 +33,10 @@ pub fn encode_success<T: Serialize + ?Sized>(
 }
 
 /// Use `None` until a valid request UUID is known. Preserve engine certainty.
-pub fn encode_error(request_id: Option<Uuid>, error: ProtocolError) -> EncodedResponse {
+pub fn encode_error(request_id: Option<Uuid>, mut error: ProtocolError) -> EncodedResponse {
+    if error.code == ErrorCode::SplitPublicationPending {
+        error.code = ErrorCode::StorageUnavailable;
+    }
     let status = error.code.status_code();
     let outcome = error.outcome;
     match to_body(&ErrorResponse { request_id, error }) {

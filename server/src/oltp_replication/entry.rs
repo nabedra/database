@@ -31,7 +31,11 @@ pub const MAX_GROUP_REPLICA_NODES: usize = MAX_PAGE_ITEMS;
 pub struct OwnedRaftEntry<D: CommandData> {
     pub log_id: LogId,
     payload: Arc<Payload<D>>,
-    owner: Arc<OnceLock<Arc<ScratchLease>>>,
+    owner: Arc<OnceLock<EntryOwner>>,
+}
+enum EntryOwner {
+    Decode(Arc<ScratchLease>),
+    Resident(Arc<super::multiplex::ReplicaMetadata>),
 }
 impl<D: CommandData> Clone for OwnedRaftEntry<D> {
     fn clone(&self) -> Self {
@@ -56,12 +60,54 @@ impl<D: CommandData> fmt::Display for OwnedRaftEntry<D> {
     }
 }
 impl<D: CommandData> OwnedRaftEntry<D> {
+    pub(crate) fn normal_metadata_bytes() -> usize {
+        size_of::<Payload<D>>()
+            + size_of::<OnceLock<EntryOwner>>()
+            + 256
+            + size_of::<Self>() * 2
+            + 64
+    }
+    pub(crate) fn charge_resident(
+        self,
+        resident: &super::multiplex::ReplicaLease,
+    ) -> Result<Self, ProtocolError> {
+        if self.ensure_charged().is_ok() {
+            return Ok(self);
+        }
+        if let Payload::Normal(command) = self.payload() {
+            command.ensure_charged()?
+        }
+        check_membership(self.payload())?;
+        // Include the bounded append vector cell and allocation framing before
+        // the vector grows. Payload clones share this same resident owner.
+        let bytes = self
+            .heap_bytes()?
+            .checked_add(size_of::<Self>() * 2 + 64)
+            .ok_or_else(|| invalid("entry metadata overflow"))?;
+        let owner = match self.payload() {
+            Payload::Normal(command) => match command.raft_metadata() {
+                Some(owner) if owner.same_replica(resident) && owner.bytes() >= bytes => owner,
+                Some(_) => return Err(invalid("entry proposal residency differs")),
+                None => Arc::new(resident.log_metadata(bytes)?),
+            },
+            _ => Arc::new(resident.log_metadata(bytes)?),
+        };
+        if self.owner.set(EntryOwner::Resident(owner)).is_err() {
+            self.ensure_charged()?
+        }
+        self.ensure_charged()?;
+        Ok(self)
+    }
     pub fn payload(&self) -> &Payload<D> {
         &self.payload
     }
     pub fn ensure_charged(&self) -> Result<(), ProtocolError> {
-        if self.owner.get().is_none() {
-            return Err(invalid("entry has no owned decode reservation"));
+        match self.owner.get() {
+            None => return Err(invalid("entry has no owned decode reservation")),
+            Some(EntryOwner::Resident(owner)) if owner.bytes() == 0 => {
+                return Err(invalid("empty entry residency"));
+            }
+            _ => {}
         }
         if let Payload::Normal(command) = self.payload() {
             command.ensure_charged()?;
@@ -82,14 +128,14 @@ impl<D: CommandData> OwnedRaftEntry<D> {
             command.ensure_charged()?;
         }
         check_membership(self.payload())?;
-        let retained=self.clone();
+        let retained = self.clone();
         match OwnedCommand::new_owned(self, shared, class).and_then(Self::from_owned) {
-            Ok(entry)=>Ok(entry),
+            Ok(entry) => Ok(entry),
             // Concurrent replication/logging of the same leader entry may
             // install the shared metadata owner first. Its valid owner wins;
             // the losing temporary reservation is released by the codec.
-            Err(_) if retained.ensure_charged().is_ok()=>Ok(retained),
-            Err(error)=>Err(error),
+            Err(_) if retained.ensure_charged().is_ok() => Ok(retained),
+            Err(error) => Err(error),
         }
     }
     pub fn decode(
@@ -111,13 +157,13 @@ impl<D: CommandData> OwnedRaftEntry<D> {
         let entry = owned.payload()?.clone();
         let owner = owned.decode_owner()?;
         if let Some(existing) = entry.owner.get() {
-            if !Arc::ptr_eq(existing, &owner) {
+            if !matches!(existing,EntryOwner::Decode(existing) if Arc::ptr_eq(existing,&owner)) {
                 return Err(invalid("entry owner changed"));
             }
         } else {
             entry
                 .owner
-                .set(owner)
+                .set(EntryOwner::Decode(owner))
                 .map_err(|_| invalid("entry owner raced"))?;
         }
         entry.ensure_charged()?;
@@ -169,7 +215,7 @@ impl<D: CommandData> OwnedPayload for OwnedRaftEntry<D> {
             Payload::Blank => 0,
         };
         inner
-            .checked_add(size_of::<Payload<D>>() + size_of::<OnceLock<Arc<ScratchLease>>>() + 128)
+            .checked_add(size_of::<Payload<D>>() + size_of::<OnceLock<EntryOwner>>() + 256)
             .ok_or_else(|| invalid("entry heap overflow"))
     }
     fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
@@ -177,12 +223,12 @@ impl<D: CommandData> OwnedPayload for OwnedRaftEntry<D> {
             command.attach_from_codec(owner.clone())?;
         }
         if let Some(existing) = self.owner.get() {
-            if !Arc::ptr_eq(existing, &owner) {
+            if !matches!(existing,EntryOwner::Decode(existing) if Arc::ptr_eq(existing,&owner)) {
                 return Err(invalid("entry decode owner changed"));
             }
         } else {
             self.owner
-                .set(owner)
+                .set(EntryOwner::Decode(owner))
                 .map_err(|_| invalid("entry decode owner raced"))?;
         }
         Ok(())
@@ -235,21 +281,36 @@ enum BoundedPayload<D: CommandData> {
     Membership(BoundedMembership),
 }
 struct BoundedMembership(Membership);
+#[derive(Clone, Debug)]
+pub(crate) struct BoundedStoredMembership(
+    pub openraft::StoredMembership<CommittedLeaderId, Membership>,
+);
+impl Serialize for BoundedStoredMembership {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for BoundedStoredMembership {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Stored {
+            log_id: Option<LogId>,
+            membership: BoundedMembership,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(Self(openraft::StoredMembership::new(
+            stored.log_id,
+            stored.membership.0,
+        )))
+    }
+}
 pub(crate) fn stored_membership(
     input: &[u8],
 ) -> Result<openraft::StoredMembership<CommittedLeaderId, Membership>, ProtocolError> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Stored {
-        log_id: Option<LogId>,
-        membership: BoundedMembership,
-    }
-    let stored: Stored =
+    let stored: BoundedStoredMembership =
         serde_json::from_slice(input).map_err(|_| invalid("invalid bounded stored membership"))?;
-    Ok(openraft::StoredMembership::new(
-        stored.log_id,
-        stored.membership.0,
-    ))
+    Ok(stored.0)
 }
 impl<'de> Deserialize<'de> for BoundedMembership {
     fn deserialize<T: Deserializer<'de>>(deserializer: T) -> Result<Self, T::Error> {

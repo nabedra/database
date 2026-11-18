@@ -3,7 +3,7 @@
 use super::{
     machine::*,
     model::*,
-    service::{ControlHandle, OperatorPolicy},
+    service::{ControlHandle, InventoryPage, OperatorPolicy},
 };
 use crate::{
     config::WorkerResources,
@@ -28,6 +28,9 @@ use std::{
     },
 };
 use uuid::Uuid;
+mod growth;
+mod pool_drain;
+mod restart;
 
 struct Directory(PathBuf);
 impl Directory {
@@ -145,7 +148,11 @@ impl Fixture {
     ) -> GroupRecord {
         let generation = Uuid::new_v4();
         let group = GroupIdentity {
-            group_id: Uuid::new_v4(),
+            group_id: if kind == GroupKind::Control {
+                self.machine.store().identity().group_id
+            } else {
+                Uuid::new_v4()
+            },
             kind,
             ..self.machine.store().identity().clone()
         };
@@ -519,6 +526,133 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
     assert_eq!(bytes.as_ref(), b"null");
 }
 
+#[tokio::test]
+async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_sealed_placement() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool).await;
+    fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let ready = fixture.add_ready(owner, &mut Vec::new()).await;
+    let mut members = Vec::new();
+    for index in 1..=3 {
+        let worker = if index == 1 {
+            owner
+        } else {
+            fixture.enroll(index as u128).await
+        };
+        members.push(ReplicaMember {
+            node_id: index,
+            worker_id: worker.worker_id,
+            pool_id: Uuid::new_v4(),
+        });
+    }
+    let group = GroupIdentity {
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Data {
+            table_id: Uuid::new_v4(),
+            shard_id: Uuid::new_v4(),
+        },
+        ..scope
+    };
+    let generation = Uuid::new_v4();
+    let initial = |replicas: Vec<ReplicaMember>, generation| {
+        let proof = GroupMembershipStamp {
+            group: group.clone(),
+            generation,
+            replica_count: replicas.len() as u64,
+            replica_root: group_root(
+                replicas.len() as u64,
+                replicas.iter().fold(group_seed(), group_step),
+            ),
+            applied_at: AppliedPosition {
+                term: 1,
+                node_id: 1,
+                index: 4,
+            },
+            authority: ready.view.authority(),
+        };
+        let mut authorization = authorization();
+        authorization.evidence = serialized_digest(&proof).unwrap();
+        authorization.subject = owner.certificate_sha256;
+        ControlCommand::RegisterInitialData {
+            operation_id: Uuid::new_v4(),
+            proof,
+            replicas: Page::new(replicas).unwrap(),
+            authorization,
+        }
+    };
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginGroup {
+                operation_id: Uuid::new_v4(),
+                generation,
+                identity: group.clone(),
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::GroupBuilding { count: 0, .. }
+    ));
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![members[0].clone()]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { count: 1, .. }
+    ));
+    let mut substituted = members.clone();
+    substituted[0].pool_id = Uuid::new_v4();
+    assert_eq!(
+        fixture.apply(initial(substituted, generation)).await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    let reply = fixture.apply(initial(members.clone(), generation)).await;
+    assert_eq!(
+        reply,
+        ControlReply::GroupRegistered {
+            group_id: group.group_id,
+            count: 3,
+            root: group_root(3, members.iter().fold(group_seed(), group_step)),
+        }
+    );
+    assert_eq!(
+        fixture.apply(initial(members.clone(), generation)).await,
+        reply
+    );
+    assert_eq!(
+        fixture
+            .apply(initial(members.clone(), Uuid::new_v4()))
+            .await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    let state = fixture.state().await;
+    assert_eq!(state.group_inventory_revision, 2);
+    assert_eq!(state.group_count, 2);
+    fixture
+        .machine
+        .store()
+        .read(BUDGET, move |view| {
+            let record: GroupRecord =
+                decode(view.get(&key(GROUPS, group.group_id))?.unwrap().as_ref())?;
+            assert_eq!(record.generation, generation);
+            assert_eq!(record.replica_count, 3);
+            for member in members {
+                let node = view.get(&member_key(generation, member.node_id))?.unwrap();
+                let worker = view
+                    .get(&member_worker_key(generation, member.worker_id))?
+                    .unwrap();
+                assert_eq!(decode::<ReplicaMember>(node.as_ref())?, member);
+                assert_eq!(decode::<ReplicaMember>(worker.as_ref())?, member);
+            }
+            view.encode(&())
+        })
+        .await
+        .unwrap();
+}
+
 /// Model only: forwards to real native storage, not a quorum/leader shortcut
 /// used in production. The hosted integration supplies actual OpenRaft.
 struct NativeModelConsensus {
@@ -827,6 +961,17 @@ async fn r04_control_cold_fence_waits_for_every_group_and_old_worker_exclusion()
             required_groups: 2
         }
     );
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::BeginColdFence {
+                operation_id: Uuid::new_v4(),
+                expected: next,
+                next_run: ready.view.run_id,
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
     assert_eq!(fixture.state().await.ready, next);
 }
 
@@ -1120,4 +1265,138 @@ async fn c07_q06_control_authorized_terminal_metadata_progresses_with_query_slot
     };
     assert_eq!(*statement, expected);
     drop((reply, full_data, occupied_query, endpoint));
+}
+
+#[tokio::test]
+async fn u01_api_ingress_enrollment_never_grants_worker_readiness_or_replica_proofs() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool).await;
+    fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let ready = fixture.add_ready(owner, &mut Vec::new()).await;
+    let api = ApiEnrollment {
+        database: scope.database.clone(),
+        enrollment: worker(800),
+    };
+    let previous = WorkerIdentity::from(api.transport());
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::EnrollApi {
+                operation_id: Uuid::new_v4(),
+                expected: None,
+                next: api.clone(),
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::Enrolled(previous)
+    );
+    let mut rotated = api.clone();
+    rotated.enrollment.incarnation = Uuid::new_v4();
+    rotated.enrollment.certificate_sha256 = hash(b"rotated API certificate");
+    rotated.enrollment.enrollment_revision += 1;
+    let current = WorkerIdentity::from(rotated.transport());
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::EnrollApi {
+                operation_id: Uuid::new_v4(),
+                expected: Some(previous),
+                next: rotated.clone(),
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::Enrolled(current)
+    );
+    assert_eq!(fixture.state().await.ready, ready);
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: ready.view,
+                target: current,
+            })
+            .await,
+        ControlReply::Rejected(_)
+    ));
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::Enroll {
+                operation_id: Uuid::new_v4(),
+                expected: None,
+                next: rotated.enrollment.clone(),
+                authorization: authorization(),
+                previous_process: None,
+            })
+            .await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    let state = fixture.state().await;
+    let model = Arc::new(NativeModelConsensus {
+        machine: fixture.machine.clone(),
+        next: AtomicU64::new(fixture.next),
+        reads: AtomicU64::new(0),
+    });
+    let handle = ControlHandle::new(
+        fixture.machine.clone(),
+        model,
+        OperatorPolicy {
+            policy: authorization().policy,
+            certificate_pins: Default::default(),
+        },
+    );
+    let queue_scope = QueueScope {
+        cluster_id: scope.cluster_id,
+        database: scope.database.clone(),
+    };
+    assert!(
+        handle
+            .service_role(
+                &queue_scope,
+                previous,
+                ServiceAction::ApiIngress,
+                scope.clone()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        handle
+            .service_role(
+                &queue_scope,
+                current,
+                ServiceAction::ApiIngress,
+                scope.clone()
+            )
+            .await
+            .unwrap()
+            .owner,
+        Some(owner)
+    );
+    for action in [
+        ServiceAction::Owner,
+        ServiceAction::TimestampProof {
+            source_group: scope.group_id,
+        },
+        ServiceAction::ParticipantProof {
+            source_group: scope.group_id,
+        },
+    ] {
+        assert!(
+            handle
+                .service_role(&queue_scope, current, action, scope.clone())
+                .await
+                .is_err()
+        );
+    }
+    let page: InventoryPage<ApiEnrollment> = decode(
+        handle
+            .apis(state.enrollment_revision, None)
+            .await
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    assert_eq!(&*page.items, &[rotated]);
+    assert!(page.done);
+    assert!(handle.worker(current.worker_id).await.unwrap().is_none());
 }

@@ -28,6 +28,7 @@ Issues = "https://github.com/zPy52/nabedra-database/issues"
 database = []
 gateway = ["httpx>=0.27,<1"]
 aws = ["boto3>=1.34,<2"]
+eks-replacement = ["boto3>=1.34,<2", "cryptography>=40"]
 
 [project.scripts]
 nabedra = "nabedra.cli:main"

@@ -17,6 +17,10 @@ use openraft::vote::RaftLeaderId;
 use std::time::Duration;
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+#[path = "../../../tests/oltp_native_durability/fixture.rs"]
+mod native_durability;
+
 #[derive(Serialize, Deserialize)]
 struct Command(PreparedWrite);
 impl std::fmt::Display for Command {
@@ -39,19 +43,39 @@ openraft::declare_raft_types!(TestConfig:D=OwnedCommand<Command>,R=(),NodeId=u64
 impl TypedConfig for TestConfig {
     type Command = Command;
     type Reply = ();
-    fn accepts(kind:&GroupKind)->bool {matches!(kind,GroupKind::Catalog)}
+    fn accepts(kind: &GroupKind) -> bool {
+        matches!(kind, GroupKind::Catalog)
+    }
 }
 
-#[derive(Serialize,Deserialize)]
-struct MetadataCommand{value:u64}
-impl std::fmt::Display for MetadataCommand{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.write_str("control.metadata")}}
-impl OwnedPayload for MetadataCommand{
-    fn heap_bytes(&self)->Result<usize,ProtocolError>{Ok(0)}
-    fn attach_fields(&self,_:Arc<ScratchLease>)->Result<(),ProtocolError>{Ok(())}
-    fn fields_attached(&self)->bool{true}
+#[derive(Serialize, Deserialize)]
+struct MetadataCommand {
+    value: u64,
+}
+impl std::fmt::Display for MetadataCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("control.metadata")
+    }
+}
+impl OwnedPayload for MetadataCommand {
+    fn heap_bytes(&self) -> Result<usize, ProtocolError> {
+        Ok(0)
+    }
+    fn attach_fields(&self, _: Arc<ScratchLease>) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+    fn fields_attached(&self) -> bool {
+        true
+    }
 }
 openraft::declare_raft_types!(ControlTestConfig:D=OwnedCommand<MetadataCommand>,R=(),NodeId=u64,Node=ReplicaMember,Entry=OwnedRaftEntry<MetadataCommand>);
-impl TypedConfig for ControlTestConfig{type Command=MetadataCommand;type Reply=();fn accepts(kind:&GroupKind)->bool{matches!(kind,GroupKind::Control)}}
+impl TypedConfig for ControlTestConfig {
+    type Command = MetadataCommand;
+    type Reply = ();
+    fn accepts(kind: &GroupKind) -> bool {
+        matches!(kind, GroupKind::Control)
+    }
+}
 struct Dir(std::path::PathBuf);
 impl Drop for Dir {
     fn drop(&mut self) {
@@ -110,6 +134,167 @@ fn id(index: u64) -> LogId {
 }
 fn blank(index: u64) -> OwnedRaftEntry<Command> {
     OwnedRaftEntry::new(id(index), Payload::Blank)
+}
+
+/// O06/O11, C07/F03: hold the actual WAL sync and observe the typed callback.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "run with server/tests/oltp_native_durability.py on Linux"]
+async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use self::native_durability::{arm, publish, root};
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let root = root();
+        let path = root.join("pool");
+        let shared = WorkerSharedResources::new(
+            2,
+            WorkerResources {
+                max_threads: 4,
+                ..Default::default()
+            },
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let identity = PoolIdentity {
+            engine: "oltp".into(),
+            pool_format_version: 1,
+            cluster_id: Uuid::new_v4(),
+            worker_id: Uuid::new_v4(),
+            pool_id: Uuid::new_v4(),
+        };
+        let group_id = GroupIdentity {
+            cluster_id: identity.cluster_id,
+            database: Text::try_from("default").unwrap(),
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Catalog,
+            group_format_version: 1,
+        };
+        let pool = OltpPool::open_development(&path, identity.clone(), shared.clone()).unwrap();
+        let target = pool.group(group_id.clone()).await.unwrap();
+        let log = TypedLogStore::<TestConfig>::new(target, 1).await.unwrap();
+        let healthy = OltpPool::open_development(
+            root.join("healthy"),
+            PoolIdentity {
+                pool_id: Uuid::new_v4(),
+                ..identity.clone()
+            },
+            shared.clone(),
+        )
+        .unwrap();
+        let control = healthy
+            .group(GroupIdentity {
+                group_id: Uuid::new_v4(),
+                kind: GroupKind::Control,
+                ..group_id.clone()
+            })
+            .await
+            .unwrap();
+        let mut control = TypedLogStore::<ControlTestConfig>::new(control, 1)
+            .await
+            .unwrap();
+        let baseline = shared.scheduler().usage();
+        arm(&root, "gate");
+
+        let vote = Vote::new_committed(2, 1);
+        control.save_vote(&vote).await.unwrap();
+        assert!(!root.join("entered").exists(), "matched an unrelated WAL");
+
+        let (sender, mut callback) = TestConfig::oneshot();
+        let first = tokio::spawn({
+            let mut log = log.clone();
+            async move { log.append([blank(0)], IOFlushed::signal(sender)).await }
+        });
+        while !root.join("entered").is_file() {
+            assert!(
+                !first.is_finished(),
+                "append finished without matching its WAL"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!root.join("synced").exists());
+        assert!(matches!(
+            callback.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let callback = Arc::new(Mutex::new(callback));
+        let first_ack_observed = Arc::new(AtomicBool::new(false));
+        *log.append_hook.lock().unwrap() = Some(Arc::new({
+            let root = root.clone();
+            let callback = callback.clone();
+            let observed = first_ack_observed.clone();
+            move || {
+                assert!(root.join("synced").is_file());
+                assert!(matches!(callback.lock().unwrap().try_recv(), Ok(Ok(()))));
+                observed.store(true, Ordering::Release);
+            }
+        }));
+        let (sender, mut next_callback) = TestConfig::oneshot();
+        let second = tokio::spawn({
+            let mut log = log.clone();
+            async move { log.append([blank(1)], IOFlushed::signal(sender)).await }
+        });
+        while log.pending.count.load(Ordering::Acquire) != 2 {
+            assert!(!second.is_finished());
+            tokio::task::yield_now().await;
+        }
+        assert!(log.writes.try_lock().is_err());
+        assert!(shared.apply_bytes_used() > 0);
+        assert_eq!(shared.scheduler().usage()[0].1, 1);
+        assert_eq!(control.read_vote().await.unwrap(), Some(vote));
+        let vote = Vote::new_committed(3, 1);
+        control.save_vote(&vote).await.unwrap();
+        assert_eq!(control.read_vote().await.unwrap(), Some(vote));
+        assert!(!root.join("synced").exists());
+        let mut drain = Box::pin(log.drain());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        assert!(matches!(
+            callback.lock().unwrap().try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            next_callback.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        publish(&root, "release", b"");
+
+        next_callback.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        drain.await;
+        assert!(first_ack_observed.load(Ordering::Acquire));
+        assert_eq!(log.pending.count.load(Ordering::Acquire), 0);
+        assert_eq!(shared.apply_bytes_used(), 0);
+        assert_eq!(shared.working_decode_bytes(), 0);
+        assert_eq!(shared.control_bytes_used(), 0);
+        assert_eq!(shared.scheduler().usage(), baseline);
+        let mut log = log;
+        log.save_committed(Some(id(0))).await.unwrap();
+        drop(log);
+        drop(pool);
+
+        let pool = OltpPool::open_development(path, identity, shared).unwrap();
+        let group = pool.retained_group(group_id).await.unwrap();
+        let mut log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
+        let entries = log.try_get_log_entries(..).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
+            [id(0), id(1)]
+        );
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
+        assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(1)));
+        publish(&root, "ordering-verified", b"");
+    })
+    .await
+    .expect("typed actual WAL sync watchdog");
 }
 
 /// O05/O11: range truncation and metadata are one native batch, while an
@@ -270,45 +455,160 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
 /// All Query slots can remain held while Data-group vote metadata progresses.
 #[tokio::test]
 async fn c07_f03_cancelled_append_waiting_for_native_slot_stays_tracked_while_votes_progress() {
-    tokio::time::timeout(Duration::from_secs(15),async {
-        let f=Fixture::new().await;
-        let shared=f.log.group().resources();
-        let query=shared.prepare(ExecutionClass::Query).await.unwrap();
-        let (sent,mut callback)=TestConfig::oneshot();
-        let mut append=f.log.clone();let append=tokio::spawn(async move{append.append([blank(0)],IOFlushed::signal(sent)).await});
-        while f.log.pending.count.load(std::sync::atomic::Ordering::Acquire)==0{tokio::task::yield_now().await;}
-        append.abort();assert!(append.await.unwrap_err().is_cancelled());
-        let mut vote=f.log.clone();
-        vote.save_vote(&Vote::new_committed(3,1)).await.unwrap();
-        assert_eq!(vote.read_vote().await.unwrap(),Some(Vote::new_committed(3,1)));
-        assert!(tokio::time::timeout(Duration::from_millis(20),&mut callback).await.is_err());
-        let log=f.log.clone();let drain=tokio::spawn(async move{log.drain().await});
-        tokio::task::yield_now().await;assert!(!drain.is_finished());
-        assert_eq!(shared.scheduler().usage()[0].1,0);
-        drop(query);callback.await.unwrap().unwrap();drain.await.unwrap();
-        let mut log=f.log.clone();assert_eq!(log.get_log_state().await.unwrap().last_log_id,Some(id(0)));
-    }).await.expect("native-wait ownership watchdog");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let shared = f.log.group().resources();
+        let query = shared.prepare(ExecutionClass::Query).await.unwrap();
+        let (sent, mut callback) = TestConfig::oneshot();
+        let mut append = f.log.clone();
+        let append =
+            tokio::spawn(async move { append.append([blank(0)], IOFlushed::signal(sent)).await });
+        while f
+            .log
+            .pending
+            .count
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        let mut vote = f.log.clone();
+        vote.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
+        assert_eq!(
+            vote.read_vote().await.unwrap(),
+            Some(Vote::new_committed(3, 1))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut callback)
+                .await
+                .is_err()
+        );
+        let log = f.log.clone();
+        let drain = tokio::spawn(async move { log.drain().await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        assert_eq!(shared.scheduler().usage()[0].1, 0);
+        drop(query);
+        callback.await.unwrap().unwrap();
+        drain.await.unwrap();
+        let mut log = f.log.clone();
+        assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(0)));
+    })
+    .await
+    .expect("native-wait ownership watchdog");
 }
 
 /// C07/M02: actual Control entry ownership and WAL recovery do not depend on
 /// free Data wire bytes, Data working memory or a Query native slot.
 #[tokio::test]
 async fn c07_m02_control_append_and_read_progress_with_all_data_memory_and_query_capacity_held() {
-    let f=Fixture::new().await;
-    let shared=f.log.group().resources().clone();
-    let mut identity=f.log.group().identity().clone();identity.group_id=Uuid::new_v4();identity.kind=GroupKind::Control;
-    let mut control=TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(),1).await.unwrap();
-    let limits=WorkerResources{max_threads:4,..Default::default()};
-    let remaining=limits.working_bytes()-shared.scheduler().usage()[0].2;
-    let working=shared.scheduler().charge_memory(shared.scheduler_node_id(),remaining).unwrap();
-    assert!(shared.reserve_scratch(ByteClass::Data,1).is_err());
-    let data=shared.allocate_bytes(ByteClass::Data,shared.config().control_bytes-shared.config().progress_bytes).unwrap();
-    let query=shared.prepare(ExecutionClass::Query).await.unwrap();
-    let command=OwnedCommand::new_owned(MetadataCommand{value:42},&shared,ByteClass::Progress).unwrap();
-    tokio::time::timeout(Duration::from_secs(5),control.append([OwnedRaftEntry::new(id(0),Payload::Normal(command))],IOFlushed::noop())).await.unwrap().unwrap();
-    let read=tokio::time::timeout(Duration::from_secs(5),control.try_get_log_entries(0..1)).await.unwrap().unwrap();
-    let Payload::Normal(command)=read[0].payload() else{panic!("normal")};assert_eq!(command.payload().unwrap().value,42);
-    assert_eq!(shared.working_decode_bytes(),0);
-    drop(read);drop(query);drop(data);drop(working);
-    assert_eq!(shared.buffer_bytes_used(ByteClass::Progress),0);
+    let f = Fixture::new().await;
+    let shared = f.log.group().resources().clone();
+    let mut identity = f.log.group().identity().clone();
+    identity.group_id = Uuid::new_v4();
+    identity.kind = GroupKind::Control;
+    let mut control =
+        TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(), 1)
+            .await
+            .unwrap();
+    let limits = WorkerResources {
+        max_threads: 4,
+        ..Default::default()
+    };
+    let remaining = limits.working_bytes() - shared.scheduler().usage()[0].2;
+    let working = shared
+        .scheduler()
+        .charge_memory(shared.scheduler_node_id(), remaining)
+        .unwrap();
+    assert!(shared.reserve_scratch(ByteClass::Data, 1).is_err());
+    let data = shared
+        .allocate_bytes(
+            ByteClass::Data,
+            shared.config().control_bytes - shared.config().progress_bytes,
+        )
+        .unwrap();
+    let query = shared.prepare(ExecutionClass::Query).await.unwrap();
+    let command =
+        OwnedCommand::new_owned(MetadataCommand { value: 42 }, &shared, ByteClass::Progress)
+            .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        control.append(
+            [OwnedRaftEntry::new(id(0), Payload::Normal(command))],
+            IOFlushed::noop(),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let read = tokio::time::timeout(Duration::from_secs(5), control.try_get_log_entries(0..1))
+        .await
+        .unwrap()
+        .unwrap();
+    let Payload::Normal(command) = read[0].payload() else {
+        panic!("normal")
+    };
+    assert_eq!(command.payload().unwrap().value, 42);
+    assert_eq!(shared.working_decode_bytes(), 0);
+    drop(read);
+    drop(query);
+    drop(data);
+    drop(working);
+    assert_eq!(shared.buffer_bytes_used(ByteClass::Progress), 0);
+}
+
+/// O01/C07: transient Progress wire exhaustion must not become a fatal Raft
+/// WriteLogs error after the proposal already owns its command. The live host
+/// uses bounded entry residency and acknowledges only the actual sync.
+#[tokio::test]
+async fn o01_live_append_uses_residency_with_progress_wire_completely_full() {
+    let f = Fixture::new().await;
+    let shared = f.log.group().resources().clone();
+    let mut identity = f.log.group().identity().clone();
+    identity.group_id = Uuid::new_v4();
+    identity.kind = GroupKind::Control;
+    let registry = crate::oltp_replication::multiplex::EndpointRegistry::new(shared.clone());
+    let group = registry.reserve(identity.clone()).unwrap();
+    let resident = group.activate_replica(1, &shared).unwrap();
+    let mut log =
+        TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(), 1)
+            .await
+            .unwrap()
+            .with_resident(resident.clone())
+            .unwrap();
+    let command =
+        OwnedCommand::new_owned(MetadataCommand { value: 73 }, &shared, ByteClass::Progress)
+            .unwrap();
+    let remaining = shared.config().progress_bytes - shared.buffer_bytes_used(ByteClass::Progress);
+    let full = shared
+        .allocate_bytes(ByteClass::Progress, remaining)
+        .unwrap();
+    assert!(shared.reserve_scratch(ByteClass::Progress, 1).is_err());
+    let (send, done) = ControlTestConfig::oneshot();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        log.append(
+            [OwnedRaftEntry::new(id(0), Payload::Normal(command))],
+            IOFlushed::signal(send),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), done)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(0)));
+    log.drain().await;
+    assert_eq!(resident.log_metadata_used(), 0);
+    drop(full);
+    let read = log.try_get_log_entries(0..1).await.unwrap();
+    let Payload::Normal(command) = read[0].payload() else {
+        panic!("normal")
+    };
+    assert_eq!(command.payload().unwrap().value, 73);
 }

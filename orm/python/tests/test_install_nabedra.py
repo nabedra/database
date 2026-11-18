@@ -51,7 +51,7 @@ class InstallerTests(unittest.TestCase):
                     args.append('--with-s3')
                 with patch.object(installer.shutil, 'which', return_value='/tool'), patch.object(installer.venv.EnvBuilder, 'create'), patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(stdout='nabedra-db 0.1.1 oltp')) as run, patch.object(installer.shutil, 'copy2'), contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(installer.main(args), 0)
-                    self.assertEqual(run.call_args_list[0].args[0][-1], 'oltp,s3' if with_s3 else 'oltp')
+                    self.assertEqual(run.call_args_list[0].args[0][-1], 'oltp-backup-s3' if with_s3 else 'oltp')
         with tempfile.TemporaryDirectory() as temporary:
             with patch.object(installer.shutil, 'which', return_value='/tool'), patch.object(installer.venv.EnvBuilder, 'create') as create, patch.object(installer.subprocess, 'run', return_value=SimpleNamespace(stdout='nabedra-db 0.1.1 olap')), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(installer.main(['--prefix', str(Path(temporary) / 'install'), '--engine', 'oltp']), 1)

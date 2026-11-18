@@ -72,6 +72,8 @@ pub struct TypedLogStore<C: TypedConfig> {
     writes: Arc<Mutex<()>>,
     _config: PhantomData<C>,
     pending: Arc<Pending>,
+    resident: Option<super::multiplex::ReplicaLease>,
+    node_id: u64,
     _writer: Arc<WriterState>,
     #[cfg(test)]
     append_hook: Arc<std::sync::Mutex<Option<AppendHook>>>,
@@ -158,6 +160,8 @@ impl<C: TypedConfig> TypedLogStore<C> {
             writes: writer.order.clone(),
             _config: PhantomData,
             pending: writer.pending.clone(),
+            resident: None,
+            node_id,
             _writer: writer,
             #[cfg(test)]
             append_hook: Arc::new(std::sync::Mutex::new(None)),
@@ -165,6 +169,22 @@ impl<C: TypedConfig> TypedLogStore<C> {
     }
     pub fn group(&self) -> &GroupStore {
         &self.store
+    }
+    pub(crate) fn with_resident(
+        mut self,
+        resident: super::multiplex::ReplicaLease,
+    ) -> Result<Self, ProtocolError> {
+        if resident.node_id() != self.node_id
+            || resident.identity() != self.store.identity()
+            || !resident.same_resources(self.store.resources())
+        {
+            return Err(protocol("Raft log residency belongs to another group"));
+        }
+        self.resident = Some(resident);
+        Ok(self)
+    }
+    pub(crate) fn has_resident(&self) -> bool {
+        self.resident.is_some()
     }
     pub async fn drain(&self) {
         loop {
@@ -527,6 +547,10 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        if matches!(self.store.identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+            tracing::debug!(group=%self.store.identity().group_id, node=self.node_id,
+                index=id.map(|id| id.index), "typed Raft durable commit saved");
+        }
         Ok(())
     }
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
@@ -543,18 +567,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // Own a bounded append before the first write. The typed host config
         // admits one client write per batch and one replicated payload per RPC.
         // This is a transaction/frame bound, never a total log-size bound.
-        let ownership = match self.store.resources().reserve_scratch(
-            self.byte_class(),
-            4096 + MAX_COLLECTED * std::mem::size_of::<OwnedRaftEntry<C::Command>>(),
-        ) {
-            Ok(lease) => Arc::new(lease),
-            Err(error) => {
-                let error = disk(error);
-                callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
-                return Err(error);
-            }
-        };
-        let mut batch = Vec::with_capacity(MAX_COLLECTED);
+        let mut batch = Vec::new();
         let mut previous: Option<u64> = None;
         for entry in entries {
             if batch.len() == MAX_COLLECTED
@@ -565,20 +578,32 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 return Err(error);
             }
             previous = Some(entry.index());
-            let entry = match entry.charge_leader(self.store.resources(), self.byte_class()) {
+            let charged = match &self.resident {
+                Some(resident) => entry.charge_resident(resident),
+                None => entry.charge_leader(self.store.resources(), self.byte_class()),
+            };
+            let entry = match charged {
                 Ok(entry) => entry,
                 Err(error) => {
+                    tracing::error!(group=%self.store.identity().group_id,kind=?self.store.identity().kind,stage="append_entry_metadata",progress_used=self.store.resources().buffer_bytes_used(ByteClass::Progress),resident_entry_used=self.resident.as_ref().map(|resident|resident.log_metadata_used()),code=?error.code,outcome=?error.outcome,"typed append metadata reservation failed");
                     let error = disk(error);
                     callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
                     return Err(error);
                 }
             };
+            if batch.try_reserve_exact(1).is_err() {
+                let error =
+                    invalid("native append container allocation failed inside charged residency");
+                callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+                return Err(error);
+            }
             batch.push(entry);
         }
         if batch.is_empty() {
             callback.io_completed(Ok(()));
             return Ok(());
         }
+        let batch = Arc::new(batch);
         let store = self.store.clone();
         let writer = self._writer.clone();
         let writes = self.writes.clone();
@@ -589,11 +614,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
         tokio::spawn(async move {
+            let _retained_entries=batch.clone();
             let _writer = writer;
             let _pending = pending;
-            let _ownership = ownership;
             let _order = writes.lock_owned().await;
-            let result = async {
+            let result: io::Result<()> = async {
                 let class = match store.identity().kind {
                     GroupKind::Control | GroupKind::Timestamps | GroupKind::Status { .. } => {
                         ExecutionClass::Control
@@ -619,7 +644,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                             }
                         }
                         let mut counter = Counter(0);
-                        for entry in &batch {
+                        for entry in batch.iter() {
                             serde_json::to_writer(&mut counter, entry)
                                 .map_err(|_| protocol("oversized or invalid Raft append batch"))?;
                         }
@@ -639,7 +664,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                             if let Some(hook) = append_hook {
                                 hook();
                             }
-                            for entry in batch {
+                            for entry in batch.iter() {
                                 entry.ensure_charged()?;
                                 let index = entry.index();
                                 let bytes = tx.encode_value(&entry)?;
@@ -656,6 +681,9 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 Ok(())
             }
             .await;
+            if let Err(error) = &result {
+                tracing::error!(group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
+            }
             callback.io_completed(
                 result
                     .as_ref()
@@ -764,6 +792,7 @@ fn bounds<R: RangeBounds<u64>>(range: &R) -> Option<(u64, Option<u64>)> {
     }
 }
 fn disk(error: ProtocolError) -> io::Error {
+    tracing::error!(code=?error.code,outcome=?error.outcome,"typed native log operation failed");
     io::Error::other(error.to_string())
 }
 fn invalid(message: &'static str) -> io::Error {

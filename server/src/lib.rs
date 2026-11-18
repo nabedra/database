@@ -19,11 +19,20 @@ pub mod engine;
 pub mod executor;
 #[cfg(feature = "olap")]
 pub mod maintenance;
+pub mod migration_interchange;
 pub(crate) mod network;
 #[cfg(feature = "olap")]
 pub mod node;
+#[cfg(feature = "olap")]
+pub mod olap_export;
 #[cfg(feature = "oltp")]
 pub mod oltp;
+#[cfg(all(test, feature = "oltp"))]
+mod oltp_acceptance;
+#[cfg(feature = "oltp")]
+pub(crate) mod oltp_backup_repository;
+#[cfg(feature = "oltp")]
+pub mod oltp_deployment;
 #[cfg(feature = "oltp")]
 pub mod oltp_replication;
 #[cfg(feature = "oltp")]
@@ -45,6 +54,8 @@ pub mod storage;
 #[cfg(not(feature = "olap"))]
 #[path = "storage/shared.rs"]
 pub mod storage;
+#[cfg(unix)]
+pub(crate) mod supervisor;
 #[cfg(all(test, feature = "olap"))]
 #[path = "../tests/support/storage.rs"]
 pub(crate) mod test_storage;

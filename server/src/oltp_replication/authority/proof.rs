@@ -33,7 +33,7 @@ impl AuthenticatedAck {
 
 /// This serialized record goes into the timestamp command only through the
 /// private leader service. It cannot authorize a raw worker client_write call.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SealedTerminalProof {
     pub(super) statement: TerminalCopyStatement,
@@ -192,6 +192,7 @@ mod tests {
             },
             terminal_version: 7,
             response_hash: Digest::from_bytes([3; 32]),
+            terminal_digest: Some(Digest::from_bytes([4; 32])),
             pin_identity: PinIdentity {
                 run_id,
                 request_id,

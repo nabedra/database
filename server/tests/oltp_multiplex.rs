@@ -118,6 +118,7 @@ struct EchoEndpoint {
     entered: Semaphore,
     release: Semaphore,
     calls: AtomicUsize,
+    nested: RwLock<Option<(WorkerClient, Arc<WorkerSharedResources>)>>,
 }
 impl Endpoint for EchoEndpoint {
     fn preflight<'a>(
@@ -127,7 +128,13 @@ impl Endpoint for EchoEndpoint {
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
             let class = match session.purpose() {
-                Purpose::Authority => TrafficClass::Authority,
+                Purpose::Authority if session.group().kind == GroupKind::Control => {
+                    TrafficClass::Authority
+                }
+                Purpose::Authority => TrafficClass::ServiceAuthority,
+                Purpose::ControlDelegation if session.group().kind == GroupKind::Control => {
+                    TrafficClass::ControlDelegation
+                }
                 Purpose::QueueControl if header == b"state" => TrafficClass::QueueControl,
                 Purpose::QueueControl => return Err(invalid("data method on control lane")),
                 Purpose::QueueData => {
@@ -151,10 +158,32 @@ impl Endpoint for EchoEndpoint {
     fn handle<'a>(
         &'a self,
         session: AuthenticatedSession,
-        _: nabedra_database_server::oltp::pool::ChargedBytes,
+        header: nabedra_database_server::oltp::pool::ChargedBytes,
         _: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
+            if session.purpose() == Purpose::Authority && header.as_slice() == b"nested" {
+                // Hold every ordinary incoming/outgoing authority slot while
+                // the read obtains its nested delegation over real mTLS.
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+                let (client, shared) = self.nested.read().unwrap().as_ref().unwrap().clone();
+                let nested = client
+                    .request(
+                        session.group(),
+                        session.local().worker_id,
+                        Purpose::ControlDelegation,
+                        shared.copy_bytes_in(ByteClass::Progress, b"barrier")?,
+                        std::array::from_fn(|_| None),
+                        16384,
+                    )
+                    .await?;
+                assert_eq!(nested.purpose(), Purpose::ControlDelegation);
+                assert_eq!(
+                    nested.decode_header::<Echo>()?.group,
+                    session.group().group_id
+                );
+            }
             self.calls.fetch_add(1, Ordering::AcqRel);
             let class = if session.purpose() == Purpose::QueueData {
                 ByteClass::Data
@@ -225,12 +254,14 @@ async fn c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during
         entered: Semaphore::new(0),
         release: Semaphore::new(0),
         calls: AtomicUsize::new(0),
+        nested: RwLock::new(None),
     });
     let resident = registry.reserve(control.clone()).unwrap();
     for purpose in [
         Purpose::QueueControl,
         Purpose::QueueData,
         Purpose::Authority,
+        Purpose::ControlDelegation,
         Purpose::Raft,
     ] {
         resident.bind(purpose, endpoint.clone()).unwrap();
@@ -271,11 +302,13 @@ async fn c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during
     .unwrap();
     let client = source.client();
     let target = enrollments[1].worker_id;
+    *endpoint.nested.write().unwrap() = Some((client.clone(), a.clone()));
     let (stop, shutdown) = oneshot::channel();
     let mut server_task = tokio::spawn(server.run(listener, async {
         let _ = shutdown.await;
     }));
     let mut pending = None;
+    let mut nested_pending = tokio::task::JoinSet::new();
     let result = AssertUnwindSafe(timeout(Duration::from_secs(30), async {
         for identity in [&control, &timestamps] {
             let reply = client
@@ -403,9 +436,66 @@ async fn c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during
         let reply = pending.as_mut().unwrap().await.unwrap().unwrap();
         drop(reply);
         pending = None;
+        // O06/O22 C07/M02: the dependent barrier must remain admissible
+        // with all four ordinary authority calls simultaneously in flight.
+        let slots = TransportConfig::default().handler_slots[TrafficClass::Authority as usize];
+        for _ in 0..slots {
+            let client = client.clone();
+            let group = control.clone();
+            let shared = a.clone();
+            nested_pending.spawn(async move {
+                client
+                    .request(
+                        &group,
+                        target,
+                        Purpose::Authority,
+                        shared
+                            .copy_bytes_in(ByteClass::Progress, b"nested")
+                            .unwrap(),
+                        std::array::from_fn(|_| None),
+                        16384,
+                    )
+                    .await
+            });
+        }
+        endpoint
+            .entered
+            .acquire_many(slots as u32)
+            .await
+            .unwrap()
+            .forget();
+        assert_eq!(
+            a.scheduler().usage()[0].1,
+            0,
+            "dependent network waits own no CPU"
+        );
+        let overloaded = client
+            .request(
+                &control,
+                target,
+                Purpose::Authority,
+                a.copy_bytes_in(ByteClass::Progress, b"authority").unwrap(),
+                std::array::from_fn(|_| None),
+                16384,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(overloaded.code, ErrorCode::Overloaded);
+        endpoint.release.add_permits(slots);
+        while let Some(result) = nested_pending.join_next().await {
+            let reply = result.unwrap().unwrap();
+            assert_eq!(
+                reply.decode_header::<Echo>().unwrap().group,
+                control.group_id
+            );
+        }
     }))
     .catch_unwind()
     .await;
+    nested_pending.abort_all();
+    while nested_pending.join_next().await.is_some() {}
+    *endpoint.nested.write().unwrap() = None;
     if let Some(task) = pending {
         task.abort();
         let _ = task.await;

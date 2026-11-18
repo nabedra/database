@@ -7,14 +7,40 @@ use crate::{
     protocol::{ColumnType, TableDescriptor, TableFormat},
 };
 use std::{collections::BTreeMap, fmt};
+/// Equality describes the durable value. The local ownership lease is excluded
+/// from serialization and follows every clone of heap-bearing reply metadata.
+#[derive(Clone, Default)]
+struct ReplyOwner(Option<std::sync::Arc<crate::oltp::pool::ScratchLease>>);
+impl fmt::Debug for ReplyOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReplyOwner")
+    }
+}
+impl PartialEq for ReplyOwner {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ReplyOwner {}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutcomeColumn {
     name: Text<64>,
-    #[serde(deserialize_with="bounded_column_type")]
+    #[serde(deserialize_with = "bounded_column_type")]
     ty: ColumnType,
 }
-fn bounded_column_type<'de,D:serde::Deserializer<'de>>(deserializer:D)->Result<ColumnType,D::Error>{let ty=Text::<7>::deserialize(deserializer)?;match ty.as_str(){"utf8"=>Ok(ColumnType::Utf8),"int64"=>Ok(ColumnType::Int64),"float64"=>Ok(ColumnType::Float64),"bool"=>Ok(ColumnType::Bool),_=>Err(serde::de::Error::custom("invalid bounded column type"))}}
+fn bounded_column_type<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ColumnType, D::Error> {
+    let ty = Text::<7>::deserialize(deserializer)?;
+    match ty.as_str() {
+        "utf8" => Ok(ColumnType::Utf8),
+        "int64" => Ok(ColumnType::Int64),
+        "float64" => Ok(ColumnType::Float64),
+        "bool" => Ok(ColumnType::Bool),
+        _ => Err(serde::de::Error::custom("invalid bounded column type")),
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutcomeTable {
@@ -22,6 +48,8 @@ pub(crate) struct OutcomeTable {
     name: Text<64>,
     key: Text<64>,
     schema: Page<OutcomeColumn>,
+    #[serde(skip)]
+    owner: ReplyOwner,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -37,6 +65,8 @@ pub(crate) struct MutationFailure {
     code: ErrorCode,
     message: Text<4096>,
     outcome: Outcome,
+    #[serde(skip)]
+    owner: ReplyOwner,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -45,6 +75,35 @@ pub(crate) enum MutationOutcome {
     Failure(MutationFailure),
 }
 impl MutationOutcome {
+    pub(crate) fn is_not_applied(&self) -> bool {
+        matches!(
+            self,
+            Self::Failure(MutationFailure {
+                outcome: Outcome::NotApplied,
+                ..
+            })
+        )
+    }
+    pub(crate) fn retain_owner(&mut self, owner: std::sync::Arc<crate::oltp::pool::ScratchLease>) {
+        match self {
+            Self::Success(MutationValue::Created(table)) => table.owner.0 = Some(owner),
+            Self::Failure(error) => error.owner.0 = Some(owner),
+            _ => {}
+        }
+    }
+    pub(crate) fn response_hash(&self, request_id: uuid::Uuid) -> Result<Digest, ProtocolError> {
+        match self.result() {
+            Ok(data) => crate::oltp_replication::owned::serialized_digest(
+                &crate::protocol::SuccessResponse { request_id, data },
+            ),
+            Err(error) => {
+                crate::oltp_replication::owned::serialized_digest(&crate::protocol::ErrorResponse {
+                    request_id: Some(request_id),
+                    error,
+                })
+            }
+        }
+    }
     pub(crate) fn digest(&self) -> Result<Digest, ProtocolError> {
         let value = match self.result() {
             Ok(value) => value,
@@ -112,7 +171,9 @@ impl MutationOutcome {
                                     out.insert(key, ty);
                                 }
                                 if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
-                                    return Err(serde::de::Error::custom("too many schema columns"));
+                                    return Err(serde::de::Error::custom(
+                                        "too many schema columns",
+                                    ));
                                 }
                                 Ok(Columns(out))
                             }
@@ -125,6 +186,7 @@ impl MutationOutcome {
                     return Err(invalid());
                 }
                 let created = OutcomeTable {
+                    owner: ReplyOwner::default(),
                     id: table.id,
                     name: table.name,
                     key: table.key,
@@ -147,6 +209,7 @@ impl MutationOutcome {
     }
     pub(crate) fn failure(error: ProtocolError) -> Result<Self, ProtocolError> {
         Ok(Self::Failure(MutationFailure {
+            owner: ReplyOwner::default(),
             code: error.code,
             message: Text::new(error.message).map_err(|_| invalid())?,
             outcome: error.outcome,

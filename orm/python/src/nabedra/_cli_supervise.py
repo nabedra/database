@@ -12,7 +12,7 @@ import tempfile
 import time
 from uuid import uuid4
 
-from ._cli_config import protected_write, read_json
+from ._cli_config import ConfigError, protected_write, read_json
 from ._serve_process import _Owner, _Interrupted, _message, _STARTUP_SECONDS
 from .validation import validate_identifier
 
@@ -65,6 +65,9 @@ def _port():
 
 def supervise(binary, config, count, *, cold_start=False, cluster_name='Nabedra'):
     cluster_name = validate_identifier(cluster_name)
+    embedded_oltp = config.get('engine') == 'oltp'
+    if embedded_oltp and count != 1:
+        raise ConfigError('OLTP API configuration connects its declared topology; local-workers must be 1')
     owner = _Children()
     failure = None
     status = 0
@@ -87,7 +90,7 @@ def supervise(binary, config, count, *, cold_start=False, cluster_name='Nabedra'
             if any(first[k] != ready[k] for k in ('cluster_id', 'bound_url')):
                 raise RuntimeError('API readiness mismatch')
             auth = read_json(config['auth_file'], secret=True)
-            for _ in range(count):
+            for _ in range(0 if embedded_oltp else count):
                 bootstrap = copy.deepcopy(config['worker'])
                 bootstrap.update(version=config['version'], cluster_id=config['cluster_id'],
                                  node_id=str(uuid4()), request_id=None, api_urls=config['api_urls'],

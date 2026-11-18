@@ -4,7 +4,7 @@ use super::{
     CanonicalJson, Change, MvccKey, PreparedWrite,
     catalog::{
         CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, RouteRead,
-        RoutingRoot, ShardRoute, TableRecord, decode_record,
+        RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
     },
     store::{
         ParticipantHandle,
@@ -13,16 +13,20 @@ use super::{
 };
 use crate::{
     oltp::{failure, pool::ChargedBytes},
-    oltp_replication::{
-        owned::OwnedCommand,
-        types::{Digest, GroupIdentity, Page, ParticipantPlan, RequestBinding, TxnId},
-    },
+    oltp_replication::types::{GroupIdentity, Page, RequestBinding, TxnId},
     protocol::{self, ErrorCode, Key, Operation, ProtocolError, Row, TableDescriptor},
 };
 use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use uuid::Uuid;
+mod backup;
+mod index;
+mod index_build;
+mod migration;
 mod query;
+use query::schedule::QueryScheduler;
+mod query_metrics;
+pub(crate) mod split;
 pub(crate) type ResolveFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProtocolError>> + Send + 'a>>;
 pub(crate) trait ParticipantResolver: Send + Sync {
@@ -70,13 +74,43 @@ pub(crate) struct ParticipantWrites {
     pub writes: Vec<PreparedWrite>,
     pub guards: Vec<super::store::lifecycle::SealedLifecycleGuard>,
 }
+#[derive(Clone)]
 pub(crate) struct NativePlanner {
     catalog: CatalogHandle,
     resolver: Arc<dyn ParticipantResolver>,
+    query_metrics: Arc<query_metrics::QueryMetrics>,
+    query_scheduler: QueryScheduler,
+}
+/// Retain only one charged route page and its selected participant during a
+/// mutation plan. The cache cannot outlive or be reused with another pin.
+#[derive(Default)]
+struct MutationMetadata {
+    route: Option<(OwnedRecord<RoutingPage>, usize, Arc<ParticipantHandle>)>,
+    indexes: Option<Option<OwnedRecord<super::index::IndexRoot>>>,
+}
+type MutationGroups = BTreeMap<GroupIdentity, (Arc<ParticipantHandle>, Vec<PreparedWrite>)>;
+struct CandidateRow {
+    key: Key,
+    canonical: CanonicalJson,
+    insert: bool,
 }
 impl NativePlanner {
-    pub(crate) fn new(catalog: CatalogHandle, resolver: Arc<dyn ParticipantResolver>) -> Self {
-        Self { catalog, resolver }
+    pub(crate) fn new(
+        catalog: CatalogHandle,
+        resolver: Arc<dyn ParticipantResolver>,
+        max_workers_per_request: u64,
+    ) -> Result<Self, ProtocolError> {
+        let query_metrics = Arc::new(query_metrics::QueryMetrics::new(catalog.resources())?);
+        let query_scheduler = QueryScheduler::new(max_workers_per_request, catalog.resources())?;
+        Ok(Self {
+            catalog,
+            resolver,
+            query_metrics,
+            query_scheduler,
+        })
+    }
+    pub(crate) fn query_statistics(&self) -> query_metrics::QueryStatistics {
+        self.query_metrics.snapshot()
     }
     pub(crate) fn catalog(&self) -> &CatalogHandle {
         &self.catalog
@@ -159,27 +193,21 @@ impl NativePlanner {
         match operation {
             Operation::Collect(p) => {
                 return self
-                    .query(pin, table, p.query, false, owner)
+                    .query(pin, table, p.query, false, request, owner)
                     .await
                     .map(PlannedOperation::Read);
             }
             Operation::Count(p) => {
                 return self
-                    .query(pin, table, p.query, true, owner)
+                    .query(pin, table, p.query, true, request, owner)
                     .await
                     .map(PlannedOperation::Read);
             }
-            Operation::Explain(_p) => {
-                let text = format!(
-                    "engine oltp; replicated MVCC\nprimary index {}; pinned timestamp {}\nlookup point/range/stream; residual predicate exact\nmerge bounded top-k; primary-key ascending ties\nsecondary indexes require a published catalog definition",
-                    table.descriptor.key,
-                    pin.read_ts.get()
-                );
-                return Ok(PlannedOperation::Read(
-                    self.catalog
-                        .resources()
-                        .encode(&text, protocol::MAX_BODY_BYTES - 128)?,
-                ));
+            Operation::Explain(p) => {
+                return self
+                    .explain(pin, table, p.query, owner)
+                    .await
+                    .map(PlannedOperation::Read);
             }
             _ => {}
         }
@@ -195,6 +223,9 @@ impl NativePlanner {
             )
             .await?;
         let planned = async {
+            let mut metadata = MutationMetadata::default();
+            let mut mutation_owner = owner.clone();
+            let mut used = mutation_owner.bytes();
             let sealed = guard.clone().into_sealed();
             let mut grouped: BTreeMap<GroupIdentity, (Arc<ParticipantHandle>, Vec<PreparedWrite>)> =
                 BTreeMap::new();
@@ -207,7 +238,10 @@ impl NativePlanner {
                     p.rows.into_iter().map(|r| (r, true)).collect()
                 }
                 Operation::Update(p) => {
-                    let (expected, row) = self.row(pin, &table, &p.key).await?;
+                    let (participant, group) =
+                        self.mutation_route(pin, id, &p.key, &mut metadata).await?;
+                    let (expected, row) = self.row_on(pin, id, &p.key, &participant).await?;
+                    let old_index_row = row.clone();
                     let change = if let Some(row) = row {
                         let shared = self.catalog.resources().clone();
                         let values = p.values;
@@ -230,10 +264,26 @@ impl NativePlanner {
                         result = serde_json::Value::Bool(false);
                         Change::Keep
                     };
-                    let (participant, group) = self.route(pin, id, &p.key).await?;
+                    let new_index_row = match &change {
+                        Change::Put(c) => Some(c.clone()),
+                        _ => None,
+                    };
+                    let mut indexes = self
+                        .index_changes(
+                            pin,
+                            table.clone(),
+                            participant.clone(),
+                            &p.key,
+                            old_index_row,
+                            new_index_row,
+                            &mut mutation_owner,
+                            &mut used,
+                            &mut metadata,
+                        )
+                        .await?;
                     grouped
                         .entry(group)
-                        .or_insert_with(|| (participant, Vec::new()))
+                        .or_insert_with(|| (participant.clone(), Vec::new()))
                         .1
                         .push(PreparedWrite {
                             key: MvccKey::Row {
@@ -243,16 +293,35 @@ impl NativePlanner {
                             expected_version: expected,
                             change,
                         });
+                    grouped
+                        .get_mut(&participant.identity().clone())
+                        .ok_or_else(not_found)?
+                        .1
+                        .append(&mut indexes);
                     Vec::new()
                 }
                 Operation::Delete(p) => {
-                    let (expected, row) = self.row(pin, &table, &p.key).await?;
+                    let (participant, group) =
+                        self.mutation_route(pin, id, &p.key, &mut metadata).await?;
+                    let (expected, row) = self.row_on(pin, id, &p.key, &participant).await?;
                     let found = row.is_some();
                     result = serde_json::Value::Bool(found);
-                    let (participant, group) = self.route(pin, id, &p.key).await?;
+                    let mut indexes = self
+                        .index_changes(
+                            pin,
+                            table.clone(),
+                            participant.clone(),
+                            &p.key,
+                            row.clone(),
+                            None,
+                            &mut mutation_owner,
+                            &mut used,
+                            &mut metadata,
+                        )
+                        .await?;
                     grouped
                         .entry(group)
-                        .or_insert_with(|| (participant, Vec::new()))
+                        .or_insert_with(|| (participant.clone(), Vec::new()))
                         .1
                         .push(PreparedWrite {
                             key: MvccKey::Row {
@@ -262,6 +331,11 @@ impl NativePlanner {
                             expected_version: expected,
                             change: if found { Change::Delete } else { Change::Keep },
                         });
+                    grouped
+                        .get_mut(&participant.identity().clone())
+                        .ok_or_else(not_found)?
+                        .1
+                        .append(&mut indexes);
                     Vec::new()
                 }
                 _ => {
@@ -271,6 +345,9 @@ impl NativePlanner {
                 }
             };
             let mut seen = std::collections::BTreeSet::new();
+            let mut pending = Vec::with_capacity(128);
+            let mut pending_participant: Option<Arc<ParticipantHandle>> = None;
+            let mut pending_bytes = 4096usize;
             for (row, insert) in rows {
                 let column = table.descriptor.key.clone();
                 let shared = self.catalog.resources().clone();
@@ -291,24 +368,71 @@ impl NativePlanner {
                         failure(ErrorCode::Conflict, "duplicate primary key in batch").into(),
                     );
                 }
-                let (expected, old) = self.row(pin, &table, &key).await?;
-                if insert && old.is_some() {
-                    return Err(failure(ErrorCode::Conflict, "primary key already exists").into());
+                let (participant, group) =
+                    self.mutation_route(pin, id, &key, &mut metadata).await?;
+                // Bound both native request ownership and its escaped JSON wire
+                // encoding. Oversized individual keys retain the scalar path.
+                let cost = match &key {
+                    Key::Utf8(value) => {
+                        value.len().checked_mul(6).and_then(|n| n.checked_add(1024))
+                    }
+                    _ => Some(1024),
                 }
-                let (participant, group) = self.route(pin, id, &key).await?;
-                let change = Change::Put(canonical);
-                grouped
-                    .entry(group)
-                    .or_insert_with(|| (participant, Vec::new()))
-                    .1
-                    .push(PreparedWrite {
-                        key: MvccKey::Row {
-                            table_id: id,
-                            primary_key: key,
-                        },
-                        expected_version: expected,
-                        change,
-                    });
+                .ok_or_else(not_found)?;
+                if !pending.is_empty()
+                    && (pending.len() == 128
+                        || pending_bytes.checked_add(cost).is_none_or(|n| n > 1 << 20)
+                        || pending_participant
+                            .as_ref()
+                            .is_some_and(|p| p.identity() != &group))
+                {
+                    self.plan_candidate_page(
+                        pin,
+                        table.clone(),
+                        pending_participant.take().ok_or_else(not_found)?,
+                        std::mem::take(&mut pending),
+                        &mut grouped,
+                        &mut mutation_owner,
+                        &mut used,
+                        &mut metadata,
+                    )
+                    .await?;
+                    pending_bytes = 4096;
+                }
+                pending_bytes = pending_bytes.checked_add(cost).ok_or_else(not_found)?;
+                pending.push(CandidateRow {
+                    key,
+                    canonical,
+                    insert,
+                });
+                pending_participant = Some(participant);
+                if cost > (1 << 20) - 4096 {
+                    self.plan_candidate_page(
+                        pin,
+                        table.clone(),
+                        pending_participant.take().ok_or_else(not_found)?,
+                        std::mem::take(&mut pending),
+                        &mut grouped,
+                        &mut mutation_owner,
+                        &mut used,
+                        &mut metadata,
+                    )
+                    .await?;
+                    pending_bytes = 4096;
+                }
+            }
+            if !pending.is_empty() {
+                self.plan_candidate_page(
+                    pin,
+                    table.clone(),
+                    pending_participant.take().ok_or_else(not_found)?,
+                    pending,
+                    &mut grouped,
+                    &mut mutation_owner,
+                    &mut used,
+                    &mut metadata,
+                )
+                .await?;
             }
             // Empty insert_many still validates and locks the captured table
             // dependency, then records its exact zero result through Status.
@@ -335,7 +459,21 @@ impl NativePlanner {
                 ) {
                     (catalog_epochs.schema_epoch, catalog_epochs.routing_epoch)
                 } else {
-                    (table.schema_epoch, table.routing_epoch)
+                    // A split advances the Catalog routing version while
+                    // unaffected participants retain their own immutable
+                    // lineage epoch. Read it once per grouped participant.
+                    let epochs = participant.epochs().await?;
+                    if epochs.schema_epoch != table.schema_epoch
+                        || epochs.routing_epoch == 0
+                        || epochs.routing_epoch > table.routing_epoch
+                    {
+                        return Err(failure(
+                            ErrorCode::Conflict,
+                            "participant routing lineage changed",
+                        )
+                        .into());
+                    }
+                    (epochs.schema_epoch, epochs.routing_epoch)
                 };
                 participants.push(ParticipantWrites {
                     schema_epoch,
@@ -349,7 +487,7 @@ impl NativePlanner {
                 participants,
                 lifecycle: vec![guard.clone()],
                 result,
-                _owner: owner.clone(),
+                _owner: mutation_owner,
             }))
         }
         .await;
@@ -508,7 +646,12 @@ impl NativePlanner {
             .await?;
         let cpu = shared
             .scheduler()
-            .reserve_on(0, 1, shared.scheduler_node_id(), 0)
+            .reserve_on(
+                shared.next_native_request_id()?,
+                1,
+                shared.scheduler_node_id(),
+                0,
+            )
             .await?;
         let (result, _guard) = native.run_with_guard((owner, cpu), work).await?;
         result
@@ -531,7 +674,42 @@ impl NativePlanner {
             )
             .into());
         }
-        let binding = LifecycleBinding {
+        self.guard_at(pin, txn, request, table_id, lifecycle_version, schema_epoch, mode, current)
+            .await
+    }
+
+    async fn guard_at(
+        &self,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        table_id: Uuid,
+        lifecycle_version: Option<crate::oltp_replication::types::CommitTs>,
+        schema_epoch: u64,
+        mode: GuardMode,
+        authority: crate::oltp_replication::types::Authority,
+    ) -> Result<VerifiedLifecycleGuard, PlanError> {
+        let binding = self.lifecycle_binding(pin, txn, request, table_id, lifecycle_version, schema_epoch, authority);
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::index_faults::observe_lifecycle(&binding);
+        self.catalog
+            .participant()
+            .acquire_lifecycle(binding.clone(), mode)
+            .await?
+            .ok_or(PlanError::LifecyclePending(binding))
+    }
+
+    fn lifecycle_binding(
+        &self,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        table_id: Uuid,
+        lifecycle_version: Option<crate::oltp_replication::types::CommitTs>,
+        schema_epoch: u64,
+        authority: crate::oltp_replication::types::Authority,
+    ) -> LifecycleBinding {
+        LifecycleBinding {
             guard_id: derived_uuid(b"nabedra/lifecycle-guard/v1", table_id, txn.request_id),
             catalog_group_id: self.catalog.participant().identity().group_id,
             table_id,
@@ -540,13 +718,8 @@ impl NativePlanner {
             txn,
             request,
             read_ts: pin.read_ts,
-            authority: current,
-        };
-        self.catalog
-            .participant()
-            .acquire_lifecycle(binding.clone(), mode)
-            .await?
-            .ok_or(PlanError::LifecyclePending(binding))
+            authority,
+        }
     }
     async fn route(
         &self,
@@ -576,6 +749,22 @@ impl NativePlanner {
         PlanError,
     > {
         let (participant, _) = self.route(pin, table.descriptor.id, key).await?;
+        self.row_on(pin, table.descriptor.id, key, &participant)
+            .await
+    }
+    async fn row_on(
+        &self,
+        pin: &PinnedCatalog,
+        table_id: Uuid,
+        key: &Key,
+        participant: &ParticipantHandle,
+    ) -> Result<
+        (
+            Option<crate::oltp_replication::types::CommitTs>,
+            Option<OwnedRecord<Row>>,
+        ),
+        PlanError,
+    > {
         value(
             decode_record(
                 self.catalog.resources(),
@@ -583,7 +772,7 @@ impl NativePlanner {
                     .read_at(
                         pin.read_ts,
                         MvccKey::Row {
-                            table_id: table.descriptor.id,
+                            table_id,
                             primary_key: key.clone(),
                         },
                     )
@@ -591,6 +780,190 @@ impl NativePlanner {
             )
             .await?,
         )
+    }
+    async fn plan_candidate_page(
+        &self,
+        pin: &PinnedCatalog,
+        table: OwnedRecord<TableRecord>,
+        participant: Arc<ParticipantHandle>,
+        candidates: Vec<CandidateRow>,
+        grouped: &mut MutationGroups,
+        owner: &mut Arc<crate::oltp::pool::ScratchLease>,
+        used: &mut usize,
+        metadata: &mut MutationMetadata,
+    ) -> Result<(), PlanError> {
+        use super::store::{point::PointReadRequest, scan::ScanPage};
+        let mut completed = 0;
+        while completed < candidates.len() {
+            let first = &candidates[completed];
+            let oversized = matches!(&first.key, Key::Utf8(key) if key.len().saturating_mul(6).saturating_add(5120) > 1 << 20);
+            if oversized {
+                let (expected, old) = self
+                    .row_on(pin, table.descriptor.id, &first.key, &participant)
+                    .await?;
+                self.append_candidate(
+                    pin,
+                    table.clone(),
+                    participant.clone(),
+                    first,
+                    expected,
+                    old,
+                    grouped,
+                    owner,
+                    used,
+                    metadata,
+                )
+                .await?;
+                completed += 1;
+                continue;
+            }
+            let keys = candidates[completed..]
+                .iter()
+                .map(|row| MvccKey::Row {
+                    table_id: table.descriptor.id,
+                    primary_key: row.key.clone(),
+                })
+                .collect();
+            let request = crate::oltp_replication::owned::OwnedCommand::new_owned(
+                PointReadRequest {
+                    read_ts: pin.read_ts,
+                    keys: Page::new(keys).map_err(|_| not_found())?,
+                    max_bytes: 16 << 20,
+                },
+                self.catalog.resources(),
+                crate::oltp::pool::ByteClass::Data,
+            )?;
+            let page = participant.read_page(request).await?;
+            match page.payload()? {
+                ScanPage::Blocked { txn, manifest } => {
+                    return Err(PlanError::Blocked(IntentRef {
+                        txn: *txn,
+                        manifest: *manifest,
+                    }));
+                }
+                ScanPage::Records { records, exhausted } => {
+                    if records.is_empty()
+                        || records.len() > candidates.len() - completed
+                        || *exhausted != (records.len() == candidates.len() - completed)
+                    {
+                        return Err(not_found().into());
+                    }
+                    for record in records.iter() {
+                        let candidate = &candidates[completed];
+                        if record.key
+                            != (MvccKey::Row {
+                                table_id: table.descriptor.id,
+                                primary_key: candidate.key.clone(),
+                            })
+                        {
+                            return Err(not_found().into());
+                        }
+                        let old = match &record.value {
+                            Some(value) => Some(
+                                super::catalog::decode_canonical(
+                                    self.catalog.resources(),
+                                    value.clone(),
+                                )
+                                .await?,
+                            ),
+                            None => None,
+                        };
+                        self.append_candidate(
+                            pin,
+                            table.clone(),
+                            participant.clone(),
+                            candidate,
+                            record.version,
+                            old,
+                            grouped,
+                            owner,
+                            used,
+                            metadata,
+                        )
+                        .await?;
+                        completed += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn append_candidate(
+        &self,
+        pin: &PinnedCatalog,
+        table: OwnedRecord<TableRecord>,
+        participant: Arc<ParticipantHandle>,
+        candidate: &CandidateRow,
+        expected: Option<crate::oltp_replication::types::CommitTs>,
+        old: Option<OwnedRecord<Row>>,
+        grouped: &mut MutationGroups,
+        owner: &mut Arc<crate::oltp::pool::ScratchLease>,
+        used: &mut usize,
+        metadata: &mut MutationMetadata,
+    ) -> Result<(), PlanError> {
+        if candidate.insert && old.is_some() {
+            return Err(failure(ErrorCode::Conflict, "primary key already exists").into());
+        }
+        let mut indexes = self
+            .index_changes(
+                pin,
+                table.clone(),
+                participant.clone(),
+                &candidate.key,
+                old,
+                Some(candidate.canonical.clone()),
+                owner,
+                used,
+                metadata,
+            )
+            .await?;
+        let writes = &mut grouped
+            .entry(participant.identity().clone())
+            .or_insert_with(|| (participant.clone(), Vec::new()))
+            .1;
+        writes.push(PreparedWrite {
+            key: MvccKey::Row {
+                table_id: table.descriptor.id,
+                primary_key: candidate.key.clone(),
+            },
+            expected_version: expected,
+            change: Change::Put(candidate.canonical.clone()),
+        });
+        writes.append(&mut indexes);
+        Ok(())
+    }
+    async fn mutation_route(
+        &self,
+        pin: &PinnedCatalog,
+        table_id: Uuid,
+        key: &Key,
+        metadata: &mut MutationMetadata,
+    ) -> Result<(Arc<ParticipantHandle>, GroupIdentity), PlanError> {
+        if let Some((page, selected, participant)) = &metadata.route {
+            if super::catalog::contains(&page.shards[*selected].span, key) {
+                return Ok((participant.clone(), participant.identity().clone()));
+            }
+            if let Some(index) = page
+                .shards
+                .iter()
+                .position(|route| super::catalog::contains(&route.span, key))
+            {
+                let group = page.shards[index].group.clone();
+                let participant = self.resolver.participant(&group).await?;
+                metadata.route = Some((page.clone(), index, participant.clone()));
+                return Ok((participant, group));
+            }
+        }
+        match self.catalog.route(pin, table_id, key).await? {
+            RouteRead::Blocked(i) => Err(PlanError::Blocked(i)),
+            RouteRead::Missing => Err(not_found().into()),
+            RouteRead::Route { page, index } => {
+                let group = page.shards[index].group.clone();
+                let participant = self.resolver.participant(&group).await?;
+                metadata.route = Some((page, index, participant.clone()));
+                Ok((participant, group))
+            }
+        }
     }
 }
 fn value<T>(
