@@ -18,6 +18,9 @@ Create a rubric with the minimal set of tests that comprises a full quality asse
 2. Regression tests
 Make sure the new changes do not break anything of what we previously had. This means that the new implementation of a sidebar or module does not break the dashboard, bugs a module already implemented, etc.
 
+For ORM changes and database changes that affect ORM callers, include the
+[ORM parity checks](../../../docs/testing/orm-parity.md) in the review rubric.
+
 If there is some compatibility issue (i.e., a change of specs; e.g., migrating from SQLite local db in a mobile phone to JSON files in the app data folder), ask the user if it is intended to break regression compatibility and thus not work well in previous implementations. If not intended, e.g. perhaps losing the previous data, act in consequence. Anyway make sure to ask the user if backwards compatibility is expected to be retained or not, because it might depend on the project (it's not the same a beta app used by virtually no one versus a production and famous mobile app)
 
 3. ZERO Slop policy

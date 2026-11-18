@@ -18,3 +18,9 @@ API/worker failures while a worker retains its complete request record. After
 every worker stops, abandon outstanding requests instead of replaying them on
 restart. Committed mutations remain durable. This supersedes the earlier
 suggestion to persist the request queue across a complete cluster shutdown.
+
+# ORM parity
+
+For every ORM change and any database change that affects ORM callers, follow the
+[ORM parity checks](docs/testing/orm-parity.md). Apply shared changes to every
+supported language in the same PR and keep their package versions in sync.
