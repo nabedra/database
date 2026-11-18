@@ -309,7 +309,21 @@ Separate RF3 runs used an ordinary HTTPS gateway and three registered workers. A
 
 The stock fixture reached the final receipt assertion and failed it. The gated fixture passed. Both used matching unoptimized Linux builds and the same 4 CPU and 7.90 GB runtime allocation including the driver, with swap disabled. This exercises Q06/T04 and the fixed-ready subsets of O10 and O23.
 
-The retained gateway change uses the coordinator's existing Control confirmation of the exact terminal copy. It passed the same RF3 fixture and two native checks for exact ready-view and version matching, recovery selection, and result expiry. A separate capped RF3 run held the follower through the bounded POST deadline. POST returned HTTP 503 with an unknown outcome, GET stayed `committing` while the follower was paused, and GET returned the exact original success after release. The driver submitted once. All three terminal copies, the original pin release, and the final row verified. Live expiry, direct worker HTTP, membership churn, and throughput remain open.
+The retained gateway change uses the coordinator's existing Control confirmation of the exact terminal copy. It passed the same RF3 fixture and two native checks for exact ready-view and version matching, recovery selection, and result expiry. A separate capped RF3 run held the follower through the bounded POST deadline. POST returned HTTP 503 with an unknown outcome, GET stayed `committing` while the follower was paused, and GET returned the exact original success after release. The driver submitted once. All three terminal copies, the original pin release, and the final row verified. Live expiry, direct worker HTTP, and membership churn remain open.
+
+### Optimized gateway measurements
+
+The paired release builds used stock `4483521` and the confirmed-copy gateway in `230ec16`. Each run used fresh RF3 workers, the ordinary HTTPS gateway, RSA certificates, and the matched 2,000-row fixture with 4 CPUs and 7.90 GB. Each load sweep verified all 13 snapshots and 468 offers including warm-up. All timed outcomes were synchronous successes or explicit parsing-capacity rejections.
+
+| Offered updates/s | Stock acknowledgments | Confirmed-copy acknowledgments | Stock goodput / successful p99 | Confirmed-copy goodput / successful p99 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 9 / 15 | 9 / 15 | 0.594/s / 2,617 ms | 0.542/s / 3,807 ms |
+| 5 | 17 / 75 | 16 / 75 | 0.747/s / 4,309 ms | 0.641/s / 4,863 ms |
+| 20 | 18 / 300 | 18 / 300 | 0.815/s / 3,964 ms | 0.807/s / 4,315 ms |
+
+Each p99 is the median of three phase p99 values and describes the few successful writes in each phase. Goodput includes drain time. In the separate serial pair at 0.2/s, both builds acknowledged all ten timed writes and matched all 12 snapshots. Median latency moved from 1,794.35 to 1,826.72 ms, an increase of 1.8%. The observed ranges were 1,725.12–2,077.66 ms and 1,704.45–2,475.44 ms. The build changes where acknowledgment ends, and the comparison does not isolate time spent in the wait from run variability. These are fixed-ready O23, warm point-write O24, and B02 workload subsets.
+
+The stock and confirmed-copy executable SHA-256 values were `2f2b749b24ff125e2679dcbc8504389f8e5e9d6dddd75d46ca6b38dab4a6a30c` and `cce7c4a11e82b2010f833fb45436583ca716dae961d29d6b5b15fd04846c8a19`. Both optimized builds and all four runtime fixtures completed under their caps with zero OOM events.
 
 ## Reproduce
 
