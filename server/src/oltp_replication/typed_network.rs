@@ -7,7 +7,8 @@ use super::{
     hosted::{HostedState, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, Purpose,
-        ReceivePlan, ReplicaLease, TrafficClass, WorkerClient,
+        RAFT_PROGRESS_DECODE_BYTES, RAFT_PROGRESS_HEADER_BYTES, ReceivePlan, ReplicaLease,
+        RequestError, TrafficClass, WorkerClient,
     },
     typed_log::TypedConfig,
     types::{GroupKind, ReplicaMember},
@@ -33,8 +34,12 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+mod snapshot;
+#[cfg(test)]
+#[path = "typed_network/tests.rs"]
+mod tests;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Method {
     Vote,
@@ -51,6 +56,16 @@ struct Header {
     vote: Vote,
     prev_log_id: Option<LogId>,
     leader_commit: Option<LogId>,
+}
+impl Header {
+    fn route(self, kind: &GroupKind) -> (Purpose, TrafficClass) {
+        let traffic = class(kind);
+        if traffic == TrafficClass::DataConsensus && self.payload_bytes == 0 {
+            (Purpose::RaftProgress, TrafficClass::RaftProgress)
+        } else {
+            (Purpose::Raft, traffic)
+        }
+    }
 }
 fn header(bytes: &[u8]) -> Result<Header, ProtocolError> {
     crate::protocol::json_input(bytes, 1024)
@@ -90,7 +105,7 @@ impl<C: TypedConfig> TypedNetworkFactory<C> {
         })
     }
     fn class(&self) -> TrafficClass {
-        class(self.resident.identity().kind.clone())
+        class(&self.resident.identity().kind)
     }
 }
 pub(crate) struct TypedNetwork<C: TypedConfig> {
@@ -118,33 +133,67 @@ impl<C: TypedConfig> TypedNetwork<C> {
         if self.node.node_id != self.target {
             return Err(invalid("target node disagrees with membership"));
         }
+        let group = self.factory.resident.identity();
+        let (purpose, traffic) = header.route(&group.kind);
         let shared = self.factory.shared.clone();
-        let byte_class = self.factory.class().byte_class();
-        let exec = execution(self.factory.class());
-        let header = shared.encode_in(byte_class, &header, 1024)?;
+        let byte_class = traffic.byte_class();
+        let report = |phase: &'static str, failure: &'static str, code: Option<ErrorCode>| {
+            tracing::debug!(group=%group.group_id, from_node=header.from_node, to_node=header.to_node,
+                method=?header.method, ?purpose, phase, failure, ?code,
+                prev_index=header.prev_log_id.map(|id| id.index),
+                commit_index=header.leader_commit.map(|id| id.index), "typed Raft RPC failed");
+        };
+        let encoded = shared
+            .encode_in(byte_class, &header, RAFT_PROGRESS_HEADER_BYTES)
+            .inspect_err(|error| report("encode_header", "local_protocol", Some(error.code)))?;
+        let (response_decode, response_header) = if traffic == TrafficClass::RaftProgress {
+            (RAFT_PROGRESS_DECODE_BYTES, RAFT_PROGRESS_HEADER_BYTES)
+        } else {
+            (128 << 10, 16 << 10)
+        };
         let reply = tokio::time::timeout(
             ttl,
-            self.factory.client.request(
-                self.factory.resident.identity(),
+            self.factory.client.request_classified(
+                group,
                 self.node.worker_id,
-                Purpose::Raft,
-                header,
+                purpose,
+                encoded,
                 [payload, None, None],
-                128 << 10,
+                response_decode,
             ),
         )
         .await
-        .map_err(|_| unavailable())??;
+        .map_err(|_| {
+            report("exchange", "rpc_deadline", None);
+            unavailable()
+        })?
+        .map_err(|failure| {
+            let (reason, code) = match &failure {
+                RequestError::OutgoingLaneFull => ("outgoing_lane_full", None),
+                RequestError::Unreachable => ("unreachable", None),
+                RequestError::PeerRejected { error, .. } => ("peer_rejected", Some(error.code)),
+                RequestError::Protocol(error) => ("local_protocol", Some(error.code)),
+            };
+            report("exchange", reason, code);
+            ProtocolError::from(failure)
+        })?;
         // The two private return types contain only fixed vote/log metadata.
         // Move the entire transport owner into the native codec until it settles.
-        shared
-            .execute(exec, self.target, 0, move || {
-                crate::protocol::json_input(reply.header.as_slice(), 16 << 10)
+        let decoded = shared
+            .execute(execution(traffic), self.target, 0, move || {
+                crate::protocol::json_input(reply.header.as_slice(), response_header)
                     .map_err(|_| invalid("typed Raft reply bounds"))?;
                 serde_json::from_slice(reply.header.as_slice())
                     .map_err(|_| invalid("invalid typed Raft reply"))
             })
             .await
+            .inspect_err(|error| report("decode_reply", "local_protocol", Some(error.code)))?;
+        if traffic == TrafficClass::RaftProgress {
+            tracing::debug!(group=%group.group_id, from_node=header.from_node, to_node=header.to_node,
+                method=?header.method, ?purpose, prev_index=header.prev_log_id.map(|id| id.index),
+                commit_index=header.leader_commit.map(|id| id.index), "typed Raft reply decoded");
+        }
+        Ok(decoded)
     }
 }
 impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
@@ -163,7 +212,7 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             let shared = self.factory.shared.clone();
             let class = self.factory.class();
             let entry = entry
-                .charge_leader(&shared, class.byte_class())
+                .charge_resident(&self.factory.resident)
                 .map_err(|_| unreachable())?;
             Some(
                 shared
@@ -197,6 +246,14 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             .rpc(header, payload, option.soft_ttl())
             .await
             .map_err(|_| unreachable())?;
+        if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
+            || (header.payload_bytes == 0
+                && matches!(reply, AppendEntriesResponse::PartialSuccess(_)))
+        {
+            tracing::debug!(group=%self.factory.resident.identity().group_id, to_node=self.target,
+                prev_index=previous.map(|id| id.index), "typed Raft reply disagrees with append prefix");
+            return Err(unreachable());
+        }
         Ok(reply.into_append_result(previous, last))
     }
     async fn vote(
@@ -223,21 +280,53 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
     }
     async fn full_snapshot(
         &mut self,
-        _vote: Vote,
-        _snapshot: SnapshotOf<C, TypedSnapshot>,
-        _cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
-        _option: RPCOption,
+        vote: Vote,
+        snapshot: SnapshotOf<C, TypedSnapshot>,
+        cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
+        option: RPCOption,
     ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
-        Err(StreamingError::Unreachable(Unreachable::from_string(
-            "typed snapshot RPC streaming is not wired yet",
-        )))
+        self.stream_snapshot(vote, snapshot, cancel, option).await
     }
 }
 
 /// A group endpoint dispatches permanent node IDs, allowing an old voter and a
 /// replacement learner on different pools of one worker to coexist safely.
 pub(crate) struct ReplicaDispatcher {
-    nodes: Mutex<BTreeMap<u64, Arc<dyn Endpoint>>>,
+    nodes: Mutex<BTreeMap<u64, Arc<DispatchRoute>>>,
+}
+struct DispatchRoute {
+    endpoint: Arc<dyn Endpoint>,
+    closed: std::sync::atomic::AtomicBool,
+    admitted: tokio::sync::RwLock<()>,
+}
+impl Endpoint for DispatchRoute {
+    fn preflight<'a>(
+        &'a self,
+        session: &'a AuthenticatedSession,
+        bytes: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async move {
+            let _admitted = self.admitted.read().await;
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(unavailable());
+            }
+            self.endpoint.preflight(session, bytes).await
+        })
+    }
+    fn handle<'a>(
+        &'a self,
+        session: AuthenticatedSession,
+        bytes: ChargedBytes,
+        sections: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        Box::pin(async move {
+            let _admitted = self.admitted.read().await;
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(unavailable());
+            }
+            self.endpoint.handle(session, bytes, sections).await
+        })
+    }
 }
 impl ReplicaDispatcher {
     pub(crate) fn new() -> Self {
@@ -250,16 +339,35 @@ impl ReplicaDispatcher {
         if node == 0 || nodes.contains_key(&node) || nodes.len() >= 128 {
             return Err(invalid("invalid or duplicate hosted replica route"));
         }
-        nodes.insert(node, endpoint);
+        nodes.insert(
+            node,
+            Arc::new(DispatchRoute {
+                endpoint,
+                closed: std::sync::atomic::AtomicBool::new(false),
+                admitted: tokio::sync::RwLock::new(()),
+            }),
+        );
         Ok(())
     }
-    fn get(&self, node: u64) -> Result<Arc<dyn Endpoint>, ProtocolError> {
+    fn get(&self, node: u64) -> Result<Arc<DispatchRoute>, ProtocolError> {
         self.nodes
             .lock()
             .map_err(|_| unavailable())?
             .get(&node)
             .cloned()
             .ok_or_else(|| invalid("worker does not host target replica node"))
+    }
+    /// Remove this permanent node route and join requests already admitted by
+    /// it. A retained preflight handle cannot reopen it after removal.
+    pub(in crate::oltp_replication) async fn retire(&self, node: u64) -> Result<(), ProtocolError> {
+        let route = self.nodes.lock().map_err(|_| unavailable())?.remove(&node);
+        if let Some(route) = route {
+            route
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _joined = route.admitted.write().await;
+        }
+        Ok(())
     }
 }
 impl Endpoint for ReplicaDispatcher {
@@ -269,7 +377,7 @@ impl Endpoint for ReplicaDispatcher {
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
-            self.get(header(bytes)?.to_node)?
+            self.get(snapshot::target_node(bytes)?)?
                 .preflight(session, bytes)
                 .await
         })
@@ -281,7 +389,7 @@ impl Endpoint for ReplicaDispatcher {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
-            self.get(header(bytes.as_slice())?.to_node)?
+            self.get(snapshot::target_node(bytes.as_slice())?)?
                 .handle(session, bytes, sections)
                 .await
         })
@@ -294,6 +402,8 @@ where
     M: TypedMachine<C>,
 {
     raft: Raft<C, HostedState<C, M>>,
+    state: HostedState<C, M>,
+    incoming: Arc<tokio::sync::Mutex<Option<snapshot::Incoming>>>,
     resident: ReplicaLease,
     shared: Arc<WorkerSharedResources>,
     bootstrap: Arc<BTreeMap<u64, ReplicaMember>>,
@@ -305,6 +415,7 @@ where
 {
     pub(crate) fn new(
         raft: Raft<C, HostedState<C, M>>,
+        state: HostedState<C, M>,
         resident: ReplicaLease,
         shared: Arc<WorkerSharedResources>,
         bootstrap: BTreeMap<u64, ReplicaMember>,
@@ -314,16 +425,46 @@ where
         }
         Ok(Self {
             raft,
+            state,
+            incoming: Arc::new(tokio::sync::Mutex::new(None)),
             resident,
             shared,
             bootstrap: Arc::new(bootstrap),
         })
     }
-    fn verify(&self, session: &AuthenticatedSession, head: Header) -> Result<(), ProtocolError> {
-        if session.group() != self.resident.identity()
-            || session.purpose() != Purpose::Raft
-            || head.to_node != self.resident.node_id()
-        {
+    fn verify(
+        &self,
+        session: &AuthenticatedSession,
+        head: Header,
+    ) -> Result<TrafficClass, ProtocolError> {
+        let (purpose, traffic) = head.route(&self.resident.identity().kind);
+        if session.purpose() != purpose {
+            return Err(invalid("typed RPC purpose mismatch"));
+        }
+        if head.vote.leader_id().node_id != head.from_node {
+            return Err(invalid(
+                "Raft vote or append sender differs from TLS replica",
+            ));
+        }
+        match head.method {
+            Method::Vote if head.payload_bytes != 0 || head.leader_commit.is_some() => {
+                return Err(invalid("invalid vote frame fields"));
+            }
+            Method::Append if head.leadership_transfer_from.is_some() => {
+                return Err(invalid("invalid append frame fields"));
+            }
+            _ => {}
+        }
+        self.verify_sender(session, head.from_node, head.to_node)?;
+        Ok(traffic)
+    }
+    fn verify_sender(
+        &self,
+        session: &AuthenticatedSession,
+        from_node: u64,
+        to_node: u64,
+    ) -> Result<(), ProtocolError> {
+        if session.group() != self.resident.identity() || to_node != self.resident.node_id() {
             return Err(invalid("typed RPC target mismatch"));
         }
         let metrics = self.raft.metrics();
@@ -331,11 +472,11 @@ where
         let membership = metrics.membership_config.membership();
         let member = membership
             .nodes()
-            .find(|(node, _)| **node == head.from_node)
+            .find(|(node, _)| **node == from_node)
             .map(|(_, member)| member)
             .or_else(|| {
                 if membership.nodes().next().is_none() {
-                    self.bootstrap.get(&head.from_node)
+                    self.bootstrap.get(&from_node)
                 } else {
                     None
                 }
@@ -358,12 +499,19 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
+            if session.purpose() == Purpose::Snapshot {
+                return self.snapshot_preflight(session, bytes);
+            }
             let head = header(bytes)?;
-            self.verify(session, head)?;
+            let traffic = self.verify(session, head)?;
             Ok(ReceivePlan {
-                class: class(self.resident.identity().kind.clone()),
+                class: traffic,
                 section_lengths: [head.payload_bytes, 0, 0],
-                decode_budget_bytes: 0,
+                decode_budget_bytes: if traffic == TrafficClass::RaftProgress {
+                    RAFT_PROGRESS_DECODE_BYTES
+                } else {
+                    0
+                },
             })
         })
     }
@@ -374,15 +522,26 @@ where
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
+            if session.purpose() == Purpose::Snapshot {
+                return self.snapshot_handle(session, bytes, sections).await;
+            }
             let head = header(bytes.as_slice())?;
-            self.verify(&session, head)?;
-            let traffic = class(self.resident.identity().kind.clone());
+            let traffic = self.verify(&session, head)?;
+            let response_limit = if traffic == TrafficClass::RaftProgress {
+                RAFT_PROGRESS_HEADER_BYTES
+            } else {
+                16 << 10
+            };
+            let observe = |phase: &'static str, decision: &'static str| {
+                tracing::debug!(group=%self.resident.identity().group_id, from_node=head.from_node,
+                    to_node=head.to_node, method=?head.method, purpose=?session.purpose(), phase,
+                    decision, prev_index=head.prev_log_id.map(|id| id.index),
+                    commit_index=head.leader_commit.map(|id| id.index), "typed Raft RPC");
+            };
             let shared = self.shared.clone();
-            match head.method {
+            observe("received", "pending");
+            let header = match head.method {
                 Method::Append => {
-                    if head.vote.leader_id().node_id != head.from_node {
-                        return Err(invalid("append sender differs from TLS replica"));
-                    }
                     let entry = if head.payload_bytes == 0 {
                         None
                     } else {
@@ -411,25 +570,21 @@ where
                         entries: entry.into_iter().collect(),
                         leader_commit: head.leader_commit,
                     };
-                    let reply = self
-                        .raft
-                        .append_entries(rpc)
-                        .await
-                        .map_err(|_| unavailable())?;
-                    let header = shared.encode_in(
-                        traffic.byte_class(),
-                        &AppendEntriesResponse::<C>::from(reply),
-                        16 << 10,
-                    )?;
-                    Ok(ChargedReply {
-                        header,
-                        sections: [None, None, None],
-                    })
+                    let reply = self.raft.append_entries(rpc).await.map_err(|_| {
+                        observe("raft_handled", "raft_unavailable");
+                        unavailable()
+                    })?;
+                    let reply = AppendEntriesResponse::<C>::from(reply);
+                    let decision = match reply {
+                        AppendEntriesResponse::Success => "accepted",
+                        AppendEntriesResponse::PartialSuccess(_) => "partial",
+                        AppendEntriesResponse::Conflict => "conflict",
+                        AppendEntriesResponse::HigherVote(_) => "higher_vote",
+                    };
+                    observe("raft_handled", decision);
+                    shared.encode_in(traffic.byte_class(), &reply, response_limit)?
                 }
                 Method::Vote => {
-                    if head.payload_bytes != 0 || head.vote.leader_id().node_id != head.from_node {
-                        return Err(invalid("vote candidate differs from TLS node"));
-                    }
                     let reply = self
                         .raft
                         .vote(VoteRequest::<C> {
@@ -438,18 +593,29 @@ where
                             leadership_transfer_from: head.leadership_transfer_from,
                         })
                         .await
-                        .map_err(|_| unavailable())?;
-                    let header = shared.encode_in(traffic.byte_class(), &reply, 16 << 10)?;
-                    Ok(ChargedReply {
-                        header,
-                        sections: [None, None, None],
-                    })
+                        .map_err(|_| {
+                            observe("raft_handled", "raft_unavailable");
+                            unavailable()
+                        })?;
+                    observe(
+                        "raft_handled",
+                        if reply.vote_granted {
+                            "granted"
+                        } else {
+                            "declined"
+                        },
+                    );
+                    shared.encode_in(traffic.byte_class(), &reply, response_limit)?
                 }
-            }
+            };
+            Ok(ChargedReply {
+                header,
+                sections: [None, None, None],
+            })
         })
     }
 }
-fn class(kind: GroupKind) -> TrafficClass {
+fn class(kind: &GroupKind) -> TrafficClass {
     match kind {
         GroupKind::Control | GroupKind::Timestamps | GroupKind::Status { .. } => {
             TrafficClass::ControlConsensus
@@ -459,7 +625,7 @@ fn class(kind: GroupKind) -> TrafficClass {
 }
 fn execution(class: TrafficClass) -> ExecutionClass {
     match class {
-        TrafficClass::ControlConsensus => ExecutionClass::Control,
+        TrafficClass::ControlConsensus | TrafficClass::RaftProgress => ExecutionClass::Control,
         _ => ExecutionClass::Query,
     }
 }

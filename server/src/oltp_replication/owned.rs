@@ -47,6 +47,7 @@ pub trait OwnedPayload: Serialize + DeserializeOwned + Send + Sync + 'static {
 struct Inner<D> {
     payload: D,
     owner: OnceLock<Arc<ScratchLease>>,
+    raft_metadata: OnceLock<Arc<super::multiplex::ReplicaMetadata>>,
 }
 pub struct OwnedCommand<D: OwnedPayload> {
     inner: Arc<Inner<D>>,
@@ -71,6 +72,30 @@ impl<D: OwnedPayload + fmt::Display> fmt::Display for OwnedCommand<D> {
     }
 }
 impl<D: OwnedPayload> OwnedCommand<D> {
+    pub(crate) fn reserve_raft_metadata(
+        &self,
+        resident: &super::multiplex::ReplicaLease,
+        bytes: usize,
+    ) -> Result<(), ProtocolError> {
+        if let Some(owner) = self.inner.raft_metadata.get() {
+            return if owner.same_replica(resident) && owner.bytes() >= bytes {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        let owner = Arc::new(resident.proposal_metadata(bytes)?);
+        if self.inner.raft_metadata.set(owner).is_err() {
+            let owner = self.inner.raft_metadata.get().ok_or_else(invalid)?;
+            if !owner.same_replica(resident) || owner.bytes() < bytes {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn raft_metadata(&self) -> Option<Arc<super::multiplex::ReplicaMetadata>> {
+        self.inner.raft_metadata.get().cloned()
+    }
     /// A native builder reserves its complete working footprint before growing
     /// this typed payload. Validate its retained heap and attach the same owner
     /// before any field or command can leave that native job.
@@ -88,6 +113,7 @@ impl<D: OwnedPayload> OwnedCommand<D> {
             inner: Arc::new(Inner {
                 payload,
                 owner: OnceLock::new(),
+                raft_metadata: OnceLock::new(),
             }),
         }
     }

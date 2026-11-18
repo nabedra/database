@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+#[path = "../../../tests/oltp_native_durability/fixture.rs"]
+mod native_durability;
+
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
@@ -76,6 +80,247 @@ async fn get(group: &GroupStore, key: &'static [u8]) -> Vec<u8> {
         .unwrap()
         .as_slice()
         .to_vec()
+}
+
+#[cfg(target_os = "linux")]
+const FAULT_ROW: &[u8] = b"nabedra-native-durability-row-c179bac4";
+
+/// O11/O29 and the native equivalent of T04's durable but unobserved response.
+/// The runner sends SIGKILL after these live-view assertions and before reopen.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "run with server/tests/oltp_native_durability.py on Linux"]
+async fn o11_o29_pool_refuses_aliases_after_native_wal_eio() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use self::native_durability::{arm, publish, root};
+        use std::sync::atomic::AtomicUsize;
+
+        let root = root();
+        let path = root.join("pool");
+        let identity = pool_identity();
+        let resources = shared(SharedResourceConfig::default());
+        let pool = OltpPool::open_development(&path, identity.clone(), resources.clone()).unwrap();
+        let group_id = group_identity(&pool);
+        let group = pool.group(group_id.clone()).await.unwrap();
+        let alias_pool = pool.clone();
+        let alias = alias_pool.group(group_id.clone()).await.unwrap();
+        let healthy_id = PoolIdentity {
+            pool_id: Uuid::new_v4(),
+            ..identity.clone()
+        };
+        let healthy =
+            OltpPool::open_development(root.join("healthy"), healthy_id.clone(), resources.clone())
+                .unwrap();
+        let independent_id = group_identity(&healthy);
+        let independent = healthy.group(independent_id.clone()).await.unwrap();
+        let mut initial = meta(0);
+        initial.membership = Some(resources.copy_bytes(b"original-voters").unwrap());
+        assert_eq!(
+            group
+                .transaction(initial, budget(), |tx| {
+                    tx.put(b"row/original", b"original-row")?;
+                    Ok(Transition::Commit(tx.copy_output(b"original-decision")?))
+                })
+                .await
+                .unwrap()
+                .as_slice(),
+            b"original-decision",
+        );
+
+        let outcome = Uuid::new_v4();
+        publish(
+            &root,
+            "fixture.json",
+            serde_json::to_vec(&(&identity, &group_id, outcome, healthy_id, independent_id))
+                .unwrap(),
+        );
+        let baseline = resources.scheduler().usage();
+        let sequence = pool.inner.db.latest_sequence_number();
+        arm(&root, "post-sync-eio");
+        independent
+            .transaction(meta(0), budget(), |tx| {
+                tx.put(b"value", b"healthy-before")?;
+                Ok(Transition::Commit(tx.copy_output(b"healthy-before")?))
+            })
+            .await
+            .unwrap();
+        assert!(!root.join("entered").exists(), "matched an unrelated WAL");
+
+        let mut target = meta(1);
+        target.membership = Some(resources.copy_bytes(b"next-voters").unwrap());
+        let result = group
+            .transaction(target, budget(), move |tx| {
+                tx.put(b"row/new", FAULT_ROW)?;
+                tx.put(b"index/new", b"row/new")?;
+                tx.put(b"outcome/new", outcome.as_bytes())?;
+                Ok(Transition::Commit(tx.copy_output(outcome.as_bytes())?))
+            })
+            .await;
+        assert_eq!(result.err().unwrap(), recovery_unknown());
+        assert!(root.join("synced").is_file());
+        assert!(pool.requires_recovery());
+        assert!(alias_pool.requires_recovery());
+        assert!(!healthy.requires_recovery());
+        assert_eq!(pool.inner.db.latest_sequence_number(), sequence);
+        {
+            let live = pool.inner.db.snapshot();
+            let mut key = group.prefix(&live, false).unwrap();
+            key.extend_from_slice(b"row/new");
+            assert!(
+                live.get(key).unwrap().is_none(),
+                "the synced write reached the live view"
+            );
+        }
+        assert_eq!(
+            pool.inner
+                .db
+                .get(group_key(group_id.group_id, b'r', b""))
+                .unwrap()
+                .unwrap(),
+            b"original-decision",
+        );
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        for candidate in [&group, &alias] {
+            let observed = callbacks.clone();
+            let read = candidate.read(budget(), move |view| {
+                observed.fetch_add(1, Ordering::Relaxed);
+                view.copy_output(b"unexpected live read")
+            });
+            assert_eq!(read.await.err().unwrap(), recovery_unknown());
+            assert_eq!(
+                candidate.applied_state(budget()).await.err().unwrap(),
+                recovery_unknown()
+            );
+            for index in [1, 2] {
+                let observed = callbacks.clone();
+                let retry = candidate.transaction(meta(index), budget(), move |tx| {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    Ok(Transition::Commit(tx.copy_output(b"unexpected execution")?))
+                });
+                assert_eq!(retry.await.err().unwrap(), recovery_unknown());
+            }
+        }
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.inner.db.latest_sequence_number(), sequence);
+        assert_eq!(
+            alias_pool.group(group_id).await.err().unwrap(),
+            recovery_unknown()
+        );
+        assert_eq!(
+            OltpPool::open_development(&path, identity, resources.clone())
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::StorageUnavailable
+        );
+        assert_eq!(get(&independent, b"value").await, b"healthy-before");
+        independent
+            .transaction(meta(1), budget(), |tx| {
+                tx.put(b"value", b"healthy-after")?;
+                Ok(Transition::Commit(tx.copy_output(b"healthy-after")?))
+            })
+            .await
+            .unwrap();
+        assert_eq!(get(&independent, b"value").await, b"healthy-after");
+        assert_eq!(resources.control_bytes_used(), 0);
+        assert_eq!(resources.scheduler().usage(), baseline);
+        publish(&root, "alias-refusal-verified", b"");
+
+        // Keep the native store open for the runner's process crash.
+        std::future::pending::<()>().await;
+        drop((group, alias, pool, alias_pool, independent, healthy));
+    })
+    .await
+    .expect("pool native WAL fault watchdog");
+}
+
+/// O11/O29/R04/T04: a new process sees the exact durable applied state after
+/// loss of the reply. A byte changed in a separate copy's WAL fails recovery.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "run with server/tests/oltp_native_durability.py on Linux"]
+async fn o11_o29_pool_reopens_exact_wal_batch_and_refuses_corruption() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let root = native_durability::root();
+        let (identity, group_id, outcome, healthy_id, independent_id): (
+            PoolIdentity,
+            GroupIdentity,
+            Uuid,
+            PoolIdentity,
+            GroupIdentity,
+        ) = serde_json::from_slice(&fs::read(root.join("fixture.json")).unwrap()).unwrap();
+        let resources = shared(SharedResourceConfig::default());
+        let pool =
+            OltpPool::open_development(root.join("pool"), identity.clone(), resources.clone())
+                .unwrap();
+        let group = pool.retained_group(group_id.clone()).await.unwrap();
+        assert!(!pool.requires_recovery());
+        assert_eq!(get(&group, b"row/original").await, b"original-row");
+        assert_eq!(get(&group, b"row/new").await, FAULT_ROW);
+        assert_eq!(get(&group, b"index/new").await, b"row/new");
+        assert_eq!(get(&group, b"outcome/new").await, outcome.as_bytes());
+        let applied = group.applied_state(budget()).await.unwrap().unwrap();
+        assert_eq!(applied.position, meta(1).position);
+        assert_eq!(applied.command_digest, meta(1).command_digest);
+        assert_eq!(applied.membership.unwrap().as_slice(), b"next-voters");
+        let sequence = pool.inner.db.latest_sequence_number();
+        for _ in 0..2 {
+            assert_eq!(
+                group
+                    .transaction(meta(1), budget(), |_| panic!("replay ran transition again"))
+                    .await
+                    .unwrap()
+                    .as_slice(),
+                outcome.as_bytes()
+            );
+        }
+        let mut changed = meta(1);
+        changed.command_digest = Digest::from_bytes([255; 32]);
+        let error = group
+            .transaction(changed, budget(), |_| {
+                panic!("conflicting replay ran transition")
+            })
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            failure(
+                ErrorCode::StorageUnavailable,
+                "conflicting applied entry replay"
+            )
+        );
+        assert_eq!(pool.inner.db.latest_sequence_number(), sequence);
+
+        let healthy =
+            OltpPool::open_development(root.join("healthy"), healthy_id, resources.clone())
+                .unwrap();
+        let independent = healthy.retained_group(independent_id).await.unwrap();
+        let corrupted = root.join("corrupt");
+        let mut native_options = Options::default();
+        native_options.set_wal_recovery_mode(DBRecoveryMode::AbsoluteConsistency);
+        let native = DB::open_for_read_only(&native_options, &corrupted, false)
+            .err()
+            .expect("corrupt WAL was accepted by RocksDB");
+        assert_eq!(native.kind(), rocksdb::ErrorKind::Corruption, "{native}");
+        assert!(native.to_string().contains("checksum mismatch"), "{native}");
+        let refusal = OltpPool::open_development(corrupted, identity, resources.clone())
+            .err()
+            .expect("corrupt WAL was accepted by OltpPool");
+        assert_eq!(
+            refusal,
+            failure(
+                ErrorCode::StorageUnavailable,
+                "OLTP storage unavailable or corrupt"
+            )
+        );
+        assert_eq!(get(&group, b"row/new").await, FAULT_ROW);
+        assert_eq!(get(&independent, b"value").await, b"healthy-after");
+        assert_eq!(resources.control_bytes_used(), 0);
+        native_durability::publish(&root, "recovery-verified", b"");
+    })
+    .await
+    .expect("pool native WAL recovery watchdog");
 }
 
 #[tokio::test]
@@ -306,6 +551,105 @@ impl Drop for ReleaseOnDrop {
     fn drop(&mut self) {
         self.0.release();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_worker_drain() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = Dir::new();
+        let resources = shared(SharedResourceConfig {
+            query_threads: 2,
+            ..Default::default()
+        });
+        let identity = pool_identity();
+        let pool = OltpPool::open_development(&dir.0, identity.clone(), resources.clone()).unwrap();
+        let group_id = group_identity(&pool);
+        let group = pool.group(group_id.clone()).await.unwrap();
+        drop(
+            group
+                .transaction(meta(0), budget(), |tx| {
+                    tx.put(b"kept", b"committed")?;
+                    Ok(Transition::Commit(tx.encode(&())?))
+                })
+                .await
+                .unwrap(),
+        );
+        let snapshot = group.export_snapshot(budget()).await.unwrap();
+        let file = snapshot.file.clone();
+        drop(snapshot);
+        drop(group);
+        let gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let _release = ReleaseOnDrop(gate.clone());
+        let (entered, arrival) = tokio::sync::oneshot::channel();
+        let (settled, completed) = tokio::sync::oneshot::channel();
+        let work = tokio::spawn({
+            let shared = resources.clone();
+            let gate = gate.clone();
+            async move {
+                shared
+                    .execute(ExecutionClass::Query, 0, 0, move || {
+                        let _ = entered.send(());
+                        gate.wait();
+                        let _ = file.metadata().map_err(|_| storage_error_message())?;
+                        drop(file);
+                        let _ = settled.send(());
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        arrival.await.unwrap();
+        work.abort();
+        assert!(work.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            resources.scheduler().usage()[0].1,
+            1,
+            "cancelled native file work remains charged"
+        );
+        let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let compute = prepared.reserve_compute(0, 0).await.unwrap();
+        let pool = match pool
+            .close_with_native(Uuid::new_v4(), prepared, compute)
+            .await
+            .unwrap()
+        {
+            PoolCloseOutcome::StillOwned(pool) => pool,
+            _ => panic!("a live snapshot file produced a pool-close proof"),
+        };
+        assert!(
+            OltpPool::open_development(&dir.0, identity.clone(), resources.clone()).is_err(),
+            "RocksDB lock disappeared while transfer retained its file"
+        );
+        gate.release();
+        completed.await.unwrap();
+        let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let compute = prepared.reserve_compute(0, 0).await.unwrap();
+        let proof = match pool
+            .close_with_native(Uuid::new_v4(), prepared, compute)
+            .await
+            .unwrap()
+        {
+            PoolCloseOutcome::Closed(proof) => proof,
+            _ => panic!("settled unique pool did not close"),
+        };
+        assert_eq!(proof.statement().identity, identity);
+        assert!(
+            proof.registered_owner().is_none(),
+            "a development pool cannot attest provider detach"
+        );
+        let reopened = OltpPool::open_development(&dir.0, identity, resources.clone()).unwrap();
+        let reopened_group = reopened.group(group_id).await.unwrap();
+        assert_eq!(get(&reopened_group, b"kept").await, b"committed");
+        drop(reopened_group);
+        drop(reopened);
+        resources.drain().await;
+        assert_eq!(resources.scheduler().usage()[0].1, 0);
+    })
+    .await
+    .expect("pool close/transfer watchdog");
 }
 
 #[test]
@@ -558,7 +902,7 @@ async fn o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_
     let file = File::open(&path).unwrap();
     let length = file.metadata().unwrap().len();
     let incoming = GroupSnapshot {
-        file: Arc::new(file),
+        file: PoolSnapshotFile::new(file, b.pool().clone()),
         path,
         bytes: length,
         header,
@@ -1532,7 +1876,7 @@ async fn o11_snapshot_membership_comes_from_immutable_cut_and_rejects_corrupt_re
     fs::write(&path, &bytes).unwrap();
     let file = File::open(&path).unwrap();
     let damaged = GroupSnapshot {
-        file: Arc::new(file),
+        file: PoolSnapshotFile::new(file, group.pool().clone()),
         path,
         bytes: bytes.len() as u64,
         header: original.header,

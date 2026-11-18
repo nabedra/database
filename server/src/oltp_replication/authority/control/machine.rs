@@ -10,10 +10,19 @@ use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use uuid::Uuid;
+pub(super) mod data_worker;
+pub(super) mod replacement;
+pub(super) mod restart;
+pub(super) mod placement;
+pub(super) mod pool_drain;
+pub(super) mod worker_drain;
 
 pub(super) const STATE: &[u8] = b"ct/state";
+pub(super) const APIS: &[u8] = b"ct/api/";
 pub(super) const WORKERS: &[u8] = b"ct/worker/";
 pub(super) const GROUPS: &[u8] = b"ct/group/";
+pub(super) const RUNS: &[u8] = b"ct/used-run/";
+pub(super) const COLD_PUBLICATION: &[u8] = b"ct/published-cold-fence";
 pub(super) const BUDGET: TransactionBudget = TransactionBudget {
     scratch_bytes: 2 << 20,
     batch_bytes: 2 << 20,
@@ -54,9 +63,11 @@ impl ControlMachine {
 }
 
 #[derive(Serialize, serde::Deserialize)]
-struct Receipt {
-    digest: Digest,
-    reply: ControlReply,
+pub(super) struct Receipt {
+    pub(super) digest: Digest,
+    pub(super) reply: ControlReply,
+    #[serde(default)]
+    pub(super) growth_digest: Option<Digest>,
 }
 #[derive(Serialize, serde::Deserialize, PartialEq, Eq)]
 struct FenceAck {
@@ -79,8 +90,24 @@ fn apply(
         return reject(tx, Fault::Invalid);
     }
     let receipt_key = key(b"ct/op/", op);
+    let growth_digest = match command {
+        ControlCommand::Growth { command, .. } => Some(
+            crate::oltp_replication::owned::serialized_digest(&(op, command))?,
+        ),
+        _ => None,
+    };
     if let Some(old) = load::<Receipt>(tx, &receipt_key)? {
-        return if old.digest == digest {
+        let authorized_growth_replay =
+            if old.growth_digest.is_some() && old.growth_digest == growth_digest {
+                match command {
+                    ControlCommand::Growth { authorization, .. } => load::<State>(tx, STATE)?
+                        .is_some_and(|state| stamp(authorization, state.policy)),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+        return if old.digest == digest || authorized_growth_replay {
             commit(tx, &old.reply)
         } else {
             reject(tx, Fault::Conflict)
@@ -118,8 +145,10 @@ fn apply(
                     group_count: 1,
                     invalid_ready: 0,
                     pending: None,
+                    restart: None,
                 };
                 save(tx, STATE, &state)?;
+                save(tx, &key(RUNS, *run_id), &true)?;
                 save(
                     tx,
                     &key(GROUPS, scope.group_id),
@@ -139,6 +168,7 @@ fn apply(
         (Some(mut state), _) => {
             let reply = apply_initialized(tx, scope, position, digest, command, &mut state)?;
             if !matches!(reply, ControlReply::Rejected(_)) {
+                pool_drain::advance_revision(tx, command)?;
                 save(tx, STATE, &state)?;
             }
             reply
@@ -161,6 +191,7 @@ fn apply(
         &Receipt {
             digest,
             reply: reply.clone(),
+            growth_digest,
         },
     )?;
     commit(tx, &reply)
@@ -175,7 +206,149 @@ fn apply_initialized(
     state: &mut State,
 ) -> Result<ControlReply, ProtocolError> {
     use ControlCommand::*;
+    if state.restart.is_some()
+        && matches!(
+            command,
+            BeginGroup { .. }
+                | RegisterInitialData { .. }
+                | BeginGroupReplacement { .. }
+                | GroupPage { .. }
+                | SealGroup { .. }
+                | ReplicaRetired { .. }
+                | BeginReplicaMove { .. }
+                | PublishReplicaMove { .. }
+                | ArmReplicaMove { .. }
+                | CancelReplicaMove { .. }
+        )
+    {
+        return fault(Fault::Busy);
+    }
+    if matches!(command,
+        PrepareRestart { .. } | PrepareDataWorker { .. } | CompleteDataWorker { .. }
+        | BeginDataWorkerJoin { .. } | BeginJoin { .. } | BeginRemoval { .. } | BeginQueueRemoval { .. }
+        | BeginOwnerFence { .. } | BeginColdFence { .. } | Enroll { .. }
+    ) && load::<Uuid>(tx, placement::ACTIVE)?.is_some() {
+        return fault(Fault::Busy);
+    }
     match command {
+        BeginWorkerDrain { operation_id, worker, authorization, intent } =>
+            worker_drain::begin(tx, state, *operation_id, *worker, authorization, intent),
+        BeginWorkerDrainRemoval { operation_id, worker, authorization, id, expected, placement_revision, policy, growth_revision } =>
+            worker_drain::begin_removal(tx, state, *operation_id, *worker, authorization, *id, *expected, *placement_revision, *policy, *growth_revision),
+        CloseDataWorker { proof, .. } => worker_drain::close(tx, scope, state, proof),
+        EksWorkerReplacement { operation_id, worker, authorization, request } =>
+            replacement::apply(tx, scope, state, *operation_id, *worker, authorization, request),
+        CompleteEksWorkerReplacement { worker, mounted, .. } =>
+            replacement::complete(tx, scope, state, *worker, mounted),
+        PoolDrain { operation_id, worker, authorization, command } =>
+            pool_drain::apply(tx, scope, state, *operation_id, *worker, authorization, command),
+        PrepareDataWorker { intent, authorization, .. } =>
+            data_worker::prepare(tx, scope, state, intent, authorization),
+        CompleteDataWorker { intent, mount, proof, .. } =>
+            data_worker::complete(tx, scope, state, intent, mount, proof),
+        BeginDataWorkerJoin { operation_id, claim_id, worker, expected } =>
+            data_worker::begin_join(tx, state, *operation_id, *worker, *claim_id, *expected),
+        RegisterRestartMount { worker, pool_id, generation, public_key, authorization, .. } =>
+            restart::register_mount(tx, state, *worker, *pool_id, *generation, *public_key, authorization),
+        PrepareRestart { operation_id, intent, authorization } => {
+            if tx.get(data_worker::PREPARED)?.is_some() {
+                return fault(Fault::Busy);
+            }
+            restart::prepare(tx, scope, state, *operation_id, intent, authorization)
+        }
+        CompleteRestart { operation_id, intent, proof, exclusion } =>
+            restart::complete(tx, scope, state, *operation_id, intent, proof, exclusion),
+        BeginReplicaMove { operation_id, plan, authorization } =>
+            placement::begin(tx, scope, state, *operation_id, plan, authorization),
+        ArmReplicaMove { transition_id, worker, authorization, guard, .. } =>
+            placement::arm(tx, state, *transition_id, *worker, authorization, guard),
+        CancelReplicaMove { transition_id, worker, authorization, .. } =>
+            placement::cancel(tx, state, *transition_id, *worker, authorization),
+        PublishReplicaMove { proof, authorization, .. } =>
+            placement::publish(tx, scope, state, proof, authorization),
+        ReplicaRetired {
+            authorization,
+            proof,
+            remote,
+            ..
+        } => {
+            if let Some(plan) = load(tx, &placement::move_key(proof.generation))? {
+                return placement::retire(tx, scope, state, plan, proof, remote.as_ref(), authorization);
+            }
+            if remote.is_some() || !stamp(authorization, state.policy) {
+                return fault(Fault::Unauthorized);
+            }
+            let Some(mut build) =
+                load::<GroupBuild>(tx, &key(b"ct/group-build/", proof.generation))?
+            else {
+                return fault(Fault::NotFound);
+            };
+            let Some(expected) = build.expected.as_ref() else {
+                return fault(Fault::Invalid);
+            };
+            let Some(published) = load::<GroupRecord>(tx, &key(GROUPS, proof.group.group_id))?
+            else {
+                return fault(Fault::NotFound);
+            };
+            if published.identity != proof.group
+                || published.generation != proof.generation
+                || proof.worker.worker_id != proof.replica.worker_id
+                || proof.worker.validate().is_err()
+                || !position_valid(proof.applied_at)
+                || proof.applied_at.index < published.membership_position.index
+                || load::<ReplicaMember>(
+                    tx,
+                    &member_key(expected.generation, proof.replica.node_id),
+                )?
+                .as_ref()
+                    != Some(&proof.replica)
+                || load::<ReplicaMember>(tx, &member_key(proof.generation, proof.replica.node_id))?
+                    .is_some()
+            {
+                return fault(Fault::Invalid);
+            }
+            let retired = pool_drain::retired_key(proof.generation, proof.replica.node_id);
+            if let Some(old) = load::<ReplicaRetiredStamp>(tx, &retired)? {
+                if old != *proof {
+                    return fault(Fault::Conflict);
+                }
+            } else {
+                if load::<Uuid>(tx, &key(b"ct/group-replacement/", proof.group.group_id))?
+                    != Some(proof.generation)
+                {
+                    return fault(Fault::Conflict);
+                }
+                build.retired_count = build.retired_count.checked_add(1).ok_or_else(unknown)?;
+                if build.retired_count > expected.replica_count.saturating_sub(build.retained_count)
+                {
+                    return fault(Fault::Invalid);
+                }
+                save(tx, &retired, proof)?;
+                save(tx, &key(b"ct/group-build/", proof.generation), &build)?;
+            }
+            let remaining = expected
+                .replica_count
+                .checked_sub(build.retained_count)
+                .and_then(|n| n.checked_sub(build.retired_count))
+                .ok_or_else(unknown)?;
+            if remaining == 0 {
+                tx.delete(&key(b"ct/group-replacement/", proof.group.group_id))?;
+            }
+            Ok(ControlReply::GroupRetirement {
+                generation: proof.generation,
+                remaining,
+            })
+        }
+        Growth {
+            authorization,
+            command,
+            ..
+        } => {
+            if !stamp(authorization, state.policy) {
+                return fault(Fault::Unauthorized);
+            }
+            super::growth::apply(tx, command, state)
+        }
         Initialize { .. } => Ok(ControlReply::Rejected(Fault::Conflict)),
         Enroll {
             expected,
@@ -184,11 +357,25 @@ fn apply_initialized(
             previous_process,
             ..
         } => {
+            if tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
+                || load::<super::DataWorkerIntent>(tx, data_worker::PREPARED)?
+                    .is_some_and(|intent| intent.enrollment.worker_id == next.worker_id)
+            {
+                return fault(Fault::Unauthorized);
+            }
             if matches!(state.pending, Some(Pending::Ready(_))) {
+                return fault(Fault::Busy);
+            }
+            if state.restart.as_ref().is_some_and(|restart| restart.intent.previous.worker_id == next.worker_id)
+                && !matches!(&state.pending, Some(Pending::Fence(fence)) if fence.cold)
+            {
                 return fault(Fault::Busy);
             }
             if !stamp(authorization, state.policy) || next.validate().is_err() {
                 return fault(Fault::Unauthorized);
+            }
+            if load::<ApiEnrollment>(tx, &key(APIS, next.worker_id))?.is_some() {
+                return fault(Fault::Conflict);
             }
             let old = load::<WorkerRecord>(tx, &key(WORKERS, next.worker_id))?;
             if old.as_ref().map(|v| WorkerIdentity::from(&v.enrollment)) != *expected {
@@ -220,6 +407,9 @@ fn apply_initialized(
             } else if previous_process.is_some() {
                 return fault(Fault::Invalid);
             }
+            if let Some(proof) = previous_process {
+                record_process_exclusion(tx, proof)?;
+            }
             state.enrollment_revision = state
                 .enrollment_revision
                 .checked_add(1)
@@ -234,13 +424,50 @@ fn apply_initialized(
             )?;
             Ok(ControlReply::Enrolled(WorkerIdentity::from(next)))
         }
+        EnrollApi {
+            expected,
+            next,
+            authorization,
+            ..
+        } => {
+            if !stamp(authorization, state.policy)
+                || next.validate().is_err()
+                || next.database != scope.database
+            {
+                return fault(Fault::Unauthorized);
+            }
+            let next_identity = WorkerIdentity::from(next.transport());
+            if load::<WorkerRecord>(tx, &key(WORKERS, next_identity.worker_id))?.is_some() {
+                return fault(Fault::Conflict);
+            }
+            let old = load::<ApiEnrollment>(tx, &key(APIS, next_identity.worker_id))?;
+            if old
+                .as_ref()
+                .map(|old| WorkerIdentity::from(old.transport()))
+                != *expected
+            {
+                return fault(Fault::Stale);
+            }
+            if old.as_ref().is_some_and(|old| {
+                old.enrollment.incarnation == next.enrollment.incarnation
+                    || next.enrollment.enrollment_revision <= old.enrollment.enrollment_revision
+            }) {
+                return fault(Fault::Invalid);
+            }
+            state.enrollment_revision = state
+                .enrollment_revision
+                .checked_add(1)
+                .ok_or_else(unknown)?;
+            save(tx, &key(APIS, next_identity.worker_id), next)?;
+            Ok(ControlReply::Enrolled(next_identity))
+        }
         BeginGroup {
             generation,
             identity,
             authorization,
             ..
         } => {
-            if state.pending.is_some() {
+            if state.pending.is_some() || tx.get(&placement::move_key(*generation))?.is_some() {
                 return fault(Fault::Busy);
             }
             if !stamp(authorization, state.policy)
@@ -275,6 +502,73 @@ fn apply_initialized(
                     count: 0,
                     last_node: None,
                     chain: group_seed(),
+                    expected: None,
+                    retained_count: 0,
+                    retired_count: 0,
+                },
+            )?;
+            Ok(ControlReply::GroupBuilding {
+                generation: *generation,
+                count: 0,
+            })
+        }
+        RegisterInitialData {
+            proof,
+            replicas,
+            authorization,
+            ..
+        } => register_initial_data(tx, scope, state, proof, replicas, authorization),
+        BeginGroupReplacement {
+            generation,
+            expected,
+            authorization,
+            ..
+        } => {
+            if state.pending.is_some() || tx.get(&placement::move_key(*generation))?.is_some() {
+                return fault(Fault::Busy);
+            }
+            if !stamp(authorization, state.policy)
+                || !same_scope(scope, &expected.identity)
+                || generation.is_nil()
+                || *generation == expected.generation
+                || expected.replica_count == 0
+            {
+                return fault(Fault::Unauthorized);
+            }
+            if let Some(build) = load::<GroupBuild>(tx, &key(b"ct/group-build/", *generation))? {
+                return if build.expected.as_ref() == Some(expected) {
+                    Ok(ControlReply::GroupBuilding {
+                        generation: *generation,
+                        count: build.count,
+                    })
+                } else {
+                    fault(Fault::Conflict)
+                };
+            }
+            if load::<GroupRecord>(tx, &key(GROUPS, expected.identity.group_id))?.as_ref()
+                != Some(expected)
+            {
+                return fault(Fault::Stale);
+            }
+            // One durable replacement claim per group. The old paged record
+            // remains authoritative until a new actual membership is sealed.
+            let claim = key(b"ct/group-replacement/", expected.identity.group_id);
+            if load::<Uuid>(tx, &claim)?.is_some_and(|old| old != *generation) {
+                return fault(Fault::Busy);
+            }
+            save(tx, &claim, generation)?;
+            save(
+                tx,
+                &key(b"ct/group-build/", *generation),
+                &GroupBuild {
+                    generation: *generation,
+                    identity: expected.identity.clone(),
+                    count: 0,
+                    last_node: None,
+                    chain: group_seed(),
+                    expected: Some(expected.clone()),
+                    retained_count: 0,
+                    retired_count: 0,
                 },
             )?;
             Ok(ControlReply::GroupBuilding {
@@ -294,12 +588,22 @@ fn apply_initialized(
             else {
                 return fault(Fault::NotFound);
             };
+            if load::<GroupRecord>(tx, &key(GROUPS, build.identity.group_id))?
+                .is_some_and(|record| record.generation == *generation)
+            {
+                return fault(Fault::Conflict);
+            }
             let mut within = BTreeSet::new();
             for member in replicas.iter() {
+                if pool_drain::blocks_pool(tx, member.pool_id)? || worker_drain::blocks_worker(tx, member.worker_id)? {
+                    return fault(Fault::Busy);
+                }
                 if member.validate().is_err()
                     || build.last_node.is_some_and(|old| member.node_id <= old)
                     || !within.insert(member.worker_id)
                     || load::<WorkerRecord>(tx, &key(WORKERS, member.worker_id))?.is_none()
+                    || (!matches!(build.identity.kind, GroupKind::Data { .. })
+                        && tx.get(&key(data_worker::REGISTERED, member.worker_id))?.is_some())
                     || tx
                         .get(&member_worker_key(*generation, member.worker_id))?
                         .is_some()
@@ -309,6 +613,17 @@ fn apply_initialized(
                 build.last_node = Some(member.node_id);
                 build.count = build.count.checked_add(1).ok_or_else(unknown)?;
                 build.chain = group_step(build.chain, member);
+                if let Some(expected) = &build.expected {
+                    if let Some(old) =
+                        load::<ReplicaMember>(tx, &member_key(expected.generation, member.node_id))?
+                    {
+                        if old != *member {
+                            return fault(Fault::Invalid);
+                        }
+                        build.retained_count =
+                            build.retained_count.checked_add(1).ok_or_else(unknown)?;
+                    }
+                }
             }
             for member in replicas.iter() {
                 save(tx, &member_key(*generation, member.node_id), member)?;
@@ -344,8 +659,25 @@ fn apply_initialized(
                 return fault(Fault::Invalid);
             }
             let old = load::<GroupRecord>(tx, &key(GROUPS, build.identity.group_id))?;
-            if old.as_ref().is_some_and(|g| g.replica_count != 0) {
-                return fault(Fault::Conflict);
+            if let Some(old) = &old {
+                if old.generation == *generation
+                    && old.identity == build.identity
+                    && old.replica_count == build.count
+                    && old.replica_root == proof.replica_root
+                {
+                    return Ok(ControlReply::GroupRegistered {
+                        group_id: build.identity.group_id,
+                        count: build.count,
+                        root: proof.replica_root,
+                    });
+                }
+            }
+            match &build.expected {
+                Some(expected)
+                    if old.as_ref() == Some(expected)
+                        && proof.applied_at.index >= expected.membership_position.index => {}
+                None if old.as_ref().is_none_or(|group| group.replica_count == 0) => {}
+                _ => return fault(Fault::Conflict),
             }
             save(
                 tx,
@@ -361,6 +693,16 @@ fn apply_initialized(
             if old.is_none() {
                 state.group_count = state.group_count.checked_add(1).ok_or_else(unknown)?;
             }
+            // Keep the durable transition exclusive through actual retirement
+            // of every removed local replica. Publication alone cannot unlock
+            // another move or authorize detaching any storage.
+            if build
+                .expected
+                .as_ref()
+                .is_some_and(|old| old.replica_count == build.retained_count)
+            {
+                tx.delete(&key(b"ct/group-replacement/", build.identity.group_id))?;
+            }
             state.group_inventory_revision = state
                 .group_inventory_revision
                 .checked_add(1)
@@ -375,15 +717,12 @@ fn apply_initialized(
             operation_id,
             expected,
             target,
-        } => begin_ready(
-            tx,
-            state,
-            *operation_id,
-            *expected,
-            *target,
-            ReadyChange::Join,
-            None,
-        ),
+        } => {
+            if tx.get(&key(data_worker::REGISTERED, target.worker_id))?.is_some() {
+                return fault(Fault::Unauthorized);
+            }
+            begin_ready(tx, state, *operation_id, *expected, *target, ReadyChange::Join, None, false)
+        }
         BeginRemoval {
             operation_id,
             expected,
@@ -397,7 +736,32 @@ fn apply_initialized(
             *target,
             ReadyChange::Remove,
             Some(proof),
+            false,
         ),
+        BeginQueueRemoval {
+            operation_id,
+            expected,
+            target,
+            owner_fence,
+            authorization,
+        } => {
+            let published: Option<(Uuid, Authority)> = load(tx, b"ct/published-owner-fence")?;
+            if !stamp(authorization, state.policy)
+                || published != Some((*owner_fence, state.ready.view.authority()))
+            {
+                return fault(Fault::Unauthorized);
+            }
+            begin_ready(
+                tx,
+                state,
+                *operation_id,
+                *expected,
+                *target,
+                ReadyChange::Remove,
+                None,
+                true,
+            )
+        }
         ReadyPage {
             transition_id,
             members,
@@ -432,7 +796,7 @@ fn apply_initialized(
             transition_id,
             proof,
             ..
-        } => publish_ready(state, *transition_id, proof),
+        } => publish_ready(tx, state, *transition_id, proof),
         BeginOwnerFence {
             operation_id,
             expected,
@@ -445,6 +809,7 @@ fn apply_initialized(
             if *expected != state.ready
                 || !stamp(authorization, state.policy)
                 || !current_ready(tx, state, *next_owner)?
+                || tx.get(&key(data_worker::REGISTERED, next_owner.worker_id))?.is_some()
             {
                 return fault(Fault::Stale);
             }
@@ -488,6 +853,16 @@ fn apply_initialized(
             {
                 return fault(Fault::Unauthorized);
             }
+            if load::<bool>(tx, &key(RUNS, *next_run))?.is_some() {
+                return fault(Fault::Conflict);
+            }
+            if state.restart.take().is_some() {
+                state.enrollment_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
+            }
+            if tx.get(data_worker::PREPARED)?.is_some() {
+                tx.delete(data_worker::PREPARED)?;
+                state.enrollment_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
+            }
             let next = ReadyMembership {
                 view: AuthorityView {
                     run_id: *next_run,
@@ -507,6 +882,8 @@ fn apply_initialized(
                 ready_root: ReadySetHasher::default().finish(),
                 ready_count: 0,
             };
+            save(tx, &key(RUNS, state.ready.view.run_id), &true)?;
+            save(tx, &key(RUNS, *next_run), &true)?;
             begin_fence(
                 tx,
                 scope,
@@ -554,6 +931,7 @@ fn apply_initialized(
             }
             for (target, proof) in additions {
                 save(tx, &target, proof)?;
+                record_process_exclusion(tx, proof)?;
                 pending.excluded_workers = pending
                     .excluded_workers
                     .checked_add(1)
@@ -624,8 +1002,26 @@ fn apply_initialized(
             state.ready = pending.next;
             state.owner = pending.next_owner;
             if pending.cold {
+                // A cold fence begun by an earlier binary can still publish.
+                save(tx, &key(RUNS, pending.expected.view.run_id), &true)?;
+                save(tx, &key(RUNS, pending.next.view.run_id), &true)?;
+                save(
+                    tx,
+                    COLD_PUBLICATION,
+                    &(
+                        *transition_id,
+                        pending.expected.view.authority(),
+                        pending.next.view.authority(),
+                    ),
+                )?;
                 state.ready_generation = *transition_id;
                 state.invalid_ready = 0;
+            } else {
+                save(
+                    tx,
+                    b"ct/published-owner-fence",
+                    &(*transition_id, pending.next.view.authority()),
+                )?;
             }
             state.pending = None;
             Ok(ControlReply::Published {
@@ -644,12 +1040,25 @@ fn begin_ready(
     target: WorkerIdentity,
     change: ReadyChange,
     removed: Option<&ExclusionStamp>,
+    logical_fence: bool,
 ) -> Result<ControlReply, ProtocolError> {
     if state.pending.is_some() {
         return fault(Fault::Busy);
     }
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
+    }
+    if change == ReadyChange::Join && worker_drain::blocks_worker(tx, target.worker_id)?
+        && !replacement::can_join(tx, target)?
+    {
+        return fault(Fault::Busy);
+    }
+    if change == ReadyChange::Join
+        && state.restart.as_ref().is_some_and(|restart| {
+            !restart.enrolled || WorkerIdentity::from(&restart.intent.next) != target
+        })
+    {
+        return fault(Fault::Busy);
     }
     let enrolled = load::<WorkerRecord>(tx, &key(WORKERS, target.worker_id))?;
     if enrolled
@@ -667,13 +1076,17 @@ fn begin_ready(
             if existing != Some(target)
                 || state.ready.ready_count <= 1
                 || state.owner == Some(target)
-                || !removed.is_some_and(|proof| {
-                    proof.worker == target && exclusion(proof, state.policy)
-                }) =>
+                || !logical_fence
+                    && !removed.is_some_and(|proof| {
+                        proof.worker == target && exclusion(proof, state.policy)
+                    }) =>
         {
             return fault(Fault::Unauthorized);
         }
         _ => {}
+    }
+    if let Some(proof) = removed {
+        record_process_exclusion(tx, proof)?;
     }
     state.pending = Some(Pending::Ready(ReadyPending {
         transition_id: id,
@@ -792,6 +1205,7 @@ fn seal_ready(
     })
 }
 fn publish_ready(
+    tx: &mut GroupTransaction<'_>,
     state: &mut State,
     id: Uuid,
     proof: &QueueCopyStatement,
@@ -833,6 +1247,16 @@ fn publish_ready(
     }
     state.invalid_ready = 0;
     state.pending = None;
+    worker_drain::publish_queue_removed(tx, &pending, state.ready)?;
+    if let Some(fault) = data_worker::publish_mount(tx, state, &pending)? {
+        return Ok(ControlReply::Rejected(fault));
+    }
+    if pending.change == ReadyChange::Join && state.restart.as_ref().is_some_and(|restart| {
+        restart.enrolled && WorkerIdentity::from(&restart.intent.next) == pending.target
+    }) {
+        state.restart = None;
+        state.enrollment_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
+    }
     Ok(ControlReply::Published {
         ready: state.ready,
         owner: state.owner,
@@ -914,6 +1338,14 @@ pub(super) fn key(prefix: &[u8], id: Uuid) -> Vec<u8> {
     key.extend_from_slice(id.as_bytes());
     key
 }
+pub(super) fn process_exclusion_key(worker: WorkerIdentity) -> Vec<u8> {
+    let mut key = key(b"ct/process-exclusion/", worker.worker_id);
+    key.extend_from_slice(&worker.enrollment_revision.to_be_bytes());
+    key
+}
+fn record_process_exclusion(tx: &mut GroupTransaction<'_>, stamp: &ExclusionStamp) -> Result<(), ProtocolError> {
+    save(tx, &process_exclusion_key(stamp.worker), &stamp.worker)
+}
 pub(super) fn ready_prefix(generation: Uuid) -> Vec<u8> {
     key(b"ct/ready/", generation)
 }
@@ -928,6 +1360,11 @@ pub(super) fn member_key(generation: Uuid, node: u64) -> Vec<u8> {
     key.extend_from_slice(&node.to_be_bytes());
     key
 }
+fn member_key_nested(prefix: &[u8], generation: Uuid, node: u64) -> Vec<u8> {
+    let mut result = key(prefix, generation);
+    result.extend_from_slice(&node.to_be_bytes());
+    result
+}
 pub(super) fn member_worker_key(generation: Uuid, worker: Uuid) -> Vec<u8> {
     key(&key(b"ct/member-worker/", generation), worker)
 }
@@ -937,10 +1374,137 @@ fn fence_key(transition: Uuid, group: Uuid) -> Vec<u8> {
 fn exclusion_key(transition: Uuid, worker: Uuid) -> Vec<u8> {
     key(&key(b"ct/exclusion/", transition), worker)
 }
-pub(super) fn group_seed() -> Digest {
+fn register_initial_data(
+    tx: &mut GroupTransaction<'_>,
+    scope: &GroupIdentity,
+    state: &mut State,
+    proof: &GroupMembershipStamp,
+    replicas: &[ReplicaMember],
+    authorization: &AuthorizationStamp,
+) -> Result<ControlReply, ProtocolError> {
+    if state.pending.is_some()
+        || tx.get(&placement::move_key(proof.generation))?.is_some()
+        || tx
+            .get(&key(b"ct/group-replacement/", proof.group.group_id))?
+            .is_some()
+    {
+        return fault(Fault::Busy);
+    }
+    if !stamp(authorization, state.policy)
+        || authorization.evidence != crate::oltp_replication::owned::serialized_digest(proof)?
+        || !state
+            .owner
+            .is_some_and(|owner| owner.certificate_sha256 == authorization.subject)
+        || !matches!(proof.group.kind, GroupKind::Data { .. })
+        || !same_scope(scope, &proof.group)
+        || proof.group.validate().is_err()
+        || proof.generation.is_nil()
+        || proof.authority != state.ready.view.authority()
+        || !position_valid(proof.applied_at)
+        || proof.applied_at.index == 0
+    {
+        return fault(Fault::Unauthorized);
+    }
+    let count = replicas.len() as u64;
+    let chain = replicas.iter().fold(group_seed(), group_step);
+    if validate_voters(replicas).is_err()
+        || replicas
+            .windows(2)
+            .any(|pair| pair[0].node_id >= pair[1].node_id)
+        || count != proof.replica_count
+        || proof.replica_root != group_root(count, chain)
+    {
+        return fault(Fault::Invalid);
+    }
+    let reply = ControlReply::GroupRegistered {
+        group_id: proof.group.group_id,
+        count,
+        root: proof.replica_root,
+    };
+    let group_key = key(GROUPS, proof.group.group_id);
+    if let Some(existing) = load::<GroupRecord>(tx, &group_key)? {
+        return if existing.identity == proof.group
+            && existing.generation == proof.generation
+            && existing.replica_count == count
+            && existing.replica_root == proof.replica_root
+        {
+            Ok(reply)
+        } else {
+            fault(Fault::Conflict)
+        };
+    }
+    let build_key = key(b"ct/group-build/", proof.generation);
+    let prior_build = load::<GroupBuild>(tx, &build_key)?;
+    let staged = if let Some(build) = &prior_build {
+        if build.identity != proof.group
+            || build.generation != proof.generation
+            || build.expected.is_some()
+            || build.count > count
+            || build.retained_count != 0
+            || build.retired_count != 0
+        {
+            return fault(Fault::Conflict);
+        }
+        let prefix = &replicas[..build.count as usize];
+        if build.last_node != prefix.last().map(|member| member.node_id)
+            || build.chain != prefix.iter().fold(group_seed(), group_step)
+        {
+            return fault(Fault::Conflict);
+        }
+        prefix.len()
+    } else {
+        0
+    };
+    for (index, member) in replicas.iter().enumerate() {
+        if pool_drain::blocks_pool(tx, member.pool_id)? || worker_drain::blocks_worker(tx, member.worker_id)? {
+            return fault(Fault::Busy);
+        }
+        if load::<WorkerRecord>(tx, &key(WORKERS, member.worker_id))?.is_none() {
+            return fault(Fault::Invalid);
+        }
+        let expected = (index < staged).then_some(member);
+        let node = member_key(proof.generation, member.node_id);
+        let worker = member_worker_key(proof.generation, member.worker_id);
+        if load::<ReplicaMember>(tx, &node)?.as_ref() != expected
+            || load::<ReplicaMember>(tx, &worker)?.as_ref() != expected
+        {
+            return fault(Fault::Conflict);
+        }
+    }
+    for member in &replicas[staged..] {
+        save(tx, &member_key(proof.generation, member.node_id), member)?;
+        save(
+            tx,
+            &member_worker_key(proof.generation, member.worker_id),
+            member,
+        )?;
+    }
+    if prior_build.is_some() {
+        tx.delete(&build_key)?;
+    }
+    save(
+        tx,
+        &group_key,
+        &GroupRecord {
+            identity: proof.group.clone(),
+            generation: proof.generation,
+            replica_count: count,
+            replica_root: proof.replica_root,
+            membership_position: proof.applied_at,
+        },
+    )?;
+    state.group_count = state.group_count.checked_add(1).ok_or_else(unknown)?;
+    state.group_inventory_revision = state
+        .group_inventory_revision
+        .checked_add(1)
+        .ok_or_else(unknown)?;
+    Ok(reply)
+}
+
+pub(crate) fn group_seed() -> Digest {
     hash(b"nabedra/control/group-members/v1")
 }
-pub(super) fn group_step(prior: Digest, member: &ReplicaMember) -> Digest {
+pub(crate) fn group_step(prior: Digest, member: &ReplicaMember) -> Digest {
     let mut h = Sha256::new();
     h.update(b"nabedra/control/group-member/v1");
     h.update(prior.as_bytes());
@@ -949,7 +1513,7 @@ pub(super) fn group_step(prior: Digest, member: &ReplicaMember) -> Digest {
     h.update(member.pool_id.as_bytes());
     Digest::from_bytes(h.finalize().into())
 }
-pub(super) fn group_root(count: u64, chain: Digest) -> Digest {
+pub(crate) fn group_root(count: u64, chain: Digest) -> Digest {
     let mut h = Sha256::new();
     h.update(b"nabedra/control/group-root/v1");
     h.update(count.to_be_bytes());

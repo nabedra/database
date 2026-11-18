@@ -390,6 +390,22 @@ impl RequestQueue {
         self.records.remove(&id);
         Ok(())
     }
+    /// The caller must already hold a durable, non-executable terminal identity
+    /// proof. This removes RAM only and never creates a reusable identity.
+    #[cfg(feature = "oltp")]
+    pub(crate) fn retire_terminal(
+        &mut self,
+        id: impl Into<RequestKey>,
+        version: u64,
+    ) -> Result<(), QueueError> {
+        let id = id.into();
+        let record = self.records.get(&id).ok_or(QueueError::NotFound)?;
+        if !record.accepted || !record.state.terminal() || record.version != version {
+            return Err(QueueError::Conflict);
+        }
+        self.records.remove(&id);
+        Ok(())
+    }
     pub fn pending(&self) -> usize {
         self.records
             .values()
@@ -494,20 +510,82 @@ impl RequestQueue {
     pub fn install(&mut self, record: RequestRecord) -> Result<(), QueueError> {
         self.install_validated(ValidatedRecord::prepare(record)?)
     }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn reconcile_validated(
+        &mut self,
+        prepared: ValidatedRecord,
+    ) -> Result<bool, QueueError> {
+        let incoming = prepared.record();
+        self.validate_record(incoming)?;
+        if !incoming.replicas.is_empty() {
+            return Err(QueueError::Invalid);
+        }
+        if let Some(local) = self.records.get(&incoming.identity()) {
+            Self::check_identity(local, incoming)?;
+            if local.pinned_catalog != incoming.pinned_catalog
+                || local.state.terminal()
+                    && incoming.state.terminal()
+                    && local.completed_at_ms != incoming.completed_at_ms
+            {
+                return Err(QueueError::Conflict);
+            }
+            if incoming.version < local.version {
+                Self::check_successor(incoming, local)?;
+                return Ok(false);
+            }
+            if incoming.version == local.version {
+                Self::check_successor(local, incoming)?;
+                if local.state != incoming.state
+                    || local.accepted != incoming.accepted
+                    || local.completed_at_ms != incoming.completed_at_ms
+                    || local.response_status != incoming.response_status
+                    || local.response_body != incoming.response_body
+                    || local.result_expired != incoming.result_expired
+                {
+                    return Err(QueueError::Conflict);
+                }
+                return Ok(false);
+            }
+        }
+        self.install_validated(prepared)?;
+        Ok(true)
+    }
+
+    fn check_identity(old: &RequestRecord, new: &RequestRecord) -> Result<(), QueueError> {
+        if old.context != new.context
+            || old.digest != new.digest
+            || (!old.body.is_empty() && !new.body.is_empty() && old.body != new.body)
+            || old.sequence != new.sequence
+        {
+            return Err(QueueError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn check_successor(old: &RequestRecord, new: &RequestRecord) -> Result<(), QueueError> {
+        if old.accepted && !new.accepted
+            || old.state.terminal()
+                && (old.state != new.state
+                    || old.response_status != new.response_status
+                    || old.result_expired && !new.result_expired
+                    || !new.result_expired && old.response_body != new.response_body)
+            || old.pinned_catalog.is_some()
+                && old.pinned_catalog != new.pinned_catalog
+                && !new.result_expired
+        {
+            return Err(QueueError::Conflict);
+        }
+        Ok(())
+    }
     pub fn install_validated(&mut self, prepared: ValidatedRecord) -> Result<(), QueueError> {
         let record = prepared.0;
         self.validate_record(&record)?;
         if let Some(old) = self.records.get(&record.identity()) {
-            if old.context != record.context
-                || old.digest != record.digest
-                || (!old.body.is_empty() && !record.body.is_empty() && old.body != record.body)
-                || old.sequence != record.sequence
-            {
-                return Err(QueueError::Conflict);
-            }
+            Self::check_identity(old, &record)?;
             if record.version < old.version {
                 return Err(QueueError::Stale);
             }
+            Self::check_successor(old, &record)?;
             if record.version == old.version {
                 let mut merged = old.clone();
                 merged.replicas.extend(record.replicas.iter().copied());
@@ -520,18 +598,6 @@ impl RequestQueue {
                 self.check_capacity(&merged)?;
                 self.records.insert(record.identity(), merged);
                 return Ok(());
-            }
-            if old.accepted && !record.accepted
-                || old.state.terminal()
-                    && (old.state != record.state
-                        || old.response_status != record.response_status
-                        || old.result_expired && !record.result_expired
-                        || !record.result_expired && old.response_body != record.response_body)
-                || old.pinned_catalog.is_some()
-                    && old.pinned_catalog != record.pinned_catalog
-                    && !record.result_expired
-            {
-                return Err(QueueError::Conflict);
             }
         } else if self.records.values().any(|r| r.sequence == record.sequence) {
             return Err(QueueError::Conflict);
@@ -638,6 +704,46 @@ impl RequestQueue {
         self.check_capacity(&record)?;
         self.records.insert(id, record.clone());
         Ok(record)
+    }
+    /// Tentative complete payloads may be copied before their durable snapshot
+    /// context is bound. They cannot become executable merely through ACKs.
+    #[cfg(feature = "oltp")]
+    pub(crate) fn acknowledge_payload_version(
+        &mut self,
+        id: impl Into<RequestKey>,
+        version: u64,
+        member: Uuid,
+    ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
+        if !self.members.contains(&member)
+            || self.records.get(&id).is_none_or(|r| r.version != version)
+        {
+            return Err(QueueError::Stale);
+        }
+        let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
+        record.replicas.insert(member);
+        self.check_capacity(&record)?;
+        self.records.insert(id, record.clone());
+        Ok(record)
+    }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn accept_payload(&mut self, id: Uuid) -> Result<(), QueueError> {
+        let record = self
+            .records
+            .get_mut(&id.into())
+            .ok_or(QueueError::NotFound)?;
+        if record.accepted {
+            return Ok(());
+        }
+        if record.replicas != self.members || record.state != RequestState::Queued {
+            return Err(QueueError::Unavailable);
+        }
+        record.accepted = true;
+        record.version = record
+            .version
+            .checked_add(1)
+            .ok_or(QueueError::Overloaded)?;
+        Ok(())
     }
     pub fn ready(&self, id: impl Into<RequestKey>) -> bool {
         let id = id.into();
@@ -841,6 +947,17 @@ impl RequestQueue {
     }
     pub fn records(&self) -> impl Iterator<Item = &RequestRecord> {
         self.records.values()
+    }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn record_after(&self, after: Option<Uuid>) -> Option<Uuid> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        // OLTP stores the accepted context in pinned_catalog and keys RAM
+        // records solely by the operation UUID.
+        let start = after.map_or(Unbounded, |id| Excluded(RequestKey::from(id)));
+        self.records
+            .range((start, Unbounded))
+            .next()
+            .map(|(key, _)| key.request_id)
     }
     pub fn snapshot_page(&self, after_sequence: Option<u64>) -> (QueueSnapshot, bool) {
         let next = self

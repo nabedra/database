@@ -1,0 +1,56 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:ae3fcc48c64f4b4d6cf550fe3952a4bbec08c881a0cd646cb15b8f2a185f8fd8",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "bf16edbdc7ede610409a894f779e3a40878165f8c0d3a16ad011fd7dbdbc6a99",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 96,
+  "cases": {
+    "growth": {
+      "pass": false,
+      "error": "deadline waiting for operation 008def8a-4419-4c07-bd4e-9d931ba6e2db completion",
+      "seconds": 257.437
+    }
+  },
+  "checks": [
+    {
+      "check": "EV08 RF1 metadata and partition promote to RF3 through Raft snapshot catch-up",
+      "voters": [
+        1,
+        2,
+        3
+      ],
+      "checkpoint": 1,
+      "leader_snapshot_index": 1023,
+      "learner_snapshot_indexes": {
+        "2": 1023,
+        "3": 1023
+      }
+    },
+    {
+      "check": "EV08 learner SIGKILL after partial snapshot write leaves source placement intact",
+      "interrupted_broker": 4,
+      "first_chunk_bytes": 131072
+    },
+    {
+      "check": "EV08 pending move survives controller SIGKILL and commits after target starts",
+      "old_controller": 1,
+      "new_controller": 2,
+      "operation_id": "a031fbb0-2cb4-4c48-b32b-27fa3c1afc99",
+      "committed_voters": [
+        2,
+        3,
+        4
+      ]
+    }
+  ]
+}

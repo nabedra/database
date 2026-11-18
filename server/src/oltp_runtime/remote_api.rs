@@ -1,0 +1,387 @@
+//! A stateless API attaches to enrolled workers over the existing mTLS service.
+//! It opens no data pool and cannot create a run or worker readiness.
+use super::{
+    application::ApplicationClient,
+    http_runtime::{HttpRuntime, OwnedReceipt},
+    replica::QueueScope,
+    worker_endpoint::AuthorityReader,
+};
+use crate::{
+    config::WorkerResources,
+    executor::Executor,
+    oltp::pool::{ByteClass, ExecutionClass, SharedResourceConfig, WorkerSharedResources},
+    oltp_replication::{
+        TlsMaterial,
+        authority::control::{ApiEnrollment, ControlClient, ControlRoutes},
+        multiplex::{
+            AppliedPeerDirectory, EndpointFuture, EndpointRegistry, TransportConfig,
+            WorkerTransport,
+        },
+        types::*,
+    },
+    protocol::{ErrorCode, Outcome, ProtocolError},
+    request_queue::{Receipt, RequestRecord, RequestState},
+    response::{self, EncodedResponse},
+    scheduling::ResourceScheduler,
+};
+use serde::Deserialize;
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use uuid::Uuid;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteConfig {
+    pub cluster_id: Uuid,
+    pub control_group_id: Uuid,
+    pub enrollment: ApiEnrollment,
+    pub worker_tls: PrivateTls,
+    pub control_peers: Vec<WorkerEnrollment>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrivateTls {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub ca_file: PathBuf,
+}
+struct Routes(Vec<Uuid>);
+impl ControlRoutes for Routes {
+    fn next(&self, after: Option<Uuid>) -> Result<Option<Uuid>, ProtocolError> {
+        Ok(self
+            .0
+            .iter()
+            .copied()
+            .find(|id| after.is_none_or(|after| *id > after)))
+    }
+}
+pub(crate) struct RemoteRuntime {
+    shared: Arc<WorkerSharedResources>,
+    control: Arc<ControlClient>,
+    client: Arc<ApplicationClient>,
+    scope: QueueScope,
+    ingress: Executor,
+    accepting: AtomicBool,
+    stop: watch::Sender<bool>,
+    tasks: Mutex<Option<(JoinHandle<Result<(), ProtocolError>>, JoinHandle<()>)>>,
+}
+impl RemoteRuntime {
+    pub(crate) async fn open(
+        mut config: RemoteConfig,
+        parent: &Path,
+        database: &str,
+        token: String,
+        resources: WorkerResources,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        config.enrollment.validate()?;
+        if config.enrollment.database.as_str() != database
+            || resources.max_threads == 0
+            || resources.max_threads > 256
+        {
+            return Err(invalid());
+        }
+        let group = GroupIdentity {
+            cluster_id: config.cluster_id,
+            database: config.enrollment.database.clone(),
+            group_id: config.control_group_id,
+            kind: GroupKind::Control,
+            group_format_version: GROUP_FORMAT_VERSION,
+        };
+        group.validate().map_err(|_| invalid())?;
+        let mut ids = config
+            .control_peers
+            .iter()
+            .map(|peer| peer.worker_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() != config.control_peers.len() || ids.is_empty() || ids.len() > 128 {
+            return Err(invalid());
+        }
+        let material = |path: &mut PathBuf, secret: bool| -> Result<Vec<u8>, ProtocolError> {
+            if path.is_relative() {
+                *path = parent.join(&*path);
+            }
+            let file = super::api_process::regular(path, secret)?;
+            let mut bytes = Vec::new();
+            file.take(65537)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?;
+            if bytes.len() > 65536 {
+                return Err(invalid());
+            }
+            Ok(bytes)
+        };
+        let tls = TlsMaterial::from_pem(
+            &material(&mut config.worker_tls.cert_file, false)?,
+            &material(&mut config.worker_tls.key_file, true)?,
+            &material(&mut config.worker_tls.ca_file, false)?,
+        )
+        .map_err(|_| invalid())?;
+        let node =
+            (config.enrollment.enrollment.worker_id.as_u128() as u64 & ((1u64 << 63) - 1)).max(1);
+        let shared = WorkerSharedResources::new(
+            node,
+            resources,
+            SharedResourceConfig {
+                query_threads: resources.max_threads as usize,
+                ..Default::default()
+            },
+        )?;
+        shared.bind_worker(config.enrollment.enrollment.worker_id)?;
+        let directory = AppliedPeerDirectory::from_bootstrap(
+            group.clone(),
+            config.control_peers,
+            shared.clone(),
+        )?;
+        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+        let transport = Arc::new(WorkerTransport::new(
+            config.enrollment.transport(),
+            &tls,
+            shared.clone(),
+            directory.clone(),
+            registry,
+            TransportConfig::default(),
+        )?);
+        let listener = TcpListener::bind(config.enrollment.enrollment.endpoint.as_str())
+            .await
+            .map_err(|_| unavailable())?;
+        let control = ControlClient::new(
+            transport.client(),
+            shared.clone(),
+            group.clone(),
+            Arc::new(Routes(ids)),
+        )?;
+        let (stop, mut stopped) = watch::channel(false);
+        let owner = transport.clone();
+        let task = tokio::spawn(async move {
+            owner
+                .run(listener, async move {
+                    while !*stopped.borrow_and_update() {
+                        if stopped.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+        });
+        let initialize = async {
+            directory.refresh(&control).await?;
+            let scope = QueueScope {
+                cluster_id: group.cluster_id,
+                database: group.database.clone(),
+            };
+            let grant = control
+                .service_role(
+                    &scope,
+                    WorkerIdentity::from(config.enrollment.transport()),
+                    crate::oltp_replication::authority::control::ServiceAction::ApiIngress,
+                    group.clone(),
+                )
+                .await?;
+            if grant.owner.is_none() {
+                return Err(unavailable());
+            }
+            let client = ApplicationClient::new(
+                shared.clone(),
+                transport.client(),
+                control.clone(),
+                group,
+                token,
+            )?;
+            Ok((scope, client))
+        }
+        .await;
+        let (scope, client) = match initialize {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = stop.send(true);
+                let _ = task.await;
+                return Err(error);
+            }
+        };
+        let refresh = tokio::spawn(directory.run_refresh(control.clone(), stop.subscribe()));
+        Ok(Arc::new(Self {
+            shared,
+            control,
+            client,
+            scope,
+            ingress: Executor::new(2, 16)?,
+            accepting: AtomicBool::new(true),
+            stop,
+            tasks: Mutex::new(Some((task, refresh))),
+        }))
+    }
+    pub(crate) fn cluster_id(&self) -> Uuid {
+        self.scope.cluster_id
+    }
+    pub(crate) fn application(
+        self: &Arc<Self>,
+        token: String,
+        database: String,
+        admin: String,
+    ) -> Result<axum::Router, ProtocolError> {
+        super::http::router_for_admin(self.clone(), token, database, Some(admin))
+    }
+    pub(crate) fn stop_accepting(&self) {
+        self.accepting.store(false, Ordering::Release);
+        self.ingress.stop_accepting();
+    }
+    pub(crate) async fn drain(&self) -> Result<(), ProtocolError> {
+        self.stop_accepting();
+        self.ingress.drain().await;
+        let _ = self.stop.send(true);
+        let tasks = self.tasks.lock().map_err(|_| unavailable())?.take();
+        if let Some((transport, refresh)) = tasks {
+            refresh.await.map_err(|_| unavailable())?;
+            transport.await.map_err(|_| unavailable())??;
+        }
+        self.shared.drain().await;
+        Ok(())
+    }
+    async fn receipt_owned(&self, run: Uuid, id: Uuid) -> Result<OwnedReceipt, ProtocolError> {
+        let observed = self.client.observe(run, id).await?;
+        let state = observed.metadata.record.state;
+        if !state.terminal() {
+            return Ok(Receipt {
+                request_id: id,
+                run_id: run,
+                state,
+                result: None,
+                error: None,
+            }
+            .into());
+        }
+        let bytes = self.client.result(observed).await?;
+        let shared = self.shared.clone();
+        self.shared
+            .execute(ExecutionClass::Control, 0, 0, move || {
+                let owner = Arc::new(
+                    shared.reserve_scratch(
+                        ByteClass::Data,
+                        crate::oltp::mvcc::json_decode_budget(bytes.as_ref())?
+                            .checked_mul(2)
+                            .ok_or_else(unavailable)?,
+                    )?,
+                );
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(bytes.as_ref()).map_err(|_| unavailable())?;
+                let result = value
+                    .get_mut("data")
+                    .map(serde_json::Value::take)
+                    .filter(|v| !v.is_null());
+                let error = value
+                    .get_mut("error")
+                    .map(serde_json::Value::take)
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| unavailable())?;
+                Ok(OwnedReceipt {
+                    receipt: Receipt {
+                        request_id: id,
+                        run_id: run,
+                        state,
+                        result,
+                        error,
+                    },
+                    _owner: Some(owner),
+                })
+            })
+            .await
+    }
+}
+impl Drop for RemoteRuntime {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+    }
+}
+impl HttpRuntime for RemoteRuntime {
+    fn ingress(&self) -> &Executor {
+        &self.ingress
+    }
+    fn scheduler(&self) -> ResourceScheduler {
+        self.shared.scheduler()
+    }
+    fn scheduler_node_id(&self) -> u64 {
+        self.shared.scheduler_node_id()
+    }
+    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
+        Box::pin(async move {
+            if !self.accepting.load(Ordering::Acquire) {
+                return Err(unavailable());
+            }
+            self.client.submit(self.shared.copy_bytes(&body)?).await
+        })
+    }
+    fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
+        Box::pin(self.receipt_owned(run, id))
+    }
+    fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse> {
+        Box::pin(async move {
+            // Observation uses fresh authoritative routing and mTLS. Avoid
+            // making a long-running request generate a stream of quorum reads.
+            // The caller's observation timeout remains independent of execution.
+            let mut interval = std::time::Duration::from_millis(50);
+            loop {
+                let observed = self
+                    .client
+                    .observe(record.run_id, record.request_id)
+                    .await?;
+                let metadata = &observed.metadata.record;
+                if metadata.digest != record.digest || metadata.state == RequestState::Reconciling {
+                    return Err(unavailable());
+                }
+                if metadata.state.terminal() {
+                    let status = metadata.response_status.ok_or_else(unavailable)?;
+                    let body = self.client.result(observed).await?;
+                    return Ok(EncodedResponse {
+                        status,
+                        body: body.as_ref().to_vec(),
+                    });
+                }
+                tokio::time::sleep(interval).await;
+                interval = (interval * 2).min(std::time::Duration::from_millis(500));
+            }
+        })
+    }
+    fn health(&self) -> EndpointFuture<'_, EncodedResponse> {
+        Box::pin(async move {
+            if !self.accepting.load(Ordering::Acquire) {
+                return Err(unavailable());
+            }
+            let current = self.control.current(&self.scope).await?;
+            Ok(response::EncodedResponse {status:200,body:serde_json::to_vec(&serde_json::json!({"status":"ready","engine":"oltp",
+            "topology":"api-gateway","cluster_id":self.scope.cluster_id,"run_id":current.ready.view.run_id,"ready_workers":current.ready.ready_count})).map_err(|_|unavailable())?})
+        })
+    }
+    fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
+        Box::pin(async move {
+            let body = self.client.stats().await?;
+            Ok(EncodedResponse {
+                status: 200,
+                body: body.as_ref().to_vec(),
+            })
+        })
+    }
+}
+fn invalid() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::ValidationError,
+        "invalid enrolled API gateway configuration",
+        Outcome::NotApplied,
+    )
+}
+fn unavailable() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "original worker authority or result unavailable",
+        Outcome::Unknown,
+    )
+}

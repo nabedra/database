@@ -1,0 +1,111 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:630389e108220d346d14344f4e3a8bac02c303895e50f8d88b084ba7df76c944",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "0c56e9cd389752c6eb91fff7f81419c1c76180734eba6a55afd587bbb0b0da90",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "load-1": {
+      "pass": true,
+      "seconds": 21.035
+    }
+  },
+  "checks": [
+    {
+      "check": "EV09 1 broker Docker load run with independent fast and slow replay oracles",
+      "brokers": 1,
+      "replication_factor": 1,
+      "broker_caps": {
+        "cpu": 2.0,
+        "memory_mib": 1536
+      },
+      "stages": [
+        {
+          "phase": "balanced",
+          "events": 256,
+          "seconds": 2.6835,
+          "events_per_second": 95.4,
+          "p50_publish_ms": 72.74,
+          "p99_publish_ms": 170.65,
+          "p99_poll_ms": 92.15,
+          "retry_responses": {
+            "publish": {},
+            "poll": {},
+            "checkpoint": {}
+          }
+        },
+        {
+          "phase": "skewed",
+          "events": 256,
+          "seconds": 2.1846,
+          "events_per_second": 117.19,
+          "p50_publish_ms": 62.05,
+          "p99_publish_ms": 141.12,
+          "p99_poll_ms": 59.61,
+          "retry_responses": {
+            "publish": {},
+            "poll": {},
+            "checkpoint": {}
+          }
+        },
+        {
+          "phase": "balanced",
+          "events": 256,
+          "seconds": 1.971,
+          "events_per_second": 129.89,
+          "p50_publish_ms": 55.17,
+          "p99_publish_ms": 134.98,
+          "p99_poll_ms": 38.51,
+          "retry_responses": {
+            "publish": {},
+            "poll": {},
+            "checkpoint": {}
+          }
+        }
+      ],
+      "payload_distribution": "512-byte padding per JSON object, 8 concurrent producers",
+      "event_id_namespace": "91cc4a30-4813-47cb-95ff-0a829ed4f53d",
+      "arrival_schedule": "Fast subscriber commits before second half of each publish round",
+      "asserted_ids": 832,
+      "duplicate_ids": 0,
+      "lost_ids": 0,
+      "slow_subscription_lag_by_partition": {
+        "0": 832
+      },
+      "post_replay_lag": 0,
+      "docker_stats": [
+        {
+          "BlockIO": "0B / 6.18MB",
+          "CPUPerc": "2.72%",
+          "Container": "c5f4bdc745f30568834b94e3e95e75aef83936554cce8b3aa676455ab9f9913d",
+          "ID": "c5f4bdc745f3",
+          "MemPerc": "0.75%",
+          "MemUsage": "11.57MiB / 1.5GiB",
+          "Name": "events-f9105c8883a9-broker-1-1",
+          "NetIO": "1.78MB / 2.46MB",
+          "PIDs": "11"
+        }
+      ],
+      "cgroup_samples": [
+        {
+          "peak_cgroup_bytes": 15486976,
+          "broker_peak_rss_bytes": 45801472,
+          "cpu_usage_usec": 8925487,
+          "disk_bytes": 1791955
+        }
+      ],
+      "encoded_publish_record_bytes": 502956,
+      "rough_disk_to_ingress_ratio": 3.56
+    }
+  ]
+}

@@ -1,0 +1,780 @@
+use super::*;
+use crate::{
+    config::WorkerResources,
+    oltp::pool::SharedResourceConfig,
+    oltp_replication::types::{Text, WorkerEnrollment},
+};
+use std::{future::ready, path::PathBuf, pin::Pin, sync::mpsc};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
+
+#[path = "../../../../tests/support/tls.rs"]
+mod tls;
+
+const GONE: &str = "removed-worker.example:443";
+const OTHER: &str = "other-worker.example:443";
+const OFFLINE_PROGRESS: &str = "offline-progress.example:443";
+const LIVE: &str = "surviving-worker.example:443";
+
+struct GatedLookup {
+    started: async_mpsc::UnboundedReceiver<String>,
+    releases: BTreeMap<&'static str, mpsc::Sender<()>>,
+}
+
+impl GatedLookup {
+    fn resolver(held: &[&'static str], address: SocketAddr) -> (PeerResolver, Self) {
+        let (started, events) = async_mpsc::unbounded_channel();
+        let (releases, gates): (BTreeMap<_, _>, BTreeMap<_, _>) = held
+            .iter()
+            .map(|&endpoint| {
+                let (release, gate) = mpsc::channel();
+                ((endpoint, release), (endpoint, gate))
+            })
+            .unzip();
+        let gates = Mutex::new(gates);
+        let resolver = PeerResolver::with_lookup(move |endpoint| {
+            let gate = gates.lock().unwrap().remove(endpoint);
+            let _ = started.send(endpoint.to_owned());
+            if let Some(gate) = gate {
+                let _ = gate.recv_timeout(Duration::from_secs(10));
+                return Vec::new();
+            }
+            vec![address]
+        });
+        (
+            resolver,
+            Self {
+                started: events,
+                releases,
+            },
+        )
+    }
+
+    fn release(&mut self, endpoint: &str) {
+        self.releases.remove(endpoint).unwrap().send(()).unwrap();
+    }
+
+    async fn next(&mut self, endpoint: &str) {
+        assert_eq!(self.started.recv().await.unwrap(), endpoint);
+    }
+}
+
+async fn assert_pending<T>(waiter: Pin<&mut impl Future<Output = T>>) {
+    tokio::select! {
+        biased;
+        _ = waiter => panic!("operation finished before release"),
+        _ = ready(()) => {}
+    }
+}
+
+fn identity() -> WorkerIdentity {
+    WorkerIdentity {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: Digest::from_bytes([1; 32]),
+        enrollment_revision: 1,
+    }
+}
+
+#[test]
+fn o05_m02_failed_replica_reservation_releases_unused_group_capacity() {
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig {
+            max_resident_groups: 2,
+            precharge_group_capacity: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let registry = EndpointRegistry::new(shared.clone());
+    let first = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("capacity").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Catalog,
+        group_format_version: 1,
+    };
+    let second = GroupIdentity {
+        group_id: Uuid::new_v4(),
+        ..first.clone()
+    };
+    let (group, replica) = registry.reserve_replica(first.clone(), 1).unwrap();
+    let (same_group, learner) = registry.reserve_replica(first, 2).unwrap();
+    assert!(Arc::ptr_eq(&group.0, &same_group.0));
+    let error = registry.reserve_replica(second.clone(), 1).err().unwrap();
+    assert_eq!(error.code, ErrorCode::Overloaded);
+    assert_eq!(error.outcome, Outcome::NotApplied);
+    assert_eq!(
+        error.message,
+        "worker active Raft replica capacity exhausted"
+    );
+    assert_eq!(registry.groups.lock().unwrap().len(), 1);
+    drop(learner);
+    let replacement = registry.reserve_replica(second, 1).unwrap();
+    assert_eq!(registry.groups.lock().unwrap().len(), 2);
+    assert_eq!(shared.resident_group_usage(), (2, 2));
+    drop((group, replica, same_group, replacement));
+    registry.close_worker().unwrap();
+    assert_eq!(shared.resident_group_usage(), (0, 2));
+}
+
+/// O14/O22/C07/F03. A canceled awaiter releases its RPC but the host lookup
+/// retains ownership while native code is still blocked.
+#[tokio::test(start_paused = true)]
+async fn o14_o22_c07_f03_hostname_lookup_owns_slots_across_cancellations() {
+    let address = "127.0.0.1:443".parse().unwrap();
+    let (resolver, mut lookup) = GatedLookup::resolver(&[GONE, OTHER, OFFLINE_PROGRESS], address);
+    let gone = Text::try_from(GONE).unwrap();
+    let other = Text::try_from(OTHER).unwrap();
+    let offline_progress = Text::try_from(OFFLINE_PROGRESS).unwrap();
+    let live = Text::try_from(LIVE).unwrap();
+    let changed_port = Text::try_from("REMOVED-WORKER.example.:444").unwrap();
+    let first = identity();
+    let second = identity();
+    let bulk = TrafficClass::DataConsensus;
+    let progress = TrafficClass::ControlConsensus;
+
+    let mut waiting = Box::pin(resolver.resolve(first, &gone, bulk));
+    assert_pending(waiting.as_mut()).await;
+    lookup.next(GONE).await;
+    drop(waiting);
+    let mut waiting = Box::pin(resolver.resolve(second, &other, bulk));
+    assert_pending(waiting.as_mut()).await;
+    lookup.next(OTHER).await;
+    drop(waiting);
+
+    for class in [bulk, progress, TrafficClass::Settlement] {
+        for _ in 0..16 {
+            let mut waiter = Box::pin(resolver.resolve(first, &gone, class));
+            assert_pending(waiter.as_mut()).await;
+        }
+    }
+    assert_eq!(resolver.active_for_test(), [2, 0]);
+    assert!(lookup.started.try_recv().is_err());
+    assert!(matches!(
+        resolver.resolve(second, &live, bulk).await,
+        Err(ResolveError::LocallyUnavailable)
+    ));
+    let replacement = WorkerIdentity {
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 2,
+        ..first
+    };
+    assert!(matches!(
+        resolver.resolve(replacement, &changed_port, progress).await,
+        Err(ResolveError::LocallyUnavailable)
+    ));
+    let mut waiter = Box::pin(resolver.resolve(second, &offline_progress, progress));
+    assert_pending(waiter.as_mut()).await;
+    lookup.next(OFFLINE_PROGRESS).await;
+    drop(waiter);
+    assert!(matches!(
+        resolver
+            .resolve(replacement, &offline_progress, progress)
+            .await,
+        Err(ResolveError::LocallyUnavailable)
+    ));
+    assert_eq!(resolver.active_for_test(), [2, 1]);
+    assert_eq!(
+        resolver
+            .resolve(replacement, &live, progress)
+            .await
+            .unwrap()
+            .as_ref(),
+        &[address]
+    );
+    lookup.next(LIVE).await;
+
+    let mut waiter = Box::pin(resolver.resolve(first, &gone, progress));
+    assert_pending(waiter.as_mut()).await;
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert_pending(waiter.as_mut()).await;
+    tokio::time::advance(Duration::from_millis(2)).await;
+    assert!(matches!(
+        waiter.await,
+        Err(ResolveError::LocallyUnavailable)
+    ));
+    assert_eq!(resolver.active_for_test(), [2, 1]);
+
+    lookup.release(GONE);
+    assert!(matches!(
+        resolver.resolve(first, &gone, progress).await,
+        Err(ResolveError::NoAddresses)
+    ));
+    assert_eq!(resolver.active_for_test(), [1, 1]);
+    assert!(matches!(
+        resolver.resolve(first, &gone, bulk).await,
+        Err(ResolveError::NoAddresses)
+    ));
+    assert!(lookup.started.try_recv().is_err());
+    assert_eq!(
+        resolver
+            .resolve(replacement, &gone, progress)
+            .await
+            .unwrap()
+            .as_ref(),
+        &[address]
+    );
+    lookup.next(GONE).await;
+    tokio::time::advance(Duration::from_millis(251)).await;
+    assert_eq!(
+        resolver
+            .resolve(first, &gone, progress)
+            .await
+            .unwrap()
+            .as_ref(),
+        &[address]
+    );
+    lookup.next(GONE).await;
+    assert_eq!(
+        resolver.resolve(first, &gone, bulk).await.unwrap().as_ref(),
+        &[address]
+    );
+    assert!(lookup.started.try_recv().is_err());
+    tokio::time::advance(Duration::from_millis(1001)).await;
+    resolver.resolve(first, &gone, progress).await.unwrap();
+    lookup.next(GONE).await;
+
+    lookup.release(OTHER);
+    assert!(matches!(
+        resolver.resolve(second, &other, bulk).await,
+        Err(ResolveError::NoAddresses)
+    ));
+    lookup.release(OFFLINE_PROGRESS);
+    assert!(matches!(
+        resolver.resolve(second, &offline_progress, progress).await,
+        Err(ResolveError::NoAddresses)
+    ));
+    assert_eq!(resolver.active_for_test(), [0, 0]);
+}
+
+#[derive(Default)]
+struct TestDirectory(Mutex<BTreeMap<Uuid, WorkerEnrollment>>);
+
+impl TestDirectory {
+    fn install(&self, item: WorkerEnrollment) {
+        self.0.lock().unwrap().insert(item.worker_id, item);
+    }
+}
+
+impl PeerDirectory for TestDirectory {
+    fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
+        self.0
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .cloned()
+            .ok_or_else(unavailable)
+    }
+
+    fn verify(
+        &self,
+        peer: WorkerIdentity,
+        _group: &GroupIdentity,
+        _purpose: Purpose,
+    ) -> Result<TransportTrust, ProtocolError> {
+        if WorkerIdentity::from(&self.resolve(peer.worker_id)?) != peer {
+            return Err(malformed("worker differs from test enrollment"));
+        }
+        Ok(TransportTrust::AppliedEnrollment)
+    }
+}
+
+#[derive(Default)]
+struct Echo(std::sync::atomic::AtomicUsize);
+
+impl Endpoint for Echo {
+    fn preflight<'a>(
+        &'a self,
+        session: &'a AuthenticatedSession,
+        _header: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async move {
+            Ok(ReceivePlan {
+                class: traffic(session.group(), session.purpose())?,
+                section_lengths: [0; MAX_SECTIONS],
+                decode_budget_bytes: 0,
+            })
+        })
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _session: AuthenticatedSession,
+        header: ChargedBytes,
+        _sections: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(ChargedReply {
+                header,
+                sections: [None, None, None],
+            })
+        })
+    }
+}
+
+struct TestDirectoryPath(PathBuf);
+
+impl Drop for TestDirectoryPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct RejectProbe;
+
+impl Endpoint for RejectProbe {
+    fn preflight<'a>(
+        &'a self,
+        _: &'a AuthenticatedSession,
+        _: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async { Err(unavailable()) })
+    }
+
+    fn handle<'a>(
+        &'a self,
+        _: AuthenticatedSession,
+        _: ChargedBytes,
+        _: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        panic!("probe should stop at preflight")
+    }
+}
+
+/// R05/F03. Probes can observe a live worker again when native lookup slots
+/// settle. Local resolver contention must not contribute to its miss streak.
+#[tokio::test]
+async fn r05_f03_queue_probe_resolver_contention_is_indeterminate() {
+    use crate::{
+        oltp_replication::types::{AuthorityView, ReadyMembership},
+        oltp_runtime::{
+            replica::QueueScope,
+            worker_endpoint::{PeerReachability, QueuePeerClient, QueueRequest},
+        },
+    };
+
+    let temp =
+        TestDirectoryPath(std::env::temp_dir().join(format!("probe-dns-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 2);
+    let group = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("probe").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let scope = QueueScope {
+        cluster_id: group.cluster_id,
+        database: group.database.clone(),
+    };
+    let ready = ReadyMembership {
+        view: AuthorityView {
+            run_id: Uuid::new_v4(),
+            owner_term: 1,
+            membership_revision: 1,
+        },
+        ready_root: Digest::from_bytes([1; 32]),
+        ready_count: 2,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (resolver, mut lookup) =
+        GatedLookup::resolver(&[GONE, OTHER], listener.local_addr().unwrap());
+    let enrollment = |index: usize, endpoint: &str| WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
+        endpoint: Text::try_from(endpoint).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let caller = enrollment(0, "127.0.0.1:1");
+    let live = enrollment(1, LIVE);
+    let first = enrollment(1, GONE);
+    let second = enrollment(1, OTHER);
+    let alias = enrollment(1, "REMOVED-WORKER.example.:444");
+    let peers = Arc::new(TestDirectory::default());
+    for worker in [&caller, &live, &first, &second, &alias] {
+        peers.install(worker.clone());
+    }
+
+    let transport = |local: &WorkerEnrollment, node, index: usize| {
+        let shared = WorkerSharedResources::new(
+            node,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+        WorkerTransport::new(
+            local,
+            &tls[index],
+            shared,
+            peers.clone(),
+            registry,
+            TransportConfig::default(),
+        )
+        .unwrap()
+    };
+    let receiver = Arc::new(transport(&live, 2, 1));
+    receiver
+        .registry
+        .reserve(group.clone())
+        .unwrap()
+        .bind(Purpose::QueueControl, Arc::new(RejectProbe))
+        .unwrap();
+    let mut caller = transport(&caller, 1, 0);
+    Arc::get_mut(&mut caller.common).unwrap().resolver = resolver;
+    let queue =
+        QueuePeerClient::new(caller.client(), caller.common.shared.clone(), group.clone()).unwrap();
+    let probe =
+        |peer: &WorkerEnrollment| queue.probe(WorkerIdentity::from(peer), scope.clone(), ready);
+    let (stop, shutdown) = oneshot::channel();
+    let worker = tokio::spawn(receiver.run(listener, async {
+        let _ = shutdown.await;
+    }));
+
+    timeout(Duration::from_secs(5), async {
+        for (peer, endpoint) in [(&first, GONE), (&second, OTHER)] {
+            let mut waiter = Box::pin(probe(peer));
+            assert_pending(waiter.as_mut()).await;
+            lookup.next(endpoint).await;
+        }
+        assert_eq!(caller.common.resolver.active_for_test(), [0, 2]);
+        for _ in 0..3 {
+            assert_eq!(probe(&live).await, PeerReachability::Indeterminate);
+        }
+        let header = caller
+            .common
+            .shared
+            .encode_in(
+                ByteClass::Progress,
+                &QueueRequest::Ping {
+                    scope: scope.clone(),
+                    view: ready.view,
+                },
+                1024,
+            )
+            .unwrap();
+        assert!(matches!(
+            caller
+                .client()
+                .request_classified(
+                    &group,
+                    WorkerIdentity::from(&live),
+                    Purpose::QueueControl,
+                    header,
+                    [None, None, None],
+                    0,
+                )
+                .await,
+            Err(RequestError::Unreachable)
+        ));
+        assert!(lookup.started.try_recv().is_err());
+
+        lookup.release(OTHER);
+        assert_eq!(probe(&second).await, PeerReachability::Unreachable);
+        assert_eq!(caller.common.resolver.active_for_test(), [0, 1]);
+        assert_eq!(probe(&alias).await, PeerReachability::Indeterminate);
+        assert!(lookup.started.try_recv().is_err());
+
+        let mut waiter = Box::pin(probe(&first));
+        assert_pending(waiter.as_mut()).await;
+        assert_eq!(waiter.await, PeerReachability::Indeterminate);
+        assert_eq!(caller.common.resolver.active_for_test(), [0, 1]);
+        lookup.release(GONE);
+        assert_eq!(probe(&first).await, PeerReachability::Unreachable);
+        assert_eq!(caller.common.resolver.active_for_test(), [0, 0]);
+
+        assert_eq!(probe(&live).await, PeerReachability::Reachable);
+        lookup.next(LIVE).await;
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    worker.await.unwrap().unwrap();
+    assert_eq!(probe(&live).await, PeerReachability::Unreachable);
+}
+
+/// O14/O22/C07/F03. Numeric and hostname targets use real authenticated
+/// transport while both ordinary DNS slots remain occupied.
+#[tokio::test]
+async fn o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("peer-dns-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 2);
+    let group = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("progress").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Catalog,
+        group_format_version: 1,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let enrollment = |index: usize, endpoint: Text<255>| WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
+        endpoint,
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let caller = enrollment(0, Text::try_from("127.0.0.1:1").unwrap());
+    let mut target = enrollment(1, Text::new(address.to_string()).unwrap());
+    let gone = enrollment(1, Text::try_from(GONE).unwrap());
+    let other = enrollment(1, Text::try_from(OTHER).unwrap());
+    let peers = Arc::new(TestDirectory::default());
+    for worker in [&caller, &target, &gone, &other] {
+        peers.install(worker.clone());
+    }
+
+    let transport = |local: &WorkerEnrollment, node, index: usize| {
+        let shared = WorkerSharedResources::new(
+            node,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+        WorkerTransport::new(
+            local,
+            &tls[index],
+            shared,
+            peers.clone(),
+            registry,
+            TransportConfig::default(),
+        )
+        .unwrap()
+    };
+    let receiver = Arc::new(transport(&target, 2, 1));
+    let echo = Arc::new(Echo::default());
+    receiver
+        .registry
+        .reserve(group.clone())
+        .unwrap()
+        .bind(Purpose::RaftProgress, echo.clone())
+        .unwrap();
+    let (resolver, mut lookup) = GatedLookup::resolver(&[GONE, OTHER], address);
+    let mut caller = transport(&caller, 1, 0);
+    Arc::get_mut(&mut caller.common).unwrap().resolver = resolver;
+    let client = caller.client();
+    let (stop, shutdown) = oneshot::channel();
+    let worker = tokio::spawn(receiver.run(listener, async {
+        let _ = shutdown.await;
+    }));
+
+    timeout(Duration::from_secs(5), async {
+        let request = |target, purpose, class: ByteClass, text: &str| {
+            let header = caller.common.shared.encode_in(class, &text, 1024).unwrap();
+            client.request_classified(&group, target, purpose, header, [None, None, None], 0)
+        };
+        for (peer, endpoint) in [(&gone, GONE), (&other, OTHER)] {
+            let mut waiter = Box::pin(request(
+                WorkerIdentity::from(peer),
+                Purpose::Raft,
+                ByteClass::Data,
+                "unreachable",
+            ));
+            assert_pending(waiter.as_mut()).await;
+            lookup.next(endpoint).await;
+        }
+        assert_eq!(caller.common.resolver.active_for_test(), [2, 0]);
+
+        let progress = |peer: &WorkerEnrollment, text| {
+            request(
+                WorkerIdentity::from(peer),
+                Purpose::RaftProgress,
+                ByteClass::Progress,
+                text,
+            )
+        };
+        let reply = progress(&target, "numeric").await.unwrap();
+        assert_eq!(reply.header.as_slice(), b"\"numeric\"");
+        assert_eq!(reply.remote_identity(), WorkerIdentity::from(&target));
+        assert!(lookup.started.try_recv().is_err());
+
+        target.endpoint = Text::try_from(LIVE).unwrap();
+        peers.install(target.clone());
+        let reply = progress(&target, "hostname").await.unwrap();
+        assert_eq!(reply.header.as_slice(), b"\"hostname\"");
+        assert_eq!(reply.remote_identity(), WorkerIdentity::from(&target));
+        lookup.next(LIVE).await;
+        let reply = progress(&target, "cached").await.unwrap();
+        assert_eq!(reply.header.as_slice(), b"\"cached\"");
+        assert!(lookup.started.try_recv().is_err());
+
+        target.enrollment_revision += 1;
+        target.certificate_sha256 = caller.common.local.certificate_sha256;
+        peers.install(target.clone());
+        for _ in 0..2 {
+            assert!(matches!(
+                progress(&target, "wrong fingerprint").await,
+                Err(RequestError::Protocol(error))
+                    if error.message == "target certificate or ALPN differs"
+            ));
+        }
+        lookup.next(LIVE).await;
+        assert!(lookup.started.try_recv().is_err());
+        assert_eq!(echo.0.load(Ordering::Relaxed), 3);
+        assert_eq!(caller.common.resolver.active_for_test(), [2, 0]);
+
+        for (peer, endpoint) in [(&gone, GONE), (&other, OTHER)] {
+            lookup.release(endpoint);
+            assert!(matches!(
+                request(
+                    WorkerIdentity::from(peer),
+                    Purpose::Raft,
+                    ByteClass::Data,
+                    "settle"
+                )
+                .await,
+                Err(RequestError::Unreachable)
+            ));
+        }
+        assert_eq!(caller.common.resolver.active_for_test(), [0, 0]);
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    worker.await.unwrap().unwrap();
+}
+
+/// O14/O23/C07/R03. A role read waits before dispatch under Authority pressure,
+/// then uses the first available slot without blocking other Authority reads.
+#[tokio::test]
+async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
+    let temp =
+        TestDirectoryPath(std::env::temp_dir().join(format!("authority-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 2);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let enrollment = |index: usize, endpoint: String| WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[index].certificate_sha256()).unwrap(),
+        endpoint: Text::new(endpoint).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let caller = enrollment(0, "127.0.0.1:1".to_owned());
+    let target = enrollment(1, listener.local_addr().unwrap().to_string());
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(caller.clone());
+    peers.install(target.clone());
+    let authority = TrafficClass::Authority as usize;
+    let mut config = TransportConfig::default();
+    config.handler_slots[authority] = 2;
+    config.preflight_slots[authority] = 1;
+    let transport = |local, node, index: usize| {
+        let shared = WorkerSharedResources::new(
+            node,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+        WorkerTransport::new(
+            local,
+            &tls[index],
+            shared,
+            peers.clone(),
+            registry,
+            config.clone(),
+        )
+        .unwrap()
+    };
+    let group = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("authority").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let receiver = Arc::new(transport(&target, 2, 1));
+    let echo = Arc::new(Echo::default());
+    receiver
+        .registry
+        .reserve(group.clone())
+        .unwrap()
+        .bind(Purpose::Authority, echo.clone())
+        .unwrap();
+    let caller = transport(&caller, 1, 0);
+    let client = caller.client();
+    let (stop, shutdown) = oneshot::channel();
+    let worker = tokio::spawn(receiver.run(listener, async {
+        let _ = shutdown.await;
+    }));
+    let used_bytes = || caller.common.shared.buffer_bytes_used(ByteClass::Progress);
+    let baseline = used_bytes();
+    let header = |bytes: &[u8]| {
+        caller
+            .common
+            .shared
+            .copy_bytes_in(ByteClass::Progress, bytes)
+            .unwrap()
+    };
+    let dependency = |bytes: &[u8]| {
+        client.request_authority_dependency(&group, target.worker_id, header(bytes), 0)
+    };
+
+    tokio::time::pause();
+    let held = client.hold_outgoing_for_test(TrafficClass::Authority);
+    let mut pending = Box::pin(dependency(b"cancelled"));
+    assert_pending(pending.as_mut()).await;
+    assert!(used_bytes() > baseline + b"cancelled".len());
+    assert!(matches!(
+        dependency(b"excess").await,
+        Err(RequestError::OutgoingLaneFull)
+    ));
+    drop(pending);
+    assert_eq!(used_bytes(), baseline);
+    let mut pending = Box::pin(dependency(b"expired"));
+    assert_pending(pending.as_mut()).await;
+    tokio::time::advance(config.deadline).await;
+    assert!(matches!(pending.await, Err(RequestError::OutgoingLaneFull)));
+    assert_eq!(caller.common.authority_waiters.available_permits(), 1);
+    assert_eq!(echo.0.load(Ordering::Relaxed), 0);
+    assert_eq!(used_bytes(), baseline);
+    drop(held);
+    tokio::time::resume();
+
+    timeout(Duration::from_secs(5), async {
+        let held = client
+            .authority_slots(Instant::now() + config.deadline)
+            .await
+            .unwrap();
+        let mut pending = Box::pin(dependency(b"role"));
+        assert_pending(pending.as_mut()).await;
+        assert_eq!(caller.common.authority_waiters.available_permits(), 0);
+        let ordinary = client
+            .request(
+                &group,
+                target.worker_id,
+                Purpose::Authority,
+                header(b"current"),
+                [None, None, None],
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary.header.as_slice(), b"current");
+        assert_eq!(echo.0.load(Ordering::Relaxed), 1);
+        drop(held);
+        let reply = pending.await.unwrap();
+        assert_eq!(reply.header.as_slice(), b"role");
+        assert_eq!(reply.remote_identity(), WorkerIdentity::from(&target));
+        assert_eq!(echo.0.load(Ordering::Relaxed), 2);
+        assert_eq!(caller.common.authority_waiters.available_permits(), 1);
+        assert_eq!(caller.common.outgoing[authority].available_permits(), 2);
+        drop((ordinary, reply));
+        assert_eq!(used_bytes(), baseline);
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    worker.await.unwrap().unwrap();
+}

@@ -23,6 +23,7 @@ path = "src/main.rs"
 default = ["olap", "s3"]
 olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
 oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
+oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]

@@ -12,14 +12,59 @@ use crate::{
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Decoded receipt heap remains charged through HTTP serialization/observation.
+pub(crate) struct OwnedReceipt {
+    pub receipt: Receipt,
+    pub _owner: Option<Arc<crate::oltp::pool::ScratchLease>>,
+}
+impl From<Receipt> for OwnedReceipt {
+    fn from(receipt: Receipt) -> Self {
+        Self {
+            receipt,
+            _owner: None,
+        }
+    }
+}
+impl std::ops::Deref for OwnedReceipt {
+    type Target = Receipt;
+    fn deref(&self) -> &Receipt {
+        &self.receipt
+    }
+}
+
 pub(crate) trait HttpRuntime: Send + Sync + 'static {
     fn ingress(&self) -> &Executor;
     fn scheduler(&self) -> ResourceScheduler;
     fn scheduler_node_id(&self) -> u64;
     fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord>;
-    fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, Receipt>;
+    fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt>;
     fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse>;
     fn health(&self) -> EndpointFuture<'_, EncodedResponse>;
+    fn admin_memory(&self) -> Result<Arc<crate::oltp::pool::ScratchLease>, ProtocolError> {
+        Err(ProtocolError::new(
+            ErrorCode::UnsupportedOperation,
+            "administration is unavailable",
+            Outcome::NotApplied,
+        ))
+    }
+    fn administer(self: Arc<Self>, _body: Vec<u8>) -> EndpointFuture<'static, EncodedResponse> {
+        Box::pin(async {
+            Err(ProtocolError::new(
+                ErrorCode::UnsupportedOperation,
+                "administration is unavailable",
+                Outcome::NotApplied,
+            ))
+        })
+    }
+    fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
+        Box::pin(async {
+            Err(ProtocolError::new(
+                ErrorCode::UnsupportedOperation,
+                "runtime statistics are unavailable",
+                Outcome::NotApplied,
+            ))
+        })
+    }
 }
 impl HttpRuntime for LocalRuntime {
     fn ingress(&self) -> &Executor {
@@ -34,8 +79,8 @@ impl HttpRuntime for LocalRuntime {
     fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
         Box::pin(async move { LocalRuntime::submit(&self, body).await })
     }
-    fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, Receipt> {
-        Box::pin(LocalRuntime::receipt(self, run, id))
+    fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
+        Box::pin(async move { LocalRuntime::receipt(self, run, id).await.map(Into::into) })
     }
     fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse> {
         Box::pin(LocalRuntime::wait(self, record))

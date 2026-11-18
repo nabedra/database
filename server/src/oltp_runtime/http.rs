@@ -19,6 +19,7 @@ struct ApiState {
     runtime: Arc<dyn HttpRuntime>,
     token: String,
     database: String,
+    admin: Option<String>,
 }
 
 pub fn router(
@@ -35,6 +36,20 @@ pub(crate) fn router_for(
     token: String,
     database: String,
 ) -> Result<Router, ProtocolError> {
+    router_for_admin(runtime, token, database, None)
+}
+pub(crate) fn router_for_admin(
+    runtime: Arc<dyn HttpRuntime>,
+    token: String,
+    database: String,
+    admin: Option<String>,
+) -> Result<Router, ProtocolError> {
+    if admin
+        .as_ref()
+        .is_some_and(|admin| admin.is_empty() || admin == &token)
+    {
+        return Err(invalid("admin and data credentials must differ"));
+    }
     if token.trim().is_empty() || !valid_database(&database) {
         return Err(invalid("invalid authentication configuration"));
     }
@@ -43,17 +58,21 @@ pub(crate) fn router_for(
     let operation_capacity = Arc::new(tokio::sync::Semaphore::new(256));
     let submissions = Arc::new(tokio::sync::Semaphore::new(16));
     let receipts = Arc::new(tokio::sync::Semaphore::new(8));
+    let administration = Arc::new(tokio::sync::Semaphore::new(2));
     Ok(Router::new()
         .route("/v1/operations", post(operations))
         .route("/v1/requests", post(submit))
         .route("/v1/requests/{run_id}/{request_id}", get(receipt))
         .route("/v1/cluster/operations", post(unsupported))
+        .route("/v1/runtime/stats", get(stats))
         .route("/health/live", get(|| async { "live" }))
         .route("/health/ready", get(health))
         .layer(axum::middleware::from_fn(
             move |request: Request, next: axum::middleware::Next| {
                 let scheduler = scheduler.clone();
-                let budget = if request.uri().path().starts_with("/v1/requests/") {
+                let budget = if request.uri().path() == "/v1/cluster/operations" {
+                    administration.clone()
+                } else if request.uri().path().starts_with("/v1/requests/") {
                     receipts.clone()
                 } else if request.uri().path() == "/v1/requests" {
                     submissions.clone()
@@ -102,24 +121,31 @@ pub(crate) fn router_for(
             runtime,
             token,
             database,
+            admin,
         })))
 }
 
 fn authorized(headers: &HeaderMap, state: &ApiState) -> bool {
+    authorized_as(headers, state, &state.token)
+}
+fn authorized_as(headers: &HeaderMap, state: &ApiState, expected: &str) -> bool {
+    authorize_database(headers, expected, &state.database)
+}
+pub(super) fn authorize_database(headers: &HeaderMap, expected: &str, database: &str) -> bool {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let auth = values
         .next()
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split_once(' ').is_some_and(|(scheme, token)| {
-                scheme.eq_ignore_ascii_case("Bearer") && token == state.token
+                scheme.eq_ignore_ascii_case("Bearer") && token == expected
             })
         })
         && values.next().is_none();
     let mut selectors = headers.get_all("x-nabedra-database").iter();
     let selected = selectors
         .next()
-        .is_none_or(|v| v.to_str().ok() == Some(&state.database));
+        .is_none_or(|v| v.to_str().ok() == Some(database));
     auth && selected
         && selectors.next().is_none()
         && !headers.keys().any(|name| {
@@ -150,7 +176,10 @@ fn content_type(headers: &HeaderMap) -> bool {
         })
         && values.next().is_none()
 }
-async fn body(mut body: Body) -> Result<Vec<u8>, ProtocolError> {
+async fn body(body: Body) -> Result<Vec<u8>, ProtocolError> {
+    bounded_body(body, protocol::MAX_BODY_BYTES).await
+}
+async fn bounded_body(mut body: Body, maximum: usize) -> Result<Vec<u8>, ProtocolError> {
     let mut bytes = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     while let Some(frame) = tokio::time::timeout_at(deadline, body.frame())
@@ -159,7 +188,7 @@ async fn body(mut body: Body) -> Result<Vec<u8>, ProtocolError> {
     {
         let frame = frame.map_err(|_| invalid("request body could not be read"))?;
         if let Ok(data) = frame.into_data() {
-            if data.len() > protocol::MAX_BODY_BYTES - bytes.len() {
+            if data.len() > maximum - bytes.len() {
                 return Err(ProtocolError::new(
                     ErrorCode::LimitExceeded,
                     "request body exceeds 8 MiB",
@@ -271,7 +300,7 @@ async fn receipt(
         ))
     });
     match observed {
-        Ok(receipt) => match serde_json::to_vec(&receipt) {
+        Ok(receipt) => match serde_json::to_vec(&receipt.receipt) {
             Ok(body) if body.len() <= protocol::MAX_BODY_BYTES => {
                 complete(EncodedResponse { status: 200, body })
             }
@@ -288,6 +317,32 @@ async fn receipt(
     }
 }
 async fn unsupported(State(state): State<Arc<ApiState>>, request: Request) -> Response {
+    if let Some(admin) = &state.admin {
+        if !authorized_as(request.headers(), &state, admin) {
+            return failure(
+                None,
+                ProtocolError::new(ErrorCode::Unauthorized, "unauthorized", Outcome::NotApplied),
+            );
+        }
+        if request.uri().query().is_some() || !content_type(request.headers()) {
+            return failure(None, invalid("invalid administration request"));
+        }
+        let owner = match state.runtime.admin_memory() {
+            Ok(owner) => owner,
+            Err(error) => return failure(None, error),
+        };
+        let bytes = match bounded_body(request.into_body(), 64 << 10).await {
+            Ok(bytes) => bytes,
+            Err(error) => return failure(None, error),
+        };
+        let id = scan_request_id(&bytes);
+        let result = state.runtime.clone().administer(bytes).await;
+        drop(owner);
+        return match result {
+            Ok(encoded) => complete(encoded),
+            Err(error) => failure(id, error),
+        };
+    }
     if let Err(error) = authorize(&request, &state) {
         return failure(None, error);
     }
@@ -299,6 +354,15 @@ async fn unsupported(State(state): State<Arc<ApiState>>, request: Request) -> Re
             Outcome::NotApplied,
         ),
     )
+}
+async fn stats(State(state): State<Arc<ApiState>>, request: Request) -> Response {
+    if let Err(error) = authorize(&request, &state) {
+        return failure(None, error);
+    }
+    match state.runtime.stats().await {
+        Ok(encoded) => complete(encoded),
+        Err(error) => failure(None, error),
+    }
 }
 async fn health(State(state): State<Arc<ApiState>>) -> Response {
     match state.runtime.health().await {

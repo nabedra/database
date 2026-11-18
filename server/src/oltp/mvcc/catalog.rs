@@ -34,6 +34,36 @@ pub(crate) struct TableRecord {
     pub descriptor: TableDescriptor,
     pub schema_epoch: u64,
     pub routing_epoch: u64,
+    /// Routing-only versions retain this identity. Schema/index transitions
+    /// replace it, so an old pin cannot omit a newly Building index.
+    #[serde(default, skip_serializing_if = "Uuid::is_nil")]
+    pub lifecycle_id: Uuid,
+}
+impl TableRecord {
+    pub(super) fn with_lifecycle(&self, id: Uuid) -> Self {
+        Self {
+            lifecycle_id: id,
+            ..self.clone()
+        }
+    }
+}
+pub(super) fn lifecycle_anchor(
+    table_id: Uuid,
+    schema_epoch: u64,
+    version: Option<CommitTs>,
+    stored: Uuid,
+) -> Result<Uuid, ProtocolError> {
+    if !stored.is_nil() {
+        return Ok(stored);
+    }
+    let version = version.ok_or_else(invalid)?;
+    let digest = crate::oltp_replication::owned::serialized_digest(&(
+        b"nabedra/legacy-table-lifecycle/v1".as_slice(),
+        table_id,
+        schema_epoch,
+        version,
+    ))?;
+    Uuid::from_slice(&digest.as_bytes()[..16]).map_err(|_| invalid())
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,6 +305,7 @@ impl CatalogHandle {
             descriptor,
             schema_epoch: route.schema_epoch,
             routing_epoch: route.routing_epoch,
+            lifecycle_id: table_id,
         };
         let entries = [
             (
@@ -385,7 +416,7 @@ pub(crate) async fn decode_canonical<T: DeserializeOwned + Send + Sync + 'static
         .await
 }
 
-fn contains(span: &KeySpan, key: &Key) -> bool {
+pub(super) fn contains(span: &KeySpan, key: &Key) -> bool {
     span.start
         .as_ref()
         .is_none_or(|a| primary(a, key) != std::cmp::Ordering::Greater)
@@ -394,7 +425,7 @@ fn contains(span: &KeySpan, key: &Key) -> bool {
             .as_ref()
             .is_none_or(|b| primary(key, b) == std::cmp::Ordering::Less)
 }
-fn primary(a: &Key, b: &Key) -> std::cmp::Ordering {
+pub(super) fn primary(a: &Key, b: &Key) -> std::cmp::Ordering {
     match (a, b) {
         (Key::Int64(a), Key::Int64(b)) => a.cmp(b),
         (Key::Utf8(a), Key::Utf8(b)) => a.cmp(b),
@@ -508,9 +539,22 @@ impl CatalogHandle {
                 }
             }
         }
+        // Authority terms fence execution but do not change an immutable cut.
+        // A same-run takeover must reconstruct the same pre-accept lineage.
         // List/create-absent uses this genuine namespace identity/epoch plus
         // the allocator-pinned read timestamp. Every catalog key is MVCC at s.
-        capture.catalog_root = crate::oltp_replication::owned::serialized_digest(&capture)?;
+        capture.catalog_root = crate::oltp_replication::owned::serialized_digest(&(
+            b"nabedra/pinned-catalog-lineage/v1".as_slice(),
+            &pin.catalog,
+            pin.read_ts,
+            pin.authority.run_id,
+            capture.table_id,
+            capture.name_version,
+            capture.table_version,
+            capture.routing_version,
+            capture.schema_epoch,
+            capture.routing_epoch,
+        ))?;
         Ok(CaptureRead::Captured(capture))
     }
 }

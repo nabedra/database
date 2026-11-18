@@ -2,11 +2,28 @@
 //! The installed server uses RF1; distributed production composition and
 //! provisioning are not enabled by the CLI.
 mod admission;
-mod bootstrap;
+mod admission_tickets;
+mod authority_fence;
+#[cfg(unix)]
+pub mod api_process;
+pub(crate) mod application;
+pub mod archive_cli;
+pub(crate) mod bootstrap;
 pub mod coordinator;
+#[cfg(unix)]
+pub mod data_worker_process;
+#[cfg(test)]
+mod direct_benchmark;
 mod http;
 mod http_runtime;
+mod operator;
 mod queue;
+#[cfg(unix)]
+pub mod registered_process;
+#[cfg(test)]
+pub(crate) mod recovery_tests;
+#[cfg(unix)]
+mod remote_api;
 pub mod replica;
 mod transaction;
 pub mod worker_endpoint;
@@ -32,8 +49,8 @@ pub(crate) const MAX_DECODED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const RECEIPT_OBSERVATION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(2);
 
-/// Runtime used by the standalone CLI. Validated worker resources allow at most
-/// 254 foreground native jobs, so this pool does not impose an extra four-job cap.
+/// Runtime used by the standalone CLI. Storage query/control work uses its
+/// explicitly bounded owned executors; this pool serves networking helpers.
 pub fn standalone_network_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -50,11 +67,14 @@ pub struct ServeOptions {
     /// Database selector accepted by this endpoint.
     #[arg(long, default_value = "default")]
     pub database: String,
+    /// Authorize a new run after positive proof the previous local worker stopped.
+    #[arg(long)]
+    pub cold_start: bool,
     #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
     pub host: IpAddr,
     #[arg(long, default_value_t = 8000)]
     pub port: u16,
-    /// Total execution threads, including two storage maintenance threads.
+    /// Query compute ceiling. Control and storage maintenance have separate budgets.
     #[arg(long, default_value_t = 4)]
     pub workers: usize,
     /// Additional pending slots beyond foreground executors.
@@ -88,7 +108,7 @@ fn invalid(message: &'static str) -> ProtocolError {
 
 impl ServeOptions {
     pub fn limits(&self) -> Result<(ExecutionConfig, WorkerResources), ProtocolError> {
-        if self.workers < 4
+        if self.workers == 0
             || self.workers > 256
             || !valid_database(&self.database)
             || self.tls_cert.is_some() != self.tls_key.is_some()
@@ -111,7 +131,6 @@ impl ServeOptions {
         };
         let capacity = resources
             .max_threads
-            .saturating_sub(3)
             .checked_add(self.queue_size as u64)
             .filter(|n| *n <= 1_000_000)
             .ok_or_else(|| invalid("invalid queue capacity"))?;
@@ -122,9 +141,9 @@ impl ServeOptions {
                 ..Default::default()
             },
         };
-        if resources.max_threads < 4 {
+        if resources.max_threads == 0 || resources.max_threads > 256 {
             return Err(invalid(
-                "OLTP requires one query, one control and two storage maintenance threads",
+                "OLTP query compute ceiling must be between 1 and 256",
             ));
         }
         resources
@@ -201,12 +220,13 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
     #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|_| "signal initialization failed")?;
-    let runtime = worker_runtime::WorkerRuntime::open(
+    let runtime = worker_runtime::WorkerRuntime::open_configured(
         &options.data_dir,
         &options.database,
         &token,
         execution,
         resources,
+        options.cold_start,
     )
     .await
     .map_err(|error| {

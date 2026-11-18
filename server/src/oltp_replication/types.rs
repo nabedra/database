@@ -389,6 +389,17 @@ pub struct PinIdentity {
     pub digest: Digest,
     pub nonce: Uuid,
 }
+/// A storage-retention pin for one index build attempt. This metadata cannot
+/// reconstruct a request, queue entry, row or backfill job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MaintenanceOwnerRef {
+    pub catalog_group_id: Uuid,
+    pub table_id: Uuid,
+    pub index_id: Uuid,
+    pub build_id: Uuid,
+    pub attempt: u64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoragePin {
@@ -448,6 +459,8 @@ pub struct TerminalCopyStatement {
     pub request: RequestBinding,
     pub terminal_version: u64,
     pub response_hash: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_digest: Option<Digest>,
     pub pin_identity: PinIdentity,
     pub storage_pin: StoragePin,
 }

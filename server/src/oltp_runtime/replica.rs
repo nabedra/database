@@ -2,10 +2,10 @@
 //!
 //! This module has no disk interface and cannot grant run authority. Its caller
 //! supplies a fresh Control view and authenticated peer identity. The installed
-//! RF1 server remains separate until the typed data/status backend is composed.
+//! RF1 server composes this same queue with durable typed data/status groups.
 use crate::{
-    oltp::pool::{ChargedBytes, QueueLease, WorkerSharedResources},
-    oltp_replication::{ReadySetHasher, types::*},
+    oltp::pool::{ByteClass, ChargedBytes, QueueLease, WorkerSharedResources},
+    oltp_replication::{ReadySetHasher, service_rpc::ReadGrant, types::*},
     protocol,
     request_queue::{
         QueueError, QueueLimits, RequestQueue, RequestRecord, RequestState, ValidatedRecord,
@@ -15,17 +15,28 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Instant,
+};
 use uuid::Uuid;
 
 pub const QUEUE_FORMAT_VERSION: u32 = 1;
 pub const MAX_HEADER_BYTES: usize = 4096;
+pub(crate) const MAX_RECORD_HEADER_BYTES: usize = 8192;
 pub const MAX_CONTEXT_BYTES: usize = 4096;
 
 fn hash(bytes: &[u8]) -> Digest {
     Digest::from_bytes(Sha256::digest(bytes).into())
 }
 
+mod queue_latency;
+use queue_latency::{AcceptanceTiming, QueueLatency, QueueLatencySnapshot};
+mod removal;
+mod read_grants;
+pub use read_grants::ReadGrantSet;
+pub(crate) use read_grants::MAX_READ_GRANTS;
 #[cfg(test)]
 mod tests;
 mod transfer;
@@ -157,6 +168,8 @@ pub struct RecordHeader {
     /// is no serde byte-array expansion or worker list in this header.
     pub section_lengths: [u64; 3],
     pub all_copy_evidence: bool,
+    #[serde(default = "ReadGrantSet::initial", skip_serializing_if = "ReadGrantSet::is_initial")]
+    pub(crate) read_grants: ReadGrantSet,
 }
 impl RecordHeader {
     pub fn preflight(&self, scope: &QueueScope, current: QueueAuthority) -> Result<(), QueueError> {
@@ -184,6 +197,7 @@ impl RecordHeader {
         self.scope.validate()?;
         self.ready.view.validate().map_err(invalid)?;
         self.owner.validate().map_err(invalid)?;
+        self.read_grants.validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
         Ok(())
     }
 }
@@ -200,12 +214,23 @@ impl RecordFrame {
         self.version(&self.decode_header()?)
     }
     pub fn decode_header(&self) -> Result<RecordHeader, QueueError> {
-        if self.header.len() > MAX_HEADER_BYTES {
+        if self.header.len() > MAX_RECORD_HEADER_BYTES {
             return Err(QueueError::Invalid);
         }
         serde_json::from_slice(self.header.as_ref()).map_err(invalid)
     }
     fn version(&self, header: &RecordHeader) -> Result<RecordVersion, QueueError> {
+        Self::canonical_version(
+            header,
+            self.sections
+                .each_ref()
+                .map(|section| section.as_ref().map_or(&[][..], AsRef::as_ref)),
+        )
+    }
+    fn canonical_version(
+        header: &RecordHeader,
+        sections: [&[u8]; 3],
+    ) -> Result<RecordVersion, QueueError> {
         let mut canonical = header.clone();
         // Copy evidence grows without changing the immutable record version.
         canonical.all_copy_evidence = false;
@@ -222,8 +247,7 @@ impl RecordFrame {
         let mut writer = Writer(Sha256::new());
         writer.0.update(b"nabedra/ram-queue-record/v1\0");
         serde_json::to_writer(&mut writer, &canonical).map_err(invalid)?;
-        for (index, section) in self.sections.iter().enumerate() {
-            let bytes = section.as_ref().map_or(&[][..], AsRef::as_ref);
+        for (index, bytes) in sections.into_iter().enumerate() {
             if bytes.len() as u64 != header.section_lengths[index] {
                 return Err(QueueError::Invalid);
             }
@@ -261,7 +285,7 @@ pub struct InstallEnvironment {
 }
 // Includes the BTreeMap node and fixed metadata. The queue reserves this slot
 // from initial admission through eventual durable identity retirement.
-const PROOF_METADATA_BYTES: usize = 1024;
+const PROOF_METADATA_BYTES: usize = 2560;
 #[derive(Clone)]
 struct TerminalMetadata {
     version: u64,
@@ -269,7 +293,10 @@ struct TerminalMetadata {
     response_hash: Digest,
     pin: Option<(PinIdentity, StoragePin)>,
 }
-const _: () = assert!(std::mem::size_of::<TerminalMetadata>() + 128 <= PROOF_METADATA_BYTES);
+const _: () = assert!(
+    std::mem::size_of::<TerminalMetadata>() + std::mem::size_of::<CopyBarrier>() + 256
+        <= PROOF_METADATA_BYTES
+);
 impl TerminalMetadata {
     fn prepare(
         record: &RequestRecord,
@@ -341,8 +368,13 @@ pub struct PreparedInstall {
     version: RecordVersion,
     record: ValidatedRecord,
     terminal: Option<TerminalMetadata>,
+    read_grants: ReadGrantSet,
 }
 impl PreparedInstall {
+    pub(crate) fn record_id(&self) -> Uuid {
+        self.version.request_id
+    }
+
     /// Run under a native/task/scratch owner outside the queue lock.
     pub fn prepare(
         environment: InstallEnvironment,
@@ -360,6 +392,7 @@ impl PreparedInstall {
         let body = section(0)?;
         let context_bytes = section(1)?;
         let context: AcceptedContext = serde_json::from_slice(context_bytes).map_err(invalid)?;
+        header.read_grants.validate_context(&context, context_bytes)?;
         let record = RequestRecord {
             context: None,
             run_id: header.ready.view.run_id,
@@ -401,6 +434,7 @@ impl PreparedInstall {
             version,
             record: ValidatedRecord::prepare(record)?,
             terminal,
+            read_grants: header.read_grants,
         })
     }
 }
@@ -417,6 +451,7 @@ struct CopyBarrier {
     version: RecordVersion,
     ready: ReadySetHasher,
     complete: bool,
+    acceptance_timing: AcceptanceTiming,
 }
 
 /// One physical worker's queue, constructed once and shared by all hosted pools.
@@ -430,18 +465,78 @@ pub struct WorkerReplica {
     members: Arc<BTreeMap<Uuid, WorkerIdentity>>,
     queue: RequestQueue,
     barriers: BTreeMap<Uuid, CopyBarrier>,
+    queue_latency: QueueLatency,
     terminal_metadata: BTreeMap<Uuid, TerminalMetadata>,
+    read_grants: BTreeMap<Uuid, read_grants::GrantEntry>,
+    retired_through_sequence: u64,
+    retirement_generation: u64,
     change_cut: u64,
     changes: BTreeMap<Uuid, u64>,
     export: Option<transfer::JoinExport>,
     import: Option<transfer::JoinImport>,
     bootstrap: Option<JoinTicket>,
+    removal: Option<JoinTicket>,
+    removal_root: Option<QueueCopyStatement>,
+    removal_worker_after: Option<Uuid>,
+    removal_record_after: Option<Uuid>,
     _memory: MemoryCharge,
     _membership_memory: MemoryCharge,
     _queue_owner: QueueLease,
     retention_ms: u64,
 }
+#[derive(serde::Serialize)]
+pub(crate) struct QueueStats {
+    pub accepted_records: u64,
+    pub queued_records: u64,
+    pub running_records: u64,
+    pub reconciling_records: u64,
+    pub terminal_records: u64,
+    pub charged_queue_bytes: usize,
+    pub charged_result_bytes: usize,
+}
 impl WorkerReplica {
+    pub(crate) fn growth_queue_observation(&self) -> Option<(usize, Option<(Uuid, u64)>)> {
+        let mut queued = 0;
+        let mut oldest: Option<&RequestRecord> = None;
+        for (index, record) in self.queue.records().enumerate() {
+            if index == 4096 {
+                return None;
+            }
+            if record.accepted && record.state == RequestState::Queued {
+                queued += 1;
+                if oldest.is_none_or(|previous| record.sequence < previous.sequence) {
+                    oldest = Some(record);
+                }
+            }
+        }
+        Some((queued, oldest.map(|record| (record.request_id, record.version))))
+    }
+    pub(crate) fn stats(&self) -> QueueStats {
+        let (charged_queue_bytes, charged_result_bytes) = self.queue.charged_bytes();
+        let mut stats = QueueStats {
+            accepted_records: 0,
+            queued_records: 0,
+            running_records: 0,
+            reconciling_records: 0,
+            terminal_records: 0,
+            charged_queue_bytes,
+            charged_result_bytes,
+        };
+        for record in self.queue.records() {
+            stats.accepted_records += u64::from(record.accepted);
+            match record.state {
+                RequestState::Queued => stats.queued_records += 1,
+                RequestState::Running | RequestState::Committing => stats.running_records += 1,
+                RequestState::Reconciling => stats.reconciling_records += 1,
+                _ => stats.terminal_records += 1,
+            }
+        }
+        stats
+    }
+    pub(crate) fn queue_latency_stats(&self) -> QueueLatencySnapshot {
+        self.queue_latency
+            .snapshot(self.local, self.authority.owner, self.authority.ready.view)
+    }
     pub fn new(
         shared: Arc<WorkerSharedResources>,
         scope: QueueScope,
@@ -611,12 +706,20 @@ impl WorkerReplica {
             members: Arc::new(ordered),
             queue,
             barriers: BTreeMap::new(),
+            queue_latency: QueueLatency::default(),
             terminal_metadata: BTreeMap::new(),
+            read_grants: BTreeMap::new(),
+            retired_through_sequence: 0,
+            retirement_generation: 0,
             change_cut: 0,
             changes: BTreeMap::new(),
             export: None,
             import: joining.map(transfer::JoinImport::new),
             bootstrap: None,
+            removal: None,
+            removal_root: None,
+            removal_worker_after: None,
+            removal_record_after: None,
             _memory: memory,
             _membership_memory: membership_memory,
             _queue_owner: queue_owner,
@@ -651,6 +754,45 @@ impl WorkerReplica {
             replicas: Default::default(),
         })
     }
+    pub(crate) fn read_member(&self, authority: Authority, worker: Uuid) -> Option<WorkerIdentity> {
+        (self.authority.ready.view.authority() == authority)
+            .then(|| self.members.get(&worker).copied())
+            .flatten()
+    }
+    pub(crate) fn scan_context(
+        &self,
+        scope: crate::oltp_replication::service_rpc::ReadScope,
+        owner: WorkerIdentity,
+        target: WorkerIdentity,
+    ) -> Result<ChargedBytes, QueueError> {
+        if self.authority.owner != owner
+            || self.local != target
+            || self.read_member(scope.authority, target.worker_id) != Some(target)
+            || scope.request.run_id != scope.authority.run_id
+        {
+            return Err(QueueError::Invalid);
+        }
+        let record = self
+            .queue
+            .record(scope.request.request_id)
+            .ok_or(QueueError::NotFound)?;
+        if !record.accepted
+            || record.state != RequestState::Running
+            || record.run_id != scope.request.run_id
+            || Digest::parse(&record.digest).map_err(invalid)? != scope.request.digest
+        {
+            return Err(QueueError::Invalid);
+        }
+        self.shared
+            .copy_bytes_in(
+                ByteClass::Progress,
+                record
+                    .pinned_catalog
+                    .as_deref()
+                    .ok_or(QueueError::Invalid)?,
+            )
+            .map_err(|_| QueueError::Overloaded)
+    }
     pub(crate) fn input(
         &self,
         id: Uuid,
@@ -671,6 +813,16 @@ impl WorkerReplica {
             .map_err(|_| QueueError::Overloaded)?;
         Ok((body, context, self.observation(id)?))
     }
+    pub(crate) fn staged_context(&self, id: Uuid) -> Result<Option<ChargedBytes>, QueueError> {
+        let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
+        if record.accepted {
+            return Ok(None);
+        }
+        self.shared
+            .copy_bytes(record.pinned_catalog.as_deref().ok_or(QueueError::Invalid)?)
+            .map(Some)
+            .map_err(|_| QueueError::Overloaded)
+    }
     pub(crate) fn response(
         &self,
         run: Uuid,
@@ -681,16 +833,147 @@ impl WorkerReplica {
             return Err(QueueError::Abandoned);
         }
         let record = self.retained_record(id, now)?;
-        let bytes = record
+        let bytes = self.copy_response_bytes(record, usize::MAX, ByteClass::Data)?;
+        Ok((self.observation(id)?, bytes))
+    }
+    pub(crate) fn copy_response_bytes(
+        &self,
+        record: &RequestRecord,
+        limit: usize,
+        class: ByteClass,
+    ) -> Result<Option<ChargedBytes>, QueueError> {
+        record
             .response_body
             .as_ref()
+            .filter(|body| body.len() <= limit)
             .map(|body| {
                 self.shared
-                    .copy_bytes(body)
+                    .copy_bytes_in(class, body)
                     .map_err(|_| QueueError::Overloaded)
             })
-            .transpose()?;
-        Ok((self.observation(id)?, bytes))
+            .transpose()
+    }
+    pub(crate) fn reconciling_ids(&self, maximum: usize) -> Vec<Uuid> {
+        self.queue
+            .records()
+            .filter(|record| record.state == RequestState::Reconciling)
+            .take(maximum.min(128))
+            .map(|record| record.request_id)
+            .collect()
+    }
+    fn needs_recovery(&self, record: &RequestRecord, now: u64) -> bool {
+        self.has_read_grants(record.request_id)
+            || !record.state.terminal()
+            || (!self.terminal_expired(record, now) && !self.copies_complete(record.request_id))
+    }
+    pub(crate) fn has_recovery_work(&self, now: u64, active: &BTreeSet<Uuid>) -> bool {
+        self.queue
+            .records()
+            .any(|record| self.needs_recovery(record, now) && !active.contains(&record.request_id))
+    }
+    fn terminal_expired(&self, record: &RequestRecord, now: u64) -> bool {
+        record.accepted && record.state.terminal() && !self.has_read_grants(record.request_id)
+            && record
+                .completed_at_ms
+                .is_some_and(|done| now.saturating_sub(done) >= self.retention_ms)
+    }
+    pub(crate) fn has_retirement_work(&self, now: u64, active: &BTreeSet<Uuid>) -> bool {
+        self.queue.records().any(|record| {
+            !active.contains(&record.request_id)
+                && (self.terminal_expired(record, now)
+                    || (self.local == self.authority.owner
+                        && record.state == RequestState::Reconciling))
+        })
+    }
+    /// Bounded cursor page so a blocked old request cannot starve another
+    /// retained record. Tentative copies must finish admission before execution.
+    pub(crate) fn recovery_ids(&self, now: u64, after: Option<Uuid>, maximum: usize) -> Vec<Uuid> {
+        self.queue
+            .records()
+            .filter(|record| {
+                after.is_none_or(|after| record.request_id > after) && self.needs_recovery(record, now)
+            })
+            .take(maximum.min(128))
+            .map(|record| record.request_id)
+            .collect()
+    }
+    pub(crate) fn expired_terminals(
+        &self,
+        now: u64,
+        after: Option<u64>,
+        maximum: usize,
+    ) -> Vec<(Uuid, u64)> {
+        let maximum = maximum.min(128);
+        let mut page = BTreeMap::new();
+        if maximum == 0 {
+            return Vec::new();
+        }
+        for record in self.queue.records().filter(|record| {
+            after.is_none_or(|after| record.sequence > after) && self.terminal_expired(record, now)
+        }) {
+            if page.len() < maximum
+                || page
+                    .last_key_value()
+                    .is_some_and(|(last, _)| record.sequence < *last)
+            {
+                page.insert(record.sequence, record.request_id);
+                if page.len() > maximum {
+                    page.pop_last();
+                }
+            }
+        }
+        page.into_iter()
+            .map(|(sequence, id)| (id, sequence))
+            .collect()
+    }
+    pub(crate) fn retire(
+        &mut self,
+        current: QueueAuthority,
+        proof: crate::oltp_replication::authority::status::VerifiedTerminalRetirement,
+        now: u64,
+    ) -> Result<(), QueueError> {
+        if self.authority != current || !self.is_ready_member() {
+            return Err(QueueError::Stale);
+        }
+        if self.export.is_some() {
+            return Err(QueueError::Unavailable);
+        }
+        let id = proof.request_id();
+        let Some(record) = self.queue.record(id) else {
+            return Ok(());
+        };
+        if !self.terminal_expired(record, now) || !proof.matches(&self.terminal_copy_statement(id)?) {
+            return Err(QueueError::Stale);
+        }
+        let sequence = record.sequence;
+        let generation = self.retirement_generation.checked_add(1).ok_or(QueueError::Overloaded)?;
+        self.queue.retire_terminal(id, record.version)?;
+        self.retired_through_sequence = self.retired_through_sequence.max(sequence);
+        self.retirement_generation = generation;
+        self.terminal_metadata.remove(&id);
+        self.read_grants.remove(&id);
+        if let Some(mut barrier) = self.barriers.remove(&id) {
+            self.queue_latency.discard(&mut barrier.acceptance_timing);
+        }
+        self.changes.remove(&id);
+        // A frozen removal can retry against a smaller certified inventory.
+        // Keep the admission freeze until the ready transition finishes.
+        self.removal_root = None;
+        self.removal_worker_after = None;
+        self.removal_record_after = None;
+        Ok(())
+    }
+    pub(crate) fn can_certify_retirement(&self, current: QueueAuthority) -> bool {
+        self.export.is_none() && self.mutating_owner(current).is_ok()
+    }
+    pub(crate) fn install_retirement_check(&self, header: &RecordHeader) -> Option<u64> {
+        self.missing_record_retirement_generation(header.request_id, header.sequence)
+    }
+    fn missing_record_retirement_generation(&self, id: Uuid, sequence: u64) -> Option<u64> {
+        // A delayed retransmission keeps its original sequence. New sequences
+        // above the highest local deletion need no Status lookup.
+        (sequence <= self.retired_through_sequence && self.queue.record(id).is_none())
+            .then_some(self.retirement_generation)
     }
     pub(crate) fn reconcile(
         &mut self,
@@ -761,6 +1044,7 @@ impl WorkerReplica {
     fn mutating_owner(&self, current: QueueAuthority) -> Result<(), QueueError> {
         self.check_owner(current, self.local)?;
         if self.bootstrap.is_some()
+            || self.removal.is_some()
             || self.export.as_ref().is_some_and(|e| e.final_cut.is_some())
             || self.import.is_some()
         {
@@ -859,22 +1143,38 @@ impl WorkerReplica {
     ) -> Result<CopyAcknowledgement, QueueError> {
         self.install_environment(prepared.authority, prepared.authority.owner)?;
         let incoming = prepared.record.record();
+        self.check_read_grant_revision(incoming.request_id, &prepared.read_grants)?;
         let changed = self
             .queue
             .record(incoming.request_id)
             .is_none_or(|old| old.version != incoming.version);
         self.queue.install_validated(prepared.record)?;
+        let grant_changed = self.record_read_grants(prepared.version.request_id, prepared.read_grants);
         if let Some(metadata) = prepared.terminal {
             self.terminal_metadata
                 .insert(prepared.version.request_id, metadata);
         }
-        if changed {
+        if changed || grant_changed {
             self.changed(prepared.version.request_id)?;
         }
         Ok(CopyAcknowledgement::authenticated(
             self.local,
             prepared.version,
         ))
+    }
+    pub(crate) fn install_prepared_checked(
+        &mut self,
+        prepared: PreparedInstall,
+        observed: Option<u64>,
+    ) -> Result<CopyAcknowledgement, QueueError> {
+        let record = prepared.record.record();
+        if self
+            .missing_record_retirement_generation(record.request_id, record.sequence)
+            .is_some_and(|generation| observed != Some(generation))
+        {
+            return Err(QueueError::Stale);
+        }
+        self.install_prepared(prepared)
     }
 
     fn begin_barrier(&mut self, id: Uuid) -> Result<RecordFrame, QueueError> {
@@ -884,17 +1184,16 @@ impl WorkerReplica {
             .entry(id)
             .and_modify(|barrier| {
                 if barrier.version != version {
-                    *barrier = CopyBarrier {
-                        version,
-                        ready: ReadySetHasher::default(),
-                        complete: false,
-                    };
+                    barrier.version = version;
+                    barrier.ready = ReadySetHasher::default();
+                    barrier.complete = false;
                 }
             })
             .or_insert_with(|| CopyBarrier {
                 version,
                 ready: ReadySetHasher::default(),
                 complete: false,
+                acceptance_timing: AcceptanceTiming::Untracked,
             });
         Ok(frame)
     }
@@ -906,6 +1205,14 @@ impl WorkerReplica {
         &mut self,
         current: QueueAuthority,
         ack: CopyAcknowledgement,
+    ) -> Result<Option<RecordFrame>, QueueError> {
+        self.acknowledge_phase(current, ack, true)
+    }
+    pub(crate) fn acknowledge_phase(
+        &mut self,
+        current: QueueAuthority,
+        ack: CopyAcknowledgement,
+        promote: bool,
     ) -> Result<Option<RecordFrame>, QueueError> {
         self.mutating_owner(current)?;
         if self.members.get(&ack.worker.worker_id) != Some(&ack.worker) {
@@ -927,11 +1234,19 @@ impl WorkerReplica {
             return Err(QueueError::Stale);
         }
         barrier.ready.push(ack.worker).map_err(invalid)?;
-        let record = self.queue.acknowledge_version(
-            ack.record.request_id,
-            ack.record.version,
-            ack.worker.worker_id,
-        )?;
+        let record = if promote {
+            self.queue.acknowledge_version(
+                ack.record.request_id,
+                ack.record.version,
+                ack.worker.worker_id,
+            )?
+        } else {
+            self.queue.acknowledge_payload_version(
+                ack.record.request_id,
+                ack.record.version,
+                ack.worker.worker_id,
+            )?
+        };
         if barrier.ready.count() != current.ready.ready_count {
             return Ok(None);
         }
@@ -940,13 +1255,47 @@ impl WorkerReplica {
         }
         barrier.complete = true;
         if record.version != ack.record.version {
+            barrier.acceptance_timing = AcceptanceTiming::Copying;
             self.changed(record.request_id)?;
             // The final payload ACK creates the acceptance-evidence version.
             return self.begin_barrier(record.request_id).map(Some);
         }
+        if record.accepted
+            && record.state == RequestState::Queued
+            && matches!(barrier.acceptance_timing, AcceptanceTiming::Copying)
+        {
+            self.queue_latency
+                .accepted(&mut barrier.acceptance_timing, Instant::now());
+        }
         Ok(None)
     }
 
+    pub(crate) fn payloads_complete(&self, id: Uuid) -> bool {
+        self.queue.record(id).is_some_and(|record| {
+            self.barriers.get(&id).is_some_and(|barrier| {
+                barrier.complete && barrier.version.version == record.version
+            })
+        })
+    }
+    pub(crate) fn accept_staged(
+        &mut self,
+        current: QueueAuthority,
+        id: Uuid,
+    ) -> Result<RecordFrame, QueueError> {
+        self.mutating_owner(current)?;
+        if !self.payloads_complete(id) {
+            return Err(QueueError::Unavailable);
+        }
+        let old = self.queue.record(id).ok_or(QueueError::NotFound)?.version;
+        self.queue.accept_payload(id)?;
+        if self.queue.record(id).ok_or(QueueError::NotFound)?.version != old {
+            if let Some(barrier) = self.barriers.get_mut(&id) {
+                barrier.acceptance_timing = AcceptanceTiming::Copying;
+            }
+            self.changed(id)?;
+        }
+        self.begin_barrier(id)
+    }
     pub fn copies_complete(&self, id: Uuid) -> bool {
         self.queue.record(id).is_some_and(|record| {
             record.accepted
@@ -958,6 +1307,9 @@ impl WorkerReplica {
 
     pub fn start(&mut self, current: QueueAuthority, id: Uuid) -> Result<RecordFrame, QueueError> {
         self.mutating_owner(current)?;
+        if self.has_read_grants(id) {
+            return Err(QueueError::Unavailable);
+        }
         if self
             .queue
             .record(id)
@@ -971,6 +1323,22 @@ impl WorkerReplica {
         self.queue.start(id, None)?;
         self.changed(id)?;
         self.begin_barrier(id)
+    }
+
+    pub(crate) fn observe_dispatch(&mut self, current: QueueAuthority, version: RecordVersion) {
+        if self.authority != current || current.owner != self.local {
+            return;
+        }
+        if let Some(barrier) = self.barriers.get_mut(&version.request_id)
+            && barrier.complete
+            && barrier.version == version
+            && self.queue.record(version.request_id).is_some_and(|record| {
+                record.version == version.version && record.state == RequestState::Running
+            })
+        {
+            self.queue_latency
+                .dispatch(&mut barrier.acceptance_timing, Instant::now());
+        }
     }
 
     pub fn terminal_input(&self, id: Uuid) -> Result<TerminalInput, QueueError> {
@@ -1028,6 +1396,9 @@ impl WorkerReplica {
         }
         self.queue
             .finish_retained_validated(id, prepared.response, prepared.now_ms)?;
+        if let Some(barrier) = self.barriers.get_mut(&id) {
+            self.queue_latency.discard(&mut barrier.acceptance_timing);
+        }
         let mut metadata = prepared.metadata;
         metadata.version = self.queue.record(id).ok_or(QueueError::NotFound)?.version;
         self.terminal_metadata.insert(id, metadata);
@@ -1057,6 +1428,36 @@ impl WorkerReplica {
     /// Describes only this holder. The TSO leader verifies the complete current
     /// ready inventory itself; followers need no lost owner's private ACK set.
     pub fn terminal_copy_statement(&self, id: Uuid) -> Result<TerminalCopyStatement, QueueError> {
+        if self.has_read_grants(id) {
+            return Err(QueueError::Unavailable);
+        }
+        let (record, metadata) = self.terminal_record_metadata(id)?;
+        let (pin_identity, storage_pin) = metadata.pin.clone().ok_or(QueueError::Invalid)?;
+        let mut digest = Sha256::new();
+        digest.update(b"nabedra/terminal-record/v1");
+        digest.update(metadata.response_hash.as_bytes());
+        digest.update(record.response_status.ok_or(QueueError::Invalid)?.to_be_bytes());
+        digest.update(record.completed_at_ms.ok_or(QueueError::Invalid)?.to_be_bytes());
+        digest.update([record.state as u8]);
+        Ok(TerminalCopyStatement {
+            ready: self.authority.ready,
+            request: metadata.request,
+            terminal_version: record.version,
+            response_hash: metadata.response_hash,
+            terminal_digest: Some(Digest::from_bytes(digest.finalize().into())),
+            pin_identity,
+            storage_pin,
+        })
+    }
+
+    pub(super) fn terminal_response_hash(&self, id: Uuid) -> Result<Digest, QueueError> {
+        Ok(self.terminal_record_metadata(id)?.1.response_hash)
+    }
+
+    fn terminal_record_metadata(
+        &self,
+        id: Uuid,
+    ) -> Result<(&RequestRecord, &TerminalMetadata), QueueError> {
         let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
         if !record.accepted || !record.state.terminal() {
             return Err(QueueError::Conflict);
@@ -1068,15 +1469,7 @@ impl WorkerReplica {
         {
             return Err(QueueError::Stale);
         }
-        let (pin_identity, storage_pin) = metadata.pin.clone().ok_or(QueueError::Invalid)?;
-        Ok(TerminalCopyStatement {
-            ready: self.authority.ready,
-            request: metadata.request,
-            terminal_version: record.version,
-            response_hash: metadata.response_hash,
-            pin_identity,
-            storage_pin,
-        })
+        Ok((record, metadata))
     }
 
     /// Called only after Control and dependent groups commit their fences.
@@ -1126,9 +1519,17 @@ impl WorkerReplica {
         )?;
         self.members = Arc::new(ordered);
         self.authority = next;
+        for entry in self.read_grants.values_mut() {
+            entry.copying = false;
+        }
+        self.queue_latency.change_authority();
         self.barriers.clear();
         self.export = None;
         self.import = None;
+        self.removal = None;
+        self.removal_root = None;
+        self.removal_worker_after = None;
+        self.removal_record_after = None;
         let cut = self
             .change_cut
             .checked_add(1)
@@ -1171,7 +1572,17 @@ impl WorkerReplica {
                 .transpose()
                 .map_err(|_| QueueError::Overloaded)?,
         ];
-        let header = RecordHeader {
+        let header = self.record_header(record)?;
+        Ok(RecordFrame {
+            header: self
+                .shared
+                .encode(&header, MAX_RECORD_HEADER_BYTES)
+                .map_err(|_| QueueError::Overloaded)?,
+            sections,
+        })
+    }
+    fn record_header(&self, record: &RequestRecord) -> Result<RecordHeader, QueueError> {
+        Ok(RecordHeader {
             queue_format_version: QUEUE_FORMAT_VERSION,
             scope: self.scope.clone(),
             ready: self.authority.ready,
@@ -1184,17 +1595,13 @@ impl WorkerReplica {
             state: record.state,
             response_status: record.response_status,
             completed_at_ms: record.completed_at_ms,
-            section_lengths: sections
-                .each_ref()
-                .map(|s| s.as_ref().map_or(0, |v| v.len() as u64)),
+            section_lengths: [
+                record.body.len() as u64,
+                record.pinned_catalog.as_ref().map_or(0, Vec::len) as u64,
+                record.response_body.as_ref().map_or(0, Vec::len) as u64,
+            ],
             all_copy_evidence: record.accepted && record.replicas == *self.queue.members(),
-        };
-        Ok(RecordFrame {
-            header: self
-                .shared
-                .encode(&header, MAX_HEADER_BYTES)
-                .map_err(|_| QueueError::Overloaded)?,
-            sections,
+            read_grants: self.read_grant_set(record.request_id),
         })
     }
 }

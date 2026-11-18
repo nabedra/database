@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+getent group events >/dev/null || groupadd --system events
+id events >/dev/null 2>&1 || useradd --system --gid events --no-create-home --shell /usr/sbin/nologin events
+install -d -m 0750 -o root -g events /etc/nabedra-events
+install -d -m 0755 /var/lib/nabedra-events
+printf '%s' '${deployment}' | base64 -d > /etc/nabedra-events/deployment.json
+chmod 0600 /etc/nabedra-events/deployment.json
+printf '%s' '${prepare_script}' | base64 -d > /usr/local/sbin/nabedra-events-prepare
+chmod 0755 /usr/local/sbin/nabedra-events-prepare
+
+cat > /etc/systemd/system/nabedra-events.service <<'UNIT'
+[Unit]
+Description=Nabedra Events broker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=events
+Group=events
+ExecStartPre=+/usr/local/sbin/nabedra-events-prepare
+ExecStart=/usr/local/bin/nabedra-events serve --config /etc/nabedra-events/current/broker.json
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=300
+TimeoutStopSec=40
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nabedra-events
+LimitNOFILE=32768
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+if [[ '${start_broker}' == true ]]; then
+    systemctl enable --now nabedra-events.service
+else
+    /usr/local/sbin/nabedra-events-prepare
+fi

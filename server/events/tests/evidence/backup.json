@@ -1,0 +1,34 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:524b09a5e5aeade937ea25d9fd6772e2baafc16e13b4a933050ac25838040645",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "f9c7b9ddb637670bf572e051c95582cce52538e2883ddd2933741a4edce5c65e",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "backup": {
+      "pass": true,
+      "seconds": 67.948
+    }
+  },
+  "checks": [
+    {
+      "check": "EV10 Docker RF3 cut restores onto fresh disks and rejects corruption and old grants",
+      "backups": 3,
+      "backup_seconds": 1.771,
+      "restore_seconds": 33.169,
+      "committed_checkpoints": 2,
+      "source_cluster_id": "49cc3ac9-c11e-4259-8999-c935ea95bd3b",
+      "restored_cluster_id": "89aaefa0-b21b-4033-842b-fe70386cfddc"
+    }
+  ]
+}

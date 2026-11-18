@@ -3,12 +3,13 @@
 pub(crate) mod authority;
 pub mod entry;
 pub(crate) mod hosted;
-pub(crate) mod manager;
 mod log;
+pub(crate) mod manager;
 pub mod multiplex;
 mod network;
 pub mod owned;
 mod proof;
+pub(crate) mod service_rpc;
 pub mod typed_log;
 pub(crate) mod typed_network;
 pub mod types;

@@ -42,10 +42,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UnixStream},
     sync::watch,
-    time::{Instant, timeout_at},
+    time::Instant,
 };
 use uuid::Uuid;
 type Result<T> = http::Result<T>;
@@ -949,72 +948,23 @@ async fn receipt_request(
 }
 
 async fn frame(stream: &mut UnixStream, end: Option<Instant>) -> Result<Vec<u8>> {
-    let mut first = [0; 1];
-    match end {
-        Some(end) => timeout_at(end, stream.read_exact(&mut first))
-            .await
-            .map_err(|_| unavailable())?
-            .map_err(|_| unavailable())?,
-        None => stream
-            .read_exact(&mut first)
-            .await
-            .map_err(|_| unavailable())?,
-    };
-    let end = end.unwrap_or_else(|| Instant::now() + Duration::from_secs(2));
-    let mut prefix = [0; 4];
-    prefix[0] = first[0];
-    timeout_at(end, stream.read_exact(&mut prefix[1..]))
+    crate::supervisor::frame(stream, end)
         .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
-    let length = u32::from_be_bytes(prefix) as usize;
-    if length == 0 || length > 16384 {
-        return Err(invalid());
-    }
-    let mut body = vec![0; length];
-    timeout_at(end, stream.read_exact(&mut body))
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
-    if !body
-        .iter()
-        .copied()
-        .find(|b| !b.is_ascii_whitespace())
-        .is_some_and(|b| b == b'{')
-    {
-        return Err(invalid());
-    }
-    Ok(body)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                invalid()
+            } else {
+                unavailable()
+            }
+        })
 }
 async fn send(stream: &mut UnixStream, value: serde_json::Value, end: Instant) -> Result<()> {
-    let bytes = serde_json::to_vec(&value).map_err(|_| invalid())?;
-    timeout_at(end, async {
-        stream
-            .write_all(&(bytes.len() as u32).to_be_bytes())
-            .await?;
-        stream.write_all(&bytes).await
-    })
-    .await
-    .map_err(|_| unavailable())?
-    .map_err(|_| unavailable())
+    crate::supervisor::send(stream, &value, end)
+        .await
+        .map_err(|_| unavailable())
 }
 fn supervisor() -> Result<UnixStream> {
-    use std::os::fd::FromRawFd;
-    let fd: i32 = std::env::var("NABEDRA_SUPERVISOR_FD")
-        .map_err(|_| invalid())?
-        .parse()
-        .map_err(|_| invalid())?;
-    if fd < 3 {
-        return Err(invalid());
-    }
-    // This explicit inherited descriptor is transferred by the owning supervisor.
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(invalid());
-    }
-    stream.set_nonblocking(true).map_err(|_| invalid())?;
-    UnixStream::from_std(stream).map_err(|_| invalid())
+    crate::supervisor::open().map_err(|_| invalid())
 }
 pub async fn run_api(path: PathBuf) -> std::result::Result<(), &'static str> {
     run_api_configured(path, false, false).await

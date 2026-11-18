@@ -3,7 +3,10 @@
 //! implement Raft, distributed timestamps, cross-pool commits or worker failover.
 mod codec;
 mod native;
+#[cfg(test)]
+mod migration_acceptance;
 pub use native::NativeThreadBudget;
+pub(crate) mod backup;
 pub mod mvcc;
 pub mod pool;
 mod query;

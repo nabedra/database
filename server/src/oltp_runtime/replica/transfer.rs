@@ -53,6 +53,10 @@ impl JoinPage {
 pub(super) struct JoinExport {
     snapshot: JoinSnapshot,
     pub(super) final_cut: Option<u64>,
+    snapshot_after: Option<u64>,
+    snapshot_done: bool,
+    delta_after: Option<u64>,
+    delta_done: bool,
 }
 pub(super) struct JoinImport {
     ticket: JoinTicket,
@@ -87,9 +91,16 @@ impl WorkerReplica {
         current: QueueAuthority,
         ticket: JoinTicket,
     ) -> Result<JoinSnapshot, QueueError> {
+        self.check_owner(current, self.local)?;
+        if let Some(export) = &self.export {
+            return if export.snapshot.ticket == ticket {
+                Ok(export.snapshot)
+            } else {
+                Err(QueueError::Stale)
+            };
+        }
         self.mutating_owner(current)?;
-        if self.export.is_some()
-            || ticket.ticket_id.is_nil()
+        if ticket.ticket_id.is_nil()
             || ticket.source_ready != current.ready
             || self.members.contains_key(&ticket.target.worker_id)
         {
@@ -105,8 +116,53 @@ impl WorkerReplica {
         self.export = Some(JoinExport {
             snapshot,
             final_cut: None,
+            snapshot_after: None,
+            snapshot_done: false,
+            delta_after: None,
+            delta_done: false,
         });
         Ok(snapshot)
+    }
+
+    pub(crate) fn join_export_progress(
+        &self,
+        current: QueueAuthority,
+        snapshot: JoinSnapshot,
+        phase: JoinPhase,
+    ) -> Result<(Option<u64>, bool), QueueError> {
+        self.check_owner(current, self.local)?;
+        let export = self.export.as_ref().ok_or(QueueError::NotFound)?;
+        if export.snapshot != snapshot {
+            return Err(QueueError::Stale);
+        }
+        Ok(match phase {
+            JoinPhase::Snapshot => (export.snapshot_after, export.snapshot_done),
+            JoinPhase::Delta => (export.delta_after, export.delta_done),
+        })
+    }
+
+    /// Advance only after the target authenticated the exact page. Cancellation
+    /// before this transition resends that page, which the importer recognizes.
+    pub(crate) fn acknowledge_join_page(
+        &mut self,
+        current: QueueAuthority,
+        page: JoinPageHeader,
+    ) -> Result<(), QueueError> {
+        self.check_owner(current, self.local)?;
+        let export = self.export.as_mut().ok_or(QueueError::NotFound)?;
+        if export.snapshot != page.snapshot {
+            return Err(QueueError::Stale);
+        }
+        let (after, done) = match page.phase {
+            JoinPhase::Snapshot => (&mut export.snapshot_after, &mut export.snapshot_done),
+            JoinPhase::Delta => (&mut export.delta_after, &mut export.delta_done),
+        };
+        if *done || page.after_sequence != *after {
+            return Err(QueueError::Stale);
+        }
+        *after = page.next_sequence;
+        *done = page.done;
+        Ok(())
     }
 
     /// Snapshot pages may overlap admissions. The final delta includes every

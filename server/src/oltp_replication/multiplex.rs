@@ -10,15 +10,19 @@ use crate::{
 use serde::de::DeserializeOwned;
 use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 use uuid::Uuid;
+mod directory;
 mod transport;
+pub(crate) use directory::AppliedPeerDirectory;
 pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,
 };
-pub(crate) use transport::{ReplicaLease, ReplicaMetadata};
+pub(crate) use transport::{ReplicaLease, ReplicaMetadata, RequestError, RequestTarget};
 
 pub const MAX_SECTIONS: usize = 3;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
+pub(super) const RAFT_PROGRESS_HEADER_BYTES: usize = 1024;
+pub(super) const RAFT_PROGRESS_DECODE_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -29,6 +33,17 @@ pub enum Purpose {
     QueueControl = 4,
     QueueData = 5,
     Storage = 6,
+    ApiIngress = 7,
+    ApiObservation = 8,
+    Settlement = 9,
+    ServiceMutation = 10,
+    GroupLifecycle = 11,
+    ControlDelegation = 12,
+    ShardSplit = 13,
+    ShardSplitProof = 14,
+    ShardSplitImage = 15,
+    ReplicaPlacement = 16,
+    RaftProgress = 17,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {
@@ -39,14 +54,33 @@ pub enum TrafficClass {
     QueueData,
     Snapshot,
     Storage,
+    ControlSnapshot,
+    ServiceAuthority,
+    ApiIngress,
+    ApiObservation,
+    Settlement,
+    ServiceMutation,
+    ControlDelegation,
+    RaftProgress,
 }
 impl TrafficClass {
     pub fn byte_class(self) -> ByteClass {
         match self {
-            Self::ControlConsensus | Self::Authority | Self::QueueControl => ByteClass::Progress,
-            Self::DataConsensus | Self::QueueData | Self::Snapshot | Self::Storage => {
-                ByteClass::Data
-            }
+            Self::ControlConsensus
+            | Self::Authority
+            | Self::QueueControl
+            | Self::ControlSnapshot
+            | Self::ServiceAuthority
+            | Self::ApiObservation
+            | Self::Settlement
+            | Self::ServiceMutation
+            | Self::ControlDelegation
+            | Self::RaftProgress => ByteClass::Progress,
+            Self::DataConsensus
+            | Self::QueueData
+            | Self::Snapshot
+            | Self::Storage
+            | Self::ApiIngress => ByteClass::Data,
         }
     }
 }
@@ -199,9 +233,16 @@ impl Deref for ReceivedReply {
 impl ReceivedReply {
     /// Metadata readers use the worker's independent bounded reply decoder,
     /// never the query working budget or an arena holding their raw frames.
-    pub(crate) async fn reserve_reply_decode(mut self,shared:&Arc<crate::oltp::pool::WorkerSharedResources>,bytes:usize)->Result<Self,ProtocolError>{
-        if !Arc::ptr_eq(shared,&self.resources){return Err(malformed("reply decoder belongs to another worker"))}
-        self.scratch=Arc::new(shared.reserve_reply_decode(bytes).await?);Ok(self)
+    pub(crate) async fn reserve_reply_decode(
+        mut self,
+        shared: &Arc<crate::oltp::pool::WorkerSharedResources>,
+        bytes: usize,
+    ) -> Result<Self, ProtocolError> {
+        if !Arc::ptr_eq(shared, &self.resources) {
+            return Err(malformed("reply decoder belongs to another worker"));
+        }
+        self.scratch = Arc::new(shared.reserve_reply_decode(bytes).await?);
+        Ok(self)
     }
     pub fn reserve_decode(
         mut self,

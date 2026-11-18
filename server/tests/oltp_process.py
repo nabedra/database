@@ -26,23 +26,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "orm/python/src"))
 from nabedra import Database, col
 
 
-def raw(url, path, body=None, *, token="test-token", database="test", headers=None):
+def raw(url, path, body=None, *, token="test-token", database="test", headers=None, timeout=10):
     data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
     request = urllib.request.Request(url + path, data=data, headers={
         "Authorization": f"Bearer {token}", "X-Nabedra-Database": database,
         "Content-Type": "application/json", **(headers or {}),
     })
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
 
 
 class Server:
-    def __init__(self, binary, directory):
+    def __init__(self, binary, directory, diagnostics=None):
         self.binary, self.directory = binary, directory
         self.process = None
+        self.diagnostics = diagnostics
+        self.diagnostics_stream = None
 
     def start(self, tls=False):
         with socket.socket() as sock:
@@ -53,15 +55,18 @@ class Server:
         env["NABEDRA_TOKEN"] = "test-token"
         command = [
             self.binary, "serve", "--data-dir", self.directory, "--database", "test",
-            "--host", "127.0.0.1", "--port", str(port), "--workers", "3", "--queue-size", "8",
+            "--host", "127.0.0.1", "--port", str(port), "--workers", "4", "--queue-size", "8",
         ]
+        if (Path(self.directory) / "NABEDRA_TYPED_WORKER.json").exists():
+            command += ["--cold-start"]
         if tls:
             command += ["--tls-cert", self.directory + "/cert.pem", "--tls-key", self.directory + "/key.pem"]
-        self.process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.diagnostics_stream = open(self.diagnostics, "ab", buffering=0) if self.diagnostics else None
+        self.process = subprocess.Popen(command, env=env, stdout=self.diagnostics_stream or subprocess.DEVNULL, stderr=self.diagnostics_stream or subprocess.PIPE)
         until = time.monotonic() + 30
         while time.monotonic() < until:
             if self.process.poll() is not None:
-                raise AssertionError(f"server exited: {self.process.stderr.read().decode()}")
+                raise AssertionError(f"server exited; diagnostics: {self.diagnostics}" if self.diagnostics else f"server exited: {self.process.stderr.read().decode()}")
             try:
                 with urllib.request.urlopen(self.url + "/health/ready", timeout=0.5, context=ssl.create_default_context(cafile=self.directory + "/cert.pem") if tls else None) as response:
                     value = json.load(response)
@@ -83,6 +88,9 @@ class Server:
         if self.process and self.process.stderr:
             self.process.stderr.close()
         self.process = None
+        if self.diagnostics_stream:
+            self.diagnostics_stream.close()
+            self.diagnostics_stream = None
 
 
 def terminal(url, run, identity):
@@ -147,7 +155,7 @@ def benchmark(users, condition):
             "scope": "sequential loopback latency sample after warm-up; cache-hit rates not measured; not B01/B02, throughput scaling, cold-read or PostgreSQL evidence"}
 
 
-def main(binary, evidence_dir, condition):
+def main(binary, evidence_dir, condition, build_profile):
     tested_source = source_digest()
     fixture_hash = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     version = subprocess.check_output([binary, "--version"], text=True)
@@ -238,7 +246,7 @@ def main(binary, evidence_dir, condition):
             rejected = subprocess.run([binary, "serve", "--data-dir", directory, "--database", "other", "--port", "0"], env={**os.environ, "NABEDRA_TOKEN": "test-token"}, capture_output=True, text=True, timeout=15)
             assert rejected.returncode != 0 and "selector differs" in rejected.stderr, rejected.stderr
             remote = subprocess.run([binary, "worker", "--bootstrap", "missing.json"], capture_output=True, text=True, timeout=5)
-            assert remote.returncode != 0 and "standalone serve only" in remote.stderr, remote.stderr
+            assert remote.returncode != 0 and "protocol_error" in remote.stderr, remote.stderr
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", directory + "/key.pem", "-out", directory + "/cert.pem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
             server.start(tls=True)
             secure = Database(url=server.url, token="test-token", database="test", ca_file=directory + "/cert.pem")
@@ -247,7 +255,7 @@ def main(binary, evidence_dir, condition):
             server.stop()
     assert source_digest() == tested_source, "server or ORM source changed during the process fixture"
     assert hashlib.sha256(Path(__file__).read_bytes()).hexdigest() == fixture_hash, "fixture source changed during execution"
-    evidence = {"result": "passed", "argv": sys.argv, "fixture_sha256": fixture_hash, "build_profile": "dev, unoptimized, debug=0, incremental disabled", "binary_sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+    evidence = {"result": "passed", "argv": sys.argv, "fixture_sha256": fixture_hash, "build_profile": build_profile, "binary_sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
         "created_at_utc": datetime.now(timezone.utc).isoformat(), "python": sys.version, "binary_version": version.strip(), "platform": platform.platform(), "logical_cpus": os.cpu_count(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "cargo": subprocess.check_output(["cargo", "--version"], text=True).strip(),
@@ -255,13 +263,13 @@ def main(binary, evidence_dir, condition):
         "working_diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"])).hexdigest(),
         "cpu_quota": "no CPU quota configured or measured by this fixture", "storage": "host temporary filesystem directory; no EBS/provider assertion",
         "clock": "perf_counter_ns monotonic client clock", "features": ["oltp"],
-        "config": {"workers": 3, "foreground_threads": 1, "storage_background_threads": 2, "network_threads": 2, "queue_size": 8, "max_pending_requests": 9, "memory_limit_bytes": 8589934592, "task_memory_limit_bytes": 536870912, "result_retention_ms": 300000, "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit", "topology": "standalone_rf1", "S3_credentials": "absent"},
+        "config": {"workers": 4, "foreground_threads": 1, "control_threads": 1, "storage_background_threads": 2, "network_threads": 2, "queue_size": 8, "max_pending_requests": 9, "memory_limit_bytes": 8589934592, "task_memory_limit_bytes": 536870912, "result_retention_ms": 300000, "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit", "topology": "typed_groups_rf1", "S3_credentials": "absent"},
         "benchmark": measurement, "accepted_identity_assertions": {"durable_mutations": 1, "query_receipts": 1, "TLS_verified": True, "database_scope_rebind_rejected": True, "resources_override_257_rejected_before_storage_or_readiness": True, "ORM_growth_count_before_and_after_SIGKILL": 110001, "ORM_count_with_limit_above_100000": 100001, "duplicate_logical_mutations": 0, "missing_acknowledged_mutations_after_SIGKILL": 0}}
     if evidence_dir:
         path = Path(evidence_dir)
         path.mkdir(parents=True, exist_ok=True)
         (path / "rf1-process.json").write_text(json.dumps(evidence, indent=2) + "\n")
-    print(json.dumps({"result": "passed", "engine": "oltp", "topology": "standalone_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": True, "ORM_growth_rows": 110001, "elapsed_seconds": round(time.monotonic() - started, 3)}))
+    print(json.dumps({"result": "passed", "engine": "oltp", "topology": "typed_groups_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": True, "ORM_growth_rows": 110001, "elapsed_seconds": round(time.monotonic() - started, 3)}))
 
 
 if __name__ == "__main__":
@@ -269,5 +277,6 @@ if __name__ == "__main__":
     parser.add_argument("--binary", required=True)
     parser.add_argument("--evidence-dir")
     parser.add_argument("--benchmark-condition", default="host activity not recorded")
+    parser.add_argument("--build-profile", default="unspecified by caller; fixture does not inspect compiler flags")
     args = parser.parse_args()
-    main(str(Path(args.binary).resolve()), args.evidence_dir, args.benchmark_condition)
+    main(str(Path(args.binary).resolve()), args.evidence_dir, args.benchmark_condition, args.build_profile)

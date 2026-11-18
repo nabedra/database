@@ -2,6 +2,8 @@
 //! excludes retained local owners. The generated private CA is restricted to
 //! this worker's loopback transport; it does not authorize a remote deployment.
 pub(crate) use super::super::authority::control::LocalOperatorPermit;
+mod registered;
+mod restore;
 use super::super::{
     TlsMaterial,
     multiplex::{PeerDirectory, TransportConfig, TransportTrust, WorkerTransport},
@@ -12,6 +14,10 @@ use crate::{
     config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig},
 };
+pub(crate) use registered::{
+    GroupPlacement, RegisteredConfig, RegisteredSystemGroups, RegisteredWorker, SystemPlacement,
+};
+pub(crate) use restore::RegisteredRestoreConfig;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -71,33 +77,6 @@ struct DirectoryOwner {
     _lock: File,
     path: PathBuf,
 }
-struct LocalDirectory {
-    enrollment: WorkerEnrollment,
-    cluster: Uuid,
-    database: Text<128>,
-}
-impl PeerDirectory for LocalDirectory {
-    fn verify(
-        &self,
-        peer: WorkerIdentity,
-        group: &GroupIdentity,
-        _: Purpose,
-    ) -> Result<TransportTrust, ProtocolError> {
-        if peer != WorkerIdentity::from(&self.enrollment)
-            || group.cluster_id != self.cluster
-            || group.database != self.database
-        {
-            return Err(invalid());
-        }
-        Ok(TransportTrust::AppliedEnrollment)
-    }
-    fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
-        if worker != self.enrollment.worker_id {
-            return Err(invalid());
-        }
-        Ok(self.enrollment.clone())
-    }
-}
 pub(crate) struct LocalWorker {
     pub manager: Arc<HostedGroupManager>,
     pub shared: Arc<WorkerSharedResources>,
@@ -107,6 +86,7 @@ pub(crate) struct LocalWorker {
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
     pub listener: TcpListener,
+    pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     ownership: Arc<DirectoryOwner>,
 }
 impl LocalWorker {
@@ -118,6 +98,19 @@ impl LocalWorker {
     ) -> Result<Self, ProtocolError> {
         let database = Text::try_from(database).map_err(|_| invalid())?;
         let ownership = Arc::new(lock_directory(path)?);
+        if ownership
+            .path
+            .join("RESTORE_IN_PROGRESS.json")
+            .symlink_metadata()
+            .is_ok()
+            && !ownership
+                .path
+                .join("RESTORED_GENESIS.json")
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            return Err(invalid());
+        }
         let topology = topology(&ownership, &database)?;
         let tls_dir = ownership.path.join("internal-tls");
         fs::create_dir_all(&tls_dir).map_err(storage)?;
@@ -150,16 +143,16 @@ impl LocalWorker {
             enrollment_revision: topology.enrollment_revision,
         };
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-        let directory = Arc::new(LocalDirectory {
-            enrollment: enrollment.clone(),
-            cluster: topology.cluster_id,
-            database: topology.database.clone(),
-        });
+        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
+            topology.group(GroupKind::Control)?,
+            vec![enrollment.clone()],
+            shared.clone(),
+        )?;
         let transport = Arc::new(WorkerTransport::new(
             &enrollment,
             &tls,
             shared.clone(),
-            directory,
+            directory.clone(),
             registry.clone(),
             TransportConfig::default(),
         )?);
@@ -185,6 +178,7 @@ impl LocalWorker {
             operator,
             transport,
             listener,
+            directory,
             ownership,
         })
     }

@@ -10,10 +10,91 @@ const META: TransactionBudget = TransactionBudget {
     batch_bytes: 0,
     output_bytes: 16 << 10,
 };
+pub(crate) type ParticipantFuture<'a, T> =
+    crate::oltp_replication::authority::consensus::ConsensusFuture<'a, T>;
+pub(crate) type ScheduledReadFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<
+                    OwnedCommand<super::scan::ScanPage>,
+                    crate::oltp_replication::service_rpc::ScheduledReadError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
+pub(crate) trait RemoteParticipant: Send + Sync {
+    fn propose(
+        &self,
+        command: OwnedCommand<ParticipantCommand>,
+    ) -> ParticipantFuture<'_, Applied<ParticipantReply>>;
+    fn read_at(&self, read_ts: ReadTs, key: MvccKey) -> ParticipantFuture<'_, ChargedBytes>;
+    fn read_page(
+        &self,
+        request: OwnedCommand<super::point::PointReadRequest>,
+    ) -> ParticipantFuture<'_, OwnedCommand<super::scan::ScanPage>>;
+    fn committed_image_page(
+        &self,
+        request: OwnedCommand<super::image_archive::ImageRequest>,
+    ) -> ParticipantFuture<'_, OwnedCommand<super::image_archive::ImagePage>>;
+    fn archive_effect_page(
+        &self,
+        proof: crate::oltp_replication::authority::status::VerifiedStatusDecision,
+        after: u64,
+        max_items: u16,
+        max_bytes: usize,
+    ) -> ParticipantFuture<'_, OwnedCommand<super::archive::ArchiveEffects>>;
+    fn scheduled_scan_page(
+        &self,
+        scope: crate::oltp_replication::service_rpc::ReadScope,
+        request: super::scan::ScanRequest,
+    ) -> ScheduledReadFuture<'_>;
+    fn scan_page(
+        &self,
+        request: super::scan::ScanRequest,
+    ) -> ParticipantFuture<'_, OwnedCommand<super::scan::ScanPage>>;
+    fn activation(&self) -> ParticipantFuture<'_, Option<ParticipantEpochs>>;
+    fn strong_seal(
+        &self,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ParticipantFuture<'_, VerifiedParticipantSeal>;
+    fn strong_resolution(
+        &self,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ParticipantFuture<'_, VerifiedParticipantResolution>;
+    fn acquire_lifecycle(
+        &self,
+        binding: super::lifecycle::LifecycleBinding,
+        mode: super::lifecycle::GuardMode,
+    ) -> ParticipantFuture<'_, Option<super::lifecycle::VerifiedLifecycleGuard>>;
+    fn lifecycle_holder(
+        &self,
+        table_id: Uuid,
+    ) -> ParticipantFuture<'_, Option<super::lifecycle::LifecycleBinding>>;
+    fn lifecycle_guard(
+        &self,
+        binding: super::lifecycle::LifecycleBinding,
+    ) -> ParticipantFuture<'_, Option<super::lifecycle::VerifiedLifecycleGuard>>;
+    fn strong_index_attempt_closed(
+        &self,
+        owner: crate::oltp_replication::types::MaintenanceOwnerRef,
+    ) -> ParticipantFuture<'_, super::index::VerifiedIndexAttemptClosed>;
+    fn fence_current(
+        &self,
+        transition_id: Uuid,
+        expected: Authority,
+        next: Authority,
+    ) -> ParticipantFuture<'_, crate::oltp_replication::types::GroupFenceReceipt>;
+}
 #[derive(Clone)]
 pub(crate) struct ParticipantHandle {
-    pub(super) machine: ParticipantMachine,
-    pub(super) consensus: Arc<dyn Consensus<ParticipantCommand, ParticipantReply>>,
+    machine: Option<ParticipantMachine>,
+    consensus: Option<Arc<dyn Consensus<ParticipantCommand, ParticipantReply>>>,
+    identity: GroupIdentity,
+    resources: Arc<crate::oltp::pool::WorkerSharedResources>,
+    pub(super) remote: Option<Arc<dyn RemoteParticipant>>,
 }
 #[derive(Clone)]
 pub(crate) struct VerifiedParticipantSeal {
@@ -31,6 +112,28 @@ impl std::fmt::Debug for VerifiedParticipantResolution {
     }
 }
 impl VerifiedParticipantSeal {
+    pub(crate) fn from_authenticated(
+        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        evidence: PreparedParticipant,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Self, ProtocolError> {
+        if context.group() != &evidence.participant.group
+            || evidence.txn != txn
+            || evidence.manifest != manifest
+        {
+            return Err(invalid());
+        }
+        context.verify_payload(
+            crate::oltp_replication::service_rpc::ParticipantProofKind::Seal,
+            &evidence,
+        )?;
+        Ok(Self {
+            evidence,
+            _owner: context.owner(),
+        })
+    }
+
     pub(crate) fn evidence(&self) -> &PreparedParticipant {
         &self.evidence
     }
@@ -44,6 +147,28 @@ pub(crate) struct VerifiedParticipantResolution {
     _owner: Arc<ScratchLease>,
 }
 impl VerifiedParticipantResolution {
+    pub(crate) fn from_authenticated(
+        context: crate::oltp_replication::service_rpc::AuthenticatedParticipantReplyContext,
+        evidence: ResolutionEvidence,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Self, ProtocolError> {
+        if context.group() != &evidence.group
+            || evidence.txn != txn
+            || evidence.manifest != manifest
+        {
+            return Err(invalid());
+        }
+        context.verify_payload(
+            crate::oltp_replication::service_rpc::ParticipantProofKind::Resolution,
+            &evidence,
+        )?;
+        Ok(Self {
+            evidence,
+            _owner: context.owner(),
+        })
+    }
+
     pub(crate) fn evidence(&self) -> &ResolutionEvidence {
         &self.evidence
     }
@@ -56,19 +181,56 @@ impl ParticipantHandle {
         machine: ParticipantMachine,
         consensus: Arc<dyn Consensus<ParticipantCommand, ParticipantReply>>,
     ) -> Self {
-        Self { machine, consensus }
+        let identity = machine.store.identity().clone();
+        let resources = machine.store.resources().clone();
+        Self {
+            machine: Some(machine),
+            consensus: Some(consensus),
+            identity,
+            resources,
+            remote: None,
+        }
+    }
+    pub(crate) fn remote(
+        identity: GroupIdentity,
+        resources: Arc<crate::oltp::pool::WorkerSharedResources>,
+        remote: Arc<dyn RemoteParticipant>,
+    ) -> Result<Self, ProtocolError> {
+        identity.validate().map_err(|_| invalid())?;
+        if !matches!(identity.kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+            return Err(invalid());
+        }
+        Ok(Self {
+            machine: None,
+            consensus: None,
+            identity,
+            resources,
+            remote: Some(remote),
+        })
+    }
+    pub(super) fn local_machine(&self) -> &ParticipantMachine {
+        self.machine.as_ref().expect("local participant dispatch")
+    }
+    pub(super) fn local_consensus(
+        &self,
+    ) -> &Arc<dyn Consensus<ParticipantCommand, ParticipantReply>> {
+        self.consensus.as_ref().expect("local participant dispatch")
     }
     pub(crate) fn identity(&self) -> &GroupIdentity {
-        self.machine.store.identity()
+        &self.identity
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
-        self.machine.store.resources()
+        &self.resources
     }
     pub(crate) async fn propose(
         &self,
         command: OwnedCommand<ParticipantCommand>,
     ) -> Result<Applied<ParticipantReply>, ProtocolError> {
-        self.consensus.propose(command).await
+        if let Some(remote) = &self.remote {
+            return remote.propose(command).await;
+        }
+
+        self.local_consensus().propose(command).await
     }
     pub(crate) async fn prepare_page(
         &self,
@@ -94,43 +256,113 @@ impl ParticipantHandle {
                 result_digest,
             },
             self.resources(),
-            crate::oltp::pool::ByteClass::Data,
+            crate::oltp::pool::ByteClass::Progress,
         )?)
         .await
     }
     pub(crate) async fn resolve(
         &self,
         authority: Authority,
-        proof: SealedStatusDecision,
+        decision: crate::oltp_replication::authority::status::VerifiedStatusDecision,
         max_items: u16,
     ) -> Result<Applied<ParticipantReply>, ProtocolError> {
         self.propose(OwnedCommand::new_owned(
             ParticipantCommand::Resolve {
                 authority,
-                proof,
+                proof: decision.into_sealed(),
                 max_items,
             },
             self.resources(),
-            crate::oltp::pool::ByteClass::Data,
+            crate::oltp::pool::ByteClass::Progress,
         )?)
         .await
+    }
+    /// A durable witness can replace the remote Status reads only on the
+    /// current participant leader, while that exact decision is still paging.
+    pub(crate) async fn has_resolution_witness(
+        &self,
+        authority: Authority,
+        proof: &SealedStatusDecision,
+    ) -> Result<bool, ProtocolError> {
+        let statement = proof.statement().clone();
+        proof.validate_for(statement.txn, &statement.manifest, &statement.request)?;
+        let digest = proof.digest();
+        let group = self.identity().clone();
+        self.local_consensus().ensure_linearizable().await?;
+        let raw = self
+            .local_machine()
+            .store
+            .read_metadata(META, move |view| {
+                let Some(witness) = view.pinned(&txn_key(RESOLUTION_WITNESS, statement.txn))?
+                else {
+                    return view.encode(&false);
+                };
+                let config = view.pinned(CONFIG)?.ok_or_else(recovery_unknown)?;
+                let state = view
+                    .pinned(&txn_key(b't', statement.txn))?
+                    .ok_or_else(recovery_unknown)?;
+                if config.len() > METADATA_BYTES || state.len() > METADATA_BYTES {
+                    return Err(recovery_unknown());
+                }
+                let config: Config =
+                    serde_json::from_slice(&config).map_err(|_| recovery_unknown())?;
+                let state: Txn = serde_json::from_slice(&state).map_err(|_| recovery_unknown())?;
+                // An older voter can finish a page without removing a key
+                // carried over in a newer voter's checkpoint.
+                if config.authority != authority || state.resolved == state.writes {
+                    return view.encode(&false);
+                }
+                if decode_resolution_witness(&witness)? != digest {
+                    return Err(invalid());
+                }
+                if state.plan.group != group
+                    || state.request != statement.request
+                    || state.manifest != statement.manifest
+                    || state.decision != Some(statement.decision)
+                    || state.resolved == 0
+                    || state.resolved > state.writes
+                {
+                    return Err(recovery_unknown());
+                }
+                view.encode(&true)
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
     pub(crate) async fn read_at(
         &self,
         read_ts: ReadTs,
         key: MvccKey,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        self.machine.read_at(read_ts, key).await
+        if let Some(remote) = &self.remote {
+            return remote.read_at(read_ts, key).await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
+        self.local_machine().read_at(read_ts, key).await
+    }
+    pub(crate) async fn read_page(
+        &self,
+        request: OwnedCommand<super::point::PointReadRequest>,
+    ) -> Result<OwnedCommand<super::scan::ScanPage>, ProtocolError> {
+        if let Some(remote) = &self.remote {
+            return remote.read_page(request).await;
+        }
+        self.local_consensus().ensure_linearizable().await?;
+        self.local_machine().read_page(request).await
     }
     pub(crate) async fn strong_seal(
         &self,
         txn: TxnId,
         manifest: ManifestRef,
     ) -> Result<VerifiedParticipantSeal, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        if let Some(remote) = &self.remote {
+            return remote.strong_seal(txn, manifest).await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
         let raw = self
-            .machine
+            .local_machine()
             .store
             .read_metadata(META, move |view| {
                 let state = view.pinned(&txn_key(b't', txn))?.ok_or_else(invalid)?;
@@ -168,9 +400,13 @@ impl ParticipantHandle {
         txn: TxnId,
         manifest: ManifestRef,
     ) -> Result<VerifiedParticipantResolution, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        if let Some(remote) = &self.remote {
+            return remote.strong_resolution(txn, manifest).await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
         let raw = self
-            .machine
+            .local_machine()
             .store
             .read_metadata(META, move |view| {
                 let state = view.pinned(&txn_key(b'd', txn))?.ok_or_else(invalid)?;
@@ -214,9 +450,13 @@ pub(crate) struct ParticipantEpochs {
 }
 impl ParticipantHandle {
     pub(crate) async fn activation(&self) -> Result<Option<ParticipantEpochs>, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        if let Some(remote) = &self.remote {
+            return remote.activation().await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
         let raw = self
-            .machine
+            .local_machine()
             .store
             .read_metadata(META, |view| {
                 let raw = view.pinned(CONFIG)?;
@@ -235,22 +475,7 @@ impl ParticipantHandle {
         serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
     pub(crate) async fn epochs(&self) -> Result<ParticipantEpochs, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        let raw = self
-            .machine
-            .store
-            .read_metadata(META, |view| {
-                let raw = view.pinned(CONFIG)?.ok_or_else(invalid)?;
-                if raw.len() > METADATA_BYTES {
-                    return Err(recovery_unknown());
-                }
-                // Unknown range fields are skipped, not allocated.
-                let epochs: ParticipantEpochs =
-                    serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
-                view.encode(&epochs)
-            })
-            .await?;
-        serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
+        self.activation().await?.ok_or_else(invalid)
     }
 }
 
@@ -281,9 +506,13 @@ impl ParticipantHandle {
         expected: Authority,
         next: Authority,
     ) -> Result<crate::oltp_replication::types::GroupFenceReceipt, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        if let Some(remote) = &self.remote {
+            return remote.fence_current(transition_id, expected, next).await;
+        }
+
+        self.local_consensus().ensure_linearizable().await?;
         let raw = self
-            .machine
+            .local_machine()
             .store
             .read_metadata(META, |view| {
                 view.pinned(CONFIG)?

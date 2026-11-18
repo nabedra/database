@@ -125,6 +125,815 @@ fn copy(
     next
 }
 
+#[tokio::test(start_paused = true)]
+async fn c07_m02_f03_o22_o23_read_grant_copy_retries_only_the_blocked_replica() {
+    use crate::oltp_replication::{multiplex::EndpointFuture, service_rpc::ReadScope};
+    use crate::oltp_runtime::{
+        coordinator::{QueueCoordinator, ReplicaTransport},
+        worker_endpoint::AuthorityReader,
+    };
+    use crate::protocol::{ErrorCode, Outcome, ProtocolError};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    struct Current(Mutex<QueueAuthority>);
+    impl AuthorityReader for Current {
+        fn current<'a>(&'a self, _: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority> {
+            Box::pin(async { Ok(*self.0.lock().unwrap()) })
+        }
+    }
+
+    struct Peers {
+        current: QueueAuthority,
+        receivers: [Mutex<WorkerReplica>; 2],
+        faults: Mutex<VecDeque<ProtocolError>>,
+        attempts: Mutex<Vec<(WorkerIdentity, ReadGrantSet)>>,
+        refused: Notify,
+    }
+    impl ReplicaTransport for Peers {
+        fn install<'a>(
+            &'a self,
+            _: WorkerIdentity,
+            _: &'a RecordFrame,
+        ) -> EndpointFuture<'a, CopyAcknowledgement> {
+            panic!("read grant copy must not reinstall the request")
+        }
+        fn copy_read_grants(
+            &self,
+            target: WorkerIdentity,
+            scope: QueueScope,
+            view: AuthorityView,
+            id: Uuid,
+            set: ReadGrantSet,
+        ) -> EndpointFuture<'_, ()> {
+            Box::pin(async move {
+                assert_eq!(view, self.current.ready.view);
+                self.attempts.lock().unwrap().push((target, set.clone()));
+                let mut first = self.receivers[0].lock().unwrap();
+                if first.local_identity() == target {
+                    assert_eq!(*first.scope(), scope);
+                    return first
+                        .install_read_grants(self.current, self.current.owner, id, set)
+                        .map_err(QueueError::protocol);
+                }
+                drop(first);
+                let fault = self.faults.lock().unwrap().pop_front();
+                if let Some(error) = &fault
+                    && error.outcome == Outcome::NotApplied
+                {
+                    self.refused.notify_one();
+                    return Err(error.clone());
+                }
+                let mut blocked = self.receivers[1].lock().unwrap();
+                assert_eq!(blocked.local_identity(), target);
+                assert_eq!(*blocked.scope(), scope);
+                blocked
+                    .install_read_grants(self.current, self.current.owner, id, set)
+                    .map_err(QueueError::protocol)?;
+                fault.map_or(Ok(()), Err)
+            })
+        }
+    }
+
+    let fixture = Fixture::new(3);
+    let current = fixture.authority;
+    let mut owner = fixture.replica(0);
+    let mut receivers = [fixture.replica(1), fixture.replica(2)];
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let pending = owner
+        .propose(current, body.clone(), context.clone(), 0)
+        .unwrap();
+    let accepted = copy(&mut owner, &mut receivers, &pending).unwrap();
+    copy(&mut owner, &mut receivers, &accepted);
+    let running = owner.start(current, id).unwrap();
+    copy(&mut owner, &mut receivers, &running);
+    drop((pending, accepted, running));
+    let template = ReadGrant {
+        scope: ReadScope {
+            request: RequestBinding {
+                run_id: current.ready.view.run_id,
+                request_id: id,
+                digest: hash(&body),
+                accepted_context: hash(
+                    owner.record(id).unwrap().pinned_catalog.as_deref().unwrap(),
+                ),
+            },
+            authority: current.ready.view.authority(),
+            read_ts: context.read.as_ref().unwrap().storage_pin.read_ts,
+        },
+        owner: current.owner,
+        worker: current.owner,
+        group: Uuid::new_v4(),
+        node: 1,
+        ticket: Uuid::nil(),
+        input: hash(b"scan page"),
+    };
+    let shared = fixture.shared.clone();
+    let baseline = shared.scheduler().usage();
+    let grant = shared.read_attempts.open(&shared, template).unwrap();
+    let refused = ProtocolError::new(ErrorCode::Overloaded, "test lane full", Outcome::NotApplied);
+    let lost = ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "test copy reply lost",
+        Outcome::Unknown,
+    );
+    let owner = Arc::new(Mutex::new(owner));
+    let authority = Arc::new(Current(Mutex::new(current)));
+    let peers = Arc::new(Peers {
+        current,
+        receivers: receivers.map(Mutex::new),
+        faults: Mutex::new(VecDeque::from([refused.clone(), lost.clone()])),
+        attempts: Mutex::new(Vec::new()),
+        refused: Notify::new(),
+    });
+    let queue = QueueCoordinator::new(owner.clone(), authority.clone(), peers.clone());
+    let opening = {
+        let queue = queue.clone();
+        tokio::spawn(async move { queue.open_read_grant(grant).await })
+    };
+    peers.refused.notified().await;
+    assert!(!opening.is_finished());
+    assert!(owner.lock().unwrap().pending_read_grant_copy(id).is_some());
+    assert!(peers.receivers[0].lock().unwrap().knows_read_grant(grant));
+    assert!(!peers.receivers[1].lock().unwrap().knows_read_grant(grant));
+    opening.await.unwrap().unwrap();
+    assert!(owner.lock().unwrap().pending_read_grant_copy(id).is_none());
+    assert!(
+        peers
+            .receivers
+            .iter()
+            .all(|r| r.lock().unwrap().knows_read_grant(grant))
+    );
+    {
+        let attempts = peers.attempts.lock().unwrap();
+        let targets = attempts
+            .iter()
+            .map(|(target, _)| *target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [
+                fixture.members[1],
+                fixture.members[2],
+                fixture.members[2],
+                fixture.members[2]
+            ]
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|(_, set)| *set == attempts[0].1 && set.grants == [grant])
+        );
+    }
+    queue.settle_read_grant(grant).await.unwrap();
+    assert!(
+        peers
+            .receivers
+            .iter()
+            .all(|r| !r.lock().unwrap().has_read_grants(id))
+    );
+    assert_eq!(shared.scheduler().usage(), baseline);
+
+    let grant = shared.read_attempts.open(&shared, template).unwrap();
+    peers.faults.lock().unwrap().push_back(refused.clone());
+    peers.attempts.lock().unwrap().clear();
+    let opening = {
+        let queue = queue.clone();
+        tokio::spawn(async move { queue.open_read_grant(grant).await })
+    };
+    peers.refused.notified().await;
+    authority.0.lock().unwrap().ready.view.membership_revision += 1;
+    let stale = opening.await.unwrap().unwrap_err();
+    assert_eq!(stale, QueueError::Stale.protocol());
+    assert_eq!(peers.attempts.lock().unwrap().len(), 2);
+    assert!(owner.lock().unwrap().pending_read_grant_copy(id).is_some());
+    assert!(!peers.receivers[1].lock().unwrap().knows_read_grant(grant));
+    *authority.0.lock().unwrap() = current;
+    queue.settle_read_grant(grant).await.unwrap();
+    assert_eq!(shared.scheduler().usage(), baseline);
+
+    let grant = shared.read_attempts.open(&shared, template).unwrap();
+    {
+        let mut faults = peers.faults.lock().unwrap();
+        faults.push_back(lost);
+        faults.extend(std::iter::repeat_n(refused, 130));
+    }
+    let start = tokio::time::Instant::now();
+    let expired = queue.open_read_grant(grant).await.unwrap_err();
+    assert_eq!(expired.code, ErrorCode::Overloaded);
+    assert_eq!(expired.outcome, Outcome::Unknown);
+    assert!((29..=30).contains(&start.elapsed().as_secs()));
+    assert!(owner.lock().unwrap().pending_read_grant_copy(id).is_some());
+    assert!(peers.receivers[1].lock().unwrap().knows_read_grant(grant));
+    peers.faults.lock().unwrap().clear();
+    queue.settle_read_grant(grant).await.unwrap();
+    assert_eq!(shared.scheduler().usage(), baseline);
+}
+
+#[test]
+fn o22_c04_r01_r03_r04_f03_live_read_grants_survive_copy_and_owner_loss() {
+    use crate::oltp_replication::service_rpc::ReadScope;
+    use crate::oltp_runtime::worker_endpoint::QueueRequest;
+
+    let fixture = Fixture::new(3);
+    let current = fixture.authority;
+    let mut owner = fixture.replica(0);
+    let mut survivors = [fixture.replica(1), fixture.replica(2)];
+    let target = survivors[1].shared_resources();
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let pending = owner.propose(current, body.clone(), context.clone(), 0).unwrap();
+    let accepted = copy(&mut owner, &mut survivors, &pending).unwrap();
+    copy(&mut owner, &mut survivors, &accepted);
+    let running = owner.start(current, id).unwrap();
+    copy(&mut owner, &mut survivors, &running);
+    let record = owner.record(id).unwrap();
+    let accepted_context = record.pinned_catalog.clone().unwrap();
+    let sequence = record.sequence;
+    let scope = ReadScope {
+        request: RequestBinding {
+            run_id: current.ready.view.run_id,
+            request_id: id,
+            digest: hash(&body),
+            accepted_context: hash(&accepted_context),
+        },
+        authority: current.ready.view.authority(),
+        read_ts: context.read.as_ref().unwrap().storage_pin.read_ts,
+    };
+    let template = ReadGrant {
+        scope, owner: current.owner, worker: fixture.members[2],
+        group: Uuid::new_v4(), node: 1, ticket: Uuid::nil(), input: hash(b"scan page"),
+    };
+    let baseline = target.scheduler().usage();
+    let mut running = Vec::new();
+    for _ in 0..MAX_READ_GRANTS {
+        let grant = target.read_attempts.open(&target, template).unwrap();
+        assert!(!survivors[1].knows_read_grant(grant));
+        let set = owner.update_read_grant(current, grant, true).unwrap().unwrap();
+        for worker in &mut survivors {
+            worker.install_read_grants(current, current.owner, id, set.clone()).unwrap();
+            assert!(worker.knows_read_grant(grant));
+        }
+        owner.complete_read_grant_copy(current, id, &set).unwrap();
+        let (actual, lease) = target.read_attempts.claim(grant.ticket, current.owner, grant.group, grant.node).unwrap();
+        assert_eq!(actual, grant);
+        running.push((grant, lease));
+    }
+    assert_eq!(owner.update_read_grant(current, ReadGrant { ticket: Uuid::new_v4(), ..template }, true),
+        Err(QueueError::Overloaded));
+
+    let joiner = WorkerIdentity { worker_id: Uuid::new_v4(), incarnation: Uuid::new_v4(), ..fixture.members[2] };
+    let ticket = JoinTicket { ticket_id: Uuid::new_v4(), target: joiner, source_ready: current.ready };
+    let snapshot = owner.begin_join(current, ticket).unwrap();
+    let page = owner.join_page(current, snapshot, JoinPhase::Snapshot, None).unwrap();
+    let frame_header = page.record.as_ref().unwrap().decode_header().unwrap();
+    assert_eq!(frame_header.read_grants.grants.len(), MAX_READ_GRANTS);
+    let copy_wire = QueueRequest::JoinPage {
+        scope: fixture.scope.clone(), view: current.ready.view, page: Box::new(page.header()),
+        record: Some(frame_header),
+    };
+    assert!(serde_json::to_vec(&copy_wire).unwrap().len() < MAX_RECORD_HEADER_BYTES);
+    let mut joining = WorkerReplica::new_joining(
+        WorkerSharedResources::new(91, WorkerResources::default(), SharedResourceConfig::default()).unwrap(),
+        fixture.scope.clone(), joiner, current, fixture.members.clone(), QueueLimits {
+            max_pending_requests: 20,
+            max_queue_bytes_per_replica: 4 << 20,
+            max_retained_result_bytes_per_worker: 1 << 20,
+            result_retention_ms: 100,
+        }, ticket,
+    ).unwrap();
+    joining.install_join_page(current, current.owner, &page).unwrap();
+    owner.seal_join(current, snapshot).unwrap();
+    let delta = owner.join_page(current, snapshot, JoinPhase::Delta, None).unwrap();
+    joining.install_join_page(current, current.owner, &delta).unwrap();
+    assert_eq!(joining.join_statement(current).unwrap(), owner.join_statement(current).unwrap());
+    assert_eq!(joining.pending_read_grants(id), owner.pending_read_grants(id));
+    drop(joining);
+
+    // The previous owner exits before producing a result, while its exact
+    // tickets still hold memory on the original target process.
+    drop(owner);
+    let members = fixture.members[1..].to_vec();
+    let mut ready = ReadySetHasher::default();
+    for member in &members {
+        ready.push(*member).unwrap();
+    }
+    let next = QueueAuthority {
+        owner: fixture.members[1],
+        ready: ReadyMembership {
+            view: AuthorityView { owner_term: 2, membership_revision: 2, ..current.ready.view },
+            ready_root: ready.finish(), ready_count: ready.count(),
+        },
+    };
+    for survivor in &mut survivors {
+        survivor.fenced_takeover(current, next, members.clone()).unwrap();
+        assert_eq!(survivor.pending_read_grants(id).len(), MAX_READ_GRANTS);
+    }
+    assert_eq!(survivors[0].start(next, id).unwrap_err(), QueueError::Unavailable);
+    for (grant, _) in &running {
+        assert!(target.read_attempts.settle(*grant).is_err());
+        assert!(target.read_attempts.claim(grant.ticket, next.owner, grant.group, grant.node).is_err());
+    }
+    for (grant, lease) in running {
+        let forged = ReadGrant { input: hash(b"different input"), ..grant };
+        assert!(target.read_attempts.settle(forged).is_err());
+        assert_eq!(survivors[0].update_read_grant(next, forged, false), Err(QueueError::Conflict));
+        drop(lease);
+        target.read_attempts.settle(grant).unwrap();
+        let cleared = survivors[0].update_read_grant(next, grant, false).unwrap().unwrap();
+        survivors[1].install_read_grants(next, next.owner, id, cleared.clone()).unwrap();
+        assert!(survivors[0].has_read_grants(id));
+        survivors[0].complete_read_grant_copy(next, id, &cleared).unwrap();
+    }
+    assert_eq!(target.scheduler().usage()[0].2, baseline[0].2 - 256);
+    assert!(!survivors[0].has_read_grants(id));
+    assert!(!survivors[1].has_read_grants(id));
+    assert_eq!(survivors[0].record(id).unwrap().sequence, sequence);
+    assert_eq!(survivors[0].record(id).unwrap().pinned_catalog.as_ref(), Some(&accepted_context));
+    let [mut owner, survivor] = survivors;
+    let recovered = owner.resume(next, id).unwrap();
+    copy(&mut owner, &mut [survivor], &recovered);
+    assert!(owner.start(next, id).is_ok());
+
+    // No new process uses an old ticket or recovers an old accepted record.
+    drop(owner);
+    drop(target);
+    let cold = Fixture::new(1);
+    let restarted = cold.replica(0);
+    assert_ne!(restarted.authority().ready.view.run_id, current.ready.view.run_id);
+    assert!(restarted.record(id).is_none());
+    assert!(!restarted.has_read_grants(id));
+}
+
+#[test]
+fn o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement() {
+    use crate::oltp_replication::service_rpc::ReadScope;
+
+    let fixture = Fixture::new(1);
+    let current = fixture.authority;
+    let mut owner = fixture.replica(0);
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let read_ts = context.read.as_ref().unwrap().storage_pin.read_ts;
+    let pending = owner.propose(current, body.clone(), context, 0).unwrap();
+    let accepted = copy(&mut owner, &mut [], &pending).unwrap();
+    copy(&mut owner, &mut [], &accepted);
+    let running = owner.start(current, id).unwrap();
+    copy(&mut owner, &mut [], &running);
+    let pin = owner.record(id).unwrap().pinned_catalog.as_deref().unwrap();
+    let grant = ReadGrant {
+        scope: ReadScope {
+            request: RequestBinding {
+                run_id: current.ready.view.run_id,
+                request_id: id,
+                digest: hash(&body),
+                accepted_context: hash(pin),
+            },
+            authority: current.ready.view.authority(),
+            read_ts,
+        },
+        owner: current.owner,
+        worker: current.owner,
+        group: Uuid::new_v4(),
+        node: 1,
+        ticket: Uuid::new_v4(),
+        input: hash(b"scan page"),
+    };
+    let pending = owner.update_read_grant(current, grant, true).unwrap().unwrap();
+    owner.complete_read_grant_copy(current, id, &pending).unwrap();
+    let reply = crate::response::encode_error(Some(id), QueueError::Unavailable.protocol());
+    let digest = hash(&reply.body);
+    let terminal = owner.finish(current, id, reply.status, reply.body, 1).unwrap();
+    copy(&mut owner, &mut [], &terminal);
+
+    assert_eq!(owner.retained_record(id, 2).unwrap().state, RequestState::Failed);
+    assert_eq!(owner.terminal_response_hash(id), Ok(digest));
+    assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
+    assert!(owner.knows_read_grant(grant));
+
+    let cleared = owner.update_read_grant(current, grant, false).unwrap().unwrap();
+    assert_eq!(owner.terminal_statement(id), Err(QueueError::Unavailable));
+    owner.complete_read_grant_copy(current, id, &cleared).unwrap();
+    assert_eq!(owner.terminal_statement(id).unwrap().response_hash, digest);
+}
+
+#[test]
+fn o14_o23_q03_r01_r02_r03_removal_merges_lower_uuid_data_survivor() {
+    use crate::oltp_replication::service_rpc::ReadScope;
+
+    let mut fixture = Fixture::new(4);
+    let [data_id, failed_id, owner_id, peer_id] = fixture.members.as_slice() else {
+        unreachable!()
+    };
+    fixture.authority.owner = *failed_id;
+    let previous = fixture.authority;
+    let mut old_owner = fixture.replica(1);
+    let mut survivors = [fixture.replica(0), fixture.replica(2), fixture.replica(3)];
+    let copy =
+        |owner: &mut WorkerReplica, survivors: &mut [WorkerReplica; 3], frame: &RecordFrame| {
+            let [data, first_system, second_system] = survivors;
+            let data_ack = data.install(previous, previous.owner, frame).unwrap();
+            owner.acknowledge_phase(previous, data_ack, false).unwrap();
+            let owner_ack =
+                CopyAcknowledgement::authenticated(previous.owner, frame.record_version().unwrap());
+            owner.acknowledge_phase(previous, owner_ack, false).unwrap();
+            for peer in [first_system, second_system] {
+                let ack = peer.install(previous, previous.owner, frame).unwrap();
+                owner.acknowledge_phase(previous, ack, false).unwrap();
+            }
+        };
+    let accepted = Uuid::from_u128(1);
+    let tentative = Uuid::from_u128(2);
+    let terminal = Uuid::from_u128(3);
+    let mut original = BTreeMap::new();
+    for id in [accepted, tentative, terminal] {
+        let body = fixture.body(id);
+        let context = fixture.context(id, &body);
+        let payload = old_owner
+            .propose(previous, body.clone(), context.clone(), 0)
+            .unwrap();
+        original.insert(id, (body, serde_json::to_vec(&context).unwrap()));
+        if id == tentative {
+            // The earliest ready worker installed one tentative page. Its ACK
+            // and every later body copy are absent when the owner fails.
+            survivors[0]
+                .install(previous, previous.owner, &payload)
+                .unwrap();
+            continue;
+        }
+        copy(&mut old_owner, &mut survivors, &payload);
+        let evidence = old_owner.accept_staged(previous, id).unwrap();
+        if id == accepted {
+            // W4 sorts before either electable survivor. It gets the first
+            // accepted version, but the all-ready acceptance barrier is open.
+            survivors[0]
+                .install(previous, previous.owner, &evidence)
+                .unwrap();
+            assert!(!old_owner.copies_complete(id));
+        } else {
+            copy(&mut old_owner, &mut survivors, &evidence);
+            let running = old_owner.start(previous, id).unwrap();
+            copy(&mut old_owner, &mut survivors, &running);
+            let grant = ReadGrant {
+                scope: ReadScope {
+                    request: RequestBinding {
+                        run_id: previous.ready.view.run_id,
+                        request_id: id,
+                        digest: hash(&original[&id].0),
+                        accepted_context: hash(&original[&id].1),
+                    },
+                    authority: previous.ready.view.authority(),
+                    read_ts: context.read.as_ref().unwrap().storage_pin.read_ts,
+                },
+                owner: previous.owner,
+                worker: *data_id,
+                group: Uuid::new_v4(),
+                node: 1,
+                ticket: Uuid::new_v4(),
+                input: hash(b"held scan page"),
+            };
+            let grants = old_owner
+                .update_read_grant(previous, grant, true)
+                .unwrap()
+                .unwrap();
+            survivors[0]
+                .install_read_grants(previous, previous.owner, id, grants.clone())
+                .unwrap();
+            let reply = crate::response::encode_error(Some(id), QueueError::Unavailable.protocol());
+            let completed = old_owner
+                .finish(previous, id, reply.status, reply.body, 1)
+                .unwrap();
+            survivors[0]
+                .install(previous, previous.owner, &completed)
+                .unwrap();
+            assert_eq!(survivors[0].pending_read_grants(id), vec![grant]);
+            assert!(!old_owner.copies_complete(id));
+        }
+    }
+    drop(old_owner);
+
+    let current = QueueAuthority {
+        owner: *owner_id,
+        ready: ReadyMembership {
+            view: AuthorityView {
+                owner_term: 2,
+                ..previous.ready.view
+            },
+            ..previous.ready
+        },
+    };
+    for survivor in &mut survivors {
+        survivor
+            .fenced_takeover(previous, current, fixture.members.clone())
+            .unwrap();
+    }
+    let [mut data, mut owner, mut peer] = survivors;
+    assert!(data.record(accepted).unwrap().accepted);
+    assert!(!owner.record(accepted).unwrap().accepted);
+    assert!(owner.record(tentative).is_none());
+    assert!(matches!(
+        data.install(current, current.owner, &owner.frame(accepted).unwrap()),
+        Err(QueueError::Stale)
+    ));
+    let terminal_before = data.observation(terminal).unwrap();
+    let terminal_hash = data.terminal_response_hash(terminal).unwrap();
+    let grants_before = data.pending_read_grants(terminal);
+    let ticket = JoinTicket {
+        ticket_id: Uuid::new_v4(),
+        target: *failed_id,
+        source_ready: current.ready,
+    };
+    owner.begin_removal_merge(current, ticket).unwrap();
+    assert_eq!(
+        owner.begin_removal(current, ticket),
+        Err(QueueError::Unavailable)
+    );
+    assert_eq!(owner.removal_merge_step(ticket), Ok(Some((*data_id, None))));
+    let mut pages = 0;
+    while let Some((worker, after)) = owner.removal_merge_step(ticket).unwrap() {
+        pages += 1;
+        assert!(pages <= 9);
+        let from = if worker == *data_id {
+            Some(&data)
+        } else if worker == *peer_id {
+            Some(&peer)
+        } else {
+            None
+        };
+        let frame = from.and_then(|from| from.removal_record(current, ticket, after).unwrap());
+        if let Some(frame) = frame {
+            if after.is_none() && worker == *data_id {
+                let retry = data
+                    .removal_record(current, ticket, after)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    frame.record_version().unwrap(),
+                    retry.record_version().unwrap()
+                );
+            }
+            let environment = owner.install_environment(current, current.owner).unwrap();
+            if after.is_none() && worker == *peer_id {
+                let mut forged = frame.decode_header().unwrap();
+                forged.version = owner.record(accepted).unwrap().version;
+                let duplicate = RecordFrame {
+                    header: owner
+                        .shared_resources()
+                        .encode(&forged, MAX_RECORD_HEADER_BYTES)
+                        .unwrap(),
+                    sections: frame.sections.clone(),
+                };
+                let prepared = PreparedInstall::prepare(environment.clone(), &duplicate).unwrap();
+                assert_eq!(
+                    owner.merge_removal_record(ticket, worker, after, prepared, None),
+                    Err(QueueError::Conflict)
+                );
+                assert_eq!(owner.removal_merge_step(ticket), Ok(Some((worker, after))));
+            }
+            let prepared = PreparedInstall::prepare(environment, &frame).unwrap();
+            owner
+                .merge_removal_record(ticket, worker, after, prepared, None)
+                .unwrap();
+        } else {
+            owner
+                .acknowledge_removal_inventory(ticket, worker, after)
+                .unwrap();
+        }
+    }
+    assert_eq!(pages, 8);
+    let proof = owner.begin_removal(current, ticket).unwrap();
+    assert_eq!(proof.snapshot_cut, 3);
+    for survivor in [&mut data, &mut peer] {
+        for id in [accepted, tentative, terminal] {
+            survivor
+                .install(current, current.owner, &owner.frame(id).unwrap())
+                .unwrap();
+        }
+        assert_eq!(survivor.removal_statement(ticket).unwrap(), proof);
+    }
+    for survivor in [&data, &owner, &peer] {
+        assert_eq!(survivor.observation(terminal).unwrap(), terminal_before);
+        assert_eq!(
+            survivor.terminal_response_hash(terminal).unwrap(),
+            terminal_hash
+        );
+        assert_eq!(survivor.pending_read_grants(terminal), grants_before);
+        assert!(matches!(
+            survivor.retained_record(tentative, 2),
+            Err(QueueError::Unavailable)
+        ));
+        for id in [accepted, tentative, terminal] {
+            let (body, context, _) = survivor.input(id).unwrap();
+            assert_eq!(
+                (body.as_ref(), context.as_ref()),
+                (original[&id].0.as_slice(), original[&id].1.as_slice())
+            );
+        }
+    }
+
+    // After the ready cut publishes, the original accepted read can finish
+    // with the original pin. Merely copying the W4-only tentative cannot run it.
+    let live = [*data_id, *owner_id, *peer_id];
+    let mut root = ReadySetHasher::default();
+    for worker in live {
+        root.push(worker).unwrap();
+    }
+    let ready = QueueAuthority {
+        owner: current.owner,
+        ready: ReadyMembership {
+            view: AuthorityView {
+                membership_revision: 2,
+                ..current.ready.view
+            },
+            ready_root: root.finish(),
+            ready_count: root.count(),
+        },
+    };
+    for survivor in [&mut data, &mut owner, &mut peer] {
+        survivor.fenced_takeover(current, ready, live).unwrap();
+    }
+    let replicate = |owner: &mut WorkerReplica,
+                     data: &mut WorkerReplica,
+                     peer: &mut WorkerReplica,
+                     frame: &RecordFrame| {
+        let first = data.install(ready, ready.owner, frame).unwrap();
+        let local =
+            CopyAcknowledgement::authenticated(ready.owner, frame.record_version().unwrap());
+        let last = peer.install(ready, ready.owner, frame).unwrap();
+        for ack in [first, local, last] {
+            assert!(owner.acknowledge(ready, ack).unwrap().is_none());
+        }
+    };
+    assert_eq!(
+        owner.start(ready, tentative).unwrap_err(),
+        QueueError::Unavailable
+    );
+    let recovered = owner.resume(ready, accepted).unwrap();
+    replicate(&mut owner, &mut data, &mut peer, &recovered);
+    let running = owner.start(ready, accepted).unwrap();
+    replicate(&mut owner, &mut data, &mut peer, &running);
+    let expected =
+        format!(r#"{{"request_id":"{accepted}","data":["original read"]}}"#).into_bytes();
+    let response = owner
+        .finish(ready, accepted, 200, expected.clone(), 2)
+        .unwrap();
+    replicate(&mut owner, &mut data, &mut peer, &response);
+    for survivor in [&data, &owner, &peer] {
+        let (record, bytes) = survivor
+            .response(previous.ready.view.run_id, accepted, 2)
+            .unwrap();
+        assert_eq!(record.state, RequestState::Succeeded);
+        assert_eq!(bytes.unwrap().as_ref(), expected.as_slice());
+        assert_eq!(
+            survivor.input(accepted).unwrap().1.as_ref(),
+            original[&accepted].1.as_slice()
+        );
+    }
+}
+
+#[test]
+fn r01_r02_removal_copy_resumes_exact_ack_cursor_after_cancel_and_lost_reply() {
+    let fixture = Fixture::new(3);
+    let mut old_owner = fixture.replica(0);
+    let mut survivors = [fixture.replica(1), fixture.replica(2)];
+    let ids = (1..=3).map(Uuid::from_u128).collect::<Vec<_>>();
+    let mut original = Vec::new();
+    for id in &ids {
+        let mut body = fixture.body(*id);
+        body.extend(std::iter::repeat_n(b' ', 96 << 10));
+        let context = fixture.context(*id, &body);
+        let payload = old_owner
+            .propose(fixture.authority, body.clone(), context.clone(), 0)
+            .unwrap();
+        let accepted = copy(&mut old_owner, &mut survivors, &payload).unwrap();
+        copy(&mut old_owner, &mut survivors, &accepted);
+        assert!(old_owner.copies_complete(*id));
+        original.push((body, context));
+    }
+    let current = QueueAuthority {
+        owner: fixture.members[1],
+        ready: ReadyMembership {
+            view: AuthorityView {
+                owner_term: 2,
+                ..fixture.authority.ready.view
+            },
+            ..fixture.authority.ready
+        },
+    };
+    for worker in &mut survivors {
+        worker
+            .fenced_takeover(fixture.authority, current, fixture.members.clone())
+            .unwrap();
+    }
+    drop(old_owner);
+    let [mut source, mut target] = survivors;
+    let ticket = JoinTicket {
+        ticket_id: Uuid::new_v4(),
+        target: fixture.members[0],
+        source_ready: current.ready,
+    };
+    source.begin_removal_merge(current, ticket).unwrap();
+    while let Some((worker, after)) = source.removal_merge_step(ticket).unwrap() {
+        let frame = if worker == target.local_identity() {
+            target.removal_record(current, ticket, after).unwrap()
+        } else {
+            None
+        };
+        if let Some(frame) = frame {
+            let environment = source.install_environment(current, current.owner).unwrap();
+            let prepared = PreparedInstall::prepare(environment, &frame).unwrap();
+            source.merge_removal_record(ticket, worker, after, prepared, None).unwrap();
+        } else {
+            source.acknowledge_removal_inventory(ticket, worker, after).unwrap();
+        }
+    }
+    let root = source.begin_removal(current, ticket).unwrap();
+    source
+        .acknowledge_removal_worker(ticket, source.local_identity())
+        .unwrap();
+    assert_eq!(
+        source.removal_progress(ticket).unwrap(),
+        (Some(source.local_identity().worker_id), None)
+    );
+    assert_eq!(
+        source.acknowledge_removal_worker(ticket, target.local_identity()),
+        Err(QueueError::Stale)
+    );
+    let frame = source.frame(ids[0]).unwrap();
+    let lost_ack = target.install(current, current.owner, &frame).unwrap();
+    // Reply lost before cursor save: the exact repeated install is safe.
+    assert_eq!(source.removal_progress(ticket).unwrap().1, None);
+    let replay_ack = target.install(current, current.owner, &frame).unwrap();
+    assert_eq!(lost_ack.record(), replay_ack.record());
+    let mut forged = replay_ack.record();
+    forged.version += 1;
+    assert_eq!(
+        source.acknowledge_removal_record(ticket, target.local_identity(), None, forged),
+        Err(QueueError::Stale)
+    );
+    source
+        .acknowledge_removal_record(ticket, target.local_identity(), None, replay_ack.record())
+        .unwrap();
+    drop(frame);
+    // Dropping/restarting the coordinator future preserves acknowledged RAM
+    // progress, without treating the cursor itself as a complete-copy proof.
+    assert_eq!(source.begin_removal(current, ticket).unwrap(), root);
+    assert_eq!(source.removal_progress(ticket).unwrap().1, Some(ids[0]));
+    assert_eq!(
+        source.record_after(source.removal_progress(ticket).unwrap().1),
+        Some(ids[1])
+    );
+    let mut wrong = ticket;
+    wrong.ticket_id = Uuid::new_v4();
+    assert_eq!(source.removal_progress(wrong), Err(QueueError::Stale));
+    let mut after = Some(ids[0]);
+    for id in &ids[1..] {
+        let frame = source.frame(*id).unwrap();
+        let ack = target.install(current, current.owner, &frame).unwrap();
+        source
+            .acknowledge_removal_record(ticket, target.local_identity(), after, ack.record())
+            .unwrap();
+        after = Some(*id);
+    }
+    source
+        .acknowledge_removal_worker(ticket, target.local_identity())
+        .unwrap();
+    assert_eq!(
+        source.removal_statement(ticket).unwrap(),
+        target.removal_statement(ticket).unwrap()
+    );
+    for (id, (body, context)) in ids.iter().zip(original) {
+        for replica in [&source, &target] {
+            let record = replica.record(*id).unwrap();
+            assert!(record.accepted);
+            assert_eq!(record.body, body);
+            assert_eq!(
+                serde_json::from_slice::<AcceptedContext>(
+                    record.pinned_catalog.as_deref().unwrap()
+                )
+                .unwrap(),
+                context
+            );
+        }
+    }
+    let members = fixture.members[1..].to_vec();
+    let mut next = current;
+    next.ready.view.membership_revision += 1;
+    let mut ready = ReadySetHasher::default();
+    for member in &members {
+        ready.push(*member).unwrap();
+    }
+    next.ready.ready_root = ready.finish();
+    next.ready.ready_count = ready.count();
+    source.fenced_takeover(current, next, members).unwrap();
+    assert_eq!(source.removal_progress(ticket), Err(QueueError::Stale));
+}
+
 #[test]
 fn q03_payload_and_acceptance_evidence_are_separate_all_ready_barriers() {
     let fixture = Fixture::new(3);
@@ -179,6 +988,126 @@ fn q03_payload_and_acceptance_evidence_are_separate_all_ready_barriers() {
     drop(payload);
     drop(accepted);
     assert_eq!(fixture.shared.control_bytes_used(), 0);
+}
+
+#[test]
+fn b02_r01_queue_latency_consumes_the_first_dispatch_and_drops_fenced_waits() {
+    let fixture = Fixture::new(3);
+    let mut owner = fixture.replica(0);
+    let mut replicas = [fixture.replica(1), fixture.replica(2)];
+    let stats = |replica: &WorkerReplica| serde_json::to_value(replica.queue_latency_stats()).unwrap();
+    let samples = |replica: &WorkerReplica| {
+        stats(replica)["bucket_counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|count| count.as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let enqueue = |owner: &mut WorkerReplica, replicas: &mut [WorkerReplica]| {
+        let id = Uuid::new_v4();
+        let body = fixture.body(id);
+        let context = fixture.context(id, &body);
+        let payload = owner.propose(fixture.authority, body, context, 1).unwrap();
+        let accepted = copy(owner, replicas, &payload).unwrap();
+        assert_eq!(stats(owner)["waiting"], 0);
+        copy(owner, replicas, &accepted);
+        assert_eq!(stats(owner)["waiting"], 1);
+        assert_eq!(stats(&replicas[0])["waiting"], 0);
+        id
+    };
+
+    let id = enqueue(&mut owner, &mut replicas);
+    let running = owner.start(fixture.authority, id).unwrap();
+    let version = running.record_version().unwrap();
+    owner.observe_dispatch(fixture.authority, version);
+    assert_eq!(samples(&owner), 0);
+    copy(&mut owner, &mut replicas, &running);
+    owner.observe_dispatch(fixture.authority, version);
+    owner.observe_dispatch(fixture.authority, version);
+    assert_eq!(stats(&owner)["waiting"], 0);
+    assert_eq!(samples(&owner), 1);
+    assert_eq!(samples(&replicas[0]), 0);
+
+    let pending = enqueue(&mut owner, &mut replicas);
+    let mut next = fixture.authority;
+    next.ready.view.owner_term += 1;
+    owner
+        .fenced_takeover(fixture.authority, next, fixture.members.iter().copied())
+        .unwrap();
+    for replica in &mut replicas {
+        replica
+            .fenced_takeover(fixture.authority, next, fixture.members.iter().copied())
+            .unwrap();
+    }
+    let resumed = owner.resume(next, pending).unwrap();
+    copy(&mut owner, &mut replicas, &resumed);
+    let resumed = owner.start(next, pending).unwrap();
+    copy(&mut owner, &mut replicas, &resumed);
+    owner.observe_dispatch(next, resumed.record_version().unwrap());
+    assert_eq!(stats(&owner)["discarded_on_authority_change_total"], 1);
+    assert_eq!(stats(&owner)["waiting"], 0);
+    assert_eq!(samples(&owner), 0);
+}
+
+#[test]
+fn q04_q06_idle_preflight_preserves_recovery_and_expired_result_work() {
+    for count in [1, 3] {
+        let fixture = Fixture::new(count);
+        let mut owner = fixture.replica(0);
+        let mut followers: Vec<_> = (1..count)
+            .map(|index| fixture.replica(index as usize))
+            .collect();
+        let id = Uuid::new_v4();
+        let mut active = BTreeSet::new();
+        assert!(!owner.has_recovery_work(1, &active));
+        assert!(!owner.has_retirement_work(0, &active));
+
+        let body = fixture.body(id);
+        let context = fixture.context(id, &body);
+        let proposed = owner.propose(fixture.authority, body, context, 0).unwrap();
+        assert!(owner.has_recovery_work(1, &active));
+        let accepted = copy(&mut owner, &mut followers, &proposed).unwrap();
+        copy(&mut owner, &mut followers, &accepted);
+        assert!(owner.has_recovery_work(1, &active));
+        assert!(!owner.has_retirement_work(0, &active));
+
+        let running = owner.start(fixture.authority, id).unwrap();
+        copy(&mut owner, &mut followers, &running);
+        owner.reconcile(fixture.authority, id).unwrap();
+        assert!(owner.has_recovery_work(1, &active));
+        assert!(owner.has_retirement_work(1, &active));
+        active.insert(id);
+        assert!(!owner.has_recovery_work(1, &active));
+        assert!(!owner.has_retirement_work(1, &active));
+        active.remove(&id);
+
+        let response = format!(r#"{{"request_id":"{id}","data":[]}}"#).into_bytes();
+        let terminal = owner
+            .finish(fixture.authority, id, 200, response, 2)
+            .unwrap();
+        let ack = owner
+            .install(fixture.authority, fixture.authority.owner, &terminal)
+            .unwrap();
+        owner.acknowledge(fixture.authority, ack).unwrap();
+        assert!(!owner.has_retirement_work(101, &active));
+        assert!(matches!(
+            owner.retained_record(id, 102),
+            Err(QueueError::NotFound)
+        ));
+        assert!(owner.has_retirement_work(102, &active));
+        assert_eq!(owner.has_recovery_work(101, &active), count > 1);
+        assert!(!owner.has_recovery_work(102, &active));
+        for follower in &mut followers {
+            let ack = follower
+                .install(fixture.authority, fixture.authority.owner, &terminal)
+                .unwrap();
+            owner.acknowledge(fixture.authority, ack).unwrap();
+            assert!(follower.has_retirement_work(102, &active));
+        }
+        assert!(!owner.has_recovery_work(1, &active));
+        assert!(owner.has_retirement_work(102, &active));
+    }
 }
 
 #[test]
@@ -409,8 +1338,8 @@ fn joiner(fixture: &Fixture) -> (WorkerReplica, JoinTicket) {
     )
 }
 
-#[test]
-fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag() {
+#[tokio::test]
+async fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag() {
     for count in [0, 1, 3] {
         let fixture = Fixture::new(2);
         let mut owner = fixture.replica(0);
@@ -431,6 +1360,10 @@ fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag
         }
         let (mut target, ticket) = joiner(&fixture);
         let snapshot = owner.begin_join(fixture.authority, ticket).unwrap();
+        assert_eq!(
+            owner.begin_join(fixture.authority, ticket).unwrap(),
+            snapshot
+        );
         assert!(target.join_statement(fixture.authority).is_err());
         let mut cursor = None;
         let mut received = 0;
@@ -443,6 +1376,26 @@ fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag
             target
                 .install_join_page(fixture.authority, fixture.authority.owner, &page)
                 .unwrap();
+            // A lost authenticated page reply resends the same page. The
+            // sender advances its RAM cursor only after that reply arrives.
+            assert_eq!(
+                owner
+                    .join_export_progress(fixture.authority, snapshot, JoinPhase::Snapshot)
+                    .unwrap(),
+                (cursor, false)
+            );
+            target
+                .install_join_page(fixture.authority, fixture.authority.owner, &page)
+                .unwrap();
+            owner
+                .acknowledge_join_page(fixture.authority, page.header())
+                .unwrap();
+            assert_eq!(
+                owner
+                    .join_export_progress(fixture.authority, snapshot, JoinPhase::Snapshot)
+                    .unwrap(),
+                (page.next_sequence, page.done)
+            );
             cursor = page.next_sequence;
             if page.done {
                 break;
@@ -456,6 +1409,10 @@ fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag
         assert_eq!(target.pending(), count as usize);
         assert!(target.join_statement(fixture.authority).is_err());
         owner.seal_join(fixture.authority, snapshot).unwrap();
+        assert_eq!(
+            owner.begin_join(fixture.authority, ticket).unwrap(),
+            snapshot
+        );
         let delta = owner
             .join_page(fixture.authority, snapshot, JoinPhase::Delta, None)
             .unwrap();
@@ -463,10 +1420,71 @@ fn r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag
         target
             .install_join_page(fixture.authority, fixture.authority.owner, &delta)
             .unwrap();
+        owner
+            .acknowledge_join_page(fixture.authority, delta.header())
+            .unwrap();
+        assert_eq!(
+            owner
+                .join_export_progress(fixture.authority, snapshot, JoinPhase::Delta)
+                .unwrap(),
+            (delta.next_sequence, true)
+        );
         assert_eq!(
             target.join_statement(fixture.authority).unwrap(),
             owner.join_statement(fixture.authority).unwrap()
         );
+        // O14/O23, R03/Q03, C07/M02: the complete statement's bounded
+        // representation needs more decode heap than the former 16 KiB guess.
+        // Keep Data full while the protected metadata reply decoder progresses.
+        let statement = target.join_statement(fixture.authority).unwrap();
+        let full_data = fixture
+            .shared
+            .allocate_bytes(
+                crate::oltp::pool::ByteClass::Data,
+                fixture.shared.config().control_bytes - fixture.shared.config().progress_bytes,
+            )
+            .unwrap();
+        let header = fixture
+            .shared
+            .encode_in(
+                crate::oltp::pool::ByteClass::Progress,
+                &super::super::worker_endpoint::QueueReply::JoinStatement {
+                    worker: ticket.target,
+                    statement: Box::new(statement),
+                    nonce: Uuid::new_v4(),
+                },
+                MAX_HEADER_BYTES,
+            )
+            .unwrap();
+        let decode = crate::oltp::mvcc::json_decode_budget(header.as_ref()).unwrap();
+        assert!(decode > 4 * MAX_HEADER_BYTES);
+        let owner = Arc::new(fixture.shared.reserve_reply_decode(decode).await.unwrap());
+        let (decoded, owner) = fixture
+            .shared
+            .execute(
+                crate::oltp::pool::ExecutionClass::Control,
+                0,
+                0,
+                move || {
+                    let decoded: super::super::worker_endpoint::QueueReply =
+                        serde_json::from_slice(header.as_ref()).unwrap();
+                    Ok((decoded, owner))
+                },
+            )
+            .await
+            .unwrap();
+        let super::super::worker_endpoint::QueueReply::JoinStatement {
+            worker,
+            statement: copied,
+            ..
+        } = decoded
+        else {
+            panic!("wrong typed join completion");
+        };
+        assert_eq!(worker, ticket.target);
+        assert_eq!(*copied, statement);
+        drop(owner);
+        drop(full_data);
         // Copy evidence has not published a new ready revision.
         assert_eq!(target.authority(), fixture.authority);
         assert_eq!(target.authority().ready.ready_count, 2);
@@ -651,4 +1669,148 @@ fn m02_fixed_terminal_cache_slot_is_reserved_at_initial_admission_and_snapshot_r
         .install_snapshot(replica.queue.snapshot())
         .unwrap();
     assert_eq!(replica.queue.charged_bytes(), bytes);
+}
+
+#[test]
+fn q03_f03_tentative_copies_keep_original_context_until_explicit_acceptance() {
+    let fixture = Fixture::new(3);
+    let mut owner = fixture.replica(0);
+    let mut first = fixture.replica(1);
+    let mut second = fixture.replica(2);
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let payload = owner
+        .propose(fixture.authority, body.clone(), context.clone(), 1)
+        .unwrap();
+    let ack = owner
+        .install(fixture.authority, fixture.authority.owner, &payload)
+        .unwrap();
+    owner
+        .acknowledge_phase(fixture.authority, ack, false)
+        .unwrap();
+    assert!(!owner.payloads_complete(id));
+    assert_eq!(owner.recovery_ids(1, None, 1), vec![id]);
+    assert!(owner.has_recovery_work(1, &BTreeSet::new()));
+    assert!(!owner.has_recovery_work(1, &BTreeSet::from([id])));
+    for replica in [&mut first, &mut second] {
+        let ack = replica
+            .install(fixture.authority, fixture.authority.owner, &payload)
+            .unwrap();
+        owner
+            .acknowledge_phase(fixture.authority, ack, false)
+            .unwrap();
+    }
+    assert!(owner.payloads_complete(id));
+    assert!(!owner.copies_complete(id));
+    assert!(!owner.record(id).unwrap().accepted);
+    assert_eq!(
+        owner.start(fixture.authority, id).unwrap_err(),
+        QueueError::Unavailable
+    );
+    drop(owner);
+    let live = fixture.members[1..].to_vec();
+    let mut root = ReadySetHasher::default();
+    for member in &live {
+        root.push(*member).unwrap();
+    }
+    let next = QueueAuthority {
+        owner: live[0],
+        ready: ReadyMembership {
+            view: AuthorityView {
+                run_id: fixture.authority.ready.view.run_id,
+                owner_term: 2,
+                membership_revision: 2,
+            },
+            ready_root: root.finish(),
+            ready_count: 2,
+        },
+    };
+    first
+        .fenced_takeover(fixture.authority, next, live.clone())
+        .unwrap();
+    second
+        .fenced_takeover(fixture.authority, next, live)
+        .unwrap();
+    let record = first.record(id).unwrap();
+    assert_eq!(record.body, body);
+    assert!(!record.accepted);
+    assert_eq!(first.recovery_ids(1, None, 1), vec![id]);
+    assert_eq!(
+        serde_json::from_slice::<AcceptedContext>(record.pinned_catalog.as_ref().unwrap()).unwrap(),
+        context
+    );
+    let payload = first.resume(next, id).unwrap();
+    let ack = first.install(next, next.owner, &payload).unwrap();
+    first.acknowledge_phase(next, ack, false).unwrap();
+    let ack = second.install(next, next.owner, &payload).unwrap();
+    first.acknowledge_phase(next, ack, false).unwrap();
+    assert!(first.payloads_complete(id));
+    assert!(!first.copies_complete(id));
+    // Production invokes this only after the real TSO context-bind succeeds.
+    let accepted = first.accept_staged(next, id).unwrap();
+    let ack = first.install(next, next.owner, &accepted).unwrap();
+    first.acknowledge(next, ack).unwrap();
+    assert!(!first.copies_complete(id));
+    let ack = second.install(next, next.owner, &accepted).unwrap();
+    first.acknowledge(next, ack).unwrap();
+    assert!(first.copies_complete(id));
+    assert_eq!(
+        serde_json::from_slice::<AcceptedContext>(
+            first.record(id).unwrap().pinned_catalog.as_ref().unwrap()
+        )
+        .unwrap(),
+        context
+    );
+}
+
+#[test]
+fn o13_q06_delayed_install_cannot_restore_retired_terminal_and_new_sequences_skip_lookup() {
+    use crate::oltp_replication::authority::status::VerifiedTerminalRetirement;
+    let fixture = Fixture::new(2);
+    let current = fixture.authority;
+    let mut owner = fixture.replica(0);
+    let mut peers = [fixture.replica(1)];
+    let propose = |source: &mut WorkerReplica| {
+        let id = Uuid::new_v4();
+        let body = fixture.body(id);
+        let context = fixture.context(id, &body);
+        (id, source.propose(current, body, context, 0).unwrap())
+    };
+    let (_, earlier) = propose(&mut owner);
+    let (id, tentative) = propose(&mut owner);
+    let accepted = copy(&mut owner, &mut peers, &tentative).unwrap();
+    copy(&mut owner, &mut peers, &accepted);
+    let response = serde_json::to_vec(&serde_json::json!({ "request_id": id, "data": [] })).unwrap();
+    let terminal = owner.finish(current, id, 200, response, 1).unwrap();
+    copy(&mut owner, &mut peers, &terminal);
+    let statement = owner.terminal_statement(id).unwrap();
+    let [mut receiver] = peers;
+    let prepare = |receiver: &WorkerReplica, frame: &RecordFrame| {
+        PreparedInstall::prepare(receiver.install_environment(current, current.owner).unwrap(), frame).unwrap()
+    };
+
+    let delayed = prepare(&receiver, &accepted);
+    let header = accepted.decode_header().unwrap();
+    assert_eq!(receiver.install_retirement_check(&header), None);
+    let proof = || VerifiedTerminalRetirement::test_certificate(statement.clone(), &fixture.members);
+    assert_eq!(receiver.retire(current, proof(), 100), Err(QueueError::Stale));
+    assert!(receiver.record(id).is_some());
+    receiver.retire(current, proof(), 101).unwrap();
+    assert_eq!(receiver.stats().charged_queue_bytes, 0);
+    assert!(receiver.install_retirement_check(&header).is_some());
+    assert!(matches!(receiver.install_prepared_checked(delayed, None), Err(QueueError::Stale)));
+    assert!(receiver.record(id).is_none());
+
+    // A slower earlier identity needs a strong negative certificate lookup.
+    // A higher new sequence is provably outside this local deletion history.
+    let node_generation = receiver.install_retirement_check(&earlier.decode_header().unwrap());
+    assert!(node_generation.is_some());
+    let prepared = prepare(&receiver, &earlier);
+    receiver.install_prepared_checked(prepared, node_generation).unwrap();
+    let (new_id, newer) = propose(&mut owner);
+    assert_eq!(receiver.install_retirement_check(&newer.decode_header().unwrap()), None);
+    let prepared = prepare(&receiver, &newer);
+    receiver.install_prepared_checked(prepared, None).unwrap();
+    assert!(receiver.record(new_id).is_some());
 }
