@@ -15,11 +15,12 @@ To file the PR, use the `file-pr` skill in this repo. Include before and after p
 Also always include screenshots and videos of the functional implementation of logic, or other methods to visualize the feature (diagrams, charts, etc.) and efficiency and time benchmarks (jitter, lag, time-to-first-token, results from the tests for scaling or load scenarios...)
 
 # Rubric policy for big tasks
-When you are given a big task or big functionality to implement, come up with a temporary TODO table in markdown where you break down the big project into eatable tasks that can be run in parallel. These shall be practical features that correspond to a feature description. For example, if you are given an SDK interface to implement, each subtask might be "Implement the filtering module", "Code the sign up page", etc. If a task is of this size (making a page, a module, etc) you should likely avoid doing the rubric; this strategy should be reserved for big tasks
 
-Each subtask should be then handled to a subagent, the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. And each subtask should be worked on in parallel by these agents. You should dedicate exclusively to orchestrate and handle these agents; never do the heavy-lifting of coding yourself
-
-For big tasks, delegate test harnesses, acceptance runners, and integration implementation to subagents as well. The lead agent must only orchestrate, track the TODO table, coordinate interfaces, and assess results.
+For large implementations with independent subtasks, follow the
+[subagent-driven development workflow](references/subagent-driven-development.md).
+Keep a temporary Markdown TODO table and delegate implementation, test harnesses,
+acceptance runners, and integration work. The lead coordinates interfaces, tracks
+progress, and assesses results. Handle isolated changes directly.
 
 # For logic implementations
 You should expect to receive the input and/or output and/or examples of how the module should look. E.g., an interface and example usage:
