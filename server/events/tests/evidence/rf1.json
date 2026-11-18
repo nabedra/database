@@ -1,0 +1,62 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:524b09a5e5aeade937ea25d9fd6772e2baafc16e13b4a933050ac25838040645",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "f9c7b9ddb637670bf572e051c95582cce52538e2883ddd2933741a4edce5c65e",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "rf1": {
+      "pass": true,
+      "seconds": 30.064
+    }
+  },
+  "checks": [
+    {
+      "check": "EV03 oversized topology is refused before creating a durable intent",
+      "rejected_partitions": 4096,
+      "completed_partitions": 2
+    },
+    {
+      "check": "EV01–EV03 HTTP validates scopes, limits, atomic batches, and unread publish replies",
+      "concurrent_requests": 14,
+      "retained_tail": 18,
+      "exact_event_bytes": 65536,
+      "exact_request_bytes": 1048576
+    },
+    {
+      "check": "EV02 lease renews, expires, redelivers, and fences stale credentials",
+      "checkpoint": 2
+    },
+    {
+      "check": "EV02 wall-clock retention expires event and dedup state and requires explicit reset",
+      "earliest_offset": 2
+    },
+    {
+      "check": "EV01 RF1 SIGKILL restart preserves the log, identities, offsets, and checkpoint",
+      "events": 18,
+      "disk_mounts": 1,
+      "recovery_seconds": 4.942
+    },
+    {
+      "check": "EV03 low-disk publishes return 507 while polling and acknowledgment progress",
+      "rejected_publishes": 10,
+      "checkpoint": 3
+    },
+    {
+      "check": "EV03 withheld request bodies fill publish admission while control still commits",
+      "held_bodies": 5,
+      "checkpoint": 4,
+      "publish_rejection": 429
+    }
+  ]
+}

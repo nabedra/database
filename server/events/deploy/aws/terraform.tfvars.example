@@ -1,0 +1,49 @@
+region                 = "us-east-1"
+name                   = "orders"
+cluster_id             = "86d4a4d1-ddb4-4028-a796-0ec9b54265b8"
+vpc_id                 = "vpc-REPLACE"
+peer_zone_id           = "ZPRIVATE"
+client_zone_id         = "ZCLIENT"
+client_dns_name        = "events.example.com"
+client_certificate_arn = "arn:aws:acm:us-east-1:111111111111:certificate/REPLACE"
+ingress_subnet_ids     = ["subnet-ingress-a", "subnet-ingress-b", "subnet-ingress-c"]
+client_ipv4_cidrs      = ["10.0.0.0/16"]
+service_ipv4_cidrs     = ["10.0.0.0/16"]
+artifact_bucket        = "replace-with-artifact-bucket"
+backup_bucket          = "replace-with-backup-bucket"
+backup_prefix          = "nabedra-events/orders"
+backup_kms_key_arn     = "arn:aws:kms:us-east-1:111111111111:key/REPLACE"
+metadata_voters        = [1, 2, 3]
+
+brokers = {
+  "1" = {
+    subnet_id           = "subnet-broker-a"
+    ami_id              = "ami-REPLACE"
+    instance_type       = "m7i.large"
+    secret_arn          = "arn:aws:secretsmanager:us-east-1:111111111111:secret:broker-1-REPLACE"
+    artifact_key        = "nabedra-events/releases/0.1.0/nabedra-events-linux-amd64"
+    artifact_sha256     = "0000000000000000000000000000000000000000000000000000000000000000"
+    disk_gib            = 200
+    format_blank_volume = true
+  }
+  "2" = {
+    subnet_id           = "subnet-broker-b"
+    ami_id              = "ami-REPLACE"
+    instance_type       = "m7i.large"
+    secret_arn          = "arn:aws:secretsmanager:us-east-1:111111111111:secret:broker-2-REPLACE"
+    artifact_key        = "nabedra-events/releases/0.1.0/nabedra-events-linux-amd64"
+    artifact_sha256     = "0000000000000000000000000000000000000000000000000000000000000000"
+    disk_gib            = 200
+    format_blank_volume = true
+  }
+  "3" = {
+    subnet_id           = "subnet-broker-c"
+    ami_id              = "ami-REPLACE"
+    instance_type       = "m7i.large"
+    secret_arn          = "arn:aws:secretsmanager:us-east-1:111111111111:secret:broker-3-REPLACE"
+    artifact_key        = "nabedra-events/releases/0.1.0/nabedra-events-linux-amd64"
+    artifact_sha256     = "0000000000000000000000000000000000000000000000000000000000000000"
+    disk_gib            = 200
+    format_blank_volume = true
+  }
+}

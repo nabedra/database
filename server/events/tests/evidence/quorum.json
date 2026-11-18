@@ -1,0 +1,51 @@
+{
+  "docker": {
+    "n_cpus": 8,
+    "memory": 8220106752,
+    "arch": "x86_64",
+    "server": "28.3.3"
+  },
+  "image_id": "sha256:524b09a5e5aeade937ea25d9fd6772e2baafc16e13b4a933050ac25838040645",
+  "host": "macOS-26.7.3-x86_64-i386-64bit",
+  "git_base": "51d75d6c1de71d8323b4104f2258ff488c39ecd6",
+  "checkout_source_sha256": "f9c7b9ddb637670bf572e051c95582cce52538e2883ddd2933741a4edce5c65e",
+  "caps": {
+    "cpus": "2",
+    "memory_mib": 1536
+  },
+  "records_per_load_repetition": 256,
+  "cases": {
+    "quorum": {
+      "pass": true,
+      "seconds": 41.308
+    }
+  },
+  "checks": [
+    {
+      "check": "EV07 RF3 wrong-broker ingress, unread committed reply, and leader SIGKILL",
+      "old_leader": 1,
+      "new_leader": 2,
+      "old_term": 1,
+      "new_term": 2,
+      "leader_matches_before_kill": {
+        "1": 8,
+        "2": 8,
+        "3": 8
+      },
+      "recovery_seconds": 2.276,
+      "checkpoint": 1
+    },
+    {
+      "check": "EV07 RF3 minority returns 503 while independent cached RF1 partition commits",
+      "isolated_leader": 2,
+      "minority_result": "unavailable",
+      "healthy_offset": 2
+    },
+    {
+      "check": "EV07 all three RF3 disks reopen after every broker stops",
+      "events": 2,
+      "disk_mounts": 3,
+      "recovery_seconds": 10.857
+    }
+  ]
+}
