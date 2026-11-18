@@ -210,6 +210,22 @@ The load sweep acknowledged 47 of 390 measured writes, the same total as the con
 
 The 4 CPU and 7.90 GB RF3 runs exercised the fixed-membership O23/O24 and B02 subsets. The serial run verified equal terminal and accepted counters on all three workers at the sampled boundaries. Fault injection and authority changes during observation remain unverified. The host rebooted after compilation. The recovered binary matched the build log's SHA-256 `66bd52910a308d55ee38bb6ac58c917bfd0bebda992ad9cf2272c8ceb0fbdb32`. The comparison uses the recorded control aggregates because the reboot cleared their intermediate artifacts. The notification load and serial result SHA-256 hashes were `6610dbccf8cfb2e5f01fbda062c4faf15ef3640b84651c7825ede040b8c18d6d` and `5f395b8cd7a49455145ea7754c06e5d130e38b4dbed491e6d7a6e4b787383b7d`.
 
+## Iteration 15 — Atomic Data prepare and seal
+
+This feature-gated build used one Data log entry for a bounded prepare page and seal, on top of iteration 7. One exact native test exercised legacy page and seal prefixes, exact replay after reopen, mismatched writes and result digests, private visibility, atomic rejection of an invalid root, and an old-run proposal after a fence (O07/O09/O10/O11/O15 subsets). The ordinary feature-off binary target passed compilation. A separate homogeneous RF3 diagnostic traced the compound apply for each of three measured successful writes and matched all five snapshots, including setup and warm-up.
+
+The first untraced sweep stopped when a snapshot read timed out at 1 offered update/s. The identical retry used fresh volumes, the same 2,000-row RSA workload, and the same 4 CPU and 7.90 GB caps as the iteration 7 run. The table compares the retry with the historical iteration 7 aggregates. A host reboot cleared the raw control artifacts. The experiment did not build a same-source feature-off release control.
+
+| Offered updates/s | Iteration 7 goodput / successful p99 | Atomic Data goodput / successful p99 | Atomic Data acknowledgments |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.600/s / 1,935 ms | 0.600/s / 1,934 ms | 9 / 15 |
+| 5 | 0.902/s / 3,656 ms | 0.831/s / 3,391 ms | 18 / 75 |
+| 20 | 0.995/s / 3,662 ms | 0.873/s / 4,252 ms | 18 / 300 |
+
+All 13 retry snapshots matched. Of the 390 measured offers, 45 succeeded and 345 received explicit `not_applied` parsing-capacity rejections. The driver recorded zero unresolved outcomes. Accepted-record deltas and the owner's first-dispatch count matched successes. Eight follower terminal deltas across five phases differed by one and matched changes in the sampled running counts. At the final sample all three workers showed 95 accepted and 95 terminal records, including setup and snapshot requests. These O23/O24 and B02 subsets leave all-ready acknowledgment timing and membership churn unverified. The highest tested rate showed 12.3% lower goodput and 16.1% higher successful p99. The branch excludes the experiment.
+
+The optimized binary SHA-256 was `a253c0562e9cf3860fd2ea87255c251bec5e5b09bdb071081ae920a2b32aba69`. The untraced retry result SHA-256 was `151044117551cc9fc265cd6467006cd0a96054ffbffc7864a0d7b1085154806d`.
+
 ## ScyllaDB reference
 
 The ScyllaDB 6.2.3 reference ran three nodes and the driver with a combined cap of 3.65 CPUs and 7.35 GB. Each node and the driver had the same limits as in the symmetric Nabedra runs. This topology serves prepared CQL directly. It used RF3, QUORUM and batch commit-log sync. The fixture verified the effective sync mode on every node. On Docker Desktop the Linux AIO limit prevented the third node from starting, so the run used the epoll backend. [ScyllaDB Docker Desktop workaround](https://github.com/scylladb/scylladb/issues/16806)
