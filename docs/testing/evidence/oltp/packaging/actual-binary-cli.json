@@ -1,0 +1,22 @@
+{
+  "olap": {
+    "sha256": "75dad951118cee3e16cc59da5fcc678f1449cbc022cbcbeadc3b3c8d0a6ef17a",
+    "native": "nabedra-db 0.1.1 olap",
+    "python": {
+      "cli": "0.1.0",
+      "binary": "0.1.1",
+      "config": 2,
+      "protocol": 1
+    }
+  },
+  "oltp": {
+    "sha256": "0f5db62f0edc0ad5b1a21ac7f2f1990e16a18a3adf6e1a5b723895290cc9ec26",
+    "native": "nabedra-db 0.1.1 oltp",
+    "python": {
+      "cli": "0.1.0",
+      "binary": "0.1.1",
+      "config": 2,
+      "protocol": 1
+    }
+  }
+}

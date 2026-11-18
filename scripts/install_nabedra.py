@@ -12,6 +12,13 @@ import venv
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--prefix', default='.nabedra', help='new isolated environment directory')
+    parser.add_argument('--engine', choices=('olap', 'oltp'), default='olap',
+                        help='server engine to compile (default: olap)')
+    s3 = parser.add_mutually_exclusive_group()
+    s3.add_argument('--with-s3', dest='s3', action='store_true', default=None,
+                    help='include optional AWS transport dependencies')
+    s3.add_argument('--without-s3', dest='s3', action='store_false',
+                    help='omit optional AWS transport dependencies')
     args = parser.parse_args(argv)
     if sys.version_info < (3, 11):
         parser.error('Python 3.11 or newer is required')
@@ -25,12 +32,22 @@ def main(argv=None):
         parser.error('Install the repository Rust toolchain with Cargo and rustc first')
     try:
         # Cargo resolves any repository toolchain override from the server directory.
-        subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db'],
+        use_s3 = args.s3 if args.s3 is not None else args.engine == 'olap'
+        features = args.engine
+        if use_s3:
+            features = 'oltp-backup-s3' if args.engine == 'oltp' else 'olap,s3'
+        subprocess.run(['cargo', 'build', '--locked', '--release', '--bin', 'nabedra-db',
+                        '--no-default-features', '--features', features],
                        cwd=root / 'server', check=True)
         target = Path(os.environ.get('CARGO_TARGET_DIR', str(root / 'server' / 'target')))
         if not target.is_absolute():
             target = root / 'server' / target
         binary = target / 'release' / 'nabedra-db'
+        version = subprocess.run([str(binary), '--version'], check=True,
+                                 capture_output=True, text=True).stdout
+        if args.engine not in version.split():
+            print('Installation failed: compiled binary reports a different engine.', file=sys.stderr)
+            return 1
         venv.EnvBuilder(with_pip=True).create(prefix)
         subprocess.run([str(prefix / 'bin' / 'python'), '-m', 'pip', 'install', str(root / 'orm' / 'python')], check=True)
         shutil.copy2(binary, prefix / 'bin' / 'nabedra-db')
@@ -38,7 +55,7 @@ def main(argv=None):
     except (OSError, subprocess.CalledProcessError):
         print('Installation failed. Check build tools and preceding diagnostics; remove the incomplete prefix before retrying.', file=sys.stderr)
         return 1
-    print('Installed Nabedra Database in ' + str(prefix))
+    print('Installed Nabedra Database (' + args.engine + ') in ' + str(prefix))
     return 0
 
 

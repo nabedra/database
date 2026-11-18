@@ -1,0 +1,19 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 21.43s
+     Running tests/oltp_replication.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_replication-626edd0b2379b8c1)
+
+running 1 test
+
+thread 'o06_o10_o15_three_tls_peers_replicate_fence_and_reject_stale_authority' (6463534) panicked at tests/oltp_replication.rs:564:21:
+write stream Stopped; leader state Err(StorageError(StorageError { subject: Apply(LogId { leader_id: LeaderId { term: 1, node_id: 1 }, index: 4 }), verb: Write, source: BoxedErrorSource { inner: core::io::error::Error: state storage/application failure: operation exceeds task working memory } }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test o06_o10_o15_three_tls_peers_replicate_fence_and_reject_stale_authority ... FAILED
+
+failures:
+
+failures:
+    o06_o10_o15_three_tls_peers_replicate_fence_and_reject_stale_authority
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 8.61s
+
+error: test failed, to rerun pass `--test oltp_replication`

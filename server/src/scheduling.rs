@@ -258,6 +258,7 @@ impl ResourceScheduler {
     }
     /// Coordinator metadata/encoding stages use working RAM, outside the
     /// per-partition task limit. Leave headroom for ingress and child progress.
+    #[cfg(any(feature = "olap", test))]
     pub(crate) async fn reserve_coordinator_memory(
         &self,
         request: u64,
@@ -316,6 +317,10 @@ impl ResourceScheduler {
         reservation.charged = vec![charge];
         Ok(reservation)
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "admission checks these independent resource and placement bounds together"
+    )]
     async fn reserve_kind(
         &self,
         request: u64,
@@ -346,13 +351,11 @@ impl ResourceScheduler {
             // A bounded operator may retain earlier output while requesting its next
             // input. Waiting for more memory then permits cycles between operators.
             // Reject that growth, while a fresh request may still wait and age normally.
-            if !compute {
-                if let Some(node_id) = fixed_node {
-                    // An available buffer cannot form a retained-memory cycle.
-                    // Avoid scanning every queue/body owner on the common path.
-                    if state.check_available_memory(node_id, bytes).is_err() {
-                        state.check_buffered_growth(request, node_id, bytes)?;
-                    }
+            if !compute && let Some(node_id) = fixed_node {
+                // An available buffer cannot form a retained-memory cycle.
+                // Avoid scanning every queue/body owner on the common path.
+                if state.check_available_memory(node_id, bytes).is_err() {
+                    state.check_buffered_growth(request, node_id, bytes)?;
                 }
             }
             if buffered_growth {
@@ -557,6 +560,12 @@ impl ResourceScheduler {
             .map(|(&id, n)| (id, n.threads, n.bytes + n.retained))
             .collect()
     }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn oltp_capacity(&self, id: u64) -> Option<(u64, u64, WorkerResources)> {
+        let state = self.shared.state.lock().ok()?;
+        let node = state.nodes.get(&id)?;
+        Some((node.threads, node.bytes.checked_add(node.retained)?, node.limits))
+    }
     /// Stop new reservations and wake all waiters, including storage downloads
     /// waiting only for memory. Existing owners retain their charges until drop.
     pub fn close(&self) {
@@ -729,7 +738,8 @@ impl State {
                 .filter(|(id, node)| {
                     let fit = node.enabled
                         && (!pending.compute || node.threads < node.limits.max_threads)
-                        && (!(pending.node_allocation && !pending.compute)
+                        && (!pending.node_allocation
+                            || pending.compute
                             || node.io_allocations < node.io_limit)
                         && pending.fixed_node.is_none_or(|wanted| wanted == **id)
                         && (pending.headroom > 0
@@ -845,6 +855,7 @@ pub(crate) fn with_task_limit<T>(bytes: u64, work: impl FnOnce() -> T) -> T {
     drop(reset);
     result
 }
+#[cfg(feature = "olap")]
 pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
     if TASK_LIMIT.with(|limit| limit.get().is_some_and(|limit| bytes > limit)) {
         Err(resource())
@@ -852,6 +863,7 @@ pub(crate) fn check_task_memory(bytes: u64) -> Result<(), ProtocolError> {
         Ok(())
     }
 }
+#[cfg(feature = "olap")]
 pub(crate) fn task_memory_limit() -> Option<u64> {
     TASK_LIMIT.with(std::cell::Cell::get)
 }

@@ -29,5 +29,9 @@ Run repository commands from the root unless a guide says otherwise. Shared
 acceptance scripts and test evidence cover interactions between the server and
 clients.
 
+Testing and release checks run locally through Codex or Claude Code agents with
+explicit CPU and memory budgets. Use the reusable scripts in `scripts/` and the
+contracts in `docs/testing/`. GitHub Actions are not used.
+
 Read [CONTRIBUTION.md](CONTRIBUTION.md) before opening an issue or pull request,
 and follow [AGENTS.md](AGENTS.md) when changing worker execution or recovery.

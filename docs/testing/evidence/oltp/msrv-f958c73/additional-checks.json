@@ -1,0 +1,56 @@
+[
+  {
+    "name": "default",
+    "command": [
+      "rustup",
+      "run",
+      "1.94.1",
+      "cargo",
+      "check",
+      "--locked",
+      "--manifest-path",
+      "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-msrv-f958c73-n3ggcp4o/source/server/Cargo.toml",
+      "--all-targets"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 178.58281604699732
+  },
+  {
+    "name": "olap-no-s3",
+    "command": [
+      "rustup",
+      "run",
+      "1.94.1",
+      "cargo",
+      "check",
+      "--locked",
+      "--manifest-path",
+      "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-msrv-f958c73-n3ggcp4o/source/server/Cargo.toml",
+      "--no-default-features",
+      "--features",
+      "olap",
+      "--all-targets"
+    ],
+    "exit_code": 101,
+    "elapsed_seconds": 63.04191671899753
+  },
+  {
+    "name": "oltp-with-s3",
+    "command": [
+      "rustup",
+      "run",
+      "1.94.1",
+      "cargo",
+      "check",
+      "--locked",
+      "--manifest-path",
+      "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-msrv-f958c73-n3ggcp4o/source/server/Cargo.toml",
+      "--no-default-features",
+      "--features",
+      "oltp,s3",
+      "--all-targets"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 80.74961614899803
+  }
+]

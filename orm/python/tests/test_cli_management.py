@@ -63,6 +63,35 @@ class ManagementTests(unittest.TestCase):
         del original['mode']
         validate(original)
 
+    def test_local_oltp_config_and_public_cli_composition(self):
+        auth = self.root / 'auth.json'
+        protected_write(auth, dict(admin_token='A' * 43, data_token='B' * 43,
+                                  enrollment_token='C' * 43))
+        config = dict(version=1, engine='oltp', bind='127.0.0.1:0', database='application',
+                      auth_file='auth.json', topology=dict(mode='local', data_dir='volume'))
+        protected_write(self.config, config)
+        validate(config)
+        with patch('nabedra.cli.resolve_server_binary', return_value='/binary'), \
+             patch('nabedra._cli_supervise.supervise', return_value=0) as supervise:
+            self.assertEqual(self.run_cli('serve', '--config', str(self.config),
+                                         '--threads-per-worker', '8')[0], 0)
+            actual = supervise.call_args.args[1]
+            self.assertEqual(actual['topology']['data_dir'], str(self.root / 'volume'))
+            self.assertEqual(actual['auth_file'], str(auth))
+            self.assertEqual(actual['worker']['resources']['max_threads'], 8)
+            self.assertNotIn('partition_slots', actual['worker'])
+            self.assertNotIn('storage', actual)
+        for mutate in (lambda c: c['topology'].update(mode='remote'),
+                       lambda c: c.update(bind='0.0.0.0:8000'),
+                       lambda c: c.update(storage={}),
+                       lambda c: c.update(worker={'resources': dict(max_threads=0,
+                           memory_limit_bytes=8 << 30, task_memory_limit_bytes=512 << 20,
+                           control_memory_reserve_bytes=256 << 20)})):
+            invalid = copy.deepcopy(config)
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                validate(invalid)
+
     def test_doctor_read_only_and_secret_permissions(self):
         self.init()
         before = self.config.read_bytes()
@@ -112,18 +141,22 @@ class ManagementTests(unittest.TestCase):
         binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 0.1.1")\n')
         binary.chmod(0o700)
         with patch('nabedra._binary.sys.prefix', str(self.root)), patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(resolve_server_binary(check=True), str(binary))
-            with contextlib.redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(cli.main(['--version', '--json']), 0)
-            versions = json.loads(output.getvalue())
-            self.assertEqual(versions['cli'], '0.1.0')
-            self.assertEqual(versions['binary'], '0.1.1')
+            for suffix in ('', ' olap', ' oltp'):
+                with self.subTest(engine=suffix):
+                    binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 0.1.1' + suffix + '")\n')
+                    self.assertEqual(resolve_server_binary(check=True), str(binary))
+                    with contextlib.redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(cli.main(['--version', '--json']), 0)
+                    versions = json.loads(output.getvalue())
+                    self.assertEqual(versions['cli'], '0.1.0')
+                    self.assertEqual(versions['binary'], '0.1.1')
             with patch.dict(os.environ, {'NABEDRA_SERVER_BINARY': 'absent'}):
                 with self.assertRaises(RuntimeError):
                     resolve_server_binary(check=True)
-            binary.write_text('#!' + sys.executable + '\nprint("nabedra-db 9.0.0")\n')
-            with self.assertRaises(RuntimeError):
-                resolve_server_binary(check=True)
+            for invalid in ('nabedra-db 9.0.0', 'nabedra-db 0.1.1 hybrid'):
+                binary.write_text('#!' + sys.executable + '\nprint("' + invalid + '")\n')
+                with self.assertRaises(RuntimeError):
+                    resolve_server_binary(check=True)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OLTP request paths</title>
+  <style>
+    :root { color-scheme: light dark; --path-color: var(--chart-1, var(--primary)); }
+    body { margin: 0; font-family: var(--font-sans, system-ui); color: var(--foreground); }
+    #oltp-paths { display: grid; gap: 16px; }
+    #oltp-paths fieldset { border: 0; padding: 0; margin: 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    #oltp-paths select { font: inherit; color: var(--foreground); background: var(--background); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; max-width: 100%; }
+    #oltp-paths p { margin: 0; }
+    #oltp-paths .pipeline { display: grid; gap: 6px; text-align: center; }
+    #oltp-paths .step { padding: 6px 0; }
+    #oltp-paths .arrow { color: var(--muted-foreground); }
+    #oltp-paths .small { color: var(--muted-foreground); font-size: 0.875rem; }
+    #oltp-paths .workers { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 20px; }
+    #oltp-paths .worker { display: grid; gap: 10px; align-content: start; }
+    #oltp-paths .worker h3 { font-size: 1rem; font-weight: 500; margin: 0; }
+    #oltp-paths .replica { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+    #oltp-paths .mark { width: 9px; height: 9px; flex: 0 0 9px; border-radius: 50%; background: var(--border); }
+    #oltp-paths .replica.active .mark { background: var(--path-color); }
+    #oltp-paths .replica.active .replica-label { font-weight: 500; }
+    #oltp-paths .volume { border-top: 1px solid var(--border); padding-top: 8px; }
+    #oltp-paths .queue-copy { display: flex; gap: 8px; align-items: center; }
+    #oltp-paths .queue-mark { width: 9px; height: 9px; box-sizing: border-box; border: 1px solid var(--foreground); flex: 0 0 9px; }
+    #oltp-paths .details { display: grid; gap: 10px; border-top: 1px solid var(--border); padding-top: 14px; }
+    #oltp-paths .legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+    #oltp-paths .legend span { display: flex; gap: 8px; align-items: center; }
+    #oltp-paths [hidden] { display: none; }
+    @media (max-width: 480px) {
+      #oltp-paths .workers { grid-template-columns: 1fr; gap: 18px; }
+      #oltp-paths .worker { grid-template-columns: 1fr 1fr; column-gap: 12px; }
+      #oltp-paths .worker h3, #oltp-paths .queue-copy, #oltp-paths .volume { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+<main id="oltp-paths" aria-label="Proposed three-worker OLTP request routing">
+  <fieldset aria-label="Operation">
+    <label for="oltp-operation">Operation</label>
+    <select id="oltp-operation" class="form-select">
+      <option value="point">Primary-key lookup</option>
+      <option value="query">Indexed filter across shards</option>
+      <option value="batch">Atomic batch across two shards</option>
+    </select>
+  </fieldset>
+  <section class="pipeline" aria-label="Shared admission path">
+    <p class="step">Same ORM calls → stateless API</p>
+    <p class="arrow" aria-hidden="true">↓</p>
+    <p class="step">Complete RAM request copy on every ready worker</p>
+    <p class="arrow" aria-hidden="true">↓</p>
+    <p class="step">Fenced scheduler → owning data shards</p>
+  </section>
+  <section class="workers" aria-label="Shard replicas and private volumes">
+    <article class="worker">
+      <h3>AZ A · Worker A</h3>
+      <p class="queue-copy small"><span class="queue-mark" aria-hidden="true"></span>RAM queue copy</p>
+      <p class="replica" data-leader="1"><span class="mark" aria-hidden="true"></span><span class="replica-label">Shard 1 leader</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 2 follower</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 3 follower</span></p>
+      <p class="volume small">Private EBS A · indexes + MVCC + logs</p>
+    </article>
+    <article class="worker">
+      <h3>AZ B · Worker B</h3>
+      <p class="queue-copy small"><span class="queue-mark" aria-hidden="true"></span>RAM queue copy</p>
+      <p class="replica" data-leader="2"><span class="mark" aria-hidden="true"></span><span class="replica-label">Shard 2 leader</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 1 follower</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 3 follower</span></p>
+      <p class="volume small">Private EBS B · indexes + MVCC + logs</p>
+    </article>
+    <article class="worker">
+      <h3>AZ C · Worker C</h3>
+      <p class="queue-copy small"><span class="queue-mark" aria-hidden="true"></span>RAM queue copy</p>
+      <p class="replica" data-leader="3"><span class="mark" aria-hidden="true"></span><span class="replica-label">Shard 3 leader</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 1 follower</span></p>
+      <p class="replica small"><span class="mark" aria-hidden="true"></span><span>Shard 2 follower</span></p>
+      <p class="volume small">Private EBS C · indexes + MVCC + logs</p>
+    </article>
+  </section>
+  <section class="details" aria-label="Selected execution path" aria-live="polite">
+    <p id="oltp-detail"></p>
+    <p id="oltp-authority" class="small"></p>
+    <p id="oltp-result"></p>
+  </section>
+  <div class="legend small" aria-label="Legend">
+    <span><span class="mark" style="background:var(--path-color)" aria-hidden="true"></span>Selected data execution</span>
+    <span><span class="queue-mark" aria-hidden="true"></span>Admission on all workers</span>
+  </div>
+  <p class="small">Example placement: 3 shards, 3 replicas per shard. Larger clusters distribute replicas over subsets of workers.</p>
+</main>
+<script>
+(() => {
+  const root = document.getElementById('oltp-paths');
+  const select = root.querySelector('#oltp-operation');
+  const modes = {
+    point: {
+      shards: ['1'],
+      detail: 'One data shard seeks the primary index. Hot rows can come from its block cache.',
+      authority: 'Strong read authority and the pinned snapshot still apply. No table scan or remote-volume mount.',
+      result: 'Return one row or None.'
+    },
+    query: {
+      shards: ['1', '2', '3'],
+      detail: 'Relevant leaders search their local secondary indexes at one shared snapshot.',
+      authority: 'A filter without primary-key bounds can touch every shard. Parallelism stays within the request cap.',
+      result: 'Merge ordered results, apply the global limit, then project columns.'
+    },
+    batch: {
+      shards: ['1', '2'],
+      detail: 'Two data shards prepare private changes. Each prepare reaches a durable 2-of-3 quorum.',
+      authority: 'A separate replicated transaction-status partition records one COMMIT or ABORT. Readers resolve outstanding intents.',
+      result: 'Return success only for the complete atomic batch.'
+    }
+  };
+  function show(mode) {
+    const state = modes[mode] || modes.point;
+    root.querySelectorAll('[data-leader]').forEach(node => {
+      const active = state.shards.includes(node.dataset.leader);
+      node.classList.toggle('active', active);
+      node.setAttribute('aria-label', node.textContent.trim() + (active ? ', selected for data execution' : ', not selected for data execution'));
+    });
+    root.querySelector('#oltp-detail').textContent = state.detail;
+    root.querySelector('#oltp-authority').textContent = state.authority;
+    root.querySelector('#oltp-result').textContent = state.result;
+  }
+  select.addEventListener('change', () => show(select.value));
+  show(select.value);
+})();
+</script>
+</body>
+</html>

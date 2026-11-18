@@ -1,0 +1,7 @@
+{
+  "source_json_sha256": "b8de84b041c1740c1e4288ef541def2f450069111dac0461e7ffb7e927996f86",
+  "renderer_sha256": "01adae0609722f8409511496c831e09ebdf350eb21febb92b87f19010b87a812",
+  "matplotlib": "3.11.0",
+  "python": "3.11.7 (v3.11.7:fa7a6f2303, Dec  4 2023, 15:22:56) [Clang 13.0.0 (clang-1300.0.29.30)]",
+  "created_at_utc": "2026-11-16T21:55:05.199269+00:00"
+}

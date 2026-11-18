@@ -1,0 +1,1197 @@
+{
+  "result": "passed",
+  "argv": [
+    "server/tests/oltp_process.py",
+    "--binary",
+    "/tmp/nabedra-oltp-rf1-61f458b746e4e9fc",
+    "--evidence-dir",
+    "docs/testing/evidence/oltp/quiet-rf1",
+    "--benchmark-condition",
+    "Repository Rust/C++ builds and tests were paused during this fixture; host load and process checks are recorded."
+  ],
+  "fixture_sha256": "cda5a7aa58752f204791fe187f366958a11e49c2e3d5992f6ae61a65019bbeec",
+  "build_profile": "dev, unoptimized, debug=0, incremental disabled",
+  "binary_sha256": "61f458b746e4e9fc3bd840cbb8e726a07a5b742ca3a45c38fa8e0f9257d21afe",
+  "created_at_utc": "2026-11-16T21:54:43.680873+00:00",
+  "python": "3.12.1 (main, Dec  9 2023, 08:07:48) [Clang 15.0.0 (clang-1500.0.40.1)]",
+  "binary_version": "nabedra-db 0.1.1 oltp",
+  "platform": "macOS-26.7.3-x86_64-i386-64bit",
+  "logical_cpus": 8,
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)",
+  "source_tree_sha256": "f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff",
+  "git_commit": "964ac691dcbd20bc37903b7ed5ee931d5a5cb241",
+  "working_diff_sha256": "f1e360a692c7016853cd9df39c3af631fe9631b27aa2c590b615e4b479c8581c",
+  "cpu_quota": "no CPU quota configured or measured by this fixture",
+  "storage": "host temporary filesystem directory; no EBS/provider assertion",
+  "clock": "perf_counter_ns monotonic client clock",
+  "features": [
+    "oltp"
+  ],
+  "config": {
+    "workers": 2,
+    "foreground_threads": 1,
+    "storage_background_threads": 1,
+    "network_threads": 2,
+    "queue_size": 8,
+    "max_pending_requests": 9,
+    "memory_limit_bytes": 8589934592,
+    "task_memory_limit_bytes": 536870912,
+    "result_retention_ms": 300000,
+    "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit",
+    "topology": "standalone_rf1",
+    "S3_credentials": "absent"
+  },
+  "benchmark": {
+    "started_at_utc": "2026-11-16T21:54:41.493319+00:00",
+    "ended_at_utc": "2026-11-16T21:54:42.484853+00:00",
+    "initial_host_load_1_5_15": [
+      2.54833984375,
+      2.626953125,
+      2.75830078125
+    ],
+    "final_host_load_1_5_15": [
+      2.42431640625,
+      2.599609375,
+      2.74755859375
+    ],
+    "initial_build_process_names": [],
+    "final_build_process_names": [],
+    "host_conditions": "Repository Rust/C++ builds and tests were paused during this fixture; host load and process checks are recorded.",
+    "seed": 91347,
+    "warmup_requests": 30,
+    "repetitions": [
+      {
+        "repetition": 1,
+        "samples": [
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.746483
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.227363
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.677737
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.747297
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.1998
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.45859
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.810576
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.288589
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.181993
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.294799
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.122381
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.996134
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.705026
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.375137
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.346949
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.297179
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.849414
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.47191
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.039459
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.346491
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.889702
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.379017
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.840809
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.097035
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.653324
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.67085
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.581742
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.030669
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.77722
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.144371
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.421559
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.770601
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.212312
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.264489
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.889068
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.627575
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.39335
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.818999
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.391802
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.381743
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.314654
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.461903
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.67617
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.761281
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.581419
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.293581
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.638206
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.139438
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.298979
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.466637
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.386989
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.266006
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.273155
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.01881
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.750274
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.350285
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.413923
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.902491
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.459234
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.33888
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.239664
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.346429
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.471082
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.495999
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.30557
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.329271
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.632061
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.007738
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.250767
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.980036
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.271625
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.795674
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.120668
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.84325
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.460504
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.840977
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.978054
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.767619
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.934684
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.668893
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.300927
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.069899
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.70839
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.497606
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.300783
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.294725
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.294264
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.939336
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.721146
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.676399
+          }
+        ]
+      },
+      {
+        "repetition": 2,
+        "samples": [
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.437132
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.479932
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.295776
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 2.979271
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.584703
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.009126
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.419692
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.041856
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.442247
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.215615
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.368325
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.553596
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.752735
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 4.358529
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.428346
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.810409
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.706545
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.609567
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.475651
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.647916
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.96015
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.788199
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.539159
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.154915
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.686746
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.960218
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.533925
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.051076
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.519756
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.915408
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.90183
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.771404
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.088262
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.431181
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 5.400257
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.12416
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.631249
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.59576
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.952926
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.808091
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.005819
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.988809
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.500525
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.963113
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.626871
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.26202
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.774119
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.850848
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.95779
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.830159
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.745408
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.613818
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.834638
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 5.40601
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 4.262581
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.636224
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.684919
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.907009
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.293366
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.816473
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 5.070476
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 4.663975
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.95141
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.18814
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.519058
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.610225
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 4.098631
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.726694
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.027424
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.91024
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.069425
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.82117
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.038869
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.632955
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.296172
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 5.018901
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.494753
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.554025
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.031834
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.567931
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.970188
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.369058
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.084372
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.783957
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.303562
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.037065
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.798335
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.98528
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.987072
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.685076
+          }
+        ]
+      },
+      {
+        "repetition": 3,
+        "samples": [
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.293563
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.547601
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.237302
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.792446
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.854084
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.698243
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.760815
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.705385
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 4.502884
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.830259
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.648921
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.711297
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.124048
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.78859
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.164826
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.553429
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.934832
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.818762
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.350691
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.013734
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.348305
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.950749
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.831863
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.739622
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.809525
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.308654
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.90665
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.638819
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.228586
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.763775
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.59765
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.122914
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.342148
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.925191
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.088659
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.395802
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.160535
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.93434
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.525297
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.898512
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.504286
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.89161
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.96821
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.90442
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.378989
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.500677
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.345847
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.205888
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.80828
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.061414
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.458514
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.808874
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.408717
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.002954
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 4.782512
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.359408
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 2.993472
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.052201
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.129002
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.990069
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.894142
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.371308
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.287721
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.122815
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.330644
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.058118
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.206417
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.122896
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.338712
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.127218
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.090645
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.316122
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.212996
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.905647
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.75739
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.44926
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.569896
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.618648
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.671103
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.34508
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.021479
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.712676
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.986969
+          },
+          {
+            "kind": "point_hit",
+            "latency_ms": 3.358132
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.555514
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.350839
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.294526
+          },
+          {
+            "kind": "bounded_count",
+            "latency_ms": 3.494288
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 3.156406
+          },
+          {
+            "kind": "point_miss",
+            "latency_ms": 2.98635
+          }
+        ]
+      }
+    ],
+    "summary": {
+      "point_hit": {
+        "samples": 103,
+        "p50_ms": 2.90665,
+        "p95_ms": 3.567931,
+        "p99_ms": 4.358529
+      },
+      "point_miss": {
+        "samples": 88,
+        "p50_ms": 2.760815,
+        "p95_ms": 3.555514,
+        "p99_ms": 3.705385
+      },
+      "bounded_count": {
+        "samples": 79,
+        "p50_ms": 3.345847,
+        "p95_ms": 4.782512,
+        "p99_ms": 5.400257
+      }
+    },
+    "percentile_method": "lower order statistic at floor((n-1)*p/100)",
+    "arrival": "one sequential ORM call at a time, no retries",
+    "query_table_rows": 3,
+    "dataset": "3-row query table; separate 110001-row validation table dropped before warm-up",
+    "scope": "sequential loopback latency sample after warm-up; cache-hit rates not measured; not B01/B02, throughput scaling, cold-read or PostgreSQL evidence"
+  },
+  "accepted_identity_assertions": {
+    "durable_mutations": 1,
+    "query_receipts": 1,
+    "TLS_verified": true,
+    "database_scope_rebind_rejected": true,
+    "resources_override_257_rejected_before_storage_or_readiness": true,
+    "ORM_growth_count_before_and_after_SIGKILL": 110001,
+    "ORM_count_with_limit_above_100000": 100001,
+    "duplicate_logical_mutations": 0,
+    "missing_acknowledged_mutations_after_SIGKILL": 0
+  }
+}

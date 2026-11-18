@@ -132,8 +132,10 @@ class ClientAPITests(unittest.TestCase):
         self.assertEqual(query.limit(0).collect(), [])
         self.reply(0)
         self.assertEqual(query.limit(0).count(), 0)
-        self.reply(100000)
-        self.assertEqual(table.query().limit(10**100).count(), 100000)
+        self.reply(100001)
+        self.assertEqual(table.query().limit(10**100).count(), 100001)
+        self.reply(2**63)
+        self.assertEqual(table.query().count(), 2**63)
         self.reply([{'age': 1}] * 10000)
         self.assertEqual(len(table.query().select('age').collect()), 10000)
 
@@ -157,9 +159,6 @@ class ClientAPITests(unittest.TestCase):
             self.reply(result)
             with self.subTest(result=result), self.assertRaises(errors.ProtocolError):
                 query.count()
-        self.reply(100001)
-        with self.assertRaises(errors.ProtocolError):
-            table.query().count()
         for result in [None, [], {'text': 'plan'}, 1]:
             self.reply(result)
             with self.assertRaises(errors.ProtocolError):

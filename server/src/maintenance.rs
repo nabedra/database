@@ -1,7 +1,9 @@
 //! Explicit maintenance commands, separate from process enrollment and startup.
+#[cfg(feature = "s3")]
+use crate::storage::CatalogFence;
 use crate::{
     cluster::startup_material::composition::prepare_api,
-    storage::{CatalogFence, Namespace, ObjectKey, Storage},
+    storage::{Namespace, ObjectKey, Storage},
 };
 use std::{
     path::Path,

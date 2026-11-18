@@ -1,0 +1,8 @@
+{
+  "baseline": "prior /tmp/nabedra-audit-check-clippy.log",
+  "comparison": "first default Clippy run before shared OLTP cleanup",
+  "baseline_emitted_diagnostics": 29,
+  "current_emitted_diagnostics": 29,
+  "added": [],
+  "removed": []
+}

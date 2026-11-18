@@ -17,7 +17,11 @@ fn installed_command_identity_and_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap().trim(),
-        concat!("nabedra-db ", env!("CARGO_PKG_VERSION"))
+        format!(
+            "nabedra-db {} {}",
+            env!("CARGO_PKG_VERSION"),
+            nabedra_database_server::ENGINE
+        )
     );
     assert!(output.stderr.is_empty());
     let output = binary(&["--help"], false);

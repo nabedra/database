@@ -1,0 +1,17 @@
+{
+  "command": [
+    "rustup",
+    "run",
+    "1.94.1",
+    "cargo",
+    "fmt",
+    "--manifest-path",
+    "/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-linux-cb38250-kkt8vzqn/source/server/Cargo.toml",
+    "--all",
+    "--",
+    "--check"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 5.266246316998149,
+  "scope": "Immutable cb38250 on macOS, minimum-toolchain formatting only"
+}

@@ -1,0 +1,2 @@
+Command: /opt/local/bin/python3.12 server/tests/oltp_process.py --binary /tmp/nabedra-oltp-rf1-61f458b746e4e9fc --evidence-dir docs/testing/evidence/oltp/quiet-rf1 --benchmark-condition 'Repository Rust/C++ builds and tests were paused during this fixture; host load and process checks are recorded.'
+{"result": "passed", "engine": "oltp", "topology": "standalone_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": true, "ORM_growth_rows": 110001, "elapsed_seconds": 20.291}

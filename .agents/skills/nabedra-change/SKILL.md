@@ -19,6 +19,8 @@ When you are given a big task or big functionality to implement, come up with a 
 
 Each subtask should be then handled to a subagent, the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. And each subtask should be worked on in parallel by these agents. You should dedicate exclusively to orchestrate and handle these agents; never do the heavy-lifting of coding yourself
 
+For big tasks, delegate test harnesses, acceptance runners, and integration implementation to subagents as well. The lead agent must only orchestrate, track the TODO table, coordinate interfaces, and assess results.
+
 # For logic implementations
 You should expect to receive the input and/or output and/or examples of how the module should look. E.g., an interface and example usage:
 ```python

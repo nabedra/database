@@ -10,7 +10,9 @@ pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 pub const MAX_BATCH_ROWS: usize = 10_000;
 pub const MAX_RESULT_ROWS: usize = 10_000;
+#[cfg(feature = "olap")]
 pub const MAX_TABLE_ROWS: usize = 100_000;
+#[cfg(feature = "olap")]
 pub const MAX_DECODED_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SCHEMA_COLUMNS: usize = 128;
 /// Root predicate has depth one, including comparison leaves.
@@ -27,6 +29,8 @@ pub enum ErrorCode {
     LimitExceeded,
     Overloaded,
     StorageUnavailable,
+    #[doc(hidden)]
+    SplitPublicationPending,
     OutcomeUnknown,
     InternalError,
 }
@@ -39,7 +43,7 @@ impl ErrorCode {
             Self::Conflict => 409,
             Self::LimitExceeded => 413,
             Self::Overloaded => 429,
-            Self::StorageUnavailable | Self::OutcomeUnknown => 503,
+            Self::StorageUnavailable | Self::SplitPublicationPending | Self::OutcomeUnknown => 503,
             Self::InternalError => 500,
         }
     }
@@ -544,8 +548,8 @@ fn required_nullable_limit<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64
             "limit must be null or a nonnegative integer",
         ));
     }
-    // Tables contain at most MAX_TABLE_ROWS, so overflow cannot affect which
-    // rows collect/count return. Keep the engine's Option<u64> contract.
+    // The execution/count representation is u64. A larger requested limit
+    // includes every representable result, without imposing a table-size cap.
     Ok(Some(text.bytes().fold(0_u64, |n, b| {
         n.saturating_mul(10).saturating_add(u64::from(b - b'0'))
     })))
@@ -769,4 +773,53 @@ impl Predicate {
             Self::Logical(LogicalPredicate::Not { arg }) => arg.validate_at(schema, depth + 1),
         }
     }
+}
+
+/// Lexical limits before typed JSON decoding, including opaque RawValue fields.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum JsonBoundsError {
+    LimitExceeded,
+    InvalidRecord,
+}
+pub(crate) fn json_input(bytes: &[u8], cap: usize) -> Result<(), JsonBoundsError> {
+    json_input_at_depth(bytes, cap, 32)
+}
+/// Logical predicate nodes may contain both an object and an args array.
+/// Preserve the public depth-32 predicate contract without relaxing internal
+/// storage/control JSON. This remains below serde_json's depth-128 stack guard.
+#[cfg(feature = "oltp")]
+pub(crate) fn request_json_input(bytes: &[u8]) -> Result<(), JsonBoundsError> {
+    json_input_at_depth(bytes, MAX_BODY_BYTES, (2 * MAX_PREDICATE_DEPTH + 8) as u32)
+}
+fn json_input_at_depth(bytes: &[u8], cap: usize, max_depth: u32) -> Result<(), JsonBoundsError> {
+    if bytes.len() > cap {
+        return Err(JsonBoundsError::LimitExceeded);
+    }
+    let (mut depth, mut string, mut escape) = (0u32, false, false);
+    for b in bytes {
+        if string {
+            if escape {
+                escape = false;
+            } else if *b == b'\\' {
+                escape = true;
+            } else if *b == b'"' {
+                string = false;
+            }
+        } else {
+            match b {
+                b'"' => string = true,
+                b'{' | b'[' => {
+                    depth += 1;
+                    if depth > max_depth {
+                        return Err(JsonBoundsError::InvalidRecord);
+                    }
+                }
+                b'}' | b']' => {
+                    depth = depth.checked_sub(1).ok_or(JsonBoundsError::InvalidRecord)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }

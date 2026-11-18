@@ -1,0 +1,29 @@
+{
+  "base_commit": "f958c737d8c1010db7b5dfeda9977f4bce3e2ed5",
+  "source_tree_sha256_before": "1e8acef80ae5f69fb742ecd808145f9348a5ecfeb396a0b68ba27059e5a98e9e",
+  "source_tree_sha256_after": "1e8acef80ae5f69fb742ecd808145f9348a5ecfeb396a0b68ba27059e5a98e9e",
+  "source_unchanged": true,
+  "tested_mod_sha256": "bfed34b8b1ec66859f94b34177dc1c0770da7c8521029bd243a9af37506f4212",
+  "command": [
+    "cargo",
+    "test",
+    "--locked",
+    "--manifest-path",
+    "server/Cargo.toml",
+    "--no-default-features",
+    "--features",
+    "oltp",
+    "--lib"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 45.85440571700747,
+  "environment": {
+    "CARGO_TARGET_DIR": "/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "TOKIO_WORKER_THREADS": "2",
+    "RUST_TEST_THREADS": "1"
+  }
+}

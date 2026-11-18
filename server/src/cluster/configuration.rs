@@ -408,39 +408,12 @@ impl Timing {
 // A lexical depth check before serde allocation also covers RawValue's otherwise
 // opaque options. Strings/escapes are skipped; serde checks JSON syntax next.
 pub(crate) fn input(bytes: &[u8], cap: usize) -> Result<(), ConfigurationError> {
-    if bytes.len() > cap {
-        return Err(ConfigurationError::LimitExceeded);
-    }
-    let (mut depth, mut string, mut escape) = (0u32, false, false);
-    for b in bytes {
-        if string {
-            if escape {
-                escape = false;
-            } else if *b == b'\\' {
-                escape = true;
-            } else if *b == b'"' {
-                string = false;
-            }
-        } else {
-            match b {
-                b'"' => string = true,
-                b'{' | b'[' => {
-                    depth += 1;
-                    if depth > 32 {
-                        return Err(ConfigurationError::InvalidRecord);
-                    }
-                }
-                b'}' | b']' => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or(ConfigurationError::InvalidRecord)?;
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
+    crate::protocol::json_input(bytes, cap).map_err(|error| match error {
+        crate::protocol::JsonBoundsError::LimitExceeded => ConfigurationError::LimitExceeded,
+        crate::protocol::JsonBoundsError::InvalidRecord => ConfigurationError::InvalidRecord,
+    })
 }
+
 pub(crate) fn bounded(value: &impl Serialize, cap: usize) -> Result<Vec<u8>, ConfigurationError> {
     struct Writer {
         bytes: Vec<u8>,

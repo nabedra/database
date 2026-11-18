@@ -1,0 +1,45 @@
+{
+  "dockerfile_sha256": "273e59963392d20308b27332410d07d1c3ef3684d48f69f88e23ca11df28ea84",
+  "results": [
+    {
+      "binary": "/tmp/nabedra-olap-75dad951118cee3e",
+      "binary_sha256": "75dad951118cee3e16cc59da5fcc678f1449cbc022cbcbeadc3b3c8d0a6ef17a",
+      "version": "nabedra-db 0.1.1 olap",
+      "target": "olap",
+      "command": "nabedra-db --version | grep -w olap || { echo 'The olap target requires --build-arg NABEDRA_ENGINE=olap' >&2; exit 2; }",
+      "exit_code": 0,
+      "stdout": "nabedra-db 0.1.1 olap\n",
+      "stderr": ""
+    },
+    {
+      "binary": "/tmp/nabedra-olap-75dad951118cee3e",
+      "binary_sha256": "75dad951118cee3e16cc59da5fcc678f1449cbc022cbcbeadc3b3c8d0a6ef17a",
+      "version": "nabedra-db 0.1.1 olap",
+      "target": "oltp",
+      "command": "nabedra-db --version | grep -w oltp || { echo 'The oltp target requires --build-arg NABEDRA_ENGINE=oltp' >&2; exit 2; }",
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "The oltp target requires --build-arg NABEDRA_ENGINE=oltp\n"
+    },
+    {
+      "binary": "/tmp/nabedra-oltp-rf1-546a02fed39b10e0",
+      "binary_sha256": "546a02fed39b10e0ecb647e4a12cf0214bd755f8bc964da27636b13d01d38cbe",
+      "version": "nabedra-db 0.1.1 oltp",
+      "target": "olap",
+      "command": "nabedra-db --version | grep -w olap || { echo 'The olap target requires --build-arg NABEDRA_ENGINE=olap' >&2; exit 2; }",
+      "exit_code": 2,
+      "stdout": "",
+      "stderr": "The olap target requires --build-arg NABEDRA_ENGINE=olap\n"
+    },
+    {
+      "binary": "/tmp/nabedra-oltp-rf1-546a02fed39b10e0",
+      "binary_sha256": "546a02fed39b10e0ecb647e4a12cf0214bd755f8bc964da27636b13d01d38cbe",
+      "version": "nabedra-db 0.1.1 oltp",
+      "target": "oltp",
+      "command": "nabedra-db --version | grep -w oltp || { echo 'The oltp target requires --build-arg NABEDRA_ENGINE=oltp' >&2; exit 2; }",
+      "exit_code": 0,
+      "stdout": "nabedra-db 0.1.1 oltp\n",
+      "stderr": ""
+    }
+  ]
+}

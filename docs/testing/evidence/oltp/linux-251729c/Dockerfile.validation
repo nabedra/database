@@ -1,0 +1,5 @@
+FROM rust:1.94.1-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev python3 python3-venv openssl procps && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/nabedra-check-env && /opt/nabedra-check-env/bin/pip install --no-cache-dir httpx==0.28.1
+ENV PATH="/opt/nabedra-check-env/bin:${PATH}"
+WORKDIR /source

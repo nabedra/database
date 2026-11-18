@@ -1,0 +1,429 @@
+    Checking nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+error: large size difference between variants
+  --> src/cluster/heartbeat.rs:73:1
+   |
+73 | / pub(crate) enum HeartbeatWriteResult {
+74 | |     Acknowledged(AcknowledgedHeartbeat),
+   | |     ----------------------------------- the largest variant contains at least 248 bytes
+75 | |     ObservedExact,
+   | |     ------------- the second-largest variant carries no data at all
+76 | |     Conflict,
+77 | |     Unknown,
+78 | |     Exhausted,
+79 | | }
+   | |_^ the entire enum is at least 248 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+   = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+74 -     Acknowledged(AcknowledgedHeartbeat),
+74 +     Acknowledged(Box<AcknowledgedHeartbeat>),
+   |
+
+error: unnecessary closure used with `bool::then`
+   --> src/cluster/provider_runtime.rs:279:31
+    |
+279 |               let interrupted = (intent.state == IntentState::InProgress)
+    |  _______________________________^
+280 | |                 .then(|| intent.delivery.as_ref())
+    | |__________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_lazy_evaluations
+    = note: `-D clippy::unnecessary-lazy-evaluations` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_lazy_evaluations)]`
+help: use `then_some` instead
+    |
+280 -                 .then(|| intent.delivery.as_ref())
+280 +                 .then_some(intent.delivery.as_ref())
+    |
+
+error: this `if` statement can be collapsed
+   --> src/cluster/provider_runtime.rs:419:9
+    |
+419 | /         if root.policy.mode == PolicyMode::Autoscale {
+420 | |             if let Ok(Reply::Stats {
+421 | |                 pending,
+422 | |                 running,
+...   |
+447 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+    = note: `-D clippy::collapsible-if` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+419 ~         if root.policy.mode == PolicyMode::Autoscale
+420 ~             && let Ok(Reply::Stats {
+421 |                 pending,
+...
+445 |                 }
+446 ~             }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/cluster/provider_runtime.rs:420:13
+    |
+420 | /             if let Ok(Reply::Stats {
+421 | |                 pending,
+422 | |                 running,
+423 | |                 oldest_wait_ms,
+...   |
+446 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+425 ~             }) = self.queue_call(Command::Stats).await
+426 ~                 && let Some(candidate) = provision::demand_candidate(
+427 |                     root,
+...
+443 |                     return Ok(());
+444 ~                 }
+    |
+
+error: this `if` statement can be collapsed
+    --> src/cluster/provider_runtime.rs:1142:13
+     |
+1142 | /             if loaded.root().provisioning == Provisioning::Managed {
+1143 | |                 if let Some(desired) = requested_capacity(&request)? {
+1144 | |                     crate::node::queue_runtime::validate_coordination_capacity(
+1145 | |                         loaded.root(),
+...    |
+1150 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1142 ~             if loaded.root().provisioning == Provisioning::Managed
+1143 ~                 && let Some(desired) = requested_capacity(&request)? {
+1144 |                     crate::node::queue_runtime::validate_coordination_capacity(
+ ...
+1148 |                     )?;
+1149 ~                 }
+     |
+
+error: this `if` statement can be collapsed
+    --> src/cluster/runtime.rs:1185:9
+     |
+1185 | /         if !cold_start && !initialization_new {
+1186 | |             if let (Ok(control), Ok(catalog), Ok(now)) = (
+1187 | |                 api.load().await,
+1188 | |                 api.storage.load_cluster_catalog().await,
+...    |
+1201 | |         }
+     | |_________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1185 ~         if !cold_start && !initialization_new
+1186 ~             && let (Ok(control), Ok(catalog), Ok(now)) = (
+1187 |                 api.load().await,
+ ...
+1199 |                 }
+1200 ~             }
+     |
+
+error: this `if` statement can be collapsed
+    --> src/cluster/runtime.rs:1186:13
+     |
+1186 | /             if let (Ok(control), Ok(catalog), Ok(now)) = (
+1187 | |                 api.load().await,
+1188 | |                 api.storage.load_cluster_catalog().await,
+1189 | |                 sample(),
+...    |
+1200 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1190 ~             )
+1191 ~                 && follower_ready(
+1192 |                     &control.root().controller,
+ ...
+1198 |                     break;
+1199 ~                 }
+     |
+
+error: this `if` statement can be collapsed
+   --> src/node/coordinator.rs:162:9
+    |
+162 | /         if let Ok(catalog) = self.data.storage().load_cluster_catalog().await {
+163 | |             if catalog
+164 | |                 .catalog()
+165 | |                 .fence
+...   |
+170 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+162 ~         if let Ok(catalog) = self.data.storage().load_cluster_catalog().await
+163 ~             && catalog
+164 |                 .catalog()
+...
+168 |                 return settlement::Evidence::Fenced;
+169 ~             }
+    |
+
+error: this `if` statement can be collapsed
+   --> src/node/coordinator.rs:171:9
+    |
+171 | /         if let Ok(root) = self.worker.root().await {
+172 | |             if root
+173 | |                 .nodes
+174 | |                 .iter()
+...   |
+187 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+171 ~         if let Ok(root) = self.worker.root().await
+172 ~             && root
+173 |                 .nodes
+...
+185 |                 return settlement::Evidence::Fenced;
+186 ~             }
+    |
+
+error: this function has too many arguments (8/7)
+   --> src/node/coordinator.rs:392:1
+    |
+392 | / pub(super) async fn execute(
+393 | |     worker: &Worker,
+394 | |     key: crate::request_queue::RequestKey,
+395 | |     data: super::runtime::DataGrant,
+...   |
+400 | |     lease: &mut PayloadLease,
+401 | | ) -> Result<EncodedResponse> {
+    | |____________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: the function `execute_inner` doesn't need a mutable reference
+   --> src/node/coordinator.rs:428:32
+    |
+428 |     let result = execute_inner(&mut peers, request, bytes, lease).await;
+    |                                ^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#unnecessary_mut_passed
+    = note: `-D clippy::unnecessary-mut-passed` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_mut_passed)]`
+help: remove this `mut`
+    |
+428 -     let result = execute_inner(&mut peers, request, bytes, lease).await;
+428 +     let result = execute_inner(&peers, request, bytes, lease).await;
+    |
+
+error: this `if` statement can be collapsed
+   --> src/node/coordinator.rs:879:17
+    |
+879 | /                 if let Err(error) = processed.and(disposed) {
+880 | |                     if failure.is_none() {
+881 | |                         failure = Some(error);
+882 | |                     }
+883 | |                 }
+    | |_________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+879 ~                 if let Err(error) = processed.and(disposed)
+880 ~                     && failure.is_none() {
+881 |                         failure = Some(error);
+882 ~                     }
+    |
+
+error: this `if` statement can be collapsed
+    --> src/node/coordinator.rs:1047:17
+     |
+1047 | /                 if let Err(error) = processed.and(disposed) {
+1048 | |                     if failure.is_none() {
+1049 | |                         failure = Some(error);
+1050 | |                     }
+1051 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1047 ~                 if let Err(error) = processed.and(disposed)
+1048 ~                     && failure.is_none() {
+1049 |                         failure = Some(error);
+1050 ~                     }
+     |
+
+error: large size difference between variants
+   --> src/node/runtime.rs:88:1
+    |
+ 88 | /   enum RetainedOwner {
+ 89 | | /     Operation {
+ 90 | | |         _account: PayloadLease,
+ 91 | | |         _stream: PayloadLease,
+ 92 | | |     },
+    | | |_____- the second-largest variant contains at least 80 bytes
+...   |
+ 96 | | /     Drain {
+ 97 | | |         _owner: super::payload_owner::ControlLease,
+ 98 | | |         _proof: admission::DrainObservation,
+ 99 | | |     },
+    | | |_____- the largest variant contains at least 752 bytes
+100 | |   }
+    | |___^ the entire enum is at least 752 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+ 98 -         _proof: admission::DrainObservation,
+ 98 +         _proof: Box<admission::DrainObservation>,
+    |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> src/node/runtime.rs:132:48
+    |
+132 |             .open_accounted(context, now, Some(&self.cpu.scheduler()))
+    |                                                ^^^^^^^^^^^^^^^^^^^^^ help: change this to: `self.cpu.scheduler()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+    = note: `-D clippy::needless-borrow` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_borrow)]`
+
+error: large size difference between variants
+   --> src/node/queue_runtime.rs:176:1
+    |
+176 | /   pub(crate) enum Reply {
+177 | | /     Record {
+178 | | |         record: RequestRecord,
+179 | | |     },
+    | | |_____- the largest variant contains at least 384 bytes
+180 | | /     Receipt {
+181 | | |         receipt: Receipt,
+182 | | |     },
+    | | |_____- the second-largest variant contains at least 104 bytes
+...   |
+199 | |       },
+200 | |   }
+    | |___^ the entire enum is at least 384 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+178 -         record: RequestRecord,
+178 +         record: Box<RequestRecord>,
+    |
+
+error: this `if` statement can be collapsed
+    --> src/node/queue_runtime.rs:1393:17
+     |
+1393 | /                 if !record.state.terminal() {
+1394 | |                     if let Some(grant) = fresh_grant {
+1395 | |                         let existing = self
+1396 | |                             .queue
+...    |
+1416 | |                 }
+     | |_________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+help: collapse nested if block
+     |
+1393 ~                 if !record.state.terminal()
+1394 ~                     && let Some(grant) = fresh_grant {
+1395 |                         let existing = self
+ ...
+1414 |                         }
+1415 ~                     }
+     |
+
+error: this OR pattern can be rewritten using a range
+   --> src/node/queue_transport.rs:286:13
+    |
+286 |             502 | 503 | 504 => ErrorCode::StorageUnavailable,
+    |             ^^^^^^^^^^^^^^^ help: try: `502..=504`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_patterns
+    = note: `-D clippy::manual-range-patterns` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_range_patterns)]`
+
+error: this function has too many arguments (9/7)
+  --> src/runtime.rs:79:1
+   |
+79 | / pub async fn serve_configured<B: ObjectStore + 'static>(
+80 | |     listener: TcpListener,
+81 | |     engine: Engine<B>,
+82 | |     executor: Executor,
+...  |
+88 | |     migrate_catalog: bool,
+89 | | ) -> io::Result<()> {
+   | |___________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#too_many_arguments
+
+error: large size difference between variants
+  --> src/storage/backend.rs:4:1
+   |
+ 4 | / pub enum RuntimeStore {
+ 5 | |     Http(HttpStore),
+   | |     --------------- the largest variant contains at least 424 bytes
+ 6 | |     #[cfg(test)]
+ 7 | |     Fixture {
+...  |
+12 | |     S3(super::S3Store),
+   | |     ------------------ the second-largest variant contains at least 80 bytes
+13 | | }
+   | |_^ the entire enum is at least 424 bytes
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_enum_variant
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+   |
+ 5 -     Http(HttpStore),
+ 5 +     Http(Box<HttpStore>),
+   |
+
+error: this OR pattern can be rewritten using a range
+  --> src/storage/decision.rs:63:14
+   |
+63 |             (3 | 4 | 5, _) => return Err(StorageError::InvalidCatalog),
+   |              ^^^^^^^^^ help: try: `3..=5`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_patterns
+
+error: this OR pattern can be rewritten using a range
+  --> src/storage/decision.rs:95:43
+   |
+95 |         if !matches!(wire.format_version, 3 | 4 | 5) {
+   |                                           ^^^^^^^^^ help: try: `3..=5`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_patterns
+
+error: this OR pattern can be rewritten using a range
+   --> src/storage/history.rs:107:41
+    |
+107 |     if matches!(version.format_version, 3 | 4 | 5) {
+    |                                         ^^^^^^^^^ help: try: `3..=5`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_range_patterns
+
+error: could not compile `nabedra-database` (lib) due to 23 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: very complex type used. Consider factoring parts into `type` definitions
+   --> src/cluster/receipt_observation.rs:146:23
+    |
+146 |         observations: Mutex<Vec<(Uuid, Uuid, Option<RequestContext>, Instant)>>,
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#type_complexity
+    = note: `-D clippy::type-complexity` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::type_complexity)]`
+
+error: could not compile `nabedra-database` (lib test) due to 23 previous errors

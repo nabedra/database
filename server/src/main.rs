@@ -1,8 +1,8 @@
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use nabedra_database_server::cli::{Cli, Command};
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use nabedra_database_server::{
     config::Config,
     engine::Engine,
@@ -11,18 +11,21 @@ use nabedra_database_server::{
     storage::{S3Store, Storage},
     worker_pool::WorkerPool,
 };
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 use std::net::SocketAddr;
 use std::{io, process::ExitCode};
 use tracing_subscriber::{filter::Targets, prelude::*};
 
 fn main() -> ExitCode {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    #[cfg(feature = "oltp")]
+    let runtime = nabedra_database_server::oltp_runtime::standalone_network_runtime();
+    #[cfg(feature = "olap")]
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(4)
         .enable_all()
-        .build()
-    {
+        .build();
+    let runtime = match runtime {
         Ok(runtime) => runtime,
         Err(_) => {
             eprintln!("nabedra-db: network runtime initialization failed");
@@ -34,6 +37,11 @@ fn main() -> ExitCode {
 
 async fn run_cli() -> ExitCode {
     let command = Cli::parse().command;
+    let rpc_trace = if std::env::var("NABEDRA_OLTP_RPC_TRACE").as_deref() == Ok("1") {
+        tracing::level_filters::LevelFilter::DEBUG
+    } else {
+        tracing::level_filters::LevelFilter::OFF
+    };
     if tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -41,7 +49,22 @@ async fn run_cli() -> ExitCode {
                 .with_ansi(false)
                 .with_filter(
                     Targets::new()
-                        .with_target("nabedra_database_server::api", tracing::Level::INFO),
+                        .with_target("nabedra_database_server::api", tracing::Level::INFO)
+                        .with_target(
+                            "nabedra_database_server::oltp_replication::hosted",
+                            tracing::Level::WARN,
+                        )
+                        .with_target(
+                            "nabedra_database_server::oltp_replication::typed_log",
+                            tracing::Level::WARN,
+                        )
+                        .with_target(
+                            "nabedra_database_server::oltp_replication::service_rpc",
+                            rpc_trace,
+                        )
+                        .with_target("nabedra_database_server::oltp_runtime", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::manager::data_factory", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace),
                 ),
         )
         .try_init()
@@ -51,9 +74,13 @@ async fn run_cli() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let result = match command {
+        #[cfg(feature = "oltp")]
+        Command::GrowthPlan => nabedra_database_server::oltp_deployment::live::run_planner(),
+        #[cfg(feature = "olap")]
         Command::Doctor { config, json } => {
             nabedra_database_server::maintenance::doctor(&config, json).await
         }
+        #[cfg(feature = "olap")]
         Command::Database {
             command:
                 nabedra_database_server::cli::DatabaseCommand::Migrate {
@@ -71,7 +98,115 @@ async fn run_cli() -> ExitCode {
             )
             .await
         }
+        #[cfg(feature = "olap")]
+        Command::Database {
+            command:
+                nabedra_database_server::cli::DatabaseCommand::Export {
+                    config,
+                    output,
+                    confirm_writers_stopped,
+                },
+        } => {
+            match nabedra_database_server::olap_export::run_configured(
+                &config,
+                &output,
+                confirm_writers_stopped,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&summary).expect("archive summary")
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    eprintln!(
+                        "nabedra-db: export failed: {:?}: {}",
+                        error.code, error.message
+                    );
+                    Err("OLAP export failed")
+                }
+            }
+        }
+        #[cfg(feature = "oltp")]
+        Command::Database {
+            command: nabedra_database_server::cli::DatabaseCommand::Import(options),
+        } => nabedra_database_server::oltp_runtime::archive_cli::import(options, false).await,
+        #[cfg(feature = "oltp")]
+        Command::Database {
+            command: nabedra_database_server::cli::DatabaseCommand::Restore(options),
+        } => nabedra_database_server::oltp_runtime::archive_cli::import(options, true).await,
+        #[cfg(feature = "oltp")]
+        Command::Database {
+            command:
+                nabedra_database_server::cli::DatabaseCommand::Backup {
+                    previous,
+                    data_dir,
+                    output,
+                    database,
+                    workers,
+                    resources_config,
+                    execution_config,
+                    cold_start,
+                },
+        } => {
+            nabedra_database_server::oltp_runtime::archive_cli::backup(
+                nabedra_database_server::oltp_runtime::ServeOptions {
+                    data_dir,
+                    database,
+                    cold_start,
+                    host: std::net::Ipv4Addr::LOCALHOST.into(),
+                    port: 0,
+                    workers,
+                    queue_size: 64,
+                    resources_config,
+                    execution_config,
+                    tls_cert: None,
+                    tls_key: None,
+                },
+                output,
+                previous,
+            )
+            .await
+        }
+        #[cfg(feature = "olap")]
         Command::Serve(options) => run(options).await,
+        #[cfg(feature = "oltp")]
+        Command::Serve(options) => nabedra_database_server::oltp_runtime::run(options).await,
+        #[cfg(feature = "oltp")]
+        Command::Doctor { .. } | Command::Database { .. } => {
+            Err("unsupported OLTP operator command for this deployment configuration")
+        }
+        #[cfg(all(feature = "oltp", unix))]
+        Command::Worker { bootstrap } => {
+            nabedra_database_server::oltp_runtime::registered_process::run(bootstrap).await
+        }
+        #[cfg(all(feature = "oltp", not(unix)))]
+        Command::Worker { .. } => Err("OLTP worker processes require POSIX descriptors"),
+        #[cfg(all(feature = "oltp", unix))]
+        Command::DataWorker { bootstrap } => {
+            nabedra_database_server::oltp_runtime::data_worker_process::run(bootstrap).await
+        }
+        #[cfg(all(feature = "oltp", not(unix)))]
+        Command::DataWorker { .. } => Err("OLTP data workers require POSIX descriptors"),
+        #[cfg(all(feature = "oltp", unix))]
+        Command::Api {
+            config,
+            cold_start,
+            migrate_catalog,
+        } => {
+            nabedra_database_server::oltp_runtime::api_process::run_api_configured(
+                config,
+                cold_start,
+                migrate_catalog,
+            )
+            .await
+        }
+        #[cfg(all(feature = "oltp", not(unix)))]
+        Command::Api { .. } => Err("OLTP API supervision requires POSIX descriptors"),
+        #[cfg(feature = "olap")]
         Command::Api {
             config,
             cold_start,
@@ -84,6 +219,7 @@ async fn run_cli() -> ExitCode {
             )
             .await
         }
+        #[cfg(feature = "olap")]
         Command::Worker { bootstrap } => {
             nabedra_database_server::node::runtime::run_worker(bootstrap).await
         }
@@ -107,7 +243,7 @@ async fn run_cli() -> ExitCode {
     }
 }
 
-#[cfg(feature = "s3")]
+#[cfg(all(feature = "olap", feature = "s3"))]
 async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = Config::from_env(options).map_err(|_| "configuration invalid")?;
     // Select the provider explicitly even if dependencies also enable ring.
@@ -200,7 +336,7 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
     result.and(shutdown)
 }
 
-#[cfg(not(feature = "s3"))]
+#[cfg(all(feature = "olap", not(feature = "s3")))]
 async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(), &'static str> {
     let config = nabedra_database_server::config::Config::from_env(options)
         .map_err(|_| "configuration invalid")?;

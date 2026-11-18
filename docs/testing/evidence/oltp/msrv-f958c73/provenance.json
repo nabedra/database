@@ -1,0 +1,8 @@
+{
+  "checkpoint": "f958c737d8c1010db7b5dfeda9977f4bce3e2ed5",
+  "source_tree_sha256": "f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+  "platform": "Darwin x86_64",
+  "scope": "Compilation checks from immutable git archive; native/local only; Linux and Docker not established"
+}

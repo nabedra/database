@@ -1,5 +1,6 @@
 //! Replicated request records live only in worker RAM. Transport owns authenticated
 //! installation and must replicate each returned record before exposing its state.
+#[cfg(feature = "olap")]
 pub(crate) mod admission;
 use crate::protocol::{self, ErrorCode, Outcome, ProtocolError};
 use crate::storage::context::{RequestContext, StorageKey};
@@ -91,6 +92,9 @@ pub struct RequestRecord {
     pub result_expired: bool,
     pub replicas: BTreeSet<Uuid>,
 }
+#[cfg(any(feature = "olap", test))]
+type BindingDigests = (Option<[u8; 32]>, Option<[u8; 32]>);
+
 impl RequestRecord {
     pub fn identity(&self) -> RequestKey {
         RequestKey {
@@ -126,9 +130,8 @@ impl RequestRecord {
             })
             .ok_or(QueueError::Overloaded)
     }
-    pub(crate) fn binding_digests(
-        &self,
-    ) -> Result<(Option<[u8; 32]>, Option<[u8; 32]>), QueueError> {
+    #[cfg(any(feature = "olap", test))]
+    pub(crate) fn binding_digests(&self) -> Result<BindingDigests, QueueError> {
         match &self.context {
             None => Ok((None, None)),
             Some(c) => {
@@ -217,8 +220,98 @@ pub struct RequestQueue {
     membership_revision: u64,
     members: BTreeSet<Uuid>,
     limits: QueueLimits,
+    metadata_bytes_per_record: usize,
     next_sequence: u64,
     records: BTreeMap<RequestKey, RequestRecord>,
+}
+/// Fully decoded/hashed input, prepared under an execution memory/CPU owner
+/// before taking the short queue-state lock. Its contents cannot be modified.
+pub struct ValidatedRecord(RequestRecord);
+impl ValidatedRecord {
+    pub fn prepare(record: RequestRecord) -> Result<Self, QueueError> {
+        validate_record_contents(&record)?;
+        Ok(Self(record))
+    }
+    pub fn record(&self) -> &RequestRecord {
+        &self.0
+    }
+}
+
+/// An exact response validated under its caller's execution owner before the
+/// queue mutex is acquired. It cannot be constructed by a wire deserializer.
+pub struct ValidatedResponse {
+    request_id: Uuid,
+    status: u16,
+    body: Vec<u8>,
+}
+impl ValidatedResponse {
+    pub fn prepare(request_id: Uuid, status: u16, body: Vec<u8>) -> Result<Self, QueueError> {
+        validate_response(request_id, status, &body)?;
+        Ok(Self {
+            request_id,
+            status,
+            body,
+        })
+    }
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+fn validate_record_contents(record: &RequestRecord) -> Result<(), QueueError> {
+    // Recovery validates accepted credentials at their original epoch.
+    if let Some(c) = &record.context {
+        c.validate(0).map_err(|_| QueueError::Invalid)?;
+        if record.context_bytes()? > crate::storage::context::MAX_CONTEXT_BYTES {
+            return Err(QueueError::Invalid);
+        }
+    }
+    let expired_identity =
+        record.result_expired && record.state.terminal() && record.body.is_empty();
+    if record.sequence == 0
+        || record.version == 0
+        || record.version == u64::MAX
+        || record.digest.len() != 64
+        || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
+        || (!expired_identity
+            && (record.digest != digest(&record.body)
+                || protocol::parse_request(&record.body)
+                    .map_err(|_| QueueError::Invalid)?
+                    .request_id
+                    != record.request_id))
+        || record
+            .pinned_catalog
+            .as_ref()
+            .is_some_and(|v| v.len() > protocol::MAX_CATALOG_BYTES + 4100)
+        || record
+            .response_body
+            .as_ref()
+            .is_some_and(|v| v.len() > protocol::MAX_BODY_BYTES)
+        || (record.state.terminal() != record.completed_at_ms.is_some())
+        || (!record.state.terminal()
+            && (record.response_status.is_some()
+                || record.response_body.is_some()
+                || record.result_expired))
+        || (!record.accepted && record.state != RequestState::Queued)
+        || (record.result_expired && record.response_body.is_some())
+        || (record.state.terminal() && record.response_status.is_none())
+    {
+        return Err(QueueError::Invalid);
+    }
+    if let Some(body) = &record.response_body {
+        validate_response(
+            record.request_id,
+            record.response_status.ok_or(QueueError::Invalid)?,
+            body,
+        )?;
+    }
+    if record.state.terminal() && !record.result_expired && record.response_body.is_none() {
+        return Err(QueueError::Invalid);
+    }
+    Ok(())
 }
 impl RequestQueue {
     pub fn new(
@@ -227,6 +320,25 @@ impl RequestQueue {
         membership_revision: u64,
         limits: QueueLimits,
         members: BTreeSet<Uuid>,
+    ) -> Result<Self, QueueError> {
+        Self::new_with_metadata_overhead(
+            run_id,
+            scheduler_term,
+            membership_revision,
+            limits,
+            members,
+            0,
+        )
+    }
+    /// Additional fixed worker metadata shares the queue-byte ceiling. Existing
+    /// runtimes use zero; callers reserve each slot before installing a record.
+    pub(crate) fn new_with_metadata_overhead(
+        run_id: Uuid,
+        scheduler_term: u64,
+        membership_revision: u64,
+        limits: QueueLimits,
+        members: BTreeSet<Uuid>,
+        metadata_bytes_per_record: usize,
     ) -> Result<Self, QueueError> {
         limits.validate()?;
         if run_id.is_nil()
@@ -242,6 +354,7 @@ impl RequestQueue {
             membership_revision,
             members,
             limits,
+            metadata_bytes_per_record,
             next_sequence: 1,
             records: BTreeMap::new(),
         })
@@ -277,6 +390,22 @@ impl RequestQueue {
         self.records.remove(&id);
         Ok(())
     }
+    /// The caller must already hold a durable, non-executable terminal identity
+    /// proof. This removes RAM only and never creates a reusable identity.
+    #[cfg(feature = "oltp")]
+    pub(crate) fn retire_terminal(
+        &mut self,
+        id: impl Into<RequestKey>,
+        version: u64,
+    ) -> Result<(), QueueError> {
+        let id = id.into();
+        let record = self.records.get(&id).ok_or(QueueError::NotFound)?;
+        if !record.accepted || !record.state.terminal() || record.version != version {
+            return Err(QueueError::Conflict);
+        }
+        self.records.remove(&id);
+        Ok(())
+    }
     pub fn pending(&self) -> usize {
         self.records
             .values()
@@ -286,7 +415,8 @@ impl RequestQueue {
     pub fn charged_bytes(&self) -> (usize, usize) {
         self.records.values().fold((0, 0), |(q, r), record| {
             (
-                q.saturating_add(record.queue_bytes().unwrap_or(usize::MAX)),
+                q.saturating_add(record.queue_bytes().unwrap_or(usize::MAX))
+                    .saturating_add(self.metadata_bytes_per_record),
                 r.saturating_add(record.result_bytes()),
             )
         })
@@ -298,6 +428,25 @@ impl RequestQueue {
         &mut self,
         body: Vec<u8>,
         context: Option<RequestContext>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        self.propose_with_metadata(body, context, None, now_ms)
+    }
+    /// Install immutable snapshot/authorization bytes in the initial version,
+    /// before any replica can acknowledge its payload.
+    pub fn propose_pinned(
+        &mut self,
+        body: Vec<u8>,
+        pinned_metadata: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        self.propose_with_metadata(body, None, Some(pinned_metadata), now_ms)
+    }
+    fn propose_with_metadata(
+        &mut self,
+        body: Vec<u8>,
+        context: Option<RequestContext>,
+        pinned_catalog: Option<Vec<u8>>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
         if let Some(c) = &context {
@@ -335,7 +484,7 @@ impl RequestQueue {
             body,
             accepted: false,
             state: RequestState::Queued,
-            pinned_catalog: None,
+            pinned_catalog,
             response_status: None,
             response_body: None,
             completed_at_ms: None,
@@ -347,78 +496,96 @@ impl RequestQueue {
         Ok(record)
     }
     fn validate_record(&self, record: &RequestRecord) -> Result<(), QueueError> {
-        // Expiry is checked at admission/execution, not on replica recovery.
-        // A valid accepted snapshot remains recoverable after credentials expire.
-        if let Some(c) = &record.context {
-            c.validate(0).map_err(|_| QueueError::Invalid)?;
-            if record.context_bytes()? > crate::storage::context::MAX_CONTEXT_BYTES {
-                return Err(QueueError::Invalid);
-            }
-        }
         if record.run_id != self.run_id
             || record.scheduler_term != self.scheduler_term
             || record.membership_revision != self.membership_revision
         {
             return Err(QueueError::Stale);
         }
-        let expired_identity =
-            record.result_expired && record.state.terminal() && record.body.is_empty();
-        if record.sequence == 0
-            || record.version == 0
-            || record.version == u64::MAX
-            || record.digest.len() != 64
-            || !record.digest.bytes().all(|b| b.is_ascii_hexdigit())
-            || (!expired_identity
-                && (record.digest != digest(&record.body)
-                    || protocol::parse_request(&record.body)
-                        .map_err(|_| QueueError::Invalid)?
-                        .request_id
-                        != record.request_id))
-            || !record.replicas.is_subset(&self.members)
-            || record
-                .pinned_catalog
-                .as_ref()
-                .is_some_and(|v| v.len() > protocol::MAX_CATALOG_BYTES + 4100)
-            || record
-                .response_body
-                .as_ref()
-                .is_some_and(|v| v.len() > protocol::MAX_BODY_BYTES)
-            || (record.state.terminal() != record.completed_at_ms.is_some())
-            || (!record.state.terminal()
-                && (record.response_status.is_some()
-                    || record.response_body.is_some()
-                    || record.result_expired))
-            || (!record.accepted && record.state != RequestState::Queued)
-            || (record.result_expired && record.response_body.is_some())
-            || (record.state.terminal() && record.response_status.is_none())
-        {
-            return Err(QueueError::Invalid);
-        }
-        if let Some(body) = &record.response_body {
-            validate_response(
-                record.request_id,
-                record.response_status.ok_or(QueueError::Invalid)?,
-                body,
-            )?;
-        }
-        if record.state.terminal() && !record.result_expired && record.response_body.is_none() {
+        if !record.replicas.is_subset(&self.members) {
             return Err(QueueError::Invalid);
         }
         Ok(())
     }
     pub fn install(&mut self, record: RequestRecord) -> Result<(), QueueError> {
-        self.validate_record(&record)?;
-        if let Some(old) = self.records.get(&record.identity()) {
-            if old.context != record.context
-                || old.digest != record.digest
-                || (!old.body.is_empty() && !record.body.is_empty() && old.body != record.body)
-                || old.sequence != record.sequence
+        self.install_validated(ValidatedRecord::prepare(record)?)
+    }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn reconcile_validated(
+        &mut self,
+        prepared: ValidatedRecord,
+    ) -> Result<bool, QueueError> {
+        let incoming = prepared.record();
+        self.validate_record(incoming)?;
+        if !incoming.replicas.is_empty() {
+            return Err(QueueError::Invalid);
+        }
+        if let Some(local) = self.records.get(&incoming.identity()) {
+            Self::check_identity(local, incoming)?;
+            if local.pinned_catalog != incoming.pinned_catalog
+                || local.state.terminal()
+                    && incoming.state.terminal()
+                    && local.completed_at_ms != incoming.completed_at_ms
             {
                 return Err(QueueError::Conflict);
             }
+            if incoming.version < local.version {
+                Self::check_successor(incoming, local)?;
+                return Ok(false);
+            }
+            if incoming.version == local.version {
+                Self::check_successor(local, incoming)?;
+                if local.state != incoming.state
+                    || local.accepted != incoming.accepted
+                    || local.completed_at_ms != incoming.completed_at_ms
+                    || local.response_status != incoming.response_status
+                    || local.response_body != incoming.response_body
+                    || local.result_expired != incoming.result_expired
+                {
+                    return Err(QueueError::Conflict);
+                }
+                return Ok(false);
+            }
+        }
+        self.install_validated(prepared)?;
+        Ok(true)
+    }
+
+    fn check_identity(old: &RequestRecord, new: &RequestRecord) -> Result<(), QueueError> {
+        if old.context != new.context
+            || old.digest != new.digest
+            || (!old.body.is_empty() && !new.body.is_empty() && old.body != new.body)
+            || old.sequence != new.sequence
+        {
+            return Err(QueueError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn check_successor(old: &RequestRecord, new: &RequestRecord) -> Result<(), QueueError> {
+        if old.accepted && !new.accepted
+            || old.state.terminal()
+                && (old.state != new.state
+                    || old.response_status != new.response_status
+                    || old.result_expired && !new.result_expired
+                    || !new.result_expired && old.response_body != new.response_body)
+            || old.pinned_catalog.is_some()
+                && old.pinned_catalog != new.pinned_catalog
+                && !new.result_expired
+        {
+            return Err(QueueError::Conflict);
+        }
+        Ok(())
+    }
+    pub fn install_validated(&mut self, prepared: ValidatedRecord) -> Result<(), QueueError> {
+        let record = prepared.0;
+        self.validate_record(&record)?;
+        if let Some(old) = self.records.get(&record.identity()) {
+            Self::check_identity(old, &record)?;
             if record.version < old.version {
                 return Err(QueueError::Stale);
             }
+            Self::check_successor(old, &record)?;
             if record.version == old.version {
                 let mut merged = old.clone();
                 merged.replicas.extend(record.replicas.iter().copied());
@@ -431,18 +598,6 @@ impl RequestQueue {
                 self.check_capacity(&merged)?;
                 self.records.insert(record.identity(), merged);
                 return Ok(());
-            }
-            if old.accepted && !record.accepted
-                || old.state.terminal()
-                    && (old.state != record.state
-                        || old.response_status != record.response_status
-                        || old.result_expired && !record.result_expired
-                        || !record.result_expired && old.response_body != record.response_body)
-                || old.pinned_catalog.is_some()
-                    && old.pinned_catalog != record.pinned_catalog
-                    && !record.result_expired
-            {
-                return Err(QueueError::Conflict);
             }
         } else if self.records.values().any(|r| r.sequence == record.sequence) {
             return Err(QueueError::Conflict);
@@ -459,7 +614,10 @@ impl RequestQueue {
     }
     fn check_capacity(&self, incoming: &RequestRecord) -> Result<(), QueueError> {
         let mut pending = usize::from(!incoming.state.terminal());
-        let mut bytes = incoming.queue_bytes()?;
+        let mut bytes = incoming
+            .queue_bytes()?
+            .checked_add(self.metadata_bytes_per_record)
+            .ok_or(QueueError::Overloaded)?;
         // Reserve all-ready acknowledgment metadata at initial installation, so
         // acceptance cannot fail solely because proof UUIDs grow afterward.
         bytes = bytes
@@ -487,6 +645,7 @@ impl RequestQueue {
                 .ok_or(QueueError::Overloaded)?;
             bytes = bytes
                 .checked_add(old.queue_bytes()?)
+                .and_then(|n| n.checked_add(self.metadata_bytes_per_record))
                 .and_then(|n| {
                     n.checked_add(
                         self.members
@@ -545,6 +704,46 @@ impl RequestQueue {
         self.check_capacity(&record)?;
         self.records.insert(id, record.clone());
         Ok(record)
+    }
+    /// Tentative complete payloads may be copied before their durable snapshot
+    /// context is bound. They cannot become executable merely through ACKs.
+    #[cfg(feature = "oltp")]
+    pub(crate) fn acknowledge_payload_version(
+        &mut self,
+        id: impl Into<RequestKey>,
+        version: u64,
+        member: Uuid,
+    ) -> Result<RequestRecord, QueueError> {
+        let id = id.into();
+        if !self.members.contains(&member)
+            || self.records.get(&id).is_none_or(|r| r.version != version)
+        {
+            return Err(QueueError::Stale);
+        }
+        let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
+        record.replicas.insert(member);
+        self.check_capacity(&record)?;
+        self.records.insert(id, record.clone());
+        Ok(record)
+    }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn accept_payload(&mut self, id: Uuid) -> Result<(), QueueError> {
+        let record = self
+            .records
+            .get_mut(&id.into())
+            .ok_or(QueueError::NotFound)?;
+        if record.accepted {
+            return Ok(());
+        }
+        if record.replicas != self.members || record.state != RequestState::Queued {
+            return Err(QueueError::Unavailable);
+        }
+        record.accepted = true;
+        record.version = record
+            .version
+            .checked_add(1)
+            .ok_or(QueueError::Overloaded)?;
+        Ok(())
     }
     pub fn ready(&self, id: impl Into<RequestKey>) -> bool {
         let id = id.into();
@@ -617,13 +816,51 @@ impl RequestQueue {
         body: Vec<u8>,
         now_ms: u64,
     ) -> Result<RequestRecord, QueueError> {
+        self.finish_inner(id.into(), status, body, now_ms, false, false)
+    }
+    /// Distributed readers must keep their pinned input and terminal bytes until
+    /// all required copies exist. Capacity failure leaves the original record
+    /// intact so the owner can wait for retention capacity without losing a pin.
+    pub fn finish_retained(
+        &mut self,
+        id: impl Into<RequestKey>,
+        status: u16,
+        body: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
+        self.finish_inner(id.into(), status, body, now_ms, true, false)
+    }
+    pub fn finish_retained_validated(
+        &mut self,
+        id: impl Into<RequestKey>,
+        response: ValidatedResponse,
+        now_ms: u64,
+    ) -> Result<RequestRecord, QueueError> {
         let id = id.into();
-        self.expire(now_ms);
+        if id.request_id != response.request_id {
+            return Err(QueueError::Invalid);
+        }
+        self.finish_inner(id, response.status, response.body, now_ms, true, true)
+    }
+    fn finish_inner(
+        &mut self,
+        id: RequestKey,
+        status: u16,
+        body: Vec<u8>,
+        now_ms: u64,
+        retain: bool,
+        prevalidated: bool,
+    ) -> Result<RequestRecord, QueueError> {
+        if !retain {
+            self.expire(now_ms);
+        }
         let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
         if !record.accepted || record.state.terminal() || !(200..600).contains(&status) {
             return Err(QueueError::Conflict);
         }
-        validate_response(id.request_id, status, &body)?;
+        if !prevalidated {
+            validate_response(id.request_id, status, &body)?;
+        }
         record.state = if status == 200 {
             RequestState::Succeeded
         } else {
@@ -636,6 +873,9 @@ impl RequestQueue {
         // cap. Never strand a committed mutation in Running; lookup explicitly
         // reports unavailable and durable history can recover its decision.
         if self.check_capacity(&record) == Err(QueueError::Overloaded) {
+            if retain {
+                return Err(QueueError::Overloaded);
+            }
             record.response_body = None;
             record.result_expired = true;
             record.body.clear();
@@ -708,6 +948,17 @@ impl RequestQueue {
     pub fn records(&self) -> impl Iterator<Item = &RequestRecord> {
         self.records.values()
     }
+    #[cfg(feature = "oltp")]
+    pub(crate) fn record_after(&self, after: Option<Uuid>) -> Option<Uuid> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        // OLTP stores the accepted context in pinned_catalog and keys RAM
+        // records solely by the operation UUID.
+        let start = after.map_or(Unbounded, |id| Excluded(RequestKey::from(id)));
+        self.records
+            .range((start, Unbounded))
+            .next()
+            .map(|(key, _)| key.request_id)
+    }
     pub fn snapshot_page(&self, after_sequence: Option<u64>) -> (QueueSnapshot, bool) {
         let next = self
             .records
@@ -745,12 +996,13 @@ impl RequestQueue {
         {
             return Err(QueueError::Stale);
         }
-        let mut replacement = Self::new(
+        let mut replacement = Self::new_with_metadata_overhead(
             self.run_id,
             self.scheduler_term,
             self.membership_revision,
             self.limits,
             self.members.clone(),
+            self.metadata_bytes_per_record,
         )?;
         for record in snapshot.records {
             replacement.install(record)?;
@@ -780,16 +1032,55 @@ impl RequestQueue {
         membership_revision: u64,
         members: BTreeSet<Uuid>,
     ) -> Result<QueueSnapshot, QueueError> {
+        self.takeover_in_place(term, membership_revision, members)?;
+        Ok(self.snapshot())
+    }
+    /// Rebase a complete RAM copy without cloning every queued payload. The
+    /// caller has already committed the run/owner/membership fence. All failure
+    /// checks precede mutation, including the larger ready set's ACK reserve.
+    pub fn takeover_in_place(
+        &mut self,
+        term: u64,
+        membership_revision: u64,
+        members: BTreeSet<Uuid>,
+    ) -> Result<(), QueueError> {
         if term < self.scheduler_term
             || membership_revision < self.membership_revision
             || term == self.scheduler_term && membership_revision == self.membership_revision
             || members.is_empty()
+            || members.iter().any(Uuid::is_nil)
         {
             return Err(QueueError::Stale);
         }
-        let mut replacement =
-            Self::new(self.run_id, term, membership_revision, self.limits, members)?;
-        for mut record in self.records.values().cloned() {
+        let mut queue_bytes = 0usize;
+        for record in self.records.values() {
+            if record.version.checked_add(1).is_none_or(|v| v == u64::MAX) {
+                return Err(QueueError::Invalid);
+            }
+            let old_ack_bytes = record
+                .replicas
+                .len()
+                .checked_mul(32)
+                .ok_or(QueueError::Overloaded)?;
+            let new_ack_bytes = members
+                .len()
+                .checked_mul(32)
+                .ok_or(QueueError::Overloaded)?;
+            queue_bytes = queue_bytes
+                .checked_add(
+                    record
+                        .queue_bytes()?
+                        .checked_add(self.metadata_bytes_per_record)
+                        .and_then(|n| n.checked_sub(old_ack_bytes))
+                        .and_then(|n| n.checked_add(new_ack_bytes))
+                        .ok_or(QueueError::Overloaded)?,
+                )
+                .ok_or(QueueError::Overloaded)?;
+        }
+        if queue_bytes > self.limits.max_queue_bytes_per_replica {
+            return Err(QueueError::Overloaded);
+        }
+        for record in self.records.values_mut() {
             record.scheduler_term = term;
             record.membership_revision = membership_revision;
             record.replicas.clear();
@@ -800,10 +1091,11 @@ impl RequestQueue {
                 record.state = RequestState::Reconciling;
             }
             record.version = record.version.checked_add(1).ok_or(QueueError::Invalid)?;
-            replacement.install(record)?;
         }
-        *self = replacement;
-        Ok(self.snapshot())
+        self.scheduler_term = term;
+        self.membership_revision = membership_revision;
+        self.members = members;
+        Ok(())
     }
 }
 fn validate_response(id: Uuid, status: u16, body: &[u8]) -> Result<(), QueueError> {

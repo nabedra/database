@@ -1,0 +1,32 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 3.99s
+     Running tests/startup.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/startup-b5063762cf406496)
+
+running 2 tests
+test installed_command_identity_and_version ... ok
+test parser_and_invalid_startup_exit_without_aws ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.02s
+
+     Running tests/storage.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/storage-e62293601c1fd1f3)
+
+running 8 tests
+test neutral_reader_bounds_and_partial_failure ... ok
+test frozen_v1_reads_without_migration_and_new_writes_are_v2 ... ok
+test load_initialize_and_conditional_race ... ok
+test namespace_snapshot_validation_and_read_bounds ... ok
+test mixed_v2_roundtrip_and_typed_routing ... ok
+test partition_metadata_rejects_invalid_manifests ... ok
+test unreadable_catalog_never_resets ... ok
+test catalog_codec_rejects_duplicate_names_and_bounds_encoding ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/worker_pool.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/worker_pool-2488dc4497c41c61)
+
+running 2 tests
+test shared_threads_refill_any_free_executor_and_bound_work ... ok
+test shutdown_drains_abandoned_and_panicking_jobs_and_joins ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

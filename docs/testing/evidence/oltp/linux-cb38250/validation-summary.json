@@ -1,0 +1,86 @@
+{
+  "checkpoint": "cb382507b3fd7748a4cb785d0085ae624ce41949",
+  "source_tree_sha256_before": "56f1e40f10e54274692cafd36da0b01dfdc426221eb652f09b7a502b8dfde763",
+  "platform": "Linux-6.10.14-linuxkit-x86_64-with-glibc2.36",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+  "python": "3.11.2",
+  "cpu_max": "200000 100000",
+  "memory_max": "6442450944",
+  "scope": "Linux container correctness checks; source is immutable checkpoint; concurrent host work uncontrolled",
+  "stages": [
+    {
+      "name": "engine-matrix",
+      "command": [
+        "python",
+        "scripts/check_engine_features.py"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1070.569383391
+    },
+    {
+      "name": "oltp-no-s3-build",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--manifest-path",
+        "server/Cargo.toml",
+        "--no-default-features",
+        "--features",
+        "oltp",
+        "--bin",
+        "nabedra-db"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.2720723879999696
+    },
+    {
+      "name": "process",
+      "command": [
+        "python",
+        "server/tests/oltp_process.py",
+        "--binary",
+        "/target/debug/nabedra-db",
+        "--evidence-dir",
+        "/evidence/process",
+        "--benchmark-condition",
+        "Linux Docker container, two CPU quota, six GiB memory limit; concurrent host compilation uncontrolled"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 22.03412123000021
+    },
+    {
+      "name": "python-unit",
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "orm/python/tests",
+        "-v"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 56.52718290500002
+    },
+    {
+      "name": "harness-unit",
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts",
+        "-p",
+        "test_*.py",
+        "-v"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.4212585780001064
+    }
+  ],
+  "source_tree_sha256_after": "56f1e40f10e54274692cafd36da0b01dfdc426221eb652f09b7a502b8dfde763",
+  "source_unchanged": true
+}

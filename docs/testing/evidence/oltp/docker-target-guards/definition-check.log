@@ -1,0 +1,19 @@
+#0 building with "desktop-linux" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.91kB 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim-bookworm
+#2 ...
+
+#3 [internal] load metadata for docker.io/library/rust:1.94.1-bookworm
+#3 DONE 0.9s
+
+#2 [internal] load metadata for docker.io/library/python:3.11-slim-bookworm
+#2 DONE 1.5s
+
+#4 [internal] load .dockerignore
+#4 transferring context: 466B done
+#4 DONE 0.0s
+Check complete, no warnings found.

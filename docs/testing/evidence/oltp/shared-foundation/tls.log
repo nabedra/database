@@ -1,0 +1,9 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 19.32s
+     Running tests/oltp_multiplex.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_multiplex-61da5e1ea03dc9ca)
+
+running 1 test
+test c07_m02_o06_one_tls_listener_routes_groups_and_preserves_control_during_blocked_data_preflight ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+

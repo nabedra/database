@@ -1,0 +1,989 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 2m 47s
+     Running unittests src/lib.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/nabedra_database_server-f697e6175b29b702)
+
+running 570 tests
+test api::queue::tests::q02_rollback_cannot_discard_an_accepted_or_different_version ... ok
+test api::queue::tests::q02_f03_stale_unaccepted_actor_cannot_retire_same_id_retry ... ok
+test api::queue::tests::q01_f02_f03_actor_unwind_settles_unknown_and_releases_original_memory ... ok
+test cluster::admin::tests::malformed_original_envelopes_never_become_decisions ... ok
+test cluster::admin::tests::freshness_invalid_base_and_each_counter_exhaustion ... ok
+test cluster::admin::tests::external_fixed_goals_and_auto_capability ... ok
+test cluster::admin::tests::identical_policy_keeps_its_independent_revision_even_at_max ... ok
+test cluster::admin_history::tests::replay_interleaved_revisions_exact_bytes_and_prefix ... ok
+test cluster::admin::tests::fixed_auto_transitions_clamp_zero_and_max ... ok
+test cluster::admin::tests::typed_invalid_bounds_are_deterministic_terminal_errors_before_capability ... ok
+test cluster::admin_history::tests::zero_and_admission_deadline_before_io ... ok
+test cluster::admin_history::tests::independent_invalid_links_and_missing_records ... ok
+test cluster::attachment::tests::incompatible_create_winner_is_never_reset_or_recreated ... ok
+test cluster::attachment::tests::callback_enrollment_retains_material_and_checks_immutable_root ... ok
+test cluster::attachment::tests::preserves_loaded_noninitial_root_with_relocated_material ... ok
+test cluster::attachment::tests::real_decode_failures_and_storage_failures_have_fixed_categories ... ok
+test cluster::attachment::tests::real_initialization_existing_and_race_use_one_comparison ... ok
+test cluster::callback::tests::a02_fresh_authorization_requires_exact_retained_claim_and_owner ... ok
+test cluster::callback::tests::commands_and_evidence_have_no_deserialization_or_clone_constructors ... ok
+test cluster::callback::tests::delivery_records_have_no_serialization_constructor ... ok
+test cluster::callback::tests::inventory_literal_command_hash_and_stop_null_positive ... ok
+test cluster::admin_history::tests::stalled_get_and_partial_body_are_errors ... ok
+test cluster::admin::tests::exact_original_whitespace_escapes_and_boundary_size ... ok
+test cluster::attachment::tests::independently_rejects_local_and_stored_semantic_changes ... ok
+test cluster::callback::tests::resource_requires_bounded_control_free_utf8 ... ok
+test cluster::callback::tests::replies_enforce_status_outcome_correlation_objects_and_limits ... ok
+test cluster::callback::tests::reconstructs_original_template_after_relocation_and_deletion ... ok
+test cluster::callback::tests::start_context_associates_serialized_digest_and_target_across_claim_successor ... ok
+test cluster::controller::guard_tests::actual_forward_and_backward_wall_steps_at_finish_and_check ... ok
+test cluster::controller::guard_tests::boot_is_closed_and_only_ack_installs_pre_io_deadline ... ok
+test cluster::callback::tests::stop_context_matches_exact_node_intent_and_delivery_across_successor ... ok
+test cluster::callback::tests::stop_exact_bytes_original_hash_semantics_and_strict_fields ... ok
+test cluster::controller::guard_tests::closed_admission_during_renewal_does_not_cancel_valid_pending_completion ... ok
+test cluster::controller::guard_tests::checked_time_and_generation_exhaustion_fail_closed_permanently ... ok
+test cluster::controller::guard_tests::equal_revision_integrity_and_older_reads ... ok
+test cluster::controller::guard_tests::mismatched_uuid_and_preparation_failure_release_only_current_slot ... ok
+test cluster::controller::guard_tests::full_candidate_contents_are_bound_and_owner_must_be_this_boot ... ok
+test cluster::controller::guard_tests::observations_preserve_anchor_and_reject_superseded_authorization ... ok
+test cluster::controller::guard_tests::exact_expiry_discontinuities_tolerance_and_retained_drift ... ok
+test cluster::controller::guard_tests::newer_same_tuple_observation_invalidates_pending_and_changed_tuple_revokes ... ok
+test cluster::controller::guard_tests::stale_completions_cannot_clear_recovery_or_release_new_slot ... ok
+test cluster::controller::guard_tests::precomputed_arithmetic_failures_close_before_io_and_leave_slot_free ... ok
+test cluster::controller::guard_tests::submillisecond_monotonic_drift_above_tolerance_closes ... ok
+test cluster::controller::guard_tests::unrelated_admin_member_and_claim_content_preserves_original_deadline ... ok
+test cluster::controller::tests::acquisition_obeys_expiry_boot_identity_and_epoch_continuity ... ok
+test cluster::controller::tests::exact_owner_renewal_and_release_require_held_state_and_deadline_advance ... ok
+test cluster::controller::guard_tests::pending_renewal_clock_failure_makes_later_acknowledgment_obsolete ... ok
+test cluster::controller::tests::only_revision_change_id_and_controller_change_in_representative_roots ... ok
+test cluster::drain::proof::tests::all_four_loaded_occupancy_metrics_refuse_independently ... ok
+test cluster::drain::proof::tests::allocation_successor_rejects_unrelated_changes_and_reused_proposals ... ok
+test cluster::drain::proof::tests::authenticated_loaded_positive_baseline ... ok
+test cluster::drain::proof::tests::changed_idle_at_exhausted_revision_refuses_with_sanitized_error ... ok
+test cluster::drain::proof::tests::claim_confirmation_requires_entire_expected_root_and_outcome_kind ... ok
+test cluster::controller::tests::checked_exhaustion_duplicate_proposal_and_local_validation_fail_without_mutation ... ok
+test cluster::callback::tests::inventory_rejects_conflicts_but_retains_unknown_resources ... ok
+test cluster::drain::proof::tests::contradiction_then_zero_cannot_restore_retained_positive ... ok
+test cluster::drain::proof::tests::current_api_boot_and_key_are_required ... ok
+test cluster::drain::proof::tests::evidence_has_no_clone_or_serde_and_debug_is_redacted ... ok
+test cluster::drain::proof::tests::delayed_idle_false_invalidates_confirmed_successor_before_and_after_later_zero ... ok
+test cluster::drain::proof::tests::exact_allocation_and_claim_chain_reaches_fresh_guard_authorization ... ok
+test cluster::drain::proof::tests::exact_idle_at_exhausted_revision_converges_before_arithmetic ... ok
+test cluster::drain::proof::tests::exact_outcome_competition_is_metadata_only ... ok
+test cluster::drain::proof::tests::fresh_round_can_continue_an_existing_retained_stop ... ok
+test cluster::drain::proof::tests::idle_confirmation_preserves_root_and_refuses_competing_metadata ... ok
+test cluster::drain::proof::tests::original_context_cannot_be_replaced_by_identical_auth ... ok
+test cluster::drain::proof::tests::late_idle_false_invalidates_other_retained_positive ... ok
+test cluster::drain::proof::tests::real_lost_reply_gate_distinguishes_exact_from_superseding_root ... ok
+test cluster::attachment::tests::foreign_hints_never_read_and_tls_uses_retained_material ... ok
+test cluster::drain::proof::tests::whole_root_confirmation_accepts_actual_loaded_ack ... ok
+test cluster::drain::proof::tests::takeover_requires_fresh_loaded_sequence_advancement ... ok
+test cluster::drain::stop::tests::ambiguous_retained_stops_refuse_without_a_new_identity ... ok
+test cluster::drain::proof::tests::claim_successor_refuses_binding_counter_owner_digest_and_unrelated_changes ... ok
+test cluster::drain::stop::tests::competing_actual_cas_then_fresh_round_converges_on_winner ... ok
+test cluster::drain::stop::tests::current_binding_or_owner_change_refuses_consumed_proof ... ok
+test cluster::drain::stop::tests::changed_overflow_and_retained_id_collisions_have_distinct_errors ... ok
+test cluster::drain::stop::tests::external_proof_refuses_at_allocator_and_unknown_unregistered_refuse_earlier ... ok
+test cluster::drain::stop::tests::plans_and_retained_owner_are_not_clone_or_serde ... ok
+test cluster::drain::proof::tests::reply_and_live_observation_refusals_are_independent ... ok
+test cluster::drain::stop::tests::registered_unknown_resource_proof_is_refused_by_allocator ... ok
+test cluster::drain::stop::tests::retained_failure_and_exact_max_revision_converge_before_growth_checks ... ok
+test cluster::drain::stop::tests::lost_allocation_reply_exact_read_can_confirm_but_gated_takeover_cannot ... ok
+test cluster::drain::tests::begin_preserves_full_root_and_credits_for_retained_phases ... ok
+test cluster::drain::tests::candidates_bind_complete_observation_and_are_not_clone_or_serializable ... ok
+test cluster::drain::tests::existing_converges_before_growth_and_clear_retains_ack ... ok
+test cluster::drain::stop::tests::signed_idle_cas_then_reserved_stop_cas_preserves_root_and_live_authority ... ok
+test cluster::drain::stop::tests::pending_allocation_refuses_wrong_expected_root_unknown_and_conflict ... ok
+test cluster::drain::tests::external_and_unrelated_records_remain_exact_and_existing_still_checks_owner ... ok
+test cluster::heartbeat::observation::tests::autoscale_all_required_members_recover_after_any_freshness_gap ... ok
+test cluster::drain::tests::independent_refusals_validate_base_owner_target_and_fresh_identity ... ok
+test cluster::heartbeat::observation::tests::autoscale_duplicates_preserve_but_cannot_refresh_or_restore ... ok
+test cluster::heartbeat::observation::tests::autoscale_foreign_replaced_capacity_and_backward_time_close_receipts ... ok
+test cluster::heartbeat::observation::tests::autoscale_busy_between_polls_resets_each_load_dimension ... ok
+test cluster::heartbeat::observation::tests::autoscale_loaded_progress_yields_snapshot ... ok
+test cluster::heartbeat::observation::tests::autoscale_loaded_duplicate_retains_contradiction_check_after_raw_failure ... ok
+test cluster::heartbeat::observation::tests::autoscale_missed_deadline_checked_before_advancing_load ... ok
+test cluster::heartbeat::observation::tests::autoscale_identity_and_housekeeping_are_distinct ... ok
+test cluster::heartbeat::observation::tests::autoscale_missing_corrupt_and_failed_load_notifications ... ok
+test cluster::heartbeat::observation::tests::autoscale_real_guard_failed_ambiguous_expired_and_obsolete_renewals_reset ... ok
+test cluster::heartbeat::observation::tests::autoscale_rejections_close_old_snapshots_and_require_new_progress ... ok
+test cluster::heartbeat::observation::tests::autoscale_snapshot_traits_are_closed ... ok
+test cluster::heartbeat::observation::tests::autoscale_restart_never_inherits_persisted_diagnostic ... ok
+test cluster::heartbeat::observation::tests::autoscale_unavailable_members_and_terminal_witnesses_are_not_empty_idle ... ok
+test cluster::heartbeat::observation::tests::binding_and_capacity_controls_do_not_restore_freshness ... ok
+test cluster::heartbeat::observation::tests::autoscale_time_drift_and_exhaustion_fail_closed ... ok
+test cluster::heartbeat::observation::tests::both_query_time_regressions_persist_and_keep_high_water ... ok
+test cluster::heartbeat::observation::tests::drain_receipt_requires_present_durable_drain_identity ... ok
+test cluster::heartbeat::observation::tests::failures_keep_original_loss_anchors_and_require_advance ... ok
+test cluster::heartbeat::observation::tests::drain_receipt_requires_progress_and_current_configured_evidence ... ok
+test cluster::heartbeat::observation::tests::loss_candidate_preserves_root_and_draining_never_expires ... ok
+test cluster::heartbeat::observation::tests::overflow_and_generation_exhaustion_close_evidence ... ok
+test cluster::heartbeat::observation::tests::receipt_traits_are_closed ... ok
+test cluster::heartbeat::observation::tests::repeats_expire_at_original_advance ... ok
+test cluster::heartbeat::observation::tests::r01_r05_lease_renewal_does_not_postpone_worker_loss ... ok
+test cluster::heartbeat::observation::tests::autoscale_real_guard_renewals_preserve_original_sixty_second_anchor ... ok
+test cluster::heartbeat::observation::tests::root_order_and_integrity_preserve_accepted_binding ... ok
+test cluster::heartbeat::observation::tests::takeover_grace_does_not_manufacture_sequence_advancement_time ... ok
+test cluster::heartbeat::tests::applied_write_with_invalid_or_missing_readback_remains_unknown ... ok
+test cluster::heartbeat::tests::c01_c02_availability_is_bound_to_advertised_resource_limits ... ok
+test cluster::heartbeat::tests::complete_valid_prefix_requires_clean_eof ... ok
+test cluster::heartbeat::tests::create_then_match_preserves_independent_capacities ... ok
+test cluster::heartbeat::observation::tests::takeover_restart_baseline_and_full_grace ... ok
+test cluster::heartbeat::tests::dropped_borrowed_publish_preserves_high_water_and_pending_provider_effect ... ok
+test cluster::heartbeat::tests::exact_readback_and_failed_reconciliation_never_mint_acknowledgement ... ok
+test cluster::heartbeat::tests::definite_max_conflict_exhausts_while_ambiguous_max_remains_unknown ... ok
+test cluster::heartbeat::tests::invalid_inputs_are_independent_and_pre_io ... ok
+test cluster::heartbeat::tests::loaded_receipt_binding_bounds_and_sequence_exhaustion ... ok
+test cluster::heartbeat::tests::receipts_and_writer_are_non_clone_and_readonly ... ok
+test cluster::heartbeat::tests::reload_budget_conflict_and_empty_acknowledgement ... ok
+test cluster::heartbeat::tests::retained_old_effect_competes_with_fresh_proposal_in_both_orders ... ok
+test cluster::heartbeat::tests::old_write_wins_after_fresh_condition_capture_and_late_ack_has_no_receipt ... ok
+test cluster::membership::tests::consumed_parts_diagnostics_and_retained_stop_evidence ... ok
+test cluster::admin_history::tests::hard_record_limit_stops_before_next_get ... ok
+test cluster::membership::tests::late_registration_and_exact_reply_loss_recovery ... ok
+test cluster::membership::tests::external_admission_replacement_and_permanent_retirement ... ok
+test cluster::membership::tests::expiry_is_phase_safe_and_checks_monotonic_assertions ... ok
+test cluster::membership::tests::owner_proposal_and_revision_exhaustion ... ok
+test cluster::membership::tests::readiness_binds_initialized_challenge_resource_and_complete_root ... ok
+test cluster::membership::tests::managed_eligibility_and_exact_retry_conflicts ... ok
+test cluster::provision::delivery::tests::checked_counters_timestamps_and_bounded_delays_preserve_base ... ok
+test cluster::provision::delivery::tests::common_delivery_owners_are_not_clone_or_serde ... ok
+test cluster::provision::delivery::tests::claim_rejects_independent_ineligible_valid_roots ... ok
+test cluster::provision::delivery::tests::confirmation_requires_entire_root_and_rejects_unknown_conflict ... ok
+test cluster::provision::delivery::tests::exact_claim_hash_confirmation_and_resource_completion ... ok
+test cluster::provision::delivery::tests::definite_first_denial_vs_registration_resource_later_attempt_and_prior_ambiguity ... ok
+test cluster::provision::delivery::tests::late_registered_draining_success_preserves_bindings_and_failure_history ... ok
+test cluster::provision::delivery::tests::exact_delivery_rejects_owner_epoch_invocation_digest_launch_phase_and_resource ... ok
+test cluster::provision::delivery::tests::pending_start_can_be_claimed ... ok
+test cluster::provision::delivery::tests::prepared_stale_completion_loses_to_takeover_with_exact_token_and_counts ... ok
+test cluster::provision::delivery::tests::resource_collision_terminal_contradiction_and_invalid_evidence_refuse_mutation ... ok
+test cluster::provision::delivery::tests::retired_boot_prevents_false_no_effect_terminalization ... ok
+test cluster::provision::delivery::tests::shared_claim_construction_keeps_initial_and_reconciled_eligibility_distinct ... ok
+test cluster::provision::delivery::tests::uncertainty_sanitizes_uncorrelated_evidence_and_checks_global_deadline ... ok
+test cluster::provision::reconcile::tests::complete_scan_rejects_wrong_request_unknown_collision_and_terminal_independently ... ok
+test cluster::provision::reconcile::tests::exact_absence_allows_only_explicit_same_identity_retry ... ok
+test cluster::provision::reconcile::tests::exact_positive_recovers_retained_launch_and_submits ... ok
+test cluster::provision::reconcile::tests::inventory_failure_preserves_root_except_checked_scheduler_backoff ... ok
+test cluster::provision::reconcile::tests::known_and_unresolved_unrelated_resources_preserve_collision_refusals ... ok
+test cluster::heartbeat::observation::tests::replacement_pruning_bounds_and_delayed_old_root ... ok
+test cluster::provision::reconcile::tests::late_registered_and_unregistered_draining_recovery_preserves_entire_history ... ok
+test cluster::provision::reconcile::tests::new_root_retry_confirmation_and_later_denial_preserve_ambiguity ... ok
+test cluster::provision::reconcile::tests::parent_regression_two_unresolved_launches_recover_in_separate_fresh_rounds ... ok
+test cluster::provision::reconcile::tests::parent_regression_collision_checks_scan_each_retained_array_once_per_record ... ok
+test cluster::admin::tests::saturated_retained_root_accepts_policy_without_spending_credits ... ok
+test cluster::provision::reconcile::tests::takeover_adopts_delivery_before_recovery_and_requires_new_inventory_round ... ok
+test cluster::provision::reconcile::tests::retry_refuses_backoffs_exhaustion_phase_evidence_and_reused_identity ... ok
+test cluster::provision::reconcile::tests::terminated_is_exact_binding_only_and_absence_never_releases_capacity ... ok
+test cluster::provision::stop::tests::claim_owners_are_not_clone_or_serde ... ok
+test cluster::provision::stop::tests::acceptance_retains_history_and_completion_rejects_changed_binding ... ok
+test cluster::provision::stop::tests::collision_quarantines_while_unrelated_recoverable_launch_does_not_block_stop ... ok
+test cluster::provision::stop::tests::exact_proof_rejects_independently_valid_root_target_and_owner_substitution ... ok
+test cluster::provision::stop::tests::expired_intent_deadline_does_not_replace_live_proof_or_extend_round ... ok
+test cluster::provision::stop::tests::correlated_denials_and_unrelated_wire_errors_keep_capacity ... ok
+test cluster::provision::stop::tests::explicit_unknown_or_conflict_with_expected_current_still_releases_nothing ... ok
+test cluster::provision::stop::tests::fresh_retained_stop_existing_path_claims_and_confirms ... ok
+test cluster::provision::stop::tests::gated_prepared_completion_loses_cas_to_real_takeover ... ok
+test cluster::provision::stop::tests::initial_claim_accepts_actual_allocated_proof ... ok
+test cluster::provision::stop::tests::inventory_negatives_termination_and_same_owner_in_progress_are_closed ... ok
+test cluster::provision::stop::tests::expired_original_round_at_joint_confirmation_releases_nothing ... ok
+test cluster::provision::stop::tests::invocation_and_proposal_cannot_alias_retained_identity_roles ... ok
+test cluster::provision::stop::tests::multiple_retained_stops_refuse_initial_claim_without_selecting_one ... ok
+test cluster::provision::stop::tests::new_stop_plans_are_not_clone_or_serde_and_debug_is_redacted ... ok
+test cluster::provision::stop::tests::lost_claim_reply_exact_read_jointly_confirms_but_gated_takeover_releases_nothing ... ok
+test cluster::provision::stop::tests::proof_for_first_target_cannot_claim_another_retained_target_in_same_root ... ok
+test cluster::provision::stop::tests::pending_eligibility_backoffs_and_checked_limits ... ok
+test cluster::provision::stop::tests::stop_checked_failure_arithmetic_and_retry_backoffs_limits_preserve_base ... ok
+test cluster::provision::stop::tests::stop_null_acceptance_preserves_everything_except_state_and_root_version ... ok
+test cluster::provision::stop::tests::takeover_adopts_then_requires_new_inventory_and_authenticated_round ... ok
+test cluster::provision::stop::tests::uncertain_delivery_fresh_round_inventory_retry_joint_confirmation_and_authorization ... ok
+test cluster::provision::termination::tests::callback_null_and_not_invoked_stop_shapes_release_nothing_without_positive_inventory ... ok
+test cluster::provision::termination::tests::contradictory_later_inventory_preserves_witness_and_pending_failure_is_global_only ... ok
+test cluster::provision::stop::tests::wrong_successor_and_same_uuid_different_complete_contents_release_nothing ... ok
+test cluster::provision::termination::tests::contradictory_retained_delivery_bindings_quarantine_before_terminal_mutation ... ok
+test cluster::provision::termination::tests::exact_replay_precedes_max_revision_and_proposal_growth ... ok
+test cluster::provision::termination::tests::known_lost_resource_without_stop_retains_start_delivery_and_terminalizes ... ok
+test cluster::provision::termination::tests::known_stop_commits_preserving_complete_session_drain_delivery_history ... ok
+test cluster::provision::termination::tests::gated_terminal_cas_loses_to_takeover_or_late_resource_recovery ... ok
+test cluster::provision::termination::tests::late_unregistered_draining_and_phase_only_stopped_need_positive_record ... ok
+test cluster::provision::termination::tests::original_start_reply_cannot_overwrite_committed_terminal_resource ... ok
+test cluster::provision::termination::tests::mismatches_and_multiple_terminal_resources_degrade_without_attachment ... ok
+test cluster::provision::termination::tests::stale_root_owner_external_and_incomplete_evidence_refuse ... ok
+test cluster::provision::termination::tests::two_independent_unbound_terminal_launches_progress_only_with_fresh_successor_inventory ... ok
+test cluster::provision::termination::tests::unique_positive_lost_launch_commits_exact_terminal_witness ... ok
+test cluster::provision::tests::a02_demand_respects_age_bounds_cooldown_and_idle_stabilization ... ok
+test cluster::provision::tests::c01_c07_pending_managed_capacity_uses_effective_resources_and_job_frontier ... ok
+test cluster::provision::tests::capacity_retains_ambiguous_and_phase_only_records ... ok
+test cluster::admin_history::tests::hard_byte_limit_is_not_deadline_exhaustion ... ok
+test cluster::provision::tests::identities_never_reused_in_any_retained_role ... ok
+test cluster::provision::tests::initial_fields_sorted_and_unrelated_preserved ... ok
+test cluster::provision::tests::pending_launch_remains_charged ... ok
+test cluster::provision::tests::rejection_and_checked_exhaustion ... ok
+test cluster::runtime::provider_runtime::tests::control_admission_rejects_duplicates_wrong_payloads_and_noncanonical_ids ... ok
+test cluster::runtime::queue_response_tests::q04_t04_post_accept_lookup_failure_preserves_identity_and_unknown_outcome ... ok
+test cluster::runtime::queue_response_tests::u02_q05_follower_api_attaches_only_to_live_matching_authority ... ok
+test cluster::runtime::receipt_observation::tests::q04_observation_deadline_cancels_slow_recovery_without_resubmission ... ok
+test cluster::runtime::receipt_observation::tests::q04_q06_healthy_pending_resets_streak_without_shortening_queue_wait_or_retrying_terminal_errors ... ok
+test cluster::runtime::receipt_observation::tests::q04_t04_transient_receipt_observation_never_resubmits ... ok
+test cluster::runtime::receipt_observation::tests::q04_transient_streak_has_exact_bound_backoff_and_unknown_exhaustion ... ok
+test cluster::runtime::receipt_observation::tests::u02_q06_nontransient_malformed_and_foreign_receipts_stop_immediately ... ok
+test cluster::startup_config::tests::cli02_v2_mode_and_legacy_canonical_defaults ... ok
+test cluster::startup_config::tests::local_url_tls_capacity_feature_and_path_checks ... ok
+test cluster::startup_config::tests::raw_byte_depth_template_bounds_and_sanitized_diagnostics ... ok
+test cluster::startup_config::tests::strict_original_objects_and_integer_identities ... ok
+test cluster::startup_config::tests::valid_records_and_lifecycle_expansion ... ok
+test cluster::provision::reconcile::tests::retained_inventory_recovery_and_failure_work_at_full_admission ... ok
+test cluster::startup_material::composition::tests::api_retains_local_material_for_actual_http_construction ... ok
+test cluster::startup_material::composition::tests::constructor_rejection_and_unimplemented_s3_are_sanitized ... ok
+test cluster::startup_material::composition::tests::local_failures_are_fixed_invalid_config_without_sources ... ok
+test cluster::startup_material::composition::tests::bootstrap_explicit_and_selected_temporary_roots_are_equivalent ... ok
+test cluster::startup_material::composition::tests::protected_bootstrap_uses_original_symlink_directory_for_hints ... ok
+test cluster::startup_material::composition::tests::selected_bad_roots_and_supplied_http_ca_fail_locally ... ok
+test cluster::startup_material::files::tests::aggregate_and_each_file_cap ... ok
+test cluster::startup_material::files::tests::fixture_timeout_reaps_its_direct_child ... ok
+test cluster::startup_material::files::tests::literal_paths_bounded_reads_and_deadlines ... ok
+test cluster::startup_material::files::tests::original_input_decoders_and_retained_bytes ... ok
+test cluster::startup_material::files::tests::protected_targets_and_preopen_swap ... ok
+test cluster::startup_material::files::tests::strict_auth_token_and_redaction ... ok
+test cluster::startup_material::composition::tests::plain_http_retains_supplied_trust_and_null_only_when_unsupplied ... ok
+test cluster::membership::tests::saturated_admission_preserves_retained_recovery_and_unrelated_bytes ... ok
+test cluster::startup_material::identity::tests::concrete_function_vectors ... ok
+test cluster::startup_material::identity::tests::fixed_canonical_vectors ... ok
+test cluster::startup_material::files::tests::tls_real_material_retention_mismatch_and_strict_pem ... ok
+test cluster::startup_material::identity::tests::local_api_fields_are_excluded_from_worker_identity ... ok
+test cluster::startup_material::identity::tests::secret_fixed_vector ... ok
+test cluster::startup_material::identity::tests::worker_semantics_and_storage_normalization ... ok
+test cluster::store::admin::tests::competing_captured_roots_require_explicit_recompute ... ok
+test cluster::store::admin::tests::delayed_original_is_fenced_only_by_a_successful_cas ... ok
+test cluster::startup_material::identity::tests::loaded_material_equivalence_and_differences ... ok
+test cluster::store::admin::tests::immutable_confirmation_requires_entire_original_encoding ... ok
+test cluster::controller::tests::retained_roots_need_no_new_admission_room ... ok
+test cluster::store::admin::tests::lost_root_reply_replays_earlier_response_after_later_commits ... ok
+test cluster::store::admin::tests::replay_precedes_counters_and_incomplete_history_never_writes ... ok
+test cluster::store::drain::tests::applied_lost_reply_exact_or_superseded_uses_one_read_and_no_resend ... ok
+test cluster::store::drain::tests::consumed_prepare_checks_complete_observation_and_owner ... ok
+test cluster::store::admin::tests::reconciliation_failures_and_definite_adapter_errors_stay_distinct ... ok
+test cluster::store::drain::tests::late_verified_enrollment_recomputes_after_drain_wins ... ok
+test cluster::store::drain::tests::gated_competing_drain_and_takeover_reload_winner ... ok
+test cluster::store::membership::tests::competing_registrations_and_exact_binding_recovery ... ok
+test cluster::store::membership::tests::committed_reply_loss_exact_or_later_root_and_binding_retry ... ok
+test cluster::store::membership::tests::expired_before_submission_is_definite_and_performs_no_write ... ok
+test cluster::provision::tests::full_augmented_admission_refuses_new_pair ... ok
+test cluster::store::membership::tests::delayed_original_remains_possible_until_a_fresh_match_fences_it ... ok
+test cluster::store::membership::tests::preparation_rejects_complete_base_and_owner_mismatches_before_io ... ok
+test cluster::store::membership::tests::gated_registration_and_readiness_lose_to_takeover_drain_or_replacement ... ok
+test cluster::store::provision::tests::applied_lost_reply_confirms_only_exact_whole_candidate ... ok
+test cluster::store::membership::tests::reconciliation_failures_and_equal_uuid_unequal_contents_remain_unknown ... ok
+test cluster::store::provision::tests::same_token_allocations_have_one_winner ... ok
+test cluster::store::provision::tests::preparation_binds_complete_observation_and_owner ... ok
+test cluster::store::provision::tests::successful_takeover_fences_old_allocation ... ok
+test cluster::store::tests::cancellation_after_observed_application_never_resubmits ... ok
+test cluster::store::provision::tests::unreadable_lost_allocation_reply_keeps_capacity_reserved_after_reload ... ok
+test cluster::store::tests::captured_token_preservation_and_local_rejections ... ok
+test cluster::store::tests::empty_ack_reconciles_once ... ok
+test cluster::store::tests::guard_actual_preparation_failure_completes_only_its_stamp ... ok
+test cluster::store::tests::definite_conflict_and_definite_failure_are_not_ambiguous ... ok
+test cluster::store::tests::guard_gated_ack_after_observed_takeover_cannot_restore_owner ... ok
+test cluster::store::tests::guard_late_ack_error_cancel_cannot_disturb_fresh_recovery ... ok
+test cluster::store::tests::guard_lost_acquire_renew_release_ack_requires_distinct_fresh_renewal ... ok
+test cluster::store::tests::lost_acquire_renew_release_replies_confirm_only_exact_current ... ok
+test cluster::store::tests::recovery_is_a_separate_explicit_owner_checked_renewal ... ok
+test cluster::store::tests::reconcile_failures_and_integrity_keep_application_uncertain ... ok
+test cluster::store::tests::takeover_fences_renewal_held_before_match ... ok
+test engine::mutation::resource_tests::m01_update_values_are_checked_before_cloning_into_candidate ... ok
+test cluster::provision::termination::tests::retained_terminal_recovery_ignores_admission_gate_and_checks_failure_backoff ... ok
+test engine::mutation::tests::duplicate_rejection_is_atomic_including_a_late_conflict ... ok
+test cluster::store::tests::two_acquisitions_have_exactly_one_winner ... ok
+test engine::mutation::tests::missing_and_noop_mutations_report_found_separately_from_changed ... ok
+test engine::mutation::tests::public_mutations_preserve_types_and_return_wire_results ... ok
+test engine::mutation::tests::upsert_replaces_complete_rows_and_preserves_float_bits ... ok
+test engine::mutation::tests::validates_public_operations_before_lookup_or_changes ... ok
+test engine::query::tests::composed_typed_query_filters_orders_limits_then_projects ... ok
+test engine::query::tests::deterministic_default_and_explicit_order_including_float_zero ... ok
+test cluster::store::admin::tests::empty_ack_caps_and_deadlines_do_not_resubmit ... ok
+test engine::query::tests::validates_public_inputs_and_explains_without_rows ... ok
+test engine::query::tests::result_boundary_and_count_limits_do_not_truncate ... ok
+test node::admission::ownership_tests::api_view_local_reservation_compares_retained_identity_without_key_decoding ... ok
+test node::admission::ownership_tests::distributed_container_has_configured_ownership_tables ... ok
+test node::admission::ownership_tests::durable_drain_missing_and_lost_association_retain_owners ... ok
+test node::admission::ownership_tests::exact_retry_conflicts_and_close_retains_delivery_cleanup ... ok
+test node::admission::ownership_tests::checked_views_preserve_phase_boot_and_complete_root ... ok
+test node::admission::ownership_tests::independent_running_queue_saturation_and_reaping ... ok
+test node::admission::ownership_tests::permanent_barrier_self_peer_progress_and_closing_queue_promotion ... ok
+test cluster::store::tests::deadlines_cover_original_write_and_reconcile_without_reset ... ok
+test node::admission::ownership_tests::root_integrity_failure_is_sticky ... ok
+test node::admission::ownership_tests::queued_new_root_and_boot_checks_preserve_owners ... ok
+test node::admission::ownership_tests::stale_tickets_exhaustion_and_drop_never_reap ... ok
+test node::admission::ownership_tests::work_evidence_survives_rollback_settlement_and_exhaustion ... ok
+test node::admission::ownership_tests::separate_worker_bounds_and_initialization_identity ... ok
+test node::admission::receiver_tests::control_open_rollback_keeps_ordered_barrier_and_generation ... ok
+test node::admission::ownership_tests::work_evidence_unchanged_root_and_sticky_integrity ... ok
+test node::auth::credentials::tests::exact_verifier_uuid_bytes_and_separation ... ok
+test node::auth::credentials::tests::fixed_signing_caps ... ok
+test node::auth::credentials::tests::published_ed25519_and_independent_derivation ... ok
+test node::auth::credentials::tests::exact_typed_domain_signatures_and_local_mismatch ... ok
+test node::auth::replay::tests::association_boot_root_and_sticky_integrity_spend_nothing ... ok
+test node::auth::replay::tests::equal_sequence_one_winner_and_unseen_out_of_order_accepted ... ok
+test node::auth::replay::tests::f03_c04_close_before_delayed_open_remains_fenced_until_original_window_expires ... ok
+test node::admission::ownership_tests::full_dependency_table_includes_self_and_closing_atomic_rollback ... ok
+test cluster::provision::delivery::tests::retained_claim_and_recovery_at_full_augmented_admission_preserve_credits ... ok
+test node::auth::replay::tests::r05_authoritative_membership_fence_collects_dormant_sender_close_tombstones ... ok
+test node::auth::sequence::tests::constructors_bind_role_public_key_and_api_retained_cluster ... ok
+test node::auth::sequence::tests::encapsulation_and_value_free_debug ... ok
+test node::auth::sequence::tests::max_is_issued_once_and_exhaustion_is_permanent ... ok
+test node::auth::sequence::tests::mismatches_spend_nothing_and_later_failures_do_not_restore_issued_sequences ... ok
+test node::auth::sequence::tests::one_counter_composes_with_context_signing_and_content_across_routes_and_targets ... ok
+test node::auth::verify::consume_tests::consumes_original_bytes_once ... ok
+test node::auth::verify::consume_tests::drain_cross_claim_failure_does_not_spend_sequence ... ok
+test node::auth::verify::consume_tests::local_and_complete_observation_mismatch_spend_nothing ... ok
+test node::auth::verify::consume_tests::opaque_negative_traits_and_debug ... ok
+test node::auth::verify::consume_tests::owned_transfer_preserves_each_closed_body_and_association ... ok
+test node::auth::verify::consume_tests::valid_alternate_receiver_boot_and_key_spend_nothing ... ok
+test node::auth::replay::tests::q05_c05_signed_reordered_concurrent_packets_are_accepted_once_and_window_bounded ... ok
+test node::auth::verify::content::tests::different_execution_contexts_use_distinct_sequences ... ok
+test node::auth::verify::content::tests::exact_request_hash_claims_and_invocation_association ... ok
+test node::auth::verify::content::tests::jobs_keep_full_expectations_and_signed_claim_mismatches ... ok
+test node::auth::verify::content::tests::opaque_success_keeps_exact_data_and_checks_uuid ... ok
+test engine::query::tests::serialized_projected_array_has_a_body_budget ... ok
+test node::auth::verify::content::tests::proof_traits_and_redaction ... ok
+test node::auth::verify::content::tests::reply_correlates_sequence_status_sender_scope_target_and_domain ... ok
+test node::auth::verify::content::tests::small_echoes_preserve_pending_and_idle_false ... ok
+test node::auth::verify::content::tests::strict_error_envelopes_and_unattributed_operation_rejections ... ok
+test node::auth::verify::content::tests::target_binding_rejects_missing_replaced_retired_and_cluster ... ok
+test node::auth::verify::content::tests::transport_error_rejects_a_mismatched_known_operation_uuid ... ok
+test node::auth::verify::eligibility::tests::accepted_authority_keeps_invocation_and_allows_draining ... ok
+test node::auth::replay::tests::q02_closed_permit_capacity_is_reserved_before_sequence_is_spent ... ok
+test node::auth::verify::eligibility::tests::accepted_authority_rechecks_target_and_coordinator_independently ... ok
+test node::auth::verify::eligibility::tests::checked_capability_is_opaque ... ok
+test node::auth::verify::eligibility::tests::accepted_job_reply_and_distinct_coordinator_recheck ... ok
+test node::auth::verify::eligibility::tests::exact_current_local_binding_and_pinned_api ... ok
+test node::auth::verify::eligibility::tests::readiness_recovery_and_pending_route_requirements ... ok
+test node::auth::verify::eligibility::tests::request_phase_and_exact_invocation ... ok
+test node::auth::verify::eligibility::tests::replies_allow_accepted_draining_work_but_recheck_context_and_current_binding ... ok
+test node::auth::verify::eligibility::tests::traits_redaction_and_complete_observation ... ok
+test node::auth::verify::reply_handoff_tests::job_transfer_retains_the_complete_original_expectation ... ok
+test node::auth::verify::eligibility::tests::small_reply_requirements_preserve_recovery_and_exact_context_ids ... ok
+test node::auth::verify::reply_handoff_tests::opaque_ownership_traits_and_value_free_debug ... ok
+test node::auth::verify::content::tests::original_numeric_spelling_and_encoder_fallback_outcomes ... ok
+test node::auth::verify::reply_handoff_tests::transfers_original_allocation_after_unrelated_root_progress ... ok
+test node::auth::verify::reply_handoff_tests::rejects_different_reply_invocations_contexts_and_complete_observations ... ok
+test node::auth::verify::tests::c02_signed_capacity_and_incarnation_cannot_be_forged ... ok
+test node::auth::verify::reply_handoff_tests::small_observations_and_remote_errors_keep_their_meaning ... ok
+test node::auth::verify::tests::enrollment_rejects_signature_domain_and_changed_claims ... ok
+test node::auth::verify::tests::opaque_proofs_have_no_serialization_or_clone ... ok
+test node::auth::verify::tests::input_and_fixed_domain_allocation_bounds ... ok
+test node::auth::verify::tests::reordered_header_and_actual_route_dependency_mismatch ... ok
+test node::auth::verify::tests::reviewed_enrollment_and_claims ... ok
+test node::auth::verify::tests::enrollment_verifier_tracks_each_checked_identity_and_key ... ok
+test node::auth::verify::tests::reviewed_requests_and_distinct_invocations ... ok
+test node::auth::wire::tests::early_bounds_hex_depth_and_fixed_errors ... ok
+test node::auth::wire::tests::actual_route_role_claims_and_dependency_agree ... ok
+test node::auth::wire::tests::nested_objects_and_small_input_bounds ... ok
+test node::auth::wire::tests::small_body_shapes_and_enrollment_reply_are_separate ... ok
+test node::auth::verify::tests::request_rejects_signature_domain_and_changed_canonical_bytes ... ok
+test node::auth::wire::tests::literal_canonical_records_and_enrollment_reconstruction ... ok
+test node::auth::wire::tests::u01_worker_operation_is_only_a_self_addressed_queue_continuation ... ok
+test node::auth::wire::tests::validated_records_require_checked_construction ... ok
+test node::coordinator::resources::tests::m01_m03_tiny_legacy_file_is_not_charged_as_both_format_maxima ... ok
+test node::auth::wire::tests::strict_objects_required_nulls_strings_and_exact_numbers ... ok
+test node::coordinator::settlement::tests::f03_c04_timeout_and_close_false_retain_original_cap_until_authenticated_close ... ok
+test node::coordinator::settlement::tests::r05_c04_unreachable_close_releases_only_after_authoritative_fence ... ok
+test node::auth::wire::tests::worker_claims_and_dependency_bind_to_actual_headers ... ok
+test node::http::tests::f03_control_retry_exhaustion_is_finite_and_not_settlement_proof ... ok
+test node::initialization::checked_capability_is_opaque ... ok
+test node::http::tests::b02_c07_unsigned_overload_retries_same_permit_with_fresh_sequence_and_owned_allocation ... ok
+test node::job::queue_binding_tests::c05_same_uuid_prefix_uses_distinct_native_request_shares ... ok
+test node::http::tests::u02_unsigned_success_or_bad_signature_cannot_prove_open_or_closed ... ok
+test node::job::queue_binding_tests::r05_native_jobs_reject_missing_stale_and_cross_bound_queue_identity ... ok
+test node::job::queue_binding_tests::sl02_signed_binding_rejects_other_database_or_rotated_grant ... ok
+test node::payload::prepared::tests::closed_file_digest_mismatch_fails_even_with_valid_parquet ... ok
+test node::payload::prepared::tests::emitted_quota_failure_and_bad_local_metadata_cannot_finish ... ok
+test node::payload::prepared::tests::local_failures_poison_and_retain_prior_parts ... ok
+test node::payload::rows::tests::resource_scan_stops_before_large_values_and_counts_decoded_escapes ... ok
+test node::payload::prepared::tests::local_null_empty_and_multiple_parts_handoff ... ok
+test node::payload_owner::installation_tests::accepted_record_exhaustion_retains_refused_original_preparation ... ok
+test node::payload_owner::installation_tests::a02_ordinary_heartbeat_and_drain_proof_share_one_sequence_writer ... ok
+test node::payload_owner::installation_tests::accepted_storage_is_reserved_before_registration ... ok
+test node::payload_owner::installation_tests::barrier_sample_exhaustion_precedes_real_replay_consumption ... ok
+test node::payload_owner::installation_tests::barrier_sample_foreign_key_and_initialization_refuse ... ok
+test node::initialization::tests::configured_identity_and_original_process_are_both_required ... ok
+test node::payload_owner::installation_tests::barrier_sample_signed_delivery_history ... ok
+test node::payload_owner::installation_tests::barrier_sample_unchanged_root_and_fully_reaped_preparation ... ok
+test node::payload_owner::installation_tests::barrier_sample_worker_cleanup_and_release_handoff ... ok
+test node::payload_owner::installation_tests::c06_f03_parallel_outbound_streams_retain_one_operation_and_transfer_staging ... ok
+test node::payload_owner::installation_tests::c05_f03_signed_receiver_accepts_reordered_jobs_once_and_fences_close_before_open ... ok
+test node::payload_owner::installation_tests::configured_stream_role_bound_and_operation_cleanup_leave_job_and_control_ownership_available ... ok
+test node::payload_owner::installation_tests::data_saturation_preserves_eight_original_memory_controls_through_delivery_and_reaping ... ok
+test node::payload_owner::installation_tests::dependency_attempts_share_exact_account_and_closing_waits_for_child_and_account_reaping ... ok
+test node::payload_owner::installation_tests::drain_classifier_account_publication_discard_return_and_release ... ok
+test node::payload_owner::installation_tests::drain_classifier_dependency_without_payload_account ... ok
+test node::payload_owner::installation_tests::drain_classifier_cancelled_and_cleanup_unreaped_exemptions_refused ... ok
+test node::payload_owner::installation_tests::drain_classifier_dormant_preparation_and_unrelated_control ... ok
+test node::payload_owner::installation_tests::drain_classifier_extra_hold_cannot_replace_original_response ... ok
+test node::payload_owner::installation_tests::checked_control_continues_original_tcp_reader_through_eof ... ok
+test node::payload_owner::installation_tests::drain_classifier_failed_observer_is_retained_without_exemption ... ok
+test node::payload_owner::installation_tests::drain_classifier_failed_original_process_stays_failed ... ok
+test node::payload_owner::installation_tests::drain_classifier_unchecked_memory_control_cannot_be_observer ... ok
+test node::payload_owner::installation_tests::drain_classifier_signed_baseline_and_extra_delivery ... ok
+test node::payload_owner::installation_tests::drain_classifier_foreign_collisions_and_wrong_identity ... ok
+test node::payload_owner::installation_tests::exact_boot_receipt_needs_no_transport_and_never_initializes ... ok
+test node::payload_owner::installation_tests::failed_pool_quarantines_original_distributed_keys_and_handles ... ok
+test node::payload_owner::installation_tests::f03_c04_signed_closed_true_fences_an_older_never_installed_open ... ok
+test node::payload_owner::installation_tests::final_drain_cleanup_watchdog_keeps_original_worker_join ... ok
+test node::payload_owner::installation_tests::final_drain_cleanup_watchdog_keeps_owner_drain_before_pool_shutdown ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_account_publication_cleanup_and_release ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_dependency_without_payload ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_failed_process ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_cancelled_observer_and_stale_root_refuse ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_foreign_cycle_preserves_both_receivers ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_opaque_traits ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_reaped_original_and_ticket_drop ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_history_preparation_and_extra_response ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_replacement_cannot_take_original_cycle ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_no_ack_and_failed_outcomes ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_shutdown_retains_observation ... ok
+test node::payload_owner::installation_tests::final_drain_receipt_unrelated_control_and_preparation ... ok
+test node::payload_owner::installation_tests::pending_guard_release_remains_visible_after_handle_reaping ... ok
+test node::payload_owner::installation_tests::incomplete_preparation_and_checked_ids_refuse_without_extra_task_or_charge ... ok
+test node::payload_owner::installation_tests::operation_pair_rollback_original_handles_and_retained_publication ... ok
+test node::payload_owner::installation_tests::proof_cycle_buffered_ack_cancel_and_resume_shutdown ... ok
+test node::payload_owner::installation_tests::proof_cycle_exact_key_exhaustion_and_independent_work ... ok
+test node::payload_owner::installation_tests::proof_cycle_gates_cancelled_waiter_and_retained_ack ... ok
+test node::payload_owner::installation_tests::proof_cycle_cancelled_ticket_ambiguous_provider_is_not_recovered_by_readback ... ok
+test node::payload_owner::installation_tests::proof_cycle_registered_ack_reaps_once ... ok
+test node::payload_owner::installation_tests::proof_cycle_placeholder_shutdown_is_resumable ... ok
+test node::payload_owner::installation_tests::proof_cycle_regression_spawn_allows_receiver_inspection ... ok
+test node::payload_owner::installation_tests::proof_cycle_regression_drops_preserve_work_generation ... ok
+test node::payload_owner::installation_tests::proof_cycle_waiting_drain_survives_handle_publication ... ok
+test node::payload_owner::installation_tests::proof_cycle_no_ack_and_panic_remain_owned ... ok
+test node::payload_owner::installation_tests::publication_initialization_failure_settles_before_observation_assertions ... ok
+test node::payload_owner::installation_tests::receiver_control_response_failure_rolls_back_without_spending ... ok
+test node::payload_owner::installation_tests::receiver_association_control_keys_resolve_only_the_original_owner ... ok
+test node::payload_owner::installation_tests::receiver_association_foreign_start_preserves_local_replay_and_start ... ok
+test node::payload_owner::installation_tests::receiver_foreign_boot_and_independent_content_do_not_spend ... ok
+test node::payload_owner::installation_tests::receiver_lost_authority_preserves_queued_owner_and_divergence_is_sticky ... ok
+test node::payload_owner::installation_tests::receiver_first_draining_job_and_closing_retained_start ... ok
+test node::payload_owner::installation_tests::receiver_open_and_permanent_barrier_both_lock_orders ... ok
+test node::payload_owner::installation_tests::receiver_original_request_survives_publication_discard_and_unreaped_return ... ok
+test node::payload_owner::installation_tests::receiver_operation_capacity_payload_and_retained_start ... ok
+test node::payload_owner::installation_tests::reservation_rolls_back_parent_and_installs_original_task ... ok
+test node::payload_owner::installation_tests::receiver_same_sequence_contenders_install_exactly_one_operation ... ok
+test node::payload_owner::installation_tests::receiver_signed_replay_and_response_reservation ... ok
+test node::payload_owner::installation_tests::self_dependency_account_reaps_while_original_operation_response_is_retained ... ok
+test node::payload_owner::installation_tests::tentative_local_conflict_rolls_back_both_parent_claims_and_positions ... ok
+test node::payload_owner::installation_tests::work_evidence_regression_exhausted_pair_preparation_is_unchanged ... ok
+test node::payload_owner::installation_tests::work_evidence_regression_pair_reservation_invalidates_before_publication ... ok
+test node::payload_owner::local_tests::captured_count_ignores_limit_and_writes_nothing ... ok
+test node::payload_owner::local_tests::handler_tests::captured_partition_accounting_and_deposit_identity ... ok
+test node::payload_owner::local_tests::composition_tests::captured_split_prepare_roundtrips_original_registered_output ... ok
+test node::payload_owner::installation_tests::work_evidence_regression_response_boundary_preserves_replay_and_cleanup ... ok
+test node::payload_owner::local_tests::handler_tests::captured_reads_complete_input_and_validate_before_io ... ok
+test node::payload_owner::local_tests::local_partition_rejection_disposes_registered_empty_cell ... ok
+test node::payload_owner::preparation_tests::boot_activates_original_supervisor_before_any_transport ... ok
+test node::payload_owner::local_tests::handler_tests::captured_prepare_null_empty_split_and_range_atomicity ... ok
+test node::payload_owner::preparation_tests::close_sees_empty_placeholder_and_later_published_handle ... ok
+test node::payload_owner::preparation_tests::dormant_abandonment_needs_no_live_worker_and_refusal_stays_bounded ... ok
+test node::payload_owner::preparation_tests::fixed_shares_retain_original_handles_and_charges_through_return ... ok
+test node::payload_owner::preparation_tests::legacy_refusal_retains_registered_dormant_owner ... ok
+test node::payload_owner::preparation_tests::pre_spawn_failure_rolls_back_and_identity_exhaustion_never_wraps ... ok
+test node::payload_owner::tests::abandonment_is_sticky_before_eof_and_deadlines_do_not_release_capacity ... ok
+test node::payload_owner::tests::buffered_ticket_and_cleanup_complete_stay_registered_until_reaped ... ok
+test node::payload_owner::local_tests::local_candidate_cancel_panic_and_buffered_drop_reap_on_workers ... ok
+test node::payload_owner::tests::concurrent_disposal_waiters_survive_reaping_and_waiter_cancellation ... ok
+test node::payload_owner::tests::early_receive_errors_reap_before_returning ... ok
+test node::payload_owner::tests::initialization_failure_and_rejection_have_no_async_anchor_drop ... ok
+test node::payload_owner::tests::cancelled_append_and_panic_dispose_on_worker ... ok
+test node::payload_owner::tests::pending_submit_rejected_by_real_stop_retains_disk_and_guards ... ok
+test node::payload_owner::tests::worker_anchors_and_explicit_disposal ... ok
+test node::payload_owner::tests::take_rows_and_reap_before_admission ... ok
+test engine::mutation::tests::batch_and_resulting_row_limits_reject_without_truncation ... ok
+test node::payload_stream::send_tests::invalid_output_and_unpolled_sends_dispose ... ok
+test node::payload_stream::send_tests::registered_request_roundtrip ... ok
+test node::payload_stream::send_tests::prepared_transition_releases_exhausted_reader_before_next_open ... ok
+test node::payload_stream::tests::eof_pending_and_accepted_append_cancellation_retain_owner ... ok
+test node::payload_stream::tests::fragmented_rows_and_unused_receive_lease ... ok
+test node::payload_stream::send_tests::registered_results_roundtrip ... ok
+test node::payload_stream::tests::rows_require_payload_and_real_eof ... ok
+test node::queue_runtime::capacity_tests::c01_c02_c07_coordination_budget_exposes_cpu_frontier_or_rejects_before_enrollment ... ok
+test node::queue_runtime::class_capacity_tests::c07_r03_ingress_and_replica_saturation_preserves_bootstrap_and_progress_capacity ... ok
+test node::queue_runtime::class_capacity_tests::f03_r03_expired_join_seal_releases_waiter_without_pump_or_later_commands ... ok
+test node::queue_runtime::class_capacity_tests::m02_r03_working_memory_pressure_does_not_consume_bootstrap_or_small_control_bytes ... ok
+test node::queue_runtime::expiry_tests::sl03_t04_expired_reconciling_mutation_keeps_unknown_and_original_snapshot ... ok
+test node::queue_runtime::expiry_tests::t04_q05_terminal_reconciliation_reuses_original_version_and_rejects_mismatches ... ok
+test node::queue_transport::allocation_tests::c07_tiny_install_and_lookup_share_control_memory_concurrently ... ok
+test node::queue_transport::allocation_tests::u02_exact_wire_charge_counts_empty_and_non_ascii_payloads_before_allocation ... ok
+test node::payload_stream::tests::grouped_requests_prepared_and_grammar ... ok
+test node::queue_transport::observation_http_tests::u02_observation_http_errors_preserve_denial_and_malformed_classification ... ok
+test node::payload_stream::send_tests::blocked_writes_and_accepted_reads_retain_ownership ... ok
+test node::spool::tests::write_error_keeps_attempted_bytes_charged_and_poisons_until_drop ... ok
+test partition_size::tests::quantities_require_integral_positive_bounded_and_complete_input ... ok
+test partition_size::tests::units_use_si_and_iec_byte_arithmetic ... ok
+test request_queue::admission::tests::sl02_s3_control_overlap_is_rejected_at_api_and_peer_admission ... ok
+test request_queue::admission::tests::sl02_sl06_api_and_peer_context_validation_fail_before_admission ... ok
+test cluster::startup_material::identity::tests::bounded_identity_includes_json_syntax ... ok
+test request_queue::tests::q02_count_and_bytes_are_independent_and_no_partial_install ... ok
+test request_queue::tests::q03_replication_precedes_acceptance_and_pin_precedes_execution ... ok
+test request_queue::tests::q03_stale_ack_cannot_prove_new_pinned_record_installed ... ok
+test request_queue::tests::q04_q05_disconnect_ownership_dedup_and_conflict ... ok
+test request_queue::tests::q06_expiration_keeps_identity_and_never_reexecutes ... ok
+test request_queue::tests::q06_result_cap_settles_explicit_unavailability_without_losing_identity ... ok
+test request_queue::tests::q06_terminal_state_cannot_be_rewritten_by_newer_record ... ok
+test request_queue::tests::r01_r02_r03_survivor_takeover_and_join_preserve_every_record ... ok
+test request_queue::tests::r03_join_capacity_failure_is_atomic ... ok
+test request_queue::tests::r03_paged_copy_reports_completion_for_empty_and_final_pages ... ok
+test request_queue::tests::r04_cold_run_abandons_old_memory_without_replaying ... ok
+test request_queue::tests::r05_stale_record_and_term_cannot_replace_surviving_copy ... ok
+test request_queue::tests::sl01_q05_storage_identity_and_rotation_preserve_original_snapshot ... ok
+test request_queue::tests::sl02_context_replacement_and_forgery_are_rejected_on_replica ... ok
+test request_queue::tests::sl03_q03_r03_complete_context_recovers_after_expiry_without_renewal ... ok
+test request_queue::tests::sl04_q02_context_bytes_and_stable_scope_count_share_global_queue_budget ... ok
+test scheduling::coordinator_stage_tests::q01_m02_coordinator_stages_wait_without_cpu_and_preserve_child_ingress_headroom ... ok
+test node::auth::verify::content::tests::bounds_have_valid_at_cap_controls_and_cap_plus_one_rejections ... ok
+test scheduling::remote_placement_tests::c06_remote_io_balances_by_compute_capacity_without_reserving_cpu ... ok
+test scheduling::tests::c01_c02_heterogeneous_limits_and_impossible_work ... ok
+test scheduling::tests::c03_drain_preserves_owned_work_and_reconfigure_reuses_node ... ok
+test scheduling::tests::c04_c07_remote_io_keeps_node_cap_without_holding_cpu ... ok
+test scheduling::tests::c04_caps_include_reducers_across_hundred_jobs ... ok
+test scheduling::tests::c05_equal_peers_progress_with_one_slot_per_fair_round ... ok
+test scheduling::tests::c07_f03_memory_only_io_and_cancelled_grants_settle_once ... ok
+test scheduling::tests::c07_remote_io_count_is_bounded_across_requests_and_refills ... ok
+test scheduling::tests::f03_close_wakes_memory_only_and_cpu_waiters ... ok
+test scheduling::tests::m01_precharged_compute_and_reconfiguration_preserve_task_ceiling ... ok
+test scheduling::tests::m02_queue_results_cpu_and_memory_share_one_ceiling ... ok
+test scheduling::tests::m03_aging_earmarks_memory_after_thirty_two_grants ... ok
+test scheduling::tests::m03_f03_retained_growth_rejects_cycles_but_fresh_waiters_progress ... ok
+test scheduling::tests::m03_same_request_can_wait_for_in_flight_sibling_memory ... ok
+test scheduling::tests::m03_waiters_registered_before_first_grant_cannot_form_a_cycle ... ok
+test scheduling::tests::u03_seed_343687_conserves_resources_after_every_event ... ok
+test node::runtime::shared_tests::sl01_sl02_shared_worker_routes_independent_databases_and_reauthorizes_receipts ... ok
+test snapshot::footer::tests::bounds_skipping_of_other_footer_fields ... ok
+test snapshot::footer::tests::rejects_boolean_collections_before_library_metadata_loading ... ok
+test snapshot::footer::tests::rejects_schema_declarations_before_library_metadata_loading ... ok
+test snapshot::partition::tests::incremental_emission_stops_on_error_and_validates_all_rows_before_output ... ok
+test snapshot::resource_tests::m01_wide_strings_extreme_counts_and_encoded_growth_fail_before_allocation ... ok
+test storage::context::header_tests::sl02_missing_forged_duplicate_context_never_admits ... ok
+test storage::context::tests::gateway_expiry_requires_normalized_whole_seconds ... ok
+test storage::context::tests::sl01_stable_identity_rotation_and_prefix_isolation ... ok
+test storage::context::tests::sl02_sl06_strict_context_rejects_duplicates_unknown_fields_and_expiry ... ok
+test storage::registry::fixture_tests::sl02_fixture_rechecks_grant_and_retains_cloned_storage_lease ... ok
+test scheduling::tests::u03_seed_343687_membership_memory_drain_and_retry_conservation ... ok
+test storage::registry::tests::sl02_control_overlap_capacity_and_release ... ok
+test storage::s3::live_context_probe::explicit_context_first_use ... ignored, requires explicitly authorized fresh live S3 fixture
+test worker_pool::scheduling_tests::c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop ... ok
+test worker_pool::scheduling_tests::f03_pool_stop_wakes_download_memory_waiter ... ok
+test worker_pool::scheduling_tests::m02_m03_f03_two_buffered_requests_terminate_under_memory_pressure ... ok
+test storage::registry::sdk_tests::sl02_sdk_grant_is_explicit_and_storage_clone_retains_charge ... ok
+test node::runtime::shared_tests::sl01_first_use_absent_catalog_two_workers_metadata_create_and_list ... ok
+test scheduling::coordinator_stage_tests::q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes ... ok
+test request_queue::tests::q01_thousand_accepted_identities_terminate_once ... ok
+test node::payload_stream::send_tests::escaped_get_streams_between_distinct_pools ... ok
+test node::auth::replay::tests::actual_identity_limits_existing_progress_and_no_eviction ... ok
+test cluster::drain::stop::tests::saturation_spends_reserved_credit_without_new_admission ... ok
+
+test result: ok. 569 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 28.99s
+
+     Running unittests src/main.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/nabedra_db-0782dd7c81d6a072)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/api.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/api-29e80f134be9b05d)
+
+running 4 tests
+test authentication_overload_and_queue_do_not_poll_bodies_early ... ok
+test cancelled_handler_retains_mutation_and_drain_until_completion ... ok
+test framing_protocol_errors_and_strict_request_ids ... ok
+test inclusive_body_limit_and_unreadable_frames ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+
+     Running tests/cli.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/cli-e5ea815560db8f2d)
+
+running 4 tests
+test partition_size_spellings_allow_default_and_explicit_workers ... ok
+test documented_commands_parse_into_existing_options ... ok
+test command_shape_typed_inputs_and_clap_controls ... ok
+test partition_size_cli_rejects_invalid_values_and_shows_alias ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/commit.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/commit-266c2f4bf8ad5c7e)
+
+running 10 tests
+test reconciliation_keeps_lock_and_next_session_loads_fresh_catalog ... ok
+test malformed_candidates_and_overflow_never_write ... ok
+test ambiguous_catalog_is_confirmed_only_by_commit_uuid ... ok
+test multiple_objects_finish_before_one_catalog_put_and_failure_keeps_old_catalog ... ok
+test snapshot_then_catalog_and_drop_use_fresh_revision_and_uuid ... ok
+test partition_references_and_complete_catalog_are_validated_before_any_upload ... ok
+test partition_catalog_conflict_and_ambiguity_keep_existing_outcomes ... ok
+test snapshot_failures_never_publish_and_catalog_conflict_preserves_orphan ... ok
+test migration_reuse_range_expansion_empty_and_drop_need_only_new_objects ... ok
+test bounded_catalog_and_immutable_partition_keys_precede_publication ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.14s
+
+     Running tests/config.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/config-b6ceb7eca6c52c9f)
+
+running 4 tests
+test worker_and_admission_bounds_allow_zero_queue ... ok
+test defaults_and_explicit_options_use_storage_namespace ... ok
+test required_environment_and_prefix_errors_are_sanitized_and_debug_redacts_token ... ok
+test tls_requires_readable_regular_file_pair ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/control_configuration.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/control_configuration-6202a081d57c4713)
+
+running 7 tests
+test outgoing_paths_are_preserved_and_diagnostics_are_static ... ok
+test s3_requires_feature_and_exact_bucket_options ... ok
+test full_timing_defaults_and_relations_are_checked_on_decode_and_encode ... ok
+test strict_objects_required_nulls_duplicates_and_integer_tokens ... ok
+test round_trip_and_canonical_fingerprint_preserve_complete_outgoing_template ... ok
+test advertised_and_bind_authorities_have_distinct_port_and_path_rules ... ok
+test constructed_candidates_enforce_paths_capacities_and_encoded_limits ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/control_decision.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/control_decision-ba8ec11712fb1792)
+
+running 5 tests
+test terminal_success_errors_and_independent_policy_revision ... ok
+test metadata_relationships_canonical_ids_and_encode_parity ... ok
+test error_allowlist_and_string_only_outcome ... ok
+test strict_original_nested_shapes_and_integer_tokens ... ok
+test exact_megabyte_bodies_outer_quoting_and_limits ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s
+
+     Running tests/control_member.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/control_member-d04c2bccc14b4de3)
+
+running 4 tests
+test strict_shapes_required_nulls_and_numeric_spellings ... ok
+test lifecycle_records_roundtrip_without_discarding_recovery_state ... ok
+test limits_allow_maximum_fields_and_bound_input_before_parsing ... ok
+test local_invariants_reject_inconsistent_candidates_on_decode_and_encode ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/control_state.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/control_state-4139811222211b98)
+
+running 10 tests
+test initial_roots_and_independent_sequences_roundtrip ... ok
+test generation_two_requires_worker_semantic_identity ... ok
+test credits_follow_retained_witnesses_instead_of_phase_or_stop_result ... ok
+test cross_bindings_incarnations_external_members_and_late_recovery ... ok
+test policy_lease_nested_strictness_and_template_hash_use_real_codecs ... ok
+test strict_objects_nulls_numbers_and_identities ... ok
+test independent_corruptions_reject_decode_and_constructed_encode ... ok
+test bounds_and_diagnostics_are_sanitized ... ok
+test fleet_first_stops_preserve_reserved_capacity ... ok
+test saturated_reservations_allow_growth_and_first_stop_but_refuse_extra_identity ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+     Running tests/control_store.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/control_store-604f5ae61d24b8e2)
+
+running 9 tests
+test two_creators_read_absence_then_actual_cas_selects_one ... ok
+test creates_once_reloads_and_preserves_later_existing_root ... ok
+test lost_response_and_empty_ack_reconcile_without_resubmitting ... ok
+test invalid_initial_state_rejects_before_any_io_even_with_existing_root ... ok
+test unresolved_possible_write_stays_ambiguous_and_conflict_keeps_read_error ... ok
+test empty_ack_and_expired_reconciliation_never_authorize_another_create ... ok
+test bounded_complete_original_reads_reject_corruption_and_empty_tokens ... ok
+test absolute_deadline_bounds_get_body_and_possibly_applied_create ... ok
+test retained_root_without_new_admission_room_still_loads_unchanged ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.56s
+
+     Running tests/decision.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/decision-f63f7cea7633d815)
+
+running 5 tests
+test cluster_catalog_requires_head_and_keeps_standalone_separate ... ok
+test exact_bodies_noops_and_terminal_errors_roundtrip ... ok
+test legacy_and_partition_manifest_validation_is_shared ... ok
+test rejects_nonterminal_uncorrelated_and_malformed_records ... ok
+test independent_bounds_and_escaping_above_control_limit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.95s
+
+     Running tests/engine_catalog.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/engine_catalog-275bc186517c9a85)
+
+running 3 tests
+test creation_publishes_only_catalog_with_empty_partition_manifest ... ok
+test fresh_sorted_reads_and_rejected_creates_preserve_catalog ... ok
+test drop_retains_snapshot_and_stale_identity_while_read_failures_never_reset ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/engine_dispatch.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/engine_dispatch-d208cf8a05c922c5)
+
+running 2 tests
+test dispatch_preserves_errors_and_uncertain_publication ... ok
+test parsed_workflow_dispatches_all_thirteen_wire_shapes ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/engine_read.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/engine_read-6f635fcacfebc202)
+
+running 4 tests
+test captured_snapshot_completes_across_update_drop_and_name_reuse ... ok
+test partition_workers_capture_across_drop_and_drain_after_error ... ok
+test mixed_get_composed_query_count_and_metadata_explain ... ok
+test fresh_reads_validate_before_data_and_explain_needs_no_snapshot ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/engine_write.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/engine_write-88138c5442e87cb1)
+
+running 8 tests
+test concurrent_clones_serialize_before_loading_catalog ... ok
+test legacy_noop_stays_legacy_then_changed_rows_migrate ... ok
+test retained_metadata_counts_toward_global_candidate_limits ... ok
+test utf8_keys_route_by_typed_order_and_reuse_adjacent_files ... ok
+test mutation_workers_overlap_and_drain_without_publication_on_error ... ok
+test batches_are_atomic_and_no_ops_skip_all_puts ... ok
+test workflow_persists_rows_and_exact_results ... ok
+test candidate_limit_precedes_put_and_publication_uncertainty_propagates ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/executor.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/executor-309e62a7e5a3f880)
+
+running 4 tests
+test validates_capacity_and_releases_unused_admissions_with_zero_queue ... ok
+test disconnect_keeps_permits_until_awaited_blocking_work_finishes ... ok
+test limits_active_closures_and_drains_disconnected_queued_work ... ok
+test results_and_panics_are_visible_and_release_capacity ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/fenced_requests.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/fenced_requests-0baf199614061fac)
+
+running 8 tests
+test r05_v3_explicit_migration_preserves_tables_and_decision_history ... ok
+test t05_delayed_old_put_after_cold_fence_fails_same_cas ... ok
+test r05_bootstrap_requires_explicit_migration_even_for_empty_existing_v3 ... ok
+test r04_bootstrap_creates_v4_directly_attaches_and_cold_fences_once ... ok
+test t04_t05_applied_put_before_cold_fence_survives_lost_reply ... ok
+test t03_concurrent_local_creates_recompute_cas_loser ... ok
+test t03_t06_local_identified_workflow_replay_noops_and_atomic_batch ... ok
+test t01_t02_local_upload_failure_leaves_entire_prior_catalog_visible ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/health.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/health-8b7cb828ec3f3af9)
+
+running 3 tests
+test live_needs_no_authentication_or_storage_access ... ok
+test readiness_reads_fresh_validated_catalogs_without_writes ... ok
+test readiness_times_out_a_gated_read_while_live_stays_available ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+
+     Running tests/history.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/history-b357fcaf4422ff83)
+
+running 11 tests
+test applied_lost_responses_reconcile_without_second_put ... ok
+test concurrent_create_and_migration_use_backend_cas ... ok
+test sl05_explicit_owned_migration_keeps_reachable_decisions ... ok
+test invalid_roots_and_failed_reconciliation_never_reset_state ... ok
+test sl02_warm_catalog_does_not_authorize_denied_backing_objects ... ok
+test reachable_terminal_replay_identity_conflict_orphan_and_absence ... ok
+test initialize_attach_and_migrate_preserve_exact_legacy_identity ... ok
+test sl05_owner_cluster_is_conditional_and_legacy_migration_is_explicit ... ok
+test sl05_t05_old_publication_cannot_cross_owned_catalog_cold_fence ... ok
+test corrupt_missing_partial_relationships_and_budgets_never_prove_absence ... ok
+test unreadable_roots_and_slow_or_partial_history_fail_safely ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/http_store.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/http_store-6a2be6fa422353d6)
+
+running 6 tests
+test canonical_metadata_allowlist ... ok
+test constructor_rejects_unsafe_configuration_locally ... ok
+test actual_service_cas_restart_bounds_and_guards ... ok
+test tls_requires_trusted_ca_and_retains_verification ... ok
+test api_reopens_persisted_partitions_and_preserves_query_and_batch_atomicity ... ok
+test incomplete_and_malformed_responses_never_claim_success_or_retry ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/node_frame.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/node_frame-4c09f311df7a7e61)
+
+running 5 tests
+test cancelling_partial_io_poisons_reader_and_writer ... ok
+test truncation_trailing_bytes_and_io_failure_poison ... ok
+test fragmented_header_payload_and_eof_proof ... ok
+test invalid_declared_headers_fail_without_payload_or_eof ... ok
+test binary_roundtrip_and_exact_bounds ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+
+     Running tests/node_job.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/node_job-147039ac29c71e1d)
+
+running 6 tests
+test task_and_result_round_trips_preserve_scalar_types ... ok
+test rejects_mismatch_and_invalid_control_records ... ok
+test nested_wire_objects_and_error_records_are_strict ... ok
+test preparation_metadata_and_mutation_contracts ... ok
+test internal_get_row_can_exceed_public_response_cap ... ok
+test preparation_metadata_stream_scales_and_requires_complete_cover ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s
+
+     Running tests/node_prepared.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/node_prepared-6fca7b1737aec00e)
+
+running 4 tests
+test transitions_counts_caps_and_quota_fail_closed_and_cleanup ... ok
+test unchanged_empty_and_verified_files_preserve_controls_and_ownership ... ok
+test construction_metadata_admission_and_abandoned_attempts ... ok
+test independent_file_validation_failures_poison_receiver ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/node_rows.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/node_rows-985761d3f0314884)
+
+running 5 tests
+test empty_source_scalar_edges_and_scratch_capacity ... ok
+test full_rows_roundtrip_and_empty_results ... ok
+test collect_checks_local_order_filter_keys_counts_and_constructed_controls ... ok
+test malformed_and_semantically_invalid_rows_fail ... ok
+test numeric_token_bound_and_large_escaped_get ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.90s
+
+     Running tests/node_spool.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/node_spool-e1654b160f5c4597)
+
+running 5 tests
+test sanitized_failures_creation_rollback_and_absent_file_cleanup ... ok
+test failed_deletion_keeps_quota_charged ... ok
+test budgets_and_failed_writers_recover_only_on_drop ... ok
+test concurrent_operations_share_bytes_and_file_slots ... ok
+test immutable_readers_are_bounded_independent_and_retain_ownership ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/oltp_replication.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_replication-9e3c6b244d927c54)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/oltp_storage.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/oltp_storage-56b51b7fae7962c5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/protocol.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/protocol-51f56efdc3fe93f8)
+
+running 8 tests
+test count_requests_and_results_have_no_legacy_table_ceiling ... ok
+test wire_enums_require_strings ... ok
+test schema_rows_and_exact_scalars ... ok
+test strict_shapes_and_operation_classification ... ok
+test query_limit_accepts_unbounded_integer_wire_syntax ... ok
+test operation_roundtrips_and_error_envelopes ... ok
+test scalar_syntax_survives_rows_and_nested_predicates ... ok
+test query_depth_and_limits_are_enforced ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/publication.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/publication-c4c992730843ebc9)
+
+running 10 tests
+test failed_reconciliation_after_applied_root_remains_unknown ... ok
+test immutable_collision_rejected_and_applied_lost_upload_confirmed_once ... ok
+test applied_a_loses_reply_after_b_commits_and_replays_through_b ... ok
+test orphan_and_incomplete_history_and_ambiguous_absence_are_safe ... ok
+test pending_original_is_fenced_by_same_id_recovery ... ok
+test atomic_tables_and_exact_replay_including_noop_and_error ... ok
+test shared_base_races_serialize_and_reconcile_request_identity ... ok
+test preparation_rejects_relationships_tables_and_bounds_without_puts ... ok
+test deadline_before_root_is_attempt_error_and_pending_root_is_unknown ... ok
+test encoded_root_bound_is_checked_before_upload ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+     Running tests/queue_catalog_events.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/queue_catalog_events-70cf169003b6f098)
+
+running 2 tests
+test u03_seeded_queue_resources_membership_and_fenced_catalog_match_serial_oracle ... ok
+test u01_q01_q02_cpu_saturated_local_router_retains_every_accepted_query ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.10s
+
+     Running tests/queued_api.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/queued_api-78ef9a89afc334cf)
+
+running 5 tests
+test a01_local_fixed_worker_explicitly_rejects_provisioning_without_changing_work ... ok
+test q04_q05_u01_accepted_work_outlives_its_transport_and_deduplicates ... ok
+test q02_q04_f03_task_admission_precedes_acceptance_and_actor_memory_survives_disconnect ... ok
+test r05_cold_fence_prevents_a_paused_local_read_from_settling_as_success ... ok
+test q06_r04_receipts_reconcile_commits_and_expired_reads_are_explicit ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/rename_compatibility.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/rename_compatibility-f6f3222e5014e3fd)
+
+running 1 test
+test existing_storage_identity_and_template_fingerprints_survive_rename ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/response.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/response-1a65d827e8c0ce6e)
+
+running 3 tests
+test ordinary_envelopes_preserve_framing_status_and_request_id ... ok
+test failures_are_sanitized_and_preserve_certainty ... ok
+test limit_counts_complete_utf8_envelope_and_accepts_exact_boundary ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.80s
+
+     Running tests/runtime.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/runtime-78a95a4e83b257be)
+
+running 4 tests
+test engine_clones_retain_config_and_share_worker_threads ... ok
+test r04_startup_rejects_missing_migration_and_cold_confirmation_before_ingress ... ok
+test u01_startup_initializes_the_same_local_run_before_readiness ... ok
+test shutdown_closes_listener_and_waits_for_detached_engine_work ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/snapshot.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/snapshot-515be11ae62e11cc)
+
+running 9 tests
+test partition_empty_singleton_and_invalid_inputs ... ok
+test invalid_rows_and_stored_data_are_sanitized ... ok
+test oversized_metadata_and_string_page_fail_before_arrow_allocation ... ok
+test stored_null_nonfinite_duplicates_and_wrong_physical_type ... ok
+test roundtrip_and_closed_empty_file ... ok
+test partition_splits_preserve_typed_order_ranges_and_payload ... ok
+test roundtrip_full_128_column_schema ... ok
+test row_and_payload_limits ... ok
+test partition_real_hard_cap_splits_multiple_rows_and_rejects_singleton ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+     Running tests/startup.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/startup-b5063762cf406496)
+
+running 2 tests
+test installed_command_identity_and_version ... FAILED
+test parser_and_invalid_startup_exit_without_aws ... ok
+
+failures:
+
+---- installed_command_identity_and_version stdout ----
+
+thread 'installed_command_identity_and_version' (6229000) panicked at tests/startup.rs:18:5:
+assertion `left == right` failed
+  left: "nabedra-db 0.1.1 olap"
+ right: "nabedra-db 0.1.1"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    installed_command_identity_and_version
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.23s
+
+error: test failed, to rerun pass `--test startup`

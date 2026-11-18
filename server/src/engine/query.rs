@@ -7,10 +7,9 @@
 //! serialized string. HTTP must also bound its
 //! final envelope, whose request ID and wrapper consume additional bytes.
 use crate::protocol::{
-    ComparisonOp, ErrorCode, LogicalPredicate, MAX_BODY_BYTES, MAX_RESULT_ROWS, Outcome, Predicate,
-    ProtocolError, Query, Row, Scalar, TableDescriptor,
+    ErrorCode, MAX_BODY_BYTES, MAX_RESULT_ROWS, Outcome, ProtocolError, Query, Row, TableDescriptor,
 };
-use std::cmp::Ordering;
+pub(crate) use crate::query_semantics::{compare_rows, matches_filter};
 use std::io::{self, Write};
 
 /// Filter, order, limit, then project. Oversized results fail without truncation.
@@ -51,17 +50,6 @@ pub(crate) fn reduce_collect(
 ) -> Result<Vec<Row>, ProtocolError> {
     crate::snapshot::check_rows_memory(table, rows, 0)?;
     finish_collect(table, query, rows.iter().collect())
-}
-
-pub(crate) fn compare_rows(table: &TableDescriptor, query: &Query, a: &Row, b: &Row) -> Ordering {
-    let key_order = || compare(&a[&table.key], &b[&table.key]);
-    match &query.order_by {
-        Some(order) => {
-            let cmp = compare(&a[&order.column], &b[&order.column]);
-            (if order.desc { cmp.reverse() } else { cmp }).then_with(key_order)
-        }
-        None => key_order(),
-    }
 }
 
 fn finish_collect(
@@ -155,50 +143,6 @@ fn limited_len(len: usize, limit: Option<u64>) -> usize {
     limit
         .and_then(|n| usize::try_from(n).ok())
         .map_or(len, |n| len.min(n))
-}
-
-pub(crate) fn matches_filter(query: &Query, row: &Row) -> bool {
-    query
-        .filter
-        .as_ref()
-        .is_none_or(|p| matches_predicate(p, row))
-}
-
-fn matches_predicate(predicate: &Predicate, row: &Row) -> bool {
-    match predicate {
-        Predicate::Comparison(p) => {
-            let cmp = compare(&row[&p.column], &p.value);
-            match p.op {
-                ComparisonOp::Eq => cmp == Ordering::Equal,
-                ComparisonOp::Ne => cmp != Ordering::Equal,
-                ComparisonOp::Gt => cmp == Ordering::Greater,
-                ComparisonOp::Ge => cmp != Ordering::Less,
-                ComparisonOp::Lt => cmp == Ordering::Less,
-                ComparisonOp::Le => cmp != Ordering::Greater,
-            }
-        }
-        Predicate::Logical(LogicalPredicate::And { args }) => {
-            args.iter().all(|p| matches_predicate(p, row))
-        }
-        Predicate::Logical(LogicalPredicate::Or { args }) => {
-            args.iter().any(|p| matches_predicate(p, row))
-        }
-        Predicate::Logical(LogicalPredicate::Not { arg }) => !matches_predicate(arg, row),
-    }
-}
-
-fn compare(a: &Scalar, b: &Scalar) -> Ordering {
-    match (a, b) {
-        (Scalar::Utf8(a), Scalar::Utf8(b)) => a.cmp(b),
-        (Scalar::Int64(a), Scalar::Int64(b)) => a.cmp(b),
-        (Scalar::Bool(a), Scalar::Bool(b)) => a.cmp(b),
-        // Numeric comparison makes both zero signs equal. Snapshot validation
-        // guarantees finite floats, so unordered comparison is impossible.
-        (Scalar::Float64(a), Scalar::Float64(b)) => {
-            a.partial_cmp(b).expect("schema-valid finite floats")
-        }
-        _ => unreachable!("validated query and schema-valid rows have matching types"),
-    }
 }
 
 fn error(code: ErrorCode, message: &str) -> ProtocolError {

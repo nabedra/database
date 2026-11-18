@@ -1,0 +1,80 @@
+   Compiling nabedra-database v0.1.1 (/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-oltp-engine-plan/server)
+    Finished `test` profile [unoptimized] target(s) in 20.28s
+     Running unittests src/lib.rs (/Users/antoniopenapena/Documents/ResearchProjects/AI/nabedra-database/server/target/debug/deps/nabedra_database_server-78a7c74a9dd6b50c)
+
+running 72 tests
+test oltp::codec::tests::o03_integer_extrema_and_utf8_boundaries_keep_logical_order ... ok
+test oltp::state_machine::tests::o02_o11_replica_identity_and_public_mutation_helpers_cannot_bypass_consensus ... ok
+test oltp::tests::c07_raw_preparation_checks_mutation_flag_and_cancelled_waiters_release_ownership ... ok
+test oltp::tests::f02_o10_panic_after_durable_write_stays_unknown_and_reconciles ... ok
+test oltp::tests::c01_cli_runtime_dispatches_seven_native_threads_before_barrier_release ... ok
+test oltp::state_machine::tests::o15_r04_r05_consensus_fence_orders_prior_commits_and_rejects_late_old_work ... ok
+test oltp::tests::f02_panic_inside_unit_writer_mutex_does_not_disable_future_mutations ... ok
+test oltp::tests::o01_o03_constructed_nonfinite_rows_fail_validation_before_serialization ... ok
+test oltp::tests::f03_cancelled_execution_retains_external_charge_until_native_work_settles ... ok
+test oltp::tests::m01_f01_preflight_rejects_memory_without_partial_write_and_releases_slot ... ok
+test oltp::state_machine::tests::o08_o10_o11_replicated_commands_are_deterministic_atomic_and_deduplicated ... ok
+test oltp_replication::wire_tests::externally_tagged_commands_preserve_all_scalar_wire_types ... ok
+test oltp_runtime::queue::tests::c02_resources_file_cannot_advertise_more_than_cli_executor_capacity ... ok
+test oltp_replication::log::tests::o11_log_state_uses_one_native_snapshot_across_concurrent_purge ... ok
+test oltp_replication::log::tests::f03_cancelled_log_owner_retains_native_resources_until_settled ... ok
+test oltp::tests::o07_o11_prepared_batch_is_private_and_old_snapshot_pins_schema_and_rows ... ok
+test oltp::state_machine::tests::o11_o16_snapshot_staging_preserves_consensus_keys_and_old_read_pins ... ok
+test oltp_replication::log::tests::o10_o11_uncertain_log_write_blocks_every_handle_until_reopen ... ok
+test oltp_runtime::queue::tests::c07_o22_waiting_writers_hold_no_compute_and_read_control_progress ... ok
+test oltp_runtime::queue::tests::o29_q06_t04_matching_durable_proof_settles_reconciling_receipt_once ... ok
+test partition_size::tests::quantities_require_integral_positive_bounded_and_complete_input ... ok
+test partition_size::tests::units_use_si_and_iec_byte_arithmetic ... ok
+test oltp_runtime::queue::tests::q02_q05_rf1_bounded_admission_and_duplicate_identity ... ok
+test request_queue::tests::q02_count_and_bytes_are_independent_and_no_partial_install ... ok
+test request_queue::tests::q03_replication_precedes_acceptance_and_pin_precedes_execution ... ok
+test request_queue::tests::q03_stale_ack_cannot_prove_new_pinned_record_installed ... ok
+test request_queue::tests::q04_q05_disconnect_ownership_dedup_and_conflict ... ok
+test request_queue::tests::q06_expiration_keeps_identity_and_never_reexecutes ... ok
+test request_queue::tests::q06_result_cap_settles_explicit_unavailability_without_losing_identity ... ok
+test request_queue::tests::q06_terminal_state_cannot_be_rewritten_by_newer_record ... ok
+test request_queue::tests::r01_r02_r03_survivor_takeover_and_join_preserve_every_record ... ok
+test request_queue::tests::r03_join_capacity_failure_is_atomic ... ok
+test oltp_runtime::queue::tests::o29_uncertainty_keeps_admission_body_and_receipt_until_authoritative_reopen ... ok
+test request_queue::tests::r03_paged_copy_reports_completion_for_empty_and_final_pages ... ok
+test request_queue::tests::r04_cold_run_abandons_old_memory_without_replaying ... ok
+test request_queue::tests::r05_stale_record_and_term_cannot_replace_surviving_copy ... ok
+test request_queue::tests::sl02_context_replacement_and_forgery_are_rejected_on_replica ... ok
+test request_queue::tests::sl03_q03_r03_complete_context_recovers_after_expiry_without_renewal ... ok
+test request_queue::tests::sl01_q05_storage_identity_and_rotation_preserve_original_snapshot ... ok
+test scheduling::coordinator_stage_tests::q01_m02_coordinator_stages_wait_without_cpu_and_preserve_child_ingress_headroom ... ok
+test oltp::tests::o29_o11_model_durable_but_unobserved_native_write_requires_reopen_before_absence_is_authoritative ... ok
+test scheduling::remote_placement_tests::c06_remote_io_balances_by_compute_capacity_without_reserving_cpu ... ok
+test scheduling::tests::c01_c02_heterogeneous_limits_and_impossible_work ... ok
+test request_queue::tests::sl04_q02_context_bytes_and_stable_scope_count_share_global_queue_budget ... ok
+test scheduling::tests::c03_drain_preserves_owned_work_and_reconfigure_reuses_node ... ok
+test scheduling::tests::c04_c07_remote_io_keeps_node_cap_without_holding_cpu ... ok
+test scheduling::tests::c05_equal_peers_progress_with_one_slot_per_fair_round ... ok
+test scheduling::tests::c07_f03_memory_only_io_and_cancelled_grants_settle_once ... ok
+test scheduling::tests::c07_remote_io_count_is_bounded_across_requests_and_refills ... ok
+test scheduling::tests::f03_close_wakes_memory_only_and_cpu_waiters ... ok
+test scheduling::tests::m01_precharged_compute_and_reconfiguration_preserve_task_ceiling ... ok
+test scheduling::tests::m02_queue_results_cpu_and_memory_share_one_ceiling ... ok
+test scheduling::tests::m03_aging_earmarks_memory_after_thirty_two_grants ... ok
+test scheduling::tests::m03_f03_retained_growth_rejects_cycles_but_fresh_waiters_progress ... ok
+test scheduling::tests::m03_same_request_can_wait_for_in_flight_sibling_memory ... ok
+test scheduling::tests::m03_waiters_registered_before_first_grant_cannot_form_a_cycle ... ok
+test scheduling::tests::c04_caps_include_reducers_across_hundred_jobs ... ok
+test oltp_runtime::queue::tests::r04_rf1_queued_work_is_abandoned_after_last_runtime_stops ... ok
+test storage::context::header_tests::sl02_missing_forged_duplicate_context_never_admits ... ok
+test storage::context::tests::gateway_expiry_requires_normalized_whole_seconds ... ok
+test storage::context::tests::sl01_stable_identity_rotation_and_prefix_isolation ... ok
+test storage::context::tests::sl02_sl06_strict_context_rejects_duplicates_unknown_fields_and_expiry ... ok
+test oltp_runtime::queue::tests::q06_r04_rf1_decisions_survive_run_and_queries_expire ... ok
+test worker_pool::scheduling_tests::f03_pool_stop_wakes_download_memory_waiter ... ok
+test worker_pool::scheduling_tests::m02_m03_f03_two_buffered_requests_terminate_under_memory_pressure ... ok
+test worker_pool::scheduling_tests::c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop ... ok
+test oltp_runtime::queue::tests::replica_engine_cannot_enter_standalone_runtime_or_bind_its_api ... ok
+test scheduling::tests::u03_seed_343687_conserves_resources_after_every_event ... ok
+test scheduling::tests::u03_seed_343687_membership_memory_drain_and_retry_conservation ... ok
+test scheduling::coordinator_stage_tests::q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes ... ok
+test request_queue::tests::q01_thousand_accepted_identities_terminate_once ... ok
+test oltp::state_machine::tests::o06_o11_openraft_official_storage_contract ... ok
+
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.38s
+

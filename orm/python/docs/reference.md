@@ -320,9 +320,12 @@ copy and cannot survive losing that process.
 
 Requests and responses are capped at 8 MiB of encoded JSON, including envelopes.
 Batches and collected results are capped at 10,000 rows, schemas at 128 columns,
-and server tables at 100,000 rows and 64 MiB of decoded row payload. Byte limits
-can be reached before row limits. The server remains authoritative for stored
-data and commit validation.
+and OLAP tables at 100,000 rows and 64 MiB of decoded row payload. OLTP does
+not apply these logical-table limits. Byte limits can be reached before row
+limits for bounded requests and results. The server remains authoritative for
+stored data and commit validation. `count()` accepts nonnegative counts above
+100,000 and still enforces the query's explicit limit. Older ORM releases reject
+larger counts and need an upgrade.
 
 The table/query methods remain synchronous; receipt submission and polling let
 clients release their connections while work runs. Keyed operations route to one

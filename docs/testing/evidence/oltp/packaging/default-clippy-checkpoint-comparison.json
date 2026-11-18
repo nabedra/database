@@ -1,0 +1,31 @@
+{
+  "source_tree_sha256": "f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff",
+  "exit_code": 101,
+  "baseline_summary_errors": 27,
+  "checkpoint_summary_errors": 23,
+  "baseline_emitted_diagnostics": 29,
+  "checkpoint_emitted_diagnostics": 24,
+  "added": [],
+  "removed": [
+    {
+      "message": "error: very complex type used. Consider factoring parts into `type` definitions",
+      "file": "src/request_queue.rs",
+      "count": 2
+    },
+    {
+      "message": "error: this function has too many arguments (9/7)",
+      "file": "src/scheduling.rs",
+      "count": 1
+    },
+    {
+      "message": "error: this `if` statement can be collapsed",
+      "file": "src/scheduling.rs",
+      "count": 1
+    },
+    {
+      "message": "error: items after a test module",
+      "file": "src/partition_size.rs",
+      "count": 1
+    }
+  ]
+}
