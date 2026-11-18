@@ -1,8 +1,8 @@
 use super::*;
 use crate::oltp::mvcc::store::{VerifiedParticipantResolution, VerifiedParticipantSeal};
-use crate::oltp_replication::authority::status::{CommitPermitStatement, StatusTopology};
-use crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage;
 use crate::oltp_replication::authority::status::identity::transaction::ColdRecoveryPage;
+use crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage;
+use crate::oltp_replication::authority::status::{CommitPermitStatement, StatusTopology};
 use crate::oltp_replication::authority::timestamp::cold::ColdApplicationPin;
 use crate::oltp_replication::authority::{
     status::{
@@ -12,6 +12,9 @@ use crate::oltp_replication::authority::{
     timestamp::{VerifiedArchiveClosure, archive::ArchiveClosureStatement},
 };
 use uuid::Uuid;
+
+const INSTALL_POINT_MANIFEST: u8 = 26;
+const POINT_MANIFEST_PAYLOAD_LIMIT: usize = 4096;
 
 // External tags preserve CanonicalJson's RawValue decoder.
 #[derive(Serialize, Deserialize)]
@@ -54,6 +57,7 @@ enum Request {
         digest: Digest,
         kind: RequestKind,
     },
+    InstallPointManifest(PointManifest),
     Begin {
         authority: Authority,
         txn: TxnId,
@@ -141,6 +145,7 @@ impl Request {
             Self::Lookup { request_id, .. }
             | Self::Reserve { request_id, .. }
             | Self::Retirement { request_id, .. } => Some(*request_id),
+            Self::InstallPointManifest(point) => Some(point.txn.request_id),
             Self::Begin { txn, .. }
             | Self::Page { txn, .. }
             | Self::Seal { txn, .. }
@@ -158,8 +163,11 @@ impl Request {
             Self::Reject { ticket } => Some(ticket.expected.reservation.request_id),
             Self::ColdRecovery { after, .. } => after.map(|txn| txn.request_id),
             Self::ColdApplicationPin { pin, .. } => Some(pin.reservation.request_id),
-            Self::Current | Self::Fence { .. } | Self::ArchiveCut { .. }
-            | Self::ArchiveDecisions { .. } | Self::ArchiveIdentities { .. }
+            Self::Current
+            | Self::Fence { .. }
+            | Self::ArchiveCut { .. }
+            | Self::ArchiveDecisions { .. }
+            | Self::ArchiveIdentities { .. }
             | Self::ArchiveMetadata { .. } => None,
         }
     }
@@ -174,6 +182,7 @@ impl Request {
             Self::Current => 0,
             Self::Lookup { .. } => 1,
             Self::Reserve { .. } => 2,
+            Self::InstallPointManifest(_) => INSTALL_POINT_MANIFEST,
             Self::Begin { .. } => 3,
             Self::Page { .. } => 4,
             Self::Seal { .. } => 5,
@@ -314,7 +323,15 @@ impl StatusEndpoint {
             Method::StatusCall { .. } => header.action == ServiceAction::Owner,
             _ => false,
         };
-        if !allowed {
+        if !allowed
+            || (matches!(
+                header.method,
+                Method::StatusCall {
+                    operation: INSTALL_POINT_MANIFEST,
+                    ..
+                }
+            ) && header.payload_bytes > POINT_MANIFEST_PAYLOAD_LIMIT as u64)
+        {
             return Err(invalid());
         }
         Ok(header)
@@ -346,7 +363,10 @@ impl StatusEndpoint {
             return Err(invalid());
         }
         let handle = &self.proof.handle;
-        if request.request_id().is_some_and(|id| self.topology.request(id) != handle.identity()) {
+        if request
+            .request_id()
+            .is_some_and(|id| self.topology.request(id) != handle.identity())
+        {
             return Err(invalid());
         }
         match &request {
@@ -421,6 +441,12 @@ impl StatusEndpoint {
                         .await?,
                 )
                 .await
+            }
+            Request::InstallPointManifest(point) => {
+                let installed = handle.install_point_manifest(point).await?;
+                encode(shared, installed)
+                    .await
+                    .map_err(point_manifest_uncertain)
             }
             Request::Begin {
                 authority,
@@ -612,7 +638,12 @@ impl StatusEndpoint {
                 let grant = self
                     .proof
                     .control
-                    .service_role(&scope, session.remote(), header.action, handle.identity().clone())
+                    .service_role(
+                        &scope,
+                        session.remote(),
+                        header.action,
+                        handle.identity().clone(),
+                    )
                     .await?;
                 if grant.ready != statement.ready {
                     return Err(invalid());
@@ -633,7 +664,11 @@ impl StatusEndpoint {
             }
             Request::Retirement { request_id, digest } => {
                 let proof = handle.retirement(request_id, digest).await?;
-                encode(shared, proof.map(VerifiedTerminalRetirement::into_certificate)).await
+                encode(
+                    shared,
+                    proof.map(VerifiedTerminalRetirement::into_certificate),
+                )
+                .await
             }
         }
     }
@@ -682,8 +717,12 @@ impl Endpoint for StatusEndpoint {
             let head = self.parse(&session, bytes.as_slice())?;
             let result = async {
                 let (request, owner): (Request, _) = decode(&self.proof.shared, sections).await?;
-                if let Request::Begin { result, .. } = &request {
-                    result.attach_charge(owner.clone())?;
+                match &request {
+                    Request::Begin { result, .. } => result.attach_charge(owner.clone())?,
+                    Request::InstallPointManifest(point) => {
+                        point.result.attach_charge(owner.clone())?
+                    }
+                    _ => {}
                 }
                 let result = self.dispatch(&session, &head, request).await;
                 drop(owner);
@@ -707,7 +746,9 @@ impl StatusClient {
         authority: Authority,
         pin: ColdApplicationPin,
     ) -> Result<bool, ProtocolError> {
-        let (settled, _) = self.value(Request::ColdApplicationPin { authority, pin }).await?;
+        let (settled, _) = self
+            .value(Request::ColdApplicationPin { authority, pin })
+            .await?;
         Ok(settled)
     }
 
@@ -716,8 +757,9 @@ impl StatusClient {
         authority: Authority,
         after: Option<TxnId>,
     ) -> Result<ColdRecoveryPage, ProtocolError> {
-        let (page, _): (ColdRecoveryPage, _) =
-            self.value(Request::ColdRecovery { authority, after }).await?;
+        let (page, _): (ColdRecoveryPage, _) = self
+            .value(Request::ColdRecovery { authority, after })
+            .await?;
         if page.after < after
             || !page.done && page.after == after
             || page.transaction.is_some_and(|txn| page.after != Some(txn))
@@ -895,6 +937,79 @@ impl StatusClient {
         }
         Ok(value)
     }
+    async fn try_point_manifest(
+        &self,
+        point: PointManifest,
+    ) -> Result<Option<(ManifestRef, Digest)>, ProtocolError> {
+        let preferred = self.client.leader.load(Ordering::Relaxed);
+        if self.client.action != ServiceAction::Owner || preferred == 0 {
+            return Ok(None);
+        }
+        let routes = self.client.control.replica_routes(self.identity()).await?;
+        let Some(member) = routes
+            .members
+            .iter()
+            .find(|member| member.node_id == preferred)
+        else {
+            return Ok(None);
+        };
+        let expected_result = MutationOutcome::from_success(&point.result)?.digest()?;
+        let request = Request::InstallPointManifest(point);
+        let method = request.method();
+        let shared = self.client.shared.clone();
+        let payload = self
+            .client
+            .shared
+            .execute(ExecutionClass::Control, preferred, 0, move || {
+                shared.encode_in(ByteClass::Progress, &request, POINT_MANIFEST_PAYLOAD_LIMIT)
+            })
+            .await?;
+        // Only a verified embedded legacy decoder error is safe here. A
+        // local reply-decoding error can have the same text after execution.
+        let reply = match self
+            .client
+            .call_member(
+                ServiceAction::Owner,
+                method,
+                &Some(payload),
+                member.node_id,
+                member.worker_id.into(),
+            )
+            .await
+        {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(error)) if error == invalid() => return Ok(None),
+            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => return Ok(None),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(error.into()),
+        }
+        .map_err(|error| {
+            if route_unavailable(&error) {
+                self.client.control.invalidate_replica_routes(&routes);
+                let _ = self.client.leader.compare_exchange(
+                    preferred,
+                    0,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+            point_manifest_uncertain(error)
+        })?;
+        let node = reply.node;
+        let ((manifest, result_digest), _): ((ManifestRef, Digest), _) = reply
+            .decoded(&self.client.shared)
+            .await
+            .map_err(point_manifest_uncertain)?;
+        if manifest.status_group_id != self.identity().group_id
+            || manifest.participant_count != 1
+            || result_digest != expected_result
+        {
+            return Err(point_manifest_uncertain(invalid()));
+        }
+        routes.record_successful_node(node);
+        Ok(Some((manifest, result_digest)))
+    }
+
     pub(crate) async fn begin_manifest(
         &self,
         authority: Authority,
@@ -1147,7 +1262,9 @@ impl StatusClient {
     ) -> Result<VerifiedTerminalRetirement, ProtocolError> {
         let statement = release.statement().clone();
         let response = self
-            .response(Request::Retire { statement: statement.clone() })
+            .response(Request::Retire {
+                statement: statement.clone(),
+            })
             .await?;
         let context = response.metadata_context()?;
         let (value, _): (RetirementCertificate, _) = response.decoded(self.resources()).await?;
@@ -1161,11 +1278,13 @@ impl StatusClient {
         let request = Request::Retirement { request_id, digest };
         let method = request.method();
         let payload = encode(self.resources(), request).await?;
-        let response = self.client
+        let response = self
+            .client
             .call_as(ServiceAction::QueueRetirement, method, Some(payload))
             .await?;
         let context = response.metadata_context()?;
-        let (value, _): (Option<RetirementCertificate>, _) = response.decoded(self.resources()).await?;
+        let (value, _): (Option<RetirementCertificate>, _) =
+            response.decoded(self.resources()).await?;
         VerifiedTerminalRetirement::from_lookup_service(context, value, request_id, digest)
     }
     pub(crate) async fn rejected_identity(
@@ -1188,6 +1307,11 @@ impl StatusClient {
         }
         VerifiedAdmissionRejection::from_lookup_service(context, actual)
     }
+}
+
+fn point_manifest_uncertain(mut error: ProtocolError) -> ProtocolError {
+    error.outcome = Outcome::Unknown;
+    error
 }
 
 impl StatusService for StatusClient {
@@ -1300,6 +1424,12 @@ impl StatusService for StatusClient {
         digest: Digest,
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>> {
         Box::pin(StatusClient::retirement(self, request_id, digest))
+    }
+    fn try_install_point_manifest<'a>(
+        &'a self,
+        point: PointManifest,
+    ) -> ConsensusFuture<'a, Option<(ManifestRef, Digest)>> {
+        Box::pin(async move { self.try_point_manifest(point).await })
     }
     fn begin_manifest<'a>(
         &'a self,
@@ -1439,5 +1569,256 @@ impl StatusService for StatusClient {
         txn: TxnId,
     ) -> ConsensusFuture<'a, VerifiedStatusDecision> {
         Box::pin(async move { StatusClient::abandon_fenced(self, authority, txn).await })
+    }
+}
+
+#[cfg(test)]
+mod point_manifest_tests {
+    use super::*;
+    use crate::{
+        config::{ExecutionConfig, WorkerResources},
+        oltp_runtime::{bootstrap::LocalServices, worker_endpoint::AuthorityReader},
+    };
+    use std::sync::atomic::AtomicBool;
+
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct StaleReadHint {
+        endpoint: Arc<StatusEndpoint>,
+        fail_next_hint: AtomicBool,
+        refused: AtomicBool,
+    }
+
+    impl Endpoint for StaleReadHint {
+        fn preflight<'a>(
+            &'a self,
+            session: &'a AuthenticatedSession,
+            header: &'a [u8],
+        ) -> EndpointFuture<'a, ReceivePlan> {
+            self.endpoint.preflight(session, header)
+        }
+
+        fn handle<'a>(
+            &'a self,
+            session: AuthenticatedSession,
+            header: ChargedBytes,
+            sections: ChargedSections,
+        ) -> EndpointFuture<'a, ChargedReply> {
+            Box::pin(async move {
+                let head: Header = serde_json::from_slice(header.as_slice()).unwrap();
+                if head.placement_generation.is_some()
+                    && head.method.can_repeat_read()
+                    && self.fail_next_hint.swap(false, Ordering::Relaxed)
+                {
+                    self.refused.store(true, Ordering::Relaxed);
+                    return Err(unavailable());
+                }
+                self.endpoint.handle(session, header, sections).await
+            })
+        }
+    }
+
+    /// O07/O10/O11. The direct Status RPC replays an old draft at every
+    /// prefix and validates the original page before returning a sealed ref.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn o07_o10_o11_point_manifest_replays_legacy_prefixes_and_rejects_changed_plan() {
+        tokio::time::timeout(Duration::from_secs(40), async {
+            let directory =
+                Directory(std::env::temp_dir().join(format!("point-status-{}", Uuid::new_v4())));
+            let services = LocalServices::open(
+                &directory.0,
+                "point_manifest",
+                WorkerResources {
+                    max_threads: 1,
+                    ..Default::default()
+                },
+                &ExecutionConfig::default(),
+                false,
+            )
+            .await
+            .unwrap();
+            let (node, endpoint) = services.status_endpoint_for_test().await.unwrap();
+            let endpoint = Arc::new(StaleReadHint {
+                endpoint,
+                fail_next_hint: AtomicBool::new(false),
+                refused: AtomicBool::new(false),
+            });
+            services
+                .manager
+                .replace_service_for_test(services.status.identity(), node, endpoint.clone())
+                .await
+                .unwrap();
+            let authority = services
+                .control
+                .current(&services.scope)
+                .await
+                .unwrap()
+                .ready
+                .view
+                .authority();
+            let client = StatusClient::new(
+                services.status.identity().clone(),
+                services.shared.clone(),
+                services.manager.client(),
+                services.control_client.clone(),
+                ServiceAction::Owner,
+            )
+            .unwrap();
+            let routes = services
+                .control_client
+                .replica_routes(client.identity())
+                .await
+                .unwrap();
+            assert_eq!(client.current_authority().await.unwrap(), Some(authority));
+            assert_eq!(routes.hinted_receiver(node), Some(services.local));
+            // O06/O14: an unavailable hinted receiver must trigger a fresh
+            // routing pass within the same read, even with unchanged membership.
+            endpoint.fail_next_hint.store(true, Ordering::Relaxed);
+            assert!(
+                client
+                    .inspect_transaction(TxnId {
+                        request_id: Uuid::new_v4(),
+                        attempt: 1,
+                    })
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(endpoint.refused.load(Ordering::Relaxed));
+            let read_ts = ReadTs::new(1).unwrap();
+            let plan = ParticipantPlan {
+                group: GroupIdentity {
+                    cluster_id: client.identity().cluster_id,
+                    database: client.identity().database.clone(),
+                    group_id: Uuid::new_v4(),
+                    kind: GroupKind::Data {
+                        table_id: Uuid::new_v4(),
+                        shard_id: Uuid::new_v4(),
+                    },
+                    group_format_version: client.identity().group_format_version,
+                },
+                schema_epoch: 1,
+                routing_epoch: 1,
+                read_ts,
+                write_root: Digest::from_bytes([42; 32]),
+                write_count: 1,
+                page_count: 1,
+            };
+            let result = CanonicalJson::from_serializable(&services.shared, &1_u64, 1024).unwrap();
+            for prefix in 0..=3 {
+                let request_id = Uuid::new_v4();
+                let digest = Digest::from_bytes([45; 32]);
+                client
+                    .reserve_identity(authority, request_id, digest, RequestKind::Mutation)
+                    .await
+                    .unwrap();
+                let txn = TxnId {
+                    request_id,
+                    attempt: 1,
+                };
+                let request = RequestBinding {
+                    run_id: authority.run_id,
+                    request_id,
+                    digest,
+                    accepted_context: Digest::from_bytes([46; 32]),
+                };
+                let point = |plan: ParticipantPlan| PointManifest {
+                    authority,
+                    txn,
+                    request,
+                    read_ts,
+                    plan,
+                    result: result.clone(),
+                };
+
+                let mut previous_manifest = None;
+                if prefix >= 1 {
+                    let draft = client
+                        .begin_manifest(authority, txn, request, read_ts, 1, result.clone())
+                        .await
+                        .unwrap();
+                    if prefix >= 2 {
+                        client
+                            .append_manifest_page(
+                                authority,
+                                txn,
+                                0,
+                                draft.initial_root,
+                                Page::new(vec![plan.clone()]).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    if prefix == 3 {
+                        previous_manifest =
+                            Some(client.seal_manifest(authority, txn).await.unwrap());
+                    }
+                }
+
+                let installed = client
+                    .try_install_point_manifest(point(plan.clone()))
+                    .await
+                    .unwrap()
+                    .expect("Status replica supports the combined request");
+                let (manifest, result_digest) = installed;
+                assert!(previous_manifest.is_none_or(|old| old == manifest));
+                assert_eq!(
+                    result_digest,
+                    MutationOutcome::from_success(&result)
+                        .unwrap()
+                        .digest()
+                        .unwrap()
+                );
+                assert_eq!(
+                    client
+                        .try_install_point_manifest(point(plan.clone()))
+                        .await
+                        .unwrap(),
+                    Some(installed),
+                );
+
+                let mut changed = plan.clone();
+                changed.write_root = Digest::from_bytes([43; 32]);
+                let error = client
+                    .try_install_point_manifest(point(changed))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.outcome, Outcome::Unknown);
+                let page = client.manifest_page(txn, manifest, None).await.unwrap();
+                assert_eq!(&*page.items, std::slice::from_ref(&plan));
+                assert!(page.done);
+            }
+
+            // The legacy decoder's unknown-variant refusal is an
+            // authenticated embedded error, distinct from a bad reply.
+            let routes = services
+                .control_client
+                .replica_routes(client.identity())
+                .await
+                .unwrap();
+            let member = &routes.members[0];
+            let unsupported = services
+                .shared
+                .copy_bytes_in(ByteClass::Progress, br#"{"UnsupportedPointManifest":{}}"#)
+                .unwrap();
+            assert!(matches!(
+                client.client.call_member(
+                    ServiceAction::Owner,
+                    Method::StatusCall { operation: INSTALL_POINT_MANIFEST, mutation: true },
+                    &Some(unsupported),
+                    member.node_id,
+                    member.worker_id.into(),
+                ).await,
+                Ok(Err(error)) if error == invalid(),
+            ));
+            services.shutdown().await.unwrap();
+        })
+        .await
+        .expect("Point manifest service watchdog");
     }
 }

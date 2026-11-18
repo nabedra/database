@@ -602,3 +602,19 @@ pub(crate) struct ServiceAuthorization {
     pub effective_authority: Authority,
     pub pending_ready: Option<ReadyMembership>,
 }
+
+pub(crate) fn stale_service_route() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "service receiver placement changed",
+        Outcome::NotApplied,
+    )
+}
+
+pub(crate) fn unsupported_service_route() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::UnsupportedOperation,
+        "service receiver placement check unavailable",
+        Outcome::NotApplied,
+    )
+}

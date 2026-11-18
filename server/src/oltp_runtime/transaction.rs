@@ -15,7 +15,7 @@ use crate::{
     },
     oltp_replication::{
         authority::{
-            status::{StatusService, VerifiedStatusDecision},
+            status::{PointManifest, StatusService, VerifiedStatusDecision},
             timestamp::TimestampService,
         },
         owned::OwnedCommand,
@@ -166,38 +166,60 @@ impl TransactionCoordinator {
                 })
             })
             .await?;
-        let mut draft = self
-            .status
-            .begin_manifest(
-                authority,
-                txn,
-                request,
-                read_ts,
-                prepared.participants.len() as u64,
-                prepared.result.clone(),
-            )
-            .await
-            .map_err(|error| stage(error, "begin manifest"))?;
-        let mut previous_root = draft.initial_root;
-        for (index, page) in prepared.participants.chunks(128).enumerate() {
-            draft = self
-                .status
-                .append_manifest_page(
+        let installed = if let [point] = prepared.participants.as_slice()
+            && PointManifest::qualifies(&point.plan, &prepared.result)
+        {
+            self.status
+                .try_install_point_manifest(PointManifest {
                     authority,
                     txn,
-                    index as u64,
-                    previous_root,
-                    Page::new(page.iter().map(|part| part.plan.clone()).collect())
-                        .map_err(|_| resource_limit())?,
+                    request,
+                    read_ts,
+                    plan: point.plan.clone(),
+                    result: prepared.result.clone(),
+                })
+                .await
+                .map_err(|error| stage(error, "point manifest"))?
+        } else {
+            None
+        };
+        let (manifest, result_digest) = if let Some(installed) = installed {
+            installed
+        } else {
+            let mut draft = self
+                .status
+                .begin_manifest(
+                    authority,
+                    txn,
+                    request,
+                    read_ts,
+                    prepared.participants.len() as u64,
+                    prepared.result.clone(),
                 )
-                .await?;
-            previous_root = draft.current_root;
-        }
-        let manifest = self
-            .status
-            .seal_manifest(authority, txn)
-            .await
-            .map_err(|error| stage(error, "seal manifest"))?;
+                .await
+                .map_err(|error| stage(error, "begin manifest"))?;
+            let mut previous_root = draft.initial_root;
+            for (index, page) in prepared.participants.chunks(128).enumerate() {
+                draft = self
+                    .status
+                    .append_manifest_page(
+                        authority,
+                        txn,
+                        index as u64,
+                        previous_root,
+                        Page::new(page.iter().map(|part| part.plan.clone()).collect())
+                            .map_err(|_| resource_limit())?,
+                    )
+                    .await?;
+                previous_root = draft.current_root;
+            }
+            let manifest = self
+                .status
+                .seal_manifest(authority, txn)
+                .await
+                .map_err(|error| stage(error, "seal manifest"))?;
+            (manifest, draft.result_digest)
+        };
         let preparation = async {
             for participant in &prepared.participants {
                 let mut previous = store::initial_root(txn, &participant.plan)?;
@@ -232,7 +254,7 @@ impl TransactionCoordinator {
                 }
                 let reply = participant
                     .participant
-                    .seal(authority, txn, manifest, draft.result_digest)
+                    .seal(authority, txn, manifest, result_digest)
                     .await?;
                 if !matches!(reply.reply, ParticipantReply::Sealed(_)) {
                     return Err(conflict());

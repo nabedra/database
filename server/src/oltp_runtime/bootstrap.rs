@@ -85,6 +85,47 @@ impl Drop for LocalServices {
     }
 }
 impl LocalServices {
+    #[cfg(test)]
+    pub(crate) async fn status_endpoint_for_test(
+        &self,
+    ) -> Result<
+        (
+            u64,
+            Arc<crate::oltp_replication::service_rpc::StatusEndpoint>,
+        ),
+        ProtocolError,
+    > {
+        use crate::oltp_replication::{
+            authority::status::StatusTopology, service_rpc::StatusEndpoint,
+        };
+        let group = self.status.identity();
+        let routes = self.control_client.replica_routes(group).await?;
+        let [member] = routes.members.as_slice() else {
+            return Err(unavailable());
+        };
+        let pool = self.pools.get(member.pool_id)?.ok_or_else(unavailable)?;
+        let store = pool.group(group.clone()).await?;
+        let running = self
+            .manager
+            .start_status(
+                store.clone(),
+                member.clone(),
+                BTreeMap::from([(member.node_id, member.clone())]),
+                raft_config(),
+            )
+            .await?;
+        let handle = StatusHandle::new(StatusMachine::new(store)?, running);
+        let endpoint = StatusEndpoint::new(
+            handle,
+            member.node_id,
+            self.control_client.clone(),
+            self.manager.client(),
+            self.timestamps.identity().clone(),
+            StatusTopology::new(vec![group.clone()])?,
+        )?;
+        Ok((member.node_id, endpoint))
+    }
+
     pub(crate) async fn open(
         path: &Path,
         database: &str,

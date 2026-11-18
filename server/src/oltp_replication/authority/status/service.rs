@@ -14,6 +14,28 @@ use crate::oltp_replication::{
 };
 use std::sync::Arc;
 use uuid::Uuid;
+/// A bounded service request. Its three durable commands retain their existing
+/// wire formats, fencing checks, page receipts and applied-position semantics.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PointManifest {
+    pub authority: Authority,
+    pub txn: TxnId,
+    pub request: RequestBinding,
+    pub read_ts: ReadTs,
+    pub plan: ParticipantPlan,
+    pub result: CanonicalJson,
+}
+
+impl PointManifest {
+    pub(crate) fn qualifies(plan: &ParticipantPlan, result: &CanonicalJson) -> bool {
+        matches!(plan.group.kind, GroupKind::Data { .. })
+            && plan.write_count == 1
+            && plan.page_count == 1
+            && result.as_str().len() <= 256
+    }
+}
+
 pub(crate) trait StatusService: Send + Sync {
     fn native_archive_page<'a>(
         &'a self,
@@ -81,6 +103,12 @@ pub(crate) trait StatusService: Send + Sync {
         request_id: Uuid,
         digest: Digest,
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>>;
+    fn try_install_point_manifest<'a>(
+        &'a self,
+        _point: PointManifest,
+    ) -> ConsensusFuture<'a, Option<(ManifestRef, Digest)>> {
+        Box::pin(async { Ok(None) })
+    }
     fn begin_manifest<'a>(
         &'a self,
         authority: Authority,

@@ -21,13 +21,13 @@ pub(crate) use identity::{
 };
 pub(crate) use identity::{
     IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage, RejectedIdentity,
-    RequestKind, SealedAdmissionRejection, StatusCommand, StatusFault, StatusHandle, StatusMachine,
-    StatusReply, TerminalIdentity, TransactionInspection, VerifiedAdmissionRejection,
-    RetirementCertificate, VerifiedTerminalRetirement,
+    RequestKind, RetirementCertificate, SealedAdmissionRejection, StatusCommand, StatusFault,
+    StatusHandle, StatusMachine, StatusReply, TerminalIdentity, TransactionInspection,
+    VerifiedAdmissionRejection, VerifiedTerminalRetirement,
 };
 pub(crate) use outcome::MutationOutcome;
 pub(crate) use routing::{PartitionedStatus, StatusTopology};
-pub(crate) use service::StatusService;
+pub(crate) use service::{PointManifest, StatusService};
 
 /// Produced only after the Status leader has strongly read every participant's
 /// immutable sealed evidence. A timestamp allocation is not itself COMMIT.

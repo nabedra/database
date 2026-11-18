@@ -527,6 +527,152 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
 }
 
 #[tokio::test]
+async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool).await;
+    fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let ready = fixture.add_ready(owner, &mut Vec::new()).await;
+    let receiver = fixture.enroll(2).await;
+    let member = ReplicaMember {
+        node_id: 41,
+        worker_id: receiver.worker_id,
+        pool_id: Uuid::new_v4(),
+    };
+    let original = fixture
+        .register_group(GroupKind::Timestamps, vec![member.clone()])
+        .await;
+    let generation = Uuid::new_v4();
+    let successor = ReplicaMember {
+        node_id: 42,
+        pool_id: Uuid::new_v4(),
+        ..member.clone()
+    };
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginGroupReplacement {
+                operation_id: Uuid::new_v4(),
+                generation,
+                expected: original.clone(),
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![successor.clone()]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+
+    let model = Arc::new(NativeModelConsensus {
+        machine: fixture.machine.clone(),
+        next: AtomicU64::new(fixture.next),
+        reads: AtomicU64::new(0),
+    });
+    let handle = ControlHandle::new(
+        fixture.machine.clone(),
+        model.clone(),
+        OperatorPolicy {
+            policy: authorization().policy,
+            certificate_pins: Default::default(),
+        },
+    );
+    let queue_scope = QueueScope {
+        cluster_id: scope.cluster_id,
+        database: scope.database,
+    };
+    let check = |receiver, node, generation| {
+        handle.service_role_at_replica(
+            &queue_scope,
+            owner,
+            original.identity.clone(),
+            receiver,
+            node,
+            generation,
+        )
+    };
+    assert_eq!(
+        check(receiver, member.node_id, original.generation)
+            .await
+            .unwrap()
+            .owner,
+        Some(owner)
+    );
+    assert_eq!(model.reads.swap(0, Ordering::Relaxed), 1);
+    assert_eq!(
+        check(receiver, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::SealGroup {
+                operation_id: Uuid::new_v4(),
+                generation,
+                proof: GroupMembershipStamp {
+                    group: original.identity.clone(),
+                    generation,
+                    replica_count: 1,
+                    replica_root: group_root(1, group_step(group_seed(), &successor)),
+                    applied_at: AppliedPosition {
+                        index: original.membership_position.index + 1,
+                        ..original.membership_position
+                    },
+                    authority: ready.view.authority(),
+                },
+            })
+            .await,
+        ControlReply::GroupRegistered { .. }
+    ));
+
+    assert_eq!(
+        check(receiver, member.node_id, original.generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(receiver, member.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(owner, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    let wrong_incarnation = WorkerIdentity {
+        incarnation: Uuid::new_v4(),
+        ..receiver
+    };
+    assert_eq!(
+        check(wrong_incarnation, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(receiver, successor.node_id, generation)
+            .await
+            .unwrap()
+            .owner,
+        Some(owner)
+    );
+    assert_eq!(model.reads.load(Ordering::Relaxed), 6);
+}
+
+#[tokio::test]
 async fn o01_o14_initial_data_publication_resumes_exact_stage_and_preserves_sealed_placement() {
     let directory = Directory::new();
     let (scope, pool) = identities();

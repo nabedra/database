@@ -17,12 +17,12 @@ const TXNS: &[u8] = b"status/txn/";
 mod archive;
 pub(crate) mod archive_images;
 mod cold;
-pub(crate) use cold::ColdRecoveryPage;
 pub(crate) use archive::{
     ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
     CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
     VerifiedStatusArchiveCut,
 };
+pub(crate) use cold::ColdRecoveryPage;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManifestDraft {
@@ -635,6 +635,56 @@ impl StatusHandle {
         )?;
         self.propose_owned(command).await
     }
+    pub(crate) async fn install_point_manifest(
+        &self,
+        point: PointManifest,
+    ) -> Result<(ManifestRef, Digest), ProtocolError> {
+        let PointManifest {
+            authority,
+            txn,
+            request,
+            read_ts,
+            plan,
+            result,
+        } = point;
+        let scope = self.identity();
+        if !PointManifest::qualifies(&plan, &result)
+            || plan.validate().is_err()
+            || plan.read_ts != read_ts
+            || plan.group.cluster_id != scope.cluster_id
+            || plan.group.database != scope.database
+        {
+            return Err(invalid());
+        }
+        let page = Page::new(vec![plan]).map_err(|_| invalid())?;
+        let installed = async {
+            let draft = self
+                .begin_manifest(authority, txn, request, read_ts, 1, result)
+                .await?;
+            // Start from the original root. A retry after the page applied
+            // must replay its exact receipt before it can seal the draft.
+            let page = self
+                .append_manifest_page(authority, txn, 0, draft.initial_root, page)
+                .await?;
+            let manifest = self.seal_manifest(authority, txn).await?;
+            if manifest.status_group_id != scope.group_id
+                || manifest.participant_count != 1
+                || manifest.digest != page.current_root
+                || draft.result_digest != page.result_digest
+            {
+                return Err(invalid());
+            }
+            Ok((manifest, draft.result_digest))
+        }
+        .await;
+        // Once Begin can have executed, a refusal cannot authorize a legacy
+        // fallback. A surviving caller can retry this exact durable prefix.
+        installed.map_err(|mut error: ProtocolError| {
+            error.outcome = Outcome::Unknown;
+            error
+        })
+    }
+
     pub(crate) async fn begin_manifest(
         &self,
         authority: Authority,

@@ -2,6 +2,7 @@
 //! grants no raw Raft proposal or caller-supplied proof capability.
 use super::{
     ControlHandle, DataWorkerGrowthProof, GroupRecord, ServiceAction, ServiceAuthorization,
+    stale_service_route, unsupported_service_route,
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     mem::size_of,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -73,6 +74,12 @@ enum ReadRequest {
         remote: WorkerIdentity,
         action: ServiceAction,
         target: Box<GroupIdentity>,
+    },
+    ServiceRoleAtReplica {
+        remote: WorkerIdentity,
+        target: Box<GroupIdentity>,
+        node_id: u64,
+        generation: Uuid,
     },
     TerminalReader {
         remote: WorkerIdentity,
@@ -192,6 +199,26 @@ impl Endpoint for ControlEndpoint {
                     let grant = self
                         .handle
                         .service_role(&scope, remote, action, *target)
+                        .await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &grant, HEADER_LIMIT)?
+                }
+                ReadRequest::ServiceRoleAtReplica {
+                    remote,
+                    target,
+                    node_id,
+                    generation,
+                } => {
+                    let grant = self
+                        .handle
+                        .service_role_at_replica(
+                            &scope,
+                            remote,
+                            *target,
+                            session.remote(),
+                            node_id,
+                            generation,
+                        )
                         .await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &grant, HEADER_LIMIT)?
@@ -468,12 +495,14 @@ impl ControlClient {
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
         // The ServiceRole endpoint finishes using Control consensus and its
         // local state. It does not make another outgoing Authority read.
-        let role_dependency = matches!(request, ReadRequest::ServiceRole { .. });
+        let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
+        let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
         let preferred = self.routes.preferred();
         let mut first = preferred;
         let mut after = None;
         let mut error = unavailable();
+        let mut legacy_placement_role = false;
         loop {
             let worker = if let Some(worker) = first.take() {
                 worker
@@ -503,6 +532,21 @@ impl ControlClient {
                     // improve by selecting another peer.
                     Err(RequestError::OutgoingLaneFull) => {
                         return Err(RequestError::OutgoingLaneFull.into());
+                    }
+                    Err(RequestError::PeerRejected {
+                        worker: peer,
+                        error,
+                    }) if placement_role && peer.worker_id == worker => {
+                        if error == invalid("invalid Control authority request") {
+                            // Older Control voters reject this new, closed request
+                            // in their parser. The application has not been run.
+                            legacy_placement_role = true;
+                            continue;
+                        }
+                        if error == stale_service_route() || error.code == ErrorCode::Unauthorized {
+                            return Err(error);
+                        }
+                        Err(error)
                     }
                     result => result.map_err(ProtocolError::from),
                 }
@@ -572,6 +616,9 @@ impl ControlClient {
                 Err(failure) => error = failure,
             }
         }
+        if legacy_placement_role {
+            return Err(unsupported_service_route());
+        }
         Err(error)
     }
     async fn authority(
@@ -637,6 +684,33 @@ impl ControlClient {
             })
             .await?;
         Ok(*reply.decode_section::<ServiceAuthorization>(0)?)
+    }
+    pub(crate) async fn service_role_at_replica(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        target: GroupIdentity,
+        node_id: u64,
+        generation: Uuid,
+    ) -> Result<(), ProtocolError> {
+        if scope.cluster_id != self.group.cluster_id || scope.database != self.group.database {
+            return Err(invalid("foreign service authorization scope"));
+        }
+        let reply = self
+            .read(&ReadRequest::ServiceRoleAtReplica {
+                remote,
+                target: Box::new(target),
+                node_id,
+                generation,
+            })
+            .await?;
+        let grant = reply.decode_section::<ServiceAuthorization>(0)?;
+        if grant.owner != Some(remote) {
+            return Err(invalid(
+                "receiver placement grant differs from request owner",
+            ));
+        }
+        Ok(())
     }
     pub(crate) async fn ready_page(
         &self,
@@ -712,7 +786,50 @@ pub(crate) type ReplicaRoutes = Arc<VerifiedReplicaRoutes>;
 pub(crate) struct VerifiedReplicaRoutes {
     pub record: GroupRecord,
     pub members: Vec<ReplicaMember>,
+    hint: Mutex<ReplicaRouteHint>,
     _owner: ScratchLease,
+}
+
+#[derive(Default)]
+struct ReplicaRouteHint {
+    last_successful_node: Option<u64>,
+    receiver: Option<(u64, WorkerIdentity)>,
+    probe_after: Option<Instant>,
+}
+
+impl VerifiedReplicaRoutes {
+    pub(crate) fn last_successful_node(&self) -> Option<u64> {
+        self.hint.lock().ok()?.last_successful_node
+    }
+
+    pub(crate) fn record_successful_node(&self, node_id: u64) {
+        if let Ok(mut hint) = self.hint.lock() {
+            hint.last_successful_node = Some(node_id);
+        }
+    }
+
+    pub(crate) fn hinted_receiver(&self, node_id: u64) -> Option<WorkerIdentity> {
+        let (node, receiver) = self.hint.lock().ok()?.receiver?;
+        (node == node_id).then_some(receiver)
+    }
+
+    pub(crate) fn begin_receiver_probe(&self) -> bool {
+        let Ok(mut hint) = self.hint.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if hint.probe_after.is_some_and(|after| after > now) {
+            return false;
+        }
+        hint.probe_after = Some(now + Duration::from_secs(1));
+        true
+    }
+
+    pub(crate) fn confirm_hinted_receiver(&self, node_id: u64, receiver: WorkerIdentity) {
+        if let Ok(mut hint) = self.hint.lock() {
+            hint.receiver = Some((node_id, receiver));
+        }
+    }
 }
 
 const ROUTE_CACHE_ENTRIES: usize = 64;
@@ -765,6 +882,9 @@ impl ReplicaRouteCache {
     }
 }
 impl ControlClient {
+    pub(crate) fn cached_replica_routes(&self, group: &GroupIdentity) -> Option<ReplicaRoutes> {
+        self.route_cache()?.slot(group)?.clone()
+    }
     pub(crate) async fn enrollment_revision(&self) -> Result<u64, ProtocolError> {
         let reply = self.read(&ReadRequest::EnrollmentRevision).await?;
         Ok(*reply.decode_section::<u64>(0)?)
@@ -902,6 +1022,7 @@ impl ControlClient {
         let route = Arc::new(VerifiedReplicaRoutes {
             record,
             members,
+            hint: Mutex::new(ReplicaRouteHint::default()),
             _owner: owner,
         });
         let cacheable = retain && retained <= ROUTE_CACHE_ENTRY_BYTES;

@@ -17,13 +17,15 @@ mod participant_full;
 #[cfg(test)]
 pub(crate) use participant_full::continuation_fixture;
 mod read_attempt;
-#[cfg(test)]
-pub(crate) use read_attempt::fixture as read_fixture;
-pub(crate) use read_attempt::{ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead};
 pub(crate) use metadata::{
     AdmissionTicketIssuer, AuthenticatedMetadataReply, BackupPublicationReader,
     OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket, StatusClient,
     StatusEndpoint, TimestampClient, TimestampEndpoint,
+};
+#[cfg(test)]
+pub(crate) use read_attempt::fixture as read_fixture;
+pub(crate) use read_attempt::{
+    ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead,
 };
 mod status;
 pub(crate) use participant::{ParticipantProofClient, ParticipantProofEndpoint};
@@ -33,7 +35,9 @@ mod tests;
 pub(crate) use status::{StatusProofClient, StatusProofEndpoint};
 
 use super::{
-    authority::control::{ControlClient, ServiceAction},
+    authority::control::{
+        ControlClient, ServiceAction, stale_service_route, unsupported_service_route,
+    },
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, ReceivePlan,
         RequestError, RequestTarget, TrafficClass, WorkerClient,
@@ -148,6 +152,13 @@ impl Method {
             _ => TrafficClass::ServiceAuthority,
         }
     }
+    fn can_repeat_read(self) -> bool {
+        matches!(self.purpose(), Purpose::Authority | Purpose::Storage)
+            && !matches!(
+                self,
+                Self::ParticipantPropose { .. } | Self::ParticipantScanRun { .. }
+            )
+    }
     fn input_limit(self) -> usize {
         match self {
             Self::StatusCall { .. } | Self::TimestampCall { .. } => 128 << 10,
@@ -183,6 +194,8 @@ struct Header {
     action: ServiceAction,
     method: Method,
     payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement_generation: Option<uuid::Uuid>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,6 +342,11 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
     ) -> Result<ServiceResponse, CallError> {
+        if action == ServiceAction::Owner
+            && let Some(result) = self.call_hinted(method, payload, possibly_applied).await
+        {
+            return result;
+        }
         tracing::debug!(group=%self.group.group_id, method=?method, "service replica routes start");
         let routes = self.control.replica_routes(&self.group).await.map_err(|error| {
             tracing::debug!(group=%self.group.group_id, method=?method, code=?error.code, outcome=?error.outcome, "service replica routes failed");
@@ -354,7 +372,12 @@ impl Client {
                     )
                     .await
                 {
-                    Ok(Ok(response)) => return Ok(response),
+                    Ok(Ok(response)) => {
+                        if action == ServiceAction::Owner {
+                            routes.record_successful_node(member.node_id);
+                        }
+                        return Ok(response);
+                    }
                     Ok(Err(error)) if route_unavailable(&error) => {
                         *possibly_applied = true;
                         continue;
@@ -387,6 +410,140 @@ impl Client {
         self.control.invalidate_replica_routes(&routes);
         Err(unavailable().into())
     }
+    async fn call_hinted(
+        &self,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        possibly_applied: &mut bool,
+    ) -> Option<Result<ServiceResponse, CallError>> {
+        if *possibly_applied
+            || matches!(
+                method,
+                Method::ParticipantScanOpen { .. } | Method::ParticipantScanRun { .. }
+            )
+        {
+            return None;
+        }
+        let routes = self.control.cached_replica_routes(&self.group)?;
+        let preferred = routes
+            .last_successful_node()
+            .unwrap_or_else(|| self.leader.load(Ordering::Relaxed));
+        let member = routes
+            .members
+            .iter()
+            .find(|member| member.node_id == preferred)
+            .or_else(|| routes.members.first())?;
+        let generation = Some(routes.record.generation);
+        let receiver = match routes.hinted_receiver(member.node_id) {
+            Some(receiver) => receiver,
+            None if routes.begin_receiver_probe() => {
+                // Probe using existing read-only methods. An old replica can
+                // reject the marker without seeing the application request.
+                let (probe, input) = match self.group.kind {
+                    GroupKind::Status { .. } => (
+                        Method::StatusCall {
+                            operation: 0,
+                            mutation: false,
+                        },
+                        Some("Current"),
+                    ),
+                    GroupKind::Timestamps => (
+                        Method::TimestampCall {
+                            operation: 0,
+                            mutation: false,
+                        },
+                        Some("Current"),
+                    ),
+                    GroupKind::Catalog | GroupKind::Data { .. } => {
+                        (Method::ParticipantActivation, None)
+                    }
+                    GroupKind::Control => return None,
+                };
+                let input = input
+                    .map(|input| self.shared.encode_in(ByteClass::Progress, &input, 4096))
+                    .transpose()
+                    .ok()?;
+                let response = self
+                    .call_member_at(
+                        ServiceAction::Owner,
+                        probe,
+                        &input,
+                        member.node_id,
+                        member.worker_id.into(),
+                        generation,
+                    )
+                    .await
+                    .ok()?
+                    .ok()?;
+                let receiver = response.reply.remote_identity();
+                routes.confirm_hinted_receiver(member.node_id, receiver);
+                receiver
+            }
+            None => return None,
+        };
+        tracing::debug!(group=%self.group.group_id, method=?method, node=member.node_id, "service replica route hint");
+        let attempt = self
+            .call_member_at(
+                ServiceAction::Owner,
+                method,
+                payload,
+                member.node_id,
+                receiver.into(),
+                generation,
+            )
+            .await;
+        let route_failure = match attempt {
+            Ok(Ok(response)) => {
+                routes.record_successful_node(member.node_id);
+                return Some(Ok(response));
+            }
+            Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                if worker == receiver && placement_rejected_before_execution(&error) =>
+            {
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
+            Err(CallError::Local(error)) if error == unsupported_service_route() => return None,
+            Err(CallError::Transport(RequestError::Protocol(error)))
+                if error
+                    == ProtocolError::new(
+                        ErrorCode::ValidationError,
+                        "target incarnation differs from cached enrollment",
+                        Outcome::NotApplied,
+                    ) =>
+            {
+                // The transport rejects an exact incarnation mismatch before dialing.
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
+            Err(CallError::Transport(RequestError::Unreachable)) => unavailable(),
+            Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                if worker == receiver =>
+            {
+                if route_unavailable(&error) {
+                    error
+                } else {
+                    if error == invalid() {
+                        self.control.invalidate_replica_routes(&routes);
+                    }
+                    return Some(Err(CallError::Transport(RequestError::PeerRejected {
+                        worker,
+                        error,
+                    })));
+                }
+            }
+            Ok(Err(error)) | Err(CallError::Local(error)) if route_unavailable(&error) => error,
+            Ok(Err(error)) => return Some(Err(error.into())),
+            Err(error) => return Some(Err(error)),
+        };
+        self.control.invalidate_replica_routes(&routes);
+        if method.can_repeat_read() {
+            // A healthy leader can still serve the read within this route round.
+            return None;
+        }
+        *possibly_applied = true;
+        Some(Err(route_failure.into()))
+    }
     async fn call_member(
         &self,
         action: ServiceAction,
@@ -395,6 +552,18 @@ impl Client {
         node: u64,
         worker: RequestTarget,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
+        self.call_member_at(action, method, payload, node, worker, None)
+            .await
+    }
+    async fn call_member_at(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        node: u64,
+        worker: RequestTarget,
+        placement_generation: Option<uuid::Uuid>,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
         let header = self.shared.encode_in(
             method.class().byte_class(),
             &Header {
@@ -402,9 +571,14 @@ impl Client {
                 action,
                 method,
                 payload_bytes: payload.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                placement_generation,
             },
             4096,
         )?;
+        // The hosted replica dispatcher parses this header at a 1024-byte bound.
+        if placement_generation.is_some() && header.len() > 1024 {
+            return Err(unsupported_service_route().into());
+        }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let reply = self
             .transport
@@ -486,10 +660,7 @@ impl Client {
             reply.reserve_reply_decode(&self.shared, bytes).await?
         };
         tracing::debug!(group=%self.group.group_id, method=?method, node=node, "service reply decode reserved");
-        if !matches!(
-            method,
-            Method::ParticipantScanOpen { .. }
-        ) {
+        if !matches!(method, Method::ParticipantScanOpen { .. }) {
             self.leader.store(node, Ordering::Relaxed);
         }
         Ok(Ok(ServiceResponse {
@@ -626,6 +797,12 @@ fn parse(
         } else {
             header.payload_bytes != 0
         })
+        || (header.placement_generation.is_some()
+            && (header.action != ServiceAction::Owner
+                || matches!(
+                    header.method,
+                    Method::ParticipantScanOpen { .. } | Method::ParticipantScanRun { .. }
+                )))
     {
         return Err(invalid());
     }
@@ -640,6 +817,17 @@ async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
+    if let Some(generation) = header.placement_generation {
+        return control
+            .service_role_at_replica(
+                &scope,
+                session.remote(),
+                session.group().clone(),
+                header.to_node,
+                generation,
+            )
+            .await;
+    }
     control
         .service_role(
             &scope,
@@ -714,6 +902,15 @@ fn route_unavailable(error: &ProtocolError) -> bool {
         error.code,
         ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
     ) && error.outcome == Outcome::Unknown
+}
+
+fn placement_rejected_before_execution(error: &ProtocolError) -> bool {
+    *error == stale_service_route()
+        || *error == unsupported_service_route()
+        // The permanent node dispatcher has no endpoint to execute the request.
+        || (error.code == ErrorCode::ValidationError
+            && error.outcome == Outcome::NotApplied
+            && error.message == "worker does not host target replica node")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

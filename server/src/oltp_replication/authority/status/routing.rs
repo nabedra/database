@@ -276,6 +276,13 @@ impl StatusService for PartitionedStatus {
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>> {
         self.request(request_id).retirement(request_id, digest)
     }
+    fn try_install_point_manifest<'a>(
+        &'a self,
+        point: PointManifest,
+    ) -> ConsensusFuture<'a, Option<(ManifestRef, Digest)>> {
+        self.request(point.txn.request_id)
+            .try_install_point_manifest(point)
+    }
     fn begin_manifest<'a>(
         &'a self,
         authority: Authority,

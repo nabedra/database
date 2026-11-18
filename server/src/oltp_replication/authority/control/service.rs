@@ -1154,6 +1154,38 @@ impl ControlHandle {
         action: ServiceAction,
         target: GroupIdentity,
     ) -> Result<ServiceAuthorization, ProtocolError> {
+        self.service_role_inner(scope, remote, action, target, None)
+            .await
+    }
+    pub(super) async fn service_role_at_replica(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        target: GroupIdentity,
+        receiver: WorkerIdentity,
+        node_id: u64,
+        generation: Uuid,
+    ) -> Result<ServiceAuthorization, ProtocolError> {
+        if node_id == 0 || generation.is_nil() || target.kind == GroupKind::Control {
+            return Err(unauthorized());
+        }
+        self.service_role_inner(
+            scope,
+            remote,
+            ServiceAction::Owner,
+            target,
+            Some((receiver, node_id, generation)),
+        )
+        .await
+    }
+    async fn service_role_inner(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        action: ServiceAction,
+        target: GroupIdentity,
+        placement: Option<(WorkerIdentity, u64, Uuid)>,
+    ) -> Result<ServiceAuthorization, ProtocolError> {
         if scope.cluster_id != self.identity().cluster_id
             || scope.database != self.identity().database
             || target.cluster_id != scope.cluster_id
@@ -1198,7 +1230,8 @@ impl ControlHandle {
                 }
                 let target_record: Option<GroupRecord> =
                     load(view, &machine::key(GROUPS, target.group_id))?;
-                if action != ServiceAction::Operator
+                if placement.is_none()
+                    && action != ServiceAction::Operator
                     && target_record
                         .as_ref()
                         .is_none_or(|record| record.identity != target)
@@ -1291,6 +1324,29 @@ impl ControlHandle {
                         .is_none()
                     {
                         return Err(unauthorized());
+                    }
+                }
+                if let Some((receiver, node_id, generation)) = placement {
+                    let record = target_record
+                        .as_ref()
+                        .filter(|record| {
+                            record.identity == target
+                                && record.generation == generation
+                                && record.replica_count != 0
+                        })
+                        .ok_or_else(stale_service_route)?;
+                    let member: ReplicaMember =
+                        load(view, &machine::member_key(record.generation, node_id))?
+                            .ok_or_else(stale_service_route)?;
+                    let enrolled: WorkerRecord =
+                        load(view, &machine::key(WORKERS, receiver.worker_id))?
+                            .ok_or_else(stale_service_route)?;
+                    if member.validate().is_err()
+                        || member.node_id != node_id
+                        || member.worker_id != receiver.worker_id
+                        || WorkerIdentity::from(&enrolled.enrollment) != receiver
+                    {
+                        return Err(stale_service_route());
                     }
                 }
                 view.encode(&grant)
