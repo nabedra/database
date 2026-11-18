@@ -1,0 +1,159 @@
+{
+  "name": "nabedra",
+  "version": "0.1.0",
+  "description": "TypeScript client for the Nabedra Database HTTP API",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zPy52/nabedra-database.git",
+    "directory": "orm/typescript"
+  },
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./aws": {
+      "types": "./dist/aws.d.ts",
+      "default": "./dist/aws.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./cluster": {
+      "types": "./dist/cluster.d.ts",
+      "default": "./dist/cluster.js"
+    },
+    "./deployment": {
+      "types": "./dist/deployment/index.d.ts",
+      "default": "./dist/deployment/index.js"
+    },
+    "./deployment/cloudControl": {
+      "types": "./dist/public/deployment/cloudControl.d.ts",
+      "default": "./dist/public/deployment/cloudControl.js"
+    },
+    "./deployment/controller": {
+      "types": "./dist/public/deployment/controller.d.ts",
+      "default": "./dist/public/deployment/controller.js"
+    },
+    "./deployment/docker": {
+      "types": "./dist/public/deployment/docker.d.ts",
+      "default": "./dist/public/deployment/docker.js"
+    },
+    "./deployment/ebsHost": {
+      "types": "./dist/deployment/ebsHost.d.ts",
+      "default": "./dist/deployment/ebsHost.js"
+    },
+    "./deployment/ec2": {
+      "types": "./dist/public/deployment/ec2.d.ts",
+      "default": "./dist/public/deployment/ec2.js"
+    },
+    "./deployment/eks": {
+      "types": "./dist/public/deployment/eks.d.ts",
+      "default": "./dist/public/deployment/eks.js"
+    },
+    "./deployment/eksReplacement": {
+      "types": "./dist/public/deployment/eksReplacement.d.ts",
+      "default": "./dist/public/deployment/eksReplacement.js"
+    },
+    "./deployment/live": {
+      "types": "./dist/deployment/live.d.ts",
+      "default": "./dist/deployment/live.js"
+    },
+    "./deployment/liveDocker": {
+      "types": "./dist/deployment/liveDocker.d.ts",
+      "default": "./dist/deployment/liveDocker.js"
+    },
+    "./deployment/liveEc2": {
+      "types": "./dist/deployment/liveEc2.d.ts",
+      "default": "./dist/deployment/liveEc2.js"
+    },
+    "./deployment/liveEks": {
+      "types": "./dist/deployment/liveEks.d.ts",
+      "default": "./dist/deployment/liveEks.js"
+    },
+    "./deployment/workerDrain": {
+      "types": "./dist/deployment/workerDrain.d.ts",
+      "default": "./dist/deployment/workerDrain.js"
+    },
+    "./errors": {
+      "types": "./dist/errors.d.ts",
+      "default": "./dist/errors.js"
+    },
+    "./events": {
+      "types": "./dist/events/index.d.ts",
+      "default": "./dist/events/index.js"
+    },
+    "./events/sink": {
+      "types": "./dist/events/sink.d.ts",
+      "default": "./dist/events/sink.js"
+    },
+    "./expr": {
+      "types": "./dist/public/expr.d.ts",
+      "default": "./dist/public/expr.js"
+    },
+    "./gateway": {
+      "types": "./dist/gateway.d.ts",
+      "default": "./dist/gateway.js"
+    },
+    "./providers": {
+      "types": "./dist/providers.d.ts",
+      "default": "./dist/providers.js"
+    },
+    "./query": {
+      "types": "./dist/query.d.ts",
+      "default": "./dist/query.js"
+    },
+    "./serve": {
+      "types": "./dist/serve.d.ts",
+      "default": "./dist/serve.js"
+    },
+    "./stream": {
+      "types": "./dist/public/stream.d.ts",
+      "default": "./dist/public/stream.js"
+    },
+    "./table": {
+      "types": "./dist/public/table.d.ts",
+      "default": "./dist/public/table.js"
+    },
+    "./validation": {
+      "types": "./dist/public/validation.d.ts",
+      "default": "./dist/public/validation.js"
+    }
+  },
+  "bin": {
+    "nabedra": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && tsc -p tests/tsconfig.json && node --test --test-concurrency=2 tests/*.test.mjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@types/node": "^22.20.5",
+    "decimal.js": "^10.6.0",
+    "apache-arrow": "^21.2.0"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/credential-provider-node": "^3.972.97"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
