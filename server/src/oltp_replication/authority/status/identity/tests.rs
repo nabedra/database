@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     config::WorkerResources,
     oltp::pool::{OltpPool, PoolIdentity, SharedResourceConfig, WorkerSharedResources},
+    oltp_replication::authority::consensus::{ConsensusFuture, ReadBarrier},
 };
 
 struct Dir(std::path::PathBuf);
@@ -58,6 +59,9 @@ impl Fixture {
         }
     }
     async fn apply(&mut self, command: StatusCommand) -> StatusReply {
+        self.try_apply(command).await.unwrap()
+    }
+    async fn try_apply(&mut self, command: StatusCommand) -> Result<StatusReply, ProtocolError> {
         let command =
             OwnedCommand::new_owned(command, self.pool.resources(), ByteClass::Progress).unwrap();
         let meta = ApplyMeta {
@@ -69,9 +73,19 @@ impl Fixture {
             command_digest: serialized_digest(&command).unwrap(),
             membership: None,
         };
+        let reply = self.machine.apply(meta, command).await?;
         self.index += 1;
-        let reply = self.machine.apply(meta, command).await.unwrap();
-        serde_json::from_slice(reply.as_slice()).unwrap()
+        Ok(serde_json::from_slice(reply.as_slice()).unwrap())
+    }
+    fn read_handle(&self) -> Arc<StatusHandle> {
+        StatusHandle::new(
+            self.machine.clone(),
+            Arc::new(ModelReadBarrier(AppliedPosition {
+                term: 1,
+                node_id: 1,
+                index: self.index - 1,
+            })),
+        )
     }
     async fn reopen(self) -> Self {
         let Self {
@@ -95,6 +109,20 @@ impl Fixture {
         }
     }
 }
+
+// The fixture applies native batches directly. It models a successful
+// consensus read barrier after those batches have settled.
+struct ModelReadBarrier(AppliedPosition);
+impl Consensus<StatusCommand, StatusReply> for ModelReadBarrier {
+    fn propose(&self, _: OwnedCommand<StatusCommand>) -> ConsensusFuture<'_, Applied<StatusReply>> {
+        panic!("read-only fixture")
+    }
+
+    fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        Box::pin(async { Ok(ReadBarrier { applied: self.0 }) })
+    }
+}
+
 fn reserve(authority: Authority, id: Uuid, digest: Digest) -> StatusCommand {
     StatusCommand::ReserveIdentity {
         authority,
@@ -103,6 +131,250 @@ fn reserve(authority: Authority, id: Uuid, digest: Digest) -> StatusCommand {
         kind: RequestKind::Mutation,
         reservation_id: Uuid::new_v4(),
     }
+}
+
+#[tokio::test]
+async fn q05_q06_o10_terminal_failure_replay_keeps_the_accepted_context_and_result() {
+    let mut f = Fixture::new().await;
+    let authority = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: 1,
+    };
+    f.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(),
+        expected: None,
+        next: authority,
+    })
+    .await;
+    let request = RequestBinding {
+        run_id: authority.run_id,
+        request_id: Uuid::new_v4(),
+        digest: Digest::from_bytes([1; 32]),
+        accepted_context: Digest::from_bytes([2; 32]),
+    };
+    f.apply(reserve(authority, request.request_id, request.digest))
+        .await;
+    let failure = |request, message| StatusCommand::TerminalFailure {
+        authority,
+        request,
+        outcome: MutationOutcome::failure(ProtocolError::new(
+            ErrorCode::NotFound,
+            message,
+            Outcome::NotApplied,
+        ))
+        .unwrap(),
+    };
+    let original = f.apply(failure(request, "original failure")).await;
+    let StatusReply::Identity(IdentityLookup::Terminal(terminal)) = &original else {
+        panic!("expected durable terminal failure")
+    };
+    assert_eq!(terminal.request_binding(), request);
+    let mut f = f.reopen().await;
+    assert_eq!(f.apply(failure(request, "a later error")).await, original);
+    let changed = RequestBinding {
+        accepted_context: Digest::from_bytes([3; 32]),
+        ..request
+    };
+    assert_eq!(
+        f.apply(failure(changed, "a different acceptance")).await,
+        StatusReply::Rejected(StatusFault::InvalidBinding)
+    );
+    assert_eq!(
+        f.read_handle()
+            .lookup_identity(request.request_id, None)
+            .await
+            .unwrap(),
+        Some(IdentityLookup::Terminal(terminal.clone()))
+    );
+}
+
+#[tokio::test]
+async fn q05_q06_o10_o29_terminal_receipt_disagrees_with_the_durable_decision() {
+    use super::super::CommitStamp;
+    let mut f = Fixture::new().await;
+    let authority = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: 1,
+    };
+    f.apply(StatusCommand::Fence {
+        transition_id: Uuid::new_v4(),
+        expected: None,
+        next: authority,
+    })
+    .await;
+    let request = RequestBinding {
+        run_id: authority.run_id,
+        request_id: Uuid::new_v4(),
+        digest: Digest::from_bytes([1; 32]),
+        accepted_context: Digest::from_bytes([2; 32]),
+    };
+    let id = request.request_id;
+    let txn = TxnId {
+        request_id: id,
+        attempt: 1,
+    };
+    let read_ts = Timestamp::new(1).unwrap();
+    let outcome = |changed| {
+        MutationOutcome::from_success(
+            &crate::oltp::mvcc::CanonicalJson::from_serializable(
+                f.pool.resources(),
+                &changed,
+                1024,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let original = outcome(true);
+    let corrupted = outcome(false);
+    let result_digest = original.digest().unwrap();
+    f.apply(reserve(authority, id, request.digest)).await;
+    let StatusReply::Manifest(draft) = f
+        .apply(StatusCommand::BeginManifest {
+            authority,
+            txn,
+            request,
+            read_ts,
+            participant_count: 1,
+            outcome: original.clone(),
+            result_digest,
+        })
+        .await
+    else {
+        panic!("expected durable manifest draft")
+    };
+    let participant = ParticipantPlan {
+        group: GroupIdentity {
+            kind: GroupKind::Catalog,
+            group_id: Uuid::new_v4(),
+            ..f.machine.store().identity().clone()
+        },
+        schema_epoch: 1,
+        routing_epoch: 1,
+        read_ts,
+        write_root: Digest::from_bytes([3; 32]),
+        write_count: 1,
+        page_count: 1,
+    };
+    f.apply(StatusCommand::ManifestPage {
+        authority,
+        txn,
+        page_index: 0,
+        previous_root: draft.initial_root,
+        participants: Page::new(vec![participant.clone()]).unwrap(),
+    })
+    .await;
+    let StatusReply::ManifestSealed(manifest) = f
+        .apply(StatusCommand::SealManifest { authority, txn })
+        .await
+    else {
+        panic!("expected durable manifest")
+    };
+    let position = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: 7,
+    };
+    f.apply(StatusCommand::RecordPrepared {
+        authority,
+        evidence: PreparedParticipant {
+            txn,
+            manifest,
+            participant,
+            authority,
+            sealed_at: position,
+            result_digest,
+        },
+    })
+    .await;
+    let permit = f.read_handle().commit_permit(authority, txn).await.unwrap();
+    let stamp = CommitStamp {
+        permit_digest: permit.allocation_digest().unwrap(),
+        commit_ts: Timestamp::new(2).unwrap(),
+        allocated_at: position,
+    };
+    let StatusReply::Decided(decision) = f
+        .apply(StatusCommand::DecideCommit {
+            authority,
+            permit,
+            stamp,
+        })
+        .await
+    else {
+        panic!("expected durable commit")
+    };
+    let mut f = f.reopen().await;
+    let replay = reserve(authority, id, request.digest);
+    let StatusReply::Identity(IdentityLookup::Terminal(terminal)) = f.apply(replay.clone()).await
+    else {
+        panic!("expected durable receipt")
+    };
+    assert!(
+        matches!(&terminal, TerminalIdentity::Committed { decision: stored, outcome, .. }
+        if stored == &decision && outcome == &original)
+    );
+    assert_eq!(
+        f.read_handle()
+            .lookup_identity(id, Some(request.digest))
+            .await
+            .unwrap(),
+        Some(IdentityLookup::Terminal(terminal.clone()))
+    );
+
+    for corrupt_reservation in [false, true] {
+        let corrupted_at = AppliedPosition {
+            index: f.index,
+            ..position
+        };
+        let terminal = terminal.clone();
+        let corrupted = corrupted.clone();
+        f.index += 1;
+        f.machine
+            .store()
+            .transaction(
+                ApplyMeta {
+                    position: corrupted_at,
+                    command_digest: Digest::from_bytes([4; 32]),
+                    membership: None,
+                },
+                BUDGET,
+                move |tx| {
+                    let key = key(IDENTITIES, id);
+                    let mut record: IdentityRecord = load(tx, &key)?.unwrap();
+                    let mut terminal = terminal;
+                    if corrupt_reservation {
+                        record.reservation.digest = Digest::from_bytes([5; 32]);
+                    } else if let TerminalIdentity::Committed { outcome, .. } = &mut terminal {
+                        *outcome = corrupted;
+                    }
+                    record.terminal = Some(terminal);
+                    put(tx, &key, &record)?;
+                    Ok(Transition::Commit(tx.copy_output(b"corrupted receipt")?))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f.read_handle()
+                .lookup_identity(id, Some(request.digest))
+                .await
+                .unwrap_err()
+                .outcome,
+            Outcome::Unknown
+        );
+        assert_eq!(
+            f.try_apply(replay.clone()).await.unwrap_err().outcome,
+            Outcome::Unknown
+        );
+    }
+    let exact = f
+        .read_handle()
+        .lookup_decision(txn, manifest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact.statement(), &decision);
+    assert_eq!(exact.outcome(), Some(&original));
 }
 
 /// R04/R05/O10: permanent identity metadata prevents an unchanged delayed POST
@@ -614,22 +886,35 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         proof::ReadySetHasher,
     };
     let mut fixture = Fixture::new().await;
-    let authority = Authority { run_id: Uuid::new_v4(), owner_term: 1 };
-    fixture.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(), expected: None, next: authority,
-    }).await;
-    let workers: Vec<_> = (1..=3u128).map(|id| WorkerIdentity {
-        worker_id: Uuid::from_u128(id),
-        incarnation: Uuid::new_v4(),
-        certificate_sha256: Digest::from_bytes([7; 32]),
-        enrollment_revision: 1,
-    }).collect();
+    let authority = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: 1,
+    };
+    fixture
+        .apply(StatusCommand::Fence {
+            transition_id: Uuid::new_v4(),
+            expected: None,
+            next: authority,
+        })
+        .await;
+    let workers: Vec<_> = (1..=3u128)
+        .map(|id| WorkerIdentity {
+            worker_id: Uuid::from_u128(id),
+            incarnation: Uuid::new_v4(),
+            certificate_sha256: Digest::from_bytes([7; 32]),
+            enrollment_revision: 1,
+        })
+        .collect();
     let mut ready_set = ReadySetHasher::default();
     for worker in &workers {
         ready_set.push(*worker).unwrap();
     }
     let ready = ReadyMembership {
-        view: AuthorityView { run_id: authority.run_id, owner_term: 1, membership_revision: 8 },
+        view: AuthorityView {
+            run_id: authority.run_id,
+            owner_term: 1,
+            membership_revision: 8,
+        },
         ready_root: ready_set.finish(),
         ready_count: 3,
     };
@@ -637,39 +922,91 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     let request_id = Uuid::new_v4();
     let reservation_id = Uuid::new_v4();
     let request = RequestBinding {
-        run_id: authority.run_id, request_id, digest, accepted_context: Digest::from_bytes([19; 32]),
+        run_id: authority.run_id,
+        request_id,
+        digest,
+        accepted_context: Digest::from_bytes([19; 32]),
     };
     let outcome = MutationOutcome::failure(ProtocolError::new(
-        ErrorCode::Conflict, "deterministic terminal mutation", Outcome::NotApplied,
-    )).unwrap();
+        ErrorCode::Conflict,
+        "deterministic terminal mutation",
+        Outcome::NotApplied,
+    ))
+    .unwrap();
     let original = TerminalCopyStatement {
-        request, ready, terminal_version: 5,
+        request,
+        ready,
+        terminal_version: 5,
         response_hash: outcome.response_hash(request_id).unwrap(),
         terminal_digest: Some(Digest::from_bytes([17; 32])),
-        pin_identity: PinIdentity { run_id: authority.run_id, request_id, digest, nonce: reservation_id },
-        storage_pin: StoragePin { pin_id: Uuid::new_v4(), read_ts: Timestamp::new(11).unwrap(), allocator_epoch: 1 },
+        pin_identity: PinIdentity {
+            run_id: authority.run_id,
+            request_id,
+            digest,
+            nonce: reservation_id,
+        },
+        storage_pin: StoragePin {
+            pin_id: Uuid::new_v4(),
+            read_ts: Timestamp::new(11).unwrap(),
+            allocator_epoch: 1,
+        },
     };
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     let digest_for_ack = statement_digest(&original).unwrap();
     for worker in workers.iter().take(2) {
-        verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest_for_ack, Uuid::new_v4())).unwrap();
+        verifier
+            .accept(
+                *worker,
+                &AuthenticatedAck::from_transport(*worker, digest_for_ack, Uuid::new_v4()),
+            )
+            .unwrap();
     }
-    assert!(verifier.finish(ready).is_err(), "quorum alone cannot certify retirement");
+    assert!(
+        verifier.finish(ready).is_err(),
+        "quorum alone cannot certify retirement"
+    );
     let mut verifier = TerminalVerifier::begin(original.clone(), ready).unwrap();
     for worker in workers {
-        verifier.accept(worker, &AuthenticatedAck::from_transport(worker, digest_for_ack, Uuid::new_v4())).unwrap();
+        verifier
+            .accept(
+                worker,
+                &AuthenticatedAck::from_transport(worker, digest_for_ack, Uuid::new_v4()),
+            )
+            .unwrap();
     }
     let command = StatusCommand::RetireTerminal {
-        authority, proof: verifier.finish(ready).unwrap().into_sealed(),
-        timestamp_position: AppliedPosition { term: 2, node_id: 1, index: 11 },
+        authority,
+        proof: verifier.finish(ready).unwrap().into_sealed(),
+        timestamp_position: AppliedPosition {
+            term: 2,
+            node_id: 1,
+            index: 11,
+        },
     };
-    fixture.apply(StatusCommand::ReserveIdentity {
-        authority, request_id, digest, kind: RequestKind::Mutation, reservation_id,
-    }).await;
-    assert_eq!(fixture.apply(command.clone()).await, StatusReply::Rejected(StatusFault::TerminalConflict));
-    let terminal = fixture.apply(StatusCommand::TerminalFailure { authority, request, outcome }).await;
+    fixture
+        .apply(StatusCommand::ReserveIdentity {
+            authority,
+            request_id,
+            digest,
+            kind: RequestKind::Mutation,
+            reservation_id,
+        })
+        .await;
+    assert_eq!(
+        fixture.apply(command.clone()).await,
+        StatusReply::Rejected(StatusFault::TerminalConflict)
+    );
+    let terminal = fixture
+        .apply(StatusCommand::TerminalFailure {
+            authority,
+            request,
+            outcome,
+        })
+        .await;
     let first = fixture.apply(command.clone()).await;
-    let StatusReply::Retired(ref certificate) = first else { panic!("retirement certificate") };
+    let StatusReply::Retired(ref certificate) = first else {
+        panic!("retirement certificate")
+    };
     let mut newer = original.clone();
     newer.ready.view.membership_revision += 1;
     newer.terminal_version += 1;
@@ -685,20 +1022,45 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
     // certificate and exact failure, with only non-executable identity data.
     let mut fixture = fixture.reopen().await;
     assert_eq!(fixture.apply(command.clone()).await, first);
-    let stored = fixture.machine.store().read_metadata(BUDGET, move |view| {
-        let record: IdentityRecord = read(view, &key(IDENTITIES, request_id))?.unwrap();
-        view.encode(&record)
-    }).await.unwrap();
+    let stored = fixture
+        .machine
+        .store()
+        .read_metadata(BUDGET, move |view| {
+            let record: IdentityRecord = read(view, &key(IDENTITIES, request_id))?.unwrap();
+            view.encode(&record)
+        })
+        .await
+        .unwrap();
     let record: IdentityRecord = serde_json::from_slice(stored.as_slice()).unwrap();
     assert_eq!(record.retirement.as_ref(), Some(certificate));
     let encoded = std::str::from_utf8(stored.as_slice()).unwrap();
-    for forbidden in ["operation", "payload", "authorization", "token", "queue_order", "sequence"] {
+    for forbidden in [
+        "operation",
+        "payload",
+        "authorization",
+        "token",
+        "queue_order",
+        "sequence",
+    ] {
         assert!(!encoded.contains(&format!("\"{forbidden}\"")), "{encoded}");
     }
-    let cold = Authority { run_id: Uuid::new_v4(), owner_term: 2 };
-    fixture.apply(StatusCommand::Fence {
-        transition_id: Uuid::new_v4(), expected: Some(authority), next: cold,
-    }).await;
-    assert_eq!(fixture.apply(command).await, StatusReply::Rejected(StatusFault::StaleAuthority));
-    assert_eq!(fixture.apply(reserve(cold, request_id, digest)).await, terminal);
+    let cold = Authority {
+        run_id: Uuid::new_v4(),
+        owner_term: 2,
+    };
+    fixture
+        .apply(StatusCommand::Fence {
+            transition_id: Uuid::new_v4(),
+            expected: Some(authority),
+            next: cold,
+        })
+        .await;
+    assert_eq!(
+        fixture.apply(command).await,
+        StatusReply::Rejected(StatusFault::StaleAuthority)
+    );
+    assert_eq!(
+        fixture.apply(reserve(cold, request_id, digest)).await,
+        terminal
+    );
 }

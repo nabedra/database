@@ -539,14 +539,20 @@ impl WorkerRuntime {
                     Ok(value) => response::encode_success(id, &value, true),
                     Err(error) => response::encode_error(Some(id), error),
                 })
-            } else if let Some(IdentityLookup::Terminal(terminal)) = self.durable_lookup(id).await?
-            {
-                if terminal_record(&terminal)?.digest != record.digest {
-                    return Err(unknown());
-                }
-                Some(terminal_response(id, &terminal)?)
             } else {
-                None
+                match self.durable_lookup(id).await? {
+                    Some(IdentityLookup::Terminal(terminal @ TerminalIdentity::Failed { .. }))
+                        if terminal.request_binding() == binding =>
+                    {
+                        Some(terminal_response(id, &terminal)?)
+                    }
+                    Some(IdentityLookup::Reserved(reservation))
+                        if reservation.kind == RequestKind::Mutation && reservation.binds(binding) =>
+                    {
+                        None
+                    }
+                    _ => return Err(unknown()),
+                }
             };
             if let Some(encoded) = encoded {
                 self.services

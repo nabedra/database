@@ -87,6 +87,41 @@ fn txn_key(kind: u8, txn: TxnId, suffix: &[u8]) -> Vec<u8> {
     key.extend_from_slice(suffix);
     key
 }
+pub(super) fn verify_terminal_in_read(
+    view: &mut GroupRead<'_>,
+    decision: &DecisionStatement,
+    outcome: &MutationOutcome,
+) -> Result<(), ProtocolError> {
+    let state = read(view, &txn_key(b't', decision.txn, &[]))?;
+    verify_terminal_transaction(state, decision, outcome)
+}
+
+pub(super) fn verify_terminal_in_apply(
+    tx: &mut GroupTransaction<'_>,
+    decision: &DecisionStatement,
+    outcome: &MutationOutcome,
+) -> Result<(), ProtocolError> {
+    let state = load(tx, &txn_key(b't', decision.txn, &[]))?;
+    verify_terminal_transaction(state, decision, outcome)
+}
+
+fn verify_terminal_transaction(
+    state: Option<Transaction>,
+    decision: &DecisionStatement,
+    outcome: &MutationOutcome,
+) -> Result<(), ProtocolError> {
+    let state = state.ok_or_else(unknown)?;
+    if state.txn != decision.txn
+        || state.request != decision.request
+        || state.manifest != Some(decision.manifest)
+        || state.decision.as_ref() != Some(decision)
+        || state.outcome != *outcome
+    {
+        return Err(unknown());
+    }
+    Ok(())
+}
+
 pub(super) fn has_transaction(
     tx: &mut GroupTransaction<'_>,
     request_id: Uuid,
@@ -227,6 +262,12 @@ pub(super) fn apply(
         let Some(mut identity) = load::<IdentityRecord>(tx, &identity_key)? else {
             return reject(tx, StatusFault::IdentityNotReserved);
         };
+        if identity.reservation.request_id != request.request_id {
+            return Err(unknown());
+        }
+        verify_lookup_record(scope, &identity, |decision, outcome| {
+            verify_terminal_in_apply(tx, decision, outcome)
+        })?;
         if identity.rejection.is_some() {
             return reject(tx, StatusFault::TerminalConflict);
         }
@@ -239,10 +280,13 @@ pub(super) fn apply(
         {
             return reject(tx, StatusFault::InvalidBinding);
         }
-        if let Some(terminal) = identity.terminal {
+        if let Some(terminal) = &identity.terminal {
+            if terminal.request_binding() != *request {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
             return commit(
                 tx,
-                StatusReply::Identity(IdentityLookup::Terminal(terminal)),
+                StatusReply::Identity(IdentityLookup::Terminal(terminal.clone())),
             );
         }
         let mut has_txn = false;

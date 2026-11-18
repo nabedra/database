@@ -44,6 +44,13 @@ pub(crate) struct IdentityReservation {
     pub reservation_id: Uuid,
     pub kind: RequestKind,
 }
+impl IdentityReservation {
+    pub(crate) fn binds(self, request: RequestBinding) -> bool {
+        self.request_id == request.request_id
+            && self.digest == request.digest
+            && self.original_run == request.run_id
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TerminalIdentity {
@@ -67,6 +74,13 @@ pub(crate) enum TerminalIdentity {
     },
 }
 impl TerminalIdentity {
+    pub(crate) fn request_binding(&self) -> RequestBinding {
+        match self {
+            Self::ReadExpired { request, .. } | Self::Failed { request, .. } => *request,
+            Self::Committed { decision, .. } => decision.request,
+        }
+    }
+
     pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
         if let Self::Committed { outcome, .. } | Self::Failed { outcome, .. } = self {
             outcome.retain_owner(owner);
@@ -486,6 +500,12 @@ fn apply(
             }
             let identity_key = key(IDENTITIES, *request_id);
             if let Some(record) = load::<IdentityRecord>(tx, &identity_key)? {
+                if record.reservation.request_id != *request_id {
+                    return Err(unknown());
+                }
+                verify_lookup_record(scope, &record, |decision, outcome| {
+                    transaction::verify_terminal_in_apply(tx, decision, outcome)
+                })?;
                 if record.reservation.digest != *digest || record.reservation.kind != *kind {
                     return reject(tx, StatusFault::DigestConflict);
                 }
@@ -700,13 +720,17 @@ fn apply(
                     && *terminal_version <= statement.terminal_version
                     && *response_hash == statement.response_hash => {}
                 (
-                    Some(TerminalIdentity::Committed { decision, outcome, .. }),
+                    Some(TerminalIdentity::Committed {
+                        decision, outcome, ..
+                    }),
                     RequestKind::Mutation,
                 ) if decision.request == statement.request
                     && outcome.response_hash(statement.request.request_id)?
                         == statement.response_hash => {}
                 (
-                    Some(TerminalIdentity::Failed { request, outcome, .. }),
+                    Some(TerminalIdentity::Failed {
+                        request, outcome, ..
+                    }),
                     RequestKind::Mutation,
                 ) if *request == statement.request
                     && outcome.response_hash(statement.request.request_id)?
@@ -725,6 +749,53 @@ fn apply(
         command => transaction::apply(tx, scope, position, current, command),
     }
 }
+
+fn verify_lookup_record(
+    scope: &GroupIdentity,
+    record: &IdentityRecord,
+    verify_decision: impl FnOnce(&DecisionStatement, &MutationOutcome) -> Result<(), ProtocolError>,
+) -> Result<(), ProtocolError> {
+    let reservation = record.reservation;
+    let Some(terminal) = &record.terminal else {
+        return Ok(());
+    };
+    if record.rejection.is_some() || !reservation.binds(terminal.request_binding()) {
+        return Err(unknown());
+    }
+    match terminal {
+        TerminalIdentity::ReadExpired {
+            reservation: saved, ..
+        } if reservation == *saved && reservation.kind == RequestKind::Read => Ok(()),
+        TerminalIdentity::Failed {
+            reservation: saved,
+            outcome: MutationOutcome::Failure(_),
+            ..
+        } if reservation == *saved && reservation.kind == RequestKind::Mutation => Ok(()),
+        TerminalIdentity::Committed {
+            reservation: saved,
+            decision,
+            outcome,
+        } if reservation == *saved
+            && reservation.kind == RequestKind::Mutation
+            && decision.txn.request_id == reservation.request_id
+            && decision.manifest.status_group_id == scope.group_id
+            && matches!(
+                (decision.decision, outcome),
+                (TxnDecision::Commit { .. }, MutationOutcome::Success(_))
+                    | (TxnDecision::Abort { .. }, MutationOutcome::Failure(_))
+            ) =>
+        {
+            // Restore retains the original receipt and archives its source
+            // transaction history separately from the live transaction keys.
+            if record.restore_origin.is_none() {
+                verify_decision(decision, outcome)?;
+            }
+            Ok(())
+        }
+        _ => Err(unknown()),
+    }
+}
+
 fn lookup(authority: Authority, record: IdentityRecord) -> IdentityLookup {
     let restored = record.restore_origin.is_some();
     if let Some(rejection) = record.rejection {
@@ -1020,15 +1091,22 @@ impl StatusHandle {
         digest: Option<Digest>,
     ) -> Result<ChargedBytes, ProtocolError> {
         self.consensus.ensure_linearizable().await?;
+        let scope = self.identity().clone();
         self.machine
             .store()
             .read(BUDGET, move |view| {
                 let authority: Authority = read(view, STATE)?.ok_or_else(unknown)?;
                 let record: Option<IdentityRecord> = read(view, &key(IDENTITIES, request_id))?;
-                if record.as_ref().is_some_and(|record| {
-                    digest.is_some_and(|digest| record.reservation.digest != digest)
-                }) {
-                    return Err(invalid());
+                if let Some(record) = &record {
+                    if record.reservation.request_id != request_id {
+                        return Err(unknown());
+                    }
+                    verify_lookup_record(&scope, record, |decision, outcome| {
+                        transaction::verify_terminal_in_read(view, decision, outcome)
+                    })?;
+                    if digest.is_some_and(|digest| record.reservation.digest != digest) {
+                        return Err(invalid());
+                    }
                 }
                 view.encode(&record.map(|record| lookup(authority, record)))
             })
@@ -1109,12 +1187,18 @@ impl RetirementCertificate {
         let Some(term_advance) = after.owner_term.checked_sub(before.owner_term) else {
             return false;
         };
-        let Some(revision_advance) = after.membership_revision.checked_sub(before.membership_revision) else {
+        let Some(revision_advance) = after
+            .membership_revision
+            .checked_sub(before.membership_revision)
+        else {
             return false;
         };
-        current.terminal_version.checked_sub(original.terminal_version).is_some_and(|advance| {
-            advance != 0 && advance <= term_advance.saturating_add(revision_advance)
-        })
+        current
+            .terminal_version
+            .checked_sub(original.terminal_version)
+            .is_some_and(|advance| {
+                advance != 0 && advance <= term_advance.saturating_add(revision_advance)
+            })
     }
 }
 
@@ -1163,15 +1247,27 @@ impl VerifiedTerminalRetirement {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_certificate(statement: TerminalCopyStatement, workers: &[WorkerIdentity]) -> Self {
+    pub(crate) fn test_certificate(
+        statement: TerminalCopyStatement,
+        workers: &[WorkerIdentity],
+    ) -> Self {
         use crate::oltp_replication::authority::proof::{AuthenticatedAck, TerminalVerifier};
         let ready = statement.ready;
         let digest = statement_digest(&statement).unwrap();
         let mut verifier = TerminalVerifier::begin(statement, ready).unwrap();
         for worker in workers {
-            verifier.accept(*worker, &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4())).unwrap();
+            verifier
+                .accept(
+                    *worker,
+                    &AuthenticatedAck::from_transport(*worker, digest, Uuid::new_v4()),
+                )
+                .unwrap();
         }
-        let position = AppliedPosition { term: 1, node_id: 1, index: 2 };
+        let position = AppliedPosition {
+            term: 1,
+            node_id: 1,
+            index: 2,
+        };
         let certificate = RetirementCertificate {
             proof: verifier.finish(ready).unwrap().into_sealed(),
             timestamp_position: position,
