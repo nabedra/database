@@ -195,6 +195,7 @@ impl DurableAdmission {
                     || reservation.digest != digest
                     || reservation.kind != kind
                     || reservation.original_run != current.ready.view.run_id
+                    || reservation.scoped.is_some()
                 {
                     return Err(unknown(
                         "identity reservation differs from its original request",

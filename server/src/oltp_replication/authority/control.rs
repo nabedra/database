@@ -9,6 +9,7 @@ mod model;
 mod placement;
 mod pool_drain;
 mod restart;
+mod scoped_queue;
 mod service;
 mod worker_drain;
 
@@ -28,6 +29,7 @@ pub(crate) use pool_drain::{DrainMount, PoolDrainPhase, PoolDrainRecord, Retaine
 pub(crate) use worker_drain::{WorkerCloseAttestation, WorkerDrainIntent, WorkerDrainPhase, WorkerDrainRecord};
 pub(crate) use worker_drain::{EksReplacementAction, EksReplacementPermit, SignedEksReplacement};
 pub(crate) use restart::{RestartIntent, RestartMountKey, RestartPreparation};
+pub(crate) use scoped_queue::ScopedQueuePlacement;
 pub(crate) use service::{
     ControlHandle, InventoryPage, LocalOperatorPermit, OperatorPolicy, ReplicaInventoryPage,
     VerifiedExclusion, VerifiedMembership, VerifiedQueueCopy,

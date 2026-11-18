@@ -156,6 +156,7 @@ fn begin(
             original_run: request.run_id,
             reservation_id: identity.nonce,
             kind: super::super::status::RequestKind::Read,
+            scoped: None,
         },
         pin_id: Uuid::new_v4(),
     }
@@ -243,6 +244,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
         original_run: old.view.run_id,
         digest: index_identity.digest,
         kind: RequestKind::Mutation,
+        scoped: None,
     };
     let TimestampReply::Snapshot(index) = f
         .apply(TimestampCommand::BeginIndexMetadata {
@@ -1127,6 +1129,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     let reservation = IdentityReservation {
         request_id: split_id,
         kind: RequestKind::Mutation,
+        scoped: None,
         reservation_id: Uuid::new_v4(),
         original_run: authority.run_id,
         digest: intent.digest().unwrap(),

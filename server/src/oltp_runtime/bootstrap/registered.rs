@@ -510,6 +510,12 @@ impl LocalServices {
             )?;
             endpoint.install_admission_tickets(issuer.clone())?;
             endpoint.install_retirement_reader(routed_status.clone())?;
+            endpoint.install_scoped_payload_readers(
+                placements.control.identity.clone(),
+                rpc.clone(),
+                catalog.clone(),
+                timestamps.clone(),
+            )?;
             registration.bind(Purpose::QueueControl, endpoint.clone())?;
             registration.bind(Purpose::QueueData, endpoint)?;
             members.push(local);

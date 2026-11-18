@@ -3,7 +3,7 @@ use super::*;
 use crate::oltp::{
     mvcc::{
         CanonicalJson,
-        store::{VerifiedParticipantResolution, VerifiedParticipantSeal},
+        store::ParticipantHandle,
     },
     pool::{ChargedBytes, WorkerSharedResources},
 };
@@ -69,6 +69,21 @@ pub(crate) trait StatusService: Send + Sync {
         digest: Digest,
         kind: RequestKind,
     ) -> ConsensusFuture<'a, Applied<StatusReply>>;
+    fn reserve_scoped_identity<'a>(
+        &'a self,
+        _authority: Authority,
+        _request_id: Uuid,
+        _digest: Digest,
+        _kind: RequestKind,
+        _scoped: ScopedAdmission,
+    ) -> ConsensusFuture<'a, Applied<StatusReply>> {
+        Box::pin(async {
+            Err(crate::oltp::failure(
+                crate::protocol::ErrorCode::UnsupportedOperation,
+                "scoped reservation requires authenticated owner transport",
+            ))
+        })
+    }
     fn lookup<'a>(
         &'a self,
         request_id: Uuid,
@@ -79,6 +94,19 @@ pub(crate) trait StatusService: Send + Sync {
         request_id: Uuid,
         digest: Option<Digest>,
     ) -> ConsensusFuture<'a, Option<IdentityLookup>>;
+    fn lookup_scoped_reservation<'a>(
+        &'a self,
+        _placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        _request_id: Uuid,
+        _digest: Digest,
+    ) -> ConsensusFuture<'a, IdentityReservation> {
+        Box::pin(async {
+            Err(crate::oltp::failure(
+                crate::protocol::ErrorCode::UnsupportedOperation,
+                "scoped reservation lookup requires authenticated holder transport",
+            ))
+        })
+    }
     fn current_authority<'a>(&'a self) -> ConsensusFuture<'a, Option<Authority>>;
     fn fence<'a>(
         &'a self,
@@ -131,16 +159,35 @@ pub(crate) trait StatusService: Send + Sync {
         authority: Authority,
         txn: TxnId,
     ) -> ConsensusFuture<'a, ManifestRef>;
-    fn observe_prepared<'a>(
+    fn record_participant_prepared<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantSeal,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()>;
-    fn observe_resolved<'a>(
+    fn record_participant_resolved<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantResolution,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()>;
+    fn prepare_point_permit<'a>(
+        &'a self,
+        authority: Authority,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, Result<SealedCommitPermit, ProtocolError>> {
+        Box::pin(async move {
+            self.record_participant_prepared(authority, participant, txn, manifest)
+                .await?;
+            // Permit failures occur after the prepare was recorded. Keep
+            // them outside the coordinator's prepare-failure abort path.
+            Ok(self.commit_permit(authority, txn).await)
+        })
+    }
     fn commit_permit<'a>(
         &'a self,
         authority: Authority,
@@ -344,19 +391,29 @@ impl StatusService for StatusHandle {
     ) -> ConsensusFuture<'a, ManifestRef> {
         Box::pin(async move { StatusHandle::seal_manifest(self, authority, txn).await })
     }
-    fn observe_prepared<'a>(
+    fn record_participant_prepared<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantSeal,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
-        Box::pin(async move { StatusHandle::observe_prepared(self, authority, proof).await })
+        Box::pin(async move {
+            let proof = participant.strong_seal(txn, manifest).await?;
+            self.observe_prepared(authority, proof).await
+        })
     }
-    fn observe_resolved<'a>(
+    fn record_participant_resolved<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantResolution,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
-        Box::pin(async move { StatusHandle::observe_resolved(self, authority, proof).await })
+        Box::pin(async move {
+            let proof = participant.strong_resolution(txn, manifest).await?;
+            self.observe_resolved(authority, proof).await
+        })
     }
     fn commit_permit<'a>(
         &'a self,

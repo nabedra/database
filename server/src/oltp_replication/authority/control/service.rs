@@ -23,6 +23,7 @@ use uuid::Uuid;
 mod data_worker;
 mod growth;
 mod placement;
+mod scoped_queue;
 mod pool_drain;
 mod restart;
 mod replacement;
@@ -1254,6 +1255,62 @@ impl ControlHandle {
                         {
                             return Err(unauthorized());
                         }
+                        None
+                    }
+                    ServiceAction::ScopedCatalogRead(read) => {
+                        if target.kind != GroupKind::Catalog
+                            || read.request.request_id.is_nil()
+                            || read.request.run_id != read.queue_view.run_id
+                            || read.table_id.is_nil()
+                        {
+                            return Err(unauthorized());
+                        }
+                        let queue = scoped_queue::current_placement(
+                            view, &control, &state, read.queue_group_id,
+                        )?
+                        .ok_or_else(unauthorized)?;
+                        if queue.data_generation != read.data_generation
+                            || queue.queue_generation != read.queue_generation
+                            || queue.view != read.queue_view
+                            || !queue.members.contains(&remote)
+                            || !matches!(queue.group.kind, GroupKind::Data { table_id, .. }
+                                if table_id == read.table_id)
+                        {
+                            return Err(unauthorized());
+                        }
+                        grant.owner = Some(queue.owner);
+                        grant.effective_authority = queue.view.authority();
+                        None
+                    }
+                    ServiceAction::ScopedQueueReserve {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                    }
+                    | ServiceAction::ScopedQueueRead {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                    } => {
+                        let reserve = matches!(action, ServiceAction::ScopedQueueReserve { .. });
+                        if request_id.is_nil()
+                            || !(matches!(target.kind, GroupKind::Status { .. })
+                                || !reserve && target.kind == GroupKind::Timestamps)
+                        {
+                            return Err(unauthorized());
+                        }
+                        let queue = scoped_queue::current_placement(view, &control, &state, queue_group_id)?
+                            .ok_or_else(unauthorized)?;
+                        if queue.queue_generation != queue_generation
+                            || queue.view != queue_view
+                            || !queue.members.contains(&remote)
+                            || (reserve && queue.owner != remote)
+                        {
+                            return Err(unauthorized());
+                        }
+                        grant.owner = Some(queue.owner);
                         None
                     }
                     ServiceAction::QueueRetirement => {

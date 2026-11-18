@@ -239,8 +239,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         };
         let id = Some(parsed.request_id);
         drop(parsed);
-        let record = state.runtime.clone().submit(bytes).await;
-        drop(staging);
+        let record = state.runtime.clone().submit(bytes, staging).await;
         Ok((state, id, record))
     });
     let (state, id, record) = match operation {
@@ -255,7 +254,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         Err(error) => return failure(id, error),
     };
     // The RAM queue owns the complete body. HTTP waiters retain only identity.
-    record.body.clear();
+    record.body = Vec::new();
     record.pinned_catalog = None;
     record.response_body = None;
     if asynchronous {

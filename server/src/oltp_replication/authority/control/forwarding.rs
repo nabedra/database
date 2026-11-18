@@ -19,11 +19,15 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use tokio::time::Instant;
+
+mod read_batch;
 
 const HEADER: usize = 4096;
 const PAYLOAD: usize = 64 << 10;
 const DECODE: usize = 2 << 20;
 const MAX_TOKEN: usize = 8192;
+const READ_TIMEOUT: Duration = Duration::from_secs(3);
 fn zero(value: &u64) -> bool { *value == 0 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,10 +210,12 @@ impl DataWorkerClient {
         Err(failure)
     }
 }
+#[derive(Clone)]
 pub(crate) struct ForwardedControl {
     manager: Arc<HostedGroupManager>,
     local: ManagedControl,
-    pins: BTreeSet<Digest>,
+    pins: Arc<BTreeSet<Digest>>,
+    read_batch: read_batch::ReadBatch,
     _owner: Arc<ScratchLease>,
 }
 impl ForwardedControl {
@@ -224,14 +230,19 @@ impl ForwardedControl {
         {
             return Err(invalid());
         }
-        let owner = Arc::new(manager.resources().reserve_scratch(
-            ByteClass::Progress,
-            std::mem::size_of::<Self>() + pins.len() * 64,
-        )?);
+        let resident_bytes = std::mem::size_of::<Self>() + pins.len() * 64;
+        let resident_bytes = resident_bytes
+            + std::mem::size_of::<BTreeSet<Digest>>()
+            + 2 * std::mem::size_of::<usize>()
+            + read_batch::RESIDENT_BYTES;
+        let owner =
+            Arc::new(manager.resources().reserve_scratch(ByteClass::Progress, resident_bytes)?);
+        let pins = Arc::new(pins);
         Ok(Arc::new(Self {
             manager,
             local,
             pins,
+            read_batch: read_batch::ReadBatch::default(),
             _owner: owner,
         }))
     }
@@ -364,37 +375,55 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            let local_id = self.local.state.resident().node_id();
-            loop {
-                let read = async {
-                    if self.local.raft.current_leader().await == Some(local_id) {
-                        return self.local.ensure_linearizable().await;
-                    }
-                    let (applied, _): (AppliedPosition, _) =
-                        self.forwarded(Operation::Barrier, None).await?;
-                    self.local
-                        .raft
-                        .wait(Some(
-                            deadline.saturating_duration_since(tokio::time::Instant::now()),
-                        ))
-                        .applied_index_at_least(Some(applied.index), "forwarded Control ReadIndex")
-                        .await
-                        .map_err(|_| unavailable())?;
-                    Ok(ReadBarrier { applied })
-                };
-                match tokio::time::timeout_at(deadline, read).await {
-                    Ok(Ok(barrier)) => return Ok(barrier),
-                    Ok(Err(error))
-                        if transient(&error) && tokio::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                    Ok(Err(error)) => return Err(error),
-                    Err(_) => return Err(unavailable()),
+            let deadline = Instant::now() + READ_TIMEOUT;
+            if let Some(batch) = self.read_batch.join(self.manager.resources(), || {
+                let forwarding = self.clone();
+                async move { forwarding.read_barrier(Instant::now() + READ_TIMEOUT).await }
+            }) {
+                let (result, _owner) = tokio::time::timeout_at(deadline, batch)
+                    .await
+                    .map_err(|_| unavailable())?;
+                if Instant::now() >= deadline {
+                    return Err(unavailable());
                 }
+                return result;
             }
+            self.read_barrier(deadline).await
         })
+    }
+}
+impl ForwardedControl {
+    async fn read_barrier(&self, deadline: Instant) -> Result<ReadBarrier, ProtocolError> {
+        let local_id = self.local.state.resident().node_id();
+        loop {
+            if Instant::now() >= deadline {
+                return Err(unavailable());
+            }
+            let read = async {
+                if self.local.raft.current_leader().await == Some(local_id) {
+                    return self.local.ensure_linearizable().await;
+                }
+                let (applied, _): (AppliedPosition, _) =
+                    self.forwarded(Operation::Barrier, None).await?;
+                self.local
+                    .raft
+                    .wait(Some(deadline.saturating_duration_since(Instant::now())))
+                    .applied_index_at_least(Some(applied.index), "forwarded Control ReadIndex")
+                    .await
+                    .map_err(|_| unavailable())?;
+                Ok(ReadBarrier { applied })
+            };
+            match tokio::time::timeout_at(deadline, read).await {
+                _ if Instant::now() >= deadline => return Err(unavailable()),
+                Ok(Ok(barrier)) => return Ok(barrier),
+                Ok(Err(error)) if transient(&error) => {
+                    tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(25)))
+                        .await;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(unavailable()),
+            }
+        }
     }
 }
 fn transient(error: &ProtocolError) -> bool {
@@ -554,6 +583,9 @@ impl Endpoint for HostedControlEndpoint {
                                 if WorkerIdentity::from(&intent.next) == session.remote() => {}
                             (Operation::Propose, ControlCommand::CompleteRestart { .. })
                             | (Operation::CompleteRestart, _) => return Err(invalid()),
+                            // Scoped queue placement cannot be activated before
+                            // its execution and takeover protocols are wired.
+                            (_, ControlCommand::EnsureScopedQueue { .. }) => return Err(invalid()),
                             (
                                 Operation::Propose,
                                 ControlCommand::RegisterRestartMount { worker, .. },

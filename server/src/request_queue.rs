@@ -689,41 +689,36 @@ impl RequestQueue {
         version: u64,
         member: Uuid,
     ) -> Result<RequestRecord, QueueError> {
-        let id = id.into();
-        if !self.members.contains(&member)
-            || self.records.get(&id).is_none_or(|r| r.version != version)
-        {
-            return Err(QueueError::Stale);
-        }
-        let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
-        record.replicas.insert(member);
-        if record.replicas == self.members && !record.accepted {
-            record.accepted = true;
-            record.version = record.version.checked_add(1).ok_or(QueueError::Invalid)?;
-        }
-        self.check_capacity(&record)?;
-        self.records.insert(id, record.clone());
-        Ok(record)
+        self.acknowledge_copy(id, version, member, true).cloned()
     }
-    /// Tentative complete payloads may be copied before their durable snapshot
-    /// context is bound. They cannot become executable merely through ACKs.
-    #[cfg(feature = "oltp")]
-    pub(crate) fn acknowledge_payload_version(
+    /// Admission reserves space for all ready-set ACKs before copying a body.
+    /// Recording one of those ACKs leaves that reservation unchanged.
+    /// Tentative bodies can record ACKs without promoting to executable work.
+    pub(crate) fn acknowledge_copy(
         &mut self,
         id: impl Into<RequestKey>,
         version: u64,
         member: Uuid,
-    ) -> Result<RequestRecord, QueueError> {
-        let id = id.into();
-        if !self.members.contains(&member)
-            || self.records.get(&id).is_none_or(|r| r.version != version)
-        {
+        promote: bool,
+    ) -> Result<&RequestRecord, QueueError> {
+        if !self.members.contains(&member) {
             return Err(QueueError::Stale);
         }
-        let mut record = self.records.get(&id).ok_or(QueueError::NotFound)?.clone();
+        let record = self.records.get_mut(&id.into()).ok_or(QueueError::Stale)?;
+        if record.version != version {
+            return Err(QueueError::Stale);
+        }
+        let copied = record.replicas.len() + usize::from(!record.replicas.contains(&member));
+        let next = if promote && !record.accepted && copied == self.members.len() {
+            Some(version.checked_add(1).ok_or(QueueError::Invalid)?)
+        } else {
+            None
+        };
         record.replicas.insert(member);
-        self.check_capacity(&record)?;
-        self.records.insert(id, record.clone());
+        if let Some(next) = next {
+            record.accepted = true;
+            record.version = next;
+        }
         Ok(record)
     }
     #[cfg(feature = "oltp")]

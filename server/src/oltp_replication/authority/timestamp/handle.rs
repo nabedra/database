@@ -550,6 +550,48 @@ impl TimestampHandle {
             reply => Err(rejected(reply)),
         }
     }
+    pub(crate) async fn verify_scoped_snapshot(
+        &self,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+        reservation: IdentityReservation,
+    ) -> Result<(), ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        self.machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: State = view
+                    .get(STATE)?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                let record: PinRecord = view
+                    .get(&pin_key(identity.nonce))?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                if state.authority.run_id != request.run_id
+                    || state.authority != state.ready.view.authority()
+                    || reservation.scoped.is_none()
+                    || !reservation.binds(request)
+                    || record.identity != identity
+                    || record.pin != pin
+                    || record.request != Some(request)
+                    || record.reservation != reservation
+                    || record.purpose != PinPurpose::Application
+                    || !matches!(record.state, PinState::Active)
+                    || !view
+                        .get(&active_key(pin))?
+                        .is_some_and(|nonce| nonce.as_slice() == identity.nonce.as_bytes())
+                {
+                    return Err(invalid());
+                }
+                view.encode(&())
+            })
+            .await
+            .map(|_| ())
+    }
     pub(crate) async fn allocate_commit(
         &self,
         permit: SealedCommitPermit,

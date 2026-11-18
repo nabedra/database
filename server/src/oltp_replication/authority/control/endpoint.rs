@@ -1,8 +1,8 @@
 //! Strong Control reads share the authenticated worker listener. This endpoint
 //! grants no raw Raft proposal or caller-supplied proof capability.
 use super::{
-    ControlHandle, DataWorkerGrowthProof, GroupRecord, ServiceAction, ServiceAuthorization,
-    stale_service_route, unsupported_service_route,
+    ControlHandle, DataWorkerGrowthProof, GroupRecord, ScopedQueuePlacement, ServiceAction,
+    ServiceAuthorization, stale_service_route, unsupported_service_route,
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
@@ -64,6 +64,9 @@ enum ReadRequest {
         node: u64,
     },
     Group {
+        group_id: Uuid,
+    },
+    ScopedQueue {
         group_id: Uuid,
     },
     SplitSource {
@@ -188,6 +191,7 @@ impl Endpoint for ControlEndpoint {
                     self.shared
                         .encode_in(ByteClass::Progress, &group, HEADER_LIMIT)?
                 }
+                ReadRequest::ScopedQueue { group_id } => self.handle.read_scoped_queue(group_id).await?,
                 ReadRequest::SplitSource { expected, authority } => {
                     self.handle.split_source(*expected, authority).await?
                 }
@@ -353,6 +357,49 @@ pub(crate) struct ControlClient {
     replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
 }
 impl ControlClient {
+    pub(crate) async fn scoped_queue(
+        &self,
+        group: &GroupIdentity,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        if group.cluster_id != self.group.cluster_id
+            || group.database != self.group.database
+            || group.validate().is_err()
+            || !matches!(group.kind, GroupKind::Data { .. })
+        {
+            return Err(invalid("foreign scoped queue group"));
+        }
+        let placement = self.scoped_queue_by_id(group.group_id).await?;
+        if let Some(placement) = &placement {
+            placement.validate(group)?;
+        }
+        Ok(placement)
+    }
+
+    pub(crate) async fn scoped_queue_by_id(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        if group_id.is_nil() {
+            return Err(invalid("invalid scoped queue group ID"));
+        }
+        let reply = self
+            .read(&ReadRequest::ScopedQueue { group_id })
+            .await?;
+        let reply = self.reserve_section_decode(reply).await?;
+        let placement = reply.decode_section::<Option<ScopedQueuePlacement>>(0)?;
+        if let Some(placement) = &*placement {
+            let group = &placement.group;
+            if group.group_id != group_id
+                || group.cluster_id != self.group.cluster_id
+                || group.database != self.group.database
+            {
+                return Err(invalid("foreign scoped queue placement"));
+            }
+            placement.validate(group)?;
+        }
+        Ok((*placement).clone())
+    }
+
     pub(crate) async fn published_cold_fence(
         &self,
         authority: Authority,

@@ -16,9 +16,11 @@ use crate::oltp::mvcc::{
     },
 };
 use crate::oltp_replication::{
-    authority::{consensus::Applied, status::StatusTopology},
+    authority::{consensus::Applied, control::ScopedCatalogRead, status::StatusTopology},
     owned::{OwnedCommand, OwnedPayload},
 };
+
+const SCOPED_CATALOG_KEY_BYTES: usize = 512;
 
 #[cfg(test)]
 #[path = "participant_full/continuation_fixture.rs"]
@@ -51,8 +53,16 @@ impl ParticipantEndpoint {
             bytes,
         )?;
         let allowed = match head.method {
-            Method::ParticipantRead { .. }
-            | Method::ParticipantReadPage
+            Method::ParticipantRead { read_ts } => match head.action {
+                ServiceAction::Owner => true,
+                ServiceAction::ScopedCatalogRead(scope) => {
+                    self.proof.handle.identity().kind == GroupKind::Catalog
+                        && scope.read_ts == read_ts
+                        && head.payload_bytes <= SCOPED_CATALOG_KEY_BYTES as u64
+                }
+                _ => false,
+            },
+            Method::ParticipantReadPage
             | Method::ParticipantImages
             | Method::ParticipantArchiveEffects { .. }
             | Method::ParticipantScan
@@ -503,10 +513,13 @@ impl Endpoint for ParticipantEndpoint {
                                 }
                             })
                             .await?;
-                        self.proof
-                            .handle
-                            .read_at(read_ts, key.payload()?.0.clone())
-                            .await
+                        let key = key.payload()?.0.clone();
+                        if let ServiceAction::ScopedCatalogRead(scope) = head.action {
+                            authorize(&self.proof.control, &session, &head).await?;
+                            self.proof.handle.read_scoped_catalog(scope, key).await
+                        } else {
+                            self.proof.handle.read_at(read_ts, key).await
+                        }
                     }
                     Method::ParticipantReadPage => {
                         let shared = self.proof.shared.clone();
@@ -812,6 +825,26 @@ impl ParticipantClient {
             )
             .await
     }
+    async fn read_at_as(
+        &self,
+        action: ServiceAction,
+        read_ts: ReadTs,
+        key: MvccKey,
+        max_key_bytes: usize,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let client = &self.proof.client;
+        let shared = client.shared.clone();
+        let payload = client
+            .shared
+            .execute(ExecutionClass::Query, 0, 0, move || {
+                shared.encode_in(ByteClass::Data, &KeyPayload(key), max_key_bytes)
+            })
+            .await?;
+        let response = client
+            .call_as(action, Method::ParticipantRead { read_ts }, Some(payload))
+            .await?;
+        response.reply.sections[0].clone().ok_or_else(invalid)
+    }
 }
 impl RemoteParticipant for ParticipantClient {
     fn propose(
@@ -860,23 +893,19 @@ impl RemoteParticipant for ParticipantClient {
         })
     }
     fn read_at(&self, read_ts: ReadTs, key: MvccKey) -> ParticipantFuture<'_, ChargedBytes> {
-        Box::pin(async move {
-            let shared = self.proof.client.shared.clone();
-            let payload = self
-                .proof
-                .client
-                .shared
-                .execute(ExecutionClass::Query, 0, 0, move || {
-                    shared.encode_in(ByteClass::Data, &KeyPayload(key), MAX_FIXED_COMMAND_BYTES)
-                })
-                .await?;
-            let response = self
-                .proof
-                .client
-                .call(Method::ParticipantRead { read_ts }, Some(payload))
-                .await?;
-            response.reply.sections[0].clone().ok_or_else(invalid)
-        })
+        Box::pin(self.read_at_as(self.proof.client.action, read_ts, key, MAX_FIXED_COMMAND_BYTES))
+    }
+    fn read_scoped_catalog(
+        &self,
+        scope: ScopedCatalogRead,
+        key: MvccKey,
+    ) -> ParticipantFuture<'_, ChargedBytes> {
+        Box::pin(self.read_at_as(
+            ServiceAction::ScopedCatalogRead(scope),
+            scope.read_ts,
+            key,
+            SCOPED_CATALOG_KEY_BYTES,
+        ))
     }
     fn read_page(
         &self,

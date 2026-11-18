@@ -129,6 +129,7 @@ fn reserve(authority: Authority, id: Uuid, digest: Digest) -> StatusCommand {
         request_id: id,
         digest,
         kind: RequestKind::Mutation,
+        scoped: None,
         reservation_id: Uuid::new_v4(),
     }
 }
@@ -762,6 +763,7 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
         original_run: old.run_id,
         reservation_id: Uuid::new_v4(),
         kind: RequestKind::Mutation,
+        scoped: None,
     };
     let outcome = super::super::MutationOutcome::failure(ProtocolError::new(
         ErrorCode::NotFound,
@@ -859,6 +861,7 @@ fn o19_restored_reserved_identity_never_reenters_reused_run() {
         original_run: run_id,
         reservation_id: Uuid::new_v4(),
         kind: RequestKind::Mutation,
+        scoped: None,
     };
     let record = IdentityRecord {
         reservation,
@@ -936,7 +939,7 @@ async fn o13_o14_q06_retirement_certificate_survives_retry_reopen_and_ready_chan
         timestamp_position: AppliedPosition { term: 2, node_id: 1, index: 11 },
     };
     fixture.apply(StatusCommand::ReserveIdentity {
-        authority, request_id, digest, kind: RequestKind::Mutation, reservation_id,
+        authority, request_id, digest, kind: RequestKind::Mutation, reservation_id, scoped: None,
     }).await;
     assert_eq!(fixture.apply(command.clone()).await, StatusReply::Rejected(StatusFault::TerminalConflict));
     let terminal = fixture.apply(StatusCommand::TerminalFailure { authority, request, outcome }).await;

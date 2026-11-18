@@ -3,7 +3,10 @@
 use super::*;
 use crate::{
     oltp::pool::{ExecutionClass, ScratchLease},
-    oltp_replication::authority::consensus::{Applied, Consensus},
+    oltp_replication::authority::{
+        consensus::{Applied, Consensus},
+        control::ScopedCatalogRead,
+    },
 };
 const META: TransactionBudget = TransactionBudget {
     scratch_bytes: 128 << 10,
@@ -29,6 +32,13 @@ pub(crate) trait RemoteParticipant: Send + Sync {
         command: OwnedCommand<ParticipantCommand>,
     ) -> ParticipantFuture<'_, Applied<ParticipantReply>>;
     fn read_at(&self, read_ts: ReadTs, key: MvccKey) -> ParticipantFuture<'_, ChargedBytes>;
+    fn read_scoped_catalog(
+        &self,
+        _scope: ScopedCatalogRead,
+        _key: MvccKey,
+    ) -> ParticipantFuture<'_, ChargedBytes> {
+        Box::pin(async { Err(invalid()) })
+    }
     fn read_page(
         &self,
         request: OwnedCommand<super::point::PointReadRequest>,
@@ -340,6 +350,27 @@ impl ParticipantHandle {
 
         self.local_consensus().ensure_linearizable().await?;
         self.local_machine().read_at(read_ts, key).await
+    }
+    pub(crate) async fn read_scoped_catalog(
+        &self,
+        scope: ScopedCatalogRead,
+        key: MvccKey,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        if self.identity().kind != GroupKind::Catalog
+            || !matches!(
+                &key,
+                MvccKey::CatalogTable { table_id }
+                    | MvccKey::CatalogRoutingRoot { table_id }
+                    | MvccKey::CatalogRoutingPage { table_id, .. }
+                    if *table_id == scope.table_id
+            )
+        {
+            return Err(invalid());
+        }
+        if let Some(remote) = &self.remote {
+            return remote.read_scoped_catalog(scope, key).await;
+        }
+        self.read_at(scope.read_ts, key).await
     }
     pub(crate) async fn read_page(
         &self,

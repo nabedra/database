@@ -3,7 +3,7 @@ use crate::{
     oltp::{
         mvcc::{
             CanonicalJson,
-            store::{VerifiedParticipantResolution, VerifiedParticipantSeal},
+            store::ParticipantHandle,
         },
         pool::{ChargedBytes, WorkerSharedResources},
     },
@@ -215,6 +215,17 @@ impl StatusService for PartitionedStatus {
         self.request(request_id)
             .reserve_identity(authority, request_id, digest, kind)
     }
+    fn reserve_scoped_identity<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+        kind: RequestKind,
+        scoped: ScopedAdmission,
+    ) -> ConsensusFuture<'a, Applied<StatusReply>> {
+        self.request(request_id)
+            .reserve_scoped_identity(authority, request_id, digest, kind, scoped)
+    }
     fn lookup<'a>(
         &'a self,
         request_id: Uuid,
@@ -228,6 +239,15 @@ impl StatusService for PartitionedStatus {
         digest: Option<Digest>,
     ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
         self.request(request_id).lookup_identity(request_id, digest)
+    }
+    fn lookup_scoped_reservation<'a>(
+        &'a self,
+        placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, IdentityReservation> {
+        self.request(request_id)
+            .lookup_scoped_reservation(placement, request_id, digest)
     }
     fn current_authority<'a>(&'a self) -> ConsensusFuture<'a, Option<Authority>> {
         Box::pin(async move {
@@ -324,25 +344,42 @@ impl StatusService for PartitionedStatus {
     ) -> ConsensusFuture<'a, ManifestRef> {
         self.request(txn.request_id).seal_manifest(authority, txn)
     }
-    fn observe_prepared<'a>(
+    fn record_participant_prepared<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantSeal,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
         Box::pin(async move {
-            self.manifest(proof.evidence().txn, proof.evidence().manifest)?
-                .observe_prepared(authority, proof)
+            self.manifest(txn, manifest)?
+                .record_participant_prepared(authority, participant, txn, manifest)
                 .await
         })
     }
-    fn observe_resolved<'a>(
+    fn record_participant_resolved<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantResolution,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
         Box::pin(async move {
-            self.manifest(proof.evidence().txn, proof.evidence().manifest)?
-                .observe_resolved(authority, proof)
+            self.manifest(txn, manifest)?
+                .record_participant_resolved(authority, participant, txn, manifest)
+                .await
+        })
+    }
+    fn prepare_point_permit<'a>(
+        &'a self,
+        authority: Authority,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, Result<SealedCommitPermit, ProtocolError>> {
+        Box::pin(async move {
+            self.manifest(txn, manifest)?
+                .prepare_point_permit(authority, participant, txn, manifest)
                 .await
         })
     }

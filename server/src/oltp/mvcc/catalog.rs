@@ -12,9 +12,14 @@ use crate::{
         failure,
         pool::{ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
     },
-    oltp_replication::types::{
-        Authority, CommitTs, GroupIdentity, GroupKind, ManifestRef, Page, ReadTs, Text, TxnId,
+    oltp_replication::{
+        authority::control::{ScopedCatalogRead, ScopedQueuePlacement},
+        types::{
+            Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef, Page, ReadTs,
+            RequestBinding, Text, TxnId,
+        },
     },
+    oltp_runtime::replica::QueueReadToken,
     protocol::{ErrorCode, Key, ProtocolError, TableDescriptor},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -86,7 +91,6 @@ pub(crate) struct ShardRoute {
     pub schema_epoch: u64,
     pub routing_epoch: u64,
 }
-#[cfg(test)]
 impl ShardRoute {
     pub(crate) fn contains_key(&self, key: &Key) -> bool {
         contains(&self.span, key)
@@ -249,15 +253,152 @@ impl CatalogHandle {
         table_id: Uuid,
         key: &Key,
     ) -> Result<RouteRead, ProtocolError> {
-        let mut next = match self.routing_root(snapshot, table_id).await? {
+        let next = match self.routing_root(snapshot, table_id).await? {
             CatalogRead::Blocked(i) => return Ok(RouteRead::Blocked(i)),
             CatalogRead::Value {
                 record: Some(root), ..
             } => root.first_page,
             _ => return Ok(RouteRead::Missing),
         };
+        self.route_pages(snapshot, table_id, key, next).await
+    }
+    pub(crate) async fn scoped_route(
+        &self,
+        placement: &ScopedQueuePlacement,
+        request: RequestBinding,
+        token: &QueueReadToken,
+        key: &Key,
+    ) -> Result<RouteRead, ProtocolError> {
+        placement.validate(&placement.group)?;
+        let GroupKind::Data { table_id, .. } = placement.group.kind else {
+            return Err(invalid());
+        };
+        let catalog = self.participant.identity();
+        if placement.group.cluster_id != catalog.cluster_id
+            || placement.group.database != catalog.database
+            || request.run_id != placement.view.run_id
+            || request.request_id.is_nil()
+            || token.identity.run_id != request.run_id
+            || token.identity.request_id != request.request_id
+            || token.identity.digest != request.digest
+            || token.identity.nonce.is_nil()
+            || token.storage_pin.pin_id.is_nil()
+            || token.storage_pin.allocator_epoch == 0
+        {
+            return Err(invalid());
+        }
+        let scope = ScopedCatalogRead {
+            queue_group_id: placement.group.group_id,
+            data_generation: placement.data_generation,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request,
+            table_id,
+            read_ts: token.storage_pin.read_ts,
+        };
+        let (table_version, table) = match self
+            .read_scoped::<TableRecord>(scope, MvccKey::CatalogTable { table_id })
+            .await?
+        {
+            CatalogRead::Blocked(intent) => return Ok(RouteRead::Blocked(intent)),
+            CatalogRead::Value {
+                version,
+                record: Some(table),
+            } => (version, table),
+            CatalogRead::Value { record: None, .. } => return Ok(RouteRead::Missing),
+        };
+        let (routing_version, root) = match self
+            .read_scoped::<RoutingRoot>(scope, MvccKey::CatalogRoutingRoot { table_id })
+            .await?
+        {
+            CatalogRead::Blocked(intent) => return Ok(RouteRead::Blocked(intent)),
+            CatalogRead::Value {
+                version,
+                record: Some(root),
+            } => (version, root),
+            CatalogRead::Value { record: None, .. } => return Ok(RouteRead::Missing),
+        };
+        let capture = CatalogCapture {
+            pin: self.snapshot(scope.read_ts, placement.view.authority())?,
+            catalog_root: token.catalog_root,
+            table_id: Some(table_id),
+            name_version: None,
+            table_version,
+            routing_version,
+            schema_epoch: table.schema_epoch,
+            routing_epoch: table.routing_epoch,
+            point: None,
+        };
+        if table.descriptor.id != table_id
+            || table.schema_epoch != token.schema_epoch
+            || table.routing_epoch != token.routing_epoch
+            || root.schema_epoch != table.schema_epoch
+            || root.routing_epoch != table.routing_epoch
+            || capture.lineage_digest()? != token.catalog_root
+        {
+            return Err(invalid());
+        }
+        key.validate(
+            *table
+                .descriptor
+                .schema
+                .get(&table.descriptor.key)
+                .ok_or_else(invalid)?,
+        )?;
+        let route = self
+            .read_route_pages(&capture.pin, table_id, key, root.first_page, Some(scope))
+            .await?;
+        if let RouteRead::Route { page, index } = &route {
+            let route = &page.shards[*index];
+            if route.group != placement.group
+                || route.schema_epoch != table.schema_epoch
+                || route.routing_epoch == 0
+                || route.routing_epoch > table.routing_epoch
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(route)
+    }
+    async fn read_scoped<T: DeserializeOwned + Send + Sync + 'static>(
+        &self,
+        scope: ScopedCatalogRead,
+        key: MvccKey,
+    ) -> Result<CatalogRead<T>, ProtocolError> {
+        decode_record(
+            self.resources(),
+            self.participant.read_scoped_catalog(scope, key).await?,
+        )
+        .await
+    }
+    pub(super) async fn route_pages(
+        &self,
+        snapshot: &PinnedCatalog,
+        table_id: Uuid,
+        key: &Key,
+        next: Option<Uuid>,
+    ) -> Result<RouteRead, ProtocolError> {
+        self.read_route_pages(snapshot, table_id, key, next, None).await
+    }
+    async fn read_route_pages(
+        &self,
+        snapshot: &PinnedCatalog,
+        table_id: Uuid,
+        key: &Key,
+        mut next: Option<Uuid>,
+        scope: Option<ScopedCatalogRead>,
+    ) -> Result<RouteRead, ProtocolError> {
         while let Some(page_id) = next {
-            match self.routing_page(snapshot, table_id, page_id).await? {
+            let read = match scope {
+                Some(scope) => self
+                    .read_scoped::<RoutingPage>(
+                        scope,
+                        MvccKey::CatalogRoutingPage { table_id, page_id },
+                    )
+                    .await?,
+                None => self.routing_page(snapshot, table_id, page_id).await?,
+            };
+            match read {
                 CatalogRead::Blocked(i) => return Ok(RouteRead::Blocked(i)),
                 CatalogRead::Value {
                     record: Some(page), ..
@@ -449,8 +590,6 @@ fn invalid() -> ProtocolError {
 
 /// The root commits to an actual namespaced timestamp cut and the requested
 /// table's immutable identities/versions. Capturing it does not clone all tables.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct CatalogCapture {
     pub pin: PinnedCatalog,
     pub catalog_root: crate::oltp_replication::types::Digest,
@@ -460,6 +599,53 @@ pub(crate) struct CatalogCapture {
     pub routing_version: Option<CommitTs>,
     pub schema_epoch: u64,
     pub routing_epoch: u64,
+    point: Option<PointCatalog>,
+}
+
+/// Local, charged catalog records from the same snapshot as the accepted
+/// context. Transfer and recovery reconstruct them from the retained pin.
+pub(crate) struct PointCatalog {
+    pub(super) table: OwnedRecord<TableRecord>,
+    pub(super) table_version: Option<CommitTs>,
+    pub(super) first_page: Option<Uuid>,
+}
+
+impl CatalogCapture {
+    fn lineage_digest(&self) -> Result<Digest, ProtocolError> {
+        // Authority terms fence execution while the immutable cut survives a
+        // same-run takeover.
+        crate::oltp_replication::owned::serialized_digest(&(
+            b"nabedra/pinned-catalog-lineage/v1".as_slice(),
+            &self.pin.catalog,
+            self.pin.read_ts,
+            self.pin.authority.run_id,
+            self.table_id,
+            self.name_version,
+            self.table_version,
+            self.routing_version,
+            self.schema_epoch,
+            self.routing_epoch,
+        ))
+    }
+
+    pub(crate) fn has_point(&self) -> bool {
+        self.point.is_some()
+    }
+
+    pub(crate) fn point_for(
+        &self,
+        pin: &PinnedCatalog,
+        root: crate::oltp_replication::types::Digest,
+    ) -> Option<&PointCatalog> {
+        if self.catalog_root != root
+            || self.pin.catalog != pin.catalog
+            || self.pin.read_ts != pin.read_ts
+            || self.pin.authority != pin.authority
+        {
+            return None;
+        }
+        self.point.as_ref()
+    }
 }
 pub(crate) enum CaptureRead {
     Captured(CatalogCapture),
@@ -485,8 +671,10 @@ impl CatalogHandle {
             routing_version: None,
             schema_epoch: namespace.schema_epoch,
             routing_epoch: namespace.routing_epoch,
+            point: None,
         };
         use crate::protocol::Operation;
+        let keep_point = matches!(operation, Operation::Get(_) | Operation::Update(_));
         let name = match operation {
             Operation::Create(p) => Some(p.name.as_str()),
             Operation::Describe(p) => Some(p.name.as_str()),
@@ -522,6 +710,7 @@ impl CatalogHandle {
             };
         }
         if let Some(table_id) = capture.table_id {
+            let mut point_table = None;
             match self.describe(pin, table_id).await? {
                 CatalogRead::Blocked(i) => return Ok(CaptureRead::Blocked(i)),
                 CatalogRead::Value { version, record } => {
@@ -529,6 +718,9 @@ impl CatalogHandle {
                     if let Some(table) = record {
                         capture.schema_epoch = table.schema_epoch;
                         capture.routing_epoch = table.routing_epoch;
+                        if keep_point && table.descriptor.id == table_id {
+                            point_table = Some(table);
+                        }
                     }
                 }
             }
@@ -542,26 +734,18 @@ impl CatalogHandle {
                         {
                             return Err(invalid());
                         }
+                        if let Some(table) = point_table {
+                            capture.point = Some(PointCatalog {
+                                table,
+                                table_version: capture.table_version,
+                                first_page: root.first_page,
+                            });
+                        }
                     }
                 }
             }
         }
-        // Authority terms fence execution but do not change an immutable cut.
-        // A same-run takeover must reconstruct the same pre-accept lineage.
-        // List/create-absent uses this genuine namespace identity/epoch plus
-        // the allocator-pinned read timestamp. Every catalog key is MVCC at s.
-        capture.catalog_root = crate::oltp_replication::owned::serialized_digest(&(
-            b"nabedra/pinned-catalog-lineage/v1".as_slice(),
-            &pin.catalog,
-            pin.read_ts,
-            pin.authority.run_id,
-            capture.table_id,
-            capture.name_version,
-            capture.table_version,
-            capture.routing_version,
-            capture.schema_epoch,
-            capture.routing_epoch,
-        ))?;
+        capture.catalog_root = capture.lineage_digest()?;
         Ok(CaptureRead::Captured(capture))
     }
 }

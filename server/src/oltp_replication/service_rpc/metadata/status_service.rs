@@ -1,12 +1,14 @@
 use super::*;
-use crate::oltp::mvcc::store::{VerifiedParticipantResolution, VerifiedParticipantSeal};
+use crate::oltp::mvcc::store::ParticipantHandle;
 use crate::oltp_replication::authority::status::identity::transaction::ColdRecoveryPage;
 use crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage;
 use crate::oltp_replication::authority::status::{CommitPermitStatement, StatusTopology};
 use crate::oltp_replication::authority::timestamp::cold::ColdApplicationPin;
 use crate::oltp_replication::authority::{
+    control::ScopedQueuePlacement,
     status::{
-        ArchiveCursor, CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage,
+        ArchiveCursor, CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, ScopedAdmission,
+        IdentityReservation,
         StatusArchiveCutStatement, VerifiedStatusArchiveCut,
     },
     timestamp::{VerifiedArchiveClosure, archive::ArchiveClosureStatement},
@@ -14,7 +16,7 @@ use crate::oltp_replication::authority::{
 use uuid::Uuid;
 
 const INSTALL_POINT_MANIFEST: u8 = 26;
-const POINT_MANIFEST_PAYLOAD_LIMIT: usize = 4096;
+const POINT_CALL_PAYLOAD_LIMIT: usize = 4096;
 
 // External tags preserve CanonicalJson's RawValue decoder.
 #[derive(Serialize, Deserialize)]
@@ -56,6 +58,8 @@ enum Request {
         request_id: Uuid,
         digest: Digest,
         kind: RequestKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scoped: Option<ScopedAdmission>,
     },
     InstallPointManifest(PointManifest),
     Begin {
@@ -83,6 +87,12 @@ enum Request {
         txn: TxnId,
         manifest: ManifestRef,
     },
+    PointPreparedPermit {
+        authority: Authority,
+        group: GroupIdentity,
+        txn: TxnId,
+        manifest: ManifestRef,
+    },
     Resolved {
         authority: Authority,
         group: GroupIdentity,
@@ -90,6 +100,12 @@ enum Request {
         manifest: ManifestRef,
     },
     Commit {
+        authority: Authority,
+        txn: TxnId,
+        permit: SealedCommitPermit,
+        stamp: CommitStamp,
+    },
+    PointCommitDecision {
         authority: Authority,
         txn: TxnId,
         permit: SealedCommitPermit,
@@ -150,8 +166,10 @@ impl Request {
             | Self::Page { txn, .. }
             | Self::Seal { txn, .. }
             | Self::Prepared { txn, .. }
+            | Self::PointPreparedPermit { txn, .. }
             | Self::Resolved { txn, .. }
             | Self::Commit { txn, .. }
+            | Self::PointCommitDecision { txn, .. }
             | Self::Abort { txn, .. }
             | Self::Inspect { txn }
             | Self::Permit { txn, .. }
@@ -187,8 +205,10 @@ impl Request {
             Self::Page { .. } => 4,
             Self::Seal { .. } => 5,
             Self::Prepared { .. } => 6,
+            Self::PointPreparedPermit { .. } => POINT_PREPARED_PERMIT,
             Self::Resolved { .. } => 7,
             Self::Commit { .. } => 8,
+            Self::PointCommitDecision { .. } => POINT_COMMIT_DECISION,
             Self::Abort { .. } => 9,
             Self::Failure { .. } => 10,
             Self::Inspect { .. } => 11,
@@ -298,6 +318,22 @@ impl StatusEndpoint {
         )?;
         let allowed = match header.method {
             Method::StatusCall {
+                operation: 1,
+                mutation: false,
+            } => matches!(
+                header.action,
+                ServiceAction::Owner
+                    | ServiceAction::TimestampProof { .. }
+                    | ServiceAction::ScopedQueueRead { .. }
+            ),
+            Method::StatusCall {
+                operation: 2,
+                mutation: true,
+            } => matches!(
+                header.action,
+                ServiceAction::Owner | ServiceAction::ScopedQueueReserve { .. }
+            ),
+            Method::StatusCall {
                 operation: 15,
                 mutation: true,
             } => matches!(
@@ -305,7 +341,7 @@ impl StatusEndpoint {
                 ServiceAction::ControlFence { .. } | ServiceAction::Operator
             ),
             Method::StatusCall {
-                operation: 0 | 1 | 12 | 16 | 19,
+                operation: 0 | 12 | 16 | 19,
                 mutation: false,
             } => matches!(
                 header.action,
@@ -327,10 +363,10 @@ impl StatusEndpoint {
             || (matches!(
                 header.method,
                 Method::StatusCall {
-                    operation: INSTALL_POINT_MANIFEST,
+                    operation: INSTALL_POINT_MANIFEST | POINT_PREPARED_PERMIT | POINT_COMMIT_DECISION,
                     ..
                 }
-            ) && header.payload_bytes > POINT_MANIFEST_PAYLOAD_LIMIT as u64)
+            ) && header.payload_bytes > POINT_CALL_PAYLOAD_LIMIT as u64)
         {
             return Err(invalid());
         }
@@ -425,6 +461,33 @@ impl StatusEndpoint {
             }
             Request::Current => encode(shared, handle.current_authority().await?).await,
             Request::Lookup { request_id, digest } => {
+                if let ServiceAction::ScopedQueueRead {
+                    queue_group_id,
+                    queue_generation,
+                    queue_view,
+                    request_id: authorized_id,
+                } = header.action
+                {
+                    if authorized_id != request_id || digest.is_none() {
+                        return Err(invalid());
+                    }
+                    let value = handle.lookup_identity(request_id, digest).await?;
+                    let reservation = match value {
+                        Some(IdentityLookup::Reserved(reservation)) => reservation,
+                        _ => return Err(unavailable()),
+                    };
+                    if reservation.original_run != queue_view.run_id
+                        || reservation.scoped != Some(ScopedAdmission {
+                            protocol_version: ScopedAdmission::VERSION,
+                            queue_group_id,
+                            queue_generation,
+                            status_group_id: handle.identity().group_id,
+                        })
+                    {
+                        return Err(unavailable());
+                    }
+                    return encode(shared, reservation).await;
+                }
                 let value = handle.lookup_identity(request_id, digest).await?;
                 encode(shared, value).await
             }
@@ -433,11 +496,53 @@ impl StatusEndpoint {
                 request_id,
                 digest,
                 kind,
+                scoped,
             } => {
+                match (header.action, scoped) {
+                    (ServiceAction::Owner, None) => {}
+                    (
+                        ServiceAction::ScopedQueueReserve {
+                            queue_group_id,
+                            queue_generation,
+                            queue_view,
+                            request_id: authorized_id,
+                        },
+                        Some(binding),
+                    ) if binding.protocol_version == ScopedAdmission::VERSION
+                        && binding.status_group_id == handle.identity().group_id
+                        && binding.queue_group_id == queue_group_id
+                        && binding.queue_generation == queue_generation
+                        && queue_view.run_id == authority.run_id
+                        && authorized_id == request_id =>
+                    {
+                        // Recheck after receiving the payload. The durable
+                        // Status proposal independently checks its authority.
+                        let scope = crate::oltp_runtime::replica::QueueScope {
+                            cluster_id: session.group().cluster_id,
+                            database: session.group().database.clone(),
+                        };
+                        let grant = self
+                            .proof
+                            .control
+                            .service_role(
+                                &scope,
+                                session.remote(),
+                                header.action,
+                                session.group().clone(),
+                            )
+                            .await?;
+                        if grant.owner != Some(session.remote())
+                            || grant.effective_authority != authority
+                        {
+                            return Err(unavailable());
+                        }
+                    }
+                    _ => return Err(invalid()),
+                }
                 encode(
                     shared,
                     handle
-                        .reserve_identity(authority, request_id, digest, kind)
+                        .reserve_admission(authority, request_id, digest, kind, scoped)
                         .await?,
                 )
                 .await
@@ -446,7 +551,7 @@ impl StatusEndpoint {
                 let installed = handle.install_point_manifest(point).await?;
                 encode(shared, installed)
                     .await
-                    .map_err(point_manifest_uncertain)
+                    .map_err(owner_operation_uncertain)
             }
             Request::Begin {
                 authority,
@@ -492,6 +597,28 @@ impl StatusEndpoint {
                 handle.observe_prepared(authority, proof).await?;
                 encode(shared, ()).await
             }
+            Request::PointPreparedPermit {
+                authority,
+                group,
+                txn,
+                manifest,
+            } => {
+                if manifest.status_group_id != handle.identity().group_id
+                    || manifest.participant_count != 1
+                    || !matches!(group.kind, GroupKind::Data { .. })
+                {
+                    return Err(invalid());
+                }
+                let proof = self.participant(group).await?.seal(txn, manifest).await?;
+                handle.observe_prepared(authority, proof).await?;
+                let permit = handle
+                    .commit_permit(authority, txn)
+                    .await
+                    .map_err(owner_operation_uncertain)?;
+                encode(shared, permit.statement().clone())
+                    .await
+                    .map_err(owner_operation_uncertain)
+            }
             Request::Resolved {
                 authority,
                 group,
@@ -522,9 +649,18 @@ impl StatusEndpoint {
                 txn,
                 permit,
                 stamp,
+            }
+            | Request::PointCommitDecision {
+                authority,
+                txn,
+                permit,
+                stamp,
             } => {
-                let actual = handle.commit_permit(authority, txn).await?;
-                if actual != permit {
+                let inline = matches!(
+                    header.method,
+                    Method::StatusCall { operation: POINT_COMMIT_DECISION, .. }
+                );
+                if inline && permit.statement().manifest.participant_count != 1 {
                     return Err(invalid());
                 }
                 let client = TimestampClient::new(
@@ -536,12 +672,31 @@ impl StatusEndpoint {
                         source_group: handle.identity().group_id,
                     },
                 )?;
-                let allocated = client.confirmed_allocation(actual.clone()).await?;
-                if allocated != stamp {
+                let (actual, allocated) = tokio::try_join!(
+                    handle.commit_permit(authority, txn),
+                    client.confirmed_allocation(permit.clone()),
+                )?;
+                if actual != permit || allocated != stamp {
                     return Err(invalid());
                 }
-                let decision = handle.decide_commit(authority, actual, allocated).await?;
-                encode(shared, decision.statement().manifest).await
+                let decision = handle
+                    .decide_commit(authority, actual, allocated)
+                    .await
+                    .map_err(|error| {
+                        if inline {
+                            owner_operation_uncertain(error)
+                        } else {
+                            error
+                        }
+                    })?;
+                if inline {
+                    let outcome = decision.outcome().ok_or_else(unavailable)?;
+                    encode(shared, (decision.statement().clone(), outcome.clone()))
+                        .await
+                        .map_err(owner_operation_uncertain)
+                } else {
+                    encode(shared, decision.statement().manifest).await
+                }
             }
             Request::Abort {
                 authority,
@@ -911,19 +1066,61 @@ impl StatusClient {
         digest: Digest,
         kind: RequestKind,
     ) -> Result<Applied<StatusReply>, ProtocolError> {
-        let (applied, owner): (Applied<StatusReply>, _) = self
-            .value(Request::Reserve {
-                authority,
-                request_id,
-                digest,
-                kind,
-            })
-            .await?;
-        {
-            let mut reply = applied.reply;
-            reply.retain_owner(owner.clone());
-            Ok(Applied::owned(applied.position, reply, owner))
-        }
+        self.reserve_admission(authority, request_id, digest, kind, None)
+            .await
+    }
+    async fn reserve_admission(
+        &self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+        kind: RequestKind,
+        scoped: Option<ScopedAdmission>,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
+        let request = Request::Reserve {
+            authority,
+            request_id,
+            digest,
+            kind,
+            scoped,
+        };
+        let (applied, owner): (Applied<StatusReply>, _) = match scoped {
+            None => self.value(request).await?,
+            Some(binding) => {
+                let queue = self
+                    .client
+                    .control
+                    .scoped_queue_by_id(binding.queue_group_id)
+                    .await?
+                    .ok_or_else(unavailable)?;
+                if binding.protocol_version != ScopedAdmission::VERSION
+                    || binding.status_group_id != self.identity().group_id
+                    || binding.queue_generation != queue.queue_generation
+                    || authority.run_id != queue.view.run_id
+                    || queue.owner != self.client.transport.local_identity()
+                {
+                    return Err(unavailable());
+                }
+                let action = ServiceAction::ScopedQueueReserve {
+                    queue_group_id: binding.queue_group_id,
+                    queue_generation: binding.queue_generation,
+                    queue_view: queue.view,
+                    request_id,
+                };
+                let method = request.method();
+                let payload = encode(self.resources(), request).await?;
+                self.client
+                    .call_as(action, method, Some(payload))
+                    .await
+                    .map_err(owner_operation_uncertain)?
+                    .decoded(self.resources())
+                    .await
+                    .map_err(owner_operation_uncertain)?
+            }
+        };
+        let mut reply = applied.reply;
+        reply.retain_owner(owner.clone());
+        Ok(Applied::owned(applied.position, reply, owner))
     }
     pub(crate) async fn lookup_identity(
         &self,
@@ -937,15 +1134,29 @@ impl StatusClient {
         }
         Ok(value)
     }
-    async fn try_point_manifest(
+    async fn try_preferred_owner_response(
         &self,
-        point: PointManifest,
-    ) -> Result<Option<(ManifestRef, Digest)>, ProtocolError> {
+        request: Request,
+    ) -> Result<Option<ServiceResponse>, ProtocolError> {
         let preferred = self.client.leader.load(Ordering::Relaxed);
         if self.client.action != ServiceAction::Owner || preferred == 0 {
             return Ok(None);
         }
-        let routes = self.client.control.replica_routes(self.identity()).await?;
+        let cached = self
+            .client
+            .control
+            .cached_replica_routes(self.identity())
+            .and_then(|routes| {
+                let receiver = routes.hinted_receiver(preferred)?;
+                Some((routes, receiver))
+            });
+        let (routes, receiver) = match cached {
+            Some((routes, receiver)) => (routes, Some(receiver)),
+            None => (
+                self.client.control.replica_routes(self.identity()).await?,
+                None,
+            ),
+        };
         let Some(member) = routes
             .members
             .iter()
@@ -953,32 +1164,38 @@ impl StatusClient {
         else {
             return Ok(None);
         };
-        let expected_result = MutationOutcome::from_success(&point.result)?.digest()?;
-        let request = Request::InstallPointManifest(point);
         let method = request.method();
         let shared = self.client.shared.clone();
         let payload = self
             .client
             .shared
             .execute(ExecutionClass::Control, preferred, 0, move || {
-                shared.encode_in(ByteClass::Progress, &request, POINT_MANIFEST_PAYLOAD_LIMIT)
+                shared.encode_in(ByteClass::Progress, &request, POINT_CALL_PAYLOAD_LIMIT)
             })
             .await?;
         // Only a verified embedded legacy decoder error is safe here. A
         // local reply-decoding error can have the same text after execution.
+        let target = receiver.map_or_else(|| member.worker_id.into(), Into::into);
         let reply = match self
             .client
-            .call_member(
+            .call_member_at(
                 ServiceAction::Owner,
                 method,
                 &Some(payload),
                 member.node_id,
-                member.worker_id.into(),
+                target,
+                receiver.map(|_| routes.record.generation),
             )
             .await
         {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(error)) if error == invalid() => return Ok(None),
+            Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                if receiver == Some(worker) && placement_rejected_before_execution(&error) =>
+            {
+                self.client.control.invalidate_replica_routes(&routes);
+                return Ok(None);
+            }
             Err(CallError::Transport(RequestError::OutgoingLaneFull)) => return Ok(None),
             Ok(Err(error)) => Err(error),
             Err(error) => Err(error.into()),
@@ -993,20 +1210,33 @@ impl StatusClient {
                     Ordering::Relaxed,
                 );
             }
-            point_manifest_uncertain(error)
+            owner_operation_uncertain(error)
         })?;
-        let node = reply.node;
+        routes.record_successful_node(reply.node);
+        Ok(Some(reply))
+    }
+
+    async fn try_point_manifest(
+        &self,
+        point: PointManifest,
+    ) -> Result<Option<(ManifestRef, Digest)>, ProtocolError> {
+        let expected_result = MutationOutcome::from_success(&point.result)?.digest()?;
+        let Some(reply) = self
+            .try_preferred_owner_response(Request::InstallPointManifest(point))
+            .await?
+        else {
+            return Ok(None);
+        };
         let ((manifest, result_digest), _): ((ManifestRef, Digest), _) = reply
             .decoded(&self.client.shared)
             .await
-            .map_err(point_manifest_uncertain)?;
+            .map_err(owner_operation_uncertain)?;
         if manifest.status_group_id != self.identity().group_id
             || manifest.participant_count != 1
             || result_digest != expected_result
         {
-            return Err(point_manifest_uncertain(invalid()));
+            return Err(owner_operation_uncertain(invalid()));
         }
-        routes.record_successful_node(node);
         Ok(Some((manifest, result_digest)))
     }
 
@@ -1059,35 +1289,74 @@ impl StatusClient {
     ) -> Result<ManifestRef, ProtocolError> {
         Ok(self.value(Request::Seal { authority, txn }).await?.0)
     }
-    pub(crate) async fn observe_prepared(
+    async fn record_prepared(
         &self,
         authority: Authority,
-        proof: VerifiedParticipantSeal,
+        group: GroupIdentity,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> Result<(), ProtocolError> {
-        let evidence = proof.evidence();
         self.value::<()>(Request::Prepared {
             authority,
-            group: evidence.participant.group.clone(),
-            txn: evidence.txn,
-            manifest: evidence.manifest,
+            group,
+            txn,
+            manifest,
         })
         .await?;
         Ok(())
     }
-    pub(crate) async fn observe_resolved(
+    async fn record_resolved(
         &self,
         authority: Authority,
-        proof: VerifiedParticipantResolution,
+        group: GroupIdentity,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> Result<(), ProtocolError> {
-        let evidence = proof.evidence();
         self.value::<()>(Request::Resolved {
             authority,
-            group: evidence.group.clone(),
-            txn: evidence.txn,
-            manifest: evidence.manifest,
+            group,
+            txn,
+            manifest,
         })
         .await?;
         Ok(())
+    }
+    async fn prepare_point_permit(
+        &self,
+        authority: Authority,
+        group: GroupIdentity,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Result<SealedCommitPermit, ProtocolError>, ProtocolError> {
+        let reply = self
+            .try_preferred_owner_response(Request::PointPreparedPermit {
+                authority,
+                group: group.clone(),
+                txn,
+                manifest,
+            })
+            .await;
+        match reply {
+            Ok(Some(reply)) => {
+                let permit = async {
+                    let context = reply.metadata_context()?;
+                    let (statement, _): (CommitPermitStatement, _) =
+                        reply.decoded(self.resources()).await?;
+                    SealedCommitPermit::from_point_prepared(
+                        context, statement, authority, txn, manifest,
+                    )
+                }
+                .await
+                .map_err(owner_operation_uncertain);
+                Ok(permit)
+            }
+            Err(error) if error.outcome == Outcome::Unknown => Ok(Err(error)),
+            Err(error) => Err(error),
+            Ok(None) => {
+                self.record_prepared(authority, group, txn, manifest).await?;
+                Ok(self.commit_permit(authority, txn).await)
+            }
+        }
     }
     pub(crate) async fn commit_permit(
         &self,
@@ -1107,6 +1376,26 @@ impl StatusClient {
         stamp: CommitStamp,
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
         let txn = permit.statement().txn;
+        if permit.statement().manifest.participant_count == 1
+            && let Some(reply) = self
+                .try_preferred_owner_response(Request::PointCommitDecision {
+                    authority,
+                    txn,
+                    permit: permit.clone(),
+                    stamp,
+                })
+                .await?
+        {
+            let context = reply.metadata_context().map_err(owner_operation_uncertain)?;
+            let ((statement, outcome), _): ((DecisionStatement, MutationOutcome), _) = reply
+                .decoded(self.resources())
+                .await
+                .map_err(owner_operation_uncertain)?;
+            return VerifiedStatusDecision::from_point_commit(
+                context, statement, outcome, permit.statement(), stamp,
+            )
+            .map_err(owner_operation_uncertain);
+        }
         let (manifest, _): (ManifestRef, _) = self
             .value(Request::Commit {
                 authority,
@@ -1309,7 +1598,7 @@ impl StatusClient {
     }
 }
 
-fn point_manifest_uncertain(mut error: ProtocolError) -> ProtocolError {
+fn owner_operation_uncertain(mut error: ProtocolError) -> ProtocolError {
     error.outcome = Outcome::Unknown;
     error
 }
@@ -1375,6 +1664,19 @@ impl StatusService for StatusClient {
             StatusClient::reserve_identity(self, authority, request_id, digest, kind).await
         })
     }
+    fn reserve_scoped_identity<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+        kind: RequestKind,
+        scoped: ScopedAdmission,
+    ) -> ConsensusFuture<'a, Applied<StatusReply>> {
+        Box::pin(async move {
+            self.reserve_admission(authority, request_id, digest, kind, Some(scoped))
+                .await
+        })
+    }
     fn lookup<'a>(
         &'a self,
         request_id: Uuid,
@@ -1388,6 +1690,52 @@ impl StatusService for StatusClient {
         digest: Option<Digest>,
     ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
         Box::pin(async move { StatusClient::lookup_identity(self, request_id, digest).await })
+    }
+    fn lookup_scoped_reservation<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, IdentityReservation> {
+        Box::pin(async move {
+            placement.validate(&placement.group)?;
+            let status = self.identity();
+            if placement.group.cluster_id != status.cluster_id
+                || placement.group.database != status.database
+                || !placement.members.contains(&self.client.transport.local_identity())
+                || request_id.is_nil()
+            {
+                return Err(invalid());
+            }
+            let scoped = ScopedAdmission {
+                protocol_version: ScopedAdmission::VERSION,
+                queue_group_id: placement.group.group_id,
+                queue_generation: placement.queue_generation,
+                status_group_id: status.group_id,
+            };
+            let action = ServiceAction::ScopedQueueRead {
+                queue_group_id: scoped.queue_group_id,
+                queue_generation: scoped.queue_generation,
+                queue_view: placement.view,
+                request_id,
+            };
+            let request = Request::Lookup { request_id, digest: Some(digest) };
+            let method = request.method();
+            let payload = encode(self.resources(), request).await?;
+            let (reservation, _owner): (IdentityReservation, _) = self.client
+                .call_as(action, method, Some(payload))
+                .await?
+                .decoded(self.resources())
+                .await?;
+            if reservation.request_id != request_id
+                || reservation.digest != digest
+                || reservation.original_run != placement.view.run_id
+                || reservation.scoped != Some(scoped)
+            {
+                return Err(unavailable());
+            }
+            Ok(reservation)
+        })
     }
     fn current_authority<'a>(&'a self) -> ConsensusFuture<'a, Option<Authority>> {
         Box::pin(async move { StatusClient::current_authority(self).await })
@@ -1480,19 +1828,43 @@ impl StatusService for StatusClient {
     ) -> ConsensusFuture<'a, ManifestRef> {
         Box::pin(async move { StatusClient::seal_manifest(self, authority, txn).await })
     }
-    fn observe_prepared<'a>(
+    fn record_participant_prepared<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantSeal,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
-        Box::pin(async move { StatusClient::observe_prepared(self, authority, proof).await })
+        Box::pin(async move {
+            self.record_prepared(authority, participant.identity().clone(), txn, manifest)
+                .await
+        })
     }
-    fn observe_resolved<'a>(
+    fn record_participant_resolved<'a>(
         &'a self,
         authority: Authority,
-        proof: VerifiedParticipantResolution,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
     ) -> ConsensusFuture<'a, ()> {
-        Box::pin(async move { StatusClient::observe_resolved(self, authority, proof).await })
+        Box::pin(async move {
+            self.record_resolved(authority, participant.identity().clone(), txn, manifest)
+                .await
+        })
+    }
+    fn prepare_point_permit<'a>(
+        &'a self,
+        authority: Authority,
+        participant: &'a ParticipantHandle,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, Result<SealedCommitPermit, ProtocolError>> {
+        Box::pin(async move {
+            StatusClient::prepare_point_permit(
+                self, authority, participant.identity().clone(), txn, manifest,
+            )
+            .await
+        })
     }
     fn commit_permit<'a>(
         &'a self,

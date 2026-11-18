@@ -22,7 +22,7 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     request_queue::{Receipt, RequestRecord, RequestState},
     response::{self, EncodedResponse},
-    scheduling::ResourceScheduler,
+    scheduling::{MemoryCharge, ResourceScheduler},
 };
 use serde::Deserialize;
 use std::{
@@ -312,12 +312,22 @@ impl HttpRuntime for RemoteRuntime {
     fn scheduler_node_id(&self) -> u64 {
         self.shared.scheduler_node_id()
     }
-    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
+    fn submit(
+        self: Arc<Self>,
+        body: Vec<u8>,
+        mut parsing_charge: MemoryCharge,
+    ) -> EndpointFuture<'static, RequestRecord> {
         Box::pin(async move {
             if !self.accepting.load(Ordering::Acquire) {
                 return Err(unavailable());
             }
-            self.client.submit(self.shared.copy_bytes(&body)?).await
+            // Decoding is complete. Charge both representations during the
+            // handoff, then retain only the transport's charged body.
+            parsing_charge.shrink_to(body.capacity() as u64)?;
+            let transport_body = self.shared.copy_bytes(&body)?;
+            drop(body);
+            drop(parsing_charge);
+            self.client.submit(transport_body).await
         })
     }
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {

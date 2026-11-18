@@ -51,7 +51,7 @@ async fn execute(runtime: Arc<WorkerRuntime>, request: Arrival, due: Instant) ->
         serde_json::from_value(request.request["request_id"].clone()).expect("request UUID");
     let body = serde_json::to_vec(&request.request).expect("bounded request JSON");
     let started = Instant::now();
-    let record = match runtime.clone().submit(body).await {
+    let record = match runtime.clone().submit_owned(body).await {
         Ok(record) => record,
         Err(error) => {
             assert_eq!(

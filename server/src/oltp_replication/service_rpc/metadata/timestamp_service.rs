@@ -64,6 +64,12 @@ enum Request {
         pin: StoragePin,
         request: RequestBinding,
     },
+    ScopedSnapshot {
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+        reservation: IdentityReservation,
+    },
     Allocate {
         permit: SealedCommitPermit,
     },
@@ -149,6 +155,7 @@ impl Request {
             Self::IndexMetadata { .. } => 11,
             Self::IndexMetadataPin { .. } => 23,
             Self::ColdPins { .. } => 24,
+            Self::ScopedSnapshot { .. } => 25,
             Self::ImportMetadata { .. } => 12,
             Self::ReleaseMetadata { .. } => 13,
             Self::Backup { .. } => 14,
@@ -165,6 +172,7 @@ impl Request {
                     | Self::ArchiveLookup { .. }
                     | Self::ArchiveMetadata { .. }
                     | Self::IndexMetadataPin { .. }
+                    | Self::ScopedSnapshot { .. }
             ),
         }
     }
@@ -222,6 +230,13 @@ impl TimestampEndpoint {
             } => {
                 head.action == ServiceAction::Owner
                     || matches!(head.action, ServiceAction::StatusProof { source_group } if self.status.groups().iter().any(|status| status.group_id == source_group))
+            }
+            Method::TimestampCall {
+                operation: 25,
+                mutation: false,
+            } => {
+                matches!(head.action, ServiceAction::ScopedQueueRead { .. })
+                    && head.placement_generation.is_none()
             }
             Method::TimestampCall { .. } => head.action == ServiceAction::Owner,
             _ => false,
@@ -372,6 +387,39 @@ impl TimestampEndpoint {
                 encode(shared, ()).await
             }
             Request::Current => encode(shared, self.handle.current_authority().await?).await,
+            Request::ScopedSnapshot {
+                identity,
+                pin,
+                request,
+                reservation,
+            } => {
+                let ServiceAction::ScopedQueueRead {
+                    queue_group_id,
+                    queue_generation,
+                    queue_view,
+                    request_id,
+                } = head.action
+                else {
+                    return Err(invalid());
+                };
+                if request.request_id != request_id
+                    || request.run_id != queue_view.run_id
+                    || reservation.scoped
+                        != Some(ScopedAdmission {
+                            protocol_version: ScopedAdmission::VERSION,
+                            queue_group_id,
+                            queue_generation,
+                            status_group_id: self.status.request(request_id).group_id,
+                        })
+                {
+                    return Err(invalid());
+                }
+                self.handle
+                    .verify_scoped_snapshot(identity, pin, request, reservation)
+                    .await?;
+                authorize(&self.control, session, head).await?;
+                encode(shared, ()).await
+            }
             Request::ColdPins {
                 authority,
                 transition_id,
@@ -795,6 +843,35 @@ impl TimestampClient {
             request,
         })
         .await
+    }
+    pub(crate) async fn verify_scoped_snapshot(
+        &self,
+        placement: &crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+        reservation: IdentityReservation,
+    ) -> Result<(), ProtocolError> {
+        let action = ServiceAction::ScopedQueueRead {
+            queue_group_id: placement.group.group_id,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request_id: request.request_id,
+        };
+        let request = Request::ScopedSnapshot {
+            identity,
+            pin,
+            request,
+            reservation,
+        };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        self.client
+            .call_as(action, method, Some(payload))
+            .await?
+            .decoded::<()>(&self.client.shared)
+            .await
+            .map(|((), _)| ())
     }
     pub(crate) async fn allocate_commit(
         &self,

@@ -4,7 +4,7 @@
 use crate::{
     oltp_replication::types::{
         AppliedPosition, Authority, CommitTs, DecisionStatement, Digest, ManifestRef, ReadTs,
-        RequestBinding, TxnId,
+        RequestBinding, TxnDecision, TxnId,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
@@ -21,13 +21,16 @@ pub(crate) use identity::{
 };
 pub(crate) use identity::{
     IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage, RejectedIdentity,
-    RequestKind, RetirementCertificate, SealedAdmissionRejection, StatusCommand, StatusFault,
+    RequestKind, RetirementCertificate, ScopedAdmission, SealedAdmissionRejection, StatusCommand, StatusFault,
     StatusHandle, StatusMachine, StatusReply, TerminalIdentity, TransactionInspection,
     VerifiedAdmissionRejection, VerifiedTerminalRetirement,
 };
 pub(crate) use outcome::MutationOutcome;
 pub(crate) use routing::{PartitionedStatus, StatusTopology};
 pub(crate) use service::{PointManifest, StatusService};
+
+pub(crate) const POINT_PREPARED_PERMIT: u8 = 27;
+pub(crate) const POINT_COMMIT_DECISION: u8 = 28;
 
 /// Produced only after the Status leader has strongly read every participant's
 /// immutable sealed evidence. A timestamp allocation is not itself COMMIT.
@@ -101,6 +104,24 @@ impl SealedCommitPermit {
     ) -> Result<Self, ProtocolError> {
         context.status(12, &statement)?;
         if context.group().group_id != statement.manifest.status_group_id {
+            return Err(invalid());
+        }
+        Self::from_strong_prepared_read(statement)
+    }
+    pub(crate) fn from_point_prepared(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        statement: CommitPermitStatement,
+        authority: Authority,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> Result<Self, ProtocolError> {
+        context.status(POINT_PREPARED_PERMIT, &statement)?;
+        if context.group().group_id != manifest.status_group_id
+            || statement.authority != authority
+            || statement.txn != txn
+            || statement.manifest != manifest
+            || manifest.participant_count != 1
+        {
             return Err(invalid());
         }
         Self::from_strong_prepared_read(statement)
@@ -275,6 +296,33 @@ impl VerifiedStatusDecision {
     ) -> Result<Self, ProtocolError> {
         context.decision(txn, manifest, &Some((&statement, &outcome)))?;
         if statement.txn != txn || statement.manifest != manifest {
+            return Err(invalid());
+        }
+        let owner = context.owner();
+        outcome.retain_owner(owner.clone());
+        Self::with_outcome(statement, outcome, Some(owner))
+    }
+    pub(crate) fn from_point_commit(
+        context: crate::oltp_replication::service_rpc::AuthenticatedMetadataReply,
+        statement: DecisionStatement,
+        mut outcome: MutationOutcome,
+        permit: &CommitPermitStatement,
+        stamp: CommitStamp,
+    ) -> Result<Self, ProtocolError> {
+        context.status(POINT_COMMIT_DECISION, &(&statement, &outcome))?;
+        let exact_outcome = match (statement.decision, &outcome) {
+            (TxnDecision::Commit { commit_ts }, MutationOutcome::Success(_)) => {
+                commit_ts == stamp.commit_ts
+            }
+            (TxnDecision::Abort { .. }, MutationOutcome::Failure(_)) => true,
+            _ => false,
+        };
+        if context.group().group_id != permit.manifest.status_group_id
+            || statement.txn != permit.txn
+            || statement.request != permit.request
+            || statement.manifest != permit.manifest
+            || !exact_outcome
+        {
             return Err(invalid());
         }
         let owner = context.owner();

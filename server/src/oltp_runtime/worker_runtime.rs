@@ -33,7 +33,7 @@ use crate::{
     executor::Executor,
     oltp::{
         mvcc::{
-            catalog::{CaptureRead, IntentRef},
+            catalog::{CaptureRead, CatalogCapture, IntentRef},
             planner::{NativePlanner, PlanError, PlannedOperation},
         },
         pool::{
@@ -558,7 +558,7 @@ impl WorkerRuntime {
                     if replica.authority() != authority {
                         return Err(unknown());
                     }
-                    if let Ok(record) = replica.retained_record(id, now())
+                    if let Some(record) = replica.record(id)
                         && record.run_id == run
                         && !confirmed(&replica, record)
                     {
@@ -684,7 +684,10 @@ impl WorkerRuntime {
         }
         self.services.shutdown().await
     }
-    async fn submit_owned(self: Arc<Self>, body: Vec<u8>) -> Result<RequestRecord, ProtocolError> {
+    pub(super) async fn submit_owned(
+        self: Arc<Self>,
+        body: Vec<u8>,
+    ) -> Result<RequestRecord, ProtocolError> {
         let authorization = self.authorization.clone();
         self.submit_original(body, authorization, None).await
     }
@@ -737,6 +740,7 @@ impl WorkerRuntime {
             }
             replica.record(id).map(|record| record.accepted)
         };
+        let mut captured_point = None;
         if let Some(accepted) = existing {
             let current = self.services.control.current(&self.services.scope).await?;
             let result = if accepted {
@@ -796,6 +800,9 @@ impl WorkerRuntime {
                 #[cfg(test)]
                 super::recovery_tests::pause("bound", id).await;
                 let result = self.admission.queue().accept_staged(current, id).await;
+                if result.is_ok() && capture.has_point() {
+                    captured_point = Some(capture);
+                }
                 drop((operation, owner));
                 result
             }
@@ -859,7 +866,7 @@ impl WorkerRuntime {
                     id,
                     armed: true,
                 };
-                runtime.execute(id).await.map_err(|error| {
+                runtime.execute(id, captured_point).await.map_err(|error| {
                     eprintln!(
                         "nabedra-db: request {id} execution failed: {:?}: {}",
                         error.code, error.message
@@ -964,7 +971,11 @@ impl WorkerRuntime {
         };
         Ok((input, binding))
     }
-    async fn execute(&self, id: Uuid) -> Result<(), ProtocolError> {
+    async fn execute(
+        &self,
+        id: Uuid,
+        captured_point: Option<CatalogCapture>,
+    ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         super::recovery_tests::pause("queued", id).await;
         let running = self.services.queue.start(id).await?;
@@ -976,6 +987,9 @@ impl WorkerRuntime {
             .services
             .catalog
             .snapshot(read.storage_pin.read_ts, authority)?;
+        let point = captured_point
+            .as_ref()
+            .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));
         let txn = TxnId {
             request_id: id,
             attempt: 1,
@@ -995,6 +1009,7 @@ impl WorkerRuntime {
                 txn,
                 request,
                 input.owner.clone(),
+                point,
             );
             let result = match &split_retry {
                 Some((deadline, error)) => match tokio::time::timeout_at(*deadline, planning).await
@@ -1067,6 +1082,7 @@ impl WorkerRuntime {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         };
+        drop(captured_point);
         let encoded = match planned {
             Ok(PlannedOperation::Read(bytes)) => {
                 let shared = self.services.shared.clone();
@@ -1208,7 +1224,49 @@ impl WorkerRuntime {
     async fn durable_lookup(&self, id: Uuid) -> Result<Option<IdentityLookup>, ProtocolError> {
         self.services.status.lookup_identity(id, None).await
     }
+    async fn terminal_receipt_ready(
+        &self,
+        run: Uuid,
+        id: Uuid,
+        version: Option<u64>,
+    ) -> Result<bool, ProtocolError> {
+        if self.services.replication_factor == 1 {
+            return Ok(true);
+        }
+        let current = self.services.control.current(&self.services.scope).await?;
+        if current.ready.view.run_id != run {
+            // Old-run outcomes can be recovered from durable Status history.
+            return Ok(version.is_none());
+        }
+        if current.owner == self.services.local {
+            let replica = self.services.replica.lock().map_err(|_| unknown())?;
+            if replica.authority() != current {
+                return Err(unknown());
+            }
+            return match replica.record(id) {
+                Some(record) if record.run_id == run => Ok(replica
+                    .terminal_copy_confirmation(current, record)
+                    .is_some_and(|confirmed| version.is_none_or(|v| confirmed.version == v))),
+                Some(_) => Err(unknown()),
+                None => Ok(version.is_none()),
+            };
+        }
+        match self.services.queue.owner_record_state(current, id).await {
+            Ok(state) => Ok(state.state.terminal()
+                && state.copies_complete
+                && version.is_none_or(|v| state.version == v)),
+            Err(error) if error == QueueError::NotFound.protocol() => Ok(version.is_none()),
+            Err(error) => Err(error),
+        }
+    }
     async fn receipt_owned(&self, run: Uuid, id: Uuid) -> Result<OwnedReceipt, ProtocolError> {
+        let committing = || OwnedReceipt::from(Receipt {
+            request_id: id,
+            run_id: run,
+            state: RequestState::Committing,
+            result: None,
+            error: None,
+        });
         let local = self
             .services
             .replica
@@ -1217,6 +1275,9 @@ impl WorkerRuntime {
             .response(run, id, now());
         match local {
             Ok((record, Some(bytes))) => {
+                if !self.terminal_receipt_ready(run, id, Some(record.version)).await? {
+                    return Ok(committing());
+                }
                 let shared = self.services.shared.clone();
                 let resources = shared.clone();
                 return shared
@@ -1265,6 +1326,9 @@ impl WorkerRuntime {
                 let record = terminal_record(&terminal)?;
                 if record.run_id != run {
                     return Err(QueueError::Abandoned.protocol());
+                }
+                if !self.terminal_receipt_ready(run, id, None).await? {
+                    return Ok(committing());
                 }
                 let response = terminal_response(id, &terminal)?;
                 let owner = Arc::new(
@@ -1323,19 +1387,35 @@ impl HttpRuntime for WorkerRuntime {
     fn scheduler_node_id(&self) -> u64 {
         self.services.shared.scheduler_node_id()
     }
-    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
-        Box::pin(self.submit_owned(body))
+    fn submit(
+        self: Arc<Self>,
+        body: Vec<u8>,
+        parsing_charge: MemoryCharge,
+    ) -> EndpointFuture<'static, RequestRecord> {
+        Box::pin(async move {
+            let submitted = self.submit_owned(body).await;
+            drop(parsing_charge);
+            submitted
+        })
     }
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
         Box::pin(self.receipt_owned(run, id))
     }
     fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse> {
         Box::pin(async move {
+            let mut copy_deadline = None;
+            let mut interval = std::time::Duration::from_millis(50);
             loop {
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                let receipt = self.receipt_owned(record.run_id, record.request_id).await?;
+                let observe = self.receipt_owned(record.run_id, record.request_id);
+                let receipt = match copy_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, observe)
+                        .await
+                        .map_err(|_| unavailable())?,
+                    None => observe.await,
+                }?;
                 if receipt.state == RequestState::Reconciling {
                     return Err(unknown());
                 }
@@ -1349,7 +1429,22 @@ impl HttpRuntime for WorkerRuntime {
                         ),
                     });
                 }
-                changed.await;
+                if receipt.state == RequestState::Committing || copy_deadline.is_some() {
+                    // A remote owner's confirmation does not notify this worker.
+                    let now = tokio::time::Instant::now();
+                    let deadline = *copy_deadline
+                        .get_or_insert(now + super::RECEIPT_OBSERVATION_TIMEOUT);
+                    if now >= deadline {
+                        return Err(unavailable());
+                    }
+                    tokio::select! {
+                        () = &mut changed => {},
+                        () = tokio::time::sleep_until(deadline.min(now + interval)) => {},
+                    }
+                    interval = (interval * 2).min(std::time::Duration::from_millis(500));
+                } else {
+                    changed.await;
+                }
             }
         })
     }
@@ -1576,6 +1671,7 @@ fn q04_r01_r02_reconciling_observation_requires_exact_reserved_read() {
         original_run: Uuid::new_v4(),
         reservation_id: Uuid::new_v4(),
         kind: RequestKind::Read,
+        scoped: None,
     };
     let mut record = terminal_record_with_status(&reservation, 200);
     record.state = RequestState::Reconciling;
@@ -1673,6 +1769,7 @@ fn q04_q06_result_snapshot_checks_request_digest_status_and_terminal_hash() {
         original_run: Uuid::new_v4(),
         reservation_id: Uuid::new_v4(),
         kind: RequestKind::Mutation,
+        scoped: None,
     };
     let original = ApplicationObservation {
         record: terminal_record_with_status(&reservation, 200),

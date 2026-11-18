@@ -547,7 +547,9 @@ impl WorkerRuntime {
                         Some(terminal_response(id, &terminal)?)
                     }
                     Some(IdentityLookup::Reserved(reservation))
-                        if reservation.kind == RequestKind::Mutation && reservation.binds(binding) =>
+                        if reservation.kind == RequestKind::Mutation
+                            && reservation.scoped.is_none()
+                            && reservation.binds(binding) =>
                     {
                         None
                     }
@@ -565,7 +567,7 @@ impl WorkerRuntime {
         }
         drop(input);
         settlement.armed = true;
-        self.execute(id).await
+        self.execute(id, None).await
     }
 
     async fn release_retained(&self, id: Uuid) -> Result<(), ProtocolError> {

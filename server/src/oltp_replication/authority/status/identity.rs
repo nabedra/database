@@ -35,6 +35,27 @@ pub(crate) enum RequestKind {
     Read,
     Mutation,
 }
+/// Persistent placement for a scoped queue admission. It has no executable
+/// bytes and cannot reconstruct the request after its RAM holders stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedAdmission {
+    pub protocol_version: u32,
+    pub queue_group_id: Uuid,
+    pub queue_generation: Uuid,
+    pub status_group_id: Uuid,
+}
+impl ScopedAdmission {
+    pub(crate) const VERSION: u32 = 2;
+
+    fn valid_for(self, status_group_id: Uuid) -> bool {
+        self.protocol_version == Self::VERSION
+            && !self.queue_group_id.is_nil()
+            && !self.queue_generation.is_nil()
+            && self.queue_group_id != status_group_id
+            && self.status_group_id == status_group_id
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IdentityReservation {
@@ -43,6 +64,8 @@ pub(crate) struct IdentityReservation {
     pub original_run: Uuid,
     pub reservation_id: Uuid,
     pub kind: RequestKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped: Option<ScopedAdmission>,
 }
 impl IdentityReservation {
     pub(crate) fn binds(self, request: RequestBinding) -> bool {
@@ -228,6 +251,8 @@ pub(crate) enum StatusCommand {
         digest: Digest,
         kind: RequestKind,
         reservation_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scoped: Option<ScopedAdmission>,
     },
     RetireRead {
         authority: Authority,
@@ -488,6 +513,7 @@ fn apply(
             digest,
             kind,
             reservation_id,
+            scoped,
         } => {
             let Some(current) = current else {
                 return reject(tx, StatusFault::NotInitialized);
@@ -495,7 +521,10 @@ fn apply(
             if current != *authority {
                 return reject(tx, StatusFault::StaleAuthority);
             }
-            if request_id.is_nil() || reservation_id.is_nil() {
+            if request_id.is_nil()
+                || reservation_id.is_nil()
+                || scoped.is_some_and(|binding| !binding.valid_for(scope.group_id))
+            {
                 return reject(tx, StatusFault::InvalidBinding);
             }
             let identity_key = key(IDENTITIES, *request_id);
@@ -509,6 +538,9 @@ fn apply(
                 if record.reservation.digest != *digest || record.reservation.kind != *kind {
                     return reject(tx, StatusFault::DigestConflict);
                 }
+                if scoped.is_some() && record.reservation.scoped != *scoped {
+                    return reject(tx, StatusFault::StaleAuthority);
+                }
                 return commit(tx, StatusReply::Identity(lookup(current, record)));
             }
             let reservation = IdentityReservation {
@@ -517,6 +549,7 @@ fn apply(
                 original_run: current.run_id,
                 reservation_id: *reservation_id,
                 kind: *kind,
+                scoped: *scoped,
             };
             put(
                 tx,
@@ -752,6 +785,9 @@ fn verify_lookup_record(
     verify_decision: impl FnOnce(&DecisionStatement, &MutationOutcome) -> Result<(), ProtocolError>,
 ) -> Result<(), ProtocolError> {
     let reservation = record.reservation;
+    if reservation.scoped.is_some_and(|binding| !binding.valid_for(scope.group_id)) {
+        return Err(unknown());
+    }
     let Some(terminal) = &record.terminal else {
         return Ok(());
     };
@@ -1068,6 +1104,17 @@ impl StatusHandle {
         digest: Digest,
         kind: RequestKind,
     ) -> Result<Applied<StatusReply>, ProtocolError> {
+        self.reserve_admission(authority, request_id, digest, kind, None)
+            .await
+    }
+    pub(crate) async fn reserve_admission(
+        &self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+        kind: RequestKind,
+        scoped: Option<ScopedAdmission>,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
         let command = OwnedCommand::new_owned(
             StatusCommand::ReserveIdentity {
                 authority,
@@ -1075,6 +1122,7 @@ impl StatusHandle {
                 digest,
                 kind,
                 reservation_id: Uuid::new_v4(),
+                scoped,
             },
             self.machine.store().resources(),
             ByteClass::Progress,

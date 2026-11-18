@@ -166,9 +166,11 @@ impl TransactionCoordinator {
                 })
             })
             .await?;
-        let installed = if let [point] = prepared.participants.as_slice()
-            && PointManifest::qualifies(&point.plan, &prepared.result)
-        {
+        let point = match prepared.participants.as_slice() {
+            [point] if PointManifest::qualifies(&point.plan, &prepared.result) => Some(point),
+            _ => None,
+        };
+        let installed = if let Some(point) = point {
             self.status
                 .try_install_point_manifest(PointManifest {
                     authority,
@@ -221,6 +223,7 @@ impl TransactionCoordinator {
             (manifest, draft.result_digest)
         };
         let preparation = async {
+            let mut point_permit = None;
             for participant in &prepared.participants {
                 let mut previous = store::initial_root(txn, &participant.plan)?;
                 for (index, writes) in participant.pages.iter().enumerate() {
@@ -256,78 +259,117 @@ impl TransactionCoordinator {
                     .participant
                     .seal(authority, txn, manifest, result_digest)
                     .await?;
-                if !matches!(reply.reply, ParticipantReply::Sealed(_)) {
+                let ParticipantReply::Sealed(seal) = &reply.reply else {
                     return Err(conflict());
+                };
+                if seal.txn != txn
+                    || seal.manifest != manifest
+                    || seal.participant != participant.plan
+                    || seal.result_digest != result_digest
+                {
+                    return Err(unknown());
                 }
-                // A response shape is not proof. Each observation obtains a new
-                // quorum barrier and the exact durable participant seal.
-                let proof = participant.participant.strong_seal(txn, manifest).await?;
-                #[cfg(test)]
-                let sealed = proof.evidence().clone();
-                self.status.observe_prepared(authority, proof).await?;
+                // Status obtains a fresh quorum proof of the durable seal.
+                // A local Status handle reads it directly from the participant.
+                if point.is_some() {
+                    point_permit = Some(
+                        self.status
+                            .prepare_point_permit(
+                                authority,
+                                &participant.participant,
+                                txn,
+                                manifest,
+                            )
+                            .await?,
+                    );
+                } else {
+                    self.status
+                        .record_participant_prepared(
+                            authority,
+                            &participant.participant,
+                            txn,
+                            manifest,
+                        )
+                        .await?;
+                }
                 #[cfg(test)]
                 super::recovery_tests::transaction_checkpoint(
                     &format!("seal-{}", participant.plan.group.group_id),
                     txn.request_id,
-                    &sealed,
+                    seal,
                 )
                 .await;
             }
-            Ok::<(), ProtocolError>(())
+            Ok::<_, ProtocolError>(point_permit)
         }
         .await;
         #[cfg(test)]
         if preparation.is_ok() {
             super::recovery_tests::pause("prepared", txn.request_id).await;
         }
-        let decision = if let Err(error) = preparation {
-            if recoverable
-                && (error.outcome == Outcome::Unknown
-                    || matches!(
-                        error.code,
-                        ErrorCode::StorageUnavailable
-                            | ErrorCode::Overloaded
-                            | ErrorCode::OutcomeUnknown
-                    ))
-            {
-                return Err(error);
+        let decision = match preparation {
+            Err(error) => {
+                if recoverable
+                    && (error.outcome == Outcome::Unknown
+                        || matches!(
+                            error.code,
+                            ErrorCode::StorageUnavailable
+                                | ErrorCode::Overloaded
+                                | ErrorCode::OutcomeUnknown
+                        ))
+                {
+                    return Err(error);
+                }
+                eprintln!(
+                    "nabedra-db: transaction {} preparation failed: {:?}: {}",
+                    txn.request_id, error.code, error.message
+                );
+                self.status
+                    .abort(
+                        authority,
+                        txn,
+                        if error.code == ErrorCode::Overloaded
+                            || error.code == ErrorCode::LimitExceeded
+                        {
+                            AbortReason::ResourceLimit
+                        } else {
+                            AbortReason::Conflict
+                        },
+                        error,
+                    )
+                    .await?
             }
-            eprintln!(
-                "nabedra-db: transaction {} preparation failed: {:?}: {}",
-                txn.request_id, error.code, error.message
-            );
-            self.status
-                .abort(
-                    authority,
-                    txn,
-                    if error.code == ErrorCode::Overloaded || error.code == ErrorCode::LimitExceeded
-                    {
-                        AbortReason::ResourceLimit
-                    } else {
-                        AbortReason::Conflict
-                    },
-                    error,
+            Ok(point_permit) => {
+                let permit = match point_permit {
+                    Some(permit) => permit.map_err(|error| stage(error, "commit permit"))?,
+                    None => self
+                        .status
+                        .commit_permit(authority, txn)
+                        .await
+                        .map_err(|error| stage(error, "commit permit"))?,
+                };
+                let stamp = self
+                    .timestamps
+                    .allocate_commit(permit.clone())
+                    .await
+                    .map_err(|error| stage(error, "commit timestamp"))?;
+                #[cfg(test)]
+                super::recovery_tests::transaction_checkpoint(
+                    "commit-stamp",
+                    txn.request_id,
+                    &stamp,
                 )
-                .await?
-        } else {
-            let permit = self
-                .status
-                .commit_permit(authority, txn)
-                .await
-                .map_err(|error| stage(error, "commit permit"))?;
-            let stamp = self
-                .timestamps
-                .allocate_commit(permit.clone())
-                .await
-                .map_err(|error| stage(error, "commit timestamp"))?;
-            #[cfg(test)]
-            super::recovery_tests::transaction_checkpoint("commit-stamp", txn.request_id, &stamp)
                 .await;
-            self.status
-                .decide_commit(authority, permit, stamp)
-                .await
-                .map_err(|error| stage(error, "commit decision"))?
+                self.status
+                    .decide_commit(authority, permit, stamp)
+                    .await
+                    .map_err(|error| stage(error, "commit decision"))?
+            }
         };
+        let statement = decision.statement();
+        if statement.txn != txn || statement.request != request || statement.manifest != manifest {
+            return Err(unknown());
+        }
         #[cfg(test)]
         super::recovery_tests::transaction_checkpoint(
             "decision",
@@ -343,7 +385,15 @@ impl TransactionCoordinator {
         // An acknowledged decision survives a stopped participant. Its fixed
         // intents and durable lifecycle guards remain discoverable for helpers.
         // A failed Resolve never changes COMMIT into an application failure.
-        if self.resolve(authority, &decision).await.is_ok() {
+        let resolved = async {
+            for participant in &prepared.participants {
+                self.resolve_participant(authority, &decision, &participant.participant)
+                    .await?;
+            }
+            Ok::<(), ProtocolError>(())
+        }
+        .await;
+        if resolved.is_ok() {
             let settled = self.status.settled_proof(txn, manifest).await?;
             for guard in prepared.original.lifecycle {
                 self.catalog
@@ -397,37 +447,51 @@ impl TransactionCoordinator {
                 .await?;
             for plan in page.items.iter() {
                 let participant = self.resolver.participant(&plan.group).await?;
-                loop {
-                    let result = participant
-                        .resolve(authority, decision.clone(), 128)
-                        .await?;
-                    match result.reply {
-                        ParticipantReply::Resolved { complete: true, .. } => break,
-                        ParticipantReply::Resolved {
-                            complete: false, ..
-                        } => {}
-                        _ => return Err(unknown()),
-                    }
-                }
-                let proof = participant
-                    .strong_resolution(statement.txn, statement.manifest)
+                self.resolve_participant(authority, decision, &participant)
                     .await?;
-                #[cfg(test)]
-                let resolved = proof.evidence().clone();
-                self.status.observe_resolved(authority, proof).await?;
-                #[cfg(test)]
-                super::recovery_tests::transaction_checkpoint(
-                    &format!("resolve-{}", plan.group.group_id),
-                    statement.txn.request_id,
-                    &resolved,
-                )
-                .await;
             }
             if page.done {
                 break;
             }
             after = page.after;
         }
+        Ok(())
+    }
+    async fn resolve_participant(
+        &self,
+        authority: Authority,
+        decision: &VerifiedStatusDecision,
+        participant: &ParticipantHandle,
+    ) -> Result<(), ProtocolError> {
+        let statement = decision.statement();
+        loop {
+            let result = participant
+                .resolve(authority, decision.clone(), 128)
+                .await?;
+            match result.reply {
+                ParticipantReply::Resolved { complete: true, .. } => break,
+                ParticipantReply::Resolved {
+                    complete: false, ..
+                } => {}
+                _ => return Err(unknown()),
+            }
+        }
+        #[cfg(test)]
+        let resolved = participant
+            .strong_resolution(statement.txn, statement.manifest)
+            .await?
+            .evidence()
+            .clone();
+        self.status
+            .record_participant_resolved(authority, participant, statement.txn, statement.manifest)
+            .await?;
+        #[cfg(test)]
+        super::recovery_tests::transaction_checkpoint(
+            &format!("resolve-{}", participant.identity().group_id),
+            statement.txn.request_id,
+            &resolved,
+        )
+        .await;
         Ok(())
     }
 }
