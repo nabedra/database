@@ -1590,8 +1590,12 @@ mod point_manifest_tests {
 
     struct StaleReadHint {
         endpoint: Arc<StatusEndpoint>,
-        fail_next_hint: AtomicBool,
-        refused: AtomicBool,
+        block_next_probe: AtomicBool,
+        blocked_probe: AtomicBool,
+        release_probe: tokio::sync::Notify,
+        block_next_read: AtomicBool,
+        blocked_read: AtomicBool,
+        release_read: tokio::sync::Notify,
     }
 
     impl Endpoint for StaleReadHint {
@@ -1611,12 +1615,28 @@ mod point_manifest_tests {
         ) -> EndpointFuture<'a, ChargedReply> {
             Box::pin(async move {
                 let head: Header = serde_json::from_slice(header.as_slice()).unwrap();
+                if head.method == Request::Current.method() {
+                    if head.placement_generation.is_some()
+                        && self.block_next_probe.swap(false, Ordering::Relaxed)
+                    {
+                        self.blocked_probe.store(true, Ordering::Relaxed);
+                        self.release_probe.notified().await;
+                    } else if head.placement_generation.is_none()
+                        && self.blocked_probe.load(Ordering::Relaxed)
+                    {
+                        self.release_probe.notify_one();
+                    }
+                }
                 if head.placement_generation.is_some()
                     && head.method.can_repeat_read()
-                    && self.fail_next_hint.swap(false, Ordering::Relaxed)
+                    && self.block_next_read.swap(false, Ordering::Relaxed)
                 {
-                    self.refused.store(true, Ordering::Relaxed);
-                    return Err(unavailable());
+                    self.blocked_read.store(true, Ordering::Relaxed);
+                    self.release_read.notified().await;
+                } else if head.placement_generation.is_none()
+                    && self.blocked_read.load(Ordering::Relaxed)
+                {
+                    self.release_read.notify_one();
                 }
                 self.endpoint.handle(session, header, sections).await
             })
@@ -1645,8 +1665,12 @@ mod point_manifest_tests {
             let (node, endpoint) = services.status_endpoint_for_test().await.unwrap();
             let endpoint = Arc::new(StaleReadHint {
                 endpoint,
-                fail_next_hint: AtomicBool::new(false),
-                refused: AtomicBool::new(false),
+                block_next_probe: AtomicBool::new(true),
+                blocked_probe: AtomicBool::new(false),
+                release_probe: tokio::sync::Notify::new(),
+                block_next_read: AtomicBool::new(false),
+                blocked_read: AtomicBool::new(false),
+                release_read: tokio::sync::Notify::new(),
             });
             services
                 .manager
@@ -1674,11 +1698,22 @@ mod point_manifest_tests {
                 .replica_routes(client.identity())
                 .await
                 .unwrap();
+            // O06/O14: a stalled probe must give way to the ordinary read.
+            // The probe can finish only once that unmarked read reaches Status.
+            assert_eq!(client.current_authority().await.unwrap(), Some(authority));
+            assert!(endpoint.blocked_probe.load(Ordering::Relaxed));
+            assert_eq!(routes.hinted_receiver(node), None);
+            services.control_client.invalidate_replica_routes(&routes);
+            let routes = services
+                .control_client
+                .replica_routes(client.identity())
+                .await
+                .unwrap();
             assert_eq!(client.current_authority().await.unwrap(), Some(authority));
             assert_eq!(routes.hinted_receiver(node), Some(services.local));
             // O06/O14: an unavailable hinted receiver must trigger a fresh
             // routing pass within the same read, even with unchanged membership.
-            endpoint.fail_next_hint.store(true, Ordering::Relaxed);
+            endpoint.block_next_read.store(true, Ordering::Relaxed);
             assert!(
                 client
                     .inspect_transaction(TxnId {
@@ -1689,7 +1724,7 @@ mod point_manifest_tests {
                     .unwrap()
                     .is_none()
             );
-            assert!(endpoint.refused.load(Ordering::Relaxed));
+            assert!(endpoint.blocked_read.load(Ordering::Relaxed));
             let read_ts = ReadTs::new(1).unwrap();
             let plan = ParticipantPlan {
                 group: GroupIdentity {

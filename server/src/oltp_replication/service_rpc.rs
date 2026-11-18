@@ -54,6 +54,8 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 // Registered election timeouts reach three seconds. Leave time to refresh
 // routes and reach the new leader without using the full public wait budget.
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
+const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -342,8 +344,11 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
     ) -> Result<ServiceResponse, CallError> {
+        let mut failed_read_hint = None;
         if action == ServiceAction::Owner
-            && let Some(result) = self.call_hinted(method, payload, possibly_applied).await
+            && let Some(result) = self
+                .call_hinted(method, payload, possibly_applied, &mut failed_read_hint)
+                .await
         {
             return result;
         }
@@ -354,14 +359,20 @@ impl Client {
         })?;
         tracing::debug!(group=%self.group.group_id, method=?method, replicas=routes.members.len(), "service replica routes ready");
         let preferred = self.leader.load(Ordering::Relaxed);
-        // Try the last observed leader, then every currently registered member.
-        // The hint never grants authority and every response checks actual TLS.
-        for pass in 0..2 {
-            for member in routes
-                .members
-                .iter()
-                .filter(|member| (member.node_id == preferred) == (pass == 0))
-            {
+        let retry_last = failed_read_hint
+            .filter(|(generation, _)| *generation == routes.record.generation)
+            .map(|(_, node)| node);
+        // Prefer the observed leader, but let other replicas answer before
+        // spending another transport deadline on a failed cached receiver.
+        for pass in 0..3 {
+            for member in routes.members.iter().filter(|member| {
+                let priority = if Some(member.node_id) == retry_last {
+                    2
+                } else {
+                    u8::from(member.node_id != preferred)
+                };
+                priority == pass
+            }) {
                 match self
                     .call_member(
                         action,
@@ -415,6 +426,7 @@ impl Client {
         method: Method,
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
+        failed_read_hint: &mut Option<(uuid::Uuid, u64)>,
     ) -> Option<Result<ServiceResponse, CallError>> {
         if *possibly_applied
             || matches!(
@@ -463,18 +475,21 @@ impl Client {
                     .map(|input| self.shared.encode_in(ByteClass::Progress, &input, 4096))
                     .transpose()
                     .ok()?;
-                let response = self
-                    .call_member_at(
+                let response = tokio::time::timeout(
+                    RECEIVER_PROBE_TIMEOUT,
+                    self.call_member_at(
                         ServiceAction::Owner,
                         probe,
                         &input,
                         member.node_id,
                         member.worker_id.into(),
                         generation,
-                    )
-                    .await
-                    .ok()?
-                    .ok()?;
+                    ),
+                )
+                .await
+                .ok()?
+                .ok()?
+                .ok()?;
                 let receiver = response.reply.remote_identity();
                 routes.confirm_hinted_receiver(member.node_id, receiver);
                 receiver
@@ -482,16 +497,22 @@ impl Client {
             None => return None,
         };
         tracing::debug!(group=%self.group.group_id, method=?method, node=member.node_id, "service replica route hint");
-        let attempt = self
-            .call_member_at(
-                ServiceAction::Owner,
-                method,
-                payload,
-                member.node_id,
-                receiver.into(),
-                generation,
-            )
-            .await;
+        let call = self.call_member_at(
+            ServiceAction::Owner,
+            method,
+            payload,
+            member.node_id,
+            receiver.into(),
+            generation,
+        );
+        let attempt = if method.can_repeat_read() {
+            match tokio::time::timeout(HINTED_READ_TIMEOUT, call).await {
+                Ok(result) => result,
+                Err(_) => Err(CallError::Transport(RequestError::Unreachable)),
+            }
+        } else {
+            call.await
+        };
         let route_failure = match attempt {
             Ok(Ok(response)) => {
                 routes.record_successful_node(member.node_id);
@@ -539,6 +560,7 @@ impl Client {
         self.control.invalidate_replica_routes(&routes);
         if method.can_repeat_read() {
             // A healthy leader can still serve the read within this route round.
+            *failed_read_hint = Some((routes.record.generation, member.node_id));
             return None;
         }
         *possibly_applied = true;

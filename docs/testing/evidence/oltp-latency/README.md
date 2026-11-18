@@ -243,6 +243,8 @@ Five exact Rust tests passed on the metadata source in `c7f2a90`. The Linux Dock
 
 The output log SHA-256 was `bba718e6bcc75c7525d1541ee97b15d66d9868058785921d8a8552d78373f5a4`. These assertions cover local consensus and transport, including a modeled old decoder. The full multi-worker recovery, disk-fault, mixed-version process, and ORM suites remain pending.
 
+The follow-up bounded the optional receiver probe and repeatable hinted reads, then moved a failed same-generation receiver behind other candidates in the verified route order. All five exact tests passed again. The expanded O06/O14 assertion held each marked request until its unmarked fallback reached the same Status endpoint. The timed-out probe did not confirm a receiver. This exercised the only-replica fallback. Attempt ordering with multiple live voters remains unverified. The same Docker quotas applied, with 5,322,690,560 bytes peak memory and zero memory-limit or OOM events. The output log SHA-256 was `f7aa436e43ccd4cb57584dfa30e2f3065a5db1890df3fdd78b3cbadcc490aa15`. The timing sweeps above used `c7f2a90` before this follow-up.
+
 ## Reproduce
 
 Build or obtain a pinned Nabedra Linux release image. Use an idle Docker host and empty result directories. Run one engine at a time.
