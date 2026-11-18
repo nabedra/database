@@ -324,7 +324,8 @@ impl Api {
                 exact(self.provision_publish(loaded, candidate).await?)?;
                 return Ok(());
             }
-            return self.provider_drain(node).await;
+            // Keep the drain future out of the provider tick's stack frame.
+            return Box::pin(self.provider_drain(node)).await;
         }
         if !provision::inventory_clean(root, owner, &inventory).map_err(|_| unavailable())? {
             let candidate =
@@ -414,7 +415,7 @@ impl Api {
             .iter()
             .find(|n| n.state == NodeState::Draining && n.ownership == Ownership::Managed)
         {
-            return self.provider_drain(node.node_id).await;
+            return Box::pin(self.provider_drain(node.node_id)).await;
         }
         if root.policy.mode == PolicyMode::Autoscale {
             if let Ok(Reply::Stats {
