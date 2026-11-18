@@ -243,6 +243,21 @@ Both runs matched all 12 snapshots. The driver reported zero overlapping measure
 
 The raw `benchmark-metadata-qualified-low-load/results.json` SHA-256 was `099f773b3d0a245ffcfe7df4bbea6f22d03d8e2c67a6a63e5d169bad766e71c6`. The raw `benchmark-scylla-low-load/results.json` SHA-256 was `c5ca6bbef5fdf3b2451550375822697aa3f9a7826d80c1b6a64c4236e11e81bb`.
 
+## Transport timing diagnostic
+
+An isolated `c7f2a90` build paired client and receiver transport events by nonce. Two traced runs used one client, 16 rows, RF3, and the 4 CPU and 7.90 GB caps. All eight timed writes succeeded and all 12 snapshots matched. Seven write windows had paired gateway ingress and observation events within the measured HTTP interval. One window had a 24.136 ms clock-alignment error and was excluded from overlap calculations.
+
+| Lane in the repeat capture | Paired replies | Median sender TCP connect | Median sender TLS | Median receiver preflight | Median receiver handler |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| API ingress | 16 | 0.256 ms | 1.091 ms | 4.574 ms | 336.058 ms |
+| Authority, same worker | 331 | 0.226 ms | 0.770 ms | 0.035 ms | 4.068 ms |
+| ServiceAuthority, cross worker | 84 | 0.303 ms | 1.036 ms | 5.997 ms | 5.080 ms |
+| ControlConsensus | 7,023 | 0.247 ms | 1.198 ms | 0.031 ms | 0.088 ms |
+
+The table includes startup, seeding, snapshots, and background traffic. The repeat captured 11,015 complete sender and receiver pairs, with 12 unmatched sender replies. Within its three aligned write windows, 36 cross-worker ServiceAuthority preflights had a median duration of 5.737 ms. Directly awaited child RPCs overlapped a median 5.537 ms per preflight. The intervals overlap and do not add up to end-to-end latency. The data prioritizes reducing repeated authorization and consensus work on the request path. It leaves the savings from transport reuse unmeasured.
+
+These are traced O24 and B02 serial-workload subsets. O22 progress under mixed saturation remains unverified. The diagnostic binary SHA-256 was `076642f751de41978ad208a53561d31bad4fed1ea76ee5a40c4ef2e249338839`. The initial and repeat result SHA-256 hashes were `8b831418727ec70b04f8112a1a901cacfbad16d381d0f47ca4e9d382526a4348` and `7646b06fdda457d42606baaa5be32f10d8e02611e4ce31632e6d8bd35b565b74`.
+
 ## Focused metadata regression checks
 
 Five exact Rust tests passed on the metadata source in `c7f2a90`. The Linux Docker test container used a four-CPU quota, a 7,235,174,400-byte memory limit, and no swap. Its cgroup memory peak was 5,131,698,176 bytes, with zero memory-limit or OOM events. The checks used the pinned Rust 1.94.1 builder and RocksDB archive listed above, with `--no-default-features --features oltp --lib` and one test thread.

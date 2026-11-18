@@ -29,6 +29,8 @@ When the 1/s rate already produces rejections, compare serial point updates with
 
 After each isolated measurement, keep the candidate only when a repeatable improvement justifies the change. Preserve all-ready in-memory queue replication within each cluster, abandon pending work after full shutdown, retain committed mutations, and keep the published API and ORM compatible. Keep peer connections and routing scoped to the authorized database and cluster.
 
+The trace measured median gateway ingress connect and TLS durations of 0.256 and 1.091 ms, and a median worker handler duration of 336.058 ms. In the aligned write windows, directly linked child RPCs overlapped a median 5.537 ms of a 5.737 ms cross-worker ServiceAuthority preflight. Prioritize reducing nested requests and quorum operations. Keep the isolated local Authority shortcut pending a safe fallback and capacity check. [Transport timing evidence](../docs/testing/evidence/oltp-latency/README.md#transport-timing-diagnostic)
+
 ## Durable protocol changes
 
 Enable new Raft commands only when every voter and learner that can receive or replay them supports their format. A service capability check establishes support at one endpoint. Compound applies need one bounded state batch that includes the applied log position. The existing batch reads use the pre-write snapshot, so pass intermediate state between steps explicitly. Check old checkpoints and partial manifests, retry with a changed digest, and inject failures before and after log sync, batch apply, and quorum acknowledgment. Keep synchronous durability and exercise O06, O07, O10, O11, O15, and O29.
