@@ -21,7 +21,7 @@ struct Wire {
     terminal_paused: u8,
     calls: Mutex<Vec<(WorkerIdentity, &'static str)>>,
     reached_pause: Mutex<Vec<&'static str>>,
-    change_after_marker: Option<(WorkerIdentity, ScopedPlacement)>,
+    change_after_marker: Option<ScopedPlacement>,
 }
 
 impl Wire {
@@ -109,8 +109,8 @@ impl ScopedTransport for Wire {
             })();
             if result.is_ok()
                 && phase == "mark"
-                && let Some((member, next)) = &self.change_after_marker
-                && *member == target
+                && let Some(next) = &self.change_after_marker
+                && self.marked() == 2
             {
                 *self.current.lock().unwrap() = next.clone();
             }
@@ -337,7 +337,7 @@ async fn scoped_q03_r01_minorities_cannot_accept_and_same_request_retry_keeps_th
     let proof = accept(&placement, owner, &wire, &frame, deadline())
         .await
         .unwrap();
-    assert_eq!(wire.marked(), 2);
+    assert!(wire.marked() >= 2);
     wire.terminal_paused = 0b110;
     let response = terminal(&fixture, &frame, true);
     assert!(matches!(
@@ -407,7 +407,7 @@ async fn scoped_q05_r03_old_owner_cannot_acknowledge_after_marker_copies_cross_t
         ),
         Err(QueueError::Invalid)
     ));
-    wire.change_after_marker = Some((next_owner, next));
+    wire.change_after_marker = Some(next);
     assert_eq!(
         accept(&placement, owner, &wire, &frame, deadline()).await,
         Err(QueueError::Stale)

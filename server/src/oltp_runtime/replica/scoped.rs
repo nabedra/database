@@ -114,6 +114,7 @@ impl ScopedPlacement {
         if header.all_copy_evidence {
             return Err(QueueError::Invalid);
         }
+        let version = frame.version(&header)?;
         let body = frame.sections[0].as_ref().ok_or(QueueError::Invalid)?;
         if hash(body.as_ref()) != header.digest {
             return Err(QueueError::Conflict);
@@ -157,7 +158,7 @@ impl ScopedPlacement {
                 accepted_context: hash(context_bytes.as_ref()),
             },
             sequence: header.sequence,
-            version: frame.version(&header)?,
+            version,
             terminal: header.state.terminal(),
         })
     }
