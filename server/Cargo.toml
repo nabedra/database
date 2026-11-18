@@ -21,7 +21,7 @@ path = "src/main.rs"
 
 [features]
 default = ["olap", "s3"]
-olap = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
 oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
@@ -58,6 +58,10 @@ hyper-util = { version = "=0.1.21", default-features = false, features = ["clien
 hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "tls12", "aws-lc-rs"] }
 tokio-util = { version = "=0.7.20", features = ["io"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+
+[dependencies.arrow-ipc]
+version = "=60.1.0"
+optional = true
 
 [target.'cfg(unix)'.dependencies]
 # Bounded startup material reads use O_NONBLOCK before opened-handle validation.

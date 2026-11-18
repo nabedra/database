@@ -4,14 +4,17 @@ from __future__ import annotations
 from copy import copy
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, overload
 from collections.abc import Mapping
 
 from .errors import ProtocolError, ValidationError
 from .expr import Expr, col
+from .stream import BatchStream, StreamSnapshot, _batch_stream, _stream_snapshot
 from .validation import Row, Scalar, validate_identifier, validate_schema, validate_value
 
 if TYPE_CHECKING:
+    from pyarrow import RecordBatch
+
     from .table import Table
 
 
@@ -20,7 +23,8 @@ class Query:
     """Retain a table handle and a schema snapshot without making requests.
 
     Table.query() constructs Query(self). Terminal methods use the retained
-    handle's ID and transport, requesting a fresh server snapshot each time.
+    handle's ID and transport. Reads capture a fresh snapshot by default.
+    Stream methods can reuse a shared snapshot.
     """
 
     _table: Table
@@ -95,6 +99,38 @@ class Query:
             "order_by": {"column": self._order[0], "desc": self._order[1]} if self._order is not None else None,
             "limit": self._limit,
         }
+
+    @overload
+    def stream(
+        self, *, batch_rows: int = 64, prefetch_batches: int = 1,
+        format: Literal["rows"] = "rows", drop_last: bool = False,
+        snapshot: str | None = None, shard: int = 0,
+    ) -> BatchStream[list[Row]]: ...
+
+    @overload
+    def stream(
+        self, *, batch_rows: int = 64, prefetch_batches: int = 1,
+        format: Literal["arrow"], drop_last: bool = False,
+        snapshot: str | None = None, shard: int = 0,
+    ) -> BatchStream[RecordBatch]: ...
+
+    def stream(
+        self, *, batch_rows: int = 64, prefetch_batches: int = 1,
+        format: Literal["rows", "arrow"] = "rows", drop_last: bool = False,
+        snapshot: str | None = None, shard: int = 0,
+    ) -> BatchStream[list[Row]] | BatchStream[RecordBatch]:
+        """Prepare a single-use OLAP batch iterator. Use it in a with block."""
+        columns = self._selection if self._selection is not None else tuple(self._schema)
+        return _batch_stream(
+            self._table._transport, self._table.id, self._to_wire(),
+            {column: self._schema[column] for column in columns},
+            batch_rows=batch_rows, prefetch_batches=prefetch_batches, format=format,
+            drop_last=drop_last, snapshot=snapshot, shard=shard, limit=self._limit,
+        )
+
+    def stream_snapshot(self, *, shards: int) -> StreamSnapshot:
+        """Prepare a pinned snapshot of this query for disjoint shard streams."""
+        return _stream_snapshot(self._table._transport, self._table.id, self._to_wire(), shards)
 
     def collect(self) -> list[Row]:
         """Fetch a fresh result, validating the exact projected columns."""

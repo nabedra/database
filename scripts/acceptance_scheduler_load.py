@@ -133,6 +133,12 @@ class TraceForward(socketserver.BaseRequestHandler):
                     record['queue_command'] = command['command']
                     if command['command'] == 'install':
                         record['installed_payload'] = record_metadata(command['record'])
+                    if path == '/internal/v1/streams' and command['command'] == 'stream_request':
+                        stream_request = command['payload']['request']
+                        record['stream_operation'] = stream_request['operation']
+                        if stream_request['operation'] == 'batch':
+                            batch = stream_request['payload']
+                            record.update(stream_id=batch['stream_id'], stream_sequence=batch['sequence'])
                 else:
                     record['queue_metadata_unobserved'] = 'request exceeds observer capture bound'
             if path in ('/internal/v1/dependencies/open', '/internal/v1/dependencies/close'):
@@ -178,9 +184,12 @@ class TraceForward(socketserver.BaseRequestHandler):
                 if not gate.wait(record['node']):
                     record['failure'] = 'gate watchdog'
                     return
-            if getattr(self.server, 'partition_read_delay_seconds', 0) and record['method'] == 'GET' and '/tables/' in path:
-                record['controlled_storage_delay_seconds'] = self.server.partition_read_delay_seconds
-                threading.Event().wait(self.server.partition_read_delay_seconds)
+            if record['method'] == 'GET' and '/tables/' in path:
+                delay = getattr(self.server, 'partition_read_delay_seconds', 0)
+                delay = delay(path) if callable(delay) else delay
+                if delay:
+                    record['controlled_storage_delay_seconds'] = delay
+                    threading.Event().wait(delay)
             record['forwarded'] = time.monotonic()
             with socket.create_connection(self.server.target, timeout=5) as upstream:
                 upstream.sendall(initial)
@@ -188,7 +197,7 @@ class TraceForward(socketserver.BaseRequestHandler):
                 end = time.monotonic() + 65
                 response_header = bytearray()
                 error_response = bytearray()
-                stats_response = bytearray() if queue_auth else None
+                stats_response = bytearray() if path == '/internal/v1/queue' and queue_auth else None
                 while time.monotonic() < end:
                     ready, _, _ = select.select(list(peers), [], [], .1)
                     for source in ready:
@@ -208,6 +217,8 @@ class TraceForward(socketserver.BaseRequestHandler):
                                     record['queue_metadata_unobserved'] = 'response incomplete or exceeds observer capture bound'
                             return
                         if source is upstream:
+                            if not record['response_bytes']:
+                                record['response_started'] = time.monotonic()
                             if len(error_response) < 8192:
                                 error_response.extend(chunk[:8192-len(error_response)])
                             if stats_response is not None and len(stats_response) < MAX_OBSERVED_JSON_BYTES:

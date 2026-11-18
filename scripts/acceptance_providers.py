@@ -18,6 +18,7 @@ import time
 import uuid
 
 from acceptance_nodes import FrontDoor, announcement, call, receive, send, target, write
+from acceptance_olap_streaming import CAPABILITIES, OPEN, QUERY, batch_path, request as stream_request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'orm/python/src'))
 from nabedra._callback_bridge import _CallbackBridge
@@ -80,7 +81,18 @@ def request(base, token, method, path, value=None):
         connection.close()
 
 
-def run(binary, skip_zero=False):
+def stream_exchange(base, token, method, path, value=None):
+    def lookup():
+        try:
+            response = stream_request(base, method, path, token, value, timeout=5)
+        except (TimeoutError, http.client.RemoteDisconnected):
+            return None
+        return None if response.status in (429, 503) else response
+
+    return wait_for(lookup, f'{method} {path} did not settle')
+
+
+def run(binary, skip_zero=False, stream_drain=False):
     # A01 must fail before any callback or child resource exists.
     try:
         _validate_serve_args('Manual', (1, 2))
@@ -228,6 +240,19 @@ def run(binary, skip_zero=False):
             assert status == 200, created
             table = created['data']['id']
             assert call(api_door.url, 'table.insert', dict(table_id=table, row={'id':1}), auth['data_token'])[0] == 200
+            if stream_drain:
+                token = auth['data_token']
+                assert call(api_door.url, 'table.insert', dict(table_id=table, row={'id':2}), token)[0] == 200
+                run_id = stream_exchange(api_door.url, token, 'GET', CAPABILITIES).json()['run_id']
+                opened = stream_exchange(api_door.url, token, 'POST', OPEN, {
+                    'request_id': str(uuid.uuid4()), 'expected_run_id': run_id,
+                    'table_id': table, 'query': QUERY, 'batch_rows': 1,
+                    'prefetch_batches': 0, 'format': 'rows', 'drop_last': False,
+                    'snapshot_id': None, 'shard': 0,
+                }).json(201)
+                assert opened['run_id'] == run_id
+                first_batch = stream_exchange(api_door.url, token, 'POST', batch_path(opened, 0))
+                assert first_batch.json() == {'rows': [{'id': 1}]}
             operations_release.clear()
             for resource in list(resources.values()):
                 resource['door'].operation_entered.clear()
@@ -290,6 +315,15 @@ def run(binary, skip_zero=False):
                      len([n for n in control()['nodes'] if n['state'] == 'ready']) == 1 and
                      any(i['action'] == 'stop' and i['state'] == 'completed' and i['outcome'] == 'terminated'
                          for i in control()['intents']), 'provider termination reconciliation')
+            if stream_drain:
+                # Use the original handle after the drain and termination.
+                assert opened['run_id'] == accepted[0][1] == overlap[0][1]
+                replay = stream_exchange(api_door.url, token, 'POST', batch_path(opened, 0))
+                assert replay.status == 200 and replay.body == first_batch.body
+                next_batch = stream_exchange(api_door.url, token, 'POST', batch_path(opened, 1))
+                assert next_batch.json() == {'rows': [{'id': 2}]}
+                stream_exchange(api_door.url, token, 'POST', batch_path(opened, 2)).empty()
+                stream_exchange(api_door.url, token, 'DELETE', batch_path(opened)).empty()
             assert len({identity for identity,_ in accepted+overlap})==12
             assert any(e[0]=='drain_authorized' for e in events) and any(e[0]=='terminated' for e in events)
             if not skip_zero:
@@ -336,6 +370,8 @@ def run(binary, skip_zero=False):
                 assert error.code=='unsupported_capability' and error.outcome=='not_applied'
             assert manual_client.status()['counts']==dict(ready=0,starting=0,draining=0,lost=0)
             print('PASS A01/A02: public policies, configured callbacks, inventory failure retains 8 accepted IDs, 4 accepted IDs survive safe removal, committed row retained; explicit-zero=' + str(not skip_zero))
+            if stream_drain:
+                print('PASS ST05/A02: same stream replayed batch 0 byte for byte after provider removal, then yielded batch 1 and EOF')
         finally:
             operations_release.set()
             release_stop.set()
@@ -377,5 +413,6 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'server/target/debug/nabedra-db')
     parser.add_argument('--skip-zero',action='store_true',help='Run the up/down provider contract without the explicit full-shutdown extension')
+    parser.add_argument('--stream-drain', action='store_true', help='Keep an OLAP stream open during scale-up and drain')
     args=parser.parse_args()
-    run(args.binary.resolve(),skip_zero=args.skip_zero)
+    run(args.binary.resolve(), skip_zero=args.skip_zero, stream_drain=args.stream_drain)

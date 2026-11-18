@@ -156,6 +156,27 @@ pub struct Object {
     pub bytes: Vec<u8>,
     pub etag: String,
 }
+
+/// A sanitized failure while checking permission to read an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectAccessError {
+    Denied,
+    Storage(StorageError),
+}
+impl ObjectAccessError {
+    fn into_storage_error(self) -> StorageError {
+        match self {
+            Self::Denied => StorageError::Unavailable,
+            Self::Storage(error) => error,
+        }
+    }
+}
+impl From<StorageError> for ObjectAccessError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
 /// Trusted backend contract. GET is linearizable and returns a complete object
 /// with a nonempty version for that same representation. NotFound means definite
 /// absence; incomplete reads must fail rather than return a successful prefix.
@@ -171,6 +192,19 @@ pub struct Object {
 /// Storage additionally enforces immutable snapshots and namespace validation.
 pub trait ObjectStore: Send + Sync {
     fn get(&self, key: &str) -> impl Future<Output = Result<Download, StorageError>> + Send;
+    /// Establish GET permission by opening the object and dropping its body.
+    /// Backends can report an explicit denial when they know the response status.
+    fn authorize_get(
+        &self,
+        key: &str,
+    ) -> impl Future<Output = Result<(), ObjectAccessError>> + Send {
+        async move {
+            self.get(key)
+                .await
+                .map(drop)
+                .map_err(ObjectAccessError::Storage)
+        }
+    }
     fn put(
         &self,
         key: &str,

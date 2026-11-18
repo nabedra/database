@@ -125,6 +125,7 @@ class _Transport:
         self._url = urlunsplit((url.scheme, url.netloc, url.path.rstrip('/') + '/v1/operations', '', ''))
         self._token = token
         self._timeout = checked_timeout
+        self._tls_context = context
         self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
 
     def _require_token(self) -> str:

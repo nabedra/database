@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     http::{HeaderMap, Request, Response},
 };
+use bytes::Bytes;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
@@ -61,7 +62,10 @@ pub(crate) fn command_class(command: &str) -> Result<&'static str> {
         "lookup" => "receipt",
         "install" => "replica",
         "snapshot" | "bootstrap" => "bootstrap",
-        "stats" | "seal" | "unseal" | "join" => "progress",
+        "stats" | "seal" | "unseal" | "join" | "stream_release" => "progress",
+        "stream_request" => "ingress",
+        "stream_install" => "replica",
+        "stream_reset" | "stream_page" => "bootstrap",
         _ => return Err(invalid()),
     })
 }
@@ -76,6 +80,11 @@ fn wire_command(bytes: &[u8]) -> Result<&'static str> {
         "seal",
         "unseal",
         "join",
+        "stream_request",
+        "stream_install",
+        "stream_reset",
+        "stream_page",
+        "stream_release",
     ] {
         let prefix = format!("{{\"command\":\"{command}\"");
         if bytes.starts_with(prefix.as_bytes()) {
@@ -120,12 +129,10 @@ fn signed(signer: &Signer, claims: &Claims) -> Result<(String, String)> {
 }
 fn verify(
     headers: &HeaderMap,
-    body: Option<&[u8]>,
     root: &Control,
     local: &auth::Sender,
     pinned: &[u8; 32],
-    response: bool,
-    nonce: Option<Uuid>,
+    stream: bool,
 ) -> Result<Claims> {
     let raw = http::one(headers, "x-nabedra-queue-auth")?;
     if raw.len() > 8192 || raw.len() % 2 != 0 {
@@ -143,13 +150,14 @@ fn verify(
     {
         return Err(invalid());
     }
+    let stale_stream =
+        stream && c.scheduler_term > 0 && c.scheduler_term < root.scheduler.scheduler_term;
     if c.version != 1
         || c.cluster != root.cluster_id
-        || c.scheduler_term != root.scheduler.scheduler_term
+        || (stream && !c.command.starts_with("stream_"))
+        || (c.scheduler_term != root.scheduler.scheduler_term && !stale_stream)
         || c.membership_revision > root.revision
-        || c.response != response
-        || body.is_some_and(|body| c.digest != http::digest(body))
-        || nonce.is_some_and(|n| n != c.nonce)
+        || c.response
     {
         return Err(invalid());
     }
@@ -159,7 +167,9 @@ fn verify(
     {
         return Err(invalid());
     }
-    auth::checked_worker(root, local).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+    if !stale_stream {
+        auth::checked_worker(root, local).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
+    }
     let key = unhex::<32>(&c.public_key)?;
     let signature = unhex::<64>(http::one(headers, "x-nabedra-queue-signature")?)?;
     let mut input = b"nabedra.queue-control.v1\0".to_vec();
@@ -179,11 +189,7 @@ fn verify(
             return Err(invalid());
         }
         auth::checked_worker(root, &sender).map_err(|_| http::failure(ErrorCode::Unauthorized))?;
-    } else if response
-        || c.sender_incarnation.is_some()
-        || c.sender_session.is_some()
-        || &key != pinned
-    {
+    } else if c.sender_incarnation.is_some() || c.sender_session.is_some() || &key != pinned {
         return Err(http::failure(ErrorCode::Unauthorized));
     }
     Ok(c)
@@ -195,7 +201,40 @@ pub(super) fn preauthenticate(
     pinned: &[u8; 32],
     seen: &mut BTreeMap<Uuid, u64>,
 ) -> Result<(Uuid, Option<Uuid>, String, String, String)> {
-    let c = verify(headers, None, root, local, pinned, false, None)?;
+    let c = verify(headers, root, local, pinned, false)?;
+    admit_nonce(&c, seen)?;
+    Ok((c.nonce, c.sender_node, c.digest, c.command, c.class))
+}
+
+pub(super) struct StreamAuthentication {
+    pub nonce: Uuid,
+    pub sender: Option<Uuid>,
+    pub digest: String,
+    pub command: String,
+    pub class: String,
+    pub stale_term: bool,
+}
+
+pub(super) fn preauthenticate_stream(
+    headers: &HeaderMap,
+    root: &Control,
+    local: &auth::Sender,
+    pinned: &[u8; 32],
+    seen: &mut BTreeMap<Uuid, u64>,
+) -> Result<StreamAuthentication> {
+    let c = verify(headers, root, local, pinned, true)?;
+    admit_nonce(&c, seen)?;
+    Ok(StreamAuthentication {
+        nonce: c.nonce,
+        sender: c.sender_node,
+        digest: c.digest,
+        command: c.command,
+        class: c.class,
+        stale_term: c.scheduler_term != root.scheduler.scheduler_term,
+    })
+}
+
+fn admit_nonce(c: &Claims, seen: &mut BTreeMap<Uuid, u64>) -> Result<()> {
     let now = super::queue_runtime::now_ms();
     if c.expires_at_ms < now || c.expires_at_ms > now.saturating_add(30000) {
         return Err(invalid());
@@ -207,7 +246,7 @@ pub(super) fn preauthenticate(
     if seen.insert(c.nonce, c.expires_at_ms).is_some() {
         return Err(http::failure(ErrorCode::Conflict));
     }
-    Ok((c.nonce, c.sender_node, c.digest, c.command, c.class))
+    Ok(())
 }
 // API replies target the API's ephemeral process, so response authenticity is
 // checked against the exact worker and request nonce instead of a member receiver.
@@ -239,6 +278,31 @@ pub(super) async fn exchange_class(
     response_cap: usize,
     class: Option<&str>,
 ) -> Result<Vec<u8>> {
+    let (bytes, ()) = exchange_accounted(
+        client,
+        signer,
+        root,
+        node,
+        body,
+        response_cap,
+        class,
+        |_| Ok(()),
+    )
+    .await?;
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn exchange_accounted<T>(
+    client: &HttpClient,
+    signer: &Signer,
+    root: &Control,
+    node: &Node,
+    body: Vec<u8>,
+    response_cap: usize,
+    class: Option<&str>,
+    reserve_reply: impl FnOnce(usize) -> Result<T>,
+) -> Result<(Vec<u8>, T)> {
     if body.len() > MAX_BYTES {
         return Err(http::failure(ErrorCode::LimitExceeded));
     }
@@ -260,7 +324,11 @@ pub(super) async fn exchange_class(
                 .as_ref()
                 .ok_or_else(unavailable)?
                 .trim_end_matches('/'),
-            PATH
+            if c.command.starts_with("stream_") {
+                super::stream::PATH
+            } else {
+                PATH
+            }
         ))
         .header("connection", "close")
         .header("content-type", "application/json")
@@ -290,6 +358,7 @@ pub(super) async fn exchange_class(
     }
     let headers = response.headers().clone();
     let len = http::framing(&headers, response_cap.min(MAX_BYTES), false)?.ok_or_else(invalid)?;
+    let reservation = reserve_reply(len)?;
     let bytes = http::read_small(response.into_body(), len, end).await?;
     let raw = http::one(&headers, "x-nabedra-queue-auth")?;
     if raw.len() > 8192 || raw.len() % 2 != 0 {
@@ -342,7 +411,7 @@ pub(super) async fn exchange_class(
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&input, &signature)
         .map_err(|_| invalid())?;
-    Ok(bytes)
+    Ok((bytes, reservation))
 }
 /// Echo receiver identity for API replies without exposing a reusable credential.
 pub(super) fn reply(
@@ -351,6 +420,66 @@ pub(super) fn reply(
     headers: &HeaderMap,
     nonce: Uuid,
     bytes: Vec<u8>,
+) -> Result<Response<Body>> {
+    let len = bytes.len();
+    let digest = http::digest(&bytes);
+    signed_reply(
+        signer,
+        root,
+        headers,
+        nonce,
+        len,
+        digest,
+        "application/json",
+        Body::from(bytes),
+    )
+}
+
+pub(super) fn stream_reply(
+    signer: &Signer,
+    root: &Control,
+    headers: &HeaderMap,
+    nonce: Uuid,
+    marker: u8,
+    bytes: Bytes,
+) -> Result<Response<Body>> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update([marker]);
+    digest.update(&bytes);
+    let len = bytes.len().checked_add(1).ok_or_else(invalid)?;
+    let prefix = match marker {
+        0 => Bytes::from_static(&[0]),
+        1 => Bytes::from_static(&[1]),
+        2 => Bytes::from_static(&[2]),
+        _ => return Err(invalid()),
+    };
+    let body = http_body_util::StreamBody::new(futures_util::stream::iter([
+        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(prefix)),
+        Ok(hyper::body::Frame::data(bytes)),
+    ]));
+    signed_reply(
+        signer,
+        root,
+        headers,
+        nonce,
+        len,
+        http::hex(&digest.finalize()),
+        "application/octet-stream",
+        Body::new(body),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_reply(
+    signer: &Signer,
+    root: &Control,
+    headers: &HeaderMap,
+    nonce: Uuid,
+    len: usize,
+    digest: String,
+    media_type: &'static str,
+    body: Body,
 ) -> Result<Response<Body>> {
     let raw = http::one(headers, "x-nabedra-queue-auth")?;
     let decoded = (0..raw.len())
@@ -377,16 +506,16 @@ pub(super) fn reply(
         nonce,
         response: true,
         expires_at_ms: super::queue_runtime::now_ms().saturating_add(30000),
-        digest: http::digest(&bytes),
+        digest,
     };
     let (a, s) = signed(signer, &c)?;
     Response::builder()
         .status(200)
-        .header("content-type", "application/json")
-        .header("content-length", bytes.len())
+        .header("content-type", media_type)
+        .header("content-length", len)
         .header("x-nabedra-queue-auth", a)
         .header("x-nabedra-queue-signature", s)
-        .body(Body::from(bytes))
+        .body(body)
         .map_err(|_| invalid())
 }
 

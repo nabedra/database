@@ -1,7 +1,7 @@
 //! Conditional v3 initialization and bounded lookup in one captured history.
 use super::{
-    Catalog, CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES, Object, ObjectKey,
-    ObjectStore, Storage, StorageError, WriteCondition,
+    Catalog, CatalogFence, ClusterCatalog, Decision, MAX_DECISION_BYTES, Object, ObjectAccessError,
+    ObjectKey, ObjectStore, Storage, StorageError, WriteCondition,
 };
 use crate::protocol::MAX_CATALOG_BYTES;
 use serde::Deserialize;
@@ -126,6 +126,13 @@ pub enum FenceTransition {
     ColdStart,
 }
 impl<B: ObjectStore> Storage<B> {
+    /// Check GET permission and drop the transfer before reading its body.
+    pub(crate) async fn authorize_object(&self, key: &ObjectKey) -> Result<(), ObjectAccessError> {
+        self.backend
+            .authorize_get(&format!("{}{}", self.namespace.as_str(), key.as_str()))
+            .await
+    }
+
     /// Reauthorize all backing objects before exposing a retained result through
     /// a fresh grant. A successful GET establishes object permission; the body
     /// is immediately dropped rather than downloaded into a shared cache.
@@ -139,27 +146,18 @@ impl<B: ObjectStore> Storage<B> {
             match &entry.data {
                 super::TableData::Legacy { snapshot } => {
                     let key = ObjectKey::parse_snapshot(snapshot, entry.id)?;
-                    timeout_at(
-                        deadline,
-                        self.backend
-                            .get(&format!("{}{}", self.namespace.as_str(), key.as_str())),
-                    )
-                    .await
-                    .map_err(|_| StorageError::Unavailable)??;
+                    timeout_at(deadline, self.authorize_object(&key))
+                        .await
+                        .map_err(|_| StorageError::Unavailable)?
+                        .map_err(ObjectAccessError::into_storage_error)?;
                 }
                 super::TableData::Partitioned { files } => {
                     for file in files {
                         let key = ObjectKey::parse_partition(&file.object, entry.id)?;
-                        timeout_at(
-                            deadline,
-                            self.backend.get(&format!(
-                                "{}{}",
-                                self.namespace.as_str(),
-                                key.as_str()
-                            )),
-                        )
-                        .await
-                        .map_err(|_| StorageError::Unavailable)??;
+                        timeout_at(deadline, self.authorize_object(&key))
+                            .await
+                            .map_err(|_| StorageError::Unavailable)?
+                            .map_err(ObjectAccessError::into_storage_error)?;
                     }
                 }
             }

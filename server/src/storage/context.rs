@@ -131,7 +131,7 @@ impl RequestContext {
     pub fn namespace(&self) -> Result<Namespace, StorageError> {
         Namespace::new(&self.prefix)
     }
-    #[cfg(any(all(feature = "olap", feature = "s3"), test))]
+    #[cfg(any(feature = "olap", test))]
     pub(crate) fn credentials(&self) -> &AwsCredentials {
         &self.credentials
     }

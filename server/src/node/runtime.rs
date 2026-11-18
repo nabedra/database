@@ -799,9 +799,10 @@ async fn worker_process(path: PathBuf, cpu_pool: WorkerPool) -> Result<()> {
             Ok::<(),ProtocolError>(())
         });
         let mut app=Router::new();for path in ["operations","jobs","readiness","dependencies/open","dependencies/close","drain"]{app=app.route(&format!("/internal/v1/{path}"),post(internal));}
-        let app=app.route(super::queue_transport::PATH,post(super::queue_runtime::handler)).route("/health/live",get(||async{"true"})).with_state(worker.clone());
+        let app=app.route(super::queue_transport::PATH,post(super::queue_runtime::handler)).route(super::stream::PATH,post(super::stream::handler)).route("/health/live",get(||async{"true"})).with_state(worker.clone());
         let served=crate::runtime::serve_router_with_budget(listener,app,tls,partition_slots,async{crate::runtime::shutdown_signal().await;worker.accepting.store(false,Ordering::Release);worker.operations.stop_accepting();worker.partitions.stop_accepting();worker.controls.stop_accepting();}).await.map_err(|_|unavailable());
         worker.operations.drain().await;worker.partitions.drain().await;worker.controls.drain().await;worker.sending.drain().await;
+        worker.queue.streams.stop();
         stop.send_replace(true);queue_task.await.map_err(|_|unavailable())??;heartbeat.await.map_err(|_|unavailable())??;
         drop(worker);
         served

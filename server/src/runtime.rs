@@ -87,6 +87,10 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
     cold_start: bool,
     migrate_catalog: bool,
 ) -> io::Result<()> {
+    let stream_frontend = std::sync::Arc::new(
+        api::stream::Frontend::new()
+            .map_err(|_| io::Error::other("invalid stream ingress limits"))?,
+    );
     let (app, queue_tasks, queue) = api::router_with_queue_startup(
         engine.clone(),
         executor.clone(),
@@ -94,6 +98,7 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
         execution,
         cold_start,
         migrate_catalog,
+        stream_frontend.clone(),
     )
     .map_err(|_| io::Error::other("invalid queue configuration"))?;
     if let Err(error) = queue.initialize(&engine).await {
@@ -106,6 +111,7 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
     let signal_result = std::sync::Arc::new(std::sync::Mutex::new(None));
     let outcome = signal_result.clone();
     let ingress = executor.clone();
+    let stream_ingress = stream_frontend.clone();
     let result = serve_router(
         listener,
         app.merge(api::health::router(engine)),
@@ -113,6 +119,7 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
         async move {
             let result = shutdown.await;
             ingress.stop_accepting();
+            stream_ingress.stop_accepting();
             *outcome.lock().unwrap() = Some(result);
         },
     )
@@ -121,6 +128,7 @@ pub async fn serve_configured<B: ObjectStore + 'static>(
     executor.drain().await;
     queue_tasks.stop_accepting();
     queue_tasks.drain().await;
+    stream_frontend.drain().await;
     let signal = signal_result.lock().unwrap().take().unwrap_or(Ok(()));
     signal.and(result)
 }

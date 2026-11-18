@@ -74,3 +74,24 @@ class ProtocolError(NabedraError):
 class UnknownOutcomeError(NabedraError):
     code = "outcome_unknown"
     _default_outcome = "unknown"
+
+
+class StreamUnsupportedError(NabedraError):
+    """The server or requested query does not support streaming."""
+
+    code = "unsupported_operation"
+    _default_outcome = "not_applied"
+
+
+class StreamExpiredError(NabedraError):
+    """A stream or snapshot lease has expired."""
+
+    code = "stream_expired"
+    _default_outcome = "not_applied"
+
+
+class StreamAbandonedError(NabedraError):
+    """The worker run that owned a stream or snapshot has ended."""
+
+    code = "stream_abandoned"
+    _default_outcome = "not_applied"

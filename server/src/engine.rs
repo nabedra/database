@@ -10,6 +10,7 @@ mod mutation;
 mod partition;
 mod query;
 mod read;
+pub(crate) mod stream;
 mod write;
 
 pub use mutation::MutationResult;
