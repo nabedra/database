@@ -196,6 +196,20 @@ The fixed-membership O23/O24 and B02 subset checked ready membership, published 
 
 The raw `benchmark-metadata-qualified-resume/results.json` SHA-256 was `d9c8a92a33f9749e5a6ec170541c4782b83a50c01aedb97111a788bb4ae88ddd`.
 
+## Iteration 14 · Completion notification
+
+This isolated build added bounded gateway observation to `c7f2a90`. The server waited for the exact terminal version under the current ready membership. The gateway deferred on overload or an authority change and retried against fresh authority.
+
+| Offered updates/s | Control goodput / p99 | Notification goodput / p99 | Notification acknowledgments |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.573/s / 2,144 ms | 0.600/s / 1,927 ms | 10 / 15 |
+| 5 | 0.826/s / 3,557 ms | 0.891/s / 3,554 ms | 18 / 75 |
+| 20 | 0.879/s / 4,175 ms | 0.830/s / 4,203 ms | 19 / 300 |
+
+The load sweep acknowledged 47 of 390 measured writes, the same total as the control. The other 343 offers received explicit parsing-capacity rejections. All 13 snapshots matched, and the driver recorded zero unresolved outcomes. In the serial workload at 0.2/s, all ten measured writes succeeded and all 12 snapshots matched. Median client latency rose from 1,193.70 to 1,489.58 ms, an increase of 24.8%. The notification build's serial latencies ranged from 1,203.07 to 1,772.88 ms. Goodput stayed at 0.2/s. The mixed load results and higher serial median were grounds to set the candidate aside.
+
+The 4 CPU and 7.90 GB RF3 runs exercised the fixed-membership O23/O24 and B02 subsets. The serial run verified equal terminal and accepted counters on all three workers at the sampled boundaries. Fault injection and authority changes during observation remain unverified. The host rebooted after compilation. The recovered binary matched the build log's SHA-256 `66bd52910a308d55ee38bb6ac58c917bfd0bebda992ad9cf2272c8ceb0fbdb32`. The comparison uses the recorded control aggregates because the reboot cleared their intermediate artifacts. The notification load and serial result SHA-256 hashes were `6610dbccf8cfb2e5f01fbda062c4faf15ef3640b84651c7825ede040b8c18d6d` and `5f395b8cd7a49455145ea7754c06e5d130e38b4dbed491e6d7a6e4b787383b7d`.
+
 ## ScyllaDB reference
 
 The ScyllaDB 6.2.3 reference ran three nodes and the driver with a combined cap of 3.65 CPUs and 7.35 GB. Each node and the driver had the same limits as in the symmetric Nabedra runs. This topology serves prepared CQL directly. It used RF3, QUORUM and batch commit-log sync. The fixture verified the effective sync mode on every node. On Docker Desktop the Linux AIO limit prevented the third node from starting, so the run used the epoll backend. [ScyllaDB Docker Desktop workaround](https://github.com/scylladb/scylladb/issues/16806)
