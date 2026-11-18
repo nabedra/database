@@ -78,12 +78,19 @@ pub(crate) struct RoutingRoot {
     pub routing_epoch: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShardRoute {
     pub group: GroupIdentity,
     pub span: KeySpan,
     pub schema_epoch: u64,
     pub routing_epoch: u64,
+}
+#[cfg(test)]
+impl ShardRoute {
+    pub(crate) fn contains_key(&self, key: &Key) -> bool {
+        contains(&self.span, key)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

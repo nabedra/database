@@ -11,6 +11,8 @@ mod migration;
 mod placement;
 mod pool_drain;
 mod query_statistics;
+#[cfg(test)]
+mod shard_route;
 mod worker_drain;
 mod recovery;
 pub(super) mod retirement;

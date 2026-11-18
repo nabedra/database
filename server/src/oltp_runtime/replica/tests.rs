@@ -1901,3 +1901,5 @@ fn o13_q06_delayed_install_cannot_restore_retired_terminal_and_new_sequences_ski
     receiver.install_prepared_checked(prepared, None).unwrap();
     assert!(receiver.record(new_id).is_some());
 }
+
+mod scoped_acceptance;

@@ -23,6 +23,10 @@ mod backup;
 mod index;
 mod index_build;
 mod migration;
+#[cfg(test)]
+mod point_route;
+#[cfg(test)]
+pub(crate) use point_route::PointRoute;
 mod query;
 use query::schedule::QueryScheduler;
 mod query_metrics;

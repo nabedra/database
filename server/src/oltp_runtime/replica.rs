@@ -33,6 +33,8 @@ fn hash(bytes: &[u8]) -> Digest {
 
 mod queue_latency;
 use queue_latency::{AcceptanceTiming, QueueLatency, QueueLatencySnapshot};
+#[cfg(test)]
+pub(super) mod scoped;
 mod removal;
 mod read_grants;
 pub use read_grants::ReadGrantSet;

@@ -65,6 +65,24 @@ O05/O23/C02 native-open regression: inspect the pinned dependency's option sanit
 
 O13/M03 retained-reply regression: hold part of a reply arena, enqueue a reply requiring its full capacity, and repeatedly complete smaller fitting replies. Use deterministic release/dispatch barriers. Smaller work may bypass temporarily, but bounded aging must eventually protect enough headroom for the large eligible reply. No waiter holds CPU or a physical executor slot. Test cancellation and close without leaked reservations, and keep independent control replies progressing. General scheduler aging tests alone do not establish this separate allocator's fairness.
 
+## Scoped queue protocol version 2
+
+The [shard refactor plan](../../plans/oltp-shard-refactor.md) proposes this
+protocol for newly admitted identities in an enabled database. Each admission
+binds the exact UUID, body digest, original run, queue policy, placement and
+decision home. Retries and drain use that binding. Identities admitted under
+the all-ready policy keep its copy and receipt requirements.
+
+The point-operation prototype pairs an RF3 queue placement with the Data shard
+selected at the original snapshot. It runs only in Rust test fixtures.
+Production qualification requires all of the following process assertions.
+
+| ID | Scenario | Required assertions |
+| --- | --- | --- |
+| O30 | Delay a third holder, then delay an unrelated worker. Delay two holders during each copy phase in turn. | Within a single deadline, two exact executable RAM copies and two corresponding acceptance markers suffice. A minority in either phase cannot acknowledge or dispatch. With healthy Data and metadata quorums, require a durable visible result and two exact terminal copies before success. Count distinct enrolled incarnations and record queue copy destinations. Run Q03/Q06 on both protocols. |
+| O31 | Lose the owner after payload quorum, after marker quorum, and during membership change. Restart a voter with empty RAM and retry the UUID against another range. | Retain the exact request and pin. Fence the old owner, validate state transfer before counting the restarted voter and recover the original admission and decision home. Reject a conflicting digest even when the proposed range differs. Keep uncertainty when only one complete copy survives without a safe quorum. Run Q05, R01–R03 and O16. |
+| O32 | Isolate a last complete holder, then prove holder loss while other workers stay live. Repeat after stopping all workers. | Distinguish a partition from proven loss. Reconcile the durable decision at its recorded home before declaring abandonment. Recover any committed exact receipt and data. Begin a new run with an empty queue after full stop and preserve abandonment of pending requests. Run Q06, R04–R06 and O10/O15/O29. |
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |
