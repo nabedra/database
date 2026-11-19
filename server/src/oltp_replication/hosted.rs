@@ -1,11 +1,13 @@
 //! Actual typed OpenRaft application over shared pool groups. Application
-//! effects, applied position, membership and last response use one sync batch.
+//! effects, applied position, membership and last response use one batch per
+//! entry. That batch is unsynced when the group's synced log shares its WAL:
+//! a crash loses only a WAL suffix, and the surviving log replays it.
 use super::{
     authority::consensus::{Applied, Consensus, ConsensusFuture, ReadBarrier},
     entry::{CommittedLeaderId, LogId, Payload, stored_membership},
     multiplex::{ReplicaLease, ReplicaMetadata},
     owned::{OwnedCommand, serialized_digest},
-    typed_log::{TypedConfig, TypedLogStore},
+    typed_log::{MAX_APPEND_ENTRIES, TypedConfig, TypedLogStore},
     types::{AppliedPosition, Digest, GroupKind},
 };
 use crate::{
@@ -239,7 +241,10 @@ where
                     None
                 }
             };
-            if matches!(self.store().identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+            if matches!(
+                self.store().identity().kind,
+                GroupKind::Data { .. } | GroupKind::Catalog
+            ) {
                 tracing::debug!(group=%self.store().identity().group_id, node=self._resident.node_id(),
                     index=position.index, "typed Raft state applied");
             }
@@ -320,14 +325,21 @@ where
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
 }
-/// Single-entry batching is the initial typed storage/transport contract. It
-/// bounds transient batches independently of total retained log/table size.
-pub(crate) fn single_entry_config(
+/// Entries per AppendEntries RPC. The typed Raft wire carries one entry per
+/// frame, and an older peer cannot decode more, so replication stays at one
+/// until a negotiated multi-entry frame exists. Reading more here would only
+/// decode entries the network then drops.
+pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = 1;
+/// Byte-bounded batching. Client writes coalesce into one log append of at
+/// most `MAX_APPEND_ENTRIES` entries without lingering, and the log writes
+/// each append as synced batches of at most 1 MiB. Bounds transient batches
+/// independently of total retained log/table size.
+pub(crate) fn batched_config(
     mut config: openraft::Config,
 ) -> Result<Arc<openraft::Config>, ProtocolError> {
-    config.max_payload_entries = 1;
-    config.max_append_entries = Some(1);
-    config.api_batch_capacity = Some(1);
+    config.max_payload_entries = REPLICATION_PAYLOAD_ENTRIES;
+    config.max_append_entries = Some(MAX_APPEND_ENTRIES as u64);
+    config.api_batch_capacity = Some(MAX_APPEND_ENTRIES as u64);
     config.api_channel_size = Some(64);
     config.api_batch_linger_ms = Some(0);
     config
@@ -340,22 +352,36 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    pub(crate) async fn start(
+    /// Production passes the authenticated `TypedNetworkFactory`; a
+    /// single-voter test may pass a network that is never called.
+    pub(crate) async fn start<N>(
         config: Arc<openraft::Config>,
-        network: super::typed_network::TypedNetworkFactory<C>,
+        network: N,
         log: TypedLogStore<C>,
         state: HostedState<C, M>,
-    ) -> Result<Arc<Self>, ProtocolError> {
-        if config.max_payload_entries != 1
-            || config.max_append_entries != Some(1)
-            || config.api_batch_capacity != Some(1)
+    ) -> Result<Arc<Self>, ProtocolError>
+    where
+        N: openraft::network::RaftNetworkFactory<C>,
+        N::Network: openraft::network::NetSnapshot<C, SnapshotData = TypedSnapshot>,
+    {
+        if config.max_payload_entries != REPLICATION_PAYLOAD_ENTRIES
+            || config.max_append_entries != Some(MAX_APPEND_ENTRIES as u64)
+            || config.api_batch_capacity != Some(MAX_APPEND_ENTRIES as u64)
+            || config.api_batch_linger_ms != Some(0)
             || !log.has_resident()
             || state.store().identity() != log.group().identity()
             || !Arc::ptr_eq(state.store().resources(), log.group().resources())
         {
             return Err(invalid(
-                "typed host requires matching group/pool and validated single-entry batching",
+                "typed host requires matching group/pool and validated bounded batching",
             ));
+        }
+        // Before Raft can replay or apply anything: unsynced application is
+        // safe only when the log shares this state's WAL. Otherwise every
+        // application write stays synced.
+        if !state.store().defer_apply_sync(log.group()) {
+            tracing::warn!(group=%state.store().identity().group_id,
+                "typed Raft log and state use different pools; application stays synced");
         }
         let raft = Raft::new(
             state._resident.node_id(),
@@ -470,3 +496,6 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
         _ => ExecutionClass::Query,
     }
 }
+
+#[cfg(test)]
+mod tests;

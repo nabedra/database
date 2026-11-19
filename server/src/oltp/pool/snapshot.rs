@@ -349,6 +349,10 @@ impl GroupStore {
                 let _owner = owner;
                 let (mut scratch, _batch, _output) = reservations;
                 group.pool().healthy()?;
+                // The application order is held, so every applied write of
+                // this group has completed. Sync any unsynced one before a
+                // snapshot can name its index.
+                group.sync_deferred_applies()?;
                 let native = group.pool().inner.db.snapshot();
                 let applied = group.read_applied(&native, &mut scratch)?;
                 let membership = native

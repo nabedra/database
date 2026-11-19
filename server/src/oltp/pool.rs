@@ -27,7 +27,7 @@ use crate::{
 };
 use rocksdb::{
     BlockBasedOptions, DB, DBCompressionType, DBPinnableSlice, DBRawIterator, DBRecoveryMode,
-    Options, Snapshot, WriteBatch,
+    Options, Snapshot, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,7 +37,7 @@ use std::{
     path::Path,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::sync::OwnedSemaphorePermit;
@@ -48,6 +48,8 @@ const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const BATCH_OVERHEAD: usize = 32;
+#[cfg(test)]
+pub(crate) const TEST_UNSYNCED_WAL_IN_MEMORY: &str = "NABEDRA_TEST_UNSYNCED_WAL_IN_MEMORY";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +84,7 @@ struct PoolInner {
     shared: Arc<WorkerSharedResources>,
     recovery: Arc<AtomicBool>,
     groups: Arc<tokio::sync::Mutex<BTreeMap<Uuid, Weak<GroupInner>>>>,
+    durability: WalDurability,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
     _mount: Option<VerifiedPoolMount>,
@@ -97,7 +100,40 @@ struct GroupInner {
     generation: Arc<tokio::sync::RwLock<()>>,
     log_order: Arc<tokio::sync::Mutex<()>>,
     log_metadata_order: Arc<tokio::sync::Mutex<()>>,
+    /// Set only by the Raft host after it proves this group's log lives in
+    /// the same physical pool, and therefore the same RocksDB WAL.
+    deferred_apply: AtomicBool,
+    /// Last unsynced application write: (applied index, WAL ticket).
+    deferred_tail: std::sync::Mutex<Option<(u64, u64)>>,
+    synced_writes: AtomicU64,
+    deferred_writes: AtomicU64,
     _handle_slot: GroupCapacityLease,
+}
+/// Orders unsynced writes against later synced writes of the same WAL. A write
+/// takes its ticket only after RocksDB returned, so a synced write that starts
+/// after the ticket was issued also persists that write. RocksDB loses only a
+/// WAL suffix, so every write ordered before a completed sync survives it.
+#[derive(Default)]
+struct WalDurability {
+    issued: AtomicU64,
+    durable: AtomicU64,
+    deferred: AtomicU64,
+    in_flight: AtomicU64,
+    synced_writes: AtomicU64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PoolWriteStats {
+    /// Synced WAL writes and explicit WAL syncs: one fsync each.
+    pub synced_writes: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct GroupWriteStats {
+    /// Synced writes issued by this replica's log and state transactions.
+    pub synced_writes: u64,
+    /// Unsynced application writes made durable by a later synced write.
+    pub deferred_writes: u64,
+    /// Newest applied index a crash could still lose, if any.
+    pub unsynced_applied_index: Option<u64>,
 }
 #[derive(Clone, Copy)]
 enum MutationLane {
@@ -105,6 +141,14 @@ enum MutationLane {
     Restore,
     Log,
     LogMetadata,
+}
+/// Durability of one group write. `ApplyHint` is unsynced only for a Raft
+/// application write of a group whose host proved a shared WAL with its log.
+#[derive(Clone, Copy)]
+enum WriteSync {
+    Synced,
+    Unsynced,
+    ApplyHint,
 }
 #[derive(Clone, Copy)]
 enum ReplyLane {
@@ -157,6 +201,13 @@ impl OltpPool {
         options.create_if_missing(true);
         options.set_compression_type(DBCompressionType::None);
         options.set_wal_recovery_mode(DBRecoveryMode::AbsoluteConsistency);
+        // Test-only power-loss model: unsynced WAL records stay in process
+        // memory until a synced write, so aborting the process drops exactly
+        // the unsynced WAL suffix that an OS crash could lose.
+        #[cfg(test)]
+        if std::env::var_os(TEST_UNSYNCED_WAL_IN_MEMORY).is_some() {
+            options.set_manual_wal_flush(true);
+        }
         options.set_write_buffer_size(shared.config.write_buffer_bytes / 2);
         options.set_max_write_buffer_number(2);
         options.set_write_buffer_manager(&shared.write_buffers);
@@ -205,6 +256,7 @@ impl OltpPool {
                 shared,
                 recovery: Arc::new(AtomicBool::new(false)),
                 groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+                durability: WalDurability::default(),
                 _pool_slot: pool_slot,
                 _overhead: overhead,
                 _mount: mount,
@@ -260,13 +312,65 @@ impl OltpPool {
     }
     fn durable_write(&self, batch: WriteBatch) -> Result<(), ProtocolError> {
         self.healthy()?;
+        let covered = self.inner.durability.issued.load(Ordering::SeqCst);
         self.inner
             .db
             .write_opt(batch, &sync_options())
             .map_err(|_| {
                 self.inner.recovery.store(true, Ordering::Release);
                 recovery_unknown()
-            })
+            })?;
+        self.synced(covered);
+        Ok(())
+    }
+    /// An unsynced WAL write. Only Raft application state and the commit hint
+    /// use it, because the synced log in the same WAL replays what it covers.
+    /// Returns the ticket that a later synced write must cover.
+    fn deferred_write(&self, batch: WriteBatch) -> Result<u64, ProtocolError> {
+        self.healthy()?;
+        let durability = &self.inner.durability;
+        durability.in_flight.fetch_add(1, Ordering::SeqCst);
+        let written = self.inner.db.write_opt(batch, &deferred_options());
+        let ticket = durability.issued.fetch_add(1, Ordering::SeqCst) + 1;
+        durability.deferred.fetch_max(ticket, Ordering::SeqCst);
+        durability.in_flight.fetch_sub(1, Ordering::SeqCst);
+        written.map_err(|_| {
+            self.inner.recovery.store(true, Ordering::Release);
+            recovery_unknown()
+        })?;
+        Ok(ticket)
+    }
+    /// Synchronously persists every WAL write that completed before the call.
+    pub(crate) fn sync_wal(&self) -> Result<(), ProtocolError> {
+        self.healthy()?;
+        let covered = self.inner.durability.issued.load(Ordering::SeqCst);
+        self.inner.db.flush_wal(true).map_err(|_| {
+            self.inner.recovery.store(true, Ordering::Release);
+            recovery_unknown()
+        })?;
+        self.synced(covered);
+        Ok(())
+    }
+    fn synced(&self, covered: u64) {
+        let durability = &self.inner.durability;
+        durability.synced_writes.fetch_add(1, Ordering::Relaxed);
+        durability.durable.fetch_max(covered, Ordering::SeqCst);
+    }
+    /// True while an unsynced write may still be lost by a crash.
+    pub(crate) fn has_unsynced_writes(&self) -> bool {
+        let durability = &self.inner.durability;
+        durability.in_flight.load(Ordering::SeqCst) != 0
+            || durability.deferred.load(Ordering::SeqCst)
+                > durability.durable.load(Ordering::SeqCst)
+    }
+    fn ticket_durable(&self, ticket: u64) -> bool {
+        self.inner.durability.durable.load(Ordering::SeqCst) >= ticket
+    }
+    /// Fsync count of this physical pool, for `/v1/runtime/stats`.
+    pub fn write_stats(&self) -> PoolWriteStats {
+        PoolWriteStats {
+            synced_writes: self.inner.durability.synced_writes.load(Ordering::Relaxed),
+        }
     }
     pub async fn group(&self, identity: GroupIdentity) -> Result<GroupStore, ProtocolError> {
         self.open_group(identity, true, None).await
@@ -336,7 +440,10 @@ impl OltpPool {
                         batch.put(&key, value.as_slice());
                         batch.put(group_key(identity.group_id, b'a', &[]), 0u64.to_be_bytes());
                         if let Some(binding) = learner {
-                            batch.put(placement::learner_key(identity.group_id), binding.as_bytes());
+                            batch.put(
+                                placement::learner_key(identity.group_id),
+                                binding.as_bytes(),
+                            );
                         }
                         pool.durable_write(batch)?;
                     }
@@ -355,6 +462,10 @@ impl OltpPool {
                     generation: Arc::new(tokio::sync::RwLock::new(())),
                     log_order: Arc::new(tokio::sync::Mutex::new(())),
                     log_metadata_order: Arc::new(tokio::sync::Mutex::new(())),
+                    deferred_apply: AtomicBool::new(false),
+                    deferred_tail: std::sync::Mutex::new(None),
+                    synced_writes: AtomicU64::new(0),
+                    deferred_writes: AtomicU64::new(0),
                     _handle_slot: slot,
                 });
                 groups.insert(group.identity.group_id, Arc::downgrade(&group));
@@ -508,8 +619,15 @@ impl GroupStore {
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.mutate(Some(meta), None::<()>, MutationLane::State, budget, work)
-            .await
+        self.mutate(
+            Some(meta),
+            None::<()>,
+            MutationLane::State,
+            WriteSync::ApplyHint,
+            budget,
+            work,
+        )
+        .await
     }
     /// Membership is serialized from an already owned Raft entry inside the
     /// private native apply reservation. Transport arenas are not prerequisites
@@ -529,8 +647,15 @@ impl GroupStore {
                 "duplicate membership sources",
             ));
         }
-        self.mutate(Some(meta), membership, MutationLane::State, budget, work)
-            .await
+        self.mutate(
+            Some(meta),
+            membership,
+            MutationLane::State,
+            WriteSync::ApplyHint,
+            budget,
+            work,
+        )
+        .await
     }
     pub async fn log_transaction(
         &self,
@@ -539,8 +664,15 @@ impl GroupStore {
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.mutate(None, None::<()>, MutationLane::Log, budget, work)
-            .await
+        self.mutate(
+            None,
+            None::<()>,
+            MutationLane::Log,
+            WriteSync::Synced,
+            budget,
+            work,
+        )
+        .await
     }
     /// Small retained node/vote/commit metadata has independent execution and
     /// order from large log bodies and application state. Adapters must retain
@@ -552,14 +684,111 @@ impl GroupStore {
         + Send
         + 'static,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.mutate(None, None::<()>, MutationLane::LogMetadata, budget, work)
-            .await
+        self.mutate(
+            None,
+            None::<()>,
+            MutationLane::LogMetadata,
+            WriteSync::Synced,
+            budget,
+            work,
+        )
+        .await
     }
+    /// Unsynced log metadata. Only recovery hints that OpenRaft may lose, such
+    /// as the commit marker, use it.
+    pub async fn log_transaction_metadata_unsynced(
+        &self,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError>
+        + Send
+        + 'static,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.mutate(
+            None,
+            None::<()>,
+            MutationLane::LogMetadata,
+            WriteSync::Unsynced,
+            budget,
+            work,
+        )
+        .await
+    }
+    /// Lets Raft application writes skip their own fsync. The caller is the
+    /// Raft host and passes the store that holds this group's synced log; the
+    /// switch is refused unless both are the same group in the same physical
+    /// pool, so the log and the state share one RocksDB WAL.
+    pub(crate) fn defer_apply_sync(&self, log: &GroupStore) -> bool {
+        if !Arc::ptr_eq(&self.pool().inner, &log.pool().inner) || self.identity() != log.identity()
+        {
+            return false;
+        }
+        self.inner.deferred_apply.store(true, Ordering::Release);
+        true
+    }
+    pub fn applies_deferred(&self) -> bool {
+        self.inner.deferred_apply.load(Ordering::Acquire)
+    }
+    /// Fsync and unsynced-write counts of this replica, for `/v1/runtime/stats`.
+    pub fn write_stats(&self) -> GroupWriteStats {
+        GroupWriteStats {
+            synced_writes: self.inner.synced_writes.load(Ordering::Relaxed),
+            deferred_writes: self.inner.deferred_writes.load(Ordering::Relaxed),
+            unsynced_applied_index: self.unsynced_applied_index(),
+        }
+    }
+    /// The newest applied index whose state a crash could still lose.
+    fn unsynced_applied_index(&self) -> Option<u64> {
+        let tail = *self
+            .inner
+            .deferred_tail
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        tail.filter(|(_, ticket)| !self.pool().ticket_durable(*ticket))
+            .map(|(index, _)| index)
+    }
+    /// Log purge calls this first. It refuses a purge past the applied index
+    /// and syncs the WAL when an earlier application write is not yet durable,
+    /// so the log is never purged past state that a crash could lose.
+    pub(crate) async fn ensure_applied_durable(&self, index: u64) -> Result<(), ProtocolError> {
+        if !self.applies_deferred() {
+            return Ok(());
+        }
+        let applied = self
+            .applied_state(TransactionBudget {
+                scratch_bytes: 256 << 10,
+                batch_bytes: 0,
+                output_bytes: 256 << 10,
+            })
+            .await?;
+        if applied.is_none_or(|applied| applied.position.index < index) {
+            return Err(failure(
+                ErrorCode::StorageUnavailable,
+                "log purge passes the applied state",
+            ));
+        }
+        if self.pool().has_unsynced_writes() {
+            let pool = self.pool().clone();
+            self.resources()
+                .execute(ExecutionClass::Control, index, 0, move || pool.sync_wal())
+                .await?;
+        }
+        Ok(())
+    }
+    /// Snapshot export calls this under the group's application order, so the
+    /// exported applied index is durable before any snapshot names it.
+    pub(super) fn sync_deferred_applies(&self) -> Result<(), ProtocolError> {
+        if self.applies_deferred() && self.pool().has_unsynced_writes() {
+            self.pool().sync_wal()?;
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn mutate<T: Serialize + Send + 'static>(
         &self,
         meta: Option<ApplyMeta>,
         membership: Option<T>,
         lane: MutationLane,
+        sync: WriteSync,
         budget: TransactionBudget,
         work: impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError>
         + Send
@@ -672,7 +901,32 @@ impl GroupStore {
                         }
                     }
                     write_started.set(true);
-                    group.pool().durable_write(transaction.batch)?;
+                    let deferred_index = match sync {
+                        WriteSync::Synced => None,
+                        WriteSync::Unsynced => Some(None),
+                        WriteSync::ApplyHint => meta
+                            .as_ref()
+                            .filter(|_| group.applies_deferred())
+                            .map(|meta| Some(meta.position.index)),
+                    };
+                    match deferred_index {
+                        None => {
+                            group.pool().durable_write(transaction.batch)?;
+                            group.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(index) => {
+                            let ticket = group.pool().deferred_write(transaction.batch)?;
+                            group.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
+                            if let Some(index) = index {
+                                *group
+                                    .inner
+                                    .deferred_tail
+                                    .lock()
+                                    .unwrap_or_else(|poison| poison.into_inner()) =
+                                    Some((index, ticket));
+                            }
+                        }
+                    }
                     Ok(response)
                 }));
                 match result {
@@ -765,7 +1019,9 @@ impl GroupStore {
             },
             move |view| {
                 let generation = u64::from_be_bytes(
-                    view.prefix[18..].try_into().map_err(|_| recovery_unknown())?,
+                    view.prefix[18..]
+                        .try_into()
+                        .map_err(|_| recovery_unknown())?,
                 );
                 work(view, generation)
             },
@@ -1376,6 +1632,12 @@ impl<'a> GroupTransaction<'a> {
     }
 }
 
+fn deferred_options() -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.set_sync(false);
+    options.disable_wal(false);
+    options
+}
 fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(18 + suffix.len());
     key.push(0x40);

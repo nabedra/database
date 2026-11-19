@@ -8,7 +8,7 @@ use super::{
         status::StatusMachine,
         timestamp::TimestampMachine,
     },
-    hosted::{HostedState, RaftConsensus, TypedMachine, single_entry_config},
+    hosted::{HostedState, RaftConsensus, TypedMachine, batched_config},
     multiplex::{EndpointRegistry, Purpose, WorkerClient},
     typed_log::{TypedConfig, TypedLogStore},
     typed_network::{ReplicaDispatcher, ReplicaEndpoint, TypedNetworkFactory},
@@ -35,9 +35,11 @@ pub(crate) use lifecycle::{AppliedPlacementMembership, ReplicatedLearner};
 mod retirement;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
-pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
+pub(crate) use data_factory::placement::{
+    PlacementCatalog, RemotePlacementTarget, ReplicaPlacement,
+};
 pub(crate) use data_factory::split as shard_split;
-pub(crate) use data_factory::placement::{PlacementCatalog, RemotePlacementTarget, ReplicaPlacement};
+pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
 pub(crate) use local::{
     GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredSystemGroups,
     RegisteredWorker, SystemPlacement,
@@ -244,7 +246,7 @@ impl HostedGroupManager {
         {
             return Err(invalid());
         }
-        let config = single_entry_config(config)?;
+        let config = batched_config(config)?;
         let config_digest = super::owned::serialized_digest(config.as_ref())?;
         if let Some(existing) =
             self.existing::<C, M>(machine.store(), &local, &bootstrap, config_digest)?

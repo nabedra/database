@@ -23,33 +23,40 @@ impl GroupStore {
     ) -> Result<(), ProtocolError> {
         target.authorize_pool(self.pool().identity(), &self.pool().inner.path)?;
         let group = self.clone();
-        self.mutate(None, None::<()>, MutationLane::Restore, budget, move |tx| {
-            target.authorize_pool(group.pool().identity(), &group.pool().inner.path)?;
-            // No Raft metadata/log can already refer to this genesis. A valid
-            // online install continues to use strict snapshot activation.
-            if group
-                .read_applied(tx.read.snapshot, &mut tx.read.scratch)?
-                .is_some()
-                || tx
-                    .read
-                    .snapshot
-                    .get_pinned(group_key(group.identity().group_id, b'm', &[]))
-                    .map_err(storage_error)?
+        self.mutate(
+            None,
+            None::<()>,
+            MutationLane::Restore,
+            WriteSync::Synced,
+            budget,
+            move |tx| {
+                target.authorize_pool(group.pool().identity(), &group.pool().inner.path)?;
+                // No Raft metadata/log can already refer to this genesis. A valid
+                // online install continues to use strict snapshot activation.
+                if group
+                    .read_applied(tx.read.snapshot, &mut tx.read.scratch)?
                     .is_some()
-            {
-                return Err(recovery_unknown());
-            }
-            let log_prefix = group_key(group.identity().group_id, b'l', &[]);
-            let mut log = tx.read.snapshot.raw_iterator();
-            log.seek(&log_prefix);
-            if log.key().is_some_and(|key| key.starts_with(&log_prefix)) {
-                return Err(recovery_unknown());
-            }
-            log.status().map_err(storage_error)?;
-            drop(log);
-            work(tx)?;
-            Ok(Transition::Commit(tx.encode(&())?))
-        })
+                    || tx
+                        .read
+                        .snapshot
+                        .get_pinned(group_key(group.identity().group_id, b'm', &[]))
+                        .map_err(storage_error)?
+                        .is_some()
+                {
+                    return Err(recovery_unknown());
+                }
+                let log_prefix = group_key(group.identity().group_id, b'l', &[]);
+                let mut log = tx.read.snapshot.raw_iterator();
+                log.seek(&log_prefix);
+                if log.key().is_some_and(|key| key.starts_with(&log_prefix)) {
+                    return Err(recovery_unknown());
+                }
+                log.status().map_err(storage_error)?;
+                drop(log);
+                work(tx)?;
+                Ok(Transition::Commit(tx.encode(&())?))
+            },
+        )
         .await?;
         Ok(())
     }
