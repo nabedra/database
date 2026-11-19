@@ -57,6 +57,8 @@ small sample and single-host network establish runner interoperability.
   before reaching its authority-read assertion. C02 expected rejection
   when the unchanged CLI accepts the configured thread count. Both OLTP
   resolved package and feature graphs matched the approved-plan baseline.
+  All seven OLTP integration suites ran separately and returned 31 passes
+  and two ignores.
 - The Python regression suite ran 190 tests with one skip. TypeScript passed
   41 checks with three live skips. Both rebuilt packages are version 0.2.0,
   and installed tests exercised TLS and authentication closure on an opening

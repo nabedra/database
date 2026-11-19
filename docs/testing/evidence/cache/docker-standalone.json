@@ -8,7 +8,7 @@
     ],
     "memory_max": "268435456",
     "nabedra": "nabedra-db 0.1.1 cache",
-    "nabedra_sha256": "7be7651089cd3f831533e0cf40c785ad84d8c1bcf451519108b91c8e32d81beb",
+    "nabedra_sha256": "f650a441a5b6564f0b7aea9798edaf0d68725abe85783d6d3438a377b66c4fe3",
     "valkey": "Valkey server v=8.1.11 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=604cb0061d9bd300",
     "valkey_sha256": "a6b0ac4ab72ad2a44fd6ac20a83112faf81a46d7f83a87b266932dab1f963ff1",
     "redis_py": "6.4.0",
@@ -20,7 +20,7 @@
       "tls": true,
       "profile": "noeviction",
       "limit_overrides": {},
-      "peak_rss_kib": 11508,
+      "peak_rss_kib": 11592,
       "charged_data_bytes_at_shutdown": 825
     },
     {
@@ -28,14 +28,14 @@
       "tls": true,
       "profile": "noeviction",
       "limit_overrides": {},
-      "peak_rss_kib": 18724
+      "peak_rss_kib": 18792
     },
     {
       "name": "nabedra",
       "tls": true,
       "profile": "noeviction",
       "limit_overrides": {},
-      "peak_rss_kib": 8352,
+      "peak_rss_kib": 8464,
       "charged_data_bytes_at_shutdown": 680
     },
     {
@@ -46,7 +46,7 @@
         "max_reply_bytes": 700,
         "max_arguments": 16
       },
-      "peak_rss_kib": 6312,
+      "peak_rss_kib": 6488,
       "charged_data_bytes_at_shutdown": 2336
     },
     {
@@ -57,7 +57,7 @@
         "max_frame_bytes": 4096,
         "max_pipeline_bytes": 8192
       },
-      "peak_rss_kib": 6208,
+      "peak_rss_kib": 6528,
       "charged_data_bytes_at_shutdown": 0
     },
     {
@@ -69,7 +69,7 @@
         "max_handshakes": 2,
         "max_pending": 1
       },
-      "peak_rss_kib": 6344,
+      "peak_rss_kib": 6460,
       "charged_data_bytes_at_shutdown": 675
     },
     {
@@ -79,7 +79,7 @@
       "limit_overrides": {
         "max_handshakes": 1
       },
-      "peak_rss_kib": 8504,
+      "peak_rss_kib": 8432,
       "charged_data_bytes_at_shutdown": 0
     },
     {
@@ -89,7 +89,7 @@
       "limit_overrides": {
         "data_bytes": 131072
       },
-      "peak_rss_kib": 6728,
+      "peak_rss_kib": 6696,
       "charged_data_bytes_at_shutdown": 116446
     },
     {
@@ -99,7 +99,7 @@
       "limit_overrides": {
         "data_bytes": 131072
       },
-      "peak_rss_kib": 6572,
+      "peak_rss_kib": 6808,
       "charged_data_bytes_at_shutdown": 116380
     },
     {
@@ -109,7 +109,7 @@
       "limit_overrides": {
         "data_bytes": 2097152
       },
-      "peak_rss_kib": 16148
+      "peak_rss_kib": 16016
     },
     {
       "name": "nabedra",
@@ -118,7 +118,7 @@
       "limit_overrides": {
         "data_bytes": 131072
       },
-      "peak_rss_kib": 6728,
+      "peak_rss_kib": 6704,
       "charged_data_bytes_at_shutdown": 72176
     },
     {
@@ -128,7 +128,7 @@
       "limit_overrides": {
         "data_bytes": 4194304
       },
-      "peak_rss_kib": 10180,
+      "peak_rss_kib": 10064,
       "charged_data_bytes_at_shutdown": 2437830
     }
   ],
@@ -136,42 +136,42 @@
     {
       "id": "K01-nabedra-stock-and-installed-orm",
       "status": "passed",
-      "duration_seconds": 5.503
+      "duration_seconds": 5.118
     },
     {
       "id": "K01-valkey-stock-and-installed-orm-ab",
       "status": "passed",
-      "duration_seconds": 5.043
+      "duration_seconds": 4.697
     },
     {
       "id": "K01-tls-identity-command-and-prefix-acl",
       "status": "passed",
-      "duration_seconds": 0.279
+      "duration_seconds": 0.421
     },
     {
       "id": "K01-K02-frame-pipeline-and-output-caps",
       "status": "passed",
-      "duration_seconds": 0.07
+      "duration_seconds": 0.075
     },
     {
       "id": "K02-connection-and-handshake-admission",
       "status": "passed",
-      "duration_seconds": 0.336
+      "duration_seconds": 0.643
     },
     {
       "id": "K01-K02-noeviction-and-sampled-lru",
       "status": "passed",
-      "duration_seconds": 0.21
+      "duration_seconds": 0.237
     },
     {
       "id": "K01-K02-burst-expiry-overwrite-delete",
       "status": "passed",
-      "duration_seconds": 1.11
+      "duration_seconds": 1.134
     },
     {
       "id": "K02-unread-output-independent-session-and-rss",
       "status": "passed",
-      "duration_seconds": 0.199
+      "duration_seconds": 0.176
     }
   ],
   "unverified": [
