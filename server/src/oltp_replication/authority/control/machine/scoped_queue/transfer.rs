@@ -71,6 +71,38 @@ pub(super) fn begin(
     Ok(ControlReply::ScopedQueueTransfer(Box::new(transition)))
 }
 
+pub(super) fn rebase(
+    tx: &mut GroupTransaction<'_>,
+    state: &State,
+    id: Uuid,
+    group_id: Uuid,
+    replaces: Uuid,
+    removed: WorkerIdentity,
+    owner: WorkerIdentity,
+) -> Result<ControlReply, ProtocolError> {
+    let Some(transfer) = active(tx, state, group_id, replaces)? else {
+        return fault(Fault::Stale);
+    };
+    let next = &transfer.next;
+    let Some(record) = load::<GroupRecord>(tx, &super::key(GROUPS, group_id))?.filter(|record| {
+        record.identity == next.group
+            && record.generation == next.data_generation
+            && record.generation == transfer.previous.data_generation
+    }) else {
+        return fault(Fault::Stale);
+    };
+    if next.unavailable_holder.is_some()
+        || destinations(tx, state, &record, &transfer.previous)?
+            != Some((next.members, Some(removed)))
+    {
+        return fault(Fault::NotReady);
+    }
+
+    // Ready removal changed the exact destinations. Restart the transfer from
+    // the same published source under the next term, with fresh copy proofs.
+    begin(tx, state, id, &transfer.previous, owner, Some(replaces))
+}
+
 fn destinations(
     tx: &mut GroupTransaction<'_>,
     state: &State,

@@ -829,6 +829,34 @@ impl ControlClient {
         .await
     }
 
+    pub(crate) async fn rebase_scoped_queue_transfer(
+        &self,
+        operation_id: Uuid,
+        group_id: Uuid,
+        transfer_id: Uuid,
+        removed: WorkerIdentity,
+        next_owner: WorkerIdentity,
+    ) -> Result<(), ProtocolError> {
+        let reply = self
+            .change_scoped_queue(
+                operation_id,
+                ScopedQueueOperation::RebaseTransfer {
+                    group_id,
+                    transfer_id,
+                    removed,
+                    next_owner,
+                },
+            )
+            .await?;
+        if !matches!(reply, ControlReply::ScopedQueueTransfer(transfer)
+            if transfer.id == operation_id && transfer.previous.group.group_id == group_id
+                && transfer.next.owner == next_owner && transfer.next.unavailable_holder == Some(removed))
+        {
+            return Err(invalid("unexpected Control scoped queue rebase reply"));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn publish_scoped_queue_transfer(
         &self,
         operation_id: Uuid,

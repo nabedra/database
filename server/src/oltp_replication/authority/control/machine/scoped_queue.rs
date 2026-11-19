@@ -86,6 +86,25 @@ pub(super) fn apply(
             }
             transfer::begin(tx, state, operation_id, expected, *next_owner, *replaces)
         }
+        ScopedQueueOperation::RebaseTransfer {
+            group_id,
+            transfer_id,
+            removed,
+            next_owner,
+        } => {
+            if !current_ready(tx, state, actor)? {
+                return fault(Fault::Unauthorized);
+            }
+            transfer::rebase(
+                tx,
+                state,
+                operation_id,
+                *group_id,
+                *transfer_id,
+                *removed,
+                *next_owner,
+            )
+        }
         ScopedQueueOperation::ReportTransfer {
             group_id,
             transfer_id,

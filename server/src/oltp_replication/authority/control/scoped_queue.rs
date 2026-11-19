@@ -161,6 +161,12 @@ pub(crate) enum ScopedQueueOperation {
         next_owner: WorkerIdentity,
         replaces: Option<Uuid>,
     },
+    RebaseTransfer {
+        group_id: Uuid,
+        transfer_id: Uuid,
+        removed: WorkerIdentity,
+        next_owner: WorkerIdentity,
+    },
     ReportTransfer {
         group_id: Uuid,
         transfer_id: Uuid,
@@ -174,7 +180,10 @@ pub(crate) enum ScopedQueueOperation {
 
 impl ScopedQueueOperation {
     pub(super) fn requires_operator(&self) -> bool {
-        matches!(self, Self::SetAdmission { .. } | Self::BeginTransfer { .. })
+        matches!(
+            self,
+            Self::SetAdmission { .. } | Self::BeginTransfer { .. } | Self::RebaseTransfer { .. }
+        )
     }
 
     pub(super) fn heap_bytes(&self) -> usize {

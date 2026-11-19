@@ -100,8 +100,7 @@ impl ScopedWorker {
         let id = group.identity.group_id;
         self.services.endpoint.cleanup_scoped_group(id).await?;
         if let Some(transfer) = control.scoped_queue_transition(id).await? {
-            if self.services.operator && self.replace_unreachable_transfer(group, &transfer).await?
-            {
+            if self.services.operator && self.replace_stale_transfer(group, &transfer).await? {
                 return Ok(());
             }
             return self.advance_transfer(transfer).await;
@@ -309,12 +308,13 @@ impl ScopedWorker {
         Ok(())
     }
 
-    async fn replace_unreachable_transfer(
+    async fn replace_stale_transfer(
         &self,
         group: &GroupRecord,
         transfer: &ScopedQueueTransition,
     ) -> Result<bool, ProtocolError> {
         let local = self.services.local;
+        let removed = self.removed_transfer_destination(group, transfer)?;
         let ready = scoped_authority(&transfer.previous)
             .map_err(QueueError::protocol)?
             .ready;
@@ -332,8 +332,9 @@ impl ScopedWorker {
             }
         };
         let owner = reachable(transfer.next.owner).await;
+        let replace_destination = removed.is_some() || owner == PeerReachability::Unreachable;
         let needs_sources = transfer.basis()?.is_some() && !transfer.has_installed_quorum();
-        if !needs_sources && owner != PeerReachability::Unreachable {
+        if !replace_destination && !needs_sources {
             return Ok(false);
         }
         let old = transfer.previous.members;
@@ -344,13 +345,18 @@ impl ScopedWorker {
             .iter()
             .zip(reachability)
             .any(|(cut, reply)| cut.is_some() && reply == PeerReachability::Unreachable);
-        if !lost_source && owner != PeerReachability::Unreachable {
+        if !replace_destination && !lost_source {
             return Ok(false);
         }
         let candidates = old.into_iter().zip(reachability).filter(|(worker, reply)| {
-            transfer.previous.has_holder(*worker) && *reply == PeerReachability::Reachable
+            Some(*worker) != removed
+                && transfer.previous.has_holder(*worker)
+                && *reply == PeerReachability::Reachable
         });
         if candidates.clone().count() < 2 {
+            if removed.is_some() {
+                return Err(unavailable());
+            }
             return Ok(false);
         }
         let routes = self
@@ -365,10 +371,35 @@ impl ScopedWorker {
                     .iter()
                     .any(|member| member.worker_id == worker.worker_id)
             })
-            .min_by_key(|(worker, _)| worker.worker_id)
+            .min_by_key(|(worker, _)| {
+                (
+                    removed.is_some() && *worker != transfer.next.owner,
+                    worker.worker_id,
+                )
+            })
         else {
             return Ok(false);
         };
+        if let Some(removed) = removed {
+            let operation = transition_id(
+                "scoped-queue-rebase-transfer",
+                &(transfer.id, group.generation, local, removed, next),
+            )?;
+            self.services
+                .control
+                .rebase_scoped_queue_transfer(
+                    operation,
+                    group.identity.group_id,
+                    transfer.id,
+                    removed,
+                    next,
+                )
+                .await?;
+            tracing::debug!(group=%group.identity.group_id, previous_transfer=%transfer.id,
+                next_transfer=%operation, removed=%removed.worker_id, owner=%next.worker_id,
+                "scoped queue transfer rebased after ready removal");
+            return Ok(true);
+        }
         let operation = transition_id(
             "scoped-queue-replace-transfer",
             &(transfer.id, group.generation, next),
@@ -383,6 +414,35 @@ impl ScopedWorker {
             )
             .await?;
         Ok(true)
+    }
+
+    fn removed_transfer_destination(
+        &self,
+        group: &GroupRecord,
+        transfer: &ScopedQueueTransition,
+    ) -> Result<Option<WorkerIdentity>, ProtocolError> {
+        let next = &transfer.next;
+        if next.unavailable_holder.is_some()
+            || next.data_generation != group.generation
+            || transfer.previous.data_generation != group.generation
+            || transfer.previous.members != next.members
+        {
+            return Ok(None);
+        }
+        let replica = self.services.replica.lock().map_err(|_| unavailable())?;
+        let authority = replica.authority().ready.view.authority();
+        if authority.run_id != next.view.run_id || !replica.is_ready_member() {
+            return Ok(None);
+        }
+        let mut removed = None;
+        for worker in next.members {
+            match replica.read_member(authority, worker.worker_id) {
+                Some(ready) if ready == worker => {}
+                None if removed.is_none() => removed = Some(worker),
+                _ => return Ok(None),
+            }
+        }
+        Ok(removed)
     }
 
     async fn maybe_begin_transfer(
