@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::fs::{Fault, FaultError, FaultFs, Fs, FsOp, RealFs};
+use crate::fs::{Fault, FaultError, FaultFs, Fs, FsOp, PowerLoss, RealFs};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Rec {
@@ -256,7 +256,7 @@ fn ns05_append_after_clean_close_never_resurrects_a_lost_record() {
 
 /// One seed: six open/write/stop cycles (power loss or clean close plus kill), then two
 /// opens that must agree.
-fn campaign(seed: u64) -> std::result::Result<(), String> {
+fn campaign(seed: u64, mode: PowerLoss) -> std::result::Result<(), String> {
     let mut rng = Rng(seed * 7919 + 1);
     let mut fs = FaultFs::new();
     fs.create_dir_all_durable(Path::new("/db"));
@@ -316,7 +316,7 @@ fn campaign(seed: u64) -> std::result::Result<(), String> {
         } else {
             j.crash();
             drop(j);
-            fs = fs.power_loss(seed * 1000 + cycle);
+            fs = fs.power_loss_with(seed * 1000 + cycle, mode);
         }
     }
     let shared: Arc<dyn Fs> = Arc::new(fs.clone());
@@ -345,9 +345,13 @@ fn campaign(seed: u64) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn run_campaign(seeds: u64) {
+fn run_campaign(seeds: u64, mode: PowerLoss) {
     let failures: Vec<String> = (0..seeds)
-        .filter_map(|seed| campaign(seed).err().map(|e| format!("seed {seed}: {e}")))
+        .filter_map(|seed| {
+            campaign(seed, mode)
+                .err()
+                .map(|e| format!("seed {seed}: {e}"))
+        })
         .collect();
     for f in failures.iter().take(12) {
         eprintln!("{f}");
@@ -362,14 +366,27 @@ fn run_campaign(seeds: u64) {
 /// RV-KV1 F2: NS05-style power loss, 150 seeds (debug default, `NS05_SEEDS` overrides).
 #[test]
 fn ns05_power_loss_campaign_on_fault_fs() {
-    run_campaign(env_u64("NS05_SEEDS", 150));
+    run_campaign(env_u64("NS05_SEEDS", 150), PowerLoss::default());
 }
 
 /// The full campaign: 2,000 seeds. Run with `--release --ignored`.
 #[test]
 #[ignore = "full NS05 campaign; run with --release --ignored"]
 fn ns05_power_loss_campaign_on_fault_fs_full() {
-    run_campaign(env_u64("NS05_SEEDS", 2000));
+    run_campaign(env_u64("NS05_SEEDS", 2000), PowerLoss::default());
+}
+
+/// The campaign on a device whose atomic unit is a 4 KiB page that a power loss can also
+/// zero or fill with garbage as a whole (RV-KV1 F7.2), 100 seeds by default.
+#[test]
+fn ns05_power_loss_campaign_with_4k_units_zero_and_garbage() {
+    run_campaign(env_u64("NS05_SEEDS", 100), PowerLoss::destroy_4k());
+}
+
+#[test]
+#[ignore = "full NS05 campaign (4 KiB units); run with --release --ignored"]
+fn ns05_power_loss_campaign_with_4k_units_zero_and_garbage_full() {
+    run_campaign(env_u64("NS05_SEEDS", 2000), PowerLoss::destroy_4k());
 }
 
 /// Runs a workload of two opens (40 mixed writes each, a clean close in between) with
@@ -429,7 +446,8 @@ fn boundary_workload(limit: Option<u64>, fs: &FaultFs) -> (Vec<Vec<u8>>, usize) 
     (log, synced)
 }
 
-/// Crash after every mutating call, then `crash()`, `power_loss(seed)` or `kill()`.
+/// Crash after every mutating call, then `crash()`, `power_loss(seed)`, `kill()` or a
+/// power loss with 4 KiB units that may be zeroed or turned to garbage.
 /// `stride` > 1 checks every stride-th boundary (plus the last).
 fn run_boundaries(stride: u64) {
     let fs = FaultFs::new();
@@ -440,14 +458,15 @@ fn run_boundaries(stride: u64) {
     let mut checked = 0;
     let boundaries = (0..=total).filter(|n| n % stride == 0 || *n == total);
     for n in boundaries {
-        for mode in 0..3u64 {
+        for mode in 0..4u64 {
             let fs = FaultFs::new();
             fs.create_dir_all_durable(Path::new("/db"));
             let (log, synced) = boundary_workload(Some(n), &fs);
             let after = match mode {
                 0 => fs.crash(),
                 1 => fs.power_loss(n * 3 + 1),
-                _ => fs.kill(),
+                2 => fs.kill(),
+                _ => fs.power_loss_with(n * 3 + 2, PowerLoss::destroy_4k()),
             };
             checked += 1;
             match open(Arc::new(after), Path::new("/db/journal")) {
@@ -484,7 +503,7 @@ fn ns04_crash_at_every_boundary() {
     run_boundaries(env_u64("NS04_STRIDE", 3).max(1));
 }
 
-/// Every boundary, three crash modes each. Run with `--release --ignored`.
+/// Every boundary, four crash modes each. Run with `--release --ignored`.
 #[test]
 #[ignore = "full NS04 enumeration; run with --release --ignored"]
 fn ns04_crash_at_every_boundary_full() {
@@ -720,6 +739,59 @@ fn ns07_damaged_fence_pad_with_evidence_never_resumes_in_leftovers() {
             "replay_after {replay_after}: continue in segment B"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// NS24 (journal level): an unreadable region is never a torn tail
+
+#[test]
+fn ns24_eio_region_in_recovery_refuses_and_truncates_nothing() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let dir = Path::new("/db/journal");
+    let (j, _, sink) = open(Arc::new(fs.clone()), dir).unwrap();
+    for i in 0..6u8 {
+        j.submit(sized(&[b'e', i], 700), Durability::Sync, Box::new(()))
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let written = sink.data();
+    let (segment, at) = sink.records()[3].at.unwrap();
+    j.crash();
+    drop(j);
+    let fs = fs.crash();
+    // The 512 bytes holding the fourth record's header read back as EIO.
+    let path = segment::path_of(dir, segment, segment::LIVE_EXT);
+    fs.inject(
+        Fault::on(FsOp::Read)
+            .path_prefix(path.clone())
+            .range(at, 512)
+            .repeat(),
+    );
+    fs.clear_calls();
+    let err = open(Arc::new(fs.clone()), dir).err().expect("R2 refuses");
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    let writes: Vec<_> = fs
+        .calls()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.op,
+                FsOp::Write | FsOp::Rename | FsOp::Remove | FsOp::SetLen | FsOp::Preallocate
+            )
+        })
+        .collect();
+    assert!(
+        writes.is_empty(),
+        "a refused open writes nothing: {writes:?}"
+    );
+    // Once the region reads again, every record is there: nothing was truncated.
+    fs.clear_faults();
+    let (j, report, sink) = open(Arc::new(fs.clone()), dir).unwrap();
+    assert_eq!(sink.data(), written);
+    assert_eq!(report.tail, TailOutcome::Clean);
+    j.crash();
 }
 
 // ---------------------------------------------------------------------------------------
