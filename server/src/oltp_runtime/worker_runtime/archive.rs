@@ -99,6 +99,15 @@ impl WorkerRuntime {
         if owner.backup_id.is_nil() || owner.attempt == 0 {
             return Err(unknown());
         }
+        // Incremental segments export only Status-decided transactions, so
+        // they would lose every direct commit and its dedup record (RV-T4 F2).
+        if previous.is_some() && self.direct_commits_active() {
+            return Err(crate::oltp::failure(
+                ErrorCode::UnsupportedOperation,
+                "incremental backups are unavailable while direct commits (data.direct.v1) \
+                 are active: take a full backup",
+            ));
+        }
         if let Some(repository) = &self.services.archive_repository {
             repository.require_write()?;
             if repository.directory(self.native_archive_id(owner)?) != destination {
@@ -148,6 +157,17 @@ impl WorkerRuntime {
         })
         .await
         .map_err(|_| unknown())?
+    }
+    /// Whether direct commits are active, which refuses incremental backups.
+    pub(crate) fn direct_commits_active(&self) -> bool {
+        self.direct_commits_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Set by the `data.direct.v1` activation (T7). Off by default.
+    #[allow(dead_code)] // Driven by the capability activation (T7).
+    pub(crate) fn set_direct_commits_active(&self, active: bool) {
+        self.direct_commits_active
+            .store(active, std::sync::atomic::Ordering::Release);
     }
     async fn reconcile_native_cancellation(
         &self,
