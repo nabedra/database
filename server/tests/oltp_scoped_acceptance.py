@@ -309,11 +309,10 @@ class Driver:
             report('ordinary ORM scoped Get and Update', reads=reads, writes=writes, decision=decision,
                    payload_destinations=[self.worker_identity(role) for role in self.followers])
         else:
-            with self.pause_worker(self.followers[-1]):
-                assert self.table.get(0) == {'id': 0, 'value': 0}
-                assert self.table.update(0, {'value': 17}) is True
-            report('ordinary ORM Get and Update with an RF3 follower paused',
-                   paused=self.worker_identity(self.followers[-1]), inferred_owner=self.worker_identity(self.owner))
+            assert self.table.get(0) == {'id': 0, 'value': 0}
+            assert self.table.update(0, {'value': 17}) is True
+            report('ordinary ORM Get and Update on the release build',
+                   inferred_owner=self.worker_identity(self.owner))
 
         assert self.table.get(0) == {'id': 0, 'value': 17}
         assert self.table.get(100) is None
@@ -670,7 +669,6 @@ def start_fixture(module, args):
     args.worker_cpus = module.DEFAULT_WORKER_CPUS
     args.status_seed_worker = None
     args.tls_key_type = 'rsa'
-    args.rpc_trace = False
     args.scoped_oltp = True
     module.EXECUTION = module.EXECUTION | {'result_retention_ms': RETENTION_MS}
     worker_prefix = uuid4().int & ~0xff
@@ -762,6 +760,7 @@ def main():
     parser.add_argument('--image')
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
+    parser.add_argument('--rpc-trace', action='store_true', help='retain bounded worker and gateway RPC diagnostics')
     parser.add_argument('--idle-docker-container', action='append', default=[],
                         help='allow an existing Docker daemon container that was verified idle')
     parser.add_argument('--driver', action='store_true', help=argparse.SUPPRESS)

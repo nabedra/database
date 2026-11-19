@@ -60,8 +60,14 @@ pub(super) struct Incoming {
     touched: Instant,
     _owner: Arc<ReplicaMetadata>,
 }
-pub(super) fn target_node(bytes: &[u8]) -> Result<u64, ProtocolError> {
-    crate::protocol::json_input(bytes, 1024)
+pub(super) fn target_node(bytes: &[u8], purpose: Purpose) -> Result<u64, ProtocolError> {
+    let max_bytes = match purpose {
+        Purpose::Authority | Purpose::Storage | Purpose::Settlement | Purpose::ServiceMutation => {
+            super::super::service_rpc::SERVICE_HEADER_BYTES
+        }
+        _ => 1024,
+    };
+    crate::protocol::json_input(bytes, max_bytes)
         .map_err(|_| invalid("invalid replica route bounds"))?;
     #[derive(Deserialize)]
     struct Route {
@@ -70,6 +76,19 @@ pub(super) fn target_node(bytes: &[u8]) -> Result<u64, ProtocolError> {
     serde_json::from_slice::<Route>(bytes)
         .map(|route| route.to_node)
         .map_err(|_| invalid("invalid replica route"))
+}
+
+#[cfg(test)]
+#[test]
+fn o16_scoped_service_route_keeps_the_service_header_limit() {
+    let expanded = format!(r#"{{"to_node":3,"scope":"{}"}}"#, "a".repeat(1400));
+    assert_eq!(
+        target_node(expanded.as_bytes(), Purpose::Authority).unwrap(),
+        3
+    );
+    assert!(target_node(expanded.as_bytes(), Purpose::Snapshot).is_err());
+    let oversized = format!(r#"{{"to_node":3,"scope":"{}"}}"#, "a".repeat(4096));
+    assert!(target_node(oversized.as_bytes(), Purpose::Authority).is_err());
 }
 fn parse(bytes: &[u8]) -> Result<Header, ProtocolError> {
     crate::protocol::json_input(bytes, 1024)

@@ -60,6 +60,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -321,7 +322,7 @@ impl Client {
         payload: Option<ChargedBytes>,
     ) -> Result<ServiceResponse, ProtocolError> {
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied)
+        self.call_round(action, method, &payload, &mut possibly_applied, None)
             .await
             .map_err(Into::into)
     }
@@ -337,7 +338,13 @@ impl Client {
         loop {
             let attempt = timeout_at(
                 deadline,
-                self.call_round(self.action, method, &payload, &mut possibly_applied),
+                self.call_round(
+                    self.action,
+                    method,
+                    &payload,
+                    &mut possibly_applied,
+                    Some(deadline),
+                ),
             )
             .await
             .map_err(|_| unavailable())?;
@@ -388,6 +395,7 @@ impl Client {
         method: Method,
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
+        convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
         let mut failed_read_hint = None;
         if action == ServiceAction::Owner
@@ -413,6 +421,7 @@ impl Client {
             possibly_applied,
             &routes,
             retry_last,
+            convergence_deadline,
         )
         .await
     }
@@ -425,6 +434,7 @@ impl Client {
         possibly_applied: &mut bool,
         routes: &ReplicaRoutes,
         retry_last: Option<u64>,
+        convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
         let preferred = self.leader.load(Ordering::Relaxed);
         // Prefer the observed leader, but let other replicas answer before
@@ -438,16 +448,26 @@ impl Client {
                 };
                 priority == pass
             }) {
-                match self
-                    .call_member(
-                        action,
-                        method,
-                        payload,
-                        member.node_id,
-                        member.worker_id.into(),
-                    )
-                    .await
+                let call = self.call_member(
+                    action,
+                    method,
+                    payload,
+                    member.node_id,
+                    member.worker_id.into(),
+                );
+                let reply = if method.can_repeat_read()
+                    && let Some(deadline) = convergence_deadline
                 {
+                    // After a hinted leader disappears, one disconnected peer
+                    // must leave time to observe the next leader's election.
+                    let peer_deadline = deadline.min(Instant::now() + HINTED_READ_TIMEOUT);
+                    timeout_at(peer_deadline, call)
+                        .await
+                        .unwrap_or(Err(CallError::Transport(RequestError::Unreachable)))
+                } else {
+                    call.await
+                };
+                match reply {
                     Ok(Ok(response)) => {
                         if action == ServiceAction::Owner {
                             routes.record_successful_node(member.node_id);
@@ -495,9 +515,18 @@ impl Client {
         target: &ReplicaRoutes,
     ) -> Result<ServiceResponse, ProtocolError> {
         let mut completed = false;
+        let deadline = Instant::now() + SERVICE_CONVERGENCE;
         timeout_at(
-            Instant::now() + SERVICE_CONVERGENCE,
-            self.call_routed(self.action, method, &payload, &mut completed, target, None),
+            deadline,
+            self.call_routed(
+                self.action,
+                method,
+                &payload,
+                &mut completed,
+                target,
+                None,
+                Some(deadline),
+            ),
         )
         .await
         .map_err(|_| unavailable())?
@@ -686,9 +715,9 @@ impl Client {
                 payload_bytes: payload.as_ref().map_or(0, |bytes| bytes.len() as u64),
                 placement_generation,
             },
-            4096,
+            SERVICE_HEADER_BYTES,
         )?;
-        // The hosted replica dispatcher parses this header at a 1024-byte bound.
+        // Older replicas use a 1024-byte routing header for owner hints.
         if placement_generation.is_some() && header.len() > 1024 {
             return Err(unsupported_service_route().into());
         }
@@ -904,7 +933,7 @@ fn parse(
     {
         return Err(invalid());
     }
-    crate::protocol::json_input(bytes, 4096).map_err(|_| invalid())?;
+    crate::protocol::json_input(bytes, SERVICE_HEADER_BYTES).map_err(|_| invalid())?;
     let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     if header.to_node != node
         || session.purpose() != header.method.purpose()
