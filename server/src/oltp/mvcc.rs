@@ -305,6 +305,15 @@ pub enum MvccKey {
         values: crate::oltp_replication::types::Page<index::IndexValue>,
         primary_key: Key,
     },
+    /// A direct-commit dedup record. It is stored in its own `'D'` namespace,
+    /// never as a versioned head. Images carry it so split children, backups
+    /// and restores keep exact retry results. It sorts after every other key
+    /// and, within a table, by anchor primary key then request id.
+    DirectDedup {
+        table_id: Uuid,
+        anchor: Key,
+        request_id: Uuid,
+    },
 }
 impl MvccKey {
     pub fn heap_bytes(&self) -> usize {
@@ -326,6 +335,10 @@ impl MvccKey {
             }
             Self::Row {
                 primary_key: Key::Utf8(value),
+                ..
+            }
+            | Self::DirectDedup {
+                anchor: Key::Utf8(value),
                 ..
             } => value.capacity(),
             Self::CatalogName { name } | Self::CatalogIndexName { name, .. } => {

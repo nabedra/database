@@ -488,6 +488,11 @@ pub(super) fn freeze_source(
     if tx.first_from(&[INTENT], &[INTENT])?.is_some() {
         return reject(tx, Fault::Incomplete);
     }
+    // Direct commits take no lifecycle guard. One applied above the cut
+    // would be missing from the child images, so this cut cannot freeze.
+    if super::direct::high(tx)?.is_some_and(|high| high > left.read_ts) {
+        return reject(tx, Fault::Conflict);
+    }
     let mut next = config.clone();
     next.split_source = Some(SplitSourceState {
         statement: statement.clone(),
@@ -756,7 +761,7 @@ pub(super) fn apply(
     for image in page.images.iter() {
         if previous.is_some_and(|old| compare_keys(old, &image.key) != Ordering::Less)
             || image.commit_ts > page.binding.read_ts
-            || !owns(&page.binding.source, &page.binding.source_span, &image.key)
+            || !owns_image(&page.binding.source, &page.binding.source_span, &image.key)
         {
             return reject(tx, Fault::InvalidBinding);
         }
@@ -771,11 +776,17 @@ pub(super) fn apply(
             }
         }
         previous = Some(&image.key);
-        if !owns(group, &config.span, &image.key) {
+        if !owns_image(group, &config.span, &image.key) {
             continue;
         }
         if let Some(root) = state.image_root {
             state.image_root = Some(super::split_closure::fold_image(root, image)?);
+        }
+        if matches!(image.key, MvccKey::DirectDedup { .. }) {
+            // A retry routed to this child must replay the source's result.
+            super::direct::import_image(tx, image)?;
+            selected = selected.checked_add(1).ok_or_else(invalid)?;
+            continue;
         }
         tx.with_scratch_buffer(length + 9, |tx, key| {
             encode_key(&image.key, &mut key[1..length + 1]);
@@ -810,7 +821,7 @@ pub(super) fn apply(
         selected = selected.checked_add(1).ok_or_else(invalid)?;
     }
     if let Some(after) = after {
-        if !owns(&page.binding.source, &page.binding.source_span, after) {
+        if !owns_image(&page.binding.source, &page.binding.source_span, after) {
             return reject(tx, Fault::InvalidBinding);
         }
         let next = tx.with_scratch_buffer(key_length(after)?, |tx, buffer| {
