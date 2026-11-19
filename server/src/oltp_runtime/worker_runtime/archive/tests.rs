@@ -1239,3 +1239,80 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
     }
     std::fs::remove_dir_all(path).unwrap();
 }
+
+/// RV-T4 F2 gate: while direct commits are active, an incremental backup is
+/// refused with an error that says to take a full backup, and a full backup
+/// still runs (its committed images carry `'D'`/`'E'`; see
+/// `d03_o19_dedup_records_survive_backup_images_and_restore`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
+    let path = std::env::temp_dir().join(format!("nabedra-direct-backup-{}", Uuid::new_v4()));
+    std::fs::create_dir(&path).unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(path.clone());
+    let source = WorkerRuntime::open(
+        &path.join("source"),
+        "test",
+        "direct-backup",
+        ExecutionConfig {
+            max_pending_requests: 8,
+            ..Default::default()
+        },
+        WorkerResources {
+            max_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!source.direct_commits_active(), "off by default");
+    source.set_direct_commits_active(true);
+    let backup_id = Uuid::new_v4();
+    let base = source
+        .backup_native(
+            &path.join("base"),
+            BackupOwnerRef {
+                backup_id,
+                attempt: 1,
+            },
+            None,
+        )
+        .await
+        .expect("a full backup runs while direct commits are active");
+    let refused = source
+        .backup_native(
+            &path.join("incremental"),
+            BackupOwnerRef {
+                backup_id,
+                attempt: 2,
+            },
+            Some(base.clone()),
+        )
+        .await
+        .expect_err("an incremental backup would miss direct commits");
+    assert_eq!(refused.code, ErrorCode::UnsupportedOperation);
+    assert!(
+        refused.message.contains("take a full backup"),
+        "{}",
+        refused.message
+    );
+    assert!(!path.join("incremental").exists(), "nothing was written");
+    // Without direct commits, the same incremental backup runs.
+    source.set_direct_commits_active(false);
+    source
+        .backup_native(
+            &path.join("incremental"),
+            BackupOwnerRef {
+                backup_id,
+                attempt: 2,
+            },
+            Some(base),
+        )
+        .await
+        .unwrap();
+}

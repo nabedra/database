@@ -82,6 +82,9 @@ pub(crate) struct WorkerRuntime {
     changed: Notify,
     admission_cleanup: admission_cleanup::AdmissionCleanup,
     accepting: AtomicBool,
+    /// Set while `data.direct.v1` is active (T7). Direct commits have no
+    /// Status decision, so incremental backups would miss them.
+    direct_commits_active: AtomicBool,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -219,6 +222,7 @@ impl WorkerRuntime {
             changed: Notify::new(),
             admission_cleanup,
             accepting: AtomicBool::new(true),
+            direct_commits_active: AtomicBool::new(false),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),

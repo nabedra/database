@@ -1114,6 +1114,7 @@ mod index_recovery_tests {
             gc_floor: 0,
             split_source: None,
             split_child: None,
+            direct_pause: None,
         };
         let recover = |binding: LifecycleBinding, authority: Authority| {
             let catalog = catalog.clone();
