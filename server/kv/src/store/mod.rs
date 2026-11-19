@@ -25,13 +25,17 @@
 //! version. Point reads apply the newest covering range tombstone across every source.
 
 mod background;
+mod budget;
+mod journal_gc;
+mod level_iter;
 mod read;
+mod snapshots;
 #[cfg(test)]
 mod tests;
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -52,7 +56,7 @@ use crate::journal::{Journal, JournalSink, RecordKind};
 use crate::manifest::{
     self, AppendError, JOURNAL_DIR, ManifestState, ManifestWriter, RUNS_DIR, RunDesc, VersionEdit,
 };
-use crate::memtable::{Memtable, MemtableBudget, MemtableOptions, SnapshotList};
+use crate::memtable::{Memtable, MemtableBudget, MemtableOptions};
 use crate::quarantine::{Quarantine, QuarantineLimit, single_scope};
 use crate::recovery;
 use crate::run::{
@@ -64,11 +68,17 @@ use crate::types::{Locator, Seq};
 use crate::version::{FileTracker, LevelOptions, MemEntry, RunFile, SuperVersion, Version};
 
 use self::background::Job;
+use self::budget::BudgetGroup;
+use self::journal_gc::GcState;
+use self::snapshots::Snapshots;
 
 /// How long a stalled writer sleeps between checks.
 const STALL_POLL: Duration = Duration::from_millis(5);
 /// Background work that failed with `NoSpace` retries after this long.
 const NO_SPACE_RETRY: Duration = Duration::from_millis(200);
+/// Other background failures (EIO on a run write or an input read) are retried this many
+/// times, with growing delays, before the store latches `RecoveryRequired`.
+const MAX_BACKGROUND_FAILURES: u32 = 3;
 
 /// A store-wide key: every key belongs to no scope.
 pub fn store_wide(_: &[u8]) -> usize {
@@ -96,6 +106,9 @@ pub struct Options {
     /// A memtable is frozen once the journal written into it exceeds this, which bounds
     /// replay at open.
     pub max_replay_bytes: u64,
+    /// Journal GC relocates live journal values out of the oldest segments while the
+    /// journal's live segments exceed this (plan section 2, "Journal values").
+    pub max_journal_bytes: u64,
     pub run_writer: RunWriterOptions,
 }
 
@@ -120,6 +133,7 @@ impl Options {
             memtable: MemtableOptions::default(),
             memtable_bytes: 64 << 20,
             max_replay_bytes: 64 << 20,
+            max_journal_bytes: 512 << 20,
             run_writer: RunWriterOptions::default(),
         }
     }
@@ -136,6 +150,11 @@ pub struct RecoveryReport {
     pub manifest_torn_tail: bool,
     /// L4: unreferenced run files and stale temp files deleted.
     pub orphans_removed: u64,
+    /// Sequences the manifest's `flushed_seq` covers that the journal no longer held:
+    /// its end was behind the manifest (synced journal bytes lost and read as a torn
+    /// tail or an end marker). Their state is in runs, so nothing is lost; open voids
+    /// the numbers so they are never reused. Nonzero means the disk lost synced bytes.
+    pub journal_behind_manifest: u64,
 }
 
 pub struct Opened {
@@ -166,6 +185,44 @@ pub struct StoreStats {
     pub corruption_detected: u64,
     pub tail_truncations: u64,
     pub quarantined_scopes: u32,
+    /// `RecoveryReport::journal_behind_manifest` of the last open.
+    pub journal_behind_manifest: u64,
+    /// Reads that met a locator into a recycled segment: a journal GC invariant broke.
+    /// Each one latches `RecoveryRequired`.
+    pub recycled_value_reads: u64,
+    /// Memory this store keeps outside the block cache and the memtable budget, charged
+    /// to the pool overhead (plan section 5 "Memory"): see [`MemoryUsage`].
+    pub overhead_bytes: u64,
+}
+
+/// Resident memory of one store, by budget (plan section 5 "Memory").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryUsage {
+    /// Active and immutable memtables (inside `write_buffer_bytes`).
+    pub memtables: u64,
+    /// Pool overhead: open run writers of flushes and compactions (write buffer, data
+    /// block, about 8 B per key for the filter and one index entry per data block).
+    pub run_writers: u64,
+    /// Pool overhead: range tombstones of live runs, raw and fragmented.
+    pub range_tombstones: u64,
+    /// Pool overhead: versions and the manifest state (about 200 B per run).
+    pub versions: u64,
+    /// Pool overhead: the snapshot registry.
+    pub snapshots: u64,
+    /// Memtables already flushed but still held by snapshots or iterators, over every
+    /// store sharing the memtable budget. Charged to `write_buffer_bytes`, but writers
+    /// do not stall on them (see `store/budget.rs`).
+    pub memtables_pinned: u64,
+    /// Block cache: bytes reserved or pinned there (open runs' top-level indexes, held
+    /// blocks). Shared by every store on the cache; reported here for convenience.
+    pub cache_pinned: u64,
+}
+
+impl MemoryUsage {
+    /// The part charged to the pool overhead.
+    pub fn overhead(&self) -> u64 {
+        self.run_writers + self.range_tombstones + self.versions + self.snapshots
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -197,6 +254,9 @@ struct Counters {
     file_syncs: AtomicU64,
     user_bytes: AtomicU64,
     open_corruptions: AtomicU64,
+    relocated_bytes: AtomicU64,
+    recycled_reads: AtomicU64,
+    journal_behind: AtomicU64,
 }
 
 type DamageHook = Arc<dyn Fn(Damage) + Send + Sync>;
@@ -210,36 +270,67 @@ pub(crate) struct Inner {
     memtable_options: MemtableOptions,
     memtable_bytes: usize,
     max_replay_bytes: u64,
+    max_journal_bytes: u64,
+    segment_bytes: u64,
+    max_group_bytes: usize,
     run_writer: RunWriterOptions,
     budget: Arc<MemtableBudget>,
+    group: Arc<BudgetGroup>,
+    cache: Arc<BlockCache>,
     background: Arc<Background>,
     table_cache: TableCache,
     run_stats: Arc<RunStats>,
     tracker: Arc<FileTracker>,
     journal: OnceLock<Arc<Journal>>,
     sv: RwLock<Arc<SuperVersion>>,
+    /// Bumped (inside the `sv` write lock) whenever `sv` changes; readers cache the
+    /// super-version per thread under it (see `current_sv`).
+    sv_version: AtomicU64,
+    /// Unique per open store, for the per-thread super-version cache.
+    store_id: u64,
     /// Serializes memtable inserts (journal thread) with freezes.
     active: Mutex<()>,
     replaying: AtomicBool,
     vs: Mutex<VersionSet>,
     flush_lock: Mutex<()>,
     compaction_lock: Mutex<()>,
-    snapshots: SnapshotList,
+    snapshots: Snapshots,
+    /// Serializes the slow path of snapshot creation with readers of the snapshot list.
     snapshot_lock: Mutex<()>,
+    gc: Mutex<GcState>,
+    /// Serializes journal GC steps (background and `Store::gc_journal`).
+    gc_pass: Mutex<()>,
+    /// Run-writer memory of running flushes and compactions.
+    writer_memory: AtomicUsize,
+    /// L0 run count of the current version (write pacing reads it without a lock).
+    l0_runs: AtomicUsize,
+    /// Write pacing under L0 slowdown: the time (ns since `epoch`) up to which the
+    /// delayed write rate is already spent.
+    pace_until_ns: AtomicU64,
+    epoch: Instant,
     quarantine: Quarantine,
     latched: AtomicBool,
     jobs: Mutex<Jobs>,
     jobs_done: Condvar,
     /// A flush is waiting for a journal sync: stalled sinks must let the journal thread go.
     syncs_waiting: AtomicUsize,
+    /// While a sync waits, records up to this sequence pass a stall (they are queued
+    /// before the sync)...
+    bypass_seq: AtomicU64,
+    /// ... and later records pass while this byte allowance lasts (they may share the
+    /// sync's journal group, which completes only once all its records are applied).
+    /// RV-KV2 finding 4: the bypass admits at most one group per sync request.
+    bypass_bytes: AtomicI64,
+    /// Consecutive failed background jobs (other than `NoSpace`).
+    background_failures: AtomicU32,
+    /// Mirrors `jobs.closing` for the journal thread's hot path.
+    closing_flag: AtomicBool,
     flush_queued: AtomicBool,
     compaction_queued: AtomicBool,
     l0_changed: Condvar,
     l0_lock: Mutex<()>,
-    slowdown_debt_ns: AtomicU64,
     damage_hook: RwLock<Option<DamageHook>>,
     pending_damage: Mutex<Vec<Damage>>,
-    pending_release: Mutex<Vec<(Bytes, Seq)>>,
     counters: Counters,
     recovery_ms: AtomicU64,
     lock_file: Mutex<Option<FsLock>>,
@@ -329,7 +420,13 @@ impl Store {
         let tracker = Arc::new(FileTracker::default());
         let mut version = Version::default();
         for desc in state.runs.values() {
-            version.levels[desc.level as usize].push(RunFile::new(desc.clone(), tracker.clone()));
+            let run = RunFile::new(desc.clone(), tracker.clone());
+            if desc.level == 0
+                && let Ok(open) = table_cache.get(desc.id)
+            {
+                run.pin(open);
+            }
+            version.levels[desc.level as usize].push(run);
         }
         version.sort();
         let budget = options.memtables.clone();
@@ -345,6 +442,7 @@ impl Store {
             }
         }
         let flushed_seq = state.flushed_seq;
+        let l0_runs = version.l0_count();
         let inner = Arc::new(Inner {
             dir: dir.to_path_buf(),
             runs_dir: runs_dir.clone(),
@@ -354,8 +452,13 @@ impl Store {
             memtable_options: options.memtable,
             memtable_bytes: options.memtable_bytes.max(1),
             max_replay_bytes: options.max_replay_bytes.max(1),
+            max_journal_bytes: options.max_journal_bytes,
+            segment_bytes: options.journal.segment_bytes,
+            max_group_bytes: options.journal.max_group_bytes,
             run_writer: options.run_writer,
+            group: BudgetGroup::of(&budget),
             budget,
+            cache: options.cache.clone(),
             background: options.background.clone(),
             table_cache,
             run_stats,
@@ -366,6 +469,8 @@ impl Store {
                 imm: Vec::new(),
                 version: Arc::new(version),
             })),
+            sv_version: AtomicU64::new(0),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             active: Mutex::new(()),
             replaying: AtomicBool::new(true),
             vs: Mutex::new(VersionSet {
@@ -377,27 +482,36 @@ impl Store {
             }),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
-            snapshots: SnapshotList::new(),
+            snapshots: Snapshots::default(),
             snapshot_lock: Mutex::new(()),
+            gc: Mutex::new(GcState::default()),
+            gc_pass: Mutex::new(()),
+            writer_memory: AtomicUsize::new(0),
+            l0_runs: AtomicUsize::new(l0_runs),
+            pace_until_ns: AtomicU64::new(0),
+            epoch: Instant::now(),
             quarantine: Quarantine::new(quarantine_list),
             latched: AtomicBool::new(false),
             jobs: Mutex::new(Jobs::default()),
             jobs_done: Condvar::new(),
             syncs_waiting: AtomicUsize::new(0),
+            bypass_seq: AtomicU64::new(0),
+            bypass_bytes: AtomicI64::new(0),
+            background_failures: AtomicU32::new(0),
+            closing_flag: AtomicBool::new(false),
             flush_queued: AtomicBool::new(false),
             compaction_queued: AtomicBool::new(false),
             l0_changed: Condvar::new(),
             l0_lock: Mutex::new(()),
-            slowdown_debt_ns: AtomicU64::new(0),
             damage_hook: RwLock::new(None),
             pending_damage: Mutex::new(Vec::new()),
-            pending_release: Mutex::new(Vec::new()),
             counters: Counters::default(),
             recovery_ms: AtomicU64::new(0),
             lock_file: Mutex::new(Some(opened.lock)),
             self_ref: OnceLock::new(),
         });
         let _ = inner.self_ref.set(Arc::downgrade(&inner));
+        inner.group.join(Arc::downgrade(&inner));
         {
             let mut vs = lock(&inner.vs);
             vs.current = inner.current_sv().version.clone();
@@ -417,8 +531,13 @@ impl Store {
             sink,
         )?;
         let journal = Arc::new(journal);
+        journal.set_value_cache(options.cache.clone(), inner.table_cache.context().namespace);
         let _ = inner.journal.set(journal.clone());
         inner.replaying.store(false, Ordering::Release);
+        inner
+            .counters
+            .journal_behind
+            .store(report.voided_at_open, Ordering::Relaxed);
 
         // G1: journal damage of a group scope. Damage older than a release of that scope
         // is history.
@@ -487,6 +606,7 @@ impl Store {
             recovery_ms: started.elapsed().as_millis() as u64,
             manifest_torn_tail: opened.manifest_torn_tail,
             orphans_removed: orphans,
+            journal_behind_manifest: report.voided_at_open,
         };
         inner
             .recovery_ms
@@ -521,6 +641,26 @@ impl Store {
         self.inner.journal().submit(batch, durability, on_done)
     }
 
+    /// Write pacing while L0 is at its slowdown trigger (RocksDB's delayed write rate):
+    /// charges `bytes` to the store's pacing budget and returns how long the caller
+    /// should wait before submitting them. Zero when writes are not slowed. Only the
+    /// writers that call this wait; the journal thread never sleeps for pacing, so other
+    /// scopes keep their latency. An async caller awaits the delay (a timer), a blocking
+    /// caller uses [`Store::pace`]. At `l0_stop_writes` the journal thread itself stalls
+    /// every write until compaction catches up, paced or not.
+    pub fn write_delay(&self, bytes: usize) -> Duration {
+        self.inner.write_delay(bytes)
+    }
+
+    /// [`Store::write_delay`], slept on the calling thread. Must not be called on an
+    /// async runtime thread.
+    pub fn pace(&self, bytes: usize) {
+        let delay = self.inner.write_delay(bytes);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+
     /// Durably covers every write submitted before this call.
     pub fn sync(&self) -> Result<Commit> {
         self.inner.check_usable()?;
@@ -547,9 +687,34 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes everything under `prefix` and, once that is durable and flushed, lifts
-    /// its quarantine and drops its damaged runs (plan section 3, rule 4).
-    pub fn release_scope(&self, prefix: &[u8]) -> Result<Commit> {
+    /// Runs journal GC until the journal fits `max_journal_bytes` or nothing more can be
+    /// done now: relocates live journal values out of the oldest segments and retires
+    /// them. Returns false when retirement still waits (for a snapshot older than the
+    /// relocation, typically). Blocks (tests and maintenance); the background pool runs
+    /// the same steps after flushes.
+    pub fn gc_journal(&self) -> Result<bool> {
+        self.inner.check_usable()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut backoff = Duration::from_micros(200);
+        while Instant::now() < deadline {
+            match self.inner.journal_gc()? {
+                None => return Ok(true),
+                Some(wait) => {
+                    std::thread::sleep(backoff.min(wait));
+                    backoff *= 2;
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Deletes everything under `prefix`, makes that durable, flushes past it, records the
+    /// release in the manifest, lifts the scope's quarantine and drops its damaged runs
+    /// (plan section 3, rule 4). Returns the release's sequence once all of that is
+    /// done, so writes under `prefix` after it returns survive any crash (RV-KV2
+    /// finding 8). Blocks on a sync and a flush: must not be called on an async runtime
+    /// thread.
+    pub fn release_scope(&self, prefix: &[u8]) -> Result<Seq> {
         self.inner.check_usable()?;
         let end = prefix_successor(prefix).ok_or(Error::InvalidArgument(
             "release_scope needs a bounded prefix",
@@ -557,13 +722,14 @@ impl Store {
         let mut batch = WriteBatch::new();
         batch.set_scope(prefix);
         batch.delete_range(prefix, &end);
-        let commit = self
+        let seq = self
             .inner
             .journal()
-            .submit(batch, Durability::Sync, Box::new(()))?;
-        lock(&self.inner.pending_release).push((Bytes::copy_from_slice(prefix), commit.seq()));
-        self.inner.schedule_compaction();
-        Ok(commit)
+            .submit(batch, Durability::Sync, Box::new(()))?
+            .wait()?;
+        self.inner
+            .finish_release(Bytes::copy_from_slice(prefix), seq)?;
+        Ok(seq)
     }
 
     /// Called for damage found at run time (G2 blocks, G3 values). Store-wide damage also
@@ -597,8 +763,19 @@ impl Store {
         self.inner.stats()
     }
 
+    /// Resident memory by budget.
+    pub fn memory_usage(&self) -> MemoryUsage {
+        self.inner.memory_usage()
+    }
+
     /// Closes the store: waits for its background work, then closes the journal (clean
     /// close record) and releases the directory lock. Dropping does the same.
+    ///
+    /// **Blocks**: it waits for running flushes and compactions and joins the journal's
+    /// threads (`kv-journal`, `kv-journal-prep`). An async owner must close or drop the
+    /// last `Store` handle on a blocking thread (`spawn_blocking`), never on a runtime
+    /// worker. Snapshots and iterators that outlive the store do not block when they drop:
+    /// the journal's threads are already joined by then.
     pub fn close(self) -> Result<()> {
         self.inner.shutdown()
     }
@@ -630,11 +807,17 @@ impl Job for Inner {
         let result = self.flush_imms();
         self.end_job();
         match result {
+            Ok(()) => {
+                self.background_failures.store(0, Ordering::Relaxed);
+                None
+            }
             Err(Error::NoSpace) => {
                 self.flush_queued.store(true, Ordering::Release);
                 Some(NO_SPACE_RETRY)
             }
-            _ => None,
+            Err(e) => self.background_failed(&e).inspect(|_| {
+                self.flush_queued.store(true, Ordering::Release);
+            }),
         }
     }
 
@@ -644,25 +827,55 @@ impl Job for Inner {
             return None;
         }
         let result = self.compact_once();
+        // Journal GC runs on the compaction threads, after compaction (which may drop
+        // shadowed locators) and never concurrently with itself.
+        let gc_retry = match &result {
+            Ok(_) => match self.journal_gc() {
+                Ok(retry) => retry,
+                Err(Error::NoSpace) => Some(NO_SPACE_RETRY),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
         self.end_job();
-        let releases_waiting = !lock(&self.pending_release).is_empty();
+        let pending_damage = !lock(&self.pending_damage).is_empty();
         match result {
             Ok(true) => {
                 self.schedule_compaction();
                 None
             }
-            Ok(false) if releases_waiting => {
+            Ok(false) if pending_damage => {
                 self.compaction_queued.store(true, Ordering::Release);
                 Some(Duration::from_millis(10))
+            }
+            Ok(false) if gc_retry.is_some() => {
+                self.compaction_queued.store(true, Ordering::Release);
+                gc_retry
             }
             Err(Error::NoSpace) => {
                 self.compaction_queued.store(true, Ordering::Release);
                 Some(NO_SPACE_RETRY)
             }
-            _ => None,
+            Err(e) => self.background_failed(&e).inspect(|_| {
+                self.compaction_queued.store(true, Ordering::Release);
+            }),
+            Ok(false) => None,
         }
     }
 }
+
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-thread cache of super-versions: (store id, sv version, super-version). A hit
+/// costs no lock (RV-KV2 finding 9/8b). Entries hold weak references, so a cached entry
+/// never keeps old memtables or runs alive.
+type SvCache = Vec<(u64, u64, Weak<SuperVersion>)>;
+
+thread_local! {
+    static SV_CACHE: std::cell::RefCell<SvCache> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const SV_CACHE_ENTRIES: usize = 8;
 
 impl Inner {
     fn journal(&self) -> &Arc<Journal> {
@@ -674,11 +887,72 @@ impl Inner {
         Some(weak)
     }
 
+    /// The current super-version. Usually served from a per-thread cache without a
+    /// lock: the version counter is read first, and an entry cached under that version is
+    /// the super-version published with it, or the caller sees a newer counter.
     pub(crate) fn current_sv(&self) -> Arc<SuperVersion> {
-        self.sv
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let version = self.sv_version.load(Ordering::Acquire);
+        let hit = SV_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .iter()
+                .find(|(id, v, _)| *id == self.store_id && *v == version)
+                .and_then(|(_, _, sv)| sv.upgrade())
+        });
+        if let Some(sv) = hit {
+            return sv;
+        }
+        let (version, sv) = {
+            let guard = self.sv.read().unwrap_or_else(PoisonError::into_inner);
+            (self.sv_version.load(Ordering::Acquire), guard.clone())
+        };
+        SV_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.retain(|(id, _, w)| *id != self.store_id && w.strong_count() > 0);
+            if cache.len() >= SV_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push((self.store_id, version, Arc::downgrade(&sv)));
+        });
+        sv
+    }
+
+    /// Publishes `next` as the current super-version. The caller holds the write lock.
+    fn publish_sv(&self, slot: &mut Arc<SuperVersion>, next: SuperVersion) {
+        *slot = Arc::new(next);
+        self.sv_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A background job failed with `error` (not `NoSpace`). Retries a few times with
+    /// growing delays, then latches `RecoveryRequired` so writers fail instead of
+    /// stalling on memory forever (RV-KV2 finding 4).
+    fn background_failed(&self, error: &Error) -> Option<Duration> {
+        if matches!(error, Error::Closed | Error::RecoveryRequired) {
+            return None;
+        }
+        let n = self.background_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= MAX_BACKGROUND_FAILURES {
+            self.latch();
+            // Wake stalled writers so they see the latch.
+            self.l0_changed.notify_all();
+            return None;
+        }
+        Some(NO_SPACE_RETRY * n)
+    }
+
+    /// Unflushed memtable memory (active and immutable).
+    fn unflushed_bytes(&self) -> usize {
+        let sv = self.current_sv();
+        sv.memtables().map(|m| m.mem.approximate_memory()).sum()
+    }
+
+    /// Another store sharing the budget is stalled: freeze and flush this one.
+    fn flush_for_budget(&self) {
+        if self.closing_flag.load(Ordering::Acquire) {
+            return;
+        }
+        self.freeze_active();
+        self.schedule_flush();
     }
 
     fn check_usable(&self) -> Result<()> {
@@ -692,7 +966,7 @@ impl Inner {
     }
 
     fn closing(&self) -> bool {
-        lock(&self.jobs).closing
+        self.closing_flag.load(Ordering::Acquire)
     }
 
     fn latch(&self) {
@@ -731,6 +1005,7 @@ impl Inner {
                 return Ok(());
             }
             jobs.closing = true;
+            self.closing_flag.store(true, Ordering::Release);
             while jobs.active > 0 {
                 jobs = self
                     .jobs_done
@@ -778,14 +1053,18 @@ impl Inner {
         batch: &WriteBatch,
         locators: &[Locator],
     ) -> Result<()> {
-        if kind == RecordKind::Relocate {
-            return Err(Error::InvalidArgument(
-                "journal relocation records are not supported yet",
-            ));
-        }
         let replaying = self.replaying.load(Ordering::Acquire);
         if !replaying {
-            self.stall(batch.encoded_bytes());
+            let last = first_seq + u64::from(batch.count()).max(1) - 1;
+            self.stall(last, batch.encoded_bytes());
+            if self.latched.load(Ordering::Acquire) {
+                // The store needs recovery: fail the write (ambiguous) rather than grow
+                // memtables that can no longer be flushed.
+                return Err(Error::RecoveryRequired);
+            }
+        }
+        if kind == RecordKind::Relocate {
+            return self.apply_relocation(first_seq, batch, locators, replaying);
         }
         let _active = lock(&self.active);
         let mem = self.current_sv().mem.clone();
@@ -815,7 +1094,7 @@ impl Inner {
         }
         size >= self.memtable_bytes
             || mem.journal_bytes.load(Ordering::Relaxed) >= self.max_replay_bytes
-            || (self.budget.should_flush() && size >= (self.budget.limit() / 8).max(1))
+            || (self.group.should_flush(&self.budget) && size >= (self.budget.limit() / 8).max(1))
     }
 
     /// Publishes a new empty active memtable; `old` becomes the newest immutable one.
@@ -833,11 +1112,15 @@ impl Inner {
         let mut imm = Vec::with_capacity(sv.imm.len() + 1);
         imm.push(old.clone());
         imm.extend(sv.imm.iter().cloned());
-        *sv = Arc::new(SuperVersion {
-            mem: fresh,
-            imm,
-            version: sv.version.clone(),
-        });
+        let version = sv.version.clone();
+        self.publish_sv(
+            &mut sv,
+            SuperVersion {
+                mem: fresh,
+                imm,
+                version,
+            },
+        );
     }
 
     /// Freezes the active memtable if it holds anything.
@@ -849,25 +1132,37 @@ impl Inner {
         }
     }
 
-    /// Waits while the memtable budget is exhausted or L0 is at its stop trigger, and
-    /// slows writes while L0 is at its slowdown trigger. Writers wait; they never fail.
-    fn stall(&self, bytes: usize) {
+    /// Waits while the memtable budget is exhausted or L0 is at its stop trigger. Writers
+    /// wait; they never fail. The L0 slowdown is not applied here: it would delay every
+    /// scope behind the journal thread. Writers pace themselves ([`Store::write_delay`]).
+    fn stall(&self, last_seq: Seq, bytes: usize) {
         loop {
             if self.latched.load(Ordering::Acquire) || self.closing() {
                 return;
             }
-            // A flush waits on a journal sync, which needs this thread.
-            if self.syncs_waiting.load(Ordering::Acquire) > 0 {
+            // A flush waits on a journal sync, which needs this thread: let through the
+            // records queued before the sync and at most one journal group after it.
+            if self.syncs_waiting.load(Ordering::Acquire) > 0
+                && (last_seq <= self.bypass_seq.load(Ordering::Acquire)
+                    || self.bypass_bytes.fetch_sub(bytes as i64, Ordering::AcqRel) > 0)
+            {
                 return;
             }
-            let sv = self.current_sv();
-            let l0 = sv.version.l0_count();
-            if self.budget.is_exhausted() {
+            let l0 = self.l0_runs.load(Ordering::Relaxed);
+            if self.group.exhausted(&self.budget) {
+                let sv = self.current_sv();
+                let mine = sv.memtables().any(|m| !m.mem.is_empty());
                 if sv.imm.is_empty() && !sv.mem.mem.is_empty() {
                     drop(sv);
                     self.freeze_active();
                 }
-                self.schedule_flush();
+                if mine {
+                    self.schedule_flush();
+                } else {
+                    // Nothing of this store's to flush: flush whichever store sharing the
+                    // budget holds the most (RV-KV2 finding 6).
+                    self.group.flush_largest();
+                }
                 self.budget
                     .wait_below_limit(Some(Instant::now() + STALL_POLL));
                 continue;
@@ -878,24 +1173,53 @@ impl Inner {
                 let _ = self.l0_changed.wait_timeout(guard, STALL_POLL);
                 continue;
             }
-            if l0 >= self.levels.l0_slowdown_writes {
-                let rate = self.levels.delayed_write_rate.max(1);
-                let ns = (bytes as u64).saturating_mul(1_000_000_000) / rate;
-                let debt = self.slowdown_debt_ns.fetch_add(ns, Ordering::Relaxed) + ns;
-                if debt >= 1_000_000 {
-                    self.slowdown_debt_ns.store(0, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_nanos(debt));
-                }
-            }
             return;
+        }
+    }
+
+    /// See [`Store::write_delay`]. A token bucket at `delayed_write_rate`: each caller
+    /// takes its bytes' share of time after whatever earlier callers took, and waits
+    /// until then. Delays under a millisecond are not returned (the debt stays in the
+    /// bucket and a later caller pays it), so pacing costs no timer per small write.
+    fn write_delay(&self, bytes: usize) -> Duration {
+        if self.l0_runs.load(Ordering::Relaxed) < self.levels.l0_slowdown_writes {
+            return Duration::ZERO;
+        }
+        let rate = self.levels.delayed_write_rate.max(1);
+        let cost = (bytes as u64).saturating_mul(1_000_000_000) / rate;
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let mut prev = self.pace_until_ns.load(Ordering::Acquire);
+        loop {
+            let next = prev.max(now).saturating_add(cost);
+            match self.pace_until_ns.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+        let until = prev.max(now).saturating_add(cost);
+        let delay = until - now;
+        if delay < 1_000_000 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(delay)
         }
     }
 
     // ----- flush -----
 
     fn sync_journal(&self) -> Result<()> {
+        self.bypass_bytes
+            .store(self.max_group_bytes as i64, Ordering::Release);
         self.syncs_waiting.fetch_add(1, Ordering::AcqRel);
-        let result = self.journal().sync().and_then(Commit::wait);
+        let result = self.journal().sync().and_then(|commit| {
+            self.bypass_seq.fetch_max(commit.seq(), Ordering::AcqRel);
+            commit.wait()
+        });
         self.syncs_waiting.fetch_sub(1, Ordering::AcqRel);
         result.map(|_| ()).map_err(|e| self.latch_on(e))
     }
@@ -920,6 +1244,7 @@ impl Inner {
             target_file_size: target,
             bottommost,
             snapshots,
+            memory: &self.writer_memory,
         }
     }
 
@@ -979,17 +1304,15 @@ impl Inner {
         }
         let added: Vec<Arc<RunFile>> = metas
             .iter()
-            .map(|m| RunFile::new(desc_of(m, 0), self.tracker.clone()))
+            .map(|m| {
+                let run = RunFile::new(desc_of(m, 0), self.tracker.clone());
+                self.pin_l0(&run);
+                run
+            })
             .collect();
         let mut vs = lock(&self.vs);
         let flushed_seq = last_seq.max(vs.state.flushed_seq);
-        let retire = gc::retirable(
-            &self.journal().segments(),
-            flushed_seq,
-            self.journal().durable_seq(),
-            self.tracker.min_referenced_segment(),
-        );
-        let retire_ids: Vec<u64> = retire.iter().map(|s| s.segment).collect();
+        let retire_ids = self.retirable_segments(flushed_seq);
         let edit = VersionEdit {
             flushed_seq: Some(flushed_seq),
             added: added.iter().map(|r| r.desc.clone()).collect(),
@@ -999,11 +1322,14 @@ impl Inner {
         if let Err(e) = self.log_edit(&mut vs, edit) {
             drop(vs);
             drop(added);
-            self.remove_runs(ids);
+            if self.edit_failed_cleanly() {
+                self.remove_runs(ids);
+            }
             return Err(e);
         }
         let version = Arc::new(vs.current.with_changes(&[], added));
         vs.current = version.clone();
+        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
         {
             let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
             let imm_list = sv
@@ -1012,28 +1338,110 @@ impl Inner {
                 .filter(|m| !Arc::ptr_eq(m, imm))
                 .cloned()
                 .collect();
-            *sv = Arc::new(SuperVersion {
-                mem: sv.mem.clone(),
-                imm: imm_list,
-                version,
-            });
+            let mem = sv.mem.clone();
+            self.publish_sv(
+                &mut sv,
+                SuperVersion {
+                    mem,
+                    imm: imm_list,
+                    version,
+                },
+            );
         }
+        // Readers may still hold it; its charge now counts as pinned (finding 5).
+        imm.mark_flushed(self.group.pinned_counter());
         drop(vs);
         self.counters
             .flush_bytes
             .fetch_add(stats.bytes_written, Ordering::Relaxed);
-        for segment in retire_ids {
-            if let Err(e) = self.journal().retire(segment) {
-                if !matches!(e, Error::InvalidArgument(_)) {
-                    return Err(self.latch_on(e));
-                }
-                break;
-            }
-        }
-        if self.current_sv().version.l0_count() >= self.levels.l0_compaction_trigger {
+        self.retire_journal_segments(&retire_ids)?;
+        if self.current_sv().version.l0_count() >= self.levels.l0_compaction_trigger
+            || self.journal_over_budget()
+        {
             self.schedule_compaction();
         }
         Ok(())
+    }
+
+    /// Keeps an L0 run open for its life (its index and filter stay resident).
+    fn pin_l0(&self, run: &RunFile) {
+        if run.level() == 0
+            && let Ok(open) = self.table_cache.get(run.id())
+        {
+            run.pin(open);
+        }
+    }
+
+    /// The live journal segments that may retire once `flushed_seq` is recorded (plan
+    /// section 2 "Journal values"; the rule is in `gc.rs`). The caller holds `vs`.
+    fn retirable_segments(&self, flushed_seq: Seq) -> Vec<u64> {
+        let journal = self.journal();
+        // Visibility is read before the snapshot registry: a snapshot registered after
+        // the registry read re-checks visibility (see `snapshot`) and so is at or above
+        // anything this decision relies on.
+        let durable_seq = journal.durable_seq();
+        let visible_seq = journal.visible_seq();
+        let min_referenced = self.tracker.min_referenced_segment();
+        let segments = journal.segments();
+        let oldest_snapshot = self.snapshots.oldest();
+        let gc = lock(&self.gc);
+        let state = gc::RetireState {
+            flushed_seq,
+            durable_seq,
+            visible_seq,
+            min_referenced,
+            oldest_snapshot,
+            cleared: Some(&gc.cleared),
+        };
+        gc::retirable(&segments, &state)
+            .into_iter()
+            .map(|s| s.segment)
+            .collect()
+    }
+
+    /// Returns segments (already dropped from the manifest's segment set) to the
+    /// journal's free pool.
+    fn retire_journal_segments(&self, ids: &[u64]) -> Result<()> {
+        for &segment in ids {
+            match self.journal().retire(segment) {
+                Ok(()) => {}
+                // Already retired, or no longer eligible: the next pass decides again.
+                Err(Error::InvalidArgument(_)) => continue,
+                Err(e) => return Err(self.latch_on(e)),
+            }
+        }
+        if !ids.is_empty() {
+            let mut gc = lock(&self.gc);
+            for id in ids {
+                gc.cleared.remove(id);
+                gc.dense.remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retires every segment the rule allows now, with its own manifest edit.
+    fn retire_unreachable(&self) -> Result<usize> {
+        let mut vs = lock(&self.vs);
+        let ids = self.retirable_segments(vs.state.flushed_seq);
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.log_edit(
+            &mut vs,
+            VersionEdit {
+                segments: Some(self.segments_to_record(&ids)),
+                ..VersionEdit::default()
+            },
+        )?;
+        drop(vs);
+        self.retire_journal_segments(&ids)?;
+        Ok(ids.len())
+    }
+
+    /// True while the journal's live segments exceed `max_journal_bytes`.
+    fn journal_over_budget(&self) -> bool {
+        self.journal().segments().len() as u64 * self.segment_bytes > self.max_journal_bytes
     }
 
     /// The journal segments to record in the manifest: those whose first record is
@@ -1051,6 +1459,10 @@ impl Inner {
 
     /// Appends `edit` (rolling to a fresh manifest when needed) and applies it to the
     /// recorded state. The caller holds `vs`.
+    ///
+    /// A failure whose outcome is unknown (the edit may be durable, now or after a
+    /// restart) latches `RecoveryRequired`. Callers then must not delete any file the
+    /// edit names (RV-KV2 finding 2): see [`Inner::edit_failed_cleanly`].
     fn log_edit(&self, vs: &mut VersionSet, mut edit: VersionEdit) -> Result<()> {
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
@@ -1071,9 +1483,18 @@ impl Inner {
                 Ok(w) => w,
                 Err(e) => return Err(self.latch_on(e)),
             };
-            if let Err(e) = manifest::set_current(&*self.fs, &self.dir, number) {
-                let _ = self.fs.remove(writer.path());
-                return Err(self.latch_on(e));
+            match manifest::switch_current(&*self.fs, &self.dir, number) {
+                Ok(()) => {}
+                Err(AppendError::Retry(e)) => {
+                    // CURRENT still names the old manifest.
+                    let _ = self.fs.remove(writer.path());
+                    return Err(self.latch_on(e));
+                }
+                Err(AppendError::Fatal(e)) => {
+                    // CURRENT may name either manifest: keep both for the next open.
+                    self.latch();
+                    return Err(e);
+                }
             }
             self.counters.file_syncs.fetch_add(4, Ordering::Relaxed);
             if let Some(old) = vs.manifest.replace(writer) {
@@ -1092,6 +1513,14 @@ impl Inner {
         }
         vs.state = next;
         Ok(())
+    }
+
+    /// After a failed `log_edit`: true when the edit certainly did not persist, so the
+    /// files it would have added may be deleted. When the store is latched the outcome
+    /// may be unknown; the files stay and the next open's cleanup removes the ones no
+    /// manifest names.
+    fn edit_failed_cleanly(&self) -> bool {
+        !self.latched.load(Ordering::Acquire)
     }
 
     // ----- compaction -----
@@ -1131,9 +1560,8 @@ impl Inner {
     fn run_compaction(&self, pick: &compaction::Pick) -> Result<()> {
         if pick.is_trivial_move() {
             let run = &pick.inputs[0];
-            let mut desc = run.desc.clone();
-            desc.level = pick.output_level as u8;
-            let moved = RunFile::new(desc.clone(), self.tracker.clone());
+            let moved = run.moved(pick.output_level as u8);
+            let desc = moved.desc.clone();
             let mut vs = lock(&self.vs);
             self.log_edit(
                 &mut vs,
@@ -1195,7 +1623,9 @@ impl Inner {
         if let Err(e) = self.log_edit(&mut vs, edit) {
             drop(vs);
             drop(added);
-            self.remove_runs(ids);
+            if self.edit_failed_cleanly() {
+                self.remove_runs(ids);
+            }
             return Err(e);
         }
         if pick.level > 0 {
@@ -1215,12 +1645,10 @@ impl Inner {
 
     fn install_version(&self, vs: &mut VersionSet, version: Arc<Version>) {
         vs.current = version.clone();
+        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
         let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
-        *sv = Arc::new(SuperVersion {
-            mem: sv.mem.clone(),
-            imm: sv.imm.clone(),
-            version,
-        });
+        let (mem, imm) = (sv.mem.clone(), sv.imm.clone());
+        self.publish_sv(&mut sv, SuperVersion { mem, imm, version });
     }
 
     /// Deletes runs that are obsolete and no longer referenced.
@@ -1274,7 +1702,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Writes quarantines found at run time and completed releases to the manifest.
+    /// Writes quarantines found at run time whose immediate edit failed.
     fn persist_pending(&self) -> Result<()> {
         let damage: Vec<Damage> = std::mem::take(&mut *lock(&self.pending_damage));
         if !damage.is_empty() {
@@ -1290,56 +1718,38 @@ impl Inner {
                 return Err(e);
             }
         }
-        let releases: Vec<(Bytes, Seq)> = std::mem::take(&mut *lock(&self.pending_release));
-        if releases.is_empty() {
-            return Ok(());
-        }
-        let durable = self.journal().durable_seq();
-        let (ready, waiting): (Vec<_>, Vec<_>) =
-            releases.into_iter().partition(|(_, seq)| *seq <= durable);
-        lock(&self.pending_release).extend(waiting);
-        if ready.is_empty() {
-            return Ok(());
-        }
-        // The release must be flushed, so a later replay never meets the damaged
-        // records of the scope again.
-        let max_seq = ready.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        Ok(())
+    }
+
+    /// The durable part of [`Store::release_scope`]: once the release's range delete at
+    /// `seq` is durable, flush past it (so a later replay never meets the scope's
+    /// damaged records again), then record the release, drop the scope's quarantined
+    /// runs and lift its quarantine.
+    fn finish_release(&self, scope: Bytes, seq: Seq) -> Result<()> {
         let flushed = lock(&self.vs).state.flushed_seq;
-        if flushed < max_seq {
+        if flushed < seq {
             self.freeze_active();
-            if let Err(e) = self.flush_imms() {
-                lock(&self.pending_release).extend(ready);
-                return Err(e);
-            }
+            self.flush_imms()?;
         }
         let mut vs = lock(&self.vs);
-        let mut dropped = Vec::new();
-        for (scope, _) in &ready {
-            dropped.extend(
-                vs.state
-                    .quarantined_runs
-                    .iter()
-                    .filter(|(_, s)| *s == scope)
-                    .map(|(&id, _)| id),
-            );
-        }
-        if let Err(e) = self.log_edit(
+        let dropped: Vec<u64> = vs
+            .state
+            .quarantined_runs
+            .iter()
+            .filter(|(_, s)| **s == scope)
+            .map(|(&id, _)| id)
+            .collect();
+        self.log_edit(
             &mut vs,
             VersionEdit {
-                released: ready.clone(),
+                released: vec![(scope.clone(), seq)],
                 dropped_quarantined_runs: dropped.clone(),
                 ..VersionEdit::default()
             },
-        ) {
-            drop(vs);
-            lock(&self.pending_release).extend(ready);
-            return Err(e);
-        }
+        )?;
         drop(vs);
         self.remove_runs(dropped);
-        for (scope, _) in ready {
-            self.quarantine.remove(&scope);
-        }
+        self.quarantine.remove(&scope);
         Ok(())
     }
 
@@ -1356,8 +1766,12 @@ impl Inner {
         }
     }
 
-    /// Damage found at run time. A scoped one is quarantined (and persisted by the next
-    /// compaction job); a store-wide one latches `RecoveryRequired` (R5).
+    /// Damage found at run time. A scoped one is quarantined and persisted right away
+    /// with its own manifest edit, before the caller sees the error, so a crash cannot
+    /// forget it; if that edit fails (`NoSpace`), the background job retries it. A
+    /// store-wide one latches `RecoveryRequired` (R5).
+    ///
+    /// Must not be called with `vs` held.
     pub(crate) fn report_damage(&self, damage: Damage) {
         if damage.scope.is_empty() {
             self.latch();
@@ -1365,10 +1779,30 @@ impl Inner {
             return;
         }
         if self.quarantine.add(damage.clone()) {
-            lock(&self.pending_damage).push(damage.clone());
-            self.schedule_compaction();
+            let persisted = {
+                let mut vs = lock(&self.vs);
+                self.log_edit(
+                    &mut vs,
+                    VersionEdit {
+                        quarantined: vec![damage.clone()],
+                        ..VersionEdit::default()
+                    },
+                )
+            };
+            if persisted.is_err() {
+                lock(&self.pending_damage).push(damage.clone());
+                self.schedule_compaction();
+            }
             self.notify(damage);
         }
+    }
+
+    /// A read met a locator into a segment the journal recycled. Journal GC retires a
+    /// segment only once no reader can reach its locators, so this is an invariant
+    /// violation, not media damage: count it and latch `RecoveryRequired`.
+    pub(crate) fn recycled_value(&self) {
+        self.counters.recycled_reads.fetch_add(1, Ordering::Relaxed);
+        self.latch();
     }
 
     /// The scope `key` belongs to (empty for store-wide keys).
@@ -1379,14 +1813,32 @@ impl Inner {
 
     // ----- reads -----
 
+    /// Takes a snapshot without a store-wide lock (NS5b item 5).
+    ///
+    /// The snapshot list must know every snapshot that a compaction (or a GC decision)
+    /// could hurt. The fast path reads `visible_seq` as `s`, registers `s` in this
+    /// thread's registry shard, loads the super-version and reads `visible_seq` again. If
+    /// it is still `s`, the snapshot is safe: a compaction that read the registry before
+    /// the registration picked its inputs earlier, when every version in them was at or
+    /// below the visible sequence of that time, which is at most the second read, so
+    /// `s`; such a compaction cannot hold a version above `s` and cannot drop one `s`
+    /// needs. (The registry shard's mutex orders the compaction's read before the
+    /// registration, and the registration before the second read.) Otherwise it retries,
+    /// and after a few tries takes `snapshot_lock`, which readers of the list also hold.
     fn snapshot(self: &Arc<Self>) -> Snapshot {
-        let (seq, handle, sv) = {
-            let _guard = lock(&self.snapshot_lock);
-            let seq = self.journal().visible_seq();
+        let journal = self.journal();
+        for _ in 0..4 {
+            let seq = journal.visible_seq();
             let handle = self.snapshots.register(seq);
-            (seq, handle, self.current_sv())
-        };
-        Snapshot::new(self.clone(), seq, handle, sv)
+            let sv = self.current_sv();
+            if journal.visible_seq() == seq {
+                return Snapshot::new(self.clone(), seq, handle, sv);
+            }
+        }
+        let _guard = lock(&self.snapshot_lock);
+        let seq = journal.visible_seq();
+        let handle = self.snapshots.register(seq);
+        Snapshot::new(self.clone(), seq, handle, self.current_sv())
     }
 
     fn stats(&self) -> StoreStats {
@@ -1402,7 +1854,7 @@ impl Inner {
             journal_bytes: journal.journal_bytes,
             flush_bytes: self.counters.flush_bytes.load(Ordering::Relaxed),
             compaction_bytes: self.counters.compaction_bytes.load(Ordering::Relaxed),
-            relocated_bytes: 0,
+            relocated_bytes: self.counters.relocated_bytes.load(Ordering::Relaxed),
             stall_ms: journal.stall_ms,
             memtable_bytes: sv
                 .memtables()
@@ -1415,6 +1867,26 @@ impl Inner {
                 + self.counters.open_corruptions.load(Ordering::Relaxed),
             tail_truncations: journal.tail_truncations,
             quarantined_scopes: self.quarantine.len() as u32,
+            journal_behind_manifest: self.counters.journal_behind.load(Ordering::Relaxed),
+            recycled_value_reads: self.counters.recycled_reads.load(Ordering::Relaxed),
+            overhead_bytes: self.memory_usage().overhead(),
+        }
+    }
+
+    fn memory_usage(&self) -> MemoryUsage {
+        let sv = self.current_sv();
+        let runs = sv.version.runs().count() as u64;
+        MemoryUsage {
+            memtables: sv
+                .memtables()
+                .map(|m| m.mem.approximate_memory() as u64)
+                .sum(),
+            run_writers: self.writer_memory.load(Ordering::Relaxed) as u64,
+            range_tombstones: self.tracker.tombstone_bytes() as u64,
+            versions: runs * 200,
+            snapshots: self.snapshots.sequences().len() as u64 * 64,
+            cache_pinned: self.cache.reserved_bytes() as u64,
+            memtables_pinned: self.group.pinned_bytes() as u64,
         }
     }
 }

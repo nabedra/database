@@ -16,6 +16,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -37,6 +38,45 @@ pub(crate) struct OutputSpec<'a> {
     pub bottommost: bool,
     /// Live snapshot sequences, ascending.
     pub snapshots: &'a [Seq],
+    /// Gauge of run-writer memory (plan section 5 "Memory": pool overhead).
+    pub memory: &'a AtomicUsize,
+}
+
+/// Charges the open run writer's memory to a gauge until dropped.
+struct WriterCharge<'a> {
+    gauge: &'a AtomicUsize,
+    charged: usize,
+}
+
+impl WriterCharge<'_> {
+    fn set(&mut self, bytes: usize) {
+        if bytes > self.charged {
+            self.gauge
+                .fetch_add(bytes - self.charged, Ordering::Relaxed);
+        } else {
+            self.gauge
+                .fetch_sub(self.charged - bytes, Ordering::Relaxed);
+        }
+        self.charged = bytes;
+    }
+}
+
+impl Drop for WriterCharge<'_> {
+    fn drop(&mut self) {
+        self.gauge.fetch_sub(self.charged, Ordering::Relaxed);
+    }
+}
+
+/// What an open run writer holds: its write buffer and data block, about 8 bytes per
+/// entry for the bloom filter's key hashes, and one index entry (a key and a handle) per
+/// data block.
+fn writer_memory(writer: &RunWriter, options: &RunWriterOptions, key_len: usize) -> usize {
+    let block = options.block_size.max(1);
+    let blocks = writer.estimated_size() as usize / block + 1;
+    options.write_buffer_bytes.min(1 << 20)
+        + 2 * block
+        + writer.num_entries() as usize * 8
+        + blocks * (key_len + 24)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -148,6 +188,10 @@ fn write_outputs_inner(
     let mut outputs = Vec::new();
     let mut out: Option<Out> = None;
     let mut last_user: Vec<u8> = Vec::new();
+    let mut charge = WriterCharge {
+        gauge: spec.memory,
+        charged: 0,
+    };
 
     let open = |lo: Option<Bytes>, created: &mut Vec<u64>, next_id: &mut dyn FnMut() -> u64| {
         let id = next_id();
@@ -187,6 +231,9 @@ fn write_outputs_inner(
             let o = out.as_mut().expect("opened");
             o.writer.add(key, &input.value())?;
             stats.output_entries += 1;
+            if stats.output_entries % 256 == 1 {
+                charge.set(writer_memory(&o.writer, &spec.writer, key.len()));
+            }
             if new_user_key {
                 last_user.clear();
                 last_user.extend_from_slice(parsed.user_key);

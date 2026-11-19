@@ -15,15 +15,17 @@ use bytes::Bytes;
 use crate::error::{Damage, DamageReason, Error, FileId, Result};
 use crate::iter::range_del::{FragmentedRangeTombstones, RangeDelAggregator};
 use crate::iter::{DbIter, MergingIterator, ValueResolver};
-use crate::journal::Journal;
-use crate::memtable::{Lookup as MemLookup, SnapshotHandle};
+use crate::journal::{Journal, VALUE_RECYCLED};
+use crate::memtable::Lookup as MemLookup;
 use crate::quarantine::{quarantined_error, single_scope};
 use crate::run::{Lookup as RunLookup, Run};
 use crate::source::InternalIterator;
-use crate::types::{Kind, Locator, MAX_SEQ, Seq};
+use crate::types::{Kind, Locator, Seq};
 use crate::version::{RunFile, SuperVersion};
 
 use super::Inner;
+use super::level_iter::LevelIter;
+use super::snapshots::Registered;
 
 /// A consistent read view. Cheap to clone; a clone registers the sequence again.
 #[derive(Clone)]
@@ -31,7 +33,7 @@ pub struct Snapshot {
     inner: Arc<Inner>,
     seq: Seq,
     sv: Arc<SuperVersion>,
-    _handle: Arc<SnapshotHandle>,
+    _handle: Arc<Registered>,
 }
 
 impl std::fmt::Debug for Snapshot {
@@ -73,19 +75,99 @@ impl InternalIterator for FailedIter {
 }
 
 fn run_tombstones(file: &RunFile, run: &Run) -> Arc<FragmentedRangeTombstones> {
-    file.tombstones(|| {
-        Arc::new(FragmentedRangeTombstones::new(
-            run.range_tombstones(),
-            MAX_SEQ,
-        ))
-    })
+    file.tombstones(run)
+}
+
+/// The newest point version of `key` visible at `seq` in `sv`: `(kind, stored value)`,
+/// with range tombstones of every source applied. Run damage is reported (G2) when
+/// `report` is set; journal GC's relocation check passes false and treats any error as
+/// "the key no longer holds the old locator".
+pub(super) fn newest(
+    inner: &Inner,
+    sv: &SuperVersion,
+    key: &[u8],
+    seq: Seq,
+    report: bool,
+) -> Result<Option<(Kind, Bytes)>> {
+    for mem in sv.memtables() {
+        // A memtable applies its own range tombstones, and every older source holds
+        // only older versions, so a hit or a tombstone here is final.
+        match mem.mem.get(key, seq) {
+            MemLookup::Found(kind, value, _) => return Ok(Some((kind, value))),
+            MemLookup::Deleted(_) => return Ok(None),
+            MemLookup::NotFound => {}
+        }
+    }
+    let damage = |e: Error| {
+        if report { run_damage(inner, e, key) } else { e }
+    };
+    let version = &sv.version;
+    let mut tombstone: Option<Seq> = None;
+    let deeper = version.levels[1..]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, _)| version.find_in_level(i + 1, key));
+    for file in version.levels[0]
+        .iter()
+        .filter(|r| r.contains(key))
+        .chain(deeper)
+    {
+        let run = match file.pinned() {
+            Some(run) => run.clone(),
+            None => inner.table_cache.get(file.id()).map_err(damage)?,
+        };
+        let covering = if run.meta().num_range_tombstones == 0 {
+            None
+        } else {
+            run_tombstones(file, &run).max_covering_seq(key, seq)
+        };
+        if let Some(t) = covering {
+            tombstone = Some(tombstone.map_or(t, |old| old.max(t)));
+        }
+        match run.get(key, seq, true).map_err(damage)? {
+            RunLookup::Found {
+                kind,
+                value,
+                seq: at,
+            } => {
+                return Ok(if tombstone.is_some_and(|t| t > at) {
+                    None
+                } else {
+                    Some((kind, value))
+                });
+            }
+            RunLookup::Deleted { .. } => return Ok(None),
+            RunLookup::NotFound => {}
+        }
+    }
+    Ok(None)
+}
+
+/// G2 at read time: the key's scope is quarantined (store-wide latches).
+fn run_damage(inner: &Inner, error: Error, key: &[u8]) -> Error {
+    let file = match &error {
+        Error::Corruption { file, .. } => *file,
+        Error::Io(std::io::ErrorKind::NotFound) => FileId::Other,
+        _ => return error,
+    };
+    let file = match file {
+        FileId::Run { .. } => file,
+        _ => return error,
+    };
+    inner.report_damage(Damage {
+        scope: inner.scope_bytes(key),
+        reason: DamageReason::RunBlock,
+        file,
+        first_bad_seq: None,
+    });
+    error
 }
 
 impl Snapshot {
     pub(super) fn new(
         inner: Arc<Inner>,
         seq: Seq,
-        handle: SnapshotHandle,
+        handle: Registered,
         sv: Arc<SuperVersion>,
     ) -> Snapshot {
         Snapshot {
@@ -98,6 +180,10 @@ impl Snapshot {
 
     pub fn seq(&self) -> Seq {
         self.seq
+    }
+
+    pub(super) fn super_version(&self) -> &Arc<SuperVersion> {
+        &self.sv
     }
 
     /// The value of `key` at this snapshot.
@@ -113,83 +199,7 @@ impl Snapshot {
 
     /// The newest visible point version: `(kind, stored value)`.
     fn find(&self, key: &[u8]) -> Result<Option<(Kind, Bytes)>> {
-        let seq = self.seq;
-        for mem in self.sv.memtables() {
-            // A memtable applies its own range tombstones, and every older source holds
-            // only older versions, so a hit or a tombstone here is final.
-            match mem.mem.get(key, seq) {
-                MemLookup::Found(kind, value, _) => return Ok(Some((kind, value))),
-                MemLookup::Deleted(_) => return Ok(None),
-                MemLookup::NotFound => {}
-            }
-        }
-        let version = &self.sv.version;
-        let mut tombstone: Option<Seq> = None;
-        let deeper = version.levels[1..]
-            .iter()
-            .enumerate()
-            .filter_map(|(i, _)| version.find_in_level(i + 1, key));
-        for file in version.levels[0]
-            .iter()
-            .filter(|r| r.contains(key))
-            .chain(deeper)
-        {
-            let run = self.open_run(file, key)?;
-            let covering = if run.meta().num_range_tombstones == 0 {
-                None
-            } else {
-                run_tombstones(file, &run).max_covering_seq(key, seq)
-            };
-            if let Some(t) = covering {
-                tombstone = Some(tombstone.map_or(t, |old| old.max(t)));
-            }
-            let lookup = run
-                .get(key, seq, true)
-                .map_err(|e| self.run_damage(e, key))?;
-            match lookup {
-                RunLookup::Found {
-                    kind,
-                    value,
-                    seq: at,
-                } => {
-                    return Ok(if tombstone.is_some_and(|t| t > at) {
-                        None
-                    } else {
-                        Some((kind, value))
-                    });
-                }
-                RunLookup::Deleted { .. } => return Ok(None),
-                RunLookup::NotFound => {}
-            }
-        }
-        Ok(None)
-    }
-
-    fn open_run(&self, file: &RunFile, key: &[u8]) -> Result<Arc<Run>> {
-        self.inner
-            .table_cache
-            .get(file.id())
-            .map_err(|e| self.run_damage(e, key))
-    }
-
-    /// G2 at read time: the key's scope is quarantined (store-wide latches).
-    fn run_damage(&self, error: Error, key: &[u8]) -> Error {
-        let file = match &error {
-            Error::Corruption { file, .. } => *file,
-            Error::Io(std::io::ErrorKind::NotFound) => FileId::Other,
-            _ => return error,
-        };
-        let file = match file {
-            FileId::Run { .. } => file,
-            _ => return error,
-        };
-        self.inner.report_damage(Damage {
-            scope: self.inner.scope_bytes(key),
-            reason: DamageReason::RunBlock,
-            file,
-            first_bad_seq: None,
-        });
-        error
+        newest(&self.inner, &self.sv, key, self.seq, true)
     }
 
     fn resolve(&self, key: &[u8], stored: &Bytes) -> Result<Bytes> {
@@ -224,8 +234,16 @@ impl Snapshot {
             Bound::Included(k) | Bound::Excluded(k) => Some(k),
             Bound::Unbounded => None,
         };
-        for file in self.sv.version.runs().filter(|r| r.overlaps(lo, hi)) {
-            match self.inner.table_cache.get(file.id()) {
+        // L0 runs overlap each other: one child each (they are pinned open anyway).
+        for file in self.sv.version.levels[0]
+            .iter()
+            .filter(|r| r.overlaps(lo, hi))
+        {
+            let run = match file.pinned() {
+                Some(run) => Ok(run.clone()),
+                None => self.inner.table_cache.get(file.id()),
+            };
+            match run {
                 Ok(run) => {
                     if run.meta().num_range_tombstones > 0 {
                         tombstones.add(run_tombstones(file, &run));
@@ -233,6 +251,43 @@ impl Snapshot {
                     children.push(Box::new(run.iter(fill_cache)));
                 }
                 Err(e) => children.push(Box::new(FailedIter(e))),
+            }
+        }
+        // Deeper levels: one lazy child per level, which opens one run at a time. Range
+        // tombstones are gathered up front from each run's cached set (a run whose set is
+        // not cached yet is opened once through the table cache, and not held).
+        for level in &self.sv.version.levels[1..] {
+            let runs: Vec<Arc<RunFile>> = level
+                .iter()
+                .filter(|r| r.overlaps(lo, hi))
+                .cloned()
+                .collect();
+            if runs.is_empty() {
+                continue;
+            }
+            let mut failed = None;
+            for file in &runs {
+                let set = match file.cached_tombstones() {
+                    Some(set) => set,
+                    None => match self.inner.table_cache.get(file.id()) {
+                        Ok(run) => run_tombstones(file, &run),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    },
+                };
+                if !set.is_empty() {
+                    tombstones.add(set);
+                }
+            }
+            match failed {
+                Some(e) => children.push(Box::new(FailedIter(e))),
+                None => children.push(Box::new(LevelIter::new(
+                    self.inner.clone(),
+                    runs,
+                    fill_cache,
+                ))),
             }
         }
         let resolver: Arc<dyn ValueResolver> =
@@ -262,14 +317,21 @@ impl Snapshot {
     }
 }
 
-/// G3: a journal value failed its check. Its key's scope is quarantined (store-wide
-/// latches, R5).
+/// G3: a journal value failed its check (`VALUE_OUT_OF_RANGE`, `VALUE_CHECKSUM`). Its
+/// key's scope is quarantined (store-wide latches, R5). `VALUE_RECYCLED` is a journal GC
+/// invariant violation instead: it latches and is counted, and quarantines nothing.
 fn value_damage(inner: &Inner, error: Error, key: &[u8]) -> Error {
     if let Error::Corruption {
         file: file @ FileId::JournalValue { .. },
+        what,
         ..
     } = error
     {
+        if what == VALUE_RECYCLED {
+            // Not media damage: GC retired a segment a reader could still reach.
+            inner.recycled_value();
+            return error;
+        }
         inner.report_damage(Damage {
             scope: inner.scope_bytes(key),
             reason: DamageReason::JournalValue,
