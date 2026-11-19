@@ -1020,23 +1020,47 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
             }
         );
     };
+    assert_eq!(tables.max_open_runs(), DEFAULT_MAX_OPEN_RUNS);
     for id in 0..total {
         read(id);
         assert!(tables.open_runs() <= DEFAULT_MAX_OPEN_RUNS);
         assert!(fs.0.live_handles.load(AtomicOrdering::SeqCst) <= DEFAULT_MAX_OPEN_RUNS);
     }
-    assert_eq!(tables.open_runs(), DEFAULT_MAX_OPEN_RUNS);
+    // Sharded by id: each shard holds its share, so up to 128 runs stay open.
+    assert!(tables.open_runs() > DEFAULT_MAX_OPEN_RUNS / 2);
     assert_eq!(tables.opens(), total);
-    // Runs 72..200 are open, 72 the least recently used.
+    // The most recently read run of each shard is open: reading it again opens nothing.
     read(199);
-    read(72);
     assert_eq!(tables.opens(), total);
-    read(0); // evicts 73, the least recently used now
-    assert_eq!(tables.opens(), total + 1);
-    read(72);
-    assert_eq!(tables.opens(), total + 1);
-    read(73);
-    assert_eq!(tables.opens(), total + 2);
+    // Every run still reads correctly, reopened where it was evicted.
+    for id in 0..total {
+        read(id);
+    }
+    assert!(tables.opens() > total);
+
+    // With a small limit there is one shard and one exact LRU.
+    let small = TableCache::new(
+        fs.arc(),
+        &dir(),
+        RunReadContext::new(Arc::new(BlockCache::new(1 << 20))),
+        8,
+    );
+    for id in 0..20 {
+        small.get(id).unwrap();
+    }
+    assert_eq!(small.open_runs(), 8);
+    let opens = small.opens();
+    // Runs 12..20 are open, 12 the least recently used.
+    small.get(19).unwrap();
+    small.get(12).unwrap();
+    assert_eq!(small.opens(), opens);
+    small.get(0).unwrap(); // evicts 13, the least recently used now
+    assert_eq!(small.opens(), opens + 1);
+    small.get(12).unwrap();
+    assert_eq!(small.opens(), opens + 1);
+    small.get(13).unwrap();
+    assert_eq!(small.opens(), opens + 2);
+    drop(small);
 
     // An iterator keeps an evicted run usable.
     let held = tables.get(150).unwrap();
@@ -1052,10 +1076,7 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
         fs.0.live_handles.load(AtomicOrdering::SeqCst),
         tables.open_runs()
     );
-    assert_eq!(
-        fs.0.opens.load(AtomicOrdering::SeqCst) - base_opens,
-        tables.opens()
-    );
+    assert!(fs.0.opens.load(AtomicOrdering::SeqCst) - base_opens >= tables.opens());
     assert!(
         tables.get(total + 5).is_err(),
         "a missing run is an I/O error"
