@@ -26,13 +26,15 @@ use crate::{
 };
 use std::{
     ops::Bound::{Excluded, Included},
-    sync::Mutex,
+    sync::{Mutex, Weak},
 };
 
 // Includes fixed state, ordered-map nodes and ownership metadata.
 const ENTRY_BYTES: usize = 2048;
 const TERMINAL_BYTES: usize = 512;
 const STORE_BYTES: usize = 1024;
+// Covers the shared registration and its ordered-map entry.
+const INSERT_REGISTRATION_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1017,6 +1019,41 @@ impl ScopedTransferBatch {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScopedWriteRevision {
+    epoch: u64,
+    expiry: u64,
+}
+
+type ScopedInsertKey = (Uuid, Uuid, Uuid);
+type ScopedInsertMap = Mutex<BTreeMap<ScopedInsertKey, Weak<ScopedInsertRegistration>>>;
+
+// The last copy task drops its registration, including on cancellation.
+pub(crate) struct ScopedQueueInsert {
+    registration: Arc<ScopedInsertRegistration>,
+    epoch_revision: u64,
+}
+
+struct ScopedInsertRegistration {
+    key: ScopedInsertKey,
+    active: Weak<ScopedInsertMap>,
+    _charge: ScratchLease,
+}
+
+impl Drop for ScopedInsertRegistration {
+    fn drop(&mut self) {
+        // Expiry can remove this entry and a new copy can register the same key.
+        if let Some(active) = self.active.upgrade()
+            && let Ok(mut active) = active.lock()
+            && active
+                .get(&self.key)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+        {
+            active.remove(&self.key);
+        }
+    }
+}
+
 pub(crate) struct ScopedQueueStore {
     shared: Arc<WorkerSharedResources>,
     scope: QueueScope,
@@ -1024,7 +1061,8 @@ pub(crate) struct ScopedQueueStore {
     limits: QueueLimits,
     usage: Arc<Mutex<Usage>>,
     pending: usize,
-    write_revisions: [u64; 32],
+    write_revisions: [ScopedWriteRevision; 32],
+    active_inserts: Arc<ScopedInsertMap>,
     records: BTreeMap<(Uuid, Digest, Uuid), ScopedSurvivor>,
     frozen: BTreeMap<Uuid, (ScopedLocalEpoch, ScratchLease)>,
     transfers: BTreeMap<Uuid, ScopedTransferProgress>,
@@ -1063,7 +1101,8 @@ impl ScopedQueueStore {
                 admissions: 0,
             })),
             pending: 0,
-            write_revisions: [0; 32],
+            write_revisions: [ScopedWriteRevision::default(); 32],
+            active_inserts: Arc::default(),
             records: BTreeMap::new(),
             frozen: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -1231,9 +1270,16 @@ impl ScopedQueueStore {
         sender: WorkerIdentity,
         payload: PreparedScopedPayload,
         mut admission: Option<ScopedAdmissionPermit>,
+        insert: ScopedQueueInsert,
     ) -> Result<ScopedCopyAck, QueueError> {
         let stamp = payload.stamp;
         self.authorize(current, sender, stamp)?;
+        self.require_insert(
+            &insert,
+            current.group.group_id,
+            stamp.request.run_id,
+            stamp.request.request_id,
+        )?;
         let key = (
             current.group.group_id,
             stamp.placement,
@@ -1607,7 +1653,11 @@ impl ScopedQueueStore {
             placement_digest(placement)?,
             expected.request.request_id,
         );
-        self.fence_inflight_inserts(placement.group.group_id)?;
+        self.fence_expired_request(
+            placement.group.group_id,
+            expected.request.run_id,
+            expected.request.request_id,
+        )?;
         self.records.remove(&key);
         Ok(true)
     }
@@ -1872,10 +1922,17 @@ impl ScopedQueueStore {
         current: &ScopedQueuePlacement,
         witness: ScopedCopyAck,
         prepared: PreparedScopedTransfer,
+        insert: ScopedQueueInsert,
     ) -> Result<ScopedCopyAck, QueueError> {
         let payload = prepared.entry.payload;
         let stamp = prepared.entry.terminal.ok_or(QueueError::Invalid)?;
         self.authorize(current, witness.worker, stamp)?;
+        self.require_insert(
+            &insert,
+            current.group.group_id,
+            stamp.request.run_id,
+            stamp.request.request_id,
+        )?;
         if witness.stamp != stamp || self.local == witness.worker {
             return Err(QueueError::Conflict);
         }
@@ -1916,14 +1973,89 @@ impl ScopedQueueStore {
         Ok(self.ack(stamp))
     }
 
-    pub(crate) fn write_revision(&self, group: Uuid) -> u64 {
+    pub(crate) fn begin_insert(
+        &self,
+        group: Uuid,
+        run: Uuid,
+        request: Uuid,
+    ) -> Result<ScopedQueueInsert, QueueError> {
+        let key = (group, run, request);
+        let mut active = self
+            .active_inserts
+            .lock()
+            .map_err(|_| QueueError::Unavailable)?;
+        let registration = if let Some(registration) = active.get(&key).and_then(Weak::upgrade) {
+            registration
+        } else {
+            let charge = self
+                .shared
+                .reserve_scratch(ByteClass::Data, INSERT_REGISTRATION_BYTES)
+                .map_err(|_| QueueError::Overloaded)?;
+            let registration = Arc::new(ScopedInsertRegistration {
+                key,
+                active: Arc::downgrade(&self.active_inserts),
+                _charge: charge,
+            });
+            active.insert(key, Arc::downgrade(&registration));
+            registration
+        };
+        Ok(ScopedQueueInsert {
+            registration,
+            epoch_revision: self.write_revision(group).epoch,
+        })
+    }
+
+    fn require_insert(
+        &self,
+        insert: &ScopedQueueInsert,
+        group: Uuid,
+        run: Uuid,
+        request: Uuid,
+    ) -> Result<(), QueueError> {
+        let key = (group, run, request);
+        if insert.registration.key != key
+            || insert.epoch_revision != self.write_revision(group).epoch
+        {
+            return Err(QueueError::Stale);
+        }
+        let active = self
+            .active_inserts
+            .lock()
+            .map_err(|_| QueueError::Unavailable)?;
+        if active
+            .get(&key)
+            .is_none_or(|entry| entry.as_ptr() != Arc::as_ptr(&insert.registration))
+        {
+            return Err(QueueError::Stale);
+        }
+        Ok(())
+    }
+
+    fn fence_expired_request(
+        &mut self,
+        group: Uuid,
+        run: Uuid,
+        request: Uuid,
+    ) -> Result<(), QueueError> {
+        // Transfer inventory checks still observe every removal in the group.
+        let revision = &mut self.write_revisions[Self::write_slot(group)].expiry;
+        let next = revision.checked_add(1).ok_or(QueueError::Unavailable)?;
+        self.active_inserts
+            .lock()
+            .map_err(|_| QueueError::Unavailable)?
+            .remove(&(group, run, request));
+        *revision = next;
+        Ok(())
+    }
+
+    pub(crate) fn write_revision(&self, group: Uuid) -> ScopedWriteRevision {
         self.write_revisions[Self::write_slot(group)]
     }
 
     pub(crate) fn require_write_revision(
         &self,
         group: Uuid,
-        revision: u64,
+        revision: ScopedWriteRevision,
     ) -> Result<(), QueueError> {
         if self.write_revision(group) != revision {
             return Err(QueueError::Stale);
@@ -1931,10 +2063,8 @@ impl ScopedQueueStore {
         Ok(())
     }
 
-    // Fixed-size local fences keep delayed installs from resurrecting removed
-    // state without keeping tombstones for every expired identity.
-    fn fence_inflight_inserts(&mut self, group: Uuid) -> Result<(), QueueError> {
-        let slot = &mut self.write_revisions[Self::write_slot(group)];
+    fn fence_epoch_writes(&mut self, group: Uuid) -> Result<(), QueueError> {
+        let slot = &mut self.write_revisions[Self::write_slot(group)].epoch;
         *slot = slot.checked_add(1).ok_or(QueueError::Unavailable)?;
         Ok(())
     }
@@ -1989,7 +2119,7 @@ impl ScopedQueueStore {
             .get(&group)
             .is_some_and(|progress| progress.epoch == epoch)
         {
-            self.fence_inflight_inserts(group)?;
+            self.fence_epoch_writes(group)?;
             self.transfers.remove(&group);
         }
         if self
@@ -2004,7 +2134,7 @@ impl ScopedQueueStore {
         {
             return Ok(());
         }
-        self.fence_inflight_inserts(group)?;
+        self.fence_epoch_writes(group)?;
         for _ in 0..RECORDS_PER_PASS {
             let Some(key) = self
                 .records
@@ -2044,4 +2174,90 @@ fn scoped_range(
         Excluded((group, digest, Uuid::nil())),
         Included((group, digest, Uuid::from_u128(u128::MAX))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::WorkerResources, oltp::pool::SharedResourceConfig};
+
+    #[test]
+    fn q03_q06_scoped_expiry_only_fences_inserts_for_its_request() {
+        let shared = WorkerSharedResources::new(
+            81,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let mut store = ScopedQueueStore::new(
+            shared.clone(),
+            QueueScope {
+                cluster_id: Uuid::new_v4(),
+                database: Text::try_from("default").unwrap(),
+            },
+            WorkerIdentity {
+                worker_id: Uuid::new_v4(),
+                incarnation: Uuid::new_v4(),
+                certificate_sha256: Digest::from_bytes([1; 32]),
+                enrollment_revision: 1,
+            },
+            QueueLimits {
+                max_pending_requests: 20,
+                max_queue_bytes_per_replica: 4 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                result_retention_ms: 100,
+            },
+        )
+        .unwrap();
+        let group = Uuid::new_v4();
+        let run = Uuid::new_v4();
+        let expired = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        let old_payload = store.begin_insert(group, run, expired).unwrap();
+        let old_repair = store.begin_insert(group, run, expired).unwrap();
+        let new_payload = store.begin_insert(group, run, unrelated).unwrap();
+        let transfer = store.write_revision(group);
+        assert_eq!(shared.working_decode_bytes(), 2 * INSERT_REGISTRATION_BYTES);
+
+        store.fence_expired_request(group, run, expired).unwrap();
+        assert_eq!(
+            store.require_insert(&old_payload, group, run, expired),
+            Err(QueueError::Stale)
+        );
+        assert_eq!(
+            store.require_insert(&old_repair, group, run, expired),
+            Err(QueueError::Stale)
+        );
+        assert_eq!(
+            store.require_insert(&new_payload, group, run, unrelated),
+            Ok(())
+        );
+        assert_eq!(
+            store.require_write_revision(group, transfer),
+            Err(QueueError::Stale)
+        );
+
+        // Later copies independently recheck Timestamp or the owner's witness.
+        // Dropping earlier copies cannot remove the later registration.
+        let later_copy = store.begin_insert(group, run, expired).unwrap();
+        drop((old_payload, old_repair));
+        assert_eq!(
+            store.require_insert(&later_copy, group, run, expired),
+            Ok(())
+        );
+        assert_eq!(shared.working_decode_bytes(), 2 * INSERT_REGISTRATION_BYTES);
+
+        store.fence_epoch_writes(group).unwrap();
+        assert_eq!(
+            store.require_insert(&new_payload, group, run, unrelated),
+            Err(QueueError::Stale)
+        );
+        assert_eq!(
+            store.require_insert(&later_copy, group, run, expired),
+            Err(QueueError::Stale)
+        );
+        drop((new_payload, later_copy));
+        assert!(store.active_inserts.lock().unwrap().is_empty());
+        assert_eq!(shared.working_decode_bytes(), 0);
+    }
 }

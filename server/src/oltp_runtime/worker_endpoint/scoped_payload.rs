@@ -436,15 +436,22 @@ impl QueueEndpoint {
         admission: Option<ScopedAdmissionPermit>,
     ) -> Result<ScopedCopyQuorum, ProtocolError> {
         timeout_at(deadline, async {
-            let revision =
-                self.with_scoped_store(|store| Ok(store.write_revision(current.group.group_id)))?;
+            let record = frame.decode_header().map_err(QueueError::protocol)?;
+            let insert = self.with_scoped_store(|store| {
+                store.begin_insert(
+                    current.group.group_id,
+                    record.ready.view.run_id,
+                    record.request_id,
+                )
+            })?;
             self.require_scoped_owner(current).await?;
-            let prepared = self.prepare_scoped_payload(current, frame.clone()).await?;
+            let prepared = self
+                .prepare_scoped_payload(current, &record, frame.clone())
+                .await?;
             let stamp = prepared.stamp();
             self.require_scoped_owner(current).await?;
             let local = self.with_scoped_store(|store| {
-                store.require_write_revision(current.group.group_id, revision)?;
-                store.install_payload(current, self.local, prepared, admission)
+                store.install_payload(current, self.local, prepared, admission, insert)
             })?;
             let mut copies = FuturesUnordered::new();
             for target in current
@@ -1106,7 +1113,9 @@ impl QueueEndpoint {
     ) -> Result<ChargedReply, ProtocolError> {
         #[cfg(test)]
         super::super::recovery_tests::pause("before-scoped-payload-copy", record.request_id).await;
-        let revision = self.with_scoped_store(|store| Ok(store.write_revision(scope[0])))?;
+        let insert = self.with_scoped_store(|store| {
+            store.begin_insert(scope[0], record.ready.view.run_id, record.request_id)
+        })?;
         let placement = self
             .scoped_payload_placement(session, scope, record)
             .await?;
@@ -1114,7 +1123,9 @@ impl QueueEndpoint {
             header: self.shared.encode(record, MAX_RECORD_HEADER_BYTES)?,
             sections: std::array::from_fn(|index| sections.section(index).cloned()),
         };
-        let prepared = self.prepare_scoped_payload(&placement, frame).await?;
+        let prepared = self
+            .prepare_scoped_payload(&placement, record, frame)
+            .await?;
         let current = self
             .scoped_payload_placement(session, scope, record)
             .await?;
@@ -1122,8 +1133,7 @@ impl QueueEndpoint {
             return Err(QueueError::Stale.protocol());
         }
         let ack = self.with_scoped_store(|store| {
-            store.require_write_revision(scope[0], revision)?;
-            store.install_payload(&current, session.remote(), prepared, None)
+            store.install_payload(&current, session.remote(), prepared, None, insert)
         })?;
         self.scoped_copy_reply(session, ack)
     }
@@ -1131,10 +1141,10 @@ impl QueueEndpoint {
     async fn prepare_scoped_payload(
         &self,
         placement: &ScopedQueuePlacement,
+        record: &RecordHeader,
         frame: RecordFrame,
     ) -> Result<PreparedScopedPayload, ProtocolError> {
-        let record = frame.decode_header().map_err(QueueError::protocol)?;
-        validate_scoped_payload_header(placement, &record).map_err(QueueError::protocol)?;
+        validate_scoped_payload_header(placement, record).map_err(QueueError::protocol)?;
         let raw = frame.clone();
         let task_limit = self.task_memory_bytes;
         let shared = self.shared.clone();
@@ -1152,7 +1162,7 @@ impl QueueEndpoint {
             return Err(QueueError::Conflict.protocol());
         }
         let readers = self.scoped_payload.get().ok_or_else(unavailable)?;
-        let reservation = self.scoped_payload_reservation(placement, &record).await?;
+        let reservation = self.scoped_payload_reservation(placement, record).await?;
         readers
             .timestamps
             .verify_scoped_snapshot(
@@ -1189,7 +1199,7 @@ impl QueueEndpoint {
                 },
             )
             .await?;
-        if self.scoped_payload_reservation(placement, &record).await? != reservation {
+        if self.scoped_payload_reservation(placement, record).await? != reservation {
             return Err(QueueError::Stale.protocol());
         }
         Ok(prepared)
@@ -1315,8 +1325,10 @@ impl QueueEndpoint {
         #[cfg(test)]
         super::super::recovery_tests::pause("before-scoped-terminal-copy", record.request_id())
             .await;
-        let revision = self.with_scoped_store(|store| Ok(store.write_revision(scope[0])))?;
         let view = record.payload_header().ready.view;
+        let insert = self.with_scoped_store(|store| {
+            store.begin_insert(scope[0], view.run_id, record.request_id())
+        })?;
         let current = self
             .scoped_payload_placement(session, scope, record.payload_header())
             .await?;
@@ -1347,8 +1359,7 @@ impl QueueEndpoint {
             return Err(QueueError::Stale.protocol());
         }
         let ack = self.with_scoped_store(|store| {
-            store.require_write_revision(scope[0], revision)?;
-            store.install_terminal_repair(&current, witness, prepared)
+            store.install_terminal_repair(&current, witness, prepared, insert)
         })?;
         self.scoped_copy_reply(session, ack)
     }
