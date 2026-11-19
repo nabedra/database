@@ -2399,7 +2399,7 @@ impl StatusClient {
         let payload = encode(self.resources(), request).await?;
         let response = self
             .client
-            .call_as(ServiceAction::QueueRetirement, method, Some(payload))
+            .repeat_as(ServiceAction::QueueRetirement, method, Some(payload))
             .await?;
         let context = response.metadata_context()?;
         let (value, _): (Option<RetirementCertificate>, _) =

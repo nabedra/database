@@ -375,6 +375,7 @@ impl WorkerRuntime {
                 )
             }
             ReadyPhase::AwaitingQueueProof => {
+                tracing::debug!(transition = %pending.transition_id, "collecting surviving legacy queue copies");
                 let peer = QueuePeerClient::new(
                     self.services.manager.client(),
                     self.services.shared.clone(),
@@ -395,6 +396,7 @@ impl WorkerRuntime {
                         .await?
                         .reply,
                 )?;
+                tracing::debug!(transition = %pending.transition_id, "published surviving legacy queue copies");
                 self.recovery_probe.lock().map_err(|_| unknown())?.removal = None;
                 Ok(())
             }
