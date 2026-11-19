@@ -9,21 +9,34 @@
 pub mod batch;
 pub mod cache;
 pub mod coding;
+mod compaction;
 pub mod crc;
 pub mod error;
 pub mod fs;
+mod gc;
 pub mod iter;
 pub mod journal;
+pub mod manifest;
 pub mod memtable;
+pub mod quarantine;
+mod recovery;
 pub mod run;
 pub mod source;
+pub mod store;
 pub mod types;
+pub mod version;
 
 pub use batch::{BatchOp, WriteBatch};
 pub use cache::{BlockCache, CacheKey};
 pub use error::{Damage, DamageReason, Error, FileId, Result};
 pub use iter::{DbIter, MergingIterator, ValueResolver};
 pub use memtable::{Lookup, Memtable, MemtableBudget, MemtableOptions, SnapshotList};
+pub use quarantine::QuarantineLimit;
 pub use run::{Run, RunMeta, RunReadContext, RunWriter, RunWriterOptions, TableCache};
 pub use source::{InternalIterator, RangeTombstone};
+pub use store::{
+    Background, Commit, Durability, Iter, JournalOptions, Opened, Options, RecoveryReport,
+    Snapshot, Store, StoreStats,
+};
 pub use types::{Kind, Locator, Seq};
+pub use version::LevelOptions;
