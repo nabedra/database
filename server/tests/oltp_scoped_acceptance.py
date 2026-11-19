@@ -618,13 +618,16 @@ class Driver:
         report('O31/R01/R03 takeover after acceptance', original_owner=self.worker_identity(self.owner),
                exact_binding=decision['request'], later_row=self.table.get(5), recovered_receipt=terminal)
 
-    def run(self, binary):
+    def run(self, binary, *, owner_loss_only=False):
         os.environ['NABEDRA_SERVER_BINARY'] = binary
         with self.stack:
             self.stack.callback(self.database.close)
             gateway = self.start_second_gateway(binary)
             primary, secondary = self.client(), self.client(SECONDARY)
             self.exercise_orm()
+            if owner_loss_only:
+                self.takeover_after_acceptance(primary)
+                return
             with ThreadPoolExecutor(max_workers=2) as executor:
                 self.identical_submission(primary, secondary, executor)
                 mutations = self.lost_responses(primary, secondary)
@@ -646,11 +649,13 @@ class Driver:
                                'exact per-copy minority cuts and individual acknowledgements']))
 
 
-def launch_driver(cluster, module, barriers, test_executable):
+def launch_driver(cluster, module, barriers, test_executable, *, owner_loss_only=False):
     args = ['/source/server/tests/oltp_scoped_acceptance.py', '--worktree', '/source',
             '--driver', '--binary', cluster.binary]
     if test_executable:
         args += ['--test-executable', '/fixture-test']
+    if owner_loss_only:
+        args.append('--owner-loss-only')
     driver = cluster.launch('driver', module.DRIVER_CPU, module.DRIVER_MEMORY, 'python3', args,
                            options=('--network-alias', 'api2',
                                     '--mount', f'type=bind,source={barriers},target={BARRIERS}'))
@@ -774,7 +779,8 @@ def start_fixture(module, args):
                     metadata['registered_test_child_sha256'] = hashlib.file_digest(binary, 'sha256').hexdigest()
             write_json(fixture / 'scoped-metadata.json', metadata)
             write_json(args.output / 'fixture.json', metadata)
-            driver = launch_driver(cluster, module, barriers, test_executable)
+            driver = launch_driver(cluster, module, barriers, test_executable,
+                                   owner_loss_only=args.owner_loss_only)
             supervise_driver(cluster, driver, barriers, workers, paused)
         finally:
             cleanup_errors = []
@@ -796,16 +802,21 @@ def main():
     parser.add_argument('--image')
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
+    parser.add_argument('--owner-loss-only', action='store_true',
+                        help='run ordinary ORM operations followed by the owner-loss cut')
     parser.add_argument('--rpc-trace', action='store_true', help='retain bounded worker and gateway RPC diagnostics')
     parser.add_argument('--idle-docker-container', action='append', default=[],
                         help='allow an existing Docker daemon container that was verified idle')
     parser.add_argument('--driver', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.owner_loss_only and not args.test_executable:
+        parser.error('--owner-loss-only requires --test-executable')
     sys.path.insert(0, str(args.worktree / 'scripts'))
     import benchmark_oltp_nabedra
 
     if args.driver:
-        Driver(benchmark_oltp_nabedra, Path('/fixture'), bool(args.test_executable)).run(str(args.binary))
+        Driver(benchmark_oltp_nabedra, Path('/fixture'), bool(args.test_executable)).run(
+            str(args.binary), owner_loss_only=args.owner_loss_only)
     elif args.output and args.image:
         start_fixture(benchmark_oltp_nabedra, args)
     else:
