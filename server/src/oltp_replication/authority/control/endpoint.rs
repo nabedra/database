@@ -4,7 +4,7 @@ use super::{
     ControlCommand, ControlHandle, ControlReply, DataWorkerGrowthProof, Fault, GroupRecord,
     SCOPED_QUEUE_VERSION, ScopedQueueCapability, ScopedQueuePlacement, ScopedQueueTransferReport,
     ScopedQueueTransition, ServiceAction, ServiceAuthorization, TimestampPointRoute,
-    scoped_queue::ScopedQueueOperation, stale_service_route, unsupported_service_route,
+    scoped_queue::ScopedQueueOperation, unsupported_service_route,
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
@@ -31,9 +31,13 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
+use tokio::time::{self, Instant as TokioInstant};
 use uuid::Uuid;
 
 const HEADER_LIMIT: usize = 4096;
+const READ_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_PEER_TIMEOUT: Duration = Duration::from_millis(750);
+const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 mod route_tests;
@@ -146,6 +150,26 @@ enum ReadRequest {
         expected: Box<GroupRecord>,
         after: Option<u64>,
     },
+}
+
+impl ReadRequest {
+    fn supports_bounded_failover(&self) -> bool {
+        matches!(
+            self,
+            Self::Current
+                | Self::ColdPin { .. }
+                | Self::Group { .. }
+                | Self::GroupMembers { .. }
+                | Self::ScopedQueue { .. }
+                | Self::ScopedQueueCapability
+                | Self::ScopedQueueTransition { .. }
+                | Self::ScopedQueuePredecessor { .. }
+                | Self::ScopedQueueEpochRetired { .. }
+                | Self::ServiceRole { .. }
+                | Self::ServiceRoleAtReplica { .. }
+                | Self::TimestampPointProof { .. }
+        )
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -625,6 +649,7 @@ pub(crate) struct ControlClient {
     shared: Arc<WorkerSharedResources>,
     group: GroupIdentity,
     routes: Arc<dyn ControlRoutes>,
+    last_read_route: Mutex<Option<(Option<Uuid>, Uuid)>>,
     replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
 }
 impl ControlClient {
@@ -1080,6 +1105,7 @@ impl ControlClient {
             shared,
             group,
             routes,
+            last_read_route: Mutex::new(None),
             replica_routes,
         }))
     }
@@ -1087,137 +1113,173 @@ impl ControlClient {
         let header = self
             .shared
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
-        // The ServiceRole endpoint finishes using Control consensus and its
-        // local state. It does not make another outgoing Authority read.
         let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
         let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
-        let preferred = self.routes.preferred();
-        let mut first = preferred;
-        let mut after = None;
-        let mut error = unavailable();
-        let mut legacy_placement_role = false;
+        let deadline = request
+            .supports_bounded_failover()
+            .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
+        let mut last = unavailable();
         loop {
-            let worker = if let Some(worker) = first.take() {
-                worker
-            } else {
-                let Some(worker) = self.routes.next(after)? else {
-                    break;
-                };
-                if after.is_some_and(|previous| worker <= previous) {
-                    return Err(invalid("Control routes are not strictly ordered"));
-                }
-                after = Some(worker);
-                if Some(worker) == preferred {
-                    continue;
-                }
-                worker
+            let configured_preferred = self.routes.preferred();
+            let preferred = match configured_preferred {
+                None if deadline.is_some() => self.preferred_read_route()?,
+                value => value,
             };
-            if worker.is_nil() {
-                return Err(invalid("nil Control route"));
-            }
-            let reply = if role_dependency {
-                match self
-                    .client
-                    .request_authority_dependency(&self.group, worker, header.clone(), 64 << 10)
-                    .await
-                {
-                    // Every route shares this local lane. Exhaustion cannot
-                    // improve by selecting another peer.
-                    Err(RequestError::OutgoingLaneFull) => {
-                        return Err(RequestError::OutgoingLaneFull.into());
+            let mut first = preferred;
+            let mut after = None;
+            let mut attempted = false;
+            let mut legacy_placement_role = false;
+            loop {
+                let cursor = after;
+                let (worker, preferred_attempt) = if let Some(worker) = first.take() {
+                    (worker, true)
+                } else {
+                    let Some(worker) = self.routes.next(after)? else {
+                        break;
+                    };
+                    if after.is_some_and(|previous| worker <= previous) {
+                        return Err(invalid("Control routes are not strictly ordered"));
                     }
+                    after = Some(worker);
+                    if Some(worker) == preferred {
+                        continue;
+                    }
+                    (worker, false)
+                };
+                if worker.is_nil() {
+                    return Err(invalid("nil Control route"));
+                }
+                attempted = true;
+                let exchange = async {
+                    if role_dependency {
+                        // This endpoint uses Control consensus and its local state.
+                        // It does not make another outgoing Authority read.
+                        self.client
+                            .request_authority_dependency(
+                                &self.group,
+                                worker,
+                                header.clone(),
+                                64 << 10,
+                            )
+                            .await
+                    } else {
+                        self.client
+                            .request_classified(
+                                &self.group,
+                                worker,
+                                Purpose::Authority,
+                                header.clone(),
+                                [None, None, None],
+                                64 << 10,
+                            )
+                            .await
+                    }
+                };
+                let result = if let Some(deadline) = deadline {
+                    let now = TokioInstant::now();
+                    if now >= deadline {
+                        return Err(last);
+                    }
+                    time::timeout_at(deadline.min(now + READ_PEER_TIMEOUT), exchange)
+                        .await
+                        .unwrap_or(Err(RequestError::Unreachable))
+                } else {
+                    exchange.await
+                };
+                let reply = match result {
+                    Ok(reply) => reply,
                     Err(RequestError::PeerRejected {
                         worker: peer,
                         error,
-                    }) if placement_role && peer.worker_id == worker => {
-                        if error == invalid("invalid Control authority request") {
-                            // Older Control voters reject this new, closed request
-                            // in their parser. The application has not been run.
+                    }) if exact_sample || deadline.is_some() => {
+                        if peer.worker_id != worker {
+                            return Err(invalid(
+                                "Control error response transport binding differs",
+                            ));
+                        }
+                        if placement_role && error == invalid("invalid Control authority request") {
+                            // Older Control voters reject this closed request in their parser.
                             legacy_placement_role = true;
                             continue;
                         }
-                        if error == stale_service_route() || error.code == ErrorCode::Unauthorized {
+                        let retryable = if exact_sample {
+                            growth_sample_peer_unavailable(&error)
+                        } else {
+                            control_read_peer_unavailable(&error)
+                        };
+                        if !retryable {
                             return Err(error);
                         }
-                        Err(error)
+                        last = error;
+                        continue;
                     }
-                    result => result.map_err(ProtocolError::from),
-                }
-            } else if exact_sample {
-                match self
-                    .client
-                    .request_classified(
-                        &self.group,
-                        worker,
-                        Purpose::Authority,
-                        header.clone(),
-                        [None, None, None],
-                        64 << 10,
-                    )
-                    .await
-                {
-                    Ok(reply) => Ok(reply),
-                    Err(RequestError::Unreachable) => Err(RequestError::Unreachable.into()),
-                    Err(RequestError::PeerRejected {
-                        worker: peer,
-                        error,
-                    }) => {
-                        if peer.worker_id != worker {
-                            return Err(invalid("Control growth sample error binding differs"));
-                        }
-                        tracing::debug!(%worker, code=?error.code, outcome=?error.outcome,
-                            message=error.message, "Control own growth sample rejected");
-                        if !growth_sample_peer_unavailable(&error) {
-                            return Err(error);
-                        }
-                        Err(error)
-                    }
-                    // Local exhaustion applies to every route. An invalid
-                    // exchange cannot be replaced with a different peer reply.
-                    Err(failure) => return Err(failure.into()),
-                }
-            } else {
-                self.client
-                    .request(
-                        &self.group,
-                        worker,
-                        Purpose::Authority,
-                        header.clone(),
-                        [None, None, None],
-                        64 << 10,
-                    )
-                    .await
-            };
-            match reply {
-                Ok(reply) => {
-                    if reply.remote_identity().worker_id != worker
-                        || reply.group() != &self.group
-                        || reply.purpose() != Purpose::Authority
-                        || reply.sections[1].is_some()
-                        || reply.sections[2].is_some()
-                    {
-                        return Err(invalid("Control response transport binding differs"));
-                    }
-                    {
-                        let decoded = reply.decode_header::<ReadReply>()?;
-                        if decoded.nonce != reply.nonce()
-                            || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64)
-                                != Some(decoded.bytes)
+                    Err(failure) => {
+                        if (exact_sample || deadline.is_some())
+                            && !matches!(failure, RequestError::Unreachable)
+                            && !matches!(
+                                &failure,
+                                RequestError::Protocol(error) if peer_enrollment_unavailable(error)
+                                    && deadline.is_some()
+                            )
                         {
-                            return Err(invalid("Control response payload differs"));
+                            // A local lane refusal or invalid exchange cannot
+                            // improve by selecting another peer.
+                            return Err(failure.into());
                         }
+                        last = failure.into();
+                        continue;
                     }
-                    return Ok(reply);
+                };
+                if reply.remote_identity().worker_id != worker
+                    || reply.group() != &self.group
+                    || reply.purpose() != Purpose::Authority
+                    || reply.sections[1].is_some()
+                    || reply.sections[2].is_some()
+                {
+                    return Err(invalid("Control response transport binding differs"));
                 }
-                Err(failure) => error = failure,
+                {
+                    let decoded = reply.decode_header::<ReadReply>()?;
+                    if decoded.nonce != reply.nonce()
+                        || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64)
+                            != Some(decoded.bytes)
+                    {
+                        return Err(invalid("Control response payload differs"));
+                    }
+                }
+                if deadline.is_some()
+                    && configured_preferred.is_none()
+                    && !preferred_attempt
+                    && let Ok(mut route) = self.last_read_route.lock()
+                {
+                    *route = Some((cursor, worker));
+                }
+                return Ok(reply);
             }
+            if legacy_placement_role {
+                return Err(unsupported_service_route());
+            }
+            let Some(deadline) = deadline else {
+                return Err(last);
+            };
+            if !attempted || TokioInstant::now() >= deadline {
+                return Err(last);
+            }
+            // A new election may make a peer usable after the first round.
+            time::sleep_until(deadline.min(TokioInstant::now() + READ_RETRY_DELAY)).await;
         }
-        if legacy_placement_role {
-            return Err(unsupported_service_route());
-        }
-        Err(error)
     }
+
+    fn preferred_read_route(&self) -> Result<Option<Uuid>, ProtocolError> {
+        let hint = self.last_read_route.lock().ok().and_then(|route| *route);
+        let Some((cursor, worker)) = hint else {
+            return Ok(None);
+        };
+        // Recheck membership before using a previously responsive route.
+        Ok((self.routes.next(cursor)? == Some(worker)).then_some(worker))
+    }
+
     async fn authority(
         &self,
         scope: &QueueScope,
@@ -1357,6 +1419,18 @@ impl ControlClient {
     ) -> Result<ReceivedReply, ProtocolError> {
         self.read(&ReadRequest::Ready { expected, after }).await
     }
+}
+
+fn peer_enrollment_unavailable(error: &ProtocolError) -> bool {
+    error.code == ErrorCode::StorageUnavailable
+        && error.outcome == Outcome::Unknown
+        && error.message == "peer enrollment view is unavailable"
+}
+
+fn control_read_peer_unavailable(error: &ProtocolError) -> bool {
+    growth_sample_peer_unavailable(error)
+        || peer_enrollment_unavailable(error)
+        || error.code == ErrorCode::Overloaded
 }
 
 fn growth_sample_peer_unavailable(error: &ProtocolError) -> bool {

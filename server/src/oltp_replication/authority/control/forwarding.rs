@@ -28,6 +28,7 @@ const PAYLOAD: usize = 64 << 10;
 const DECODE: usize = 2 << 20;
 const MAX_TOKEN: usize = 8192;
 const READ_TIMEOUT: Duration = Duration::from_secs(3);
+const READ_PEER_TIMEOUT: Duration = Duration::from_millis(500);
 fn zero(value: &u64) -> bool { *value == 0 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,6 +251,7 @@ impl ForwardedControl {
         &self,
         operation: Operation,
         payload: Option<ChargedBytes>,
+        deadline: Option<Instant>,
     ) -> Result<(T, Arc<ScratchLease>), ProtocolError> {
         let shared = self.manager.resources();
         let group = self.local.state.store().identity();
@@ -270,19 +272,27 @@ impl ForwardedControl {
                 },
                 HEADER,
             )?;
-            let received = match self
-                .manager
-                .client()
-                .request(
-                    group,
-                    member.worker_id,
-                    Purpose::ControlDelegation,
-                    header,
-                    [payload.clone(), None, None],
-                    64 << 10,
-                )
-                .await
-            {
+            let client = self.manager.client();
+            let exchange = client.request(
+                group,
+                member.worker_id,
+                Purpose::ControlDelegation,
+                header,
+                [payload.clone(), None, None],
+                64 << 10,
+            );
+            let result = if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(last);
+                }
+                tokio::time::timeout_at(deadline.min(now + READ_PEER_TIMEOUT), exchange)
+                    .await
+                    .unwrap_or_else(|_| Err(unavailable()))
+            } else {
+                exchange.await
+            };
+            let received = match result {
                 Ok(reply) => reply,
                 Err(error) => {
                     tracing::debug!(group=%group.group_id,node=member.node_id,code=?error.code,outcome=?error.outcome,message=error.message,"Control forwarding transport failed");
@@ -369,7 +379,7 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
                 })
                 .await?;
             let (applied, owner): (Applied<ControlReply>, _) =
-                self.forwarded(operation, Some(payload)).await?;
+                self.forwarded(operation, Some(payload), None).await?;
             Ok(Applied::owned(applied.position, applied.reply, owner))
         })
     }
@@ -404,7 +414,7 @@ impl ForwardedControl {
                     return self.local.ensure_linearizable().await;
                 }
                 let (applied, _): (AppliedPosition, _) =
-                    self.forwarded(Operation::Barrier, None).await?;
+                    self.forwarded(Operation::Barrier, None, Some(deadline)).await?;
                 self.local
                     .raft
                     .wait(Some(deadline.saturating_duration_since(Instant::now())))
