@@ -326,6 +326,8 @@ class Driver:
 
         assert self.table.get(0) == {'id': 0, 'value': 17}
         assert self.table.get(100) is None
+        assert self.table.update(100, {'value': 17}) is False
+        assert self.table.get(100) is None
         assert self.table.query().where(id=0).collect() == [{'id': 0, 'value': 17}]
         assert self.table.query().count() == 6
         try:
