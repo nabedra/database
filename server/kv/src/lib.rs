@@ -20,6 +20,6 @@ pub mod source;
 pub mod types;
 
 pub use batch::{BatchOp, WriteBatch};
-pub use error::{Error, FileId, Result};
+pub use error::{Damage, DamageReason, Error, FileId, Result};
 pub use source::{InternalIterator, RangeTombstone};
 pub use types::{Kind, Locator, Seq};

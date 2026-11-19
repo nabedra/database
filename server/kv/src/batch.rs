@@ -12,6 +12,12 @@
 //!
 //! Operation `i` takes sequence `first_seq + i`, so a later operation on the same key in
 //! the same batch wins, including a put after a covering range delete.
+//!
+//! A batch may carry a *scope*: a key prefix every key and range of the batch lies under
+//! (for a pool group, `0x40 ‖ group id`). The journal writes the scope in the record
+//! header, outside the payload, so recovery can name the one group a damaged record
+//! belongs to. The empty scope means store-wide and allows any key. The journal rejects
+//! a batch whose operations leave its scope ([`WriteBatch::leaves_scope`]).
 
 use crate::coding::{get_length_prefixed, put_length_prefixed};
 use crate::error::{Error, FileId, Result};
@@ -32,6 +38,41 @@ pub struct WriteBatch {
     data: Vec<u8>,
     count: u32,
     journal_values: Vec<JournalValueRef>,
+    scope: Vec<u8>,
+    leaves_scope: bool,
+}
+
+/// Longest scope a journal record header can carry.
+pub const MAX_SCOPE_LEN: usize = 255;
+
+/// The smallest key greater than every key that starts with `prefix`, or `None` when no
+/// such key exists (empty prefix or all `0xFF`).
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last != 0xFF {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn op_within_scope(scope: &[u8], op: &BatchOp<'_>) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    match op {
+        BatchOp::Put { key, .. } | BatchOp::JournalPut { key, .. } | BatchOp::Delete { key } => {
+            key.starts_with(scope)
+        }
+        BatchOp::RangeDelete { start, end } => {
+            start.starts_with(scope)
+                && (end.starts_with(scope)
+                    || prefix_successor(scope)
+                        .is_some_and(|successor| *end == successor.as_slice()))
+        }
+    }
 }
 
 /// One decoded operation, borrowing from the batch.
@@ -105,8 +146,44 @@ impl WriteBatch {
         self.push(Kind::RangeDelete, start, Some(end));
     }
 
+    /// Confines the batch to keys under `prefix` (see the module docs). May be called
+    /// before or after adding operations; [`WriteBatch::leaves_scope`] reflects every
+    /// operation either way. Panics if `prefix` is longer than [`MAX_SCOPE_LEN`].
+    pub fn set_scope(&mut self, prefix: &[u8]) {
+        assert!(
+            prefix.len() <= MAX_SCOPE_LEN,
+            "scope longer than {MAX_SCOPE_LEN} bytes"
+        );
+        self.scope.clear();
+        self.scope.extend_from_slice(prefix);
+        let scope = &self.scope;
+        self.leaves_scope = self.iter().any(|op| !op_within_scope(scope, &op));
+    }
+
+    /// The scope prefix; empty means store-wide.
+    pub fn scope(&self) -> &[u8] {
+        &self.scope
+    }
+
+    /// True when some operation lies outside the scope. The journal refuses such a batch
+    /// with `Error::InvalidArgument("batch leaves its scope")`.
+    pub fn leaves_scope(&self) -> bool {
+        self.leaves_scope
+    }
+
     fn push(&mut self, kind: Kind, key: &[u8], value: Option<&[u8]>) {
         assert!(self.count < u32::MAX, "too many operations in one batch");
+        if !self.scope.is_empty() && !self.leaves_scope {
+            let op = match (kind, value) {
+                (Kind::Delete, _) => BatchOp::Delete { key },
+                (Kind::RangeDelete, Some(end)) => BatchOp::RangeDelete { start: key, end },
+                (_, value) => BatchOp::Put {
+                    key,
+                    value: value.unwrap_or_default(),
+                },
+            };
+            self.leaves_scope = !op_within_scope(&self.scope, &op);
+        }
         self.data.push(kind as u8);
         put_length_prefixed(&mut self.data, key);
         if let Some(value) = value {
@@ -141,10 +218,13 @@ impl WriteBatch {
         &self.journal_values
     }
 
+    /// Removes every operation and the scope.
     pub fn clear(&mut self) {
         self.data.clear();
         self.count = 0;
         self.journal_values.clear();
+        self.scope.clear();
+        self.leaves_scope = false;
     }
 
     pub fn iter(&self) -> BatchIter<'_> {
@@ -184,6 +264,8 @@ impl WriteBatch {
             data,
             count,
             journal_values,
+            scope: Vec::new(),
+            leaves_scope: false,
         })
     }
 }
@@ -288,6 +370,32 @@ mod tests {
                 end: b"d"
             }
         );
+    }
+
+    #[test]
+    fn scope_tracks_every_operation() {
+        let mut batch = WriteBatch::new();
+        batch.set_scope(b"g1/");
+        batch.put(b"g1/a", b"1");
+        batch.delete(b"g1/b");
+        batch.delete_range(b"g1/c", b"g10");
+        assert_eq!(prefix_successor(b"g1/").as_deref(), Some(&b"g10"[..]));
+        assert!(!batch.leaves_scope());
+        batch.delete_range(b"g1/c", b"g2");
+        assert!(batch.leaves_scope());
+
+        let mut batch = WriteBatch::new();
+        batch.put(b"other", b"1");
+        assert!(!batch.leaves_scope(), "the empty scope allows any key");
+        batch.set_scope(b"g1/");
+        assert!(
+            batch.leaves_scope(),
+            "set_scope re-checks earlier operations"
+        );
+        batch.clear();
+        assert!(batch.scope().is_empty() && !batch.leaves_scope());
+        assert_eq!(prefix_successor(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_successor(&[1, 0xFF]), Some(vec![2]));
     }
 
     #[test]

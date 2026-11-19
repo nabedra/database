@@ -3,6 +3,10 @@
 use std::fmt;
 use std::io;
 
+use bytes::Bytes;
+
+use crate::types::Seq;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// The file an error refers to.
@@ -93,4 +97,25 @@ impl From<io::Error> for Error {
             kind => Error::Io(kind),
         }
     }
+}
+
+/// What was found damaged (plan section 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DamageReason {
+    JournalRecord,
+    RunFile,
+    RunBlock,
+    JournalValue,
+}
+
+/// Damage confined to one scope: the store keeps serving other scopes while this one is
+/// quarantined and re-synced from peers. An empty `scope` means store-wide damage, which
+/// refuses the store instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Damage {
+    pub scope: Bytes,
+    pub reason: DamageReason,
+    pub file: FileId,
+    /// First sequence known to be lost, when the damage is in the journal.
+    pub first_bad_seq: Option<Seq>,
 }
