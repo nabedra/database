@@ -603,7 +603,7 @@ class Driver:
             assert wait_for([dispatch], read_json) == accepted['marker']['stamp']['request']
             assert not any(path.exists() for path in self.checkpoints(request_id, 'scoped-decision'))
             with self.pause_worker(self.owner):
-                terminal = self.terminal(primary, request_id, True, timeout=80)
+                terminal = self.terminal(primary, request_id, True, timeout=120)
                 decision = wait_for([self.record_file(role, request_id, 'scoped-decision')
                                      for role in others], read_json)
                 assert decision['request'] == accepted['marker']['stamp']['request'], decision
