@@ -399,6 +399,24 @@ impl ParticipantHandle {
         self.local_consensus().ensure_linearizable().await?;
         self.local_machine().read_at(read_ts, key).await
     }
+    /// The dedup record or forward marker for `request_id` at `anchor`,
+    /// read behind the linearizable barrier. Only the anchor range's leader
+    /// executor calls it, so a remote handle refuses.
+    #[allow(dead_code)] // Called by the leader executor (T5).
+    pub(crate) async fn direct_dedup(
+        &self,
+        table_id: Uuid,
+        anchor: Key,
+        request_id: Uuid,
+    ) -> Result<Option<super::direct::DedupLookup>, ProtocolError> {
+        if self.remote.is_some() {
+            return Err(invalid());
+        }
+        self.local_consensus().ensure_linearizable().await?;
+        self.local_machine()
+            .direct_dedup(table_id, anchor, request_id)
+            .await
+    }
     pub(crate) fn with_scoped_execution(
         &self,
         scope: ScopedCatalogRead,

@@ -12,30 +12,51 @@
 //! so every replica deletes exactly the same records. An `'E'` index ordered
 //! by `applied_unix_ms` makes each page of deletions a bounded prefix scan.
 //!
-//! Rejections map to the leader executor's actions (plan section 6):
-//! `StaleEpoch` (epoch changed, or the group is frozen or not yet published
-//! for a split) refreshes the route; `StaleAuthority` means the fence moved;
-//! `Incomplete` means a queued intent holds a key, so fall back to the queued
-//! path; `Conflict` means re-read (stale `expected_version`, `commit_ts` not
-//! above the newest version or the range floor, or the request id was used
-//! with a different body); `ResourceLimit` means the entry is too large for
-//! one batch, so use the queued path; `InvalidBinding` is a malformed command.
+//! Exactly-once across paths (plan addendum 2026-11-19): before a request
+//! that may have run directly takes the queued path, the anchor's leader
+//! commits `DirectForward`. It returns the committed result when a dedup
+//! record exists, and otherwise writes a *forward marker* under the same
+//! `'D'` key. A direct attempt that finds the marker answers `Forwarded`,
+//! so it can never apply after the queued path accepted the request.
+//! Markers share the dedup records' digest rules, expiry and carriage.
+//! `ParticipantMachine::direct_dedup` reads either behind the leader's
+//! linearizable barrier.
+//!
+//! Replies map to the leader executor's actions (plan section 6):
+//! `Forwarded` means the request belongs to the queued path (Fallback);
+//! `SplitInProgress` (a split barrier, a frozen source or an unimported
+//! child) means Fallback or a bounded wait, never a route refresh;
+//! `StaleEpoch` (the schema or routing epoch changed) refreshes the route;
+//! `StaleAuthority` means the fence moved; `Incomplete` means a queued intent
+//! holds a key, so fall back to the queued path; `Conflict` means re-read
+//! (stale `expected_version`, `commit_ts` not above the newest version or the
+//! range floor, or the request id was used with a different body);
+//! `ResourceLimit` means the entry is too large for one direct commit, so use
+//! the queued path; `InvalidBinding` is a malformed command.
+//!
+//! Clock skew (RV-T4 F7): every record is stamped with
+//! `max(applied_unix_ms, group high-water)`, and a `DirectExpire` cutoff is
+//! clamped to `high-water - retention_ms`, so a leader whose clock runs ahead
+//! cannot delete records younger than the retention window unless it also
+//! commits with that clock. Apply reads no clock.
 use super::*;
 use crate::oltp::{mvcc::CanonicalJson, pool::ScratchLease};
 
 pub(crate) mod clock;
 #[allow(unused_imports)] // Consumed by the leader executor (T5).
-pub(crate) use clock::{ClockRejection, RANGE_CLOCK_WAIT, RangeClock};
+pub(crate) use clock::{ClockRejection, LeaderToken, RANGE_CLOCK_WAIT, RangeClock};
 
 /// Logical key tag of `MvccKey::DirectDedup`. It sorts after every head tag.
 pub(crate) const DEDUP_TAG: u8 = 14;
 /// Physical namespace of dedup records: `'D' || logical dedup key`.
 pub(super) const DEDUP: u8 = b'D';
 /// Expiry index: `'E' || applied_unix_ms (big endian) || logical dedup key`.
-const EXPIRY: u8 = b'E';
+pub(super) const EXPIRY: u8 = b'E';
 /// The highest commit timestamp any direct commit applied on this group.
 /// A split freeze below it is refused, because its images would miss it.
 const DIRECT_HIGH: &[u8] = b"mvcc/direct-high/v1";
+/// The highest `applied_unix_ms` stamped on this group (RV-T4 F7).
+const UNIX_HIGH: &[u8] = b"mvcc/direct-unix-high/v1";
 
 /// `direct_dedup_retention_ms` default: 24 hours.
 #[allow(dead_code)] // Read by the leader's expiry task (T5).
@@ -71,15 +92,56 @@ pub(crate) struct DirectCommit {
     /// compared only with a `DirectExpire` cutoff, never with a local clock.
     pub applied_unix_ms: u64,
 }
-/// Delete dedup records with `applied_unix_ms < cutoff_unix_ms`, oldest
-/// first, at most `max_items` per entry. The proposer repeats it until the
-/// reply says `complete`.
+/// Delete dedup records and forward markers with `applied_unix_ms` below
+/// `min(cutoff_unix_ms, high-water - retention_ms)`, oldest first, at most
+/// `max_items` per entry. The proposer repeats it until the reply says
+/// `complete`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectExpire {
     pub authority: Authority,
     pub cutoff_unix_ms: u64,
+    /// The retention the cutoff was computed with; bounds the cutoff by the
+    /// group's own high-water, so a clock running ahead cannot shorten it.
+    pub retention_ms: u64,
     pub max_items: u16,
+}
+/// Settle `request_id` at its anchor before the request takes the queued
+/// path. Returns the committed result, or writes a forward marker so a later
+/// direct attempt of the request answers `Forwarded` instead of applying.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectForward {
+    pub authority: Authority,
+    pub table_id: Uuid,
+    /// The smallest primary key the request writes.
+    pub anchor: Key,
+    pub request_id: Uuid,
+    /// SHA-256 of the exact request body.
+    pub digest: Digest,
+    /// Leader wall clock when proposing; stamps the marker for expiry.
+    pub applied_unix_ms: u64,
+}
+/// The replicated split barrier (RV-T4 F5). While a split holds it, direct
+/// commits on the range answer `SplitInProgress`. The coordinator proposes
+/// it before allocating the cut, so every direct commit that applied first
+/// has a timestamp below the cut. A freeze for the same split takes it over;
+/// an abort or `paused: false` releases it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectPause {
+    pub authority: Authority,
+    pub split_id: Uuid,
+    pub paused: bool,
+}
+/// The coordinator tells a complete split child the source's publication
+/// timestamp (RV-T4 F8). The child refuses direct commits at or below it,
+/// because the source served snapshots up to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChildPublished {
+    pub authority: Authority,
+    pub published_at: CommitTs,
 }
 /// The cutoff a leader proposes at `now_unix_ms` for `retention_ms`.
 /// `None` while nothing can be old enough yet.
@@ -113,9 +175,29 @@ pub(crate) struct IndexChange {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DirectReply {
-    Applied { commit_ts: CommitTs },
-    Replayed { result: DirectResult },
+    Applied {
+        commit_ts: CommitTs,
+    },
+    Replayed {
+        result: DirectResult,
+    },
+    /// The request id holds a forward marker at its anchor: it belongs to
+    /// the queued path. Also the reply of a `DirectForward` that wrote one.
+    Forwarded,
     Rejected(Fault),
+}
+/// What `direct_dedup` finds at an anchor for a request id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DedupLookup {
+    Committed {
+        digest: Digest,
+        commit_ts: CommitTs,
+        result: DirectResult,
+    },
+    Forwarded {
+        digest: Digest,
+    },
 }
 /// The exact response `data` of a committed request, compared by its bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +225,43 @@ struct DedupRecord<'a> {
     digest: Digest,
     #[serde(borrow)]
     result: &'a RawValue,
+}
+/// A forward marker under a dedup key, also canonical JSON. The required
+/// `forwarded` field keeps the two shapes disjoint under
+/// `deny_unknown_fields`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForwardMarker {
+    applied_unix_ms: u64,
+    digest: Digest,
+    forwarded: bool,
+}
+enum Stored<'a> {
+    Committed(DedupRecord<'a>),
+    Forwarded(ForwardMarker),
+}
+impl<'a> Stored<'a> {
+    fn decode(raw: &'a [u8]) -> Option<Self> {
+        if let Ok(record) = serde_json::from_slice::<DedupRecord<'_>>(raw) {
+            return Some(Self::Committed(record));
+        }
+        serde_json::from_slice::<ForwardMarker>(raw)
+            .ok()
+            .filter(|marker| marker.forwarded)
+            .map(Self::Forwarded)
+    }
+    fn digest(&self) -> Digest {
+        match self {
+            Self::Committed(record) => record.digest,
+            Self::Forwarded(marker) => marker.digest,
+        }
+    }
+    fn applied_unix_ms(&self) -> u64 {
+        match self {
+            Self::Committed(record) => record.applied_unix_ms,
+            Self::Forwarded(marker) => marker.applied_unix_ms,
+        }
+    }
 }
 
 impl DirectCommit {
@@ -185,7 +304,7 @@ impl DirectCommit {
 fn reply(tx: &mut GroupTransaction<'_>, reply: DirectReply) -> Result<Transition, ProtocolError> {
     let applied = matches!(
         reply,
-        DirectReply::Applied { .. } | DirectReply::Replayed { .. }
+        DirectReply::Applied { .. } | DirectReply::Replayed { .. } | DirectReply::Forwarded
     );
     let encoded = tx.encode(&ParticipantReply::Direct(reply))?;
     Ok(if applied {
@@ -199,21 +318,26 @@ fn rejected(tx: &mut GroupTransaction<'_>, fault: Fault) -> Result<Transition, P
 }
 
 /// Structural checks that need no state. They reject before the ordered
-/// state checks, so a malformed command never reads a head.
-fn well_formed(group: &GroupIdentity, command: &DirectCommit) -> Result<bool, ProtocolError> {
+/// state checks, so a malformed command never reads a head. A command that is
+/// well formed but over a size limit answers `ResourceLimit`, so the
+/// executor falls back to the queued path instead of failing (RV-T4 F9).
+fn well_formed(
+    group: &GroupIdentity,
+    command: &DirectCommit,
+) -> Result<Option<Fault>, ProtocolError> {
+    let malformed = Ok(Some(Fault::InvalidBinding));
     let GroupKind::Data { table_id, .. } = &group.kind else {
-        return Ok(false);
+        return malformed;
     };
     if command.table_id != *table_id
         || command.request_id.is_nil()
         || command.authority.validate().is_err()
         || command.schema_epoch == 0
         || command.routing_epoch == 0
+        || command.applied_unix_ms == 0
         || command.writes.is_empty()
-        || command.writes.len() > MAX_DIRECT_WRITES
-        || command.result.as_str().len() > MAX_DIRECT_RESULT_BYTES
     {
-        return Ok(false);
+        return malformed;
     }
     let mut keys = Vec::new();
     for (offset, write) in command.writes.iter().enumerate() {
@@ -222,14 +346,13 @@ fn well_formed(group: &GroupIdentity, command: &DirectCommit) -> Result<bool, Pr
             primary_key,
         } = &write.key
         else {
-            return Ok(false);
+            return malformed;
         };
         if row_table != table_id
-            || write.index.len() > MAX_DIRECT_INDEX_CHANGES
             || (offset != 0
                 && compare_keys(&command.writes[offset - 1].key, &write.key) != Ordering::Less)
         {
-            return Ok(false);
+            return malformed;
         }
         for change in &write.index {
             let MvccKey::IndexEntry {
@@ -238,10 +361,10 @@ fn well_formed(group: &GroupIdentity, command: &DirectCommit) -> Result<bool, Pr
                 ..
             } = &change.key
             else {
-                return Ok(false);
+                return malformed;
             };
             if index_table != table_id || index_primary != primary_key {
-                return Ok(false);
+                return malformed;
             }
             keys.push(&change.key);
         }
@@ -251,7 +374,7 @@ fn well_formed(group: &GroupIdentity, command: &DirectCommit) -> Result<bool, Pr
         .windows(2)
         .any(|pair| compare_keys(pair[0], pair[1]) == Ordering::Equal)
     {
-        return Ok(false);
+        return malformed;
     }
     for (key, _, value) in command.changes() {
         key_length(key)?;
@@ -259,7 +382,57 @@ fn well_formed(group: &GroupIdentity, command: &DirectCommit) -> Result<bool, Pr
             serde_json::from_str::<&RawValue>(value.as_str()).map_err(|_| invalid())?;
         }
     }
-    Ok(true)
+    if command.writes.len() > MAX_DIRECT_WRITES
+        || command
+            .writes
+            .iter()
+            .any(|write| write.index.len() > MAX_DIRECT_INDEX_CHANGES)
+        || command.result.as_str().len() > MAX_DIRECT_RESULT_BYTES
+    {
+        return Ok(Some(Fault::ResourceLimit));
+    }
+    Ok(None)
+}
+
+/// A split holds the range: the barrier, a frozen source, or a child that
+/// has not imported everything.
+fn split_in_progress(config: &Config) -> bool {
+    config.direct_pause.is_some()
+        || config.split_source.is_some()
+        || config.split_child.is_some_and(|child| !child.complete)
+}
+
+/// The reply an existing dedup value gives a request with `digest`.
+fn settled(stored: &Stored<'_>, digest: Digest) -> DirectReply {
+    if stored.digest() != digest {
+        return DirectReply::Rejected(Fault::Conflict);
+    }
+    match stored {
+        Stored::Committed(record) => DirectReply::Replayed {
+            result: DirectResult(record.result.to_owned()),
+        },
+        Stored::Forwarded(_) => DirectReply::Forwarded,
+    }
+}
+fn lookup(
+    tx: &mut GroupTransaction<'_>,
+    dedup: &[u8],
+    digest: Digest,
+) -> Result<Option<DirectReply>, ProtocolError> {
+    let Some(raw) = tx.pinned(dedup)? else {
+        return Ok(None);
+    };
+    let stored = Stored::decode(&raw).ok_or_else(recovery_unknown)?;
+    Ok(Some(settled(&stored, digest)))
+}
+/// The stamp for a new record or marker: never below the group high-water.
+/// Raises the high-water when the leader's clock is ahead of it.
+fn stamp(tx: &mut GroupTransaction<'_>, applied_unix_ms: u64) -> Result<u64, ProtocolError> {
+    let high = load::<u64>(tx, UNIX_HIGH)?.unwrap_or(0);
+    if applied_unix_ms > high {
+        tx.put_serialized(UNIX_HIGH, &applied_unix_ms)?;
+    }
+    Ok(applied_unix_ms.max(high))
 }
 
 /// The native batch bytes this commit writes, before expiry deletions.
@@ -293,12 +466,17 @@ pub(super) fn apply(
     let Some(config) = config else {
         return rejected(tx, Fault::NotInitialized);
     };
-    if !well_formed(group, command)? {
-        return rejected(tx, Fault::InvalidBinding);
+    if let Some(fault) = well_formed(group, command)? {
+        return rejected(tx, fault);
     }
-    // 1. The group is not frozen for a split, nor an unimported child.
-    if config.split_source.is_some() || config.split_child.is_some_and(|child| !child.complete) {
-        return rejected(tx, Fault::StaleEpoch);
+    let dedup_key = command.dedup_key().ok_or_else(invalid)?;
+    let dedup = physical(DEDUP, &dedup_key)?;
+    // 1. No split holds the range. An exact retry still replays: the
+    //    record is immutable and the reply writes nothing.
+    if split_in_progress(config) {
+        let reply = lookup(tx, &dedup, command.digest)?
+            .unwrap_or(DirectReply::Rejected(Fault::SplitInProgress));
+        return self::reply(tx, reply);
     }
     // 2. The run and group fence.
     if config.authority != command.authority {
@@ -316,19 +494,11 @@ pub(super) fn apply(
     {
         return rejected(tx, Fault::InvalidBinding);
     }
-    // 5. A committed request with this id and anchor replays or conflicts.
-    //    This precedes the head checks, which the first attempt changed.
-    let dedup_key = command.dedup_key().ok_or_else(invalid)?;
-    let dedup = physical(DEDUP, &dedup_key)?;
-    if let Some(raw) = tx.pinned(&dedup)? {
-        let record: DedupRecord<'_> =
-            serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
-        if record.digest != command.digest {
-            return rejected(tx, Fault::Conflict);
-        }
-        let result = DirectResult(record.result.to_owned());
-        drop(raw);
-        return reply(tx, DirectReply::Replayed { result });
+    // 5. A committed request with this id and anchor replays or conflicts,
+    //    and a forwarded one belongs to the queued path. This precedes the
+    //    head checks, which the first attempt changed.
+    if let Some(reply) = lookup(tx, &dedup, command.digest)? {
+        return self::reply(tx, reply);
     }
     if batch_estimate(command, dedup.len())? > APPLY.batch_bytes - (64 << 10) {
         return rejected(tx, Fault::ResourceLimit);
@@ -364,7 +534,10 @@ pub(super) fn apply(
     // A direct commit never lands at or below the group's GC floor (or a
     // split child's import cut): no reader below it is served here.
     let floor = config.split_child.map_or(config.gc_floor, |child| {
-        config.gc_floor.max(child.read_ts.get())
+        config
+            .gc_floor
+            .max(child.read_ts.get())
+            .max(child.published_at.map_or(0, CommitTs::get))
     });
     if command.commit_ts.get() <= floor {
         return rejected(tx, Fault::Conflict);
@@ -396,11 +569,13 @@ pub(super) fn apply(
     }
     let result =
         serde_json::from_str::<&RawValue>(command.result.as_str()).map_err(|_| invalid())?;
-    put_record(
+    let applied_unix_ms = stamp(tx, command.applied_unix_ms)?;
+    put_entry(
         tx,
         &dedup,
+        applied_unix_ms,
         &DedupRecord {
-            applied_unix_ms: command.applied_unix_ms,
+            applied_unix_ms,
             commit_ts: command.commit_ts,
             digest: command.digest,
             result,
@@ -438,13 +613,221 @@ fn expiry_key(applied_unix_ms: u64, dedup: &[u8]) -> Result<Vec<u8>, ProtocolErr
     bytes.extend_from_slice(&dedup[1..]);
     Ok(bytes)
 }
-fn put_record(
+fn put_entry(
     tx: &mut GroupTransaction<'_>,
     dedup: &[u8],
-    record: &DedupRecord<'_>,
+    applied_unix_ms: u64,
+    value: &impl Serialize,
 ) -> Result<(), ProtocolError> {
-    tx.put_serialized(dedup, record)?;
-    tx.put(&expiry_key(record.applied_unix_ms, dedup)?, &[])
+    tx.put_serialized(dedup, value)?;
+    tx.put(&expiry_key(applied_unix_ms, dedup)?, &[])
+}
+
+pub(super) fn forward(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<&Config>,
+    command: &DirectForward,
+) -> Result<Transition, ProtocolError> {
+    let Some(config) = config else {
+        return rejected(tx, Fault::NotInitialized);
+    };
+    let anchor = MvccKey::Row {
+        table_id: command.table_id,
+        primary_key: command.anchor.clone(),
+    };
+    if !matches!(&group.kind, GroupKind::Data { table_id, .. } if *table_id == command.table_id)
+        || command.request_id.is_nil()
+        || command.authority.validate().is_err()
+        || command.applied_unix_ms == 0
+        || key_length(&anchor).is_err()
+    {
+        return rejected(tx, Fault::InvalidBinding);
+    }
+    let dedup = physical(
+        DEDUP,
+        &MvccKey::DirectDedup {
+            table_id: command.table_id,
+            anchor: command.anchor.clone(),
+            request_id: command.request_id,
+        },
+    )?;
+    // A frozen source or an unimported child cannot take a marker: a split
+    // copy would miss it. The split barrier alone does not block markers,
+    // because the freeze that follows copies the state after them.
+    if config.split_source.is_some() || config.split_child.is_some_and(|child| !child.complete) {
+        let reply = lookup(tx, &dedup, command.digest)?
+            .unwrap_or(DirectReply::Rejected(Fault::SplitInProgress));
+        return self::reply(tx, reply);
+    }
+    if config.authority != command.authority {
+        return rejected(tx, Fault::StaleAuthority);
+    }
+    if !owns(group, &config.span, &anchor) {
+        return rejected(tx, Fault::InvalidBinding);
+    }
+    if let Some(reply) = lookup(tx, &dedup, command.digest)? {
+        return self::reply(tx, reply);
+    }
+    let applied_unix_ms = stamp(tx, command.applied_unix_ms)?;
+    put_entry(
+        tx,
+        &dedup,
+        applied_unix_ms,
+        &ForwardMarker {
+            applied_unix_ms,
+            digest: command.digest,
+            forwarded: true,
+        },
+    )?;
+    reply(tx, DirectReply::Forwarded)
+}
+
+pub(super) fn pause(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<Config>,
+    command: &DirectPause,
+) -> Result<Transition, ProtocolError> {
+    let Some(mut config) = config else {
+        return reject(tx, Fault::NotInitialized);
+    };
+    if !matches!(group.kind, GroupKind::Data { .. }) || command.split_id.is_nil() {
+        return reject(tx, Fault::InvalidBinding);
+    }
+    if config.authority != command.authority {
+        return reject(tx, Fault::StaleAuthority);
+    }
+    let done = ParticipantReply::DirectPaused {
+        split_id: command.split_id,
+        paused: command.paused,
+    };
+    let frozen_by = config
+        .split_source
+        .as_ref()
+        .map(|source| source.statement.split_id);
+    if command.paused {
+        // The freeze of the same split already stops direct commits.
+        if frozen_by == Some(command.split_id) || config.direct_pause == Some(command.split_id) {
+            return commit(tx, &done);
+        }
+        if frozen_by.is_some() || config.direct_pause.is_some() {
+            return reject(tx, Fault::Conflict);
+        }
+        if config.split_child.is_some_and(|child| !child.complete) {
+            return reject(tx, Fault::Incomplete);
+        }
+        config.direct_pause = Some(command.split_id);
+    } else {
+        match config.direct_pause {
+            None => return commit(tx, &done),
+            Some(holder) if holder != command.split_id => return reject(tx, Fault::Conflict),
+            Some(_) => config.direct_pause = None,
+        }
+    }
+    tx.put_serialized(CONFIG, &config)?;
+    commit(tx, &done)
+}
+
+pub(super) fn child_published(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<Config>,
+    command: &ChildPublished,
+) -> Result<Transition, ProtocolError> {
+    let Some(mut config) = config else {
+        return reject(tx, Fault::NotInitialized);
+    };
+    if !matches!(group.kind, GroupKind::Data { .. }) {
+        return reject(tx, Fault::InvalidBinding);
+    }
+    if config.authority != command.authority {
+        return reject(tx, Fault::StaleAuthority);
+    }
+    let Some(child) = config.split_child.as_mut() else {
+        return reject(tx, Fault::InvalidBinding);
+    };
+    if !child.complete {
+        return reject(tx, Fault::Incomplete);
+    }
+    if command.published_at <= child.read_ts {
+        return reject(tx, Fault::InvalidBinding);
+    }
+    let done = ParticipantReply::ChildPublished {
+        published_at: command.published_at,
+    };
+    match child.published_at {
+        Some(existing) if existing == command.published_at => return commit(tx, &done),
+        Some(_) => return reject(tx, Fault::Conflict),
+        None => child.published_at = Some(command.published_at),
+    }
+    tx.put_serialized(CONFIG, &config)?;
+    commit(tx, &done)
+}
+
+/// `direct_dedup` behind the caller's linearizable barrier: the committed
+/// result or forward marker for `request_id` at `anchor`, if any.
+pub(super) fn read_dedup(
+    view: &mut crate::oltp::pool::GroupRead<'_>,
+    group: &GroupIdentity,
+    table_id: Uuid,
+    anchor: Key,
+    request_id: Uuid,
+) -> Result<ChargedBytes, ProtocolError> {
+    let raw = view.pinned(CONFIG)?.ok_or_else(invalid)?;
+    if raw.len() > METADATA_BYTES {
+        return Err(recovery_unknown());
+    }
+    let config: Config = serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
+    drop(raw);
+    let row = MvccKey::Row {
+        table_id,
+        primary_key: anchor.clone(),
+    };
+    if request_id.is_nil()
+        || !matches!(&group.kind, GroupKind::Data { table_id: own, .. } if *own == table_id)
+        || !owns(group, &config.span, &row)
+    {
+        return Err(invalid());
+    }
+    if config.split_child.is_some_and(|child| !child.complete) {
+        return Err(failure(
+            ErrorCode::StorageUnavailable,
+            "split child has not imported its dedup records yet",
+        ));
+    }
+    if config
+        .split_source
+        .as_ref()
+        .is_some_and(|source| source.published_at.is_some())
+    {
+        return Err(failure(
+            ErrorCode::StorageUnavailable,
+            "split routing moved this anchor to a child; refresh the route",
+        ));
+    }
+    let dedup = physical(
+        DEDUP,
+        &MvccKey::DirectDedup {
+            table_id,
+            anchor,
+            request_id,
+        },
+    )?;
+    let found = match view.pinned(&dedup)? {
+        None => None,
+        Some(raw) => Some(match Stored::decode(&raw).ok_or_else(recovery_unknown)? {
+            Stored::Committed(record) => DedupLookup::Committed {
+                digest: record.digest,
+                commit_ts: record.commit_ts,
+                result: DirectResult(record.result.to_owned()),
+            },
+            Stored::Forwarded(marker) => DedupLookup::Forwarded {
+                digest: marker.digest,
+            },
+        }),
+    };
+    view.encode(&found)
 }
 
 pub(super) fn expire(
@@ -460,6 +843,7 @@ pub(super) fn expire(
         || command.max_items == 0
         || command.max_items > MAX_DIRECT_EXPIRE_ITEMS
         || command.cutoff_unix_ms == 0
+        || command.retention_ms == 0
     {
         return reject(tx, Fault::InvalidBinding);
     }
@@ -470,9 +854,15 @@ pub(super) fn expire(
     if config.split_source.is_some() || config.split_child.is_some_and(|child| !child.complete) {
         return reject(tx, Fault::Incomplete);
     }
+    // A leader clock ahead of the group's own stamps cannot cut into the
+    // retention window of records this group already holds.
+    let high = load::<u64>(tx, UNIX_HIGH)?.unwrap_or(0);
+    let cutoff = command
+        .cutoff_unix_ms
+        .min(high.saturating_sub(command.retention_ms));
     let (deleted, complete) = sweep(
         tx,
-        command.cutoff_unix_ms,
+        cutoff,
         command.max_items,
         APPLY.batch_bytes - (64 << 10),
     )?;
@@ -547,8 +937,11 @@ pub(super) fn import_image(
         return Err(invalid());
     }
     let value = image.value.as_ref().ok_or_else(invalid)?;
-    let record: DedupRecord<'_> = serde_json::from_str(value.as_str()).map_err(|_| invalid())?;
-    if record.commit_ts != image.commit_ts {
+    let stored = Stored::decode(value.as_str().as_bytes()).ok_or_else(invalid)?;
+    // A marker has no commit; its image carries the traversal's cut.
+    if let Stored::Committed(record) = &stored
+        && record.commit_ts != image.commit_ts
+    {
         return Err(invalid());
     }
     let dedup = physical(DEDUP, &image.key)?;
@@ -559,24 +952,37 @@ pub(super) fn import_image(
             Err(recovery_unknown())
         };
     }
-    put_record(tx, &dedup, &record)
+    // Imported stamps raise the high-water, so expiry on the child or the
+    // restored group is clamped as it was on the source.
+    let applied_unix_ms = stored.applied_unix_ms();
+    if load::<u64>(tx, UNIX_HIGH)?.is_none_or(|high| high < applied_unix_ms) {
+        tx.put_serialized(UNIX_HIGH, &applied_unix_ms)?;
+    }
+    match &stored {
+        Stored::Committed(record) => put_entry(tx, &dedup, applied_unix_ms, record),
+        Stored::Forwarded(marker) => put_entry(tx, &dedup, applied_unix_ms, marker),
+    }
 }
 
 /// A dedup image for the committed-image traversal, or `None` when its
-/// commit is above the cut.
+/// commit is above the cut. A forward marker is not versioned: it travels
+/// whenever it exists, stamped with the cut, so a request the queued path
+/// may have accepted can never run directly on a split child or a restored
+/// group.
 pub(super) fn image_from_record(
     key: MvccKey,
     value: &[u8],
     read_ts: ReadTs,
     owner: Arc<ScratchLease>,
 ) -> Result<Option<super::image_archive::CommittedImage>, ProtocolError> {
-    let record: DedupRecord<'_> = serde_json::from_slice(value).map_err(|_| recovery_unknown())?;
-    if record.commit_ts > read_ts {
-        return Ok(None);
-    }
+    let commit_ts = match Stored::decode(value).ok_or_else(recovery_unknown)? {
+        Stored::Committed(record) if record.commit_ts > read_ts => return Ok(None),
+        Stored::Committed(record) => record.commit_ts,
+        Stored::Forwarded(_) => read_ts,
+    };
     Ok(Some(super::image_archive::CommittedImage {
         key,
-        commit_ts: record.commit_ts,
+        commit_ts,
         value: Some(CanonicalJson::from_stored_json(value, owner)?),
     }))
 }
@@ -584,6 +990,15 @@ pub(super) fn image_from_record(
 /// The highest direct commit timestamp applied on this group.
 pub(super) fn high(tx: &mut GroupTransaction<'_>) -> Result<Option<CommitTs>, ProtocolError> {
     load::<CommitTs>(tx, DIRECT_HIGH)
+}
+
+impl DirectForward {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match &self.anchor {
+            Key::Utf8(text) => text.capacity(),
+            _ => 0,
+        }
+    }
 }
 
 impl crate::oltp_replication::owned::OwnedPayload for DirectCommit {

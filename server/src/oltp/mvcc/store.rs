@@ -75,6 +75,9 @@ struct Config {
     split_source: Option<lineage::SplitSourceState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     split_child: Option<lineage::SplitChildVisibility>,
+    /// The split holding the replicated direct-commit barrier, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_pause: Option<Uuid>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -157,6 +160,14 @@ pub(crate) enum ParticipantCommand {
     /// Deletes dedup records older than a cutoff the proposer computed, so
     /// every replica deletes the same records. Gated like `Direct`.
     DirectExpire(direct::DirectExpire),
+    /// Settles a request id at its anchor before it takes the queued path.
+    /// Gated like `Direct`.
+    DirectForward(direct::DirectForward),
+    /// The replicated split barrier for direct commits. Gated like `Direct`.
+    DirectPause(direct::DirectPause),
+    /// The source's publication timestamp for a complete split child.
+    /// Gated like `Direct`.
+    ChildPublished(direct::ChildPublished),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -194,6 +205,13 @@ pub(crate) enum ParticipantReply {
         deleted: u64,
         complete: bool,
     },
+    DirectPaused {
+        split_id: Uuid,
+        paused: bool,
+    },
+    ChildPublished {
+        published_at: CommitTs,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -206,10 +224,18 @@ pub(crate) enum Fault {
     Incomplete,
     AlreadyDecided,
     ResourceLimit,
-    /// The schema or routing epoch differs from the group's, or the group
-    /// is frozen for a split: refresh the route. Emitted only for direct
-    /// commits, which are gated by `data.direct.v1`.
+    /// The schema or routing epoch differs from the group's: refresh the
+    /// route. Emitted only for direct commits, which are gated by
+    /// `data.direct.v1`.
     StaleEpoch,
+    /// A split holds the range (its direct barrier, a frozen source or an
+    /// unimported child). The executor falls back to the queued path or
+    /// waits; a route refresh would return the same route. Direct only.
+    SplitInProgress,
+    /// A split freeze whose cut is below a direct commit that already
+    /// applied: take the direct barrier and allocate a newer cut. Emitted
+    /// only once direct commits exist.
+    DirectCommitAboveCut,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +375,30 @@ impl ParticipantMachine {
             self.clock.settle(commit_ts);
         }
         Ok(applied)
+    }
+    /// The dedup record or forward marker for `request_id` at `anchor`
+    /// (plan addendum 2026-11-19). Callers go through
+    /// `ParticipantHandle::direct_dedup`, which takes the linearizable
+    /// barrier first.
+    pub(super) async fn direct_dedup(
+        &self,
+        table_id: Uuid,
+        anchor: Key,
+        request_id: Uuid,
+    ) -> Result<Option<direct::DedupLookup>, ProtocolError> {
+        let group = self.store.identity().clone();
+        let raw = self
+            .store
+            .read(
+                TransactionBudget {
+                    scratch_bytes: 1 << 20,
+                    batch_bytes: 0,
+                    output_bytes: 64 << 10,
+                },
+                move |view| direct::read_dedup(view, &group, table_id, anchor, request_id),
+            )
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
     /// A read never guesses the status of an unresolved intent. The caller
     /// releases native capacity before consulting the current status leader.
@@ -520,6 +570,8 @@ fn apply(
             gc_floor: config.as_ref().map_or(imported_floor, |c| c.gc_floor),
             split_source: config.as_ref().and_then(|c| c.split_source.clone()),
             split_child: config.as_ref().and_then(|c| c.split_child),
+            // A fence keeps the split barrier: the split outlives the run.
+            direct_pause: config.as_ref().and_then(|c| c.direct_pause),
         };
         if encoded_length(&next_config, METADATA_BYTES).is_err() {
             return reject(tx, Fault::ResourceLimit);
@@ -542,6 +594,15 @@ fn apply(
         }
         ParticipantCommand::DirectExpire(expire) => {
             return direct::expire(tx, group, config.as_ref(), expire);
+        }
+        ParticipantCommand::DirectForward(forward) => {
+            return direct::forward(tx, group, config.as_ref(), forward);
+        }
+        ParticipantCommand::DirectPause(pause) => {
+            return direct::pause(tx, group, config, pause);
+        }
+        ParticipantCommand::ChildPublished(published) => {
+            return direct::child_published(tx, group, config, published);
         }
         _ => {}
     }
@@ -995,7 +1056,10 @@ fn apply(
         | ParticipantCommand::RejectTimestampPoint { .. }
         | ParticipantCommand::Lifecycle(_)
         | ParticipantCommand::Direct(_)
-        | ParticipantCommand::DirectExpire(_) => unreachable!(),
+        | ParticipantCommand::DirectExpire(_)
+        | ParticipantCommand::DirectForward(_)
+        | ParticipantCommand::DirectPause(_)
+        | ParticipantCommand::ChildPublished(_) => unreachable!(),
     }
 }
 
@@ -1245,6 +1309,9 @@ impl std::fmt::Display for ParticipantCommand {
             Self::Resolve { .. } => "participant-resolve",
             Self::Direct(_) => "participant-direct",
             Self::DirectExpire(_) => "participant-direct-expire",
+            Self::DirectForward(_) => "participant-direct-forward",
+            Self::DirectPause(_) => "participant-direct-pause",
+            Self::ChildPublished(_) => "participant-child-published",
         })
     }
 }
@@ -1566,7 +1633,14 @@ impl ParticipantCommand {
     /// Commands only a range leader with `data.direct.v1` proposes. They are
     /// never nested inside a scoped or timestamp-point envelope.
     pub(crate) fn is_direct(&self) -> bool {
-        matches!(self, Self::Direct(_) | Self::DirectExpire(_))
+        matches!(
+            self,
+            Self::Direct(_)
+                | Self::DirectExpire(_)
+                | Self::DirectForward(_)
+                | Self::DirectPause(_)
+                | Self::ChildPublished(_)
+        )
     }
     pub(crate) fn uses_prepare_lane(&self) -> bool {
         matches!(
@@ -1621,6 +1695,7 @@ impl OwnedPayload for ParticipantCommand {
                 }
             }
             Self::Direct(direct) => add(direct.heap_bytes()?)?,
+            Self::DirectForward(forward) => add(forward.heap_bytes())?,
             Self::PreparePage {
                 plan,
                 writes,

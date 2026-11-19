@@ -102,22 +102,36 @@ async fn apply_at(
 /// Every key and value in the group's applied-state namespace. The applied
 /// position and reply live in separate metadata keys, so a rejected entry
 /// leaves this dump unchanged.
+/// Pages of at most 32 records keep each read inside `BUDGET`.
 async fn dump(machine: &ParticipantMachine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let raw = machine
-        .store()
-        .read(BUDGET, |view| {
-            let mut out = Vec::new();
-            let mut cursor = Vec::new();
-            while let Some(record) = view.first_from(&[], &cursor)? {
-                out.push((record.key().to_vec(), record.value().to_vec()));
-                cursor = record.key().to_vec();
-                cursor.push(0);
-            }
-            view.encode(&out)
-        })
-        .await
-        .unwrap();
-    serde_json::from_slice(raw.as_slice()).unwrap()
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    loop {
+        let mut cursor = out.last().map(|(key, _)| key.clone());
+        if let Some(cursor) = cursor.as_mut() {
+            cursor.push(0);
+        }
+        let raw = machine
+            .store()
+            .read(BUDGET, move |view| {
+                let mut page = Vec::new();
+                let mut cursor = cursor.unwrap_or_default();
+                while page.len() < 32
+                    && let Some(record) = view.first_from(&[], &cursor)?
+                {
+                    page.push((record.key().to_vec(), record.value().to_vec()));
+                    cursor = record.key().to_vec();
+                    cursor.push(0);
+                }
+                view.encode(&page)
+            })
+            .await
+            .unwrap();
+        let page: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(raw.as_slice()).unwrap();
+        if page.is_empty() {
+            return out;
+        }
+        out.extend(page);
+    }
 }
 fn count_tag(dump: &[(Vec<u8>, Vec<u8>)], tag: u8) -> usize {
     dump.iter()
@@ -265,6 +279,27 @@ impl Fixture {
     }
     async fn dump(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.replica.dump().await
+    }
+    /// A `DirectForward` of `request_id` (body `body`) anchored at `key`.
+    fn forward_of(&self, key: i64, request_id: Uuid, body: u8) -> DirectForward {
+        DirectForward {
+            authority: self.authority,
+            table_id: self.table,
+            anchor: Key::Int64(key),
+            request_id,
+            digest: digest(body),
+            applied_unix_ms: 5_000,
+        }
+    }
+    async fn forward(&mut self, forward: &DirectForward) -> ParticipantReply {
+        self.submit(ParticipantCommand::DirectForward(forward.clone()))
+            .await
+    }
+    async fn lookup(&self, key: i64, request_id: Uuid) -> Option<DedupLookup> {
+        self.machine()
+            .direct_dedup(self.table, Key::Int64(key), request_id)
+            .await
+            .unwrap()
     }
     fn key(&self, key: i64) -> MvccKey {
         MvccKey::Row {
@@ -456,10 +491,20 @@ struct QueuedPlan {
     root: Digest,
 }
 
+/// Register like the executor: take the leader token, then (here, already)
+/// the timestamp, then register.
+fn register(clock: &RangeClock, commit_ts: u64, keys: Vec<MvccKey>) -> Result<(), ClockRejection> {
+    let token = clock.leader_token().ok_or(ClockRejection::NotServing)?;
+    clock.register_pending(token, ts(commit_ts), keys)
+}
+
 fn applied(commit_ts: u64) -> ParticipantReply {
     ParticipantReply::Direct(DirectReply::Applied {
         commit_ts: ts(commit_ts),
     })
+}
+fn forwarded_reply() -> ParticipantReply {
+    ParticipantReply::Direct(DirectReply::Forwarded)
 }
 fn rejected(fault: Fault) -> ParticipantReply {
     ParticipantReply::Direct(DirectReply::Rejected(fault))
@@ -976,8 +1021,12 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
             children: Box::new(bindings(12)),
         })
         .await,
-        ParticipantReply::Rejected(Fault::Conflict)
+        ParticipantReply::Rejected(Fault::DirectCommitAboveCut)
     );
+    // A forward marker written before the freeze travels with its anchor
+    // (key 2, left child) like a dedup record.
+    let forwarded = f.forward_of(2, Uuid::new_v4(), 7);
+    assert_eq!(f.forward(&forwarded).await, forwarded_reply());
     let bindings = bindings(14);
     assert!(matches!(
         f.submit(ParticipantCommand::SplitFreeze {
@@ -987,9 +1036,28 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
         .await,
         ParticipantReply::SplitSourceFrozen(_)
     ));
-    // The frozen source takes no direct commit.
+    // The frozen source takes no direct commit, and says so with a fault
+    // the executor maps to Fallback rather than a route refresh (F6).
     let frozen = f.put(6, None, 15);
-    assert_rejected_without_writes(&mut f, &frozen, Fault::StaleEpoch).await;
+    assert_rejected_without_writes(&mut f, &frozen, Fault::SplitInProgress).await;
+    // An exact retry still replays while frozen, and writes nothing.
+    let before = f.dump().await;
+    let retry = DirectCommit {
+        commit_ts: ts(16),
+        ..left.clone()
+    };
+    assert_eq!(f.direct(&retry).await, replayed(&left));
+    // A forward on the frozen source returns the committed result, and
+    // cannot write a marker the copy would miss.
+    assert_eq!(
+        f.forward(&f.forward_of(1, left.request_id, 1)).await,
+        replayed(&left)
+    );
+    assert_eq!(
+        f.forward(&f.forward_of(6, Uuid::new_v4(), 1)).await,
+        rejected(Fault::SplitInProgress)
+    );
+    assert_eq!(f.dump().await, before);
 
     for (child, binding) in children.iter_mut().zip(bindings.iter()) {
         assert_eq!(
@@ -1008,7 +1076,17 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     let before = children[0].dump().await;
     assert_eq!(
         children[0].submit(ParticipantCommand::Direct(early)).await,
-        rejected(Fault::StaleEpoch)
+        rejected(Fault::SplitInProgress)
+    );
+    // Nor a publication floor before its import completes (F8).
+    assert_eq!(
+        children[0]
+            .submit(ParticipantCommand::ChildPublished(ChildPublished {
+                authority: f.authority,
+                published_at: ts(20),
+            }))
+            .await,
+        ParticipantReply::Rejected(Fault::Incomplete)
     );
     assert_eq!(children[0].dump().await, before);
 
@@ -1061,16 +1139,25 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
             break;
         }
     }
-    // Rows plus their dedup records, each with its anchor's child.
-    assert_eq!(imported, [2, 4]);
-    for (child, keys) in children
-        .iter()
-        .zip([vec![left.clone()], vec![right.clone(), late.clone()]])
-    {
+    // Rows plus their dedup records and markers, each with its anchor's
+    // child.
+    assert_eq!(imported, [3, 4]);
+    for (child, records) in children.iter().zip([2, 2]) {
         let state = child.dump().await;
-        assert_eq!(count_tag(&state, DEDUP), keys.len());
-        assert_eq!(count_tag(&state, EXPIRY), keys.len());
+        assert_eq!(count_tag(&state, DEDUP), records);
+        assert_eq!(count_tag(&state, EXPIRY), records);
     }
+    // The forwarded request cannot run directly on the child either.
+    let mut late_attempt = f.commit(forwarded.request_id, 7, 21, vec![f.write(2, None, None)]);
+    late_attempt.routing_epoch = 2;
+    let before = children[0].dump().await;
+    assert_eq!(
+        children[0]
+            .submit(ParticipantCommand::Direct(late_attempt))
+            .await,
+        forwarded_reply()
+    );
+    assert_eq!(children[0].dump().await, before);
     // A retry routed to the child replays the source's exact result.
     for (child, commit, expected) in [
         (0usize, &left, Some(10)),
@@ -1105,6 +1192,47 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
     assert_eq!(
         children[1].submit(ParticipantCommand::Direct(at_cut)).await,
         applied(15)
+    );
+    // F8: once told the source's publication timestamp, the child keeps
+    // direct commits above it, since the source served snapshots up to it.
+    let published = |published_at| {
+        ParticipantCommand::ChildPublished(ChildPublished {
+            authority: f.authority,
+            published_at: ts(published_at),
+        })
+    };
+    let done = ParticipantReply::ChildPublished {
+        published_at: ts(20),
+    };
+    assert_eq!(
+        children[1].submit(published(14)).await,
+        ParticipantReply::Rejected(Fault::InvalidBinding),
+        "publication is above the cut"
+    );
+    assert_eq!(children[1].submit(published(20)).await, done);
+    assert_eq!(children[1].submit(published(20)).await, done);
+    assert_eq!(
+        children[1].submit(published(21)).await,
+        ParticipantReply::Rejected(Fault::Conflict)
+    );
+    for (commit_ts, reply) in [
+        (19, rejected(Fault::Conflict)),
+        (20, rejected(Fault::Conflict)),
+    ] {
+        let mut below = f.put(4, Some(15), commit_ts);
+        below.routing_epoch = 2;
+        let before = children[1].dump().await;
+        assert_eq!(
+            children[1].submit(ParticipantCommand::Direct(below)).await,
+            reply
+        );
+        assert_eq!(children[1].dump().await, before);
+    }
+    let mut above = f.put(4, Some(15), 21);
+    above.routing_epoch = 2;
+    assert_eq!(
+        children[1].submit(ParticipantCommand::Direct(above)).await,
+        applied(21)
     );
 }
 
@@ -1310,6 +1438,7 @@ async fn d03_direct_expire_deletes_exactly_the_records_before_the_cutoff_on_ever
         ParticipantCommand::DirectExpire(DirectExpire {
             authority,
             cutoff_unix_ms: cutoff,
+            retention_ms: 50,
             max_items,
         })
     };
@@ -1324,11 +1453,21 @@ async fn d03_direct_expire_deletes_exactly_the_records_before_the_cutoff_on_ever
         (expire(0, 1), Fault::InvalidBinding),
         (
             ParticipantCommand::DirectExpire(DirectExpire {
+                authority,
+                cutoff_unix_ms: 250,
+                retention_ms: 0,
+                max_items: 1,
+            }),
+            Fault::InvalidBinding,
+        ),
+        (
+            ParticipantCommand::DirectExpire(DirectExpire {
                 authority: Authority {
                     owner_term: 9,
                     ..authority
                 },
                 cutoff_unix_ms: 250,
+                retention_ms: 50,
                 max_items: 1,
             }),
             Fault::StaleAuthority,
@@ -1367,8 +1506,8 @@ async fn d06_registration_requires_leadership_and_an_applied_entry_of_the_term()
     let f = Fixture::new().await;
     let clock = f.machine().range_clock().clone();
     assert_eq!(
-        clock.register_pending(ts(10), vec![f.key(1)]),
-        Err(ClockRejection::NotServing),
+        clock.leader_token(),
+        None,
         "a clock that never led refuses commits"
     );
     // The fixture applied term-1 entries. Leading term 2 holds until an
@@ -1377,7 +1516,7 @@ async fn d06_registration_requires_leadership_and_an_applied_entry_of_the_term()
     clock.lead(2);
     assert!(!clock.serving());
     assert_eq!(
-        clock.register_pending(ts(10), vec![f.key(1)]),
+        register(&clock, 10, vec![f.key(1)]),
         Err(ClockRejection::NotServing)
     );
     let read = tokio::spawn({
@@ -1394,15 +1533,18 @@ async fn d06_registration_requires_leadership_and_an_applied_entry_of_the_term()
     });
     read.await.unwrap().unwrap();
     assert!(clock.serving());
-    assert_eq!(clock.register_pending(ts(10), vec![f.key(1)]), Ok(()));
+    assert_eq!(register(&clock, 10, vec![f.key(1)]), Ok(()));
     assert_eq!(
-        clock.register_pending(ts(10), vec![f.key(1)]),
+        register(&clock, 10, vec![f.key(1)]),
         Err(ClockRejection::Duplicate)
     );
+    let token = clock.leader_token().unwrap();
+    assert_eq!(token.term(), 2);
     clock.step_down();
     assert_eq!(clock.pending_len(), 0);
+    assert_eq!(clock.leader_token(), None);
     assert_eq!(
-        clock.register_pending(ts(11), vec![f.key(1)]),
+        clock.register_pending(token, ts(11), vec![f.key(1)]),
         Err(ClockRejection::NotServing)
     );
 }
@@ -1417,14 +1559,14 @@ async fn d06_a_commit_cannot_land_at_or_below_an_already_served_snapshot() {
     for commit_ts in [19, 20] {
         assert!(clock.needs_new_timestamp(ts(commit_ts)));
         assert_eq!(
-            clock.register_pending(ts(commit_ts), vec![f.key(1)]),
+            register(&clock, commit_ts, vec![f.key(1)]),
             Err(ClockRejection::StaleTimestamp {
                 max_read_ts: ts(20)
             })
         );
     }
     assert!(!clock.needs_new_timestamp(ts(21)));
-    clock.register_pending(ts(21), vec![f.key(1)]).unwrap();
+    register(&clock, 21, vec![f.key(1)]).unwrap();
     assert_eq!(f.direct(&f.put(1, None, 21)).await, applied(21));
     assert_eq!(clock.pending_len(), 0, "apply settles the pending entry");
     assert_eq!(
@@ -1447,17 +1589,17 @@ async fn d06_t3_a_window_value_below_the_gc_safe_point_is_safe() {
     let safe_point = 60;
     // Nothing read this range yet: the low commit lands, and every snapshot
     // a reader may still take (at or above the safe point) sees it.
-    clock.register_pending(ts(45), vec![f.key(1)]).unwrap();
+    register(&clock, 45, vec![f.key(1)]).unwrap();
     assert_eq!(f.direct(&f.put(1, None, 45)).await, applied(45));
     assert_eq!(f.version(safe_point, 1).await, Some(45));
     // A snapshot at the safe point already read the range: another value
     // from that old window is refused and must be re-allocated.
     assert_eq!(f.version(safe_point, 2).await, None);
     assert!(matches!(
-        clock.register_pending(ts(46), vec![f.key(2)]),
+        register(&clock, 46, vec![f.key(2)]),
         Err(ClockRejection::StaleTimestamp { .. })
     ));
-    clock.register_pending(ts(61), vec![f.key(2)]).unwrap();
+    register(&clock, 61, vec![f.key(2)]).unwrap();
     assert_eq!(f.direct(&f.put(2, None, 61)).await, applied(61));
     assert_eq!(f.version(safe_point, 2).await, None);
     assert_eq!(f.version(61, 2).await, Some(61));
@@ -1468,8 +1610,8 @@ async fn d06_o07_reads_and_scans_wait_for_pending_commits_at_or_below_their_snap
     let mut f = Fixture::new().await;
     f.lead();
     let clock = f.machine().range_clock().clone();
-    clock.register_pending(ts(15), vec![f.key(1)]).unwrap();
-    clock.register_pending(ts(25), vec![f.key(2)]).unwrap();
+    register(&clock, 15, vec![f.key(1)]).unwrap();
+    register(&clock, 25, vec![f.key(2)]).unwrap();
     let scan = tokio::spawn({
         let machine = f.machine().clone();
         let table = f.table;
@@ -1509,29 +1651,6 @@ async fn d06_o07_reads_and_scans_wait_for_pending_commits_at_or_below_their_snap
         scan_versions(f.machine(), f.table, 30).await,
         BTreeMap::from([(1, 15)])
     );
-}
-
-#[tokio::test]
-async fn d06_a_split_can_pause_direct_commits_and_wait_for_the_range_to_drain() {
-    let mut f = Fixture::new().await;
-    f.lead();
-    let clock = f.machine().range_clock().clone();
-    clock.register_pending(ts(10), vec![f.key(1)]).unwrap();
-    let pause = clock.pause_commits();
-    assert_eq!(
-        clock.register_pending(ts(11), vec![f.key(2)]),
-        Err(ClockRejection::Paused)
-    );
-    let drained = tokio::spawn({
-        let clock = clock.clone();
-        async move { clock.drained().await }
-    });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!drained.is_finished());
-    assert_eq!(f.direct(&f.put(1, None, 10)).await, applied(10));
-    drained.await.unwrap().unwrap();
-    drop(pause);
-    clock.register_pending(ts(11), vec![f.key(2)]).unwrap();
 }
 
 async fn scan_versions(machine: &ParticipantMachine, table: Uuid, s: u64) -> BTreeMap<i64, u64> {
@@ -1615,7 +1734,7 @@ async fn d06_o09_concurrent_scans_see_exactly_the_commits_at_or_below_their_snap
                     rng ^= rng >> 7;
                     rng ^= rng << 17;
                     tokio::time::sleep(Duration::from_micros(rng % 2000)).await;
-                    match clock.register_pending(ts(commit_ts), vec![row.clone()]) {
+                    match register(&clock, commit_ts, vec![row.clone()]) {
                         Ok(()) => break commit_ts,
                         Err(ClockRejection::StaleTimestamp { .. }) => stale += 1,
                         Err(other) => panic!("{other:?}"),
@@ -1696,10 +1815,35 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
     let expire = serde_json::to_value(ParticipantCommand::DirectExpire(DirectExpire {
         authority: f.authority,
         cutoff_unix_ms: 1,
+        retention_ms: 1,
         max_items: 1,
     }))
     .unwrap();
     assert!(expire.get("direct_expire").is_some());
+    for (command, tag) in [
+        (
+            ParticipantCommand::DirectForward(f.forward_of(1, Uuid::new_v4(), 1)),
+            "direct_forward",
+        ),
+        (
+            ParticipantCommand::DirectPause(DirectPause {
+                authority: f.authority,
+                split_id: Uuid::new_v4(),
+                paused: true,
+            }),
+            "direct_pause",
+        ),
+        (
+            ParticipantCommand::ChildPublished(ChildPublished {
+                authority: f.authority,
+                published_at: ts(1),
+            }),
+            "child_published",
+        ),
+    ] {
+        assert!(command.is_direct());
+        assert!(serde_json::to_value(command).unwrap().get(tag).is_some());
+    }
     // The participant command decoder rejects a variant it does not know,
     // which is how an older replica fails on these tags.
     let unknown = serde_json::json!({"direct_v2": {}});
@@ -1738,4 +1882,712 @@ async fn o02_direct_variants_use_new_tags_that_an_older_decoder_rejects() {
         ParticipantReply::Rejected(Fault::InvalidBinding)
     );
     assert_eq!(f.dump().await, before);
+}
+
+// ---------------------------------------------------------------------------
+// RV-T4 fixes (T4fix)
+// ---------------------------------------------------------------------------
+
+/// F1: a leadership change fails reads that waited on a pending commit,
+/// instead of letting them read without it.
+#[tokio::test]
+async fn d06_o09_a_leadership_change_fails_reads_waiting_on_pending_commits() {
+    let f = Fixture::new().await;
+    for (round, change) in [(0u64, "step_down"), (1, "lead")] {
+        let (pending, s) = (15 + 100 * round, 20 + 100 * round);
+        f.lead();
+        let clock = f.machine().range_clock().clone();
+        register(&clock, pending, vec![f.key(1)]).unwrap();
+        let read = tokio::spawn({
+            let machine = f.machine().clone();
+            let key = f.key(1);
+            async move { machine.read_at(ts(s), key).await.map(drop) }
+        });
+        let scan = tokio::spawn({
+            let machine = f.machine().clone();
+            let table = f.table;
+            async move {
+                machine
+                    .scan_page(super::super::scan::ScanRequest {
+                        domain: super::super::scan::ScanDomain::Rows { table_id: table },
+                        read_ts: ts(s),
+                        after: None,
+                        after_owner: None,
+                        lower: None,
+                        upper: None,
+                        max_items: 16,
+                        max_bytes: crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
+                    })
+                    .await
+                    .map(drop)
+            }
+        });
+        let latest = tokio::spawn({
+            let clock = clock.clone();
+            let key = f.key(1);
+            async move { clock.wait_latest(&key).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!read.is_finished() && !scan.is_finished() && !latest.is_finished());
+        match change {
+            // The commit at 15 may still commit under the next leader.
+            "step_down" => clock.step_down(),
+            // A newer term on this node drops the older term's pending
+            // entries just the same.
+            _ => clock.lead(5),
+        }
+        for (what, result) in [
+            ("read", read.await.unwrap()),
+            ("scan", scan.await.unwrap()),
+            ("latest", latest.await.unwrap()),
+        ] {
+            let error = result.expect_err(what);
+            assert_eq!(
+                error.code,
+                ErrorCode::StorageUnavailable,
+                "{what} after {change}"
+            );
+        }
+        // A read that starts after the change is not affected by it.
+        clock.step_down();
+        f.machine().read_at(ts(s), f.key(1)).await.unwrap();
+    }
+}
+
+/// F4: a timestamp fetched under one leadership cannot register under a
+/// later one, even on the same node, because another leader may have served
+/// a snapshot above it meanwhile.
+#[tokio::test]
+async fn d06_a_timestamp_fetched_before_a_leadership_change_cannot_register() {
+    let f = Fixture::new().await;
+    let clock = f.machine().range_clock().clone();
+    clock.lead(1);
+    let token = clock.leader_token().unwrap();
+    // The Timestamp RPC is in flight while leadership moves away and back:
+    // another node led term 2, and this node leads term 3.
+    clock.step_down();
+    clock.lead(3);
+    clock.observe_applied(AppliedPosition {
+        term: 3,
+        node_id: 1,
+        index: 50,
+    });
+    assert!(clock.serving());
+    assert_eq!(
+        clock.max_read_ts(),
+        None,
+        "this node never saw the other read"
+    );
+    assert_eq!(
+        clock.register_pending(token, ts(100), vec![f.key(1)]),
+        Err(ClockRejection::NotServing)
+    );
+    // Without a step-down in between, a newer term refuses the token too.
+    let token = clock.leader_token().unwrap();
+    clock.lead(4);
+    clock.observe_applied(AppliedPosition {
+        term: 4,
+        node_id: 1,
+        index: 51,
+    });
+    assert_eq!(
+        clock.register_pending(token, ts(100), vec![f.key(1)]),
+        Err(ClockRejection::NotServing)
+    );
+    // A token taken now, before a new timestamp, registers.
+    let token = clock.leader_token().unwrap();
+    assert_eq!(token.term(), 4);
+    assert_eq!(
+        clock.register_pending(token, ts(101), vec![f.key(1)]),
+        Ok(())
+    );
+}
+
+/// F3: a forward marker settles a request id for the queued path, so a
+/// later direct attempt answers `Forwarded` and never applies.
+#[tokio::test]
+async fn d03_a_forward_marker_makes_a_later_direct_attempt_fall_back() {
+    let mut f = Fixture::new().await;
+    let request = Uuid::new_v4();
+    assert_eq!(f.lookup(1, request).await, None);
+    let forward = f.forward_of(1, request, 3);
+    assert_eq!(f.forward(&forward).await, forwarded_reply());
+    let state = f.dump().await;
+    assert_eq!(count_tag(&state, DEDUP), 1);
+    assert_eq!(count_tag(&state, EXPIRY), 1);
+    assert_eq!(
+        f.lookup(1, request).await,
+        Some(DedupLookup::Forwarded { digest: digest(3) })
+    );
+    // Repeating the forward is idempotent.
+    assert_eq!(f.forward(&forward).await, forwarded_reply());
+    assert_eq!(f.dump().await, state);
+    // The direct attempt of the same request falls back and writes nothing,
+    // even with a valid head and timestamp.
+    let attempt = f.commit(
+        request,
+        3,
+        10,
+        vec![f.write(1, None, Some(serde_json::json!({})))],
+    );
+    assert_eq!(f.direct(&attempt).await, forwarded_reply());
+    assert_eq!(f.dump().await, state);
+    // A different body under the same id conflicts on both paths.
+    let other = f.commit(request, 4, 10, vec![f.write(1, None, None)]);
+    assert_rejected_without_writes(&mut f, &other, Fault::Conflict).await;
+    assert_eq!(
+        f.forward(&f.forward_of(1, request, 4)).await,
+        rejected(Fault::Conflict)
+    );
+    // The marker is per anchor: another anchor is another request scope.
+    let elsewhere = f.commit(request, 3, 10, vec![f.write(2, None, None)]);
+    assert_eq!(f.direct(&elsewhere).await, applied(10));
+    // A bad forward writes nothing.
+    let before = f.dump().await;
+    let mut stale = f.forward_of(3, Uuid::new_v4(), 1);
+    stale.authority.owner_term += 1;
+    let mut zero_clock = f.forward_of(3, Uuid::new_v4(), 1);
+    zero_clock.applied_unix_ms = 0;
+    let mut other_table = f.forward_of(3, Uuid::new_v4(), 1);
+    other_table.table_id = Uuid::new_v4();
+    for (forward, fault) in [
+        (stale, Fault::StaleAuthority),
+        (zero_clock, Fault::InvalidBinding),
+        (other_table, Fault::InvalidBinding),
+    ] {
+        assert_eq!(f.forward(&forward).await, rejected(fault));
+    }
+    assert_eq!(f.dump().await, before);
+}
+
+/// F3: a forward after the direct commit returns its result; the lookup
+/// reads the committed record behind the barrier.
+#[tokio::test]
+async fn d03_a_forward_after_a_direct_commit_returns_the_committed_result() {
+    let mut f = Fixture::with(
+        Uuid::new_v4(),
+        KeySpan {
+            start: Some(Key::Int64(0)),
+            end: Some(Key::Int64(100)),
+        },
+    )
+    .await;
+    let commit = f.put(1, None, 10);
+    assert_eq!(f.direct(&commit).await, applied(10));
+    let Some(DedupLookup::Committed {
+        digest: found,
+        commit_ts,
+        result,
+    }) = f.lookup(1, commit.request_id).await
+    else {
+        panic!("committed record not found")
+    };
+    assert_eq!((found, commit_ts), (commit.digest, ts(10)));
+    assert_eq!(result.get(), commit.result.as_str());
+    let before = f.dump().await;
+    assert_eq!(
+        f.forward(&f.forward_of(1, commit.request_id, 1)).await,
+        replayed(&commit)
+    );
+    assert_eq!(
+        f.forward(&f.forward_of(1, commit.request_id, 2)).await,
+        rejected(Fault::Conflict)
+    );
+    assert_eq!(f.dump().await, before, "no marker over a committed record");
+    // Anchors outside the range, or of another table, are not answered.
+    assert!(
+        f.machine()
+            .direct_dedup(f.table, Key::Int64(100), commit.request_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        f.machine()
+            .direct_dedup(Uuid::new_v4(), Key::Int64(1), commit.request_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.forward(&f.forward_of(100, Uuid::new_v4(), 1)).await,
+        rejected(Fault::InvalidBinding)
+    );
+}
+
+/// The two split bindings of the fixture's full span at `cut`.
+fn split_bindings(
+    f: &Fixture,
+    split_id: Uuid,
+    cut: u64,
+) -> [super::super::lineage::SplitBinding; 2] {
+    let txn = TxnId {
+        request_id: split_id,
+        attempt: 1,
+    };
+    let guard = lifecycle::VerifiedLifecycleGuard::model_for_test(
+        lifecycle::LifecycleBinding {
+            guard_id: split_id,
+            catalog_group_id: f.catalog_group_id,
+            table_id: f.table,
+            lifecycle_version: Some(ts(1)),
+            schema_epoch: 1,
+            txn,
+            request: RequestBinding {
+                run_id: f.authority.run_id,
+                request_id: split_id,
+                digest: digest(1),
+                accepted_context: digest(2),
+            },
+            // A binding's cut is above its guard's snapshot.
+            read_ts: ts(2),
+            authority: f.authority,
+        },
+        lifecycle::GuardMode::Exclusive,
+    )
+    .into_sealed();
+    let spans = [
+        KeySpan {
+            start: None,
+            end: Some(Key::Int64(3)),
+        },
+        KeySpan {
+            start: Some(Key::Int64(3)),
+            end: None,
+        },
+    ];
+    [0, 1].map(|i| {
+        let mut target = f.group.clone();
+        // Deterministic per split, so bindings at two cuts are comparable.
+        target.group_id = Uuid::from_u128(split_id.as_u128() ^ (i as u128 + 1));
+        target.kind = GroupKind::Data {
+            table_id: f.table,
+            shard_id: Uuid::from_u128(split_id.as_u128() ^ (i as u128 + 11)),
+        };
+        super::super::lineage::SplitBinding {
+            split_id,
+            source: f.group.clone(),
+            source_schema_epoch: 1,
+            source_routing_epoch: 1,
+            source_span: full_span(),
+            target,
+            target_span: spans[i].clone(),
+            read_ts: ts(cut),
+            guard: guard.clone(),
+        }
+    })
+}
+fn pause(f: &Fixture, split_id: Uuid, paused: bool) -> ParticipantCommand {
+    ParticipantCommand::DirectPause(DirectPause {
+        authority: f.authority,
+        split_id,
+        paused,
+    })
+}
+
+/// F5: the replicated barrier lets a split freeze succeed while direct
+/// writers keep committing, and a new leader (another replica applying the
+/// same log) keeps refusing direct commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_load() {
+    let f = Fixture::new().await;
+    let mut other = f.replica_of().await;
+    let source = Arc::new(AtomicU64::new(100));
+    // One log: every entry is applied on both replicas in the same order.
+    let log = Arc::new(tokio::sync::Mutex::new((
+        f.replica.index,
+        Vec::<ParticipantCommand>::new(),
+    )));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for writer in 0..3i64 {
+        let machine = f.machine().clone();
+        let shared = f.shared().clone();
+        let source = source.clone();
+        let log = log.clone();
+        let stop = stop.clone();
+        let template = f.put(0, None, 1);
+        let row_of = f.key(0);
+        writers.push(tokio::spawn(async move {
+            let (mut applied_count, mut refused) = (0u64, 0u64);
+            let mut n = 0i64;
+            while !stop.load(AtomicOrdering::SeqCst) {
+                n += 1;
+                let MvccKey::Row { table_id, .. } = &row_of else {
+                    unreachable!()
+                };
+                let mut commit = template.clone();
+                commit.request_id = Uuid::new_v4();
+                // The timestamp is fetched before the entry is appended.
+                commit.commit_ts = ts(source.fetch_add(1, AtomicOrdering::SeqCst) + 1);
+                commit.writes[0].key = MvccKey::Row {
+                    table_id: *table_id,
+                    primary_key: Key::Int64(writer * 100_000 + n),
+                };
+                tokio::time::sleep(Duration::from_micros(200)).await;
+                let mut log = log.lock().await;
+                let command = ParticipantCommand::Direct(commit);
+                let reply = apply_at(&machine, &shared, log.0, command.clone()).await;
+                log.0 += 1;
+                log.1.push(command);
+                drop(log);
+                match reply {
+                    ParticipantReply::Direct(DirectReply::Applied { .. }) => applied_count += 1,
+                    ParticipantReply::Direct(DirectReply::Rejected(Fault::SplitInProgress)) => {
+                        refused += 1
+                    }
+                    other => panic!("{other:?}"),
+                }
+                tokio::task::yield_now().await;
+            }
+            (applied_count, refused)
+        }));
+    }
+    let submit = |command: ParticipantCommand| {
+        let machine = f.machine().clone();
+        let shared = f.shared().clone();
+        let log = log.clone();
+        async move {
+            let mut log = log.lock().await;
+            let reply = apply_at(&machine, &shared, log.0, command.clone()).await;
+            log.0 += 1;
+            log.1.push(command);
+            reply
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Without the barrier, a cut allocated before more commits apply fails.
+    let early = split_bindings(&f, Uuid::new_v4(), source.load(AtomicOrdering::SeqCst));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        submit(ParticipantCommand::SplitFreeze {
+            authority: f.authority,
+            children: Box::new(early),
+        })
+        .await,
+        ParticipantReply::Rejected(Fault::DirectCommitAboveCut)
+    );
+    // The coordinator: barrier, then the cut, then the freeze.
+    let split_id = Uuid::new_v4();
+    assert_eq!(
+        submit(pause(&f, split_id, true)).await,
+        ParticipantReply::DirectPaused {
+            split_id,
+            paused: true
+        }
+    );
+    // Writers keep going (and are refused) while the cut is fetched.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cut = source.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(
+        submit(ParticipantCommand::SplitFreeze {
+            authority: f.authority,
+            children: Box::new(split_bindings(&f, split_id, cut)),
+        })
+        .await,
+        ParticipantReply::SplitSourceFrozen(_)
+    ));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.store(true, AtomicOrdering::SeqCst);
+    let (mut applied_total, mut refused_total) = (0, 0);
+    for writer in writers {
+        let (applied_count, refused) = writer.await.unwrap();
+        applied_total += applied_count;
+        refused_total += refused;
+    }
+    assert!(
+        applied_total > 0 && refused_total > 0,
+        "{applied_total} {refused_total}"
+    );
+    eprintln!("o16 barrier: {applied_total} applied, {refused_total} refused by the barrier");
+
+    // Another replica that applies the same log, as a new leader would,
+    // holds the same barrier state and refuses the same commits.
+    let (_, commands) = std::mem::take(&mut *log.lock().await);
+    let mut replies = Vec::new();
+    for command in commands {
+        replies.push(other.submit(command).await);
+    }
+    assert_eq!(other.dump().await, f.dump().await);
+    assert!(replies.contains(&rejected(Fault::SplitInProgress)));
+}
+
+/// F5: barrier ownership. Only its split can release it, a freeze of the
+/// same split takes it over, and it survives a fence.
+#[tokio::test]
+async fn o16_the_split_barrier_belongs_to_one_split() {
+    let mut f = Fixture::new().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let paused = |split_id, paused| ParticipantReply::DirectPaused { split_id, paused };
+    // Releasing a barrier nobody holds is a no-op.
+    assert_eq!(f.submit(pause(&f, a, false)).await, paused(a, false));
+    assert_eq!(f.submit(pause(&f, a, true)).await, paused(a, true));
+    assert_eq!(f.submit(pause(&f, a, true)).await, paused(a, true));
+    let state = f.dump().await;
+    for command in [pause(&f, b, true), pause(&f, b, false)] {
+        assert_eq!(
+            f.submit(command).await,
+            ParticipantReply::Rejected(Fault::Conflict)
+        );
+    }
+    assert_eq!(
+        f.submit(ParticipantCommand::SplitFreeze {
+            authority: f.authority,
+            children: Box::new(split_bindings(&f, b, 50)),
+        })
+        .await,
+        ParticipantReply::Rejected(Fault::Conflict)
+    );
+    let mut stale = DirectPause {
+        authority: f.authority,
+        split_id: a,
+        paused: false,
+    };
+    stale.authority.owner_term += 1;
+    assert_eq!(
+        f.submit(ParticipantCommand::DirectPause(stale)).await,
+        ParticipantReply::Rejected(Fault::StaleAuthority)
+    );
+    assert_eq!(f.dump().await, state);
+    // Direct commits are refused while it is held; forwards still work,
+    // because the freeze that follows copies the markers.
+    let blocked = f.put(1, None, 10);
+    assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
+    assert_eq!(
+        f.forward(&f.forward_of(1, Uuid::new_v4(), 1)).await,
+        forwarded_reply()
+    );
+    // A fence (new run) keeps the barrier.
+    let next = Authority {
+        run_id: f.authority.run_id,
+        owner_term: 2,
+    };
+    assert!(matches!(
+        f.submit(ParticipantCommand::Fence {
+            transition_id: Uuid::new_v4(),
+            expected: Some(f.authority),
+            next,
+            schema_epoch: 1,
+            routing_epoch: 1,
+            span: full_span(),
+            catalog_group_id: f.catalog_group_id,
+        })
+        .await,
+        ParticipantReply::Fenced(_)
+    ));
+    f.authority = next;
+    let blocked = f.put(1, None, 11);
+    assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
+    // The holder releases it; commits resume.
+    assert_eq!(f.submit(pause(&f, a, false)).await, paused(a, false));
+    assert_eq!(f.direct(&f.put(1, None, 12)).await, applied(12));
+    // Taken again, the freeze of the same split takes it over.
+    assert_eq!(f.submit(pause(&f, a, true)).await, paused(a, true));
+    assert!(matches!(
+        f.submit(ParticipantCommand::SplitFreeze {
+            authority: f.authority,
+            children: Box::new(split_bindings(&f, a, 50)),
+        })
+        .await,
+        ParticipantReply::SplitSourceFrozen(_)
+    ));
+    assert_eq!(f.submit(pause(&f, a, true)).await, paused(a, true));
+    assert_eq!(
+        f.submit(pause(&f, b, true)).await,
+        ParticipantReply::Rejected(Fault::Conflict)
+    );
+    let blocked = f.put(2, None, 60);
+    assert_rejected_without_writes(&mut f, &blocked, Fault::SplitInProgress).await;
+}
+
+/// F7: stamps never go below the group high-water, and an expire cutoff
+/// never goes above `high-water - retention`, so neither a clock behind
+/// nor a clock ahead deletes a record inside the retention window.
+#[tokio::test]
+async fn d03_dedup_expiry_is_clamped_to_the_group_high_water() {
+    let mut f = Fixture::new().await;
+    let mut commits = Vec::new();
+    for (key, unix_ms) in [(1, 1_000u64), (2, 2_000), (3, 500)] {
+        let mut commit = f.put(key, None, 10 + key as u64);
+        commit.applied_unix_ms = unix_ms;
+        assert_eq!(f.direct(&commit).await, applied(10 + key as u64));
+        commits.push(commit);
+    }
+    // A clock of 0 is refused.
+    let mut zero = f.put(4, None, 20);
+    zero.applied_unix_ms = 0;
+    assert_rejected_without_writes(&mut f, &zero, Fault::InvalidBinding).await;
+    let authority = f.authority;
+    let expire = move |cutoff_unix_ms, retention_ms| {
+        ParticipantCommand::DirectExpire(DirectExpire {
+            authority,
+            cutoff_unix_ms,
+            retention_ms,
+            max_items: MAX_DIRECT_EXPIRE_ITEMS,
+        })
+    };
+    // A leader whose clock runs far ahead proposes a cutoff that would
+    // delete everything; the group's own high-water (2000) bounds it to
+    // 2000 - 900 = 1100, so only the record stamped 1000 goes.
+    assert_eq!(
+        f.submit(expire(1_000_000, 900)).await,
+        ParticipantReply::DirectExpired {
+            deleted: 1,
+            complete: true
+        }
+    );
+    // The commit proposed with a clock behind (500) was stamped 2000, so a
+    // cutoff of 1500 (inside the window of the 2000 records) keeps it.
+    assert_eq!(
+        f.submit(expire(1_500, 400)).await,
+        ParticipantReply::DirectExpired {
+            deleted: 0,
+            complete: true
+        }
+    );
+    let state = f.dump().await;
+    assert_eq!(count_tag(&state, DEDUP), 2);
+    for commit in &commits[1..] {
+        let retry = DirectCommit {
+            commit_ts: ts(40),
+            ..commit.clone()
+        };
+        assert_eq!(f.direct(&retry).await, replayed(commit));
+    }
+    // Once the window has passed for the high-water itself, both go.
+    assert_eq!(
+        f.submit(expire(1_000_000, 1)).await,
+        ParticipantReply::DirectExpired {
+            deleted: 0,
+            complete: true
+        },
+        "records inside the window of the high-water are kept"
+    );
+    let mut later = f.put(9, None, 50);
+    later.applied_unix_ms = 10_000;
+    assert_eq!(f.direct(&later).await, applied(50));
+    assert_eq!(
+        f.submit(expire(1_000_000, 1_000)).await,
+        ParticipantReply::DirectExpired {
+            deleted: 2,
+            complete: true
+        }
+    );
+}
+
+/// F9: a well-formed command over a size limit answers `ResourceLimit`, so
+/// the executor uses the queued path instead of failing the request.
+#[tokio::test]
+async fn o07_oversized_direct_commands_answer_resource_limit() {
+    let mut f = Fixture::new().await;
+    let rows: Vec<DirectWrite> = (0..=MAX_DIRECT_WRITES as i64)
+        .map(|key| f.write(key, None, None))
+        .collect();
+    let too_many_rows = f.commit(Uuid::new_v4(), 1, 10, rows);
+    let mut wide = f.write(1, None, None);
+    wide.index = (0..=MAX_DIRECT_INDEX_CHANGES as i64)
+        .map(|value| IndexChange {
+            key: MvccKey::IndexEntry {
+                table_id: f.table,
+                index_id: Uuid::new_v4(),
+                values: Page::new(vec![IndexValue::Int64(value)]).unwrap(),
+                primary_key: Key::Int64(1),
+            },
+            expected_version: None,
+            value: None,
+        })
+        .collect();
+    let too_many_index_changes = f.commit(Uuid::new_v4(), 1, 10, vec![wide]);
+    let mut large_result = f.put(1, None, 10);
+    large_result.result = f.json(serde_json::json!("x".repeat(MAX_DIRECT_RESULT_BYTES)));
+    for command in [too_many_rows, too_many_index_changes, large_result] {
+        assert_rejected_without_writes(&mut f, &command, Fault::ResourceLimit).await;
+    }
+    // A malformed command is still `InvalidBinding`, even when also large.
+    let mut both = f.commit(
+        Uuid::new_v4(),
+        1,
+        10,
+        (0..=MAX_DIRECT_WRITES as i64)
+            .rev()
+            .map(|key| f.write(key, None, None))
+            .collect(),
+    );
+    both.request_id = Uuid::nil();
+    assert_rejected_without_writes(&mut f, &both, Fault::InvalidBinding).await;
+}
+
+/// F11: a split child refuses staging when a stray dedup record or forward
+/// marker exists, rather than turning a later import into recovery_unknown.
+#[tokio::test]
+async fn o16_a_split_child_with_a_stray_dedup_record_refuses_staging() {
+    let f = Fixture::new().await;
+    let [left, _] = split_bindings(&f, Uuid::new_v4(), 30);
+    let mut child = Replica {
+        machine: ParticipantMachine::new(f.pool.group(left.target.clone()).await.unwrap()).unwrap(),
+        shared: f.shared().clone(),
+        index: 0,
+    };
+    assert!(matches!(
+        child.submit(f.fence(1, 2, left.target_span.clone())).await,
+        ParticipantReply::Fenced(_)
+    ));
+    // The stray record: a forward marker for a key in the child's span.
+    let mut stray = f.forward_of(1, Uuid::new_v4(), 1);
+    stray.anchor = Key::Int64(1);
+    assert_eq!(
+        child.submit(ParticipantCommand::DirectForward(stray)).await,
+        forwarded_reply()
+    );
+    let before = child.dump().await;
+    assert_eq!(
+        child
+            .submit(ParticipantCommand::SplitStage {
+                authority: f.authority,
+                binding: Box::new(left),
+            })
+            .await,
+        ParticipantReply::Rejected(Fault::Conflict)
+    );
+    assert_eq!(child.dump().await, before);
+}
+
+/// F10: a latest read tracks pending writers per key. It waits until every
+/// pending commit that writes its key settles, ignores commits on other keys,
+/// and the per-key counts do not leak after settle, `lead` or `step_down`.
+#[tokio::test]
+async fn d06_latest_reads_track_pending_writers_per_key() {
+    let f = Fixture::new().await;
+    f.lead();
+    let clock = f.machine().range_clock().clone();
+    register(&clock, 15, vec![f.key(1), f.key(2)]).unwrap();
+    register(&clock, 16, vec![f.key(1)]).unwrap();
+    register(&clock, 17, vec![f.key(3)]).unwrap();
+    assert_eq!(clock.pending_key_count(), 3);
+    let latest = tokio::spawn({
+        let clock = clock.clone();
+        let key = f.key(1);
+        async move { clock.wait_latest(&key).await }
+    });
+    // Other keys, and keys nobody writes, do not wait on key 1's writers.
+    clock.wait_latest(&f.key(4)).await.unwrap();
+    clock.settle(ts(17));
+    clock.wait_latest(&f.key(3)).await.unwrap();
+    // One of key 1's two writers settles: the read keeps waiting.
+    clock.settle(ts(15));
+    clock.wait_latest(&f.key(2)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!latest.is_finished(), "key 1 still has the writer at 16");
+    clock.settle(ts(16));
+    latest.await.unwrap().unwrap();
+    assert_eq!((clock.pending_len(), clock.pending_key_count()), (0, 0));
+    // Settling twice is harmless, and clearing on a leadership change drops
+    // the counts with the entries.
+    clock.settle(ts(16));
+    register(&clock, 18, vec![f.key(1)]).unwrap();
+    clock.step_down();
+    assert_eq!((clock.pending_len(), clock.pending_key_count()), (0, 0));
+    f.lead();
+    register(&clock, 19, vec![f.key(1)]).unwrap();
+    clock.lead(9);
+    assert_eq!((clock.pending_len(), clock.pending_key_count()), (0, 0));
 }
