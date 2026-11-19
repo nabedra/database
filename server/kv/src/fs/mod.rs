@@ -11,8 +11,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod fault;
 mod real;
 
+pub use fault::*;
 pub use real::RealFs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
