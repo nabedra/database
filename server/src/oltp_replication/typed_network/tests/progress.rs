@@ -394,6 +394,7 @@ async fn assert_progress<C>(
         vote: baseline_vote,
         prev_log_id: Some(cut),
         leader_commit: Some(cut),
+        entries: None,
     };
     let slots = TransportConfig::default().handler_slots[TrafficClass::DataConsensus as usize];
     let mut background = Vec::new();
