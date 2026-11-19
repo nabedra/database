@@ -653,8 +653,17 @@ pub(crate) struct ControlClient {
     routes: Arc<dyn ControlRoutes>,
     last_read_route: Mutex<Option<(Option<Uuid>, Uuid)>>,
     replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
+    service_grants: crate::oltp_replication::service_rpc::GrantCache,
 }
 impl ControlClient {
+    /// Receiver-side service-role grants for callers of this worker.
+    pub(crate) fn service_grants(&self) -> &crate::oltp_replication::service_rpc::GrantCache {
+        &self.service_grants
+    }
+    /// The locally applied Control enrollment revision, when known.
+    pub(crate) fn applied_revision(&self) -> Option<u64> {
+        self.client.applied_revision()
+    }
     pub(crate) async fn scoped_queue_capability(
         &self,
     ) -> Result<ScopedQueueCapability, ProtocolError> {
@@ -1137,6 +1146,7 @@ impl ControlClient {
             routes,
             last_read_route: Mutex::new(None),
             replica_routes,
+            service_grants: Default::default(),
         }))
     }
     async fn read(&self, request: &ReadRequest) -> Result<ReceivedReply, ProtocolError> {

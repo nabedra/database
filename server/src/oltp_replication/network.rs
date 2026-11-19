@@ -100,11 +100,14 @@ impl TlsMaterial {
     pub fn certificate_sha256(&self) -> &str {
         &self.certificate_sha256
     }
-    pub(super) fn transports(&self, alpn: &[u8]) -> (TlsConnector, TlsAcceptor) {
+    /// Offer the protocols in preference order. The server selects the first
+    /// of its own list that the client offers, so an old peer that offers only
+    /// the one-shot protocol still negotiates it.
+    pub(super) fn transports(&self, alpn: &[&[u8]]) -> (TlsConnector, TlsAcceptor) {
         let mut client = (*self.client).clone();
         let mut server = (*self.server).clone();
-        client.alpn_protocols = vec![alpn.to_vec()];
-        server.alpn_protocols = vec![alpn.to_vec()];
+        client.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+        server.alpn_protocols = client.alpn_protocols.clone();
         (
             TlsConnector::from(Arc::new(client)),
             TlsAcceptor::from(Arc::new(server)),

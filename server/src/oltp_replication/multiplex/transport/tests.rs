@@ -7,6 +7,7 @@ use crate::{
 use std::{future::ready, path::PathBuf, pin::Pin, sync::mpsc};
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
+mod sessions;
 #[path = "../../../../tests/support/tls.rs"]
 mod tls;
 
