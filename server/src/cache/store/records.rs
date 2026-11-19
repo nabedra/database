@@ -110,6 +110,16 @@ fn index_bytes(entries: usize) -> Option<usize> {
         .checked_add(64)
 }
 
+pub(super) fn snapshot_requirements(slot_bytes: usize) -> (usize, usize) {
+    let items = slot_bytes / (BODY_OVERHEAD + size_of::<Record>());
+    // The store already charges the bodies, their records, and the indexes.
+    let extra = size_of::<Effect>().saturating_sub(size_of::<Record>());
+    (
+        slot_bytes.saturating_add(items.saturating_mul(extra)),
+        items,
+    )
+}
+
 fn body_bytes(key: &Bytes, value: &Bytes) -> usize {
     BODY_OVERHEAD + key.len() + value.len()
 }

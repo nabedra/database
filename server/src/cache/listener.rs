@@ -3,7 +3,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::OwnedSemaphorePermit;
@@ -133,7 +133,6 @@ where
 {
     let mut decoder = Decoder::new(config.limits.frame());
     let mut buffered = BytesMut::with_capacity(4096.min(config.limits.max_pipeline_bytes));
-    let mut read = [0; 8192];
     let mut authenticated = None;
     let duration = config.limits.io_timeout();
     loop {
@@ -144,16 +143,17 @@ where
                     Ok(None) => {}
                     Err(error) => break Ok(Err(error)),
                 }
-                let available = (config.limits.max_pipeline_bytes - buffered.len()).min(read.len());
-                let received = stream.read(&mut read[..available]).await?;
-                if received == 0 {
+                let limit = config.limits.max_pipeline_bytes;
+                let wanted = (limit - buffered.len()).min(4096);
+                reserve_input(&mut buffered, wanted, limit);
+                let available = (buffered.capacity() - buffered.len()).min(limit - buffered.len());
+                if stream
+                    .read_buf(&mut (&mut buffered).limit(available))
+                    .await?
+                    == 0
+                {
                     break Ok(decoder.eof(&buffered).map(|()| None));
                 }
-                append_input(
-                    &mut buffered,
-                    &read[..received],
-                    config.limits.max_pipeline_bytes,
-                );
             }
         })
         .await?
@@ -202,17 +202,16 @@ where
     }
 }
 
-fn append_input(buffered: &mut BytesMut, received: &[u8], limit: usize) {
-    if !buffered.try_reclaim(received.len()) {
+fn reserve_input(buffered: &mut BytesMut, additional: usize, limit: usize) {
+    if !buffered.try_reclaim(additional) {
         // The decoder advances the logical start of this buffer. Growing it
         // in place could double backing capacity that includes the old prefix.
-        let needed = buffered.len() + received.len();
+        let needed = buffered.len() + additional;
         let capacity = buffered.capacity().saturating_mul(2).max(needed).min(limit);
         let mut replacement = BytesMut::with_capacity(capacity);
         replacement.extend_from_slice(buffered);
         *buffered = replacement;
     }
-    buffered.extend_from_slice(received);
 }
 
 type Session<'a> = Option<(&'a Identity, OwnedSemaphorePermit)>;
@@ -326,10 +325,12 @@ mod tests {
         const LIMIT: usize = 1088 * 1024;
         let payload = vec![0xcd; LIMIT];
         let mut buffered = BytesMut::new();
-        append_input(&mut buffered, &payload, LIMIT);
+        reserve_input(&mut buffered, LIMIT, LIMIT);
+        buffered.extend_from_slice(&payload);
         for _ in 0..12 {
             buffered.advance(LIMIT * 7 / 8);
-            append_input(&mut buffered, &payload[..LIMIT * 7 / 8], LIMIT);
+            reserve_input(&mut buffered, LIMIT * 7 / 8, LIMIT);
+            buffered.extend_from_slice(&payload[..LIMIT * 7 / 8]);
             assert_eq!(&buffered[..], payload);
             assert!(buffered.capacity() <= LIMIT);
         }

@@ -355,8 +355,27 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
 
 #[cfg(feature = "cache")]
 fn main() -> ExitCode {
-    let Command::Serve { config } = Cli::parse().command;
-    match nabedra_database_server::cache::run_standalone(&config) {
+    use nabedra_database_server::cache;
+    use nabedra_database_server::cli::CacheCommand;
+
+    let result = match Cli::parse().command {
+        Command::Serve { config } => cache::run_standalone(&config),
+        Command::Cache {
+            command: CacheCommand::Controller { config },
+        } => cache::run_controller(&config),
+        Command::Cache {
+            command: CacheCommand::Worker { config },
+        } => cache::run_worker(&config),
+        Command::Cache {
+            command:
+                CacheCommand::Admin {
+                    config,
+                    operation,
+                    command,
+                },
+        } => cache::run_admin(&config, operation, command),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("nabedra-db: {error}");

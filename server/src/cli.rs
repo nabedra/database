@@ -38,6 +38,12 @@ pub enum Command {
         #[arg(long)]
         config: std::path::PathBuf,
     },
+    /// Operate a Nabedra Cache cluster.
+    #[cfg(feature = "cache")]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
+    },
     #[cfg(not(feature = "cache"))]
     /// Run the supervised cluster API.
     Api {
@@ -65,6 +71,30 @@ pub enum Command {
     /// Fold a local automatic growth inventory. Makes no provider or database changes.
     #[cfg(feature = "oltp")]
     GrowthPlan,
+}
+
+#[cfg(feature = "cache")]
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// Start a cache metadata voter.
+    Controller {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    /// Start a cache data worker.
+    Worker {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    /// Perform an authenticated cache cluster operation.
+    Admin {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        operation: Option<uuid::Uuid>,
+        #[command(subcommand)]
+        command: crate::cache::AdminCommand,
+    },
 }
 
 #[cfg(not(feature = "cache"))]

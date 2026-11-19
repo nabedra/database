@@ -1,8 +1,9 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{self, MissedTickBehavior};
 
 use super::command::DataCommand;
@@ -11,27 +12,28 @@ use super::listener::{Backend, listen, shutdown};
 use super::store::{EvictionPolicy, Operation, Reply, SlotStore, StoreError, TurnLimits};
 use super::wire::Response;
 
-struct Turn {
-    operation: Operation,
-    completed: oneshot::Sender<Reply>,
+struct Standalone {
+    actor: Arc<Mutex<SlotStore>>,
+    pending: Semaphore,
+    started: Instant,
+    limits: TurnLimits,
 }
-
-struct Standalone(mpsc::Sender<Turn>);
 
 impl Backend for Standalone {
     async fn execute(&self, command: DataCommand) -> Response {
-        let (completed, reply) = oneshot::channel();
-        let turn = Turn {
-            operation: command.into_operation(),
-            completed,
-        };
-        if self.0.try_send(turn).is_err() {
+        let Ok(_admission) = self.pending.try_acquire() else {
             return Response::error(b"BUSY cache actor queue is full");
-        }
-        match reply.await {
-            Ok(reply) => response(reply),
-            Err(_) => Response::error(b"CLUSTERDOWN cache actor stopped"),
-        }
+        };
+        // A connection on the actor's current-thread runtime can execute the
+        // turn directly when the actor is idle. The mutex preserves exclusive
+        // ownership and the semaphore bounds waiting before any state changes.
+        let mut store = self.actor.lock().await;
+        response(apply(
+            &mut store,
+            &command.into_operation(),
+            self.started,
+            self.limits,
+        ))
     }
 }
 
@@ -52,54 +54,44 @@ pub fn run(path: &Path) -> io::Result<()> {
 async fn serve(config: ListenerConfig, eviction: EvictionPolicy) -> io::Result<()> {
     let socket = tokio::net::TcpListener::bind(config.listen).await?;
     let stop = shutdown()?;
-    let (sender, incoming) = mpsc::channel(config.limits.max_pending);
-    let actor = tokio::spawn(run_actor(
-        incoming,
-        SlotStore::new(config.limits.data_bytes, eviction),
-        config.turn_reserve_bytes,
-        config.limits.max_reply_bytes,
-    ));
+    let actor = Arc::new(Mutex::new(SlotStore::new(
+        config.limits.data_bytes,
+        eviction,
+    )));
+    let started = Instant::now();
+    let maintenance = tokio::spawn(expire(Arc::clone(&actor), started));
+    let backend = Standalone {
+        actor: Arc::clone(&actor),
+        pending: Semaphore::new(config.limits.max_pending),
+        started,
+        limits: TurnLimits {
+            growth_bytes: config.turn_reserve_bytes,
+            reply_bytes: config.limits.max_reply_bytes,
+        },
+    };
     eprintln!(
         "nabedra-db: standalone cache listening on {}",
         socket.local_addr()?
     );
-    let result = listen(socket, config, Standalone(sender), stop).await;
-    actor.await.map_err(io::Error::other)?;
+    let result = listen(socket, config, backend, stop).await;
+    maintenance.abort();
+    let _ = maintenance.await;
+    eprintln!(
+        "nabedra-db: cache actor stopped with {} charged bytes",
+        actor.lock().await.charged_bytes()
+    );
     result
 }
 
-async fn run_actor(
-    mut incoming: mpsc::Receiver<Turn>,
-    mut store: SlotStore,
-    reserve: usize,
-    max_reply: usize,
-) {
-    let started = Instant::now();
+async fn expire(actor: Arc<Mutex<SlotStore>>, started: Instant) {
     let mut expiry = time::interval(Duration::from_millis(10));
     expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            biased;
-            _ = expiry.tick() => {
-                let prepared = store.prepare_expiry(elapsed_ms(started), 64, Duration::from_micros(200));
-                store.commit(prepared);
-            }
-            request = incoming.recv() => {
-                let Some(Turn { operation, completed }) = request else {
-                    break;
-                };
-                if completed.is_closed() {
-                    continue;
-                }
-                let limits = TurnLimits { growth_bytes: reserve, reply_bytes: max_reply };
-                let _ = completed.send(apply(&mut store, &operation, started, limits));
-            }
-        }
+        expiry.tick().await;
+        let mut store = actor.lock().await;
+        let prepared = store.prepare_expiry(elapsed_ms(started), 64, Duration::from_micros(200));
+        store.commit(prepared);
     }
-    eprintln!(
-        "nabedra-db: cache actor stopped with {} charged bytes",
-        store.charged_bytes()
-    );
 }
 
 fn apply(

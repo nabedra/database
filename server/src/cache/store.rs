@@ -190,9 +190,14 @@ impl Default for TurnLimits {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct RemovalCounts {
+    pub expired: u64,
+    pub evicted: u64,
+}
+
 /// Owned result and effects of a command under one exclusive actor turn.
-/// The actor must reserve both these allocations and any replication journal
-/// entry before it rechecks authority. Dropping a preparation is cancellation.
+/// Dropping a preparation is cancellation.
 pub struct Prepared {
     reply: Reply,
     effects: Effects,
@@ -203,9 +208,14 @@ pub struct Prepared {
     relative_ttl_ms: Option<u64>,
     ttl_reply: Option<(u64, bool)>,
     layout: Layout,
+    removals: RemovalCounts,
 }
 
 impl Prepared {
+    pub fn removals(&self) -> RemovalCounts {
+        self.removals
+    }
+
     pub fn reply(&self) -> &Reply {
         &self.reply
     }
@@ -341,12 +351,17 @@ impl SlotStore {
         let mut turn = self.turn(now_ms);
         self.records.expired(now_ms, item_limit, time, |key| {
             turn.effects.push(Effect::Delete(key.clone()));
+            turn.removals.expired += 1;
         });
         let Some(layout) = self.records.layout(&turn.effects, self.byte_limit, 0) else {
             return self.failure(now_ms, StoreError::OutOfMemory);
         };
         turn.layout = layout;
         turn
+    }
+
+    pub fn snapshot_requirements(slot_bytes: usize) -> (usize, usize) {
+        records::snapshot_requirements(slot_bytes)
     }
 
     /// Retain an immutable snapshot with a conservative charge for all keys
@@ -405,6 +420,7 @@ impl SlotStore {
             relative_ttl_ms: None,
             ttl_reply: None,
             layout: Layout::unchanged(self.charged_bytes()),
+            removals: RemovalCounts::default(),
         }
     }
 
@@ -569,7 +585,9 @@ impl SlotStore {
     fn observe(&self, key: &Bytes, turn: &mut Prepared) -> Option<(usize, &records::Record)> {
         let (position, entry) = self.records.get(key)?;
         if entry.is_expired(turn.now_ms) {
-            Self::stage_delete(turn, key);
+            if Self::stage_delete(turn, key) {
+                turn.removals.expired += 1;
+            }
             return None;
         }
         Self::observe_deadline(entry, turn);
@@ -619,6 +637,15 @@ impl SlotStore {
             .records
             .sample_oldest(self.revision, upsert.key(), turn.now_ms);
         for victim in victims.into_iter().take(EVICTION_VICTIMS) {
+            if self
+                .records
+                .get(&victim)
+                .is_some_and(|(_, record)| record.is_expired(turn.now_ms))
+            {
+                turn.removals.expired += 1;
+            } else {
+                turn.removals.evicted += 1;
+            }
             turn.effects.push(Effect::Delete(victim));
             turn.effects.push(upsert.clone());
             if let Some(layout) = self.fitting_layout(&turn.effects, growth_bytes) {
