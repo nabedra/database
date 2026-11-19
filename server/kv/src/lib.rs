@@ -4,7 +4,7 @@
 //! runs and leveled compaction. The design and the guarantees are in
 //! `plans/native-storage-engine.md`. The modules below are owned by separate tasks;
 //! [`types`], [`batch`], [`coding`], [`error`] and the [`fs`] traits are the shared
-//! contract and change only through the lead.
+//! contract and change only through the lead, as does [`source`].
 
 pub mod batch;
 pub mod cache;
@@ -16,8 +16,10 @@ pub mod iter;
 pub mod journal;
 pub mod memtable;
 pub mod run;
+pub mod source;
 pub mod types;
 
 pub use batch::{BatchOp, WriteBatch};
 pub use error::{Error, FileId, Result};
+pub use source::{InternalIterator, RangeTombstone};
 pub use types::{Kind, Locator, Seq};
