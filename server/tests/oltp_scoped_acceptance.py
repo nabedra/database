@@ -247,6 +247,8 @@ class Driver:
                 assert reply == pending_receipt(self.run_id, request_id, reply['state']), reply
             elif status == 404 and before_acceptance:
                 assert_error((status, reply), 404, request_id, 'not_found', 'not_applied')
+            elif status == 429:
+                assert_error((status, reply), 429, request_id, 'overloaded', 'not_applied')
             else:
                 assert_uncertain((status, reply), request_id)
             if time.monotonic() >= deadline:
