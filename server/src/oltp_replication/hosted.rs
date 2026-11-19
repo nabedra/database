@@ -496,3 +496,6 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
         _ => ExecutionClass::Query,
     }
 }
+
+#[cfg(test)]
+mod tests;

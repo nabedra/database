@@ -310,7 +310,7 @@ async fn o05_o11_typed_wal_streams_beyond_collection_bound_and_atomically_trunca
     }
     assert!(f.log.try_get_log_entries(..).await.is_err());
     let limited = f.log.limited_get_log_entries(0, 140).await.unwrap();
-    assert_eq!(limited.len(), 128);
+    assert_eq!(limited.len(), MAX_APPEND_ENTRIES);
     drop(limited);
     let mut stream = Box::pin(f.log.entries_stream(..).await);
     let mut count = 0;
