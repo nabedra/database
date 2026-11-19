@@ -27,6 +27,7 @@ use std::{cmp::Ordering, io, sync::Arc};
 use uuid::Uuid;
 
 pub(crate) mod archive;
+pub(crate) mod direct;
 mod handle;
 pub(crate) mod image_archive;
 pub(crate) mod index;
@@ -150,6 +151,12 @@ pub(crate) enum ParticipantCommand {
         proof: SealedStatusDecision,
         max_items: u16,
     },
+    /// One-entry direct commit. Proposed only after `data.direct.v1` is
+    /// active: an older replica fails to decode this variant (fail closed).
+    Direct(direct::DirectCommit),
+    /// Deletes dedup records older than a cutoff the proposer computed, so
+    /// every replica deletes the same records. Gated like `Direct`.
+    DirectExpire(direct::DirectExpire),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -182,6 +189,11 @@ pub(crate) enum ParticipantReply {
         writes: u64,
     },
     Rejected(Fault),
+    Direct(direct::DirectReply),
+    DirectExpired {
+        deleted: u64,
+        complete: bool,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +206,10 @@ pub(crate) enum Fault {
     Incomplete,
     AlreadyDecided,
     ResourceLimit,
+    /// The schema or routing epoch differs from the group's, or the group
+    /// is frozen for a split: refresh the route. Emitted only for direct
+    /// commits, which are gated by `data.direct.v1`.
+    StaleEpoch,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +282,7 @@ pub(crate) struct ResolutionEvidence {
 #[derive(Clone)]
 pub(crate) struct ParticipantMachine {
     store: GroupStore,
+    clock: Arc<direct::RangeClock>,
 }
 impl ParticipantMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
@@ -286,10 +303,25 @@ impl ParticipantMachine {
                 "participant apply profile is too small",
             ));
         }
-        Ok(Self { store })
+        let clock = direct::RangeClock::for_store(&store);
+        Ok(Self { store, clock })
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
+    }
+    /// The range leader's read/commit clock, shared by every machine over
+    /// this group store.
+    #[allow(dead_code)] // Driven by the leader executor (T5).
+    pub(crate) fn range_clock(&self) -> &Arc<direct::RangeClock> {
+        &self.clock
+    }
+    /// Rule 2 of the range clock for a snapshot read at `read_ts`. Catalog
+    /// groups take no direct commits and skip it.
+    pub(super) async fn observe_snapshot(&self, read_ts: ReadTs) -> Result<(), ProtocolError> {
+        if matches!(self.store.identity().kind, GroupKind::Data { .. }) {
+            self.clock.observe_snapshot(read_ts).await?;
+        }
+        Ok(())
     }
     pub(crate) async fn apply(
         &self,
@@ -300,11 +332,23 @@ impl ParticipantMachine {
         let identity = self.store.identity().clone();
         let position = meta.position;
         let command_digest = meta.command_digest;
-        self.store
+        let direct = match command.payload()? {
+            ParticipantCommand::Direct(direct) => Some(direct.commit_ts),
+            _ => None,
+        };
+        let applied = self
+            .store
             .transaction(meta, APPLY, move |tx| {
                 apply(tx, &identity, position, command_digest, command.payload()?)
             })
-            .await
+            .await?;
+        // The entry applied (or was rejected) durably: its pending entry, if
+        // this node proposed it, leaves the range clock.
+        self.clock.observe_applied(position);
+        if let Some(commit_ts) = direct {
+            self.clock.settle(commit_ts);
+        }
+        Ok(applied)
     }
     /// A read never guesses the status of an unresolved intent. The caller
     /// releases native capacity before consulting the current status leader.
@@ -313,6 +357,7 @@ impl ParticipantMachine {
         read_ts: ReadTs,
         key: MvccKey,
     ) -> Result<ChargedBytes, ProtocolError> {
+        self.observe_snapshot(read_ts).await?;
         let group = self.store.identity().clone();
         self.store
             .read(
@@ -491,6 +536,15 @@ fn apply(
         tx.put_serialized(&fence_key, &receipt)?;
         return commit(tx, &ParticipantReply::Fenced(receipt));
     }
+    match command {
+        ParticipantCommand::Direct(direct) => {
+            return direct::apply(tx, group, config.as_ref(), direct);
+        }
+        ParticipantCommand::DirectExpire(expire) => {
+            return direct::expire(tx, group, config.as_ref(), expire);
+        }
+        _ => {}
+    }
     let Some(config) = config else {
         return reject(tx, Fault::NotInitialized);
     };
@@ -500,6 +554,9 @@ fn apply(
     let (scope, command) = match command {
         ParticipantCommand::Scoped { scope, command } => {
             let command = command.payload()?;
+            if command.is_direct() {
+                return reject(tx, Fault::InvalidBinding);
+            }
             if let Err(fault) = scoped_queue::check(tx, group, &config, *scope, command)? {
                 return reject(tx, fault);
             }
@@ -528,6 +585,9 @@ fn apply(
         }
         _ => (None, false, command),
     };
+    if command.is_direct() {
+        return reject(tx, Fault::InvalidBinding);
+    }
     if let ParticipantCommand::Lifecycle(command) = command {
         return lifecycle::apply(tx, group, &config, position, command, queue_binding);
     }
@@ -933,7 +993,9 @@ fn apply(
         | ParticipantCommand::Scoped { .. }
         | ParticipantCommand::PrepareTimestampPoint { .. }
         | ParticipantCommand::RejectTimestampPoint { .. }
-        | ParticipantCommand::Lifecycle(_) => unreachable!(),
+        | ParticipantCommand::Lifecycle(_)
+        | ParticipantCommand::Direct(_)
+        | ParticipantCommand::DirectExpire(_) => unreachable!(),
     }
 }
 
@@ -1181,6 +1243,8 @@ impl std::fmt::Display for ParticipantCommand {
             Self::RejectTimestampPoint { .. } => "participant-reject-timestamp-point",
             Self::ResolveTimestampPoint { .. } => "participant-resolve-timestamp-point",
             Self::Resolve { .. } => "participant-resolve",
+            Self::Direct(_) => "participant-direct",
+            Self::DirectExpire(_) => "participant-direct-expire",
         })
     }
 }
@@ -1334,9 +1398,35 @@ fn owns(group: &GroupIdentity, span: &KeySpan, key: &MvccKey) -> bool {
                     .as_ref()
                     .is_none_or(|k| compare_primary(primary_key, k) == Ordering::Less)
         }
-        (GroupKind::Catalog, MvccKey::Row { .. } | MvccKey::IndexEntry { .. }) => false,
+        (
+            GroupKind::Catalog,
+            MvccKey::Row { .. } | MvccKey::IndexEntry { .. } | MvccKey::DirectDedup { .. },
+        ) => false,
         (GroupKind::Catalog, _) => true,
         _ => false,
+    }
+}
+/// `owns` for committed images (split pages, backups, restore). A dedup
+/// record is never read, prepared or written through the generic key paths,
+/// but its image travels with its anchor row.
+fn owns_image(group: &GroupIdentity, span: &KeySpan, key: &MvccKey) -> bool {
+    match key {
+        MvccKey::DirectDedup {
+            table_id,
+            anchor,
+            request_id,
+        } => {
+            !request_id.is_nil()
+                && owns(
+                    group,
+                    span,
+                    &MvccKey::Row {
+                        table_id: *table_id,
+                        primary_key: anchor.clone(),
+                    },
+                )
+        }
+        _ => owns(group, span, key),
     }
 }
 fn components(key: &MvccKey) -> (u8, Uuid, Uuid, Option<&str>, Option<&Key>) {
@@ -1372,6 +1462,9 @@ fn components(key: &MvccKey) -> (u8, Uuid, Uuid, Option<&str>, Option<&Key>) {
         MvccKey::CatalogSplitClosed { table_id, split_id } => {
             (13, *table_id, *split_id, None, None)
         }
+        MvccKey::DirectDedup {
+            table_id, anchor, ..
+        } => (direct::DEDUP_TAG, *table_id, Uuid::nil(), None, Some(anchor)),
     }
 }
 pub(crate) fn compare_keys(a: &MvccKey, b: &MvccKey) -> Ordering {
@@ -1379,6 +1472,13 @@ pub(crate) fn compare_keys(a: &MvccKey, b: &MvccKey) -> Ordering {
         (MvccKey::IndexEntry { values: a, .. }, MvccKey::IndexEntry { values: b, .. }) => {
             a[..].cmp(&b[..])
         }
+        _ => Ordering::Equal,
+    };
+    let request_order = match (a, b) {
+        (
+            MvccKey::DirectDedup { request_id: a, .. },
+            MvccKey::DirectDedup { request_id: b, .. },
+        ) => a.cmp(b),
         _ => Ordering::Equal,
     };
     let a = components(a);
@@ -1392,6 +1492,7 @@ pub(crate) fn compare_keys(a: &MvccKey, b: &MvccKey) -> Ordering {
             (Some(a), Some(b)) => compare_primary(a, b),
             _ => Ordering::Equal,
         })
+        .then(request_order)
 }
 fn key_length(key: &MvccKey) -> Result<usize, ProtocolError> {
     let (_, _, _, text, primary) = components(key);
@@ -1405,6 +1506,8 @@ fn key_length(key: &MvccKey) -> Result<usize, ProtocolError> {
             .iter()
             .try_fold(1usize, |n, v| n.checked_add(v.encoded_len()))
             .ok_or_else(invalid)?,
+        // The request id follows the prefix-free anchor encoding.
+        MvccKey::DirectDedup { .. } => 16,
         _ => 0,
     };
     33usize
@@ -1432,7 +1535,8 @@ fn encode_key(key: &MvccKey, out: &mut [u8]) {
             out[cursor] = 1;
             out[cursor + 1..cursor + 9]
                 .copy_from_slice(&((*value as u64) ^ (1 << 63)).to_be_bytes());
-            return;
+            cursor += 9;
+            None
         }
         Some(Key::Utf8(s)) => {
             out[cursor] = 2;
@@ -1451,10 +1555,19 @@ fn encode_key(key: &MvccKey, out: &mut [u8]) {
             }
         }
         out[cursor..cursor + 2].copy_from_slice(&[0, 0]);
+        cursor += 2;
+    }
+    if let MvccKey::DirectDedup { request_id, .. } = key {
+        out[cursor..cursor + 16].copy_from_slice(request_id.as_bytes());
     }
 }
 
 impl ParticipantCommand {
+    /// Commands only a range leader with `data.direct.v1` proposes. They are
+    /// never nested inside a scoped or timestamp-point envelope.
+    pub(crate) fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct(_) | Self::DirectExpire(_))
+    }
     pub(crate) fn uses_prepare_lane(&self) -> bool {
         matches!(
             self,
@@ -1507,6 +1620,7 @@ impl OwnedPayload for ParticipantCommand {
                     }
                 }
             }
+            Self::Direct(direct) => add(direct.heap_bytes()?)?,
             Self::PreparePage {
                 plan,
                 writes,
@@ -1539,6 +1653,9 @@ impl OwnedPayload for ParticipantCommand {
         if let Self::SplitImportPage { page, .. } = self {
             page.attach_fields(owner.clone())?;
         }
+        if let Self::Direct(direct) = self {
+            direct.attach_fields(owner.clone())?;
+        }
         if let Self::PreparePage { writes, .. } = self {
             for write in writes.iter() {
                 write.attach_charge(owner.clone())?;
@@ -1552,6 +1669,7 @@ impl OwnedPayload for ParticipantCommand {
             | Self::PrepareTimestampPoint { page: command, .. }
             | Self::RejectTimestampPoint { page: command, .. } => command.is_attached(),
             Self::SplitImportPage { page, .. } => page.fields_attached(),
+            Self::Direct(direct) => direct.fields_attached(),
             Self::PreparePage { writes, .. } => writes.iter().all(PreparedWrite::fields_attached),
             _ => true,
         }
