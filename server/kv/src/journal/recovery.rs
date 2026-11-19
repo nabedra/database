@@ -26,13 +26,26 @@
 //! - any other case with evidence: **R1**, `Corruption`, unless the sequences that were
 //!   lost are all at or below `replay_after` (their state is in runs) or there are none.
 //!
-//! After a clean close the last record is a `Pad` with `FLAG_CLOSE` and the log simply
-//! continues after it. After a crash the end segment is never appended to again in the
-//! same epoch, because a lost write may have left valid-looking records past P that the
-//! boundary scan cannot all see: the end is fenced with a `FLAG_ROLL` pad and writing
-//! continues in another segment, or, when the end segment holds no valid record, the
-//! segment takes a new epoch. This replaces zeroing the tail (an interface deviation from
-//! the plan's "zero the tail and sync the zeros" with the same exact-prefix result).
+//! After a clean close the last record is a `Pad` with `FLAG_CLOSE`. The next open
+//! appends after it, but first writes and syncs an *open pad* (a full-block pad without
+//! `FLAG_CLOSE`): a record lost later in that run then follows a non-close record and
+//! takes the crash path below, so a lost first record can never be overwritten in place
+//! while a later record of the same run survives to chain onto the overwrite (RV-KV1 F1).
+//! After a crash the end segment is never appended to again in the same epoch, because a
+//! lost write may have left valid-looking records past P that the boundary scan cannot all
+//! see: the end is fenced with a `FLAG_ROLL` pad and writing continues in another segment,
+//! or, when the end segment holds no valid record, the segment takes a new epoch. This
+//! replaces zeroing the tail (an interface deviation from the plan's "zero the tail and
+//! sync the zeros" with the same exact-prefix result).
+//!
+//! A non-valid position P whose sequence is exactly where the next live segment starts is
+//! that segment's roll point (a roll or fence pad, torn or damaged): no sequence is lost
+//! and replay continues in the next segment, never in fenced leftovers after P.
+//!
+//! A live name with no intact header copy (both 4 KiB header blocks destroyed) is R3,
+//! unless it is the newest segment and holds no record that could continue the log
+//! (no header-valid record with a sequence at or after the recovered end): then it is an
+//! unused segment (L4) and is deleted.
 
 use bytes::Bytes;
 
@@ -45,9 +58,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::format::{
-    self, BLOCK, FLAG_CLOSE, FLAG_ROLL, HeaderCheck, RECORD_HEADER_LEN, RecordHeader, RecordType,
+    self, FLAG_CLOSE, FLAG_ROLL, HeaderCheck, RECORD_HEADER_LEN, RECORDS_START, RecordHeader,
+    RecordType,
 };
-use super::segment::{self, FreeSeg, LiveSeg};
+use super::segment::{self, FreeSeg, Headerless, LiveSeg};
 use super::{JournalOptions, JournalSink, RecordKind, RecoveryReport, TailOutcome};
 
 /// Read-ahead of the recovery reader.
@@ -82,13 +96,13 @@ pub(super) struct Recovered {
     pub live: Vec<LiveSeg>,
     pub free: Vec<FreeSeg>,
     pub max_number: u64,
-    /// First segment of the replay range.
-    pub start: usize,
     pub end: End,
     /// Sequence the next record takes.
     pub next_seq: Seq,
     /// Highest `durable_seq` seen in a valid record.
     pub max_durable: Seq,
+    /// Unused header-less segments (L4) to delete before anything is written.
+    pub discard: Vec<Headerless>,
 }
 
 fn corrupt(segment: u64, offset: u64, what: &'static str) -> Error {
@@ -109,9 +123,13 @@ struct SegReader {
 
 impl SegReader {
     fn new(seg: &LiveSeg) -> SegReader {
+        SegReader::over(seg.file.clone(), seg.len)
+    }
+
+    fn over(file: Arc<dyn FsFile>, len: u64) -> SegReader {
         SegReader {
-            file: seg.file.clone(),
-            len: seg.len,
+            file,
+            len,
             buf: Vec::new(),
             start: 0,
         }
@@ -186,7 +204,7 @@ fn evidence_scan(live: &[LiveSeg], idx: usize, from: u64) -> Result<Scan> {
     let mut scope = Vec::new();
     for (i, seg) in live.iter().enumerate().skip(idx) {
         let mut r = SegReader::new(seg);
-        let mut pos = if i == idx { from } else { BLOCK };
+        let mut pos = if i == idx { from } else { RECORDS_START };
         while pos + RECORD_HEADER_LEN as u64 <= seg.len {
             if let At::Valid(h) = header_at(&mut r, seg.number, pos, &mut scope)?
                 && h.epoch == seg.epoch
@@ -227,7 +245,19 @@ pub(super) fn recover(
     replay_after: Seq,
     sink: &dyn JournalSink,
 ) -> Result<Recovered> {
-    let inventory = segment::inventory(fs, dir, options.segment_bytes)?;
+    let mut inventory = segment::inventory(fs, dir, options.segment_bytes)?;
+    // A header-less live name below the newest valid segment sits inside the chain: R3.
+    // At most one, the newest, may turn out to be an unused segment (checked at the end).
+    let newest_valid = inventory.live.last().map(|s| s.number);
+    let mut headerless = std::mem::take(&mut inventory.headerless);
+    if let Some(h) = headerless
+        .iter()
+        .find(|h| newest_valid.is_some_and(|n| h.number < n))
+        .or_else(|| headerless.iter().rev().nth(1))
+    {
+        return Err(corrupt(h.number, 0, "journal segment header damaged"));
+    }
+    let candidate = headerless.pop();
     let mut report = RecoveryReport {
         tail: TailOutcome::Clean,
         damage: Vec::new(),
@@ -242,15 +272,17 @@ pub(super) fn recover(
     };
     let live = inventory.live;
     if live.is_empty() {
+        let next_seq = replay_after + 1;
+        let discard = check_headerless(candidate, next_seq)?;
         return Ok(Recovered {
             report,
             live,
             free: inventory.free,
             max_number: inventory.max_number,
-            start: 0,
             end: End::Fresh,
-            next_seq: replay_after + 1,
+            next_seq,
             max_durable: 0,
+            discard,
         });
     }
     let start = live
@@ -266,7 +298,7 @@ pub(super) fn recover(
     }
 
     let mut idx = start;
-    let mut pos = BLOCK;
+    let mut pos = RECORDS_START;
     let mut next_seq = live[start].first_seq;
     let mut max_durable = 0;
     let mut last_close = false;
@@ -289,7 +321,7 @@ pub(super) fn recover(
                             "journal segments do not chain",
                         ));
                     }
-                    pos = BLOCK;
+                    pos = RECORDS_START;
                     reader = SegReader::new(&live[idx]);
                     continue;
                 }
@@ -326,7 +358,7 @@ pub(super) fn recover(
                                     "journal segments do not chain",
                                 ));
                             }
-                            pos = BLOCK;
+                            pos = RECORDS_START;
                             reader = SegReader::new(&live[idx]);
                             last_close = false;
                             continue;
@@ -397,16 +429,31 @@ pub(super) fn recover(
 
         // P = (idx, pos) is not a valid record.
         if matches!(non_valid, NonValid::EndMarker) && last_close {
-            // Clean close: nothing was written after the close pad.
+            // Clean close, and the next open never wrote its open pad: nothing was
+            // written after the close pad.
             break End::Append { idx, pos };
         }
         let seq_p = next_seq;
+        if !matches!(non_valid, NonValid::Damaged(_))
+            && live
+                .get(idx + 1)
+                .is_some_and(|next| next.first_seq == seq_p)
+        {
+            // The next segment starts exactly at seq(P): P is this segment's roll or fence
+            // pad (lost, torn or damaged), and whatever follows P here takes no sequence
+            // the log keeps (at most fenced leftovers). No sequence is lost.
+            idx += 1;
+            pos = RECORDS_START;
+            reader = SegReader::new(&live[idx]);
+            last_close = false;
+            continue;
+        }
         let resume = match &non_valid {
             NonValid::Damaged(h) => pos + h.record_len(),
             _ => format::align_up(pos + 1),
         };
         let scan = evidence_scan(&live, idx, resume)?;
-        let fence = if pos == BLOCK {
+        let fence = if pos == RECORDS_START {
             End::Reepoch { idx }
         } else {
             End::Fence {
@@ -492,14 +539,42 @@ pub(super) fn recover(
         }
     };
 
+    let discard = check_headerless(candidate, next_seq)?;
     Ok(Recovered {
         report,
         live,
         free: inventory.free,
         max_number: inventory.max_number,
-        start,
         end,
         next_seq,
         max_durable,
+        discard,
     })
+}
+
+/// The newest live name has no intact header. It is unused (L4) when no record in it has
+/// a valid header and a sequence at or after `next_seq`, the sequence the log continues
+/// with: nothing then chains into it, and older records in it are leftovers of an earlier
+/// use. Otherwise it may hold records the log needs: R3.
+fn check_headerless(candidate: Option<Headerless>, next_seq: Seq) -> Result<Vec<Headerless>> {
+    let Some(h) = candidate else {
+        return Ok(Vec::new());
+    };
+    let mut r = SegReader::over(h.file.clone(), h.len);
+    let mut pos = RECORDS_START;
+    while pos + RECORD_HEADER_LEN as u64 <= h.len {
+        let avail = MAX_HEADER_AND_SCOPE.min(h.len - pos);
+        let bytes = r.get(pos, avail)?.expect("within the segment");
+        if let HeaderCheck::Valid(header) = format::check_header(bytes)
+            && pos + header.record_len() <= h.len
+        {
+            if header.record_type().is_some() && header.end_seq() > next_seq {
+                return Err(corrupt(h.number, 0, "journal segment header damaged"));
+            }
+            pos += header.record_len();
+            continue;
+        }
+        pos = format::align_up(pos + 1);
+    }
+    Ok(vec![h])
 }

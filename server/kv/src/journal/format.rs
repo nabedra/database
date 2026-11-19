@@ -1,8 +1,8 @@
 //! On-disk layout of journal segments and records (plan section 2, "Journal format").
 //!
 //! ```text
-//! segment = header block (4 KiB) ‖ record*
-//! header block: copy A at offset 0, copy B at offset 2048, zeros elsewhere
+//! segment = header block A (4 KiB) ‖ header block B (4 KiB) ‖ record*   (records at 8192)
+//! header block: one header copy at its start, zeros elsewhere
 //! header copy = magic "NBKVJNL1" | version u32 | 0 u32 | segment u64 | epoch u64
 //!             | first_seq u64 | crc u32 (masked CRC32C of the 40 bytes before it)
 //!
@@ -14,11 +14,13 @@
 //! All integers are little-endian and both CRCs are masked ([`crate::crc::mask`]).
 //! `header_crc` covers header bytes 4..48 and the scope; `payload_crc` covers the payload.
 //!
-//! The header block holds two copies so that a torn write of the block (it is rewritten
-//! when a free segment file is reused) always leaves one intact copy, old or new, on a
-//! device with 512-byte sectors. `first_seq` is the sequence the segment's first record
-//! takes; it lets recovery pick its start segment without reading records and keeps
-//! sequence continuity checkable across segment boundaries.
+//! The header is kept twice, each copy in its own 4 KiB block, and a header rewrite (a
+//! reused free file, a re-epoch) writes and syncs copy A before it writes copy B. A power
+//! loss during the rewrite can therefore destroy at most one block, even on a device
+//! whose atomic or program unit is a whole 4 KiB page, and the other copy (old or new)
+//! survives. `first_seq` is the sequence the segment's first record takes; it lets
+//! recovery pick its start segment without reading records and keeps sequence continuity
+//! checkable across segment boundaries.
 
 use crate::coding::{read_u32_le, read_u64_le};
 use crate::crc;
@@ -27,10 +29,12 @@ use crate::types::Seq;
 /// Alignment unit: the header block size, and the boundary every group commit that
 /// follows a sync starts on.
 pub const BLOCK: u64 = 4096;
+/// Offset of the first record: after the two header blocks.
+pub const RECORDS_START: u64 = 2 * BLOCK;
 pub const SEGMENT_MAGIC: [u8; 8] = *b"NBKVJNL1";
 pub const FORMAT_VERSION: u32 = 1;
 const SEGMENT_HEADER_LEN: usize = 44;
-const SEGMENT_HEADER_COPY_B: usize = 2048;
+const SEGMENT_HEADER_COPY_B: usize = BLOCK as usize;
 
 pub const RECORD_HEADER_LEN: usize = 48;
 
@@ -82,14 +86,18 @@ pub enum HeaderCopy {
 }
 
 impl SegmentHeader {
-    /// The full 4 KiB header block.
+    /// One 4 KiB header block (copy A and copy B are identical blocks).
     pub fn encode_block(&self) -> Vec<u8> {
         let mut block = vec![0u8; BLOCK as usize];
-        let copy = self.encode_copy();
-        block[..SEGMENT_HEADER_LEN].copy_from_slice(&copy);
-        block[SEGMENT_HEADER_COPY_B..SEGMENT_HEADER_COPY_B + SEGMENT_HEADER_LEN]
-            .copy_from_slice(&copy);
+        block[..SEGMENT_HEADER_LEN].copy_from_slice(&self.encode_copy());
         block
+    }
+
+    /// Both header blocks, `[0, RECORDS_START)`, for a file no record was written to.
+    pub fn encode_blocks(&self) -> Vec<u8> {
+        let mut blocks = self.encode_block();
+        blocks.extend_from_slice(&self.encode_block());
+        blocks
     }
 
     fn encode_copy(&self) -> [u8; SEGMENT_HEADER_LEN] {
@@ -104,8 +112,8 @@ impl SegmentHeader {
         out
     }
 
-    /// Decodes both copies from the header block (which may be short).
-    pub fn decode_block(block: &[u8]) -> [HeaderCopy; 2] {
+    /// Decodes both copies from the header blocks `[0, RECORDS_START)` (which may be short).
+    pub fn decode_blocks(block: &[u8]) -> [HeaderCopy; 2] {
         [
             decode_copy(block.get(..SEGMENT_HEADER_LEN)),
             decode_copy(
@@ -348,19 +356,37 @@ mod tests {
             epoch: 2,
             first_seq: 100,
         };
-        let block = header.encode_block();
+        let blocks = header.encode_blocks();
+        assert_eq!(blocks.len() as u64, RECORDS_START);
         assert_eq!(
-            SegmentHeader::decode_block(&block),
+            SegmentHeader::decode_blocks(&blocks),
             [HeaderCopy::Valid(header); 2]
         );
-        let mut torn = block.clone();
+        let mut torn = blocks.clone();
         torn[5] ^= 0xFF;
         assert_eq!(
-            SegmentHeader::decode_block(&torn),
+            SegmentHeader::decode_blocks(&torn),
             [HeaderCopy::Bad, HeaderCopy::Valid(header)]
         );
+        // A whole 4 KiB unit destroyed: the copy in the other block survives.
+        let mut destroyed = blocks.clone();
+        destroyed[..BLOCK as usize].fill(0xA5);
         assert_eq!(
-            SegmentHeader::decode_block(&vec![0u8; BLOCK as usize]),
+            SegmentHeader::decode_blocks(&destroyed),
+            [HeaderCopy::Bad, HeaderCopy::Valid(header)]
+        );
+        let mut destroyed = blocks.clone();
+        destroyed[BLOCK as usize..].fill(0);
+        assert_eq!(
+            SegmentHeader::decode_blocks(&destroyed),
+            [HeaderCopy::Valid(header), HeaderCopy::Zero]
+        );
+        assert_eq!(
+            SegmentHeader::decode_blocks(&blocks[..BLOCK as usize]),
+            [HeaderCopy::Valid(header), HeaderCopy::Bad]
+        );
+        assert_eq!(
+            SegmentHeader::decode_blocks(&vec![0u8; RECORDS_START as usize]),
             [HeaderCopy::Zero; 2]
         );
         assert_eq!(align_pad_len(4096), None);
