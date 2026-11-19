@@ -591,7 +591,7 @@ async fn read_reply(
 
 enum Route {
     Session(Arc<ClientSession>),
-    OneShot(client::TlsStream<TcpStream>),
+    OneShot(Box<client::TlsStream<TcpStream>>),
 }
 
 #[derive(Default)]
@@ -688,7 +688,7 @@ impl PeerSessions {
                 old.close();
             }
             *lock(&slot.legacy) = Some(peer.clone());
-            Ok(Route::OneShot(stream))
+            Ok(Route::OneShot(Box::new(stream)))
         }
     }
     /// One request on the peer's lane session, or a one-shot exchange when
@@ -714,7 +714,7 @@ impl PeerSessions {
             {
                 Route::Session(session) => session,
                 Route::OneShot(stream) => {
-                    return one_shot(stream, hello, header, sections, class, common, phase).await;
+                    return one_shot(*stream, hello, header, sections, class, common, phase).await;
                 }
             };
             match session
