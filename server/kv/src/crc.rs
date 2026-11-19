@@ -17,7 +17,9 @@ pub fn crc32c(data: &[u8]) -> u32 {
 #[inline]
 pub fn extend(crc: u32, data: &[u8]) -> u32 {
     match implementation() {
-        Implementation::Hardware => hardware::extend(crc, data),
+        // SAFETY: `implementation()` returns `Hardware` only after `hardware::available()`
+        // reported the CPU feature.
+        Implementation::Hardware => unsafe { hardware::extend(crc, data) },
         Implementation::Software => software_extend(crc, data),
     }
 }
@@ -135,10 +137,12 @@ mod hardware {
         std::arch::is_x86_feature_detected!("sse4.2")
     }
 
+    /// # Safety
+    ///
+    /// The CPU must support SSE4.2: call only after [`available`] returned true.
     #[inline]
-    pub fn extend(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: only reached after `available()` reported SSE4.2 (see `implementation`),
-        // or from tests that check `available()` first.
+    pub unsafe fn extend(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller guarantees SSE4.2 (this function's contract).
         unsafe { extend_sse42(crc, data) }
     }
 
@@ -166,10 +170,12 @@ mod hardware {
         std::arch::is_aarch64_feature_detected!("crc")
     }
 
+    /// # Safety
+    ///
+    /// The CPU must have the CRC extension: call only after [`available`] returned true.
     #[inline]
-    pub fn extend(crc: u32, data: &[u8]) -> u32 {
-        // SAFETY: only reached after `available()` reported the CRC extension (see
-        // `implementation`), or from tests that check `available()` first.
+    pub unsafe fn extend(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller guarantees the CRC extension (this function's contract).
         unsafe { extend_crc(crc, data) }
     }
 
@@ -194,7 +200,10 @@ mod hardware {
         false
     }
 
-    pub fn extend(crc: u32, data: &[u8]) -> u32 {
+    /// # Safety
+    ///
+    /// Never unsafe here; `unsafe` only to match the other architectures.
+    pub unsafe fn extend(crc: u32, data: &[u8]) -> u32 {
         super::software_extend(crc, data)
     }
 }
@@ -225,9 +234,16 @@ mod tests {
             ("dispatch", extend),
         ];
         if hardware::available() {
-            paths.push(("hardware", hardware::extend));
+            paths.push(("hardware", hardware_checked));
         }
         paths
+    }
+
+    /// The hardware path, after checking the CPU feature.
+    fn hardware_checked(crc: u32, data: &[u8]) -> u32 {
+        assert!(hardware::available());
+        // SAFETY: the feature was just detected.
+        unsafe { hardware::extend(crc, data) }
     }
 
     struct SplitMix(u64);
