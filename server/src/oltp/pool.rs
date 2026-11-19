@@ -132,6 +132,8 @@ pub struct GroupWriteStats {
     pub synced_writes: u64,
     /// Unsynced application writes made durable by a later synced write.
     pub deferred_writes: u64,
+    /// Newest applied index a crash could still lose, if any.
+    pub unsynced_applied_index: Option<u64>,
 }
 #[derive(Clone, Copy)]
 enum MutationLane {
@@ -731,10 +733,11 @@ impl GroupStore {
         GroupWriteStats {
             synced_writes: self.inner.synced_writes.load(Ordering::Relaxed),
             deferred_writes: self.inner.deferred_writes.load(Ordering::Relaxed),
+            unsynced_applied_index: self.unsynced_applied_index(),
         }
     }
     /// The newest applied index whose state a crash could still lose.
-    pub(crate) fn unsynced_applied_index(&self) -> Option<u64> {
+    fn unsynced_applied_index(&self) -> Option<u64> {
         let tail = *self
             .inner
             .deferred_tail

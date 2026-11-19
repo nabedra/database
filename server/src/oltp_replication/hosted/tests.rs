@@ -531,16 +531,16 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
     for index in 1..=6 {
         apply(index).await.unwrap();
     }
-    assert_eq!(store.unsynced_applied_index(), Some(6));
+    assert_eq!(store.write_stats().unsynced_applied_index, Some(6));
     // Entries 7..=10 are not applied: they are the only copy of that state.
     assert!(log.purge(id(7)).await.is_err());
-    assert_eq!(store.unsynced_applied_index(), Some(6));
+    assert_eq!(store.write_stats().unsynced_applied_index, Some(6));
     assert!(!pool.requires_recovery());
     let before = pool.write_stats().synced_writes;
     log.purge(id(4)).await.unwrap();
     // One WAL sync for the applied state, then the synced purge itself.
     assert_eq!(pool.write_stats().synced_writes - before, 2);
-    assert_eq!(store.unsynced_applied_index(), None);
+    assert_eq!(store.write_stats().unsynced_applied_index, None);
     assert_eq!(
         log.get_log_state().await.unwrap().last_purged_log_id,
         Some(id(4))
@@ -551,10 +551,10 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
     assert_eq!(pool.write_stats().synced_writes - before, 1);
 
     apply(7).await.unwrap();
-    assert_eq!(store.unsynced_applied_index(), Some(7));
+    assert_eq!(store.write_stats().unsynced_applied_index, Some(7));
     let snapshot = store.export_snapshot(BUDGET).await.unwrap();
     assert_eq!(snapshot.header.applied.map(|a| a.index), Some(7));
-    assert_eq!(store.unsynced_applied_index(), None);
+    assert_eq!(store.write_stats().unsynced_applied_index, None);
     let entries = log.try_get_log_entries(6..11).await.unwrap();
     assert_eq!(
         entries
@@ -573,7 +573,8 @@ fn o06_append_chunks_honour_64_entries_and_1_mib() {
     assert_eq!(append_chunks(&[]), Vec::<std::ops::Range<usize>>::new());
     assert_eq!(append_chunks(&[100; 130]), [0..64, 64..128, 128..130]);
     assert_eq!(append_chunks(&[600 << 10; 3]), [0..1, 1..2, 2..3]);
-    assert_eq!(append_chunks(&[2 << 20]), [0..1]);
+    let oversized = append_chunks(&[2 << 20]);
+    assert_eq!((oversized.len(), oversized[0].clone()), (1, 0..1));
     assert_eq!(
         append_chunks(&[500 << 10, 500 << 10, 100 << 10]),
         [0..2, 2..3]
