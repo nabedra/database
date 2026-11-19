@@ -11,11 +11,12 @@ import ssl
 from typing import TYPE_CHECKING, Literal, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener, getproxies
 import uuid
 import time
 from dataclasses import dataclass, field
 
+from ._http_pool import ConnectionPool
 from .errors import (
     AuthenticationError, ConflictError, LimitExceededError, NabedraError,
     NotFoundError, OverloadedError, ProtocolError, StorageError, TransportError,
@@ -84,6 +85,8 @@ class _Transport:
 
     Each instance owns its opener and verified TLS context. Timeout applies to
     blocking socket I/O, not cancellation or a server transaction deadline.
+    Without a configured proxy for the URL scheme, the opener keeps a few idle
+    HTTP/1.1 connections for reuse; it never resends a request.
     """
 
     def __init__(self, api_url: str, token: str | None, *, timeout: float = 30.0,
@@ -126,7 +129,11 @@ class _Transport:
         self._token = token
         self._timeout = checked_timeout
         self._tls_context = context
-        self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
+        if url.scheme in getproxies():
+            # urllib applies the proxy and its bypass rules, one connection per call.
+            self._opener = build_opener(_NoRedirect(), HTTPSHandler(context=context))
+        else:
+            self._opener = ConnectionPool(url.scheme, url.hostname, url.port, context)
 
     def _require_token(self) -> str:
         if self._token is None:
