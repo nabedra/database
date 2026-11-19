@@ -60,6 +60,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
 pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,6 +203,16 @@ impl Method {
                 Self::ParticipantPropose { .. } | Self::ParticipantScanRun { .. }
             )
     }
+    fn can_repeat_scoped_read(self, action: ServiceAction) -> bool {
+        self.can_repeat_read()
+            && (matches!(
+                action,
+                ServiceAction::ScopedCatalogRead(_)
+                    | ServiceAction::ScopedQueueExecute(_)
+                    | ServiceAction::ScopedQueueRead { .. }
+                    | ServiceAction::ScopedQueueFenceReceipt { .. }
+            ) || matches!(self, Self::ScopedStatusParticipant { .. }))
+    }
     fn input_limit(self) -> usize {
         match self {
             Self::StatusCall { .. } | Self::TimestampCall { .. } => 128 << 10,
@@ -321,6 +332,9 @@ impl Client {
         method: Method,
         payload: Option<ChargedBytes>,
     ) -> Result<ServiceResponse, ProtocolError> {
+        if method.can_repeat_scoped_read(action) {
+            return self.repeat_as(action, method, payload).await;
+        }
         let mut possibly_applied = false;
         self.call_round(action, method, &payload, &mut possibly_applied, None)
             .await
@@ -331,19 +345,39 @@ impl Client {
         method: Method,
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
-        let payload = Some(payload);
+        self.converge_as(self.action, method, Some(payload), false).await
+    }
+
+    /// Call only for a repeatable read or an exact, idempotent scoped command.
+    async fn repeat_as(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        self.converge_as(action, method, payload, true).await
+    }
+
+    async fn converge_as(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        bound_mutation_attempt: bool,
+    ) -> Result<ServiceResponse, ProtocolError> {
         let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let peer_deadline = (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
         let mut delay = Duration::from_millis(50);
         let mut possibly_applied = false;
         loop {
             let attempt = timeout_at(
                 deadline,
                 self.call_round(
-                    self.action,
+                    action,
                     method,
                     &payload,
                     &mut possibly_applied,
-                    Some(deadline),
+                    peer_deadline,
                 ),
             )
             .await
@@ -357,7 +391,7 @@ impl Client {
                     RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
                 )) if error.code == ErrorCode::Overloaded => {
                     // An outer transport refusal can outlive an applied command.
-                    // Retry the same idempotent metadata operation with fresh TLS context.
+                    // Retry the same idempotent operation with fresh TLS context.
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service transport temporarily overloaded");
                     false
@@ -369,9 +403,12 @@ impl Client {
                 }
                 result => {
                     return result.map_err(|error| {
-                        let mut error = ProtocolError::from(error);
-                        if possibly_applied && method.purpose() == Purpose::ServiceMutation {
-                            error.outcome = Outcome::Unknown;
+                        let error = ProtocolError::from(error);
+                        if possibly_applied
+                            && (method.purpose() == Purpose::ServiceMutation
+                                || bound_mutation_attempt && !method.can_repeat_read())
+                        {
+                            return mutation_uncertain(error);
                         }
                         error
                     });
@@ -436,7 +473,10 @@ impl Client {
         retry_last: Option<u64>,
         convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
-        let preferred = self.leader.load(Ordering::Relaxed);
+        let preferred = match self.leader.load(Ordering::Relaxed) {
+            0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
+            node => node,
+        };
         // Prefer the observed leader, but let other replicas answer before
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
@@ -455,12 +495,14 @@ impl Client {
                     member.node_id,
                     member.worker_id.into(),
                 );
-                let reply = if method.can_repeat_read()
-                    && let Some(deadline) = convergence_deadline
-                {
-                    // After a hinted leader disappears, one disconnected peer
-                    // must leave time to observe the next leader's election.
-                    let peer_deadline = deadline.min(Instant::now() + HINTED_READ_TIMEOUT);
+                let reply = if let Some(deadline) = convergence_deadline {
+                    // Leave time to reach the next leader when one peer stalls.
+                    let attempt = if method.can_repeat_read() {
+                        HINTED_READ_TIMEOUT
+                    } else {
+                        SCOPED_MUTATION_TIMEOUT
+                    };
+                    let peer_deadline = deadline.min(Instant::now() + attempt);
                     timeout_at(peer_deadline, call)
                         .await
                         .unwrap_or(Err(CallError::Transport(RequestError::Unreachable)))
@@ -469,7 +511,7 @@ impl Client {
                 };
                 match reply {
                     Ok(Ok(response)) => {
-                        if action == ServiceAction::Owner {
+                        if action == ServiceAction::Owner || convergence_deadline.is_some() {
                             routes.record_successful_node(member.node_id);
                         }
                         return Ok(response);
@@ -1063,6 +1105,11 @@ fn route_unavailable(error: &ProtocolError) -> bool {
         error.code,
         ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
     ) && error.outcome == Outcome::Unknown
+}
+
+fn mutation_uncertain(mut error: ProtocolError) -> ProtocolError {
+    error.outcome = Outcome::Unknown;
+    error
 }
 
 fn placement_rejected_before_execution(error: &ProtocolError) -> bool {

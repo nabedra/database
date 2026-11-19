@@ -606,22 +606,23 @@ impl TimestampClient {
                     .ok_or_else(unavailable)?;
                 let method = request.method();
                 let payload = Some(encode(&self.client.shared, request).await?);
-                let response = self
-                    .client
-                    .call_member(
+                let response = tokio::time::timeout(
+                    HINTED_READ_TIMEOUT,
+                    self.client.call_member(
                         self.client.action,
                         method,
                         &payload,
                         member.node_id,
                         member.worker_id.into(),
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 match response {
-                    Ok(Ok(response)) => {
+                    Ok(Ok(Ok(response))) => {
                         routes.record_successful_node(member.node_id);
                         return self.decode_point_decision(locator, response).await;
                     }
-                    Ok(Err(error)) | Err(CallError::Local(error))
+                    Ok(Ok(Err(error)) | Err(CallError::Local(error)))
                         if !route_unavailable(&error)
                             && !placement_rejected_before_execution(&error) =>
                     {

@@ -1323,6 +1323,20 @@ impl TimestampClient {
         &self.client.shared
     }
     async fn response(&self, request: Request) -> Result<ServiceResponse, ProtocolError> {
+        // These reads also arrive from Status or participant proof clients.
+        // A point decision write can repeat only in reconciliation mode.
+        if matches!(
+            request,
+            Request::ScopedReadPin { .. }
+                | Request::ScopedCopyProof { .. }
+                | Request::VerifyTimestampPointPin(_)
+                | Request::CommitTimestampPoint { reconcile: true, .. }
+                | Request::AbortTimestampPoint { reconcile: true, .. }
+        ) {
+            let method = request.method();
+            let payload = encode(&self.client.shared, request).await?;
+            return self.client.repeat_as(self.client.action, method, Some(payload)).await;
+        }
         // Snapshot transitions reuse the reservation nonce and exact context.
         // Allocate returns the existing stamp for the same transaction permit.
         let converge = matches!(
@@ -1392,12 +1406,14 @@ impl TimestampClient {
         };
         let method = request.method();
         let payload = encode(&self.client.shared, request).await?;
+        // Each transition reuses the original reservation nonce and pin identity.
         Ok(self
             .client
-            .call_as(action, method, Some(payload))
+            .repeat_as(action, method, Some(payload))
             .await?
             .decoded(&self.client.shared)
-            .await?
+            .await
+            .map_err(mutation_uncertain)?
             .0)
     }
 
@@ -1601,11 +1617,15 @@ impl TimestampClient {
         let request = Request::ReleaseScoped { statement: statement.clone() };
         let method = request.method();
         let payload = encode(&self.client.shared, request).await?;
-        let response = self.client.call_as(action, method, Some(payload)).await?;
-        let context = response.metadata_context()?;
-        let (release, _): (ScopedPinRelease, _) = response.decoded(&self.client.shared).await?;
-        context.timestamp(27, &release)?;
-        release.validate(&statement)?;
+        // Timestamp returns the existing release for this terminal statement.
+        let response = self.client.repeat_as(action, method, Some(payload)).await?;
+        let context = response.metadata_context().map_err(mutation_uncertain)?;
+        let (release, _): (ScopedPinRelease, _) = response
+            .decoded(&self.client.shared)
+            .await
+            .map_err(mutation_uncertain)?;
+        context.timestamp(27, &release).map_err(mutation_uncertain)?;
+        release.validate(&statement).map_err(mutation_uncertain)?;
         Ok(release)
     }
 

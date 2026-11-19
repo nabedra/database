@@ -145,7 +145,10 @@ impl ParticipantClient {
         {
             return Err(invalid());
         }
-        tokio::time::timeout(SERVICE_CONVERGENCE, async {
+        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let peer_deadline = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
+            .then_some(deadline);
+        timeout_at(deadline, async {
             let method = Method::ParticipantResolveTimestampPoint;
             let mut result = Err(unavailable());
             for _ in 0..2 {
@@ -168,7 +171,7 @@ impl ParticipantClient {
                         &mut possibly_applied,
                         &route,
                         None,
-                        None,
+                        peer_deadline,
                     )
                     .await
                     .map_err(ProtocolError::from);

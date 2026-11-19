@@ -449,7 +449,7 @@ impl ParticipantEndpoint {
                         },
                     )?;
                     let actual = client
-                        .lifecycle(binding)
+                        .lifecycle_for(binding, scoped)
                         .await?
                         .ok_or_else(invalid)?
                         .into_sealed();
@@ -502,7 +502,7 @@ impl ParticipantEndpoint {
                 let actual = self
                     .status(statement.txn, statement.manifest)
                     .await?
-                    .settlement(statement.txn, statement.manifest)
+                    .settlement_for(statement.txn, statement.manifest, scoped)
                     .await?
                     .into_sealed();
                 if actual.statement() != statement
@@ -1212,11 +1212,17 @@ impl ParticipantClient {
         payload: Option<ChargedBytes>,
     ) -> Result<(T, Arc<ScratchLease>), ProtocolError> {
         let response = self.proof.client.call(method, payload).await?;
+        self.decode_response(response).await
+    }
+    async fn decode_response<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        response: ServiceResponse,
+    ) -> Result<(T, Arc<ScratchLease>), ProtocolError> {
         self.proof
             .client
             .shared
             .execute(
-                if method.purpose() == Purpose::Storage {
+                if response.method.purpose() == Purpose::Storage {
                     ExecutionClass::Query
                 } else {
                     ExecutionClass::Control
@@ -1271,7 +1277,18 @@ impl RemoteParticipant for ParticipantClient {
         command: OwnedCommand<ParticipantCommand>,
     ) -> ParticipantFuture<'_, Applied<ParticipantReply>> {
         Box::pin(async move {
-            let progress = !command.payload()?.uses_prepare_lane();
+            let client = &self.proof.client;
+            let command_body = command.payload()?;
+            let progress = !command_body.uses_prepare_lane();
+            // These commands replay the same locator, page, or settled guard.
+            let repeat = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
+                && matches!(
+                    command_body,
+                    ParticipantCommand::PrepareTimestampPoint { .. }
+                        | ParticipantCommand::RejectTimestampPoint { .. }
+                        | ParticipantCommand::SealTimestampPoint { .. }
+                        | ParticipantCommand::Lifecycle(LifecycleCommand::Release { .. })
+                );
             let limit = if progress {
                 128 << 10
             } else if matches!(self.proof.client.action, ServiceAction::ScopedQueueExecute(_)) {
@@ -1305,9 +1322,16 @@ impl RemoteParticipant for ParticipantClient {
                     },
                 )
                 .await?;
-            let (value, owner): (Applied<ParticipantReply>, _) = self
-                .decoded(Method::ParticipantPropose { progress }, Some(payload))
-                .await?;
+            let method = Method::ParticipantPropose { progress };
+            let response = if repeat {
+                client.repeat_as(client.action, method, Some(payload)).await?
+            } else {
+                client.call(method, Some(payload)).await?
+            };
+            let (value, owner): (Applied<ParticipantReply>, _) =
+                self.decode_response(response).await.map_err(|error| {
+                    if repeat { mutation_uncertain(error) } else { error }
+                })?;
             Ok(Applied::owned(value.position, value.reply, owner))
         })
     }
@@ -1691,12 +1715,20 @@ impl RemoteParticipant for ParticipantClient {
                     .client
                     .shared
                     .encode_in(ByteClass::Progress, &(&binding, mode), 4096)?;
-            let response = self
-                .proof
-                .client
-                .call(Method::ParticipantAcquire, Some(payload))
-                .await?;
-            let context = response.participant_context(ParticipantProofKind::Lifecycle)?;
+            let client = &self.proof.client;
+            let method = Method::ParticipantAcquire;
+            let repeat = matches!(client.action, ServiceAction::ScopedQueueExecute(_))
+                && mode == GuardMode::Shared;
+            let response = if repeat {
+                // The same binding retrieves the existing shared guard.
+                client.repeat_as(client.action, method, Some(payload)).await?
+            } else {
+                client.call(method, Some(payload)).await?
+            };
+            let decode_error = |error| if repeat { mutation_uncertain(error) } else { error };
+            let context = response
+                .participant_context(ParticipantProofKind::Lifecycle)
+                .map_err(decode_error)?;
             self.proof
                 .client
                 .shared
@@ -1719,6 +1751,7 @@ impl RemoteParticipant for ParticipantClient {
                         .transpose()
                 })
                 .await
+                .map_err(decode_error)
         })
     }
     fn lifecycle_guard(

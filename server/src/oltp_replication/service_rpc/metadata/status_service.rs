@@ -1756,6 +1756,19 @@ impl StatusClient {
         &self.client.shared
     }
     async fn response(&self, request: Request) -> Result<ServiceResponse, ProtocolError> {
+        // The exact manifest and projection are keyed by the scoped request.
+        // The retirement marker is bound to its exact terminal statement.
+        if matches!(
+            (&request, self.client.action),
+            (Request::InstallTimestampPoint { .. } | Request::ProjectTimestampPoint { .. },
+                ServiceAction::ScopedQueueExecute(_))
+                | (Request::RecordScopedRetirement { .. }, ServiceAction::TimestampProof { .. })
+                | (Request::PriorScopedReceipt { .. } | Request::RetiredScopedReceipt { .. }, _)
+        ) {
+            let method = request.method();
+            let payload = encode(self.resources(), request).await?;
+            return self.client.repeat_as(self.client.action, method, Some(payload)).await;
+        }
         // Reserve returns the existing identity for the same UUID and digest.
         let converge = matches!(
             request,
@@ -1828,8 +1841,9 @@ impl StatusClient {
                 };
                 let method = request.method();
                 let payload = encode(self.resources(), request).await?;
+                // Status returns the reservation for this exact scoped identity.
                 self.client
-                    .call_as(action, method, Some(payload))
+                    .repeat_as(action, method, Some(payload))
                     .await
                     .map_err(owner_operation_uncertain)?
                     .decoded(self.resources())
@@ -2279,11 +2293,18 @@ impl StatusClient {
         statement: ScopedTerminalStatement,
     ) -> Result<ScopedRetirementMarker, ProtocolError> {
         statement.validate()?;
-        let response = self.response(Request::RecordScopedRetirement { statement: statement.clone() }).await?;
-        let context = response.metadata_context()?;
-        let (marker, _): (ScopedRetirementMarker, _) = response.decoded(self.resources()).await?;
-        context.status(32, &marker)?;
-        marker.validate(&statement)?;
+        let response = self
+            .response(Request::RecordScopedRetirement {
+                statement: statement.clone(),
+            })
+            .await?;
+        let context = response.metadata_context().map_err(mutation_uncertain)?;
+        let (marker, _): (ScopedRetirementMarker, _) = response
+            .decoded(self.resources())
+            .await
+            .map_err(mutation_uncertain)?;
+        context.status(32, &marker).map_err(mutation_uncertain)?;
+        marker.validate(&statement).map_err(mutation_uncertain)?;
         Ok(marker)
     }
 
@@ -2742,7 +2763,10 @@ impl StatusService for StatusClient {
             if matches!(result, Ok(Ok((manifest, _))) if manifest == expected) {
                 return Ok(expected);
             }
-            match self.timestamp_point_home(authority, request_id, digest).await? {
+            match self.timestamp_point_home(authority, request_id, digest)
+                .await
+                .map_err(mutation_uncertain)?
+            {
                 TimestampPointHome::Installed(actual) if actual.locator == locator && actual.outcome == outcome => {
                     Ok(expected)
                 }
@@ -2814,7 +2838,10 @@ impl StatusService for StatusClient {
                 record.validate_for(locator)?;
                 return Ok((record, owner));
             }
-            self.timestamp_point_projection(authority, locator).await?.ok_or_else(unavailable)
+            self.timestamp_point_projection(authority, locator)
+                .await
+                .map_err(mutation_uncertain)?
+                .ok_or_else(unavailable)
         })
     }
 

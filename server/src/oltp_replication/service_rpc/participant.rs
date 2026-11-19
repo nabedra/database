@@ -252,14 +252,23 @@ impl ParticipantProofClient {
         &self,
         binding: &LifecycleBinding,
     ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
+        self.lifecycle_for(binding, false).await
+    }
+    pub(super) async fn lifecycle_for(
+        &self,
+        binding: &LifecycleBinding,
+        scoped: bool,
+    ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
         let payload = self
             .client
             .shared
             .encode_in(ByteClass::Progress, binding, 4096)?;
-        let response = self
-            .client
-            .call(Method::ParticipantGuard, Some(payload))
-            .await?;
+        let method = Method::ParticipantGuard;
+        let response = if scoped {
+            self.client.repeat_as(self.client.action, method, Some(payload)).await?
+        } else {
+            self.client.call(method, Some(payload)).await?
+        };
         let context = response.participant_context(ParticipantProofKind::Lifecycle)?;
         let binding = binding.clone();
         self.client

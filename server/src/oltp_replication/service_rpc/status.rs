@@ -522,13 +522,23 @@ impl StatusProofClient {
         txn: TxnId,
         manifest: ManifestRef,
     ) -> Result<VerifiedSettlement, ProtocolError> {
+        self.settlement_for(txn, manifest, false).await
+    }
+    pub(super) async fn settlement_for(
+        &self,
+        txn: TxnId,
+        manifest: ManifestRef,
+        scoped: bool,
+    ) -> Result<VerifiedSettlement, ProtocolError> {
         if manifest.status_group_id != self.client.group.group_id {
             return Err(invalid());
         }
-        let response = self
-            .client
-            .read(Method::StatusSettlement { txn, manifest })
-            .await?;
+        let method = Method::StatusSettlement { txn, manifest };
+        let response = if scoped {
+            self.client.repeat_as(self.client.action, method, None).await?
+        } else {
+            self.client.read(method).await?
+        };
         let context = response.status_context();
         self.client
             .shared
