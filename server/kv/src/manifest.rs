@@ -11,6 +11,10 @@
 //!   the CRC covers `len ‖ edit`. The first record of a manifest is a full snapshot of the
 //!   state; later records are [`VersionEdit`]s. A store writes a new manifest at every
 //!   open and whenever the current one grows past [`ROLL_BYTES`] or a write to it failed.
+//! - Every record starts at a multiple of [`RECORD_ALIGN`] (4 KiB); the gap after a record
+//!   is never written. An append therefore never rewrites a device unit that holds a
+//!   synced record, so a power loss that destroys a whole 4 KiB unit (zeros or garbage)
+//!   can only hit the unsynced final record.
 //!
 //! # Torn tails (L3) and damage (R3)
 //!
@@ -42,6 +46,12 @@ pub(crate) const CURRENT_TMP: &str = "CURRENT.tmp";
 
 /// A manifest larger than this is replaced by a fresh snapshot at the next edit.
 pub const ROLL_BYTES: u64 = 4 << 20;
+/// Records start at multiples of this.
+pub const RECORD_ALIGN: u64 = 4096;
+
+fn align(pos: usize) -> usize {
+    pos.div_ceil(RECORD_ALIGN as usize) * RECORD_ALIGN as usize
+}
 
 const RECORD_HEADER: usize = 8;
 
@@ -490,11 +500,13 @@ pub fn read_manifest(
                     ));
                 }
                 report.records += 1;
-                at = end;
+                at = align(end);
             }
             None => {
                 // Torn final record, unless a valid record follows (R3).
-                let synced_later = (at + 1..data.len()).any(|p| decode_record(&data, p).is_some());
+                let synced_later = (align(at + 1)..data.len())
+                    .step_by(RECORD_ALIGN as usize)
+                    .any(|p| decode_record(&data, p).is_some());
                 if synced_later {
                     return Err(corrupt(file_id, at as u64, "damaged manifest record"));
                 }
@@ -624,10 +636,11 @@ impl ManifestWriter {
             file.sync_all().map_err(io)?;
             // The new name must be durable before CURRENT can point at it.
             fs.sync_dir(dir).map_err(io)?;
-            Ok((file, record.len() as u64))
+            Ok((file, align(record.len()) as u64))
         })();
         match result {
             Ok((file, len)) => Ok(ManifestWriter {
+                // The next record starts at the next aligned offset.
                 number,
                 path,
                 file,
@@ -669,7 +682,7 @@ impl ManifestWriter {
             self.needs_roll = true;
             return Err(AppendError::Fatal(io(e)));
         }
-        self.len += record.len() as u64;
+        self.len = align((self.len + record.len() as u64) as usize) as u64;
         Ok(())
     }
 }
