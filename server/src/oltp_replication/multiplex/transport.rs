@@ -1,9 +1,9 @@
 use super::*;
+use crate::oltp::pool::{GroupCapacityLease, RAFT_REPLICA_BYTES, WorkerSharedResources};
 use crate::oltp_replication::{
     TlsMaterial,
     types::{Digest, GroupKind},
 };
-use crate::oltp::pool::{GroupCapacityLease, RAFT_REPLICA_BYTES, WorkerSharedResources};
 use rustls::pki_types::ServerName;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -26,7 +26,9 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 mod resolve;
+mod session;
 use resolve::{PeerResolver, ResolveError};
+use session::{PeerSessions, RawReply, SESSION_ALPN};
 #[cfg(test)]
 mod tests;
 
@@ -51,15 +53,43 @@ impl TransportTrust {
     fn recovery_only(self) -> bool {
         matches!(self, Self::RecoveryControlRaft | Self::PreparedControl)
     }
-    fn validate_prepared(self, group: &GroupIdentity, purpose: Purpose) -> Result<(), ProtocolError> {
-        if self == Self::PreparedControl && (
-            group.kind != GroupKind::Control
-            || purpose != Purpose::ControlDelegation
-        ) {
+    fn validate_prepared(
+        self,
+        group: &GroupIdentity,
+        purpose: Purpose,
+    ) -> Result<(), ProtocolError> {
+        if self == Self::PreparedControl
+            && (group.kind != GroupKind::Control || purpose != Purpose::ControlDelegation)
+        {
             return Err(malformed("prepared identity permits only Control recovery"));
         }
         Ok(())
     }
+}
+/// Trust checks shared by the one-shot listener, sessions and callers.
+fn admit_trust(
+    trust: TransportTrust,
+    group: &GroupIdentity,
+    purpose: Purpose,
+) -> Result<(), ProtocolError> {
+    trust.validate_prepared(group, purpose)?;
+    if trust == TransportTrust::BootstrapControl
+        && (group.kind != GroupKind::Control
+            || !matches!(
+                purpose,
+                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
+            ))
+    {
+        return Err(malformed(
+            "bootstrap trust permits only Control consensus and enrollment reads",
+        ));
+    }
+    if trust == TransportTrust::RecoveryControlRaft
+        && !(group.kind == GroupKind::Control && purpose == Purpose::Raft)
+    {
+        return Err(malformed("recovery trust permits only Control Raft"));
+    }
+    Ok(())
 }
 pub trait PeerDirectory: Send + Sync + 'static {
     /// Read local applied enrollment or explicit recovery policy only. This
@@ -72,6 +102,11 @@ pub trait PeerDirectory: Send + Sync + 'static {
     ) -> Result<TransportTrust, ProtocolError>;
     fn resolve(&self, worker: Uuid)
     -> Result<super::super::types::WorkerEnrollment, ProtocolError>;
+    /// The locally applied Control enrollment revision, when this directory
+    /// follows Control. Receivers drop cached service grants when it changes.
+    fn applied_revision(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -446,6 +481,10 @@ struct Common {
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
+    /// False only for a test peer that speaks the one-shot protocol alone.
+    sessions_enabled: bool,
+    sessions: PeerSessions,
+    session_slots: Arc<Semaphore>,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
 }
@@ -549,6 +588,30 @@ impl WorkerTransport {
         registry: Arc<EndpointRegistry>,
         config: TransportConfig,
     ) -> Result<Self, ProtocolError> {
+        Self::build(local, tls, shared, directory, registry, config, true)
+    }
+    /// A peer as released before persistent sessions: it offers and accepts
+    /// only the one-shot `NABOTP01` exchange.
+    #[cfg(test)]
+    pub(crate) fn one_shot_for_test(
+        local: &super::super::types::WorkerEnrollment,
+        tls: &TlsMaterial,
+        shared: Arc<WorkerSharedResources>,
+        directory: Arc<dyn PeerDirectory>,
+        registry: Arc<EndpointRegistry>,
+        config: TransportConfig,
+    ) -> Result<Self, ProtocolError> {
+        Self::build(local, tls, shared, directory, registry, config, false)
+    }
+    fn build(
+        local: &super::super::types::WorkerEnrollment,
+        tls: &TlsMaterial,
+        shared: Arc<WorkerSharedResources>,
+        directory: Arc<dyn PeerDirectory>,
+        registry: Arc<EndpointRegistry>,
+        config: TransportConfig,
+        sessions_enabled: bool,
+    ) -> Result<Self, ProtocolError> {
         local
             .validate()
             .map_err(|_| malformed("invalid local worker enrollment"))?;
@@ -562,7 +625,11 @@ impl WorkerTransport {
         if local.certificate_sha256.to_string() != tls.certificate_sha256() {
             return Err(malformed("local certificate differs from enrollment"));
         }
-        let (connector, acceptor) = tls.transports(ALPN);
+        let (connector, acceptor) = if sessions_enabled {
+            tls.transports(&[SESSION_ALPN, ALPN])
+        } else {
+            tls.transports(&[ALPN])
+        };
         Ok(Self {
             common: Arc::new(Common {
                 local: WorkerIdentity::from(local),
@@ -587,6 +654,9 @@ impl WorkerTransport {
                     config.preflight_slots[TrafficClass::Authority as usize],
                 ),
                 resolver: PeerResolver::default(),
+                sessions_enabled,
+                sessions: PeerSessions::default(),
+                session_slots: Arc::new(Semaphore::new(session::MAX_SERVER_SESSIONS)),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
                 config,
@@ -605,6 +675,7 @@ impl WorkerTransport {
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), ProtocolError> {
         tokio::pin!(shutdown);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
         let mut tasks = JoinSet::new();
         loop {
             tokio::select! {
@@ -614,24 +685,48 @@ impl WorkerTransport {
                     let (socket,_)=accepted.map_err(|_| unavailable())?;
                     let Ok(permit)=self.common.handshakes.clone().try_acquire_owned() else {drop(socket);continue};
                     let owner=self.clone();
-                    tasks.spawn(async move {let _=timeout(owner.common.config.deadline,owner.serve(socket,permit)).await;});
+                    let stopped=stopped.clone();
+                    tasks.spawn(async move {owner.accept(socket,permit,stopped).await;});
                 }
             }
         }
+        // Sessions stop reading new frames and finish their in-flight streams.
+        let _ = stop.send(true);
         while tasks.join_next().await.is_some() {}
         Ok(())
     }
+    /// The TLS handshake runs under the handshake slot. A session releases it
+    /// once established; a one-shot exchange keeps it, as before sessions.
+    async fn accept(
+        self: Arc<Self>,
+        socket: TcpStream,
+        handshake: OwnedSemaphorePermit,
+        stopped: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let deadline = Instant::now() + self.common.config.deadline;
+        let _ = socket.set_nodelay(true);
+        let Ok(Ok(stream)) = timeout_at(deadline, self.common.acceptor.accept(socket)).await else {
+            return;
+        };
+        if self.common.sessions_enabled && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
+        {
+            let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
+                return;
+            };
+            let Ok(slot) = self.common.session_slots.clone().try_acquire_owned() else {
+                return;
+            };
+            drop(handshake);
+            session::serve(self, stream, certificate, stopped, slot).await;
+            return;
+        }
+        let _ = timeout_at(deadline, self.serve(stream, handshake)).await;
+    }
     async fn serve(
         &self,
-        socket: TcpStream,
+        mut stream: tokio_rustls::server::TlsStream<TcpStream>,
         classification: OwnedSemaphorePermit,
     ) -> Result<(), ProtocolError> {
-        let mut stream = self
-            .common
-            .acceptor
-            .accept(socket)
-            .await
-            .map_err(|_| unavailable())?;
         if stream.get_ref().1.alpn_protocol() != Some(ALPN) {
             return Err(malformed("wrong worker ALPN"));
         }
@@ -660,23 +755,7 @@ impl WorkerTransport {
             .common
             .directory
             .verify(hello.from, group, hello.purpose)?;
-        trust.validate_prepared(group, hello.purpose)?;
-        if trust == TransportTrust::BootstrapControl
-            && (group.kind != GroupKind::Control
-                || !matches!(
-                    hello.purpose,
-                    Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
-                ))
-        {
-            return Err(malformed(
-                "bootstrap trust permits only Control consensus and enrollment reads",
-            ));
-        }
-        if trust == TransportTrust::RecoveryControlRaft
-            && !(group.kind == GroupKind::Control && hello.purpose == Purpose::Raft)
-        {
-            return Err(malformed("recovery trust permits only Control Raft"));
-        }
+        admit_trust(trust, group, hello.purpose)?;
         let class = traffic(group, hello.purpose)?;
         trace.phase = RaftTransportPhase::Preflight;
         let preflight = self.common.preflight[class as usize]
@@ -970,66 +1049,7 @@ impl WorkerClient {
             return Err(malformed("target incarnation differs from cached enrollment").into());
         }
         let trust = self.common.directory.verify(identity, group, purpose)?;
-        trust.validate_prepared(group, purpose)?;
-        if trust == TransportTrust::BootstrapControl
-            && (group.kind != GroupKind::Control
-                || !matches!(
-                    purpose,
-                    Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
-                ))
-        {
-            return Err(malformed(
-                "bootstrap trust permits only Control consensus and enrollment reads",
-            )
-            .into());
-        }
-        if trust == TransportTrust::RecoveryControlRaft
-            && !(group.kind == GroupKind::Control && purpose == Purpose::Raft)
-        {
-            return Err(malformed("recovery trust permits only Control Raft").into());
-        }
-        let name = ServerName::try_from(peer.server_name.as_str().to_owned())
-            .map_err(|_| malformed("invalid target TLS name"))?;
-        let socket = if let Ok(address) = peer.endpoint.parse::<SocketAddr>() {
-            trace.phase = RaftTransportPhase::Connect;
-            TcpStream::connect(address).await
-        } else {
-            trace.phase = RaftTransportPhase::ResolveAddress;
-            if let Some(resolving) = probe_resolving.as_deref_mut() {
-                *resolving = true;
-            }
-            let addresses = self
-                .common
-                .resolver
-                .resolve(identity, &peer.endpoint, class)
-                .await
-                .map_err(|error| match error {
-                    ResolveError::LocallyUnavailable if probe_resolving.is_some() => {
-                        unavailable().into()
-                    }
-                    _ => RequestError::Unreachable,
-                })?;
-            if let Some(resolving) = probe_resolving {
-                *resolving = false;
-            }
-            trace.phase = RaftTransportPhase::Connect;
-            TcpStream::connect(addresses.as_ref()).await
-        }
-        .map_err(|_| RequestError::Unreachable)?;
-        trace.phase = RaftTransportPhase::Tls;
-        let mut stream = self
-            .common
-            .connector
-            .connect(name, socket)
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        if stream.get_ref().1.alpn_protocol() != Some(ALPN)
-            || peer_digest(stream.get_ref().1.peer_certificates())? != peer.certificate_sha256
-        {
-            return Err(malformed("target certificate or ALPN differs").into());
-        }
-        trace.phase = RaftTransportPhase::SendRequest;
-        let nonce = Uuid::new_v4();
+        admit_trust(trust, group, purpose)?;
         validate_reply(
             &self.common.config,
             class,
@@ -1038,6 +1058,7 @@ impl WorkerClient {
                 sections: sections.clone(),
             },
         )?;
+        let nonce = Uuid::new_v4();
         let hello = Hello {
             cluster_id: group.cluster_id,
             group_id: group.group_id,
@@ -1048,117 +1069,102 @@ impl WorkerClient {
             nonce,
             header_len: header.len(),
         };
-        stream
-            .write_all(&hello.encode())
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        stream
-            .write_all(header.as_slice())
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        for section in &sections {
-            let bytes = section.as_ref().map_or(&[][..], ChargedBytes::as_slice);
-            stream
-                .write_u64(bytes.len() as u64)
-                .await
-                .map_err(|_| RequestError::Unreachable)?;
-            stream
-                .write_all(bytes)
-                .await
-                .map_err(|_| RequestError::Unreachable)?;
-        }
-        stream
-            .flush()
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        trace.phase = RaftTransportPhase::ReceiveReply;
-        let mut prefix = [0; 53];
-        stream
-            .read_exact(&mut prefix)
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        if &prefix[..8] != MAGIC || &prefix[8..24] != nonce.as_bytes() || prefix[24] > 1 {
-            return Err(malformed("invalid worker response context").into());
-        }
-        let header_len =
-            u32::from_be_bytes(prefix[25..29].try_into().expect("fixed response header")) as usize;
-        if header_len > header_limit(class) {
-            return Err(malformed("worker response header exceeds limit").into());
-        }
-        let lengths = std::array::from_fn(|i| {
-            u64::from_be_bytes(
-                prefix[29 + i * 8..37 + i * 8]
-                    .try_into()
-                    .expect("fixed response length"),
-            )
-        });
-        let plan = ReceivePlan {
-            class,
-            section_lengths: lengths,
-            decode_budget_bytes: response_decode_bytes,
-        };
-        validate_plan(&self.common.config, class, plan)?;
-        let mut response_header = self
+        let deadline = Instant::now() + self.common.config.deadline;
+        let raw = self
             .common
-            .shared
-            .allocate_bytes(class.byte_class(), header_len)?;
-        stream
-            .read_exact(response_header.as_mut_slice())
-            .await
-            .map_err(|_| RequestError::Unreachable)?;
-        let response_header = response_header.freeze();
-        if prefix[24] == 1 {
-            if lengths.iter().any(|&length| length != 0) {
-                return Err(malformed("worker error has unexpected sections").into());
-            }
-            let _scratch = self.common.shared.reserve_scratch(
-                class.byte_class(),
-                header_decode_bytes(class, response_header.len()),
-            )?;
-            let error = serde_json::from_slice(response_header.as_slice())
-                .map_err(|_| malformed("invalid worker error"))?;
-            trace.phase = RaftTransportPhase::Complete;
-            return Err(RequestError::PeerRejected {
+            .sessions
+            .call(
+                &self.common,
+                &peer,
+                class,
+                &hello.encode(),
+                header,
+                sections,
+                deadline,
+                probe_resolving.take(),
+                &mut trace.phase,
+            )
+            .await?;
+        let reply = self.finish(raw, nonce, class, response_decode_bytes)?;
+        trace.phase = RaftTransportPhase::Complete;
+        match reply {
+            Err(error) => Err(RequestError::PeerRejected {
                 worker: identity,
                 error,
-            });
+            }),
+            Ok((reply, scratch)) => Ok(ReceivedReply {
+                reply,
+                scratch,
+                session: AuthenticatedSession {
+                    local: self.common.local,
+                    remote: identity,
+                    group: group.clone(),
+                    purpose,
+                    nonce,
+                    recovery_only: trust.recovery_only(),
+                },
+                resources: self.common.shared.clone(),
+            }),
+        }
+    }
+    /// Check a framed reply against this request. The outer error is local;
+    /// the inner error is the peer's rejection.
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        &self,
+        raw: RawReply,
+        nonce: Uuid,
+        class: TrafficClass,
+        response_decode_bytes: usize,
+    ) -> Result<Result<(ChargedReply, Arc<ScratchLease>), ProtocolError>, RequestError> {
+        let RawReply {
+            prefix,
+            header,
+            sections,
+        } = raw;
+        if prefix.nonce != *nonce.as_bytes() {
+            return Err(malformed("invalid worker response context").into());
+        }
+        validate_plan(
+            &self.common.config,
+            class,
+            ReceivePlan {
+                class,
+                section_lengths: prefix.lengths,
+                decode_budget_bytes: response_decode_bytes,
+            },
+        )?;
+        if prefix.status == 1 {
+            if prefix.lengths.iter().any(|&length| length != 0) {
+                return Err(malformed("worker error has unexpected sections").into());
+            }
+            let _scratch = self
+                .common
+                .shared
+                .reserve_scratch(class.byte_class(), header_decode_bytes(class, header.len()))?;
+            let error = serde_json::from_slice(header.as_slice())
+                .map_err(|_| malformed("invalid worker error"))?;
+            return Ok(Err(error));
         }
         let scratch = Arc::new(
             self.common
                 .shared
                 .reserve_scratch(class.byte_class(), response_decode_bytes)?,
         );
-        let mut response_sections = std::array::from_fn(|_| None);
-        for (slot, length) in response_sections.iter_mut().zip(lengths) {
-            if length != 0 {
-                let mut bytes = self
-                    .common
-                    .shared
-                    .allocate_bytes(class.byte_class(), length as usize)?;
-                stream
-                    .read_exact(bytes.as_mut_slice())
-                    .await
-                    .map_err(|_| RequestError::Unreachable)?;
-                *slot = Some(bytes.freeze());
-            }
-        }
-        trace.phase = RaftTransportPhase::Complete;
-        Ok(ReceivedReply {
-            reply: ChargedReply {
-                header: response_header,
-                sections: response_sections,
-            },
-            scratch,
-            session: AuthenticatedSession {
-                local: self.common.local,
-                remote: identity,
-                group: group.clone(),
-                purpose,
-                nonce,
-                recovery_only: trust.recovery_only(),
-            },
-            resources: self.common.shared.clone(),
-        })
+        Ok(Ok((ChargedReply { header, sections }, scratch)))
+    }
+    /// TLS connections this caller has opened, sessions and one-shot exchanges.
+    #[cfg(test)]
+    pub(crate) fn connections_for_test(&self) -> u64 {
+        self.common.sessions.connections()
+    }
+    #[cfg(test)]
+    pub(crate) fn live_sessions_for_test(&self) -> usize {
+        self.common.sessions.live_for_test()
+    }
+    /// The locally applied Control enrollment revision, if the directory has one.
+    pub(crate) fn applied_revision(&self) -> Option<u64> {
+        self.common.directory.applied_revision()
     }
 
     #[cfg(test)]
@@ -1221,7 +1227,9 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
             Ok(TrafficClass::ServiceMutation)
         }
         Purpose::GroupLifecycle if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
-        Purpose::ReplicaPlacement if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
+        Purpose::ReplicaPlacement if group.kind == GroupKind::Control => {
+            Ok(TrafficClass::Settlement)
+        }
         Purpose::ShardSplit if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
         Purpose::ShardSplitProof if group.kind == GroupKind::Control => {
             Ok(TrafficClass::ServiceAuthority)
