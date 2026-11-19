@@ -339,6 +339,11 @@ impl MemEntry {
         self.last_seq.load(Ordering::Acquire)
     }
 
+    /// Lowest journal segment a locator in this memtable points into (`u64::MAX`: none).
+    pub fn oldest_segment(&self) -> u64 {
+        self.oldest_segment.load(Ordering::Acquire)
+    }
+
     /// The memtable is flushed: from now on its budget charge counts as pinned (held only
     /// by readers), not as memory a flush can free.
     pub fn mark_flushed(&self, pinned: &Arc<AtomicUsize>) {

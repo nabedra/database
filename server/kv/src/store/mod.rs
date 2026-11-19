@@ -298,6 +298,8 @@ pub(crate) struct Inner {
     /// Serializes the slow path of snapshot creation with readers of the snapshot list.
     snapshot_lock: Mutex<()>,
     gc: Mutex<GcState>,
+    /// Serializes journal GC steps (background and `Store::gc_journal`).
+    gc_pass: Mutex<()>,
     /// Run-writer memory of running flushes and compactions.
     writer_memory: AtomicUsize,
     /// L0 run count of the current version (write pacing reads it without a lock).
@@ -483,6 +485,7 @@ impl Store {
             snapshots: Snapshots::default(),
             snapshot_lock: Mutex::new(()),
             gc: Mutex::new(GcState::default()),
+            gc_pass: Mutex::new(()),
             writer_memory: AtomicUsize::new(0),
             l0_runs: AtomicUsize::new(l0_runs),
             pace_until_ns: AtomicU64::new(0),
@@ -682,6 +685,27 @@ impl Store {
         self.inner.check_usable()?;
         while self.inner.compact_once()? {}
         Ok(())
+    }
+
+    /// Runs journal GC until the journal fits `max_journal_bytes` or nothing more can be
+    /// done now: relocates live journal values out of the oldest segments and retires
+    /// them. Returns false when retirement still waits (for a snapshot older than the
+    /// relocation, typically). Blocks (tests and maintenance); the background pool runs
+    /// the same steps after flushes.
+    pub fn gc_journal(&self) -> Result<bool> {
+        self.inner.check_usable()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut backoff = Duration::from_micros(200);
+        while Instant::now() < deadline {
+            match self.inner.journal_gc()? {
+                None => return Ok(true),
+                Some(wait) => {
+                    std::thread::sleep(backoff.min(wait));
+                    backoff *= 2;
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Deletes everything under `prefix`, makes that durable, flushes past it, records the

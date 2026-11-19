@@ -17,14 +17,29 @@
 //! is the same after a crash.
 
 use std::collections::BTreeMap;
+use std::sync::Weak;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::batch::{BatchOp, WriteBatch};
-use crate::error::Result;
-use crate::types::{Kind, Locator, Seq};
+use crate::error::{Damage, DamageReason, Error, Result};
+use crate::gc;
+use crate::journal::{Durability, Journal, RecordKind, VALUE_RECYCLED};
+use crate::source::InternalIterator;
+use crate::types::{Kind, Locator, Seq, parse_internal_key};
+use crate::version::SuperVersion;
 
 use super::{Inner, lock, read};
+
+/// Segments one GC pass relocates at most.
+const GC_SEGMENTS_PER_PASS: usize = 4;
+/// Journal values per relocation record, at most (also a quarter of a segment).
+const RELOCATE_BATCH_BYTES: usize = 1 << 20;
+/// How soon to look again while relocations wait to become retirable.
+const GC_WAIT: Duration = Duration::from_millis(20);
+const GC_RETRY_AFTER_ERROR: Duration = Duration::from_secs(1);
 
 /// Journal GC bookkeeping.
 #[derive(Default)]
@@ -107,20 +122,228 @@ impl Inner {
     /// One journal GC step, run on a compaction thread. Retires what the rule allows,
     /// then, while the journal is over budget, relocates the live journal values of its
     /// oldest segments. Returns when to run again, if there is more to do.
+    ///
+    /// Never waits for a relocation commit: the journal thread may be stalled on L0,
+    /// which needs this thread. The next step retires once the relocations are visible
+    /// and durable (syncing the journal if needed) and no snapshot predates them.
     pub(super) fn journal_gc(&self) -> Result<Option<Duration>> {
+        let _pass = lock(&self.gc_pass);
+        if self.latched.load(Ordering::Acquire) || self.journal().requires_recovery() {
+            return Err(Error::RecoveryRequired);
+        }
         self.retire_unreachable()?;
-        Ok(None)
+        let pending: Option<Seq> = lock(&self.gc).cleared.values().copied().max();
+        if let Some(relocated) = pending {
+            let journal = self.journal();
+            if journal.visible_seq() >= relocated && journal.durable_seq() < relocated {
+                self.sync_journal()?;
+                self.retire_unreachable()?;
+            }
+            return Ok((!lock(&self.gc).cleared.is_empty()).then_some(GC_WAIT));
+        }
+        if !self.journal_over_budget() {
+            return Ok(None);
+        }
+        self.relocation_pass()
+    }
+
+    /// Scans for live locators into the oldest segments and relocates them.
+    fn relocation_pass(&self) -> Result<Option<Duration>> {
+        let Some(me) = self.self_ref.get().and_then(Weak::upgrade) else {
+            return Ok(None);
+        };
+        let journal = self.journal().clone();
+        let segments = journal.segments();
+        let flushed = lock(&self.vs).state.flushed_seq;
+        let written = journal.stats().journal_bytes;
+        let requery = (self.max_journal_bytes / 4).max(self.segment_bytes);
+        let dense: Vec<u64> = lock(&self.gc)
+            .dense
+            .iter()
+            .filter(|&(_, &at)| written < at.saturating_add(requery))
+            .map(|(&s, _)| s)
+            .collect();
+        let mut targets = gc::gc_candidates(
+            &segments,
+            self.segment_bytes,
+            self.max_journal_bytes,
+            flushed,
+            journal.durable_seq(),
+            &|s| dense.contains(&s),
+            GC_SEGMENTS_PER_PASS,
+        );
+        if targets.is_empty() {
+            return Ok(None);
+        }
+
+        // Every locator into a target that is visible at the scan snapshot.
+        let snap = me.snapshot();
+        let scan_seq = snap.seq();
+        let sv = snap.super_version().clone();
+        let live = match self.live_locators(&sv, scan_seq, &targets) {
+            Ok(live) => live,
+            // A damaged or unreadable run: reads and compaction report it; try later.
+            Err(_) => return Ok(Some(GC_RETRY_AFTER_ERROR)),
+        };
+        drop(sv);
+        drop(snap);
+
+        // Dense segments are not worth moving.
+        let mut live_bytes: BTreeMap<u64, u64> = BTreeMap::new();
+        for (_, loc) in &live {
+            *live_bytes.entry(loc.segment).or_default() += u64::from(loc.len);
+        }
+        {
+            let mut gc = lock(&self.gc);
+            targets.retain(|s| {
+                let dense =
+                    gc::too_dense(live_bytes.get(s).copied().unwrap_or(0), self.segment_bytes);
+                if dense {
+                    gc.dense.insert(*s, written);
+                }
+                !dense
+            });
+        }
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let live: Vec<(Bytes, Locator)> = live
+            .into_iter()
+            .filter(|(_, loc)| targets.contains(&loc.segment))
+            .collect();
+
+        let last = self.relocate(&journal, live)?;
+        let relocated = last.unwrap_or(scan_seq).max(scan_seq);
+        let mut gc = lock(&self.gc);
+        for s in targets {
+            gc.cleared.insert(s, relocated);
+        }
+        Ok(Some(GC_WAIT))
+    }
+
+    /// `(user key, locator)` for every key whose newest version at `seq` is a journal
+    /// value in one of `targets`, sorted by scope, segment and offset.
+    fn live_locators(
+        &self,
+        sv: &SuperVersion,
+        seq: Seq,
+        targets: &[u64],
+    ) -> Result<Vec<(Bytes, Locator)>> {
+        let max_target = targets.iter().copied().max().unwrap_or(0);
+        let mut found: Vec<(Bytes, Locator)> = Vec::new();
+        let mut collect = |it: &mut dyn InternalIterator| -> Result<()> {
+            it.seek_to_first();
+            while it.valid() {
+                if let Some(parsed) = parse_internal_key(it.key())
+                    && parsed.kind == Kind::JournalPut
+                    && let Some(loc) = Locator::decode(&it.value())
+                    && targets.contains(&loc.segment)
+                {
+                    found.push((Bytes::copy_from_slice(parsed.user_key), loc));
+                }
+                it.next();
+            }
+            it.status()
+        };
+        // Memtables hold locators into flushed segments only through relocation records
+        // of an earlier pass that are already flushed, so this rarely visits one.
+        for mem in sv.memtables() {
+            if mem.oldest_segment() <= max_target {
+                collect(&mut mem.mem.iter())?;
+            }
+        }
+        for file in sv.version.runs() {
+            if file
+                .desc
+                .oldest_journal_segment
+                .is_some_and(|s| s <= max_target)
+            {
+                let run = match file.pinned() {
+                    Some(run) => run.clone(),
+                    None => self.table_cache.get(file.id())?,
+                };
+                collect(&mut run.iter(false))?;
+            }
+        }
+        found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.offset.cmp(&b.1.offset)));
+        found.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+        // Keep what the key still holds at `seq`; a key in a quarantined scope is dead
+        // (its reads fail until `release_scope` deletes it).
+        found.retain(|(key, loc)| {
+            self.quarantine.check(key).is_ok() && holds(self, sv, key, seq, &loc.encode())
+        });
+        found.sort_by(|a, b| {
+            self.scope_bytes(&a.0)
+                .cmp(&self.scope_bytes(&b.0))
+                .then(a.1.segment.cmp(&b.1.segment))
+                .then(a.1.offset.cmp(&b.1.offset))
+        });
+        Ok(found)
+    }
+
+    /// Submits `Relocate` records (one scope each, bounded size) for `live`. Returns the
+    /// last relocation's sequence, or `None` when there was nothing to move.
+    fn relocate(&self, journal: &Journal, live: Vec<(Bytes, Locator)>) -> Result<Option<Seq>> {
+        let limit = RELOCATE_BATCH_BYTES.min((self.segment_bytes / 4) as usize);
+        let mut last = None;
+        let mut batch = WriteBatch::new();
+        let mut scope = Bytes::new();
+        let mut submit = |batch: &mut WriteBatch| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let full = std::mem::take(batch);
+            let commit = journal.submit_kind(
+                RecordKind::Relocate,
+                full,
+                Durability::NoSync,
+                Box::new(()),
+            )?;
+            last = Some(commit.seq());
+            // Not awaited: the journal thread may need this thread (see `journal_gc`).
+            drop(commit);
+            Ok(())
+        };
+        for (key, loc) in live {
+            let key_scope = self.scope_bytes(&key);
+            if key_scope != scope || batch.encoded_bytes() >= limit {
+                submit(&mut batch)?;
+                scope = key_scope.clone();
+                batch.set_scope(&scope);
+            }
+            let value = match journal.read_value_with(&loc, false) {
+                Ok(value) => value,
+                Err(e @ Error::Corruption { what, .. }) if what == VALUE_RECYCLED => {
+                    // A live locator into a recycled segment: GC broke its own rule.
+                    self.recycled_value();
+                    return Err(e);
+                }
+                Err(Error::Corruption { file, .. }) => {
+                    // G3: the value is damaged. Its scope is quarantined (store-wide
+                    // latches), after which the key is dead for GC.
+                    self.report_damage(Damage {
+                        scope: key_scope.clone(),
+                        reason: DamageReason::JournalValue,
+                        file,
+                        first_bad_seq: None,
+                    });
+                    if key_scope.is_empty() {
+                        return Err(Error::RecoveryRequired);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            batch.put(&key, &loc.encode());
+            batch.put_journal(&key, &value);
+        }
+        submit(&mut batch)?;
+        Ok(last)
     }
 }
 
 /// True when the newest version of `key` at `seq` is a journal value at `old`.
-fn holds(
-    inner: &Inner,
-    sv: &crate::version::SuperVersion,
-    key: &[u8],
-    seq: Seq,
-    old: &[u8],
-) -> bool {
+fn holds(inner: &Inner, sv: &SuperVersion, key: &[u8], seq: Seq, old: &[u8]) -> bool {
     matches!(
         read::newest(inner, sv, key, seq, false),
         Ok(Some((Kind::JournalPut, ref stored))) if stored.as_ref() == old

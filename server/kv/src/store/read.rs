@@ -182,6 +182,10 @@ impl Snapshot {
         self.seq
     }
 
+    pub(super) fn super_version(&self) -> &Arc<SuperVersion> {
+        &self.sv
+    }
+
     /// The value of `key` at this snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.inner.quarantine.check(key)?;

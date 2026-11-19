@@ -73,7 +73,6 @@ pub(crate) fn retirable(segments: &[SegmentInfo], state: &RetireState<'_>) -> Ve
 /// oldest first, only segments whose state is flushed and durable (so replay never needs
 /// them), never the active one, skipping `skip` (segments found too dense to be worth
 /// relocating), and no more than `limit`. Returns nothing while the journal fits.
-#[allow(dead_code)] // used by journal GC (next commit)
 pub(crate) fn gc_candidates(
     segments: &[SegmentInfo],
     segment_bytes: u64,
@@ -102,7 +101,6 @@ pub(crate) fn gc_candidates(
 /// A segment whose live journal values fill more than this share of it is not relocated:
 /// moving it would free little and, when the live set itself exceeds the budget, GC
 /// would rewrite the same values forever.
-#[allow(dead_code)] // used by journal GC (next commit)
 pub(crate) fn too_dense(live_bytes: u64, segment_bytes: u64) -> bool {
     live_bytes.saturating_mul(4) > segment_bytes.saturating_mul(3)
 }
