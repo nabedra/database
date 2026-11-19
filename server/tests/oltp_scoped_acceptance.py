@@ -551,7 +551,15 @@ class Driver:
         request_id = request['request_id']
         follower = self.followers[-1]
         with self.pause_worker(follower):
-            self.accepted(self.submit(primary, request), request_id)
+            reply = self.submit(primary, request)
+            admission_overload = None
+            if reply[0] == 429:
+                # A whole worker pause can also interrupt a metadata election.
+                # Retry the same UUID and bytes after the explicit refusal.
+                admission_overload = assert_error(reply, 429, request_id, 'overloaded', 'not_applied')
+                time.sleep(0.25)
+                reply = self.submit(primary, request)
+            self.accepted(reply, request_id)
             terminal = self.terminal(primary, request_id, True)
             assert self.table.get(3) == {'id': 3, 'value': 73}
             status, health = primary.exchange('/health/ready')
@@ -571,6 +579,7 @@ class Driver:
         legacy_receipt = self.terminal(primary, legacy['request_id'], None)
         assert self.table.where(id=11).collect() == [{'id': 11, 'value': 83}]
         report('O30/Q03 release binary', paused=self.worker_identity(follower), scoped_receipt=terminal,
+               preaccept_overload=admission_overload,
                ready_members_during_pause=health['ready_workers'],
                legacy_admission_while_paused=legacy_reply, legacy_receipt=legacy_receipt)
 
