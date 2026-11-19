@@ -26,6 +26,16 @@
 //! crash). Timestamps it allocates afterwards come from the Timestamp
 //! authority, which issues values above every value issued before in real
 //! time, so they are above every snapshot already served.
+//!
+//! Leadership generation (RV-T4 F1, F4): `lead` and `step_down` bump a
+//! generation counter. A timestamp is bound to the generation in which it was
+//! fetched: the executor takes a `LeaderToken` before asking the Timestamp
+//! authority and passes it to `register_pending`, which refuses the token
+//! once leadership changed, because another leader may have served a snapshot
+//! above the timestamp meanwhile. A read waiting on a pending commit (or on
+//! rule 3) fails when the generation changes, because `lead` and `step_down`
+//! drop pending entries that may still commit under the next leader.
+use super::super::{encode_key, key_length};
 use crate::{
     oltp::{failure, mvcc::MvccKey, pool::GroupStore},
     oltp_replication::types::{AppliedPosition, CommitTs, ReadTs},
@@ -49,21 +59,40 @@ pub(crate) enum ClockRejection {
     StaleTimestamp { max_read_ts: ReadTs },
     /// The same timestamp is already pending on this range.
     Duplicate,
-    /// Rule 3: this node does not lead, or no entry of its term applied yet.
+    /// Rule 3: this node does not lead, no entry of its term applied yet, or
+    /// leadership changed since the caller's `LeaderToken` was taken.
     NotServing,
-    /// A split (or other range change) paused new direct commits.
-    Paused,
+    /// A key cannot be encoded; the command is malformed.
+    InvalidKey,
+}
+
+/// Proof that this node served as leader when the token was taken. Take it
+/// before fetching a commit timestamp and pass it to `register_pending`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LeaderToken {
+    term: u64,
+    generation: u64,
+}
+impl LeaderToken {
+    pub(crate) fn term(&self) -> u64 {
+        self.term
+    }
 }
 
 #[derive(Default)]
 struct ClockState {
     max_read_ts: u64,
-    pending: BTreeMap<CommitTs, Vec<MvccKey>>,
+    /// Pending commits and the encoded keys each writes.
+    pending: BTreeMap<CommitTs, Vec<Vec<u8>>>,
+    /// How many pending commits write each encoded key, so a latest read
+    /// checks its key in O(1) when woken.
+    pending_keys: HashMap<Vec<u8>, usize>,
     /// The term this node leads, if any.
     leader_term: Option<u64>,
     /// The highest term of any entry applied on this node.
     applied_term: u64,
-    paused: usize,
+    /// Bumped by every `lead` of a new term and every `step_down`.
+    generation: u64,
 }
 impl ClockState {
     fn held(&self) -> bool {
@@ -73,6 +102,24 @@ impl ClockState {
     fn serving(&self) -> bool {
         self.leader_term
             .is_some_and(|term| self.applied_term >= term)
+    }
+    fn remove(&mut self, commit_ts: CommitTs) -> bool {
+        let Some(keys) = self.pending.remove(&commit_ts) else {
+            return false;
+        };
+        for key in keys {
+            if let Some(count) = self.pending_keys.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pending_keys.remove(&key);
+                }
+            }
+        }
+        true
+    }
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.pending_keys.clear();
     }
 }
 
@@ -84,14 +131,10 @@ pub(crate) struct RangeClock {
     _store: GroupStore,
 }
 
-/// While alive, `register_pending` refuses new commits with `Paused`.
-#[must_use]
-pub(crate) struct CommitPause(Arc<RangeClock>);
-impl Drop for CommitPause {
-    fn drop(&mut self) {
-        let mut state = self.0.lock();
-        state.paused -= 1;
-    }
+fn encoded(key: &MvccKey) -> Result<Vec<u8>, ProtocolError> {
+    let mut bytes = vec![0; key_length(key)?];
+    encode_key(key, &mut bytes);
+    Ok(bytes)
 }
 
 #[allow(dead_code)] // The leader executor (T5) is the main caller.
@@ -133,6 +176,12 @@ impl RangeClock {
         self.lock().pending.len()
     }
 
+    /// Distinct keys with a pending writer (RV-T4 F10 bookkeeping).
+    #[cfg(test)]
+    pub(crate) fn pending_key_count(&self) -> usize {
+        self.lock().pending_keys.len()
+    }
+
     /// Rule 1 as a pure check: true when `commit_ts` is at or below an
     /// already-served snapshot, so the caller must fetch a new timestamp.
     /// `register_pending` repeats this check atomically.
@@ -140,21 +189,41 @@ impl RangeClock {
         commit_ts.get() <= self.lock().max_read_ts
     }
 
-    /// Register a commit before proposing it. It leaves `pending` when its
-    /// entry applies (the participant machine settles it), or when the
-    /// caller calls `settle` after a definite failure (a proposal error, an
-    /// apply error, or a dropped request), or through `step_down`.
+    /// The current leadership, or `None` while this node does not serve.
+    /// Take it before fetching the commit timestamp.
+    pub(crate) fn leader_token(&self) -> Option<LeaderToken> {
+        let state = self.lock();
+        state.serving().then(|| LeaderToken {
+            term: state.leader_term.expect("serving implies a term"),
+            generation: state.generation,
+        })
+    }
+
+    /// Register a commit before proposing it. `token` must be the one taken
+    /// before its timestamp was fetched: after a leadership change it is
+    /// refused (`NotServing`), even if this node leads again, because a
+    /// snapshot above the timestamp may have been served elsewhere meanwhile.
+    /// The entry leaves `pending` when its entry applies (the participant
+    /// machine settles it), when the caller calls `settle` after a definite
+    /// failure (a proposal error, an apply error, or a dropped request), or
+    /// through `lead` or `step_down`.
     pub(crate) fn register_pending(
         &self,
+        token: LeaderToken,
         commit_ts: CommitTs,
         keys: Vec<MvccKey>,
     ) -> Result<(), ClockRejection> {
+        let keys = keys
+            .iter()
+            .map(encoded)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ClockRejection::InvalidKey)?;
         let mut state = self.lock();
-        if !state.serving() {
+        if !state.serving()
+            || state.generation != token.generation
+            || state.leader_term != Some(token.term)
+        {
             return Err(ClockRejection::NotServing);
-        }
-        if state.paused != 0 {
-            return Err(ClockRejection::Paused);
         }
         if commit_ts.get() <= state.max_read_ts {
             return Err(ClockRejection::StaleTimestamp {
@@ -164,13 +233,16 @@ impl RangeClock {
         if state.pending.contains_key(&commit_ts) {
             return Err(ClockRejection::Duplicate);
         }
+        for key in &keys {
+            *state.pending_keys.entry(key.clone()).or_default() += 1;
+        }
         state.pending.insert(commit_ts, keys);
         Ok(())
     }
 
     /// Remove a pending commit. Idempotent.
     pub(crate) fn settle(&self, commit_ts: CommitTs) {
-        let removed = self.lock().pending.remove(&commit_ts).is_some();
+        let removed = self.lock().remove(commit_ts);
         if removed {
             self.changed.notify_waiters();
         }
@@ -180,24 +252,28 @@ impl RangeClock {
     /// wait until an entry of `term` applies here. Entries this node
     /// registered in an older term are dropped: they are in the log before
     /// any entry of `term`, so they apply before this node serves again.
+    /// Reads that waited on them fail, and older tokens are refused.
     pub(crate) fn lead(&self, term: u64) {
         let mut state = self.lock();
         if state.leader_term.is_some_and(|current| current >= term) {
             return;
         }
         state.leader_term = Some(term);
-        state.pending.clear();
+        state.generation += 1;
+        state.clear();
         drop(state);
         self.changed.notify_waiters();
     }
 
     /// Leadership was lost. Entries this node proposed may still commit under
-    /// the next leader, which reads them from its applied state; this node no
-    /// longer serves direct commits or leader reads, so waiters are released.
+    /// the next leader, which reads them from its applied state. Reads that
+    /// waited here fail instead of reading without them, and every token
+    /// taken so far is refused.
     pub(crate) fn step_down(&self) {
         let mut state = self.lock();
         state.leader_term = None;
-        state.pending.clear();
+        state.generation += 1;
+        state.clear();
         drop(state);
         self.changed.notify_waiters();
     }
@@ -223,31 +299,21 @@ impl RangeClock {
         }
     }
 
-    /// Refuse new registrations until the guard drops. A split freeze is
-    /// proposed after `drained` returns, so no direct commit above its cut
-    /// can apply first and get the freeze refused.
-    pub(crate) fn pause_commits(self: &Arc<Self>) -> CommitPause {
-        self.lock().paused += 1;
-        CommitPause(self.clone())
-    }
-
-    /// Wait until no commit is pending, bounded like a read.
-    pub(crate) async fn drained(&self) -> Result<(), ProtocolError> {
-        self.wait(|state| state.pending.is_empty()).await
-    }
-
     /// Rule 2 for a snapshot read at `read_ts`. `u64::MAX` is the "latest"
     /// sentinel some callers use. It is not a timestamp, so it waits for every
     /// pending commit without raising `max_read_ts`.
     pub(crate) async fn observe_snapshot(&self, read_ts: ReadTs) -> Result<(), ProtocolError> {
         let bound = read_ts.get();
-        if bound != u64::MAX {
+        let generation = {
             // Raise before waiting, so a commit cannot register under a read
             // that is still waiting for an earlier one or for rule 3.
             let mut state = self.lock();
-            state.max_read_ts = state.max_read_ts.max(bound);
-        }
-        self.wait(|state| {
+            if bound != u64::MAX {
+                state.max_read_ts = state.max_read_ts.max(bound);
+            }
+            state.generation
+        };
+        self.wait_since(generation, |state| {
             state
                 .pending
                 .first_key_value()
@@ -259,11 +325,17 @@ impl RangeClock {
     /// A latest-version read of `key` (plan section 6, `table.get`) waits for
     /// every pending commit that writes it. It raises nothing.
     pub(crate) async fn wait_latest(&self, key: &MvccKey) -> Result<(), ProtocolError> {
-        self.wait(|state| state.pending.values().all(|keys| !keys.contains(key)))
+        let key = encoded(key)?;
+        let generation = self.lock().generation;
+        self.wait_since(generation, |state| !state.pending_keys.contains_key(&key))
             .await
     }
 
-    async fn wait(&self, ready: impl Fn(&ClockState) -> bool) -> Result<(), ProtocolError> {
+    async fn wait_since(
+        &self,
+        generation: u64,
+        ready: impl Fn(&ClockState) -> bool,
+    ) -> Result<(), ProtocolError> {
         let deadline = tokio::time::Instant::now() + RANGE_CLOCK_WAIT;
         loop {
             let notified = self.changed.notified();
@@ -271,6 +343,15 @@ impl RangeClock {
             notified.as_mut().enable();
             {
                 let state = self.lock();
+                // Checked first: `lead` and `step_down` empty `pending`, so
+                // `ready` would hold although the awaited commit may still
+                // commit under another leader.
+                if state.generation != generation {
+                    return Err(failure(
+                        ErrorCode::StorageUnavailable,
+                        "range leadership changed while a read waited for an in-flight direct commit",
+                    ));
+                }
                 if !state.held() && ready(&state) {
                     return Ok(());
                 }
