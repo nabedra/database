@@ -359,13 +359,13 @@ impl HttpRuntime for RemoteRuntime {
         Box::pin(async move {
             // Observation uses fresh authoritative routing and mTLS. Avoid
             // making a long-running request generate a stream of quorum reads.
-            // The caller's observation timeout remains independent of execution.
+            // Start a bounded observation window when execution reaches the
+            // receipt phase or when a scoped receipt needs reconciliation.
             let mut interval = std::time::Duration::from_millis(50);
             let scoped = self
                 .client
                 .has_scoped_receipt(record.run_id, record.request_id);
-            let mut copy_deadline =
-                scoped.then(|| tokio::time::Instant::now() + super::RECEIPT_OBSERVATION_TIMEOUT);
+            let mut copy_deadline = None;
             loop {
                 let observe = self.client.observe(record.run_id, record.request_id);
                 let observed = match copy_deadline {
@@ -412,8 +412,18 @@ impl HttpRuntime for RemoteRuntime {
                 if copy_deadline.is_some_and(|end| now >= end) {
                     return Err(unavailable());
                 }
-                if state == RequestState::Committing && copy_deadline.is_none() {
-                    copy_deadline = Some(now + super::RECEIPT_OBSERVATION_TIMEOUT);
+                if (state == RequestState::Committing
+                    || scoped && state == RequestState::Reconciling)
+                    && copy_deadline.is_none()
+                {
+                    let timeout = if scoped {
+                        // The worker's copy round is allowed to recover one
+                        // slow peer. The read marker can need another quorum.
+                        super::scoped_worker::COPY_TIMEOUT
+                    } else {
+                        super::RECEIPT_OBSERVATION_TIMEOUT
+                    };
+                    copy_deadline = Some(now + timeout);
                 }
                 let next_poll = now + interval;
                 tokio::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))

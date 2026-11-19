@@ -290,7 +290,10 @@ class Driver:
                      (update, lambda: self.table.update(0, {'value': 17}), True))
             for request, invoke, expected in cases:
                 request_id = request['request_id']
-                self.select_checkpoints(request['request_id'])
+                hold_dispatch = request is get
+                self.select_checkpoints(request_id, hold_dispatch=hold_dispatch)
+                dispatch = self.record_file(self.owner, request_id, 'scoped-dispatch')
+                release_dispatch = dispatch.with_name(f'release-{dispatch.stem}')
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     with self.gates(request_id, dict.fromkeys(self.followers, COPY_PAYLOAD)):
                         # Fix UUID allocation and let the SDK make its usual request.
@@ -301,6 +304,13 @@ class Driver:
                             assert not response.done(), request_id
                             for role in self.followers:
                                 self.release(role, request_id)
+                            if hold_dispatch:
+                                try:
+                                    wait_for([dispatch], read_json)
+                                    time.sleep(2.5)
+                                    assert not response.done(), request_id
+                                finally:
+                                    release_dispatch.touch()
                             actual = response.result(timeout=HTTP_TIMEOUT + 2)
                             assert type(actual) is type(expected) and actual == expected, actual
             reads = self.copy_evidence(get)
@@ -327,13 +337,15 @@ class Driver:
         assert self.table.get(0) == {'id': 0, 'value': 17}
         report('ordinary ORM legacy create, insert, describe, list, collect, count and duplicate-key conflict')
 
-    def select_checkpoints(self, request_id):
+    def select_checkpoints(self, request_id, *, hold_dispatch=False):
         stages = ('scoped-payload-quorum', 'scoped-marker-quorum', 'scoped-terminal-quorum',
                   'scoped-dispatch', 'scoped-decision')
-        for path in self.instruments.values():
+        for role, path in self.instruments.items():
             config = path / 'transaction-gates.json'
             selected = read_json(config) if config.exists() else {}
-            write_json(config, selected | {request_id: dict.fromkeys(stages, False)})
+            settings = dict.fromkeys(stages, False)
+            settings['scoped-dispatch'] = hold_dispatch and role == self.owner
+            write_json(config, selected | {request_id: settings})
 
     def fault_command(self, role, paused):
         command_id = str(uuid4())
@@ -554,11 +566,7 @@ class Driver:
     def takeover_after_acceptance(self, primary):
         request = self.point('table.update', 5, {'value': 105})
         request_id = request['request_id']
-        self.select_checkpoints(request_id)
-        config = self.instruments[self.owner] / 'transaction-gates.json'
-        selected = read_json(config)
-        selected[request_id]['scoped-dispatch'] = True
-        write_json(config, selected)
+        self.select_checkpoints(request_id, hold_dispatch=True)
         dispatch = self.record_file(self.owner, request_id, 'scoped-dispatch')
         release = dispatch.with_name(f'release-{dispatch.stem}')
         others = [role for role in self.roles if role != self.owner]

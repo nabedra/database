@@ -53,7 +53,7 @@ use std::{
 use tokio::{sync::Mutex as AsyncMutex, time::Instant};
 use uuid::Uuid;
 
-const COPY_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const COPY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) struct ScopedWorkerServices {
     pub local: WorkerIdentity,
