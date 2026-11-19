@@ -12,6 +12,11 @@ categories = ["database", "command-line-utilities"]
 publish = ["crates-io"]
 include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
+[workspace]
+# `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
+members = [".", "kv"]
+exclude = ["events"]
+
 [lib]
 name = "nabedra_database_server"
 

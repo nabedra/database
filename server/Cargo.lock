@@ -2163,6 +2163,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-kv"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
