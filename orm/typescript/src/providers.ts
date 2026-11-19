@@ -111,7 +111,7 @@ export class KubernetesProvider {
         || v.mountPath === "/" || v.mountPath === "/nabedra" || v.mountPath.startsWith("/nabedra/"))) {
       throw new ValidationError("Credential mounts cannot override the bootstrap volume")
     }
-    this.#transport = new Transport(apiUrl, null, { timeout, caFile })
+    this.#transport = new Transport(apiUrl, null, { timeout, caFile, agent: false })
     this.#authorization = "Bearer " + token
     this.#base = "/api/v1/namespaces/" + encodeURIComponent(namespace)
     this.startNode = this.startNode.bind(this)

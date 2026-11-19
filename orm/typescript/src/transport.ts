@@ -53,6 +53,8 @@ interface ConnectionOptions {
   timeout?: number
   caFile?: string | null
   database?: string | null
+  /** Agent for exchanges that pass none. Default: a keep-alive agent; false opens one connection per call. */
+  agent?: http.Agent | false
 }
 
 interface ExchangeOptions {
@@ -67,6 +69,9 @@ interface ExchangeOptions {
 }
 
 const maxBody = 8 * 1024 * 1024
+const maxIdleSockets = 4
+// Below the server's 5 s HTTP/1.1 header read timeout, which also ends idle connections.
+const idleSocketMs = 2_000
 const maxTimerMs = 2_147_483_647
 const mutations = new Set([
   "table.create", "table.drop", "table.insert", "table.insert_many", "table.update",
@@ -402,6 +407,7 @@ export class Transport {
   readonly #token: string | null
   readonly #database: string | null
   readonly #tls?: tls.SecureContext
+  readonly #agent: http.Agent | false
 
   constructor(url: string | null | undefined, token: string | null | undefined, options: ConnectionOptions = {}) {
     try {
@@ -418,7 +424,7 @@ export class Transport {
     if (token != null && (typeof token !== "string" || !/^[A-Za-z0-9._~+/\-]+=*(?![\s\S])/.test(token))) {
       throw new ValidationError("Token must be a nonempty safe bearer token")
     }
-    const { timeout = 30, caFile = null, database = null } = options
+    const { timeout = 30, caFile = null, database = null, agent } = options
     if (!validDuration(timeout)) throw new ValidationError("Timeout must be positive and finite")
     if (caFile !== null) {
       if (typeof caFile !== "string" || !caFile || caFile.includes("\0")) {
@@ -441,13 +447,18 @@ export class Transport {
         && (typeof database !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}(?![\s\S])/.test(database))) {
       throw new ValidationError("Invalid database selector")
     }
+    if (agent !== undefined && agent !== false && !(agent instanceof http.Agent)) {
+      throw new ValidationError("Agent must be an HTTP agent or false")
+    }
     this.#token = token ?? null
     this.#database = database
     this.timeout = timeout
+    // Reused sockets never carry a retry: a failed exchange destroys its socket and surfaces as before.
+    this.#agent = agent ?? this.createAgent({ maxFreeSockets: maxIdleSockets, timeout: idleSocketMs })
   }
 
-  createAgent(): http.Agent {
-    const options = { keepAlive: true, maxSockets: 1, maxFreeSockets: 1 }
+  createAgent(limits: http.AgentOptions = { maxSockets: 1, maxFreeSockets: 1 }): http.Agent {
+    const options = { ...limits, keepAlive: true }
     return this.#url.protocol === "https:"
       ? new https.Agent({ ...options, secureContext: this.#tls, rejectUnauthorized: true })
       : new http.Agent(options)
@@ -491,7 +502,7 @@ export class Transport {
         if (mayHaveSent) sentFailures.add(error)
         reject(error)
       }
-      const req = request(this.#url, { method, path, headers, agent: agent ?? false, ...security }, (response) => {
+      const req = request(this.#url, { method, path, headers, agent: agent ?? this.#agent, ...security }, (response) => {
         mayHaveSent = true
         statusCode = response.statusCode ?? null
         const read = readResponse ?? ((message) => readBoundedResponse(message, maxBytes))

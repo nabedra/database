@@ -18,7 +18,7 @@ export class ControlTransport {
   constructor(apiUrl: string, adminToken: string, options: { timeout?: number; caFile?: string | null } = {},
     operations: { mutations: ReadonlySet<string>; reads: ReadonlySet<string> } = clusterOperations) {
     if (typeof adminToken !== "string") throw new ValidationError("Token must be a nonempty safe bearer token")
-    this.#transport = new Transport(apiUrl, adminToken, options)
+    this.#transport = new Transport(apiUrl, adminToken, { ...options, agent: false })
     this.#operations = operations
     this.#decodeIntegers = operations === clusterOperations ? "bigint" : undefined
   }
