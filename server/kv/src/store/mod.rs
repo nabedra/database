@@ -25,7 +25,9 @@
 //! version. Point reads apply the newest covering range tombstone across every source.
 
 mod background;
+mod journal_gc;
 mod read;
+mod snapshots;
 #[cfg(test)]
 mod tests;
 
@@ -52,7 +54,7 @@ use crate::journal::{Journal, JournalSink, RecordKind};
 use crate::manifest::{
     self, AppendError, JOURNAL_DIR, ManifestState, ManifestWriter, RUNS_DIR, RunDesc, VersionEdit,
 };
-use crate::memtable::{Memtable, MemtableBudget, MemtableOptions, SnapshotList};
+use crate::memtable::{Memtable, MemtableBudget, MemtableOptions};
 use crate::quarantine::{Quarantine, QuarantineLimit, single_scope};
 use crate::recovery;
 use crate::run::{
@@ -64,6 +66,8 @@ use crate::types::{Locator, Seq};
 use crate::version::{FileTracker, LevelOptions, MemEntry, RunFile, SuperVersion, Version};
 
 use self::background::Job;
+use self::journal_gc::GcState;
+use self::snapshots::Snapshots;
 
 /// How long a stalled writer sleeps between checks.
 const STALL_POLL: Duration = Duration::from_millis(5);
@@ -96,6 +100,9 @@ pub struct Options {
     /// A memtable is frozen once the journal written into it exceeds this, which bounds
     /// replay at open.
     pub max_replay_bytes: u64,
+    /// Journal GC relocates live journal values out of the oldest segments while the
+    /// journal's live segments exceed this (plan section 2, "Journal values").
+    pub max_journal_bytes: u64,
     pub run_writer: RunWriterOptions,
 }
 
@@ -120,6 +127,7 @@ impl Options {
             memtable: MemtableOptions::default(),
             memtable_bytes: 64 << 20,
             max_replay_bytes: 64 << 20,
+            max_journal_bytes: 512 << 20,
             run_writer: RunWriterOptions::default(),
         }
     }
@@ -136,6 +144,11 @@ pub struct RecoveryReport {
     pub manifest_torn_tail: bool,
     /// L4: unreferenced run files and stale temp files deleted.
     pub orphans_removed: u64,
+    /// Sequences the manifest's `flushed_seq` covers that the journal no longer held:
+    /// its end was behind the manifest (synced journal bytes lost and read as a torn
+    /// tail or an end marker). Their state is in runs, so nothing is lost; open voids
+    /// the numbers so they are never reused. Nonzero means the disk lost synced bytes.
+    pub journal_behind_manifest: u64,
 }
 
 pub struct Opened {
@@ -166,6 +179,40 @@ pub struct StoreStats {
     pub corruption_detected: u64,
     pub tail_truncations: u64,
     pub quarantined_scopes: u32,
+    /// `RecoveryReport::journal_behind_manifest` of the last open.
+    pub journal_behind_manifest: u64,
+    /// Reads that met a locator into a recycled segment: a journal GC invariant broke.
+    /// Each one latches `RecoveryRequired`.
+    pub recycled_value_reads: u64,
+    /// Memory this store keeps outside the block cache and the memtable budget, charged
+    /// to the pool overhead (plan section 5 "Memory"): see [`MemoryUsage`].
+    pub overhead_bytes: u64,
+}
+
+/// Resident memory of one store, by budget (plan section 5 "Memory").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryUsage {
+    /// Active and immutable memtables (inside `write_buffer_bytes`).
+    pub memtables: u64,
+    /// Pool overhead: open run writers of flushes and compactions (write buffer, data
+    /// block, about 8 B per key for the filter and one index entry per data block).
+    pub run_writers: u64,
+    /// Pool overhead: range tombstones of live runs, raw and fragmented.
+    pub range_tombstones: u64,
+    /// Pool overhead: versions and the manifest state (about 200 B per run).
+    pub versions: u64,
+    /// Pool overhead: the snapshot registry.
+    pub snapshots: u64,
+    /// Block cache: bytes reserved or pinned there (open runs' top-level indexes, held
+    /// blocks). Shared by every store on the cache; reported here for convenience.
+    pub cache_pinned: u64,
+}
+
+impl MemoryUsage {
+    /// The part charged to the pool overhead.
+    pub fn overhead(&self) -> u64 {
+        self.run_writers + self.range_tombstones + self.versions + self.snapshots
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -197,6 +244,9 @@ struct Counters {
     file_syncs: AtomicU64,
     user_bytes: AtomicU64,
     open_corruptions: AtomicU64,
+    relocated_bytes: AtomicU64,
+    recycled_reads: AtomicU64,
+    journal_behind: AtomicU64,
 }
 
 type DamageHook = Arc<dyn Fn(Damage) + Send + Sync>;
@@ -210,8 +260,11 @@ pub(crate) struct Inner {
     memtable_options: MemtableOptions,
     memtable_bytes: usize,
     max_replay_bytes: u64,
+    max_journal_bytes: u64,
+    segment_bytes: u64,
     run_writer: RunWriterOptions,
     budget: Arc<MemtableBudget>,
+    cache: Arc<BlockCache>,
     background: Arc<Background>,
     table_cache: TableCache,
     run_stats: Arc<RunStats>,
@@ -224,8 +277,18 @@ pub(crate) struct Inner {
     vs: Mutex<VersionSet>,
     flush_lock: Mutex<()>,
     compaction_lock: Mutex<()>,
-    snapshots: SnapshotList,
+    snapshots: Snapshots,
+    /// Serializes the slow path of snapshot creation with readers of the snapshot list.
     snapshot_lock: Mutex<()>,
+    gc: Mutex<GcState>,
+    /// Run-writer memory of running flushes and compactions.
+    writer_memory: AtomicUsize,
+    /// L0 run count of the current version (write pacing reads it without a lock).
+    l0_runs: AtomicUsize,
+    /// Write pacing under L0 slowdown: the time (ns since `epoch`) up to which the
+    /// delayed write rate is already spent.
+    pace_until_ns: AtomicU64,
+    epoch: Instant,
     quarantine: Quarantine,
     latched: AtomicBool,
     jobs: Mutex<Jobs>,
@@ -236,7 +299,6 @@ pub(crate) struct Inner {
     compaction_queued: AtomicBool,
     l0_changed: Condvar,
     l0_lock: Mutex<()>,
-    slowdown_debt_ns: AtomicU64,
     damage_hook: RwLock<Option<DamageHook>>,
     pending_damage: Mutex<Vec<Damage>>,
     pending_release: Mutex<Vec<(Bytes, Seq)>>,
@@ -329,7 +391,13 @@ impl Store {
         let tracker = Arc::new(FileTracker::default());
         let mut version = Version::default();
         for desc in state.runs.values() {
-            version.levels[desc.level as usize].push(RunFile::new(desc.clone(), tracker.clone()));
+            let run = RunFile::new(desc.clone(), tracker.clone());
+            if desc.level == 0
+                && let Ok(open) = table_cache.get(desc.id)
+            {
+                run.pin(open);
+            }
+            version.levels[desc.level as usize].push(run);
         }
         version.sort();
         let budget = options.memtables.clone();
@@ -345,6 +413,7 @@ impl Store {
             }
         }
         let flushed_seq = state.flushed_seq;
+        let l0_runs = version.l0_count();
         let inner = Arc::new(Inner {
             dir: dir.to_path_buf(),
             runs_dir: runs_dir.clone(),
@@ -354,8 +423,11 @@ impl Store {
             memtable_options: options.memtable,
             memtable_bytes: options.memtable_bytes.max(1),
             max_replay_bytes: options.max_replay_bytes.max(1),
+            max_journal_bytes: options.max_journal_bytes,
+            segment_bytes: options.journal.segment_bytes,
             run_writer: options.run_writer,
             budget,
+            cache: options.cache.clone(),
             background: options.background.clone(),
             table_cache,
             run_stats,
@@ -377,8 +449,13 @@ impl Store {
             }),
             flush_lock: Mutex::new(()),
             compaction_lock: Mutex::new(()),
-            snapshots: SnapshotList::new(),
+            snapshots: Snapshots::default(),
             snapshot_lock: Mutex::new(()),
+            gc: Mutex::new(GcState::default()),
+            writer_memory: AtomicUsize::new(0),
+            l0_runs: AtomicUsize::new(l0_runs),
+            pace_until_ns: AtomicU64::new(0),
+            epoch: Instant::now(),
             quarantine: Quarantine::new(quarantine_list),
             latched: AtomicBool::new(false),
             jobs: Mutex::new(Jobs::default()),
@@ -388,7 +465,6 @@ impl Store {
             compaction_queued: AtomicBool::new(false),
             l0_changed: Condvar::new(),
             l0_lock: Mutex::new(()),
-            slowdown_debt_ns: AtomicU64::new(0),
             damage_hook: RwLock::new(None),
             pending_damage: Mutex::new(Vec::new()),
             pending_release: Mutex::new(Vec::new()),
@@ -417,8 +493,13 @@ impl Store {
             sink,
         )?;
         let journal = Arc::new(journal);
+        journal.set_value_cache(options.cache.clone(), inner.table_cache.context().namespace);
         let _ = inner.journal.set(journal.clone());
         inner.replaying.store(false, Ordering::Release);
+        inner
+            .counters
+            .journal_behind
+            .store(report.voided_at_open, Ordering::Relaxed);
 
         // G1: journal damage of a group scope. Damage older than a release of that scope
         // is history.
@@ -487,6 +568,7 @@ impl Store {
             recovery_ms: started.elapsed().as_millis() as u64,
             manifest_torn_tail: opened.manifest_torn_tail,
             orphans_removed: orphans,
+            journal_behind_manifest: report.voided_at_open,
         };
         inner
             .recovery_ms
@@ -519,6 +601,26 @@ impl Store {
             .user_bytes
             .fetch_add(batch.encoded_bytes() as u64, Ordering::Relaxed);
         self.inner.journal().submit(batch, durability, on_done)
+    }
+
+    /// Write pacing while L0 is at its slowdown trigger (RocksDB's delayed write rate):
+    /// charges `bytes` to the store's pacing budget and returns how long the caller
+    /// should wait before submitting them. Zero when writes are not slowed. Only the
+    /// writers that call this wait; the journal thread never sleeps for pacing, so other
+    /// scopes keep their latency. An async caller awaits the delay (a timer), a blocking
+    /// caller uses [`Store::pace`]. At `l0_stop_writes` the journal thread itself stalls
+    /// every write until compaction catches up, paced or not.
+    pub fn write_delay(&self, bytes: usize) -> Duration {
+        self.inner.write_delay(bytes)
+    }
+
+    /// [`Store::write_delay`], slept on the calling thread. Must not be called on an
+    /// async runtime thread.
+    pub fn pace(&self, bytes: usize) {
+        let delay = self.inner.write_delay(bytes);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
     }
 
     /// Durably covers every write submitted before this call.
@@ -597,8 +699,19 @@ impl Store {
         self.inner.stats()
     }
 
+    /// Resident memory by budget.
+    pub fn memory_usage(&self) -> MemoryUsage {
+        self.inner.memory_usage()
+    }
+
     /// Closes the store: waits for its background work, then closes the journal (clean
     /// close record) and releases the directory lock. Dropping does the same.
+    ///
+    /// **Blocks**: it waits for running flushes and compactions and joins the journal's
+    /// threads (`kv-journal`, `kv-journal-prep`). An async owner must close or drop the
+    /// last `Store` handle on a blocking thread (`spawn_blocking`), never on a runtime
+    /// worker. Snapshots and iterators that outlive the store do not block when they drop:
+    /// the journal's threads are already joined by then.
     pub fn close(self) -> Result<()> {
         self.inner.shutdown()
     }
@@ -644,16 +757,31 @@ impl Job for Inner {
             return None;
         }
         let result = self.compact_once();
+        // Journal GC runs on the compaction threads, after compaction (which may drop
+        // shadowed locators) and never concurrently with itself.
+        let gc_retry = match &result {
+            Ok(_) => match self.journal_gc() {
+                Ok(retry) => retry,
+                Err(Error::NoSpace) => Some(NO_SPACE_RETRY),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
         self.end_job();
         let releases_waiting = !lock(&self.pending_release).is_empty();
+        let pending_damage = !lock(&self.pending_damage).is_empty();
         match result {
             Ok(true) => {
                 self.schedule_compaction();
                 None
             }
-            Ok(false) if releases_waiting => {
+            Ok(false) if releases_waiting || pending_damage => {
                 self.compaction_queued.store(true, Ordering::Release);
                 Some(Duration::from_millis(10))
+            }
+            Ok(false) if gc_retry.is_some() => {
+                self.compaction_queued.store(true, Ordering::Release);
+                gc_retry
             }
             Err(Error::NoSpace) => {
                 self.compaction_queued.store(true, Ordering::Release);
@@ -778,14 +906,12 @@ impl Inner {
         batch: &WriteBatch,
         locators: &[Locator],
     ) -> Result<()> {
-        if kind == RecordKind::Relocate {
-            return Err(Error::InvalidArgument(
-                "journal relocation records are not supported yet",
-            ));
-        }
         let replaying = self.replaying.load(Ordering::Acquire);
         if !replaying {
-            self.stall(batch.encoded_bytes());
+            self.stall();
+        }
+        if kind == RecordKind::Relocate {
+            return self.apply_relocation(first_seq, batch, locators, replaying);
         }
         let _active = lock(&self.active);
         let mem = self.current_sv().mem.clone();
@@ -849,9 +975,10 @@ impl Inner {
         }
     }
 
-    /// Waits while the memtable budget is exhausted or L0 is at its stop trigger, and
-    /// slows writes while L0 is at its slowdown trigger. Writers wait; they never fail.
-    fn stall(&self, bytes: usize) {
+    /// Waits while the memtable budget is exhausted or L0 is at its stop trigger. Writers
+    /// wait; they never fail. The L0 slowdown is not applied here: it would delay every
+    /// scope behind the journal thread. Writers pace themselves ([`Store::write_delay`]).
+    fn stall(&self) {
         loop {
             if self.latched.load(Ordering::Acquire) || self.closing() {
                 return;
@@ -878,16 +1005,33 @@ impl Inner {
                 let _ = self.l0_changed.wait_timeout(guard, STALL_POLL);
                 continue;
             }
-            if l0 >= self.levels.l0_slowdown_writes {
-                let rate = self.levels.delayed_write_rate.max(1);
-                let ns = (bytes as u64).saturating_mul(1_000_000_000) / rate;
-                let debt = self.slowdown_debt_ns.fetch_add(ns, Ordering::Relaxed) + ns;
-                if debt >= 1_000_000 {
-                    self.slowdown_debt_ns.store(0, Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_nanos(debt));
-                }
-            }
             return;
+        }
+    }
+
+    /// See [`Store::write_delay`]. A token bucket at `delayed_write_rate`: each caller
+    /// takes its bytes' share of time after whatever earlier callers took, and waits
+    /// until then. Delays under a millisecond are not returned (the debt stays in the
+    /// bucket and a later caller pays it), so pacing costs no timer per small write.
+    fn write_delay(&self, bytes: usize) -> Duration {
+        if self.l0_runs.load(Ordering::Relaxed) < self.levels.l0_slowdown_writes {
+            return Duration::ZERO;
+        }
+        let rate = self.levels.delayed_write_rate.max(1);
+        let cost = (bytes as u64).saturating_mul(1_000_000_000) / rate;
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let prev = self
+            .pace_until_ns
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |until| {
+                Some(until.max(now).saturating_add(cost))
+            })
+            .unwrap_or(now);
+        let until = prev.max(now).saturating_add(cost);
+        let delay = until - now;
+        if delay < 1_000_000 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(delay)
         }
     }
 
@@ -920,6 +1064,7 @@ impl Inner {
             target_file_size: target,
             bottommost,
             snapshots,
+            memory: &self.writer_memory,
         }
     }
 
@@ -979,17 +1124,15 @@ impl Inner {
         }
         let added: Vec<Arc<RunFile>> = metas
             .iter()
-            .map(|m| RunFile::new(desc_of(m, 0), self.tracker.clone()))
+            .map(|m| {
+                let run = RunFile::new(desc_of(m, 0), self.tracker.clone());
+                self.pin_l0(&run);
+                run
+            })
             .collect();
         let mut vs = lock(&self.vs);
         let flushed_seq = last_seq.max(vs.state.flushed_seq);
-        let retire = gc::retirable(
-            &self.journal().segments(),
-            flushed_seq,
-            self.journal().durable_seq(),
-            self.tracker.min_referenced_segment(),
-        );
-        let retire_ids: Vec<u64> = retire.iter().map(|s| s.segment).collect();
+        let retire_ids = self.retirable_segments(flushed_seq);
         let edit = VersionEdit {
             flushed_seq: Some(flushed_seq),
             added: added.iter().map(|r| r.desc.clone()).collect(),
@@ -1004,6 +1147,7 @@ impl Inner {
         }
         let version = Arc::new(vs.current.with_changes(&[], added));
         vs.current = version.clone();
+        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
         {
             let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
             let imm_list = sv
@@ -1022,18 +1166,94 @@ impl Inner {
         self.counters
             .flush_bytes
             .fetch_add(stats.bytes_written, Ordering::Relaxed);
-        for segment in retire_ids {
-            if let Err(e) = self.journal().retire(segment) {
-                if !matches!(e, Error::InvalidArgument(_)) {
-                    return Err(self.latch_on(e));
-                }
-                break;
-            }
-        }
-        if self.current_sv().version.l0_count() >= self.levels.l0_compaction_trigger {
+        self.retire_journal_segments(&retire_ids)?;
+        if self.current_sv().version.l0_count() >= self.levels.l0_compaction_trigger
+            || self.journal_over_budget()
+        {
             self.schedule_compaction();
         }
         Ok(())
+    }
+
+    /// Keeps an L0 run open for its life (its index and filter stay resident).
+    fn pin_l0(&self, run: &RunFile) {
+        if run.level() == 0
+            && let Ok(open) = self.table_cache.get(run.id())
+        {
+            run.pin(open);
+        }
+    }
+
+    /// The live journal segments that may retire once `flushed_seq` is recorded (plan
+    /// section 2 "Journal values"; the rule is in `gc.rs`). The caller holds `vs`.
+    fn retirable_segments(&self, flushed_seq: Seq) -> Vec<u64> {
+        let journal = self.journal();
+        // Visibility is read before the snapshot registry: a snapshot registered after
+        // the registry read re-checks visibility (see `snapshot`) and so is at or above
+        // anything this decision relies on.
+        let durable_seq = journal.durable_seq();
+        let visible_seq = journal.visible_seq();
+        let min_referenced = self.tracker.min_referenced_segment();
+        let segments = journal.segments();
+        let oldest_snapshot = self.snapshots.oldest();
+        let gc = lock(&self.gc);
+        let state = gc::RetireState {
+            flushed_seq,
+            durable_seq,
+            visible_seq,
+            min_referenced,
+            oldest_snapshot,
+            cleared: Some(&gc.cleared),
+        };
+        gc::retirable(&segments, &state)
+            .into_iter()
+            .map(|s| s.segment)
+            .collect()
+    }
+
+    /// Returns segments (already dropped from the manifest's segment set) to the
+    /// journal's free pool.
+    fn retire_journal_segments(&self, ids: &[u64]) -> Result<()> {
+        for &segment in ids {
+            match self.journal().retire(segment) {
+                Ok(()) => {}
+                // Already retired, or no longer eligible: the next pass decides again.
+                Err(Error::InvalidArgument(_)) => continue,
+                Err(e) => return Err(self.latch_on(e)),
+            }
+        }
+        if !ids.is_empty() {
+            let mut gc = lock(&self.gc);
+            for id in ids {
+                gc.cleared.remove(id);
+                gc.dense.remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Retires every segment the rule allows now, with its own manifest edit.
+    fn retire_unreachable(&self) -> Result<usize> {
+        let mut vs = lock(&self.vs);
+        let ids = self.retirable_segments(vs.state.flushed_seq);
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.log_edit(
+            &mut vs,
+            VersionEdit {
+                segments: Some(self.segments_to_record(&ids)),
+                ..VersionEdit::default()
+            },
+        )?;
+        drop(vs);
+        self.retire_journal_segments(&ids)?;
+        Ok(ids.len())
+    }
+
+    /// True while the journal's live segments exceed `max_journal_bytes`.
+    fn journal_over_budget(&self) -> bool {
+        self.journal().segments().len() as u64 * self.segment_bytes > self.max_journal_bytes
     }
 
     /// The journal segments to record in the manifest: those whose first record is
@@ -1215,6 +1435,7 @@ impl Inner {
 
     fn install_version(&self, vs: &mut VersionSet, version: Arc<Version>) {
         vs.current = version.clone();
+        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
         let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
         *sv = Arc::new(SuperVersion {
             mem: sv.mem.clone(),
@@ -1356,8 +1577,12 @@ impl Inner {
         }
     }
 
-    /// Damage found at run time. A scoped one is quarantined (and persisted by the next
-    /// compaction job); a store-wide one latches `RecoveryRequired` (R5).
+    /// Damage found at run time. A scoped one is quarantined and persisted right away
+    /// with its own manifest edit, before the caller sees the error, so a crash cannot
+    /// forget it; if that edit fails (`NoSpace`), the background job retries it. A
+    /// store-wide one latches `RecoveryRequired` (R5).
+    ///
+    /// Must not be called with `vs` held.
     pub(crate) fn report_damage(&self, damage: Damage) {
         if damage.scope.is_empty() {
             self.latch();
@@ -1365,10 +1590,30 @@ impl Inner {
             return;
         }
         if self.quarantine.add(damage.clone()) {
-            lock(&self.pending_damage).push(damage.clone());
-            self.schedule_compaction();
+            let persisted = {
+                let mut vs = lock(&self.vs);
+                self.log_edit(
+                    &mut vs,
+                    VersionEdit {
+                        quarantined: vec![damage.clone()],
+                        ..VersionEdit::default()
+                    },
+                )
+            };
+            if persisted.is_err() {
+                lock(&self.pending_damage).push(damage.clone());
+                self.schedule_compaction();
+            }
             self.notify(damage);
         }
+    }
+
+    /// A read met a locator into a segment the journal recycled. Journal GC retires a
+    /// segment only once no reader can reach its locators, so this is an invariant
+    /// violation, not media damage: count it and latch `RecoveryRequired`.
+    pub(crate) fn recycled_value(&self) {
+        self.counters.recycled_reads.fetch_add(1, Ordering::Relaxed);
+        self.latch();
     }
 
     /// The scope `key` belongs to (empty for store-wide keys).
@@ -1379,14 +1624,32 @@ impl Inner {
 
     // ----- reads -----
 
+    /// Takes a snapshot without a store-wide lock (NS5b item 5).
+    ///
+    /// The snapshot list must know every snapshot that a compaction (or a GC decision)
+    /// could hurt. The fast path reads `visible_seq` as `s`, registers `s` in this
+    /// thread's registry shard, loads the super-version and reads `visible_seq` again. If
+    /// it is still `s`, the snapshot is safe: a compaction that read the registry before
+    /// the registration picked its inputs earlier, when every version in them was at or
+    /// below the visible sequence of that time, which is at most the second read, so
+    /// `s`; such a compaction cannot hold a version above `s` and cannot drop one `s`
+    /// needs. (The registry shard's mutex orders the compaction's read before the
+    /// registration, and the registration before the second read.) Otherwise it retries,
+    /// and after a few tries takes `snapshot_lock`, which readers of the list also hold.
     fn snapshot(self: &Arc<Self>) -> Snapshot {
-        let (seq, handle, sv) = {
-            let _guard = lock(&self.snapshot_lock);
-            let seq = self.journal().visible_seq();
+        let journal = self.journal();
+        for _ in 0..4 {
+            let seq = journal.visible_seq();
             let handle = self.snapshots.register(seq);
-            (seq, handle, self.current_sv())
-        };
-        Snapshot::new(self.clone(), seq, handle, sv)
+            let sv = self.current_sv();
+            if journal.visible_seq() == seq {
+                return Snapshot::new(self.clone(), seq, handle, sv);
+            }
+        }
+        let _guard = lock(&self.snapshot_lock);
+        let seq = journal.visible_seq();
+        let handle = self.snapshots.register(seq);
+        Snapshot::new(self.clone(), seq, handle, self.current_sv())
     }
 
     fn stats(&self) -> StoreStats {
@@ -1402,7 +1665,7 @@ impl Inner {
             journal_bytes: journal.journal_bytes,
             flush_bytes: self.counters.flush_bytes.load(Ordering::Relaxed),
             compaction_bytes: self.counters.compaction_bytes.load(Ordering::Relaxed),
-            relocated_bytes: 0,
+            relocated_bytes: self.counters.relocated_bytes.load(Ordering::Relaxed),
             stall_ms: journal.stall_ms,
             memtable_bytes: sv
                 .memtables()
@@ -1415,6 +1678,25 @@ impl Inner {
                 + self.counters.open_corruptions.load(Ordering::Relaxed),
             tail_truncations: journal.tail_truncations,
             quarantined_scopes: self.quarantine.len() as u32,
+            journal_behind_manifest: self.counters.journal_behind.load(Ordering::Relaxed),
+            recycled_value_reads: self.counters.recycled_reads.load(Ordering::Relaxed),
+            overhead_bytes: self.memory_usage().overhead(),
+        }
+    }
+
+    fn memory_usage(&self) -> MemoryUsage {
+        let sv = self.current_sv();
+        let runs = sv.version.runs().count() as u64;
+        MemoryUsage {
+            memtables: sv
+                .memtables()
+                .map(|m| m.mem.approximate_memory() as u64)
+                .sum(),
+            run_writers: self.writer_memory.load(Ordering::Relaxed) as u64,
+            range_tombstones: self.tracker.tombstone_bytes() as u64,
+            versions: runs * 200,
+            snapshots: self.snapshots.sequences().len() as u64 * 64,
+            cache_pinned: self.cache.reserved_bytes() as u64,
         }
     }
 }

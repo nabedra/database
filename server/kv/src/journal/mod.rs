@@ -193,6 +193,10 @@ pub struct RecoveryReport {
     pub tail_truncations: u64,
     pub tail_bytes: u64,
     pub recovery_ms: u64,
+    /// Sequences at or below `replay_after` that the journal no longer held at open (its
+    /// end was behind the caller's flushed state). Open voids them so numbers are never
+    /// reused; their state is already in runs.
+    pub voided_at_open: u64,
 }
 
 /// One live segment and the sequences its records take.
@@ -434,6 +438,7 @@ impl Journal {
             prep_cancel: AtomicBool::new(false),
             value_cache: OnceLock::new(),
         });
+        report.voided_at_open = replay_after.saturating_sub(recovered.next_seq.saturating_sub(1));
         let writer = writer::Writer::finish_open(shared.clone(), recovered, replay_after)?;
         let next_seq = writer.next_seq();
         lock(&shared.queue).next_seq = next_seq;

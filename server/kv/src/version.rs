@@ -12,7 +12,7 @@
 //! live runs and memtables still point into, for journal retirement.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
@@ -20,6 +20,8 @@ use bytes::Bytes;
 use crate::iter::range_del::FragmentedRangeTombstones;
 use crate::manifest::RunDesc;
 use crate::memtable::Memtable;
+use crate::run::Run;
+use crate::source::RangeTombstone;
 use crate::types::{Kind, MAX_SEQ, Seq, parse_internal_key, user_key};
 
 /// Levels L0 to L6.
@@ -84,6 +86,9 @@ pub(crate) struct FileTracker {
     /// Runs marked obsolete whose last reference dropped: delete their files.
     obsolete: Mutex<Vec<u64>>,
     next_token: AtomicU64,
+    /// Resident range tombstones of live runs (their raw and fragmented copies), charged
+    /// to the pool overhead (plan section 5 "Memory").
+    tombstone_bytes: AtomicUsize,
 }
 
 impl FileTracker {
@@ -96,6 +101,11 @@ impl FileTracker {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// Bytes of range tombstones that live runs keep resident.
+    pub fn tombstone_bytes(&self) -> usize {
+        self.tombstone_bytes.load(Ordering::Relaxed)
     }
 
     pub fn take_obsolete(&self) -> Vec<u64> {
@@ -117,6 +127,11 @@ pub(crate) struct RunFile {
     pub hi_exclusive: bool,
     token: u64,
     tombstones: OnceLock<Arc<FragmentedRangeTombstones>>,
+    /// Bytes charged to `FileTracker::tombstone_bytes` for this run.
+    tombstone_charge: AtomicUsize,
+    /// An L0 run is kept open for its whole life (index, filter and tombstones resident),
+    /// like RocksDB's `pin_l0_filter_and_index_blocks_in_cache`.
+    pinned: OnceLock<Arc<Run>>,
     obsolete: AtomicBool,
     tracker: Arc<FileTracker>,
 }
@@ -153,6 +168,8 @@ impl RunFile {
             hi_exclusive,
             token,
             tombstones: OnceLock::new(),
+            tombstone_charge: AtomicUsize::new(0),
+            pinned: OnceLock::new(),
             obsolete: AtomicBool::new(false),
             tracker,
         })
@@ -198,17 +215,48 @@ impl RunFile {
         below_hi && above_lo
     }
 
-    /// The run's range tombstones, fragmented once.
-    pub fn tombstones(
-        &self,
-        load: impl FnOnce() -> Arc<FragmentedRangeTombstones>,
-    ) -> Arc<FragmentedRangeTombstones> {
-        self.tombstones.get_or_init(load).clone()
+    /// The run's range tombstones, fragmented once. The raw and fragmented copies are
+    /// charged to the tracker's `tombstone_bytes` while this run lives.
+    pub fn tombstones(&self, run: &Run) -> Arc<FragmentedRangeTombstones> {
+        self.tombstones
+            .get_or_init(|| {
+                let raw = run.range_tombstones();
+                let charge = 2 * tombstone_charge(raw);
+                self.tombstone_charge.store(charge, Ordering::Relaxed);
+                self.tracker
+                    .tombstone_bytes
+                    .fetch_add(charge, Ordering::Relaxed);
+                Arc::new(FragmentedRangeTombstones::new(raw, MAX_SEQ))
+            })
+            .clone()
     }
+
+    /// Keeps `run` open for as long as this run lives (L0 runs).
+    pub fn pin(&self, run: Arc<Run>) {
+        let _ = self.pinned.set(run);
+    }
+
+    pub fn pinned(&self) -> Option<&Arc<Run>> {
+        self.pinned.get()
+    }
+}
+
+/// Resident bytes of a set of range tombstones (keys plus per-entry overhead).
+pub(crate) fn tombstone_charge(tombstones: &[RangeTombstone]) -> usize {
+    tombstones
+        .iter()
+        .map(|t| t.start.len() + t.end.len() + 64)
+        .sum()
 }
 
 impl Drop for RunFile {
     fn drop(&mut self) {
+        let charge = *self.tombstone_charge.get_mut();
+        if charge > 0 {
+            self.tracker
+                .tombstone_bytes
+                .fetch_sub(charge, Ordering::Relaxed);
+        }
         if self.desc.oldest_journal_segment.is_some() {
             lock(&self.tracker.run_segments).remove(&self.token);
         }
