@@ -22,6 +22,8 @@ pub mod types;
 pub use batch::{BatchOp, WriteBatch};
 pub use cache::{BlockCache, CacheKey};
 pub use error::{Damage, DamageReason, Error, FileId, Result};
+pub use iter::{DbIter, MergingIterator, ValueResolver};
+pub use memtable::{Lookup, Memtable, MemtableBudget, MemtableOptions, SnapshotList};
 pub use run::{Run, RunMeta, RunReadContext, RunWriter, RunWriterOptions, TableCache};
 pub use source::{InternalIterator, RangeTombstone};
 pub use types::{Kind, Locator, Seq};
