@@ -135,7 +135,12 @@ impl Snapshot {
             .chain(deeper)
         {
             let run = self.open_run(file, key)?;
-            if let Some(t) = run.max_covering_tombstone_seq(key, seq) {
+            let covering = if run.meta().num_range_tombstones == 0 {
+                None
+            } else {
+                run_tombstones(file, &run).max_covering_seq(key, seq)
+            };
+            if let Some(t) = covering {
                 tombstone = Some(tombstone.map_or(t, |old| old.max(t)));
             }
             let lookup = run
@@ -222,7 +227,9 @@ impl Snapshot {
         for file in self.sv.version.runs().filter(|r| r.overlaps(lo, hi)) {
             match self.inner.table_cache.get(file.id()) {
                 Ok(run) => {
-                    tombstones.add(run_tombstones(file, &run));
+                    if run.meta().num_range_tombstones > 0 {
+                        tombstones.add(run_tombstones(file, &run));
+                    }
                     children.push(Box::new(run.iter(fill_cache)));
                 }
                 Err(e) => children.push(Box::new(FailedIter(e))),

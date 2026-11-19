@@ -317,3 +317,60 @@ fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
     let store = open(&dir, small_options(Arc::new(fs.crash()), bg));
     assert_eq!(dump(&store.snapshot()), model);
 }
+
+/// NS15 at engine level, through the FaultFs call log: journal segments are synced with
+/// `sync_data` (new segment files once with `sync_all`); runs, manifests and CURRENT
+/// with `sync_all`; directories with `sync_dir`.
+#[test]
+fn ns15_engine_sync_kinds_by_file() {
+    use nabedra_kv::fs::FsOp;
+    let (fs, dir) = fault_fs();
+    let store = open(
+        &dir,
+        small_options(Arc::new(fs.clone()), Background::new(2)),
+    );
+    let mut rng = Rng(15);
+    for tag in 0..100 {
+        write(
+            &store,
+            &random_batch(&mut rng, 3, 30, tag),
+            Durability::Sync,
+        )
+        .unwrap();
+    }
+    store.flush().unwrap();
+    store.compact().unwrap();
+    drop(store);
+    let calls = fs.calls();
+    let syncs = |op: FsOp| -> Vec<String> {
+        calls
+            .iter()
+            .filter(|c| c.op == op && c.ok)
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect()
+    };
+    let data = syncs(FsOp::SyncData);
+    let all = syncs(FsOp::SyncAll);
+    let dirs = syncs(FsOp::SyncDir);
+    assert!(
+        !data.is_empty() && data.iter().all(|p| p.contains("/journal/")),
+        "{data:?}"
+    );
+    assert!(all.iter().any(|p| p.ends_with(".run")));
+    assert!(all.iter().any(|p| p.contains("MANIFEST-")));
+    assert!(all.iter().any(|p| p.ends_with("CURRENT.tmp")));
+    // In the journal, only newly prepared segment files (size and allocation changed)
+    // take a full sync; records are synced with sync_data.
+    assert!(
+        all.iter()
+            .filter(|p| p.contains("/journal/"))
+            .all(|p| p.ends_with(".free")),
+        "{all:?}"
+    );
+    for d in [&dir, &dir.join("runs"), &dir.join("journal")] {
+        assert!(
+            dirs.contains(&d.to_string_lossy().into_owned()),
+            "{d:?} never synced"
+        );
+    }
+}
