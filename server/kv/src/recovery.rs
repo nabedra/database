@@ -89,12 +89,10 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) ->
         let (state, report) = manifest::read_manifest(fs, dir, number)?;
         (state, report.torn_tail)
     } else {
-        // Only an interrupted creation leaves no CURRENT: it is written before any run,
-        // other manifest or journal segment exists.
-        let leftovers = names(fs, dir)?
-            .iter()
-            .any(|n| manifest::parse_manifest_name(n).is_some())
-            || !names(fs, &dir.join(RUNS_DIR))?.is_empty()
+        // Only an interrupted creation leaves no CURRENT: CURRENT is durable before any
+        // run or journal segment exists, and later only replaced by an atomic rename.
+        // A manifest left by that creation holds the empty state and is removed.
+        let leftovers = !names(fs, &dir.join(RUNS_DIR))?.is_empty()
             || !names(fs, &dir.join(JOURNAL_DIR))?.is_empty();
         if leftovers {
             return Err(Error::Corruption {
@@ -103,7 +101,18 @@ pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) ->
                 what: "CURRENT is missing",
             });
         }
-        (ManifestState::new(), false)
+        // A new store: its first manifest and CURRENT exist before any journal segment.
+        for name in names(fs, dir)? {
+            if manifest::parse_manifest_name(&name).is_some() {
+                fs.remove(&dir.join(name))?;
+            }
+        }
+        let mut state = ManifestState::new();
+        let number = state.next_file;
+        state.next_file += 1;
+        manifest::ManifestWriter::create(fs, dir, number, &state)?;
+        manifest::set_current(fs, dir, number)?;
+        (state, false)
     };
     Ok(Prepared {
         lock,
