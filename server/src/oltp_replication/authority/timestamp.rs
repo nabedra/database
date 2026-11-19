@@ -18,6 +18,8 @@ use std::{fmt, sync::Arc};
 pub(crate) mod archive;
 pub(crate) mod archive_lifecycle;
 pub(crate) mod cold;
+pub(crate) mod direct;
+pub(crate) mod direct_client;
 mod handle;
 mod index_metadata;
 pub(crate) mod point_decision;
@@ -35,6 +37,14 @@ pub(crate) use scoped_retirement::{
     ScopedCopyProof, ScopedPinRelease, ScopedRetirementMarker, ScopedTerminalStatement,
     ScopedTerminalWitness, ScopedTerminalWitnessReply, ScopedTimestampEpoch,
 };
+// Stable surface for the direct path (T4 RangeClock, T5 executor, T7 gate).
+#[allow(unused_imports)]
+pub(crate) use direct::{
+    DEFAULT_DIRECT_WINDOW, DirectTimestampGate, DirectTimestampRange, DirectTimestampSource,
+    MAX_DIRECT_COUNT, MAX_DIRECT_WINDOW,
+};
+#[allow(unused_imports)]
+pub(crate) use direct_client::DirectTimestampClient;
 pub(crate) use service::TimestampService;
 
 /// Per-Status-group archive closure. Only the TSO leader's allocation/decision
@@ -199,6 +209,13 @@ pub(crate) enum TimestampCommand {
     AdvanceFloor {
         authority: Authority,
     },
+    /// Raise `high_watermark` by `count` for the leader's in-memory direct
+    /// window. Proposed only behind `DirectTimestampGate`, because a replica
+    /// built before this variant cannot decode it.
+    ReserveWindow {
+        authority: Authority,
+        count: u64,
+    },
 }
 impl fmt::Display for TimestampCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -228,6 +245,7 @@ impl fmt::Display for TimestampCommand {
             Self::SealArchive { .. } => "timestamp.seal_archive",
             Self::ArchiveControl { .. } => "timestamp.archive_control",
             Self::SplitMetadata { .. } => "timestamp.split_metadata",
+            Self::ReserveWindow { .. } => "timestamp.reserve_window",
         })
     }
 }
@@ -305,6 +323,13 @@ pub(crate) enum TimestampReply {
     },
     Rejected(Fault),
     ScopedAdmissionClosed(ScopedAdmissionClosure),
+    /// `ReserveWindow` result: `[first, last]` now lies at or below the
+    /// durable `high_watermark`.
+    Window {
+        authority: Authority,
+        first: CommitTs,
+        last: CommitTs,
+    },
 }
 /// A durable receipt for Control's pending -> TSO-fenced -> published phases.
 /// Re-proposing the same transition returns its original applied position.
@@ -428,6 +453,7 @@ struct BackupRecord {
 #[derive(Clone)]
 pub(crate) struct TimestampMachine {
     store: GroupStore,
+    direct: Arc<direct::DirectWindows>,
 }
 impl crate::oltp_replication::hosted::TypedMachine<super::config::TimestampConfig>
     for TimestampMachine
@@ -448,7 +474,10 @@ impl TimestampMachine {
         if store.identity().kind != GroupKind::Timestamps {
             return Err(invalid());
         }
-        Ok(Self { store })
+        Ok(Self {
+            direct: direct::DirectWindows::for_store(&store),
+            store,
+        })
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -462,6 +491,7 @@ impl TimestampMachine {
         let digest = meta.command_digest;
         let position = meta.position;
         let scope = self.store.identity().clone();
+        let windows = self.direct.clone();
         let budget = if matches!(command.payload()?, TimestampCommand::SplitMetadata { .. }) {
             split::BUDGET
         } else {
@@ -472,7 +502,13 @@ impl TimestampMachine {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unknown());
                 }
-                apply(tx, &scope, command.payload()?, digest, position)
+                let capture = direct::StateCapture::begin();
+                let transition = apply(tx, &scope, command.payload()?, digest, position)?;
+                // Discard the direct window before this reply can reach anyone.
+                if let (Transition::Commit(_), Some(mark)) = (&transition, capture.finish()) {
+                    windows.observe(mark);
+                }
+                Ok(transition)
             })
             .await
     }
@@ -505,6 +541,33 @@ fn apply(
             split::apply(tx, state, scope, command, position)
         }
         TimestampCommand::SealArchive { proof } => archive::apply_closure(tx, scope, state, proof),
+        TimestampCommand::ReserveWindow { authority, count } => {
+            let Some(mut state) = state else {
+                return reject(tx, Fault::NotInitialized);
+            };
+            if state.authority != *authority {
+                return reject(tx, Fault::StaleAuthority);
+            }
+            if *count == 0 || *count > direct::MAX_DIRECT_WINDOW {
+                return reject(tx, Fault::InvalidBinding);
+            }
+            let (Some(first), Some(last)) = (
+                state.high_watermark.checked_add(1),
+                state.high_watermark.checked_add(*count),
+            ) else {
+                return reject(tx, Fault::TimestampExhausted);
+            };
+            state.high_watermark = last;
+            put_state(tx, &state)?;
+            commit(
+                tx,
+                &TimestampReply::Window {
+                    authority: *authority,
+                    first: Timestamp::new(first).map_err(|_| unknown())?,
+                    last: Timestamp::new(last).map_err(|_| unknown())?,
+                },
+            )
+        }
         TimestampCommand::Fence {
             transition_id,
             expected,
@@ -559,7 +622,7 @@ fn apply(
                 gc_safe_point: old_gc,
                 ready: *ready,
             };
-            put(tx, STATE, &new)?;
+            put_state(tx, &new)?;
             let reply = TimestampReply::Fenced {
                 ready: *ready,
                 allocator_epoch: epoch,
@@ -598,7 +661,7 @@ fn apply(
                 return reject(tx, Fault::StaleReadyView);
             }
             state.ready = *next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             let reply = TimestampReply::ReadyFenced(ReadyFenceReceipt {
                 transition_id: *transition_id,
                 expected: *expected,
@@ -691,7 +754,7 @@ fn apply(
                 },
             )?;
             state.high_watermark = next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             commit(tx, &TimestampReply::Commit(stamp))
         }
         TimestampCommand::Release { proof } => {
@@ -848,7 +911,7 @@ fn apply(
                 return Err(unknown());
             }
             state.gc_safe_point = next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             commit(
                 tx,
                 &TimestampReply::Retention {
@@ -910,7 +973,7 @@ fn apply(
             put(tx, &key, &record)?;
             tx.put(&maintenance_active_key(pin), &key)?;
             state.high_watermark = next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             commit(tx, &TimestampReply::Snapshot(pin))
         }
         TimestampCommand::ReleaseMaintenance { authority, closure } => {
@@ -1008,7 +1071,7 @@ fn apply(
             )?;
             tx.put(&backup_active_key(pin), &key)?;
             state.high_watermark = next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             commit(tx, &TimestampReply::Snapshot(pin))
         }
         TimestampCommand::ReleaseBackup { authority, proof } => {
@@ -1223,7 +1286,7 @@ fn begin_metadata(
     )?;
     tx.put(&active_key(pin), identity.nonce.as_bytes())?;
     state.high_watermark = next;
-    put(tx, STATE, &state)?;
+    put_state(tx, &state)?;
     commit(tx, &TimestampReply::Snapshot(pin))
 }
 fn maintenance_key(owner: &MaintenanceOwnerRef) -> Vec<u8> {
@@ -1386,8 +1449,21 @@ fn put(
     key: &[u8],
     value: &impl Serialize,
 ) -> Result<(), ProtocolError> {
+    // Timestamp state writes must go through `put_state` so that the direct
+    // window sees every watermark move.
+    debug_assert_ne!(key, STATE);
     let bytes = tx.encode_value(value)?;
     tx.put(key, bytes.as_slice())
+}
+fn put_state(tx: &mut GroupTransaction<'_>, state: &State) -> Result<(), ProtocolError> {
+    let bytes = tx.encode_value(state)?;
+    tx.put(STATE, bytes.as_slice())?;
+    direct::record_state_write(direct::StateMark {
+        high_watermark: state.high_watermark,
+        authority: state.authority,
+        allocator_epoch: state.allocator_epoch,
+    });
+    Ok(())
 }
 fn commit(
     tx: &mut GroupTransaction<'_>,

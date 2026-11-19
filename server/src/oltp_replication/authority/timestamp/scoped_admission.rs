@@ -343,7 +343,7 @@ pub(super) fn begin(
         put(tx, &key, &record)?;
         tx.put(&active_key(pin), identity.nonce.as_bytes())?;
         state.high_watermark = next;
-        put(tx, STATE, &state)?;
+        put_state(tx, &state)?;
         (pin, false)
     };
     let Some(proposed) = origin else {

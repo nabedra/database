@@ -468,7 +468,7 @@ pub(super) fn apply(
             };
             let commit_ts = Timestamp::new(next).map_err(|_| unknown())?;
             state.high_watermark = next;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             (
                 TxnDecision::Commit { commit_ts },
                 command.intended.clone(),

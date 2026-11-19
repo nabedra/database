@@ -204,6 +204,10 @@ impl TimestampHandle {
     }
     pub(crate) async fn current_authority(&self) -> Result<Option<Authority>, ProtocolError> {
         self.consensus.ensure_linearizable().await?;
+        self.local_authority().await
+    }
+    /// The locally applied authority. Callers supply their own read barrier.
+    pub(super) async fn local_authority(&self) -> Result<Option<Authority>, ProtocolError> {
         let raw = self
             .machine
             .store()
