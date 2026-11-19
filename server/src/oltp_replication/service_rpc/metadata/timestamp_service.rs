@@ -504,9 +504,6 @@ impl TimestampEndpoint {
         head: &Header,
         request: Request,
     ) -> Result<ChargedBytes, ProtocolError> {
-        if request.method() != head.method {
-            return Err(invalid());
-        }
         let shared = self.handle.resources();
         match request {
             Request::ArchiveMetadata { closure, after } => {
@@ -825,16 +822,7 @@ impl TimestampEndpoint {
             Request::VerifyTimestampPointPin(binding) => {
                 self.verify_point_pin(session, head, *binding).await
             }
-            Request::CommitTimestampPoint { locator, reconcile } => {
-                self.decide_point(
-                    session, head, &locator, point_decision::PointOperation::Commit, reconcile,
-                ).await
-            }
-            Request::AbortTimestampPoint { locator, reconcile } => {
-                self.decide_point(
-                    session, head, &locator, point_decision::PointOperation::Abort, reconcile,
-                ).await
-            }
+            Request::CommitTimestampPoint { .. } | Request::AbortTimestampPoint { .. } => Err(invalid()),
             Request::ObserveTimestampPoint { locator } => {
                 self.observe_point(session, head, locator).await
             }
@@ -1195,7 +1183,24 @@ impl Endpoint for TimestampEndpoint {
             }
             let result = async {
                 let (request, owner) = decode(self.handle.resources(), sections).await?;
-                let result = self.dispatch(&session, &head, request).await;
+                if request.method() != head.method {
+                    return Err(invalid());
+                }
+                // Keep the decision's nested quorum reads off the metadata
+                // dispatcher's stack. Both paths retain the decode charge.
+                let result = match request {
+                    Request::CommitTimestampPoint { locator, reconcile } => {
+                        Box::pin(self.decide_point(
+                            &session, &head, &locator, point_decision::PointOperation::Commit, reconcile,
+                        )).await
+                    }
+                    Request::AbortTimestampPoint { locator, reconcile } => {
+                        Box::pin(self.decide_point(
+                            &session, &head, &locator, point_decision::PointOperation::Abort, reconcile,
+                        )).await
+                    }
+                    request => Box::pin(self.dispatch(&session, &head, request)).await,
+                };
                 drop(owner);
                 result
             }
