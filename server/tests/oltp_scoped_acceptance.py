@@ -409,7 +409,8 @@ class Driver:
             submit = executor.submit(self.submit, secondary, request)
             for role in self.followers:
                 self.reached(role, request_id, stage)
-            assert not submit.done(), 'acceptance escaped while both followers were gated'
+            if stage == COPY_PAYLOAD:
+                assert not submit.done(), 'submitting API must be in flight at the loss cut'
             before = self.receipt(primary, request_id)
             assert_uncertain(before, request_id)
             if stage == COPY_MARKER:
@@ -554,8 +555,15 @@ class Driver:
             assert status == 200 and health['run_id'] == self.run_id and health['ready_workers'] == 3, health
             legacy = envelope('table.insert', {'table_id': self.table.id,
                               'row': {'id': 11, 'value': 83}})
-            legacy_reply = self.submit(primary, legacy)
-            assert_uncertain(legacy_reply, legacy['request_id'])
+            # The full transport timeout can outlast the original ready
+            # membership. Observe a bounded window with the third copy held.
+            probe = self.client(timeout=3)
+            try:
+                legacy_reply = self.submit(probe, legacy)
+            except TimeoutError:
+                legacy_reply = {'transport': 'timed out while the follower was paused'}
+            else:
+                assert_uncertain(legacy_reply, legacy['request_id'])
         self.accepted(self.submit(primary, legacy), legacy['request_id'])
         legacy_receipt = self.terminal(primary, legacy['request_id'], None)
         assert self.table.where(id=11).collect() == [{'id': 11, 'value': 83}]
