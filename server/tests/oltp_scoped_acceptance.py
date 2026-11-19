@@ -622,10 +622,14 @@ def supervise_driver(cluster, driver, barriers, workers, paused, instrumented):
     raise TimeoutError(f'OLTP scoped acceptance driver exceeded {DRIVER_TIMEOUT} seconds')
 
 
-def start_fixture(module, args):
+def require_docker_lane(module, idle_containers):
     running = set(module.command('docker', 'ps', '--format', '{{.Names}}').splitlines())
-    if running.difference(args.idle_docker_container):
+    if running.difference(idle_containers):
         raise RuntimeError('another Docker workload is using the capped fixture lane')
+
+
+def start_fixture(module, args):
+    require_docker_lane(module, args.idle_docker_container)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True)
     args.binary = args.binary.resolve(strict=True)
