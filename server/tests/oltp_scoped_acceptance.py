@@ -584,6 +584,7 @@ class Driver:
                exact_binding=decision['request'], later_row=self.table.get(5), recovered_receipt=terminal)
 
     def run(self, binary):
+        os.environ['NABEDRA_SERVER_BINARY'] = binary
         with self.stack:
             self.stack.callback(self.database.close)
             gateway = self.start_second_gateway(binary)
