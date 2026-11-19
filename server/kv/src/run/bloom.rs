@@ -74,6 +74,11 @@ impl BloomBuilder {
         self.hashes.push(hash64(user_key));
     }
 
+    /// Forgets every key (the next filter partition starts empty).
+    pub(crate) fn clear(&mut self) {
+        self.hashes.clear();
+    }
+
     pub(crate) fn finish_into(&self, out: &mut Vec<u8>) {
         let num_probes = ((self.bits_per_key * 69) / 100).clamp(1, 30) as u8;
         let num_lines = (self.hashes.len() * self.bits_per_key)

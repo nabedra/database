@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
 
-use super::format::{FOOTER_LEN, Footer};
+use super::block::BlockIter;
+use super::format::{BlockHandle, FOOTER_LEN, Footer};
 use super::*;
 use crate::cache::{BlockCache, ENTRY_OVERHEAD};
 use crate::error::{Error, FileId};
@@ -822,28 +823,39 @@ fn ns07_bit_flip_in_each_run_part_returns_corruption_never_a_wrong_value() {
     assert_eq!(run.stats().corruption_detected(), 2);
     assert!(read_all_checked(&fs, 9, &model) > 0);
 
-    // Index block: every lookup and scan fails.
-    let fs = flip(footer.index.offset as usize + 2);
+    // The first partition (the top-level index is checked at open).
+    let top = Bytes::copy_from_slice(
+        &bytes[footer.index.offset as usize..][..footer.index.size as usize],
+    );
+    let mut top = BlockIter::new(top).unwrap();
+    top.seek_to_first();
+    let (index, filter) = BlockHandle::decode_pair(top.value_slice()).unwrap();
+    top.next();
+    assert!(top.valid(), "small blocks give several partitions");
+
+    // First index partition: lookups and scans in its range fail.
+    let fs = flip(index.offset as usize + 2);
     let run = open_run(&fs, 9, ctx()).unwrap();
-    assert_corruption(run.get(b"k020", MAX_SEQ, true), 9);
+    assert_corruption(run.get(b"k000", MAX_SEQ, true), 9);
     let mut iter = run.iter(true);
-    iter.seek(&internal_key(b"k005", MAX_SEQ, Kind::Put));
+    iter.seek(&internal_key(b"k000", MAX_SEQ, Kind::Put));
     assert_corruption(iter.status(), 9);
     assert!(read_all_checked(&fs, 9, &model) > 0);
 
-    // Bloom block: lookups fail (scans do not use it).
-    let fs = flip(footer.bloom.offset as usize + 1);
+    // First filter partition: lookups in its range fail (scans do not use it).
+    let fs = flip(filter.offset as usize + 1);
     let run = open_run(&fs, 9, ctx()).unwrap();
-    assert_corruption(run.get(b"k020", MAX_SEQ, true), 9);
+    assert_corruption(run.get(b"k000", MAX_SEQ, true), 9);
     assert_eq!(run.stats().corruption_detected(), 1);
     assert!(read_all_checked(&fs, 9, &model) > 0);
 
-    // Footer, properties and range tombstones are checked at open.
+    // Footer, properties, range tombstones and the top-level index are checked at open.
     for offset in [
         footer_at + 13,
         bytes.len() - 1,
         footer.props.offset as usize + 4,
         footer.range_del.offset as usize + 1,
+        footer.index.offset as usize + 2,
     ] {
         let ctx = ctx();
         assert_corruption(open_run(&flip(offset), 9, ctx.clone()), 9);
@@ -948,6 +960,11 @@ fn run_reads_fill_the_cache_only_when_asked_and_pin_what_callers_hold() {
     let cache = Arc::new(BlockCache::new(1 << 20));
     let ctx = RunReadContext::new(Arc::clone(&cache));
     let run = open_run(&fs, 2, ctx.clone()).unwrap();
+    // The open run's top-level index is charged to the cache as a reservation.
+    let top = cache.reserved_bytes();
+    assert!(top > 0);
+    assert_eq!(cache.usage_bytes(), top);
+    assert_eq!(cache.pinned_bytes(), top);
 
     // fill_cache = false reads through without inserting.
     for key in &model.universe {
@@ -956,11 +973,12 @@ fn run_reads_fill_the_cache_only_when_asked_and_pin_what_callers_hold() {
     let mut iter = run.iter(false);
     collect_forward(&mut iter);
     drop(iter);
-    assert_eq!(cache.usage_bytes(), 0);
+    assert_eq!(cache.usage_bytes(), top);
     let cold_reads = ctx.stats.block_reads();
     assert!(cold_reads > 0);
 
-    // fill_cache = true caches index, filter and data blocks; a second pass reads nothing.
+    // fill_cache = true caches index and filter partitions and data blocks; a second pass
+    // reads nothing.
     for key in &model.universe {
         run.get(key, MAX_SEQ, true).unwrap();
     }
@@ -973,22 +991,111 @@ fn run_reads_fill_the_cache_only_when_asked_and_pin_what_callers_hold() {
     let mut iter = run.iter(true);
     collect_forward(&mut iter);
     assert_eq!(ctx.stats.block_reads(), warm, "hot reads hit the cache");
-    // A positioned iterator pins its index and data blocks.
+    // A positioned iterator pins its index partition and data block.
     iter.seek_to_first();
-    assert!(cache.pinned_bytes() > 0);
+    assert!(cache.pinned_bytes() > top);
     drop(iter);
-    assert_eq!(cache.pinned_bytes(), 0);
+    assert_eq!(cache.pinned_bytes(), top);
 
     // A value handed to a caller pins its block until the caller drops it.
     let Lookup::Found { value, .. } = run.get(b"k001", MAX_SEQ, true).unwrap() else {
         panic!("k001 is present");
     };
     let pinned = cache.pinned_bytes();
-    assert!(pinned >= value.len() + ENTRY_OVERHEAD);
+    assert!(pinned >= top + value.len() + ENTRY_OVERHEAD);
     drop(value);
-    assert_eq!(cache.pinned_bytes(), 0);
+    assert_eq!(cache.pinned_bytes(), top);
     assert!(ctx.stats.bloom_checks() > 0);
     assert_eq!(run.get(b"k0005", MAX_SEQ, true).unwrap(), Lookup::NotFound);
+    // Closing the run releases its reservation.
+    drop(run);
+    assert_eq!(cache.reserved_bytes(), 0);
+    assert_eq!(cache.pinned_bytes(), 0);
+}
+
+/// RV-KV1 F9: with partitioned index and filter, a user key whose versions span several
+/// partitions is found at every snapshot, and every partition is a small cached unit.
+#[test]
+fn ns01_partitioned_index_finds_keys_spanning_partitions() {
+    let mut entries = Vec::new();
+    let mut universe = Vec::new();
+    for k in 0..30u32 {
+        let key = format!("key{k:03}").into_bytes();
+        // key010 has 1200 versions: many data blocks and several partitions.
+        let versions = if k == 10 { 1200 } else { 1 + k % 3 };
+        for v in (1..=versions).rev() {
+            entries.push((
+                internal_key(&key, u64::from(v) * 2, Kind::Put),
+                format!("{k}-{v}-value-padding").into_bytes(),
+            ));
+        }
+        universe.push(key);
+    }
+    let model = Model {
+        entries,
+        tombstones: Vec::new(),
+        universe,
+        max_seq: 2401,
+    };
+    let fs = MemFs::default();
+    let options = RunWriterOptions {
+        block_size: 256,
+        ..RunWriterOptions::default()
+    };
+    let meta = model.write(&fs, 4, options).unwrap();
+    let cache = Arc::new(BlockCache::new(1 << 20));
+    let ctx = RunReadContext::new(Arc::clone(&cache));
+    let run = open_run(&fs, 4, ctx.clone()).unwrap();
+    let path = dir().join(run_file_name(4));
+    let bytes = fs.contents(&path);
+    let footer = Footer::decode(bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap()).unwrap();
+    let top = Bytes::copy_from_slice(
+        &bytes[footer.index.offset as usize..][..footer.index.size as usize],
+    );
+    let mut top = BlockIter::new(top).unwrap();
+    top.seek_to_first();
+    let mut partitions = 0;
+    let mut spanning = 0;
+    let mut previous_last: Option<Vec<u8>> = None;
+    while top.valid() {
+        let (index, filter) = BlockHandle::decode_pair(top.value_slice()).unwrap();
+        assert!(
+            index.size <= 2 * 256 && filter.size <= 2 * 256 + 65,
+            "small units"
+        );
+        if previous_last
+            .as_deref()
+            .is_some_and(|p| user_key(p) == b"key010" && user_key(top.key()) == b"key010")
+        {
+            spanning += 1;
+        }
+        previous_last = Some(top.key().to_vec());
+        partitions += 1;
+        top.next();
+    }
+    assert!(partitions > 4, "{partitions} partitions");
+    assert!(spanning >= 2, "key010 spans partitions ({spanning})");
+    assert!(meta.num_data_blocks > partitions);
+    for key in &model.universe {
+        assert!(run.may_contain(key, true).unwrap());
+        for snapshot in 0..=model.max_seq {
+            assert_eq!(
+                run.get(key, snapshot, snapshot % 2 == 0).unwrap(),
+                model.get(key, snapshot),
+                "{} at {snapshot}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+    let mut iter = run.iter(true);
+    assert_eq!(collect_forward(&mut iter), model.entries);
+    assert_eq!(collect_backward(&mut iter), model.entries);
+    for key in [b"key0105".as_slice(), b"zzz", b"a"] {
+        assert_eq!(run.get(key, MAX_SEQ, true).unwrap(), Lookup::NotFound);
+    }
+    drop(iter);
+    drop(run);
+    assert_eq!(cache.pinned_bytes(), 0);
 }
 
 #[test]
@@ -1020,23 +1127,47 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
             }
         );
     };
+    assert_eq!(tables.max_open_runs(), DEFAULT_MAX_OPEN_RUNS);
     for id in 0..total {
         read(id);
         assert!(tables.open_runs() <= DEFAULT_MAX_OPEN_RUNS);
         assert!(fs.0.live_handles.load(AtomicOrdering::SeqCst) <= DEFAULT_MAX_OPEN_RUNS);
     }
-    assert_eq!(tables.open_runs(), DEFAULT_MAX_OPEN_RUNS);
+    // Sharded by id: each shard holds its share, so up to 128 runs stay open.
+    assert!(tables.open_runs() > DEFAULT_MAX_OPEN_RUNS / 2);
     assert_eq!(tables.opens(), total);
-    // Runs 72..200 are open, 72 the least recently used.
+    // The most recently read run of each shard is open: reading it again opens nothing.
     read(199);
-    read(72);
     assert_eq!(tables.opens(), total);
-    read(0); // evicts 73, the least recently used now
-    assert_eq!(tables.opens(), total + 1);
-    read(72);
-    assert_eq!(tables.opens(), total + 1);
-    read(73);
-    assert_eq!(tables.opens(), total + 2);
+    // Every run still reads correctly, reopened where it was evicted.
+    for id in 0..total {
+        read(id);
+    }
+    assert!(tables.opens() > total);
+
+    // With a small limit there is one shard and one exact LRU.
+    let small = TableCache::new(
+        fs.arc(),
+        &dir(),
+        RunReadContext::new(Arc::new(BlockCache::new(1 << 20))),
+        8,
+    );
+    for id in 0..20 {
+        small.get(id).unwrap();
+    }
+    assert_eq!(small.open_runs(), 8);
+    let opens = small.opens();
+    // Runs 12..20 are open, 12 the least recently used.
+    small.get(19).unwrap();
+    small.get(12).unwrap();
+    assert_eq!(small.opens(), opens);
+    small.get(0).unwrap(); // evicts 13, the least recently used now
+    assert_eq!(small.opens(), opens + 1);
+    small.get(12).unwrap();
+    assert_eq!(small.opens(), opens + 1);
+    small.get(13).unwrap();
+    assert_eq!(small.opens(), opens + 2);
+    drop(small);
 
     // An iterator keeps an evicted run usable.
     let held = tables.get(150).unwrap();
@@ -1052,10 +1183,7 @@ fn descriptor_cache_keeps_at_most_max_open_runs_and_reopens_transparently() {
         fs.0.live_handles.load(AtomicOrdering::SeqCst),
         tables.open_runs()
     );
-    assert_eq!(
-        fs.0.opens.load(AtomicOrdering::SeqCst) - base_opens,
-        tables.opens()
-    );
+    assert!(fs.0.opens.load(AtomicOrdering::SeqCst) - base_opens >= tables.opens());
     assert!(
         tables.get(total + 5).is_err(),
         "a missing run is an I/O error"
@@ -1107,6 +1235,9 @@ fn runs_serve_concurrent_readers_through_a_small_shared_cache() {
         thread.join().unwrap();
     }
     assert!(cache.stats().evictions > 0);
+    // Only the open run's top-level index stays pinned.
+    assert_eq!(cache.pinned_bytes(), cache.reserved_bytes());
+    drop(run);
     assert_eq!(cache.pinned_bytes(), 0);
 }
 
@@ -1229,4 +1360,106 @@ fn bench_one_run(fs: &Arc<dyn Fs>, dir: &Path, id: u64, n: u64) {
         }
         println!("{label}: cache {:?}", cache.stats());
     }
+}
+
+/// RV-KV1 F9: bytes a point get reads from a 64 MiB run when the block cache is much
+/// smaller than the run's index and filters (NS4 measured about 1.3 MB per cold get with
+/// monolithic blocks). Run with
+/// `cargo test -p nabedra-kv --release -- --ignored bench_partitioned --nocapture`.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn bench_partitioned_index_get_bytes_under_small_caches() {
+    use std::time::Instant;
+    let dir = std::env::temp_dir().join(format!("nabedra-kv-bench-part-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fs: Arc<dyn Fs> = Arc::new(RealFs);
+    let n = 600_000u64;
+    let key_of = |i: u64| {
+        let mut key = vec![0x40];
+        key.extend_from_slice(&(i % 64).to_be_bytes());
+        key.extend_from_slice(&[0u8; 8]);
+        key.extend_from_slice(&i.to_be_bytes());
+        key
+    };
+    let mut keys: Vec<Vec<u8>> = (0..n).map(key_of).collect();
+    keys.sort();
+    let mut writer = RunWriter::create(
+        &*fs,
+        &dir.join(run_file_name(1)),
+        1,
+        RunWriterOptions::default(),
+    )
+    .unwrap();
+    for key in &keys {
+        writer
+            .add(&internal_key(key, 1, Kind::Put), &[0xAB; 100])
+            .unwrap();
+    }
+    let meta = writer.finish().unwrap();
+    println!(
+        "run: {n} entries, {:.1} MiB, {} data blocks",
+        meta.file_size as f64 / f64::from(1 << 20),
+        meta.num_data_blocks
+    );
+    for capacity in [16usize << 20, 1 << 20, 0] {
+        let cache = Arc::new(BlockCache::new(capacity));
+        let ctx = RunReadContext::new(Arc::clone(&cache));
+        let tables = TableCache::new(Arc::clone(&fs), &dir, ctx.clone(), DEFAULT_MAX_OPEN_RUNS);
+        let run = tables.get(1).unwrap();
+        let mut rng = Rng(7);
+        let bytes = |ctx: &RunReadContext| ctx.stats.block_read_bytes();
+        // Fully cold: nothing cached yet.
+        let before = bytes(&ctx);
+        let cold = 100u64;
+        for _ in 0..cold {
+            let key = &keys[rng.below(n) as usize];
+            assert!(matches!(
+                run.get(key, MAX_SEQ, true).unwrap(),
+                Lookup::Found { .. }
+            ));
+        }
+        let cold_bytes = (bytes(&ctx) - before) / cold;
+        // Warm up, then measure random present and absent gets.
+        for _ in 0..50_000 {
+            run.get(&keys[rng.below(n) as usize], MAX_SEQ, true)
+                .unwrap();
+        }
+        let gets = 20_000u64;
+        let before = bytes(&ctx);
+        let t = Instant::now();
+        for _ in 0..gets {
+            let key = &keys[rng.below(n) as usize];
+            assert!(matches!(
+                run.get(key, MAX_SEQ, true).unwrap(),
+                Lookup::Found { .. }
+            ));
+        }
+        let hit_ns = t.elapsed().as_nanos() as f64 / gets as f64;
+        let hit_bytes = (bytes(&ctx) - before) / gets;
+        let before = bytes(&ctx);
+        let t = Instant::now();
+        for i in 0..gets {
+            let mut key = key_of(n + i);
+            key.push(1);
+            assert_eq!(run.get(&key, MAX_SEQ, true).unwrap(), Lookup::NotFound);
+        }
+        let miss_ns = t.elapsed().as_nanos() as f64 / gets as f64;
+        let miss_bytes = (bytes(&ctx) - before) / gets;
+        let stats = cache.stats();
+        println!(
+            "cache {:>5} KiB: first 100 gets {cold_bytes} B/get; warm present {hit_ns:.0} ns \
+             ({hit_bytes} B/get), absent {miss_ns:.0} ns ({miss_bytes} B/get); top-level index \
+             pinned {} B, usage {} KiB, evictions {}",
+            capacity >> 10,
+            cache.reserved_bytes(),
+            stats.usage_bytes >> 10,
+            stats.evictions
+        );
+        if capacity > 0 {
+            assert!(hit_bytes < 16 << 10, "a few KiB per get, not ~1.3 MB");
+        }
+        assert!(cold_bytes < 16 << 10);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

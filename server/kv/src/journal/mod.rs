@@ -28,19 +28,36 @@
 //!
 //! [`Journal::open`] replays every record with a sequence above `replay_after` through
 //! the sink and classifies the first position that is not a valid record (plan section 3,
-//! cases L1, L2, G1, R1 to R3). See [`recovery`].
+//! cases L1, L2, G1, R1 to R3). See [`recovery`]. Before it returns, every live segment is
+//! synced, so `durable_seq` covers everything the journal holds.
+//!
+//! # Rules for the store
+//!
+//! - **Journal before manifest.** A flush must make the journal durable up to the
+//!   sequences it flushes (`Journal::sync()` and wait) before it writes the manifest edit
+//!   that advances `flushed_seq` or adds a run holding journal-value locators. Otherwise a
+//!   power loss can leave runs whose locators point at journal bytes that were never
+//!   synced (RV-KV1 F5). With this rule, `replay_after` is never ahead of the journal
+//!   unless synced journal bytes were damaged.
+//! - **Directories.** `open` creates `dir` if needed and syncs the parent of every
+//!   directory it created and of `dir` itself, so the journal's own directory entry is
+//!   durable before any acknowledged write depends on it (RV-KV1 F2).
+//! - **Background work.** Besides the `kv-journal` thread, a `kv-journal-prep` thread
+//!   prepares (creates, zero-fills, syncs) the next free segment once the active one is
+//!   half used, so commits never wait for a zero fill unless no spare exists (F8).
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::batch::{MAX_SCOPE_LEN, WriteBatch};
+use crate::cache::{BlockCache, CacheKey};
 use crate::crc;
 use crate::error::{Damage, Error, FileId, Result};
 use crate::fs::{Fs, FsFile};
@@ -52,9 +69,11 @@ mod segment;
 mod writer;
 
 #[cfg(test)]
+mod crash_tests;
+#[cfg(test)]
 mod tests;
 
-use format::{BLOCK, RECORD_HEADER_LEN, RecordType};
+use format::{BLOCK, RECORD_HEADER_LEN, RECORDS_START, RecordType};
 use segment::{FreeSeg, LiveSeg};
 
 /// How durable a write must be before its commit completes.
@@ -76,7 +95,8 @@ pub enum RecordKind {
 
 #[derive(Clone, Debug)]
 pub struct JournalOptions {
-    /// Size of each segment file. A multiple of 4096, at least 8192. Default 64 MiB.
+    /// Size of each segment file. A multiple of 4096, at least 12288 (two header blocks
+    /// and one block of records). Default 64 MiB.
     pub segment_bytes: u64,
     /// The thread drains at most this many payload bytes per group (at least one batch).
     /// Default 4 MiB.
@@ -217,6 +237,15 @@ struct Counters {
     value_corruptions: AtomicU64,
 }
 
+/// `what` of the `Corruption` [`Journal::read_value`] returns when the locator's segment
+/// was retired or reused (its epoch no longer matches): the value is gone because the
+/// segment was recycled, not because bytes were damaged. A caller holding a visible
+/// locator should never see it; it points at a bug in journal GC, not at the media.
+pub const VALUE_RECYCLED: &str = "journal locator names a recycled segment";
+/// `what` of the `Corruption` for a locator whose range lies outside its segment.
+pub const VALUE_OUT_OF_RANGE: &str = "journal locator outside its segment";
+/// `what` of the `Corruption` for a value whose bytes fail the locator's CRC (G3).
+pub const VALUE_CHECKSUM: &str = "journal value checksum mismatch";
 /// Completion of one queued item.
 struct Waiter {
     tx: oneshot::Sender<Result<Seq>>,
@@ -300,6 +329,14 @@ struct Shared {
     table: Mutex<Table>,
     next_number: AtomicU64,
     stats: Counters,
+    /// The spare preparer's state, its wake-up and its completion signal.
+    prep: Mutex<writer::Prep>,
+    prep_work: Condvar,
+    prep_done: Condvar,
+    /// Set when the journal stops: a zero fill in progress gives up.
+    prep_cancel: AtomicBool,
+    /// Where journal values read through locators are cached, and the store namespace.
+    value_cache: OnceLock<(Arc<BlockCache>, u64)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -311,6 +348,34 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct Journal {
     shared: Arc<Shared>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    preparer: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Creates `dir` if needed and makes its entry durable: syncs the parent of every
+/// directory created here and of `dir` itself.
+fn ensure_durable_dir(fs: &dyn Fs, dir: &Path) -> Result<()> {
+    let mut created: Vec<&Path> = Vec::new();
+    for ancestor in dir.ancestors() {
+        if ancestor.as_os_str().is_empty() || fs.exists(ancestor).map_err(segment::io)? {
+            break;
+        }
+        created.push(ancestor);
+    }
+    fs.create_dir_all(dir).map_err(segment::io)?;
+    let mut parents: Vec<&Path> = Vec::new();
+    for d in created.iter().copied().chain(std::iter::once(dir)) {
+        let parent = match d.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+    for parent in parents {
+        fs.sync_dir(parent).map_err(segment::io)?;
+    }
+    Ok(())
 }
 
 impl Journal {
@@ -329,13 +394,15 @@ impl Journal {
         replay_after: Seq,
         sink: Arc<dyn JournalSink>,
     ) -> Result<(Journal, RecoveryReport)> {
-        if !options.segment_bytes.is_multiple_of(BLOCK) || options.segment_bytes < 2 * BLOCK {
+        if !options.segment_bytes.is_multiple_of(BLOCK)
+            || options.segment_bytes < RECORDS_START + BLOCK
+        {
             return Err(Error::InvalidArgument(
-                "journal segment_bytes must be a multiple of 4096 and at least 8192",
+                "journal segment_bytes must be a multiple of 4096 and at least 12288",
             ));
         }
         let started = std::time::Instant::now();
-        fs.create_dir_all(dir).map_err(segment::io)?;
+        ensure_durable_dir(&*fs, dir)?;
         let recovered = recovery::recover(&*fs, dir, &options, replay_after, &*sink)?;
         let mut report = recovered.report.clone();
         let shared = Arc::new(Shared {
@@ -361,6 +428,11 @@ impl Journal {
             }),
             next_number: AtomicU64::new(recovered.max_number + 1),
             stats: Counters::default(),
+            prep: Mutex::new(writer::Prep::default()),
+            prep_work: Condvar::new(),
+            prep_done: Condvar::new(),
+            prep_cancel: AtomicBool::new(false),
+            value_cache: OnceLock::new(),
         });
         let writer = writer::Writer::finish_open(shared.clone(), recovered, replay_after)?;
         let next_seq = writer.next_seq();
@@ -374,14 +446,15 @@ impl Journal {
         stats.tail_bytes.store(report.tail_bytes, Ordering::Relaxed);
         report.last_seq = next_seq - 1;
         report.recovery_ms = started.elapsed().as_millis() as u64;
+        let preparer = writer::spawn_preparer(shared.clone())?;
+        let journal = Journal {
+            shared: shared.clone(),
+            thread: Mutex::new(None),
+            preparer: Mutex::new(Some(preparer)),
+        };
         let thread = writer.spawn(sink)?;
-        Ok((
-            Journal {
-                shared,
-                thread: Mutex::new(Some(thread)),
-            },
-            report,
-        ))
+        *lock(&journal.thread) = Some(thread);
+        Ok((journal, report))
     }
 
     /// Queues `batch` as one record. Never does I/O. Sequence numbers follow submission
@@ -409,7 +482,7 @@ impl Journal {
         }
         let record_len = RECORD_HEADER_LEN + batch.scope().len() + batch.encoded_bytes();
         debug_assert!(batch.scope().len() <= MAX_SCOPE_LEN);
-        if record_len as u64 > self.shared.options.segment_bytes - BLOCK {
+        if record_len as u64 > self.shared.options.segment_bytes - RECORDS_START {
             return Err(Error::InvalidArgument(
                 "batch larger than a journal segment",
             ));
@@ -551,8 +624,28 @@ impl Journal {
         Ok(())
     }
 
-    /// Reads a journal value and checks its CRC.
+    /// Caches journal values read through locators in `cache`, keyed under `namespace`
+    /// (the store's [`crate::run::RunReadContext::namespace`]). The first call wins.
+    pub fn set_value_cache(&self, cache: Arc<BlockCache>, namespace: u64) {
+        let _ = self.shared.value_cache.set((cache, namespace));
+    }
+
+    /// Reads a journal value, checks its CRC and caches it (see
+    /// [`Journal::read_value_with`]).
     pub fn read_value(&self, locator: &Locator) -> Result<Bytes> {
+        self.read_value_with(locator, true)
+    }
+
+    /// Reads a journal value through the block cache, when one is set: a hit returns the
+    /// cached bytes (checked when they were read); a miss reads and checks the CRC and,
+    /// with `fill_cache`, inserts the value under `CacheKey::Journal`.
+    ///
+    /// Errors are `Corruption` with `file: JournalValue { segment }` and one of these
+    /// `what`s: [`VALUE_RECYCLED`] when the segment is no longer live in the locator's
+    /// epoch (also when it was retired while the read was in flight), and
+    /// [`VALUE_OUT_OF_RANGE`] or [`VALUE_CHECKSUM`] for damage (G3). Every one counts in
+    /// `value_corruptions`. A failed read is `Io`.
+    pub fn read_value_with(&self, locator: &Locator, fill_cache: bool) -> Result<Bytes> {
         let corrupt = |what| {
             self.shared
                 .stats
@@ -566,25 +659,58 @@ impl Journal {
                 what,
             }
         };
+        let max_len = self.shared.options.segment_bytes - RECORDS_START;
         let file = {
             let table = lock(&self.shared.table);
             match table.live.get(&locator.segment) {
                 Some(seg) if seg.epoch == locator.epoch => {
-                    if locator.offset < BLOCK || locator.offset + u64::from(locator.len) > seg.len {
-                        return Err(corrupt("journal locator outside its segment"));
+                    let in_range = locator.offset >= RECORDS_START
+                        && u64::from(locator.len) <= max_len
+                        && locator
+                            .offset
+                            .checked_add(u64::from(locator.len))
+                            .is_some_and(|end| end <= seg.len);
+                    if !in_range {
+                        return Err(corrupt(VALUE_OUT_OF_RANGE));
                     }
                     seg.file.clone()
                 }
-                _ => return Err(corrupt("journal locator names a recycled segment")),
+                _ => return Err(corrupt(VALUE_RECYCLED)),
             }
         };
+        let cache = self.shared.value_cache.get();
+        let key = cache.map(|(_, namespace)| CacheKey::Journal {
+            store: *namespace,
+            segment: locator.segment,
+            epoch: locator.epoch,
+            offset: locator.offset,
+        });
+        if let (Some((cache, _)), Some(key)) = (cache, &key)
+            && let Some(value) = cache.get(key)
+            && value.len() == locator.len as usize
+        {
+            return Ok(value);
+        }
         let mut value = vec![0u8; locator.len as usize];
         file.read_exact_at(&mut value, locator.offset)
             .map_err(segment::io)?;
         if crc::crc32c(&value) != locator.crc32c {
-            return Err(corrupt("journal value checksum mismatch"));
+            // A retire (and a reuse) racing with this read reports as recycled.
+            let still_live = lock(&self.shared.table)
+                .live
+                .get(&locator.segment)
+                .is_some_and(|seg| seg.epoch == locator.epoch);
+            return Err(corrupt(if still_live {
+                VALUE_CHECKSUM
+            } else {
+                VALUE_RECYCLED
+            }));
         }
-        Ok(Bytes::from(value))
+        let value = Bytes::from(value);
+        Ok(match (cache, key) {
+            (Some((cache, _)), Some(key)) if fill_cache => cache.insert(key, value),
+            _ => value,
+        })
     }
 
     pub fn stats(&self) -> JournalStats {
@@ -618,6 +744,15 @@ impl Journal {
         }
         self.shared.work.notify_one();
         if let Some(thread) = lock(&self.thread).take() {
+            let _ = thread.join();
+        }
+        {
+            let mut prep = lock(&self.shared.prep);
+            prep.stop = true;
+        }
+        self.shared.prep_cancel.store(true, Ordering::Relaxed);
+        self.shared.prep_work.notify_all();
+        if let Some(thread) = lock(&self.preparer).take() {
             let _ = thread.join();
         }
         if self.requires_recovery() {

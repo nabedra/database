@@ -22,7 +22,8 @@ pub const MAX_VALUE_LEN: usize = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunWriterOptions {
-    /// Target data block size. An entry larger than this forms a block of its own.
+    /// Target data block size. An entry larger than this forms a block of its own. Index
+    /// partitions are cut at the same size (see [`crate::run`]'s format notes).
     pub block_size: usize,
     /// Every n-th key of a data block is stored whole.
     pub restart_interval: usize,
@@ -49,9 +50,10 @@ impl Default for RunWriterOptions {
 /// run reachable (directory sync, manifest edit) is the caller's job, as is removing the
 /// file when the writer fails or is dropped unfinished.
 ///
-/// Memory: the write buffer, one data block, the index block (one key and handle per
-/// data block), one `u64` hash per distinct user key for the bloom filter, and the range
-/// tombstones.
+/// Memory: the write buffer, one data block, one index partition and one `u64` hash per
+/// distinct user key of that partition, the finished partitions (about 1.3 bytes per
+/// key for the filters plus one index entry per data block), one top-level entry per
+/// partition, and the range tombstones.
 pub struct RunWriter {
     file: Arc<dyn FsFile>,
     id: u64,
@@ -60,9 +62,18 @@ pub struct RunWriter {
     /// File offset of `out[0]`.
     written: u64,
     data: BlockBuilder,
+    /// The index partition being built.
     index: BlockBuilder,
     index_value: Vec<u8>,
+    /// The filter partition being built.
     bloom: BloomBuilder,
+    /// A partition was just cut: the next entry's user key enters the new filter even if
+    /// it equals the previous entry's.
+    bloom_fresh: bool,
+    /// Finished filter and index partitions, with trailers; offsets relative to its start.
+    parts: Vec<u8>,
+    /// Per partition: its last internal key and its index and filter handles (relative).
+    top: Vec<(Vec<u8>, BlockHandle, BlockHandle)>,
     last_key: Vec<u8>,
     tombstones: Vec<RangeTombstone>,
     meta: RunMeta,
@@ -83,6 +94,9 @@ impl RunWriter {
             index: BlockBuilder::new(1),
             index_value: Vec::with_capacity(20),
             bloom: BloomBuilder::new(options.bloom_bits_per_key),
+            bloom_fresh: false,
+            parts: Vec::new(),
+            top: Vec::new(),
             last_key: Vec::new(),
             tombstones: Vec::new(),
             meta: RunMeta {
@@ -136,9 +150,6 @@ impl RunWriter {
         if !first && compare_internal_keys(ikey, &self.last_key) != Ordering::Greater {
             return Err(Error::InvalidArgument("run entries out of order"));
         }
-        if first || user_key(&self.last_key) != parsed.user_key {
-            self.bloom.add_key(parsed.user_key);
-        }
         match parsed.kind {
             Kind::Delete => self.meta.num_deletions += 1,
             Kind::JournalPut => {
@@ -161,6 +172,11 @@ impl RunWriter {
             && self.data.size_estimate() + entry_estimate > self.options.block_size
         {
             self.flush_data_block()?;
+        }
+        // After any partition cut above, so the key lands in its own partition's filter.
+        if first || self.bloom_fresh || user_key(&self.last_key) != parsed.user_key {
+            self.bloom.add_key(parsed.user_key);
+            self.bloom_fresh = false;
         }
         self.data.add(ikey, value);
         self.last_key.clear();
@@ -198,6 +214,9 @@ impl RunWriter {
         }
         if !self.data.is_empty() {
             self.flush_data_block()?;
+        }
+        if !self.index.is_empty() {
+            self.cut_partition()?;
         }
 
         // Range tombstones, sorted by internal key of their start.
@@ -245,18 +264,35 @@ impl RunWriter {
             range_del.finish_into(out)
         });
         let range_del = self.check_emitted(handle)?;
-        let bloom = &self.bloom;
-        let handle = emit_block(&mut self.out, self.written, |out| bloom.finish_into(out));
-        let bloom = self.check_emitted(handle)?;
+        let partitions = BlockHandle {
+            offset: self.written + self.out.len() as u64,
+            size: self.parts.len() as u64,
+        };
+        if partitions.size > u64::from(u32::MAX) {
+            return self.fail(Error::InvalidArgument(
+                "run partitions larger than u32::MAX",
+            ));
+        }
+        self.out.extend_from_slice(&self.parts);
+        self.parts = Vec::new();
         let meta = &self.meta;
         let handle = emit_block(&mut self.out, self.written, |out| meta.encode(out));
         let props = self.check_emitted(handle)?;
-        let index = &mut self.index;
-        let handle = emit_block(&mut self.out, self.written, |out| index.finish_into(out));
+        let mut top = BlockBuilder::new(1);
+        for (key, index, filter) in &self.top {
+            let at = |h: &BlockHandle| BlockHandle {
+                offset: partitions.offset + h.offset,
+                size: h.size,
+            };
+            self.index_value.clear();
+            BlockHandle::encode_pair(at(index), at(filter), &mut self.index_value);
+            top.add(key, &self.index_value);
+        }
+        let handle = emit_block(&mut self.out, self.written, |out| top.finish_into(out));
         let index = self.check_emitted(handle)?;
         let footer = Footer {
             index,
-            bloom,
+            partitions,
             range_del,
             props,
         };
@@ -284,9 +320,27 @@ impl RunWriter {
         handle.encode_varint(&mut self.index_value);
         self.index.add(&self.last_key, &self.index_value);
         self.meta.num_data_blocks += 1;
+        if self.index.size_estimate() >= self.options.block_size {
+            self.cut_partition()?;
+        }
         if self.out.len() >= self.options.write_buffer_bytes {
             self.write_out()?;
         }
+        Ok(())
+    }
+
+    /// Finishes the current filter and index partitions (kept in memory until `finish`
+    /// writes them after the data) and records their top-level entry.
+    fn cut_partition(&mut self) -> Result<()> {
+        let bloom = &self.bloom;
+        let filter = emit_block(&mut self.parts, 0, |out| bloom.finish_into(out));
+        let filter = self.check_emitted(filter)?;
+        self.bloom.clear();
+        let index = &mut self.index;
+        let handle = emit_block(&mut self.parts, 0, |out| index.finish_into(out));
+        let index = self.check_emitted(handle)?;
+        self.top.push((self.last_key.clone(), index, filter));
+        self.bloom_fresh = true;
         Ok(())
     }
 

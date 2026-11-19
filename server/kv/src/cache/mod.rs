@@ -10,6 +10,11 @@
 //! is really resident, and may exceed the capacity while callers hold more than it.
 //! [`BlockCache::pinned_bytes`] reports how much of the usage is pinned.
 //!
+//! **Reservations.** Memory that callers keep resident outside the LRU on the cache's
+//! budget (each open run's top-level index) is charged with [`BlockCache::reserve`]: it
+//! counts in `usage_bytes` and `pinned_bytes`, and the LRU gets only the capacity left
+//! over, so index and filter partitions compete for what remains.
+//!
 //! Keys carry a per-store namespace from [`BlockCache::new_namespace`], because run ids
 //! and journal segment numbers are only unique inside one store while the cache is
 //! shared by every pool on a worker.
@@ -17,8 +22,8 @@
 mod lru;
 
 use std::hash::{BuildHasherDefault, Hash, Hasher};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -129,7 +134,8 @@ pub struct CacheStats {
 pub struct BlockCache {
     shards: Box<[Mutex<Shard>]>,
     capacity: usize,
-    shard_capacity: usize,
+    /// Bytes held by live [`CacheReservation`]s.
+    reserved: AtomicUsize,
     usage: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -152,7 +158,7 @@ impl BlockCache {
         BlockCache {
             shards,
             capacity: capacity_bytes,
-            shard_capacity: capacity_bytes / SHARDS,
+            reserved: AtomicUsize::new(0),
             usage: AtomicUsize::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -172,6 +178,30 @@ impl BlockCache {
         &self.shards[shard_index(key)]
     }
 
+    /// What one shard's LRU may hold: the capacity left after reservations, split evenly.
+    fn shard_capacity(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.reserved.load(Ordering::Relaxed))
+            / SHARDS
+    }
+
+    /// Charges `bytes` that the caller keeps resident outside the LRU (for example an
+    /// open run's top-level index) to this cache until the reservation is dropped. They
+    /// count as used and pinned, and the LRU shrinks by as much.
+    pub fn reserve(self: &Arc<Self>, bytes: usize) -> CacheReservation {
+        self.reserved.fetch_add(bytes, Ordering::Relaxed);
+        self.usage.fetch_add(bytes, Ordering::Relaxed);
+        CacheReservation {
+            cache: Arc::clone(self),
+            bytes,
+        }
+    }
+
+    /// Bytes held by live reservations.
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Relaxed)
+    }
+
     /// The cached block, marked most recently used.
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
         let found = lock(self.shard(key)).lru.get(key).cloned();
@@ -188,7 +218,8 @@ impl BlockCache {
     /// unpinned entries, least recently used first, until the shard fits again.
     pub fn insert(&self, key: CacheKey, value: Bytes) -> Bytes {
         let charge = value.len() + ENTRY_OVERHEAD;
-        if charge > self.shard_capacity {
+        let shard_capacity = self.shard_capacity();
+        if charge > shard_capacity {
             return value;
         }
         let mut shard = lock(self.shard(&key));
@@ -198,7 +229,7 @@ impl BlockCache {
         shard.lru.insert(key, value.clone(), charge);
         self.usage.fetch_add(charge, Ordering::Relaxed);
         self.inserts.fetch_add(1, Ordering::Relaxed);
-        while shard.lru.charge() > self.shard_capacity {
+        while shard.lru.charge() > shard_capacity {
             // The entry just inserted is pinned by `value`, so it is never chosen here.
             match shard.lru.evict(MAX_EVICTION_SCAN, Bytes::is_unique) {
                 Some((_, evicted, charge)) => {
@@ -230,20 +261,22 @@ impl BlockCache {
         self.usage.load(Ordering::Relaxed)
     }
 
-    /// Bytes charged for resident entries that a caller still references. Walks every
-    /// entry, so it is meant for stats, not for hot paths.
+    /// Bytes charged for resident entries that a caller still references, plus the
+    /// reservations. Walks every entry, so it is meant for stats, not for hot paths.
     pub fn pinned_bytes(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| {
-                lock(shard)
-                    .lru
-                    .entries()
-                    .filter(|(_, value, _)| !value.is_unique())
-                    .map(|(_, _, charge)| charge)
-                    .sum::<usize>()
-            })
-            .sum()
+        self.reserved_bytes()
+            + self
+                .shards
+                .iter()
+                .map(|shard| {
+                    lock(shard)
+                        .lru
+                        .entries()
+                        .filter(|(_, value, _)| !value.is_unique())
+                        .map(|(_, _, charge)| charge)
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -257,6 +290,33 @@ impl BlockCache {
             inserts: self.inserts.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Bytes charged to a [`BlockCache`] until dropped (see [`BlockCache::reserve`]).
+pub struct CacheReservation {
+    cache: Arc<BlockCache>,
+    bytes: usize,
+}
+
+impl CacheReservation {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for CacheReservation {
+    fn drop(&mut self) {
+        self.cache.reserved.fetch_sub(self.bytes, Ordering::Relaxed);
+        self.cache.usage.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for CacheReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheReservation")
+            .field("bytes", &self.bytes)
+            .finish()
     }
 }
 
@@ -369,6 +429,33 @@ mod tests {
         assert!(cache.get(&run_key(1, 5)).is_some());
         drop(slice);
         assert_eq!(cache.pinned_bytes(), 0);
+    }
+
+    #[test]
+    fn reservations_count_as_pinned_and_shrink_the_lru() {
+        let cache = Arc::new(BlockCache::new(SHARDS * 8192));
+        for i in 0..400u64 {
+            drop(cache.insert(run_key(1, i), Bytes::from(vec![1u8; 1000])));
+        }
+        let before = cache.stats();
+        assert!(before.usage_bytes <= cache.capacity_bytes());
+        let reservation = cache.reserve(SHARDS * 4096);
+        assert_eq!(cache.reserved_bytes(), SHARDS * 4096);
+        assert_eq!(cache.pinned_bytes(), SHARDS * 4096);
+        // New inserts now fit the LRU into what the reservation left.
+        for i in 1000..1400u64 {
+            drop(cache.insert(run_key(1, i), Bytes::from(vec![2u8; 1000])));
+        }
+        let stats = cache.stats();
+        assert!(
+            stats.usage_bytes <= cache.capacity_bytes() + SHARDS * (1000 + ENTRY_OVERHEAD),
+            "{stats:?}"
+        );
+        assert!(stats.usage_bytes - SHARDS * 4096 <= SHARDS * 4096 + SHARDS * 1100);
+        drop(reservation);
+        assert_eq!(cache.reserved_bytes(), 0);
+        assert_eq!(cache.pinned_bytes(), 0);
+        assert!(cache.usage_bytes() <= cache.capacity_bytes());
     }
 
     #[test]
