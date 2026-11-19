@@ -532,17 +532,31 @@ pub fn read_current(fs: &dyn Fs, dir: &Path) -> Result<u64> {
 
 /// Points `CURRENT` at `MANIFEST-<number>`: temp file, sync, rename, directory sync.
 pub fn set_current(fs: &dyn Fs, dir: &Path, number: u64) -> Result<()> {
+    switch_current(fs, dir, number).map_err(|e| e.error())
+}
+
+/// [`set_current`], telling whether a failure may have switched `CURRENT` already.
+/// `Retry`: it still names the old manifest. `Fatal`: the rename was attempted, so
+/// `CURRENT` may name the new manifest now or after a restart; neither manifest may be
+/// deleted before the next open decides (RV-KV2 finding 3).
+pub fn switch_current(
+    fs: &dyn Fs,
+    dir: &Path,
+    number: u64,
+) -> std::result::Result<(), AppendError> {
+    let before = |e: std::io::Error| AppendError::Retry(io(e));
     let tmp = dir.join(CURRENT_TMP);
-    if fs.exists(&tmp).map_err(io)? {
-        fs.remove(&tmp).map_err(io)?;
+    if fs.exists(&tmp).map_err(before)? {
+        fs.remove(&tmp).map_err(before)?;
     }
-    let file = fs.open(&tmp, OpenMode::CreateNew).map_err(io)?;
+    let file = fs.open(&tmp, OpenMode::CreateNew).map_err(before)?;
     file.write_all_at(current_line(number).as_bytes(), 0)
-        .map_err(io)?;
-    file.sync_all().map_err(io)?;
+        .map_err(before)?;
+    file.sync_all().map_err(before)?;
     drop(file);
-    fs.rename(&tmp, &dir.join(CURRENT_FILE)).map_err(io)?;
-    fs.sync_dir(dir).map_err(io)
+    let after = |e: std::io::Error| AppendError::Fatal(io(e));
+    fs.rename(&tmp, &dir.join(CURRENT_FILE)).map_err(after)?;
+    fs.sync_dir(dir).map_err(after)
 }
 
 /// Writes `FORMAT` once: temp file, sync, rename, directory sync.

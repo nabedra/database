@@ -25,6 +25,7 @@
 //! version. Point reads apply the newest covering range tombstone across every source.
 
 mod background;
+mod budget;
 mod journal_gc;
 mod read;
 mod snapshots;
@@ -33,7 +34,7 @@ mod tests;
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,7 @@ use crate::types::{Locator, Seq};
 use crate::version::{FileTracker, LevelOptions, MemEntry, RunFile, SuperVersion, Version};
 
 use self::background::Job;
+use self::budget::BudgetGroup;
 use self::journal_gc::GcState;
 use self::snapshots::Snapshots;
 
@@ -73,6 +75,9 @@ use self::snapshots::Snapshots;
 const STALL_POLL: Duration = Duration::from_millis(5);
 /// Background work that failed with `NoSpace` retries after this long.
 const NO_SPACE_RETRY: Duration = Duration::from_millis(200);
+/// Other background failures (EIO on a run write or an input read) are retried this many
+/// times, with growing delays, before the store latches `RecoveryRequired`.
+const MAX_BACKGROUND_FAILURES: u32 = 3;
 
 /// A store-wide key: every key belongs to no scope.
 pub fn store_wide(_: &[u8]) -> usize {
@@ -203,6 +208,10 @@ pub struct MemoryUsage {
     pub versions: u64,
     /// Pool overhead: the snapshot registry.
     pub snapshots: u64,
+    /// Memtables already flushed but still held by snapshots or iterators, over every
+    /// store sharing the memtable budget. Charged to `write_buffer_bytes`, but writers
+    /// do not stall on them (see `store/budget.rs`).
+    pub memtables_pinned: u64,
     /// Block cache: bytes reserved or pinned there (open runs' top-level indexes, held
     /// blocks). Shared by every store on the cache; reported here for convenience.
     pub cache_pinned: u64,
@@ -262,8 +271,10 @@ pub(crate) struct Inner {
     max_replay_bytes: u64,
     max_journal_bytes: u64,
     segment_bytes: u64,
+    max_group_bytes: usize,
     run_writer: RunWriterOptions,
     budget: Arc<MemtableBudget>,
+    group: Arc<BudgetGroup>,
     cache: Arc<BlockCache>,
     background: Arc<Background>,
     table_cache: TableCache,
@@ -271,6 +282,11 @@ pub(crate) struct Inner {
     tracker: Arc<FileTracker>,
     journal: OnceLock<Arc<Journal>>,
     sv: RwLock<Arc<SuperVersion>>,
+    /// Bumped (inside the `sv` write lock) whenever `sv` changes; readers cache the
+    /// super-version per thread under it (see `current_sv`).
+    sv_version: AtomicU64,
+    /// Unique per open store, for the per-thread super-version cache.
+    store_id: u64,
     /// Serializes memtable inserts (journal thread) with freezes.
     active: Mutex<()>,
     replaying: AtomicBool,
@@ -295,6 +311,17 @@ pub(crate) struct Inner {
     jobs_done: Condvar,
     /// A flush is waiting for a journal sync: stalled sinks must let the journal thread go.
     syncs_waiting: AtomicUsize,
+    /// While a sync waits, records up to this sequence pass a stall (they are queued
+    /// before the sync)...
+    bypass_seq: AtomicU64,
+    /// ... and later records pass while this byte allowance lasts (they may share the
+    /// sync's journal group, which completes only once all its records are applied).
+    /// RV-KV2 finding 4: the bypass admits at most one group per sync request.
+    bypass_bytes: AtomicI64,
+    /// Consecutive failed background jobs (other than `NoSpace`).
+    background_failures: AtomicU32,
+    /// Mirrors `jobs.closing` for the journal thread's hot path.
+    closing_flag: AtomicBool,
     flush_queued: AtomicBool,
     compaction_queued: AtomicBool,
     l0_changed: Condvar,
@@ -425,7 +452,9 @@ impl Store {
             max_replay_bytes: options.max_replay_bytes.max(1),
             max_journal_bytes: options.max_journal_bytes,
             segment_bytes: options.journal.segment_bytes,
+            max_group_bytes: options.journal.max_group_bytes,
             run_writer: options.run_writer,
+            group: BudgetGroup::of(&budget),
             budget,
             cache: options.cache.clone(),
             background: options.background.clone(),
@@ -438,6 +467,8 @@ impl Store {
                 imm: Vec::new(),
                 version: Arc::new(version),
             })),
+            sv_version: AtomicU64::new(0),
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             active: Mutex::new(()),
             replaying: AtomicBool::new(true),
             vs: Mutex::new(VersionSet {
@@ -461,6 +492,10 @@ impl Store {
             jobs: Mutex::new(Jobs::default()),
             jobs_done: Condvar::new(),
             syncs_waiting: AtomicUsize::new(0),
+            bypass_seq: AtomicU64::new(0),
+            bypass_bytes: AtomicI64::new(0),
+            background_failures: AtomicU32::new(0),
+            closing_flag: AtomicBool::new(false),
             flush_queued: AtomicBool::new(false),
             compaction_queued: AtomicBool::new(false),
             l0_changed: Condvar::new(),
@@ -474,6 +509,7 @@ impl Store {
             self_ref: OnceLock::new(),
         });
         let _ = inner.self_ref.set(Arc::downgrade(&inner));
+        inner.group.join(Arc::downgrade(&inner));
         {
             let mut vs = lock(&inner.vs);
             vs.current = inner.current_sv().version.clone();
@@ -743,11 +779,17 @@ impl Job for Inner {
         let result = self.flush_imms();
         self.end_job();
         match result {
+            Ok(()) => {
+                self.background_failures.store(0, Ordering::Relaxed);
+                None
+            }
             Err(Error::NoSpace) => {
                 self.flush_queued.store(true, Ordering::Release);
                 Some(NO_SPACE_RETRY)
             }
-            _ => None,
+            Err(e) => self.background_failed(&e).inspect(|_| {
+                self.flush_queued.store(true, Ordering::Release);
+            }),
         }
     }
 
@@ -787,10 +829,26 @@ impl Job for Inner {
                 self.compaction_queued.store(true, Ordering::Release);
                 Some(NO_SPACE_RETRY)
             }
-            _ => None,
+            Err(e) => self.background_failed(&e).inspect(|_| {
+                self.compaction_queued.store(true, Ordering::Release);
+            }),
+            Ok(false) => None,
         }
     }
 }
+
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Per-thread cache of super-versions: (store id, sv version, super-version). A hit
+/// costs no lock (RV-KV2 finding 9/8b). Entries hold weak references, so a cached entry
+/// never keeps old memtables or runs alive.
+type SvCache = Vec<(u64, u64, Weak<SuperVersion>)>;
+
+thread_local! {
+    static SV_CACHE: std::cell::RefCell<SvCache> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const SV_CACHE_ENTRIES: usize = 8;
 
 impl Inner {
     fn journal(&self) -> &Arc<Journal> {
@@ -802,11 +860,72 @@ impl Inner {
         Some(weak)
     }
 
+    /// The current super-version. Usually served from a per-thread cache without a
+    /// lock: the version counter is read first, and an entry cached under that version is
+    /// the super-version published with it, or the caller sees a newer counter.
     pub(crate) fn current_sv(&self) -> Arc<SuperVersion> {
-        self.sv
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        let version = self.sv_version.load(Ordering::Acquire);
+        let hit = SV_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .iter()
+                .find(|(id, v, _)| *id == self.store_id && *v == version)
+                .and_then(|(_, _, sv)| sv.upgrade())
+        });
+        if let Some(sv) = hit {
+            return sv;
+        }
+        let (version, sv) = {
+            let guard = self.sv.read().unwrap_or_else(PoisonError::into_inner);
+            (self.sv_version.load(Ordering::Acquire), guard.clone())
+        };
+        SV_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.retain(|(id, _, w)| *id != self.store_id && w.strong_count() > 0);
+            if cache.len() >= SV_CACHE_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push((self.store_id, version, Arc::downgrade(&sv)));
+        });
+        sv
+    }
+
+    /// Publishes `next` as the current super-version. The caller holds the write lock.
+    fn publish_sv(&self, slot: &mut Arc<SuperVersion>, next: SuperVersion) {
+        *slot = Arc::new(next);
+        self.sv_version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A background job failed with `error` (not `NoSpace`). Retries a few times with
+    /// growing delays, then latches `RecoveryRequired` so writers fail instead of
+    /// stalling on memory forever (RV-KV2 finding 4).
+    fn background_failed(&self, error: &Error) -> Option<Duration> {
+        if matches!(error, Error::Closed | Error::RecoveryRequired) {
+            return None;
+        }
+        let n = self.background_failures.fetch_add(1, Ordering::AcqRel) + 1;
+        if n >= MAX_BACKGROUND_FAILURES {
+            self.latch();
+            // Wake stalled writers so they see the latch.
+            self.l0_changed.notify_all();
+            return None;
+        }
+        Some(NO_SPACE_RETRY * n)
+    }
+
+    /// Unflushed memtable memory (active and immutable).
+    fn unflushed_bytes(&self) -> usize {
+        let sv = self.current_sv();
+        sv.memtables().map(|m| m.mem.approximate_memory()).sum()
+    }
+
+    /// Another store sharing the budget is stalled: freeze and flush this one.
+    fn flush_for_budget(&self) {
+        if self.closing_flag.load(Ordering::Acquire) {
+            return;
+        }
+        self.freeze_active();
+        self.schedule_flush();
     }
 
     fn check_usable(&self) -> Result<()> {
@@ -820,7 +939,7 @@ impl Inner {
     }
 
     fn closing(&self) -> bool {
-        lock(&self.jobs).closing
+        self.closing_flag.load(Ordering::Acquire)
     }
 
     fn latch(&self) {
@@ -859,6 +978,7 @@ impl Inner {
                 return Ok(());
             }
             jobs.closing = true;
+            self.closing_flag.store(true, Ordering::Release);
             while jobs.active > 0 {
                 jobs = self
                     .jobs_done
@@ -908,7 +1028,13 @@ impl Inner {
     ) -> Result<()> {
         let replaying = self.replaying.load(Ordering::Acquire);
         if !replaying {
-            self.stall();
+            let last = first_seq + u64::from(batch.count()).max(1) - 1;
+            self.stall(last, batch.encoded_bytes());
+            if self.latched.load(Ordering::Acquire) {
+                // The store needs recovery: fail the write (ambiguous) rather than grow
+                // memtables that can no longer be flushed.
+                return Err(Error::RecoveryRequired);
+            }
         }
         if kind == RecordKind::Relocate {
             return self.apply_relocation(first_seq, batch, locators, replaying);
@@ -941,7 +1067,7 @@ impl Inner {
         }
         size >= self.memtable_bytes
             || mem.journal_bytes.load(Ordering::Relaxed) >= self.max_replay_bytes
-            || (self.budget.should_flush() && size >= (self.budget.limit() / 8).max(1))
+            || (self.group.should_flush(&self.budget) && size >= (self.budget.limit() / 8).max(1))
     }
 
     /// Publishes a new empty active memtable; `old` becomes the newest immutable one.
@@ -959,11 +1085,15 @@ impl Inner {
         let mut imm = Vec::with_capacity(sv.imm.len() + 1);
         imm.push(old.clone());
         imm.extend(sv.imm.iter().cloned());
-        *sv = Arc::new(SuperVersion {
-            mem: fresh,
-            imm,
-            version: sv.version.clone(),
-        });
+        let version = sv.version.clone();
+        self.publish_sv(
+            &mut sv,
+            SuperVersion {
+                mem: fresh,
+                imm,
+                version,
+            },
+        );
     }
 
     /// Freezes the active memtable if it holds anything.
@@ -978,23 +1108,34 @@ impl Inner {
     /// Waits while the memtable budget is exhausted or L0 is at its stop trigger. Writers
     /// wait; they never fail. The L0 slowdown is not applied here: it would delay every
     /// scope behind the journal thread. Writers pace themselves ([`Store::write_delay`]).
-    fn stall(&self) {
+    fn stall(&self, last_seq: Seq, bytes: usize) {
         loop {
             if self.latched.load(Ordering::Acquire) || self.closing() {
                 return;
             }
-            // A flush waits on a journal sync, which needs this thread.
-            if self.syncs_waiting.load(Ordering::Acquire) > 0 {
+            // A flush waits on a journal sync, which needs this thread: let through the
+            // records queued before the sync and at most one journal group after it.
+            if self.syncs_waiting.load(Ordering::Acquire) > 0
+                && (last_seq <= self.bypass_seq.load(Ordering::Acquire)
+                    || self.bypass_bytes.fetch_sub(bytes as i64, Ordering::AcqRel) > 0)
+            {
                 return;
             }
-            let sv = self.current_sv();
-            let l0 = sv.version.l0_count();
-            if self.budget.is_exhausted() {
+            let l0 = self.l0_runs.load(Ordering::Relaxed);
+            if self.group.exhausted(&self.budget) {
+                let sv = self.current_sv();
+                let mine = sv.memtables().any(|m| !m.mem.is_empty());
                 if sv.imm.is_empty() && !sv.mem.mem.is_empty() {
                     drop(sv);
                     self.freeze_active();
                 }
-                self.schedule_flush();
+                if mine {
+                    self.schedule_flush();
+                } else {
+                    // Nothing of this store's to flush: flush whichever store sharing the
+                    // budget holds the most (RV-KV2 finding 6).
+                    self.group.flush_largest();
+                }
                 self.budget
                     .wait_below_limit(Some(Instant::now() + STALL_POLL));
                 continue;
@@ -1038,8 +1179,13 @@ impl Inner {
     // ----- flush -----
 
     fn sync_journal(&self) -> Result<()> {
+        self.bypass_bytes
+            .store(self.max_group_bytes as i64, Ordering::Release);
         self.syncs_waiting.fetch_add(1, Ordering::AcqRel);
-        let result = self.journal().sync().and_then(Commit::wait);
+        let result = self.journal().sync().and_then(|commit| {
+            self.bypass_seq.fetch_max(commit.seq(), Ordering::AcqRel);
+            commit.wait()
+        });
         self.syncs_waiting.fetch_sub(1, Ordering::AcqRel);
         result.map(|_| ()).map_err(|e| self.latch_on(e))
     }
@@ -1142,7 +1288,9 @@ impl Inner {
         if let Err(e) = self.log_edit(&mut vs, edit) {
             drop(vs);
             drop(added);
-            self.remove_runs(ids);
+            if self.edit_failed_cleanly() {
+                self.remove_runs(ids);
+            }
             return Err(e);
         }
         let version = Arc::new(vs.current.with_changes(&[], added));
@@ -1156,12 +1304,18 @@ impl Inner {
                 .filter(|m| !Arc::ptr_eq(m, imm))
                 .cloned()
                 .collect();
-            *sv = Arc::new(SuperVersion {
-                mem: sv.mem.clone(),
-                imm: imm_list,
-                version,
-            });
+            let mem = sv.mem.clone();
+            self.publish_sv(
+                &mut sv,
+                SuperVersion {
+                    mem,
+                    imm: imm_list,
+                    version,
+                },
+            );
         }
+        // Readers may still hold it; its charge now counts as pinned (finding 5).
+        imm.mark_flushed(self.group.pinned_counter());
         drop(vs);
         self.counters
             .flush_bytes
@@ -1271,6 +1425,10 @@ impl Inner {
 
     /// Appends `edit` (rolling to a fresh manifest when needed) and applies it to the
     /// recorded state. The caller holds `vs`.
+    ///
+    /// A failure whose outcome is unknown (the edit may be durable, now or after a
+    /// restart) latches `RecoveryRequired`. Callers then must not delete any file the
+    /// edit names (RV-KV2 finding 2): see [`Inner::edit_failed_cleanly`].
     fn log_edit(&self, vs: &mut VersionSet, mut edit: VersionEdit) -> Result<()> {
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
@@ -1291,9 +1449,18 @@ impl Inner {
                 Ok(w) => w,
                 Err(e) => return Err(self.latch_on(e)),
             };
-            if let Err(e) = manifest::set_current(&*self.fs, &self.dir, number) {
-                let _ = self.fs.remove(writer.path());
-                return Err(self.latch_on(e));
+            match manifest::switch_current(&*self.fs, &self.dir, number) {
+                Ok(()) => {}
+                Err(AppendError::Retry(e)) => {
+                    // CURRENT still names the old manifest.
+                    let _ = self.fs.remove(writer.path());
+                    return Err(self.latch_on(e));
+                }
+                Err(AppendError::Fatal(e)) => {
+                    // CURRENT may name either manifest: keep both for the next open.
+                    self.latch();
+                    return Err(e);
+                }
             }
             self.counters.file_syncs.fetch_add(4, Ordering::Relaxed);
             if let Some(old) = vs.manifest.replace(writer) {
@@ -1312,6 +1479,14 @@ impl Inner {
         }
         vs.state = next;
         Ok(())
+    }
+
+    /// After a failed `log_edit`: true when the edit certainly did not persist, so the
+    /// files it would have added may be deleted. When the store is latched the outcome
+    /// may be unknown; the files stay and the next open's cleanup removes the ones no
+    /// manifest names.
+    fn edit_failed_cleanly(&self) -> bool {
+        !self.latched.load(Ordering::Acquire)
     }
 
     // ----- compaction -----
@@ -1351,9 +1526,8 @@ impl Inner {
     fn run_compaction(&self, pick: &compaction::Pick) -> Result<()> {
         if pick.is_trivial_move() {
             let run = &pick.inputs[0];
-            let mut desc = run.desc.clone();
-            desc.level = pick.output_level as u8;
-            let moved = RunFile::new(desc.clone(), self.tracker.clone());
+            let moved = run.moved(pick.output_level as u8);
+            let desc = moved.desc.clone();
             let mut vs = lock(&self.vs);
             self.log_edit(
                 &mut vs,
@@ -1415,7 +1589,9 @@ impl Inner {
         if let Err(e) = self.log_edit(&mut vs, edit) {
             drop(vs);
             drop(added);
-            self.remove_runs(ids);
+            if self.edit_failed_cleanly() {
+                self.remove_runs(ids);
+            }
             return Err(e);
         }
         if pick.level > 0 {
@@ -1437,11 +1613,8 @@ impl Inner {
         vs.current = version.clone();
         self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
         let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
-        *sv = Arc::new(SuperVersion {
-            mem: sv.mem.clone(),
-            imm: sv.imm.clone(),
-            version,
-        });
+        let (mem, imm) = (sv.mem.clone(), sv.imm.clone());
+        self.publish_sv(&mut sv, SuperVersion { mem, imm, version });
     }
 
     /// Deletes runs that are obsolete and no longer referenced.
@@ -1697,6 +1870,7 @@ impl Inner {
             versions: runs * 200,
             snapshots: self.snapshots.sequences().len() as u64 * 64,
             cache_pinned: self.cache.reserved_bytes() as u64,
+            memtables_pinned: self.group.pinned_bytes() as u64,
         }
     }
 }
