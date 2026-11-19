@@ -7,7 +7,9 @@
 //! inserts a whole [`WriteBatch`] at `first_seq`; readers see it all at once because they
 //! only read at sequences the store has published after the insert returned.
 //!
-//! Range deletes go to a per-memtable tombstone list, fragmented lazily for reads.
+//! Range deletes go to a per-memtable tombstone list and are added, as they are inserted,
+//! to a fragmented set that reads query directly (see [`FragmentedRangeTombstones`]), so
+//! no read ever re-fragments the memtable's tombstones.
 //! Every insert charges its approximate memory to an optional [`MemtableBudget`], and
 //! dropping the memtable releases the charge.
 
@@ -43,8 +45,6 @@ pub const ENTRY_OVERHEAD: usize = 80;
 pub const TOMBSTONE_OVERHEAD: usize = 96;
 /// Charged per inserted batch for its shared arena.
 pub const BATCH_OVERHEAD: usize = 64;
-/// Below this many tombstones a point read scans the list instead of fragmenting it.
-const LINEAR_TOMBSTONES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemtableOptions {
@@ -84,8 +84,12 @@ struct Shard {
 
 #[derive(Default)]
 struct Tombstones {
+    /// As written, in insertion order (what a flush reads).
     raw: Vec<RangeTombstone>,
-    fragmented: Option<Arc<FragmentedRangeTombstones>>,
+    /// `raw`, fragmented. Each range delete is added in place: O(log n) plus the one or
+    /// two chunks it touches, and copy-on-write when an iterator still holds the previous
+    /// version, which it keeps unchanged.
+    fragmented: Arc<FragmentedRangeTombstones>,
 }
 
 pub struct Memtable {
@@ -257,8 +261,9 @@ impl Memtable {
                             .write()
                             .unwrap_or_else(PoisonError::into_inner)
                     });
-                    guard.raw.push(RangeTombstone { start, end, seq });
-                    guard.fragmented = None;
+                    let tombstone = RangeTombstone { start, end, seq };
+                    Arc::make_mut(&mut guard.fragmented).insert(&tombstone);
+                    guard.raw.push(tombstone);
                     charge += TOMBSTONE_OVERHEAD;
                     new_tombstones += 1;
                     continue;
@@ -341,52 +346,25 @@ impl Memtable {
     }
 
     /// The newest range tombstone of this memtable covering `user_key` at `snapshot_seq`.
+    /// O(log n) under the tombstone read lock.
     pub fn max_covering_tombstone(&self, user_key: &[u8], snapshot_seq: Seq) -> Option<Seq> {
         if self.tombstone_count.load(Ordering::Acquire) == 0 {
             return None;
         }
-        {
-            let tombstones = self
-                .tombstones
-                .read()
-                .unwrap_or_else(PoisonError::into_inner);
-            if let Some(fragmented) = &tombstones.fragmented {
-                return fragmented.max_covering_seq(user_key, snapshot_seq);
-            }
-            if tombstones.raw.len() <= LINEAR_TOMBSTONES {
-                return tombstones
-                    .raw
-                    .iter()
-                    .filter(|t| {
-                        t.seq <= snapshot_seq
-                            && t.start.as_ref() <= user_key
-                            && user_key < t.end.as_ref()
-                    })
-                    .map(|t| t.seq)
-                    .max();
-            }
-        }
-        self.fragmented_tombstones()
-            .max_covering_seq(user_key, snapshot_seq)
-    }
-
-    /// This memtable's range tombstones, fragmented (cached until the next range delete).
-    pub fn fragmented_tombstones(&self) -> Arc<FragmentedRangeTombstones> {
-        if let Some(fragmented) = &self
-            .tombstones
+        self.tombstones
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .fragmented
-        {
-            return fragmented.clone();
-        }
-        let mut tombstones = self
-            .tombstones
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let Tombstones { raw, fragmented } = &mut *tombstones;
-        fragmented
-            .get_or_insert_with(|| Arc::new(FragmentedRangeTombstones::new(raw.iter(), MAX_SEQ)))
+            .max_covering_seq(user_key, snapshot_seq)
+    }
+
+    /// This memtable's range tombstones, fragmented: a handle on the current version,
+    /// which later range deletes leave unchanged.
+    pub fn fragmented_tombstones(&self) -> Arc<FragmentedRangeTombstones> {
+        self.tombstones
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fragmented
             .clone()
     }
 
