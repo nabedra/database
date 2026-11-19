@@ -8,8 +8,12 @@
 //! operation).
 //!
 //! A worker that hosts a Timestamp replica tries it in process first. Only the
-//! leader can answer; on any local failure the client uses the remote route
-//! and skips the local replica for `LOCAL_BACKOFF`.
+//! leader can answer. On any local failure, or when the local attempt misses
+//! `LOCAL_DEADLINE`, the client uses the remote route and skips the local
+//! replica for `LOCAL_BACKOFF`. The deadline matters when the local node
+//! passes its read barrier and is then partitioned mid-`ReserveWindow`: its
+//! Raft write can wait as long as the partition lasts. Dropping the attempt
+//! also releases the handle's refill lock for other callers on that store.
 // Consumers arrive with T4, T5 and T7; until then only tests call this API.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::direct::{DirectTimestampRange, DirectTimestampSource, MAX_DIRECT_COUNT};
@@ -28,6 +32,9 @@ use std::{
 use tokio::sync::oneshot;
 
 const LOCAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Half of the service RPC convergence deadline (`SERVICE_CONVERGENCE`, 5 s),
+/// so the remote route still fits in a caller's budget after a local timeout.
+pub(crate) const LOCAL_DEADLINE: Duration = Duration::from_millis(2500);
 
 type Reply = Result<DirectTimestampRange, ProtocolError>;
 
@@ -43,6 +50,7 @@ struct Queue {
 struct Inner {
     local: Option<Arc<dyn DirectTimestampSource>>,
     remote: Arc<dyn DirectTimestampSource>,
+    local_deadline: Duration,
     local_skip_until: Mutex<Option<Instant>>,
     queue: Mutex<Queue>,
     calls: AtomicU64,
@@ -61,10 +69,19 @@ impl DirectTimestampClient {
         local: Option<Arc<dyn DirectTimestampSource>>,
         remote: Arc<dyn DirectTimestampSource>,
     ) -> Self {
+        Self::with_local_deadline(local, remote, LOCAL_DEADLINE)
+    }
+    /// As `new`, with a custom deadline for the in-process attempt.
+    pub(crate) fn with_local_deadline(
+        local: Option<Arc<dyn DirectTimestampSource>>,
+        remote: Arc<dyn DirectTimestampSource>,
+        local_deadline: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 local,
                 remote,
+                local_deadline,
                 local_skip_until: Mutex::new(None),
                 queue: Mutex::new(Queue::default()),
                 calls: AtomicU64::new(0),
@@ -191,12 +208,13 @@ impl Inner {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_some_and(|until| Instant::now() < until);
             if !skip {
-                match local.allocate_direct(count).await {
-                    Ok(range) => {
+                match tokio::time::timeout(self.local_deadline, local.allocate_direct(count)).await
+                {
+                    Ok(Ok(range)) => {
                         self.local_calls.fetch_add(1, Ordering::Relaxed);
                         return Ok(range);
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         *self
                             .local_skip_until
                             .lock()

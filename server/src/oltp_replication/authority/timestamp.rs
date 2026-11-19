@@ -41,7 +41,7 @@ pub(crate) use scoped_retirement::{
 #[allow(unused_imports)]
 pub(crate) use direct::{
     DEFAULT_DIRECT_WINDOW, DirectTimestampGate, DirectTimestampRange, DirectTimestampSource,
-    MAX_DIRECT_COUNT, MAX_DIRECT_WINDOW,
+    DirectWindowStats, MAX_DIRECT_COUNT, MAX_DIRECT_WINDOW,
 };
 #[allow(unused_imports)]
 pub(crate) use direct_client::DirectTimestampClient;

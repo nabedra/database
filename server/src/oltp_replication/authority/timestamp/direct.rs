@@ -12,10 +12,17 @@
 //!   discards the window under the mutex that hands values out, before that
 //!   command's reply is released. A queued allocation that has completed is
 //!   therefore followed only by direct values from a later window.
-//! * Values leave the window only after a read barrier whose applied term
-//!   equals the term in which the window was reserved. A node that lost and
-//!   regained leadership, or that caught up through a snapshot, reserves a new
-//!   window above the durable watermark instead of reusing an old one.
+//! * Values leave the window only after a read barrier whose applied leader ID
+//!   `(term, node_id)` equals the leader ID of the `ReserveWindow` entry. The
+//!   cluster uses openraft's advanced leader IDs, so one term can have several
+//!   leaders; comparing the term alone would depend on proposals never being
+//!   forwarded. A node that lost and regained leadership, or that caught up
+//!   through a snapshot (which skips apply), reserves a new window above the
+//!   durable watermark instead of reusing an old one.
+//! * If a queued allocation applies between `ReserveWindow` and installing its
+//!   window, the caller still gets the first values of that reservation: its
+//!   call started before the reservation was proposed, so every allocation that
+//!   completed before the call is below them. Only the rest is not installed.
 // Consumers arrive with T4, T5 and T7; until then only tests call this API.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::{TimestampCommand, TimestampHandle, TimestampReply};
@@ -40,8 +47,7 @@ pub(crate) const DEFAULT_DIRECT_WINDOW: u64 = 4096;
 pub(crate) const MAX_DIRECT_WINDOW: u64 = 1 << 20;
 /// Upper bound for one `AllocateDirect` call, local or remote.
 pub(crate) const MAX_DIRECT_COUNT: u64 = 4096;
-/// Reservations retried when a concurrent queued allocation wins the race
-/// between `ReserveWindow` applying and the window being installed.
+/// Reservations retried when `ReserveWindow` meets a stale authority.
 const REFILL_ATTEMPTS: usize = 8;
 
 /// A contiguous run of commit timestamps from `AllocateDirect`. Every value is
@@ -129,11 +135,28 @@ pub(super) struct StateMark {
     pub(super) allocator_epoch: u64,
 }
 
+/// A committed leader ID, `(term, node_id)`, ordered as openraft orders them.
+type LeaderKey = (u64, u64);
+fn leader_of(position: AppliedPosition) -> LeaderKey {
+    (position.term, position.node_id)
+}
+
 #[derive(Debug)]
 struct Window {
-    term: u64,
+    leader: LeaderKey,
     next: u64,
     last: u64,
+}
+/// Window counters for tests and stats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirectWindowStats {
+    /// `ReserveWindow` entries this node proposed and applied.
+    pub reservations: u64,
+    /// Windows dropped before they were exhausted.
+    pub discards: u64,
+    /// Reservations that lost the race to a queued allocation. The caller got
+    /// the first values; the rest were skipped.
+    pub raced: u64,
 }
 #[derive(Default)]
 struct WindowState {
@@ -143,13 +166,16 @@ struct WindowState {
 
 /// In-memory window state shared by every `TimestampMachine` and
 /// `TimestampHandle` opened on the same group store.
-pub(crate) struct DirectWindows {
+/// Never handed out beyond the machines that own the store: the registry key
+/// is only unique while one of them keeps the store alive.
+pub(super) struct DirectWindows {
     state: Mutex<WindowState>,
     refill: tokio::sync::Mutex<()>,
     gate: RwLock<Option<Arc<dyn DirectTimestampGate>>>,
     window_size: AtomicU64,
     reservations: AtomicU64,
     discards: AtomicU64,
+    raced: AtomicU64,
 }
 impl DirectWindows {
     fn new() -> Self {
@@ -160,6 +186,7 @@ impl DirectWindows {
             window_size: AtomicU64::new(DEFAULT_DIRECT_WINDOW),
             reservations: AtomicU64::new(0),
             discards: AtomicU64::new(0),
+            raced: AtomicU64::new(0),
         }
     }
     /// The hosted state machine and the service handle are separate
@@ -199,17 +226,28 @@ impl DirectWindows {
             self.discards.fetch_add(1, Ordering::Relaxed);
         }
     }
+    fn discard(&self, state: &mut WindowState) {
+        if state.window.take().is_some() {
+            self.discards.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     fn take_locked(
         &self,
         state: &mut WindowState,
-        term: u64,
+        leader: LeaderKey,
         count: u64,
     ) -> Option<DirectTimestampRange> {
         let window = state.window.as_mut()?;
-        let remaining = window.last - window.next + 1;
-        if window.term != term || remaining < count {
-            state.window = None;
-            self.discards.fetch_add(1, Ordering::Relaxed);
+        if window.leader != leader {
+            // A window from an older leader is stale. A newer one was reserved
+            // after this caller's barrier; it stays for current callers.
+            if window.leader < leader {
+                self.discard(state);
+            }
+            return None;
+        }
+        if window.last - window.next + 1 < count {
+            self.discard(state);
             return None;
         }
         let first = window.next;
@@ -221,36 +259,39 @@ impl DirectWindows {
         }
         DirectTimestampRange::from_bounds(first, last).ok()
     }
-    /// Hand out `count` values when the window was reserved in `term`.
-    pub(super) fn take(&self, term: u64, count: u64) -> Option<DirectTimestampRange> {
+    /// Hand out `count` values when the window was reserved by `leader`, the
+    /// leader ID applied at the caller's read barrier.
+    pub(super) fn take(&self, leader: LeaderKey, count: u64) -> Option<DirectTimestampRange> {
         let mut state = self.lock();
-        self.take_locked(&mut state, term, count)
+        self.take_locked(&mut state, leader, count)
     }
-    /// Install `[first, last]` if its reservation is still the newest applied
-    /// state, then hand out the first `count` values.
+    /// Hand the first `count` values of the reservation `[first, last]`, made
+    /// by `leader`, to the caller. Install the rest as the window only if the
+    /// reservation is still the newest applied state; otherwise skip it.
     pub(super) fn install_and_take(
         &self,
-        term: u64,
+        leader: LeaderKey,
         authority: Authority,
         first: u64,
         last: u64,
         count: u64,
-    ) -> Option<DirectTimestampRange> {
+    ) -> Result<DirectTimestampRange, ProtocolError> {
+        let (head, rest) = DirectTimestampRange::from_bounds(first, last)?.split_first(count)?;
         let mut state = self.lock();
-        if !state
+        let current = state
             .observed
-            .is_some_and(|mark| mark.high_watermark == last && mark.authority == authority)
-            || first == 0
-            || first > last
-        {
-            return None;
+            .is_some_and(|mark| mark.high_watermark == last && mark.authority == authority);
+        if !current {
+            self.raced.fetch_add(1, Ordering::Relaxed);
+            return Ok(head);
         }
-        state.window = Some(Window {
-            term,
-            next: first,
+        self.discard(&mut state);
+        state.window = rest.map(|rest| Window {
+            leader,
+            next: rest.first().get(),
             last,
         });
-        self.take_locked(&mut state, term, count)
+        Ok(head)
     }
     fn gate(&self) -> Option<Arc<dyn DirectTimestampGate>> {
         self.gate
@@ -258,13 +299,12 @@ impl DirectWindows {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
-    /// Number of `ReserveWindow` entries this node proposed and applied.
-    pub(crate) fn reservations(&self) -> u64 {
-        self.reservations.load(Ordering::Relaxed)
-    }
-    /// Number of windows dropped before they were exhausted.
-    pub(crate) fn discards(&self) -> u64 {
-        self.discards.load(Ordering::Relaxed)
+    pub(super) fn stats(&self) -> DirectWindowStats {
+        DirectWindowStats {
+            reservations: self.reservations.load(Ordering::Relaxed),
+            discards: self.discards.load(Ordering::Relaxed),
+            raced: self.raced.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -324,8 +364,10 @@ impl TimestampHandle {
             .store(size, Ordering::Relaxed);
         Ok(())
     }
-    pub(crate) fn direct_windows(&self) -> &Arc<DirectWindows> {
-        &self.machine.direct
+    /// A copy of the window counters. The shared window itself stays inside
+    /// the machines that own the store.
+    pub(crate) fn direct_window_stats(&self) -> DirectWindowStats {
+        self.machine.direct.stats()
     }
     /// `AllocateDirect { count }`. Succeeds only on the Timestamp leader.
     pub(crate) async fn allocate_direct(
@@ -342,12 +384,13 @@ impl TimestampHandle {
         // The plan asks for ReadPolicy::LeaseRead. The Consensus contract only
         // exposes the stricter ReadIndex barrier today.
         let barrier = self.consensus.ensure_linearizable().await?;
+        let leader = leader_of(barrier.applied);
         let direct = &self.machine.direct;
-        if let Some(range) = direct.take(barrier.applied.term, count) {
+        if let Some(range) = direct.take(leader, count) {
             return Ok(range);
         }
         let _refill = direct.refill.lock().await;
-        if let Some(range) = direct.take(barrier.applied.term, count) {
+        if let Some(range) = direct.take(leader, count) {
             return Ok(range);
         }
         let gate = direct.gate().ok_or_else(direct_disabled)?;
@@ -372,15 +415,13 @@ impl TimestampHandle {
                     && last.get().checked_sub(first.get()) == Some(size - 1) =>
                 {
                     direct.reservations.fetch_add(1, Ordering::Relaxed);
-                    if let Some(range) = direct.install_and_take(
-                        applied.position.term,
+                    return direct.install_and_take(
+                        leader_of(applied.position),
                         authority,
                         first.get(),
                         last.get(),
                         count,
-                    ) {
-                        return Ok(range);
-                    }
+                    );
                 }
                 TimestampReply::Rejected(super::Fault::StaleAuthority) => {}
                 reply => return Err(super::handle::rejected(reply)),
@@ -388,7 +429,10 @@ impl TimestampHandle {
         }
         Err(ProtocolError::new(
             ErrorCode::StorageUnavailable,
-            "direct timestamp window kept moving under concurrent allocations",
+            format!(
+                "no direct timestamp window after {REFILL_ATTEMPTS} reservation attempts; \
+                 any reserved values were skipped and none were issued"
+            ),
             Outcome::NotApplied,
         ))
     }
