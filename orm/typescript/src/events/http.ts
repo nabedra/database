@@ -249,7 +249,7 @@ export class EventsHttp {
       throw new TypeError("CA file must be a nonempty path string")
     }
     try {
-      this.#transport = new Transport(origin, token, { timeout, caFile })
+      this.#transport = new Transport(origin, token, { timeout, caFile, agent: false })
     } catch {
       throw new TypeError("Could not load Events TLS trust configuration")
     }
