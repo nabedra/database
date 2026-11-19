@@ -393,6 +393,14 @@ fn actual_runtime_child() {
                             tracing::Level::DEBUG,
                         )
                         .with_target(
+                            "nabedra_database_server::oltp_runtime::authority_fence",
+                            tracing::Level::DEBUG,
+                        )
+                        .with_target(
+                            "nabedra_database_server::oltp_runtime::scoped_worker::maintenance",
+                            tracing::Level::DEBUG,
+                        )
+                        .with_target(
                             "nabedra_database_server::oltp_runtime::coordinator",
                             tracing::Level::DEBUG,
                         )

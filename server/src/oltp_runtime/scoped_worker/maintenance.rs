@@ -51,7 +51,14 @@ impl ScopedWorker {
                 if worker.stopping.load(Ordering::Acquire) {
                     break;
                 }
-                let _ = tokio::time::timeout(GROUP_DEADLINE, worker.advance(&mut progress)).await;
+                match tokio::time::timeout(GROUP_DEADLINE, worker.advance(&mut progress)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing::debug!(
+                        group = ?progress.after, code = ?error.code, message = error.message,
+                        "scoped queue maintenance waits"
+                    ),
+                    Err(_) => tracing::debug!(group = ?progress.after, "scoped queue maintenance deadline elapsed"),
+                }
             }
         }));
         Ok(())

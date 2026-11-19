@@ -1325,6 +1325,7 @@ impl TimestampClient {
     async fn response(&self, request: Request) -> Result<ServiceResponse, ProtocolError> {
         // These reads also arrive from Status or participant proof clients.
         // A point decision write can repeat only in reconciliation mode.
+        // Fences return the receipt stored for the same transition and command.
         if matches!(
             request,
             Request::ScopedReadPin { .. }
@@ -1332,6 +1333,8 @@ impl TimestampClient {
                 | Request::VerifyTimestampPointPin(_)
                 | Request::CommitTimestampPoint { reconcile: true, .. }
                 | Request::AbortTimestampPoint { reconcile: true, .. }
+                | Request::Fence { .. }
+                | Request::Ready { .. }
         ) {
             let method = request.method();
             let payload = encode(&self.client.shared, request).await?;
@@ -1671,13 +1674,21 @@ impl TimestampClient {
         let request = Request::FenceScopedQueue { group_id, transition_id: transfer.id };
         let method = request.method();
         let payload = encode(&self.client.shared, request).await?;
-        let response = self.client.call_as(
-            ServiceAction::ParticipantProof { source_group: group_id }, method, Some(payload),
-        ).await?;
-        let context = response.metadata_context()?;
-        let (applied, _): (Applied<TimestampReply>, _) = response.decoded(&self.client.shared).await?;
-        context.timestamp(29, &applied)?;
-        verify_scoped_fence_reply(transfer, &applied.reply)
+        let response = self
+            .client
+            .repeat_as(
+                ServiceAction::ParticipantProof { source_group: group_id },
+                method,
+                Some(payload),
+            )
+            .await?;
+        let context = response.metadata_context().map_err(mutation_uncertain)?;
+        let (applied, _): (Applied<TimestampReply>, _) = response
+            .decoded(&self.client.shared)
+            .await
+            .map_err(mutation_uncertain)?;
+        context.timestamp(29, &applied).map_err(mutation_uncertain)?;
+        verify_scoped_fence_reply(transfer, &applied.reply).map_err(mutation_uncertain)
     }
 
     pub(crate) async fn scoped_queue_fence_receipt(
@@ -1765,8 +1776,10 @@ impl TimestampClient {
                 ready,
             })
             .await?;
-        let (applied, owner): (Applied<TimestampReply>, _) =
-            response.decoded(&self.client.shared).await?;
+        let (applied, owner): (Applied<TimestampReply>, _) = response
+            .decoded(&self.client.shared)
+            .await
+            .map_err(mutation_uncertain)?;
         Ok(Applied::owned(applied.position, applied.reply, owner))
     }
     pub(crate) async fn fence_ready(
@@ -1775,12 +1788,24 @@ impl TimestampClient {
         expected: ReadyMembership,
         next: ReadyMembership,
     ) -> Result<ReadyFenceReceipt, ProtocolError> {
-        self.value(Request::Ready {
-            transition_id,
-            expected,
-            next,
-        })
-        .await
+        let response = self
+            .response(Request::Ready {
+                transition_id,
+                expected,
+                next,
+            })
+            .await?;
+        let (receipt, _): (ReadyFenceReceipt, _) = response
+            .decoded(&self.client.shared)
+            .await
+            .map_err(mutation_uncertain)?;
+        if receipt.transition_id != transition_id
+            || receipt.expected != expected
+            || receipt.next != next
+        {
+            return Err(mutation_uncertain(invalid()));
+        }
+        Ok(receipt)
     }
     pub(crate) async fn begin_maintenance(
         &self,

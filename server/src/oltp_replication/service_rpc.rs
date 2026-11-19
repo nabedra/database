@@ -348,7 +348,7 @@ impl Client {
         self.converge_as(self.action, method, Some(payload), false).await
     }
 
-    /// Call only for a repeatable read or an exact, idempotent scoped command.
+    /// Call only for a repeatable read or an exact, idempotent command.
     async fn repeat_as(
         &self,
         action: ServiceAction,

@@ -1180,8 +1180,10 @@ impl ParticipantClient {
     ) -> Result<(), ProtocolError> {
         let client = &self.proof.client;
         let fence = QueueFence::for_transition(&client.group, transfer)?;
+        let mutation = !matches!(action, ServiceAction::ScopedQueueFenceReceipt { .. });
+        // Both applying and reading the fence require this exact transition.
         let response = client
-            .call_as(
+            .repeat_as(
                 action,
                 Method::ParticipantFence {
                     transition_id: transfer.id,
@@ -1204,6 +1206,7 @@ impl ParticipantClient {
                 }
             })
             .await
+            .map_err(|error| if mutation { mutation_uncertain(error) } else { error })
     }
 
     async fn decoded<T: serde::de::DeserializeOwned + Send + 'static>(
@@ -1789,16 +1792,19 @@ impl RemoteParticipant for ParticipantClient {
         next: Authority,
     ) -> ParticipantFuture<'_, GroupFenceReceipt> {
         Box::pin(async move {
-            self.decoded(
-                Method::ParticipantFence {
-                    transition_id,
-                    expected,
-                    next,
-                },
-                None,
-            )
-            .await
-            .map(|(value, _)| value)
+            let client = &self.proof.client;
+            let method = Method::ParticipantFence {
+                transition_id,
+                expected,
+                next,
+            };
+            // The participant records and returns the original transition receipt.
+            let response = client.repeat_as(client.action, method, None).await?;
+            let (receipt, _) = self
+                .decode_response(response)
+                .await
+                .map_err(mutation_uncertain)?;
+            Ok(receipt)
         })
     }
 }

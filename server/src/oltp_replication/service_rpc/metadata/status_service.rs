@@ -1758,12 +1758,14 @@ impl StatusClient {
     async fn response(&self, request: Request) -> Result<ServiceResponse, ProtocolError> {
         // The exact manifest and projection are keyed by the scoped request.
         // The retirement marker is bound to its exact terminal statement.
+        // A fence returns the receipt stored for the same transition and command.
         if matches!(
             (&request, self.client.action),
             (Request::InstallTimestampPoint { .. } | Request::ProjectTimestampPoint { .. },
                 ServiceAction::ScopedQueueExecute(_))
                 | (Request::RecordScopedRetirement { .. }, ServiceAction::TimestampProof { .. })
                 | (Request::PriorScopedReceipt { .. } | Request::RetiredScopedReceipt { .. }, _)
+                | (Request::Fence { .. }, _)
         ) {
             let method = request.method();
             let payload = encode(self.resources(), request).await?;
@@ -2265,13 +2267,17 @@ impl StatusClient {
         expected: Option<Authority>,
         next: Authority,
     ) -> Result<Applied<StatusReply>, ProtocolError> {
-        let (applied, owner): (Applied<StatusReply>, _) = self
-            .value(Request::Fence {
+        let response = self
+            .response(Request::Fence {
                 transition_id,
                 expected,
                 next,
             })
             .await?;
+        let (applied, owner): (Applied<StatusReply>, _) = response
+            .decoded(self.resources())
+            .await
+            .map_err(mutation_uncertain)?;
         let mut reply = applied.reply;
         reply.retain_owner(owner.clone());
         Ok(Applied::owned(applied.position, reply, owner))
@@ -2499,7 +2505,7 @@ impl StatusService for StatusClient {
             let body = encode(self.resources(), request).await?;
             let response = self
                 .client
-                .call_as(
+                .repeat_as(
                     ServiceAction::ParticipantProof {
                         source_group: transfer.next.group.group_id,
                     },
@@ -2507,8 +2513,10 @@ impl StatusService for StatusClient {
                     Some(body),
                 )
                 .await?;
-            let (applied, _): (Applied<StatusReply>, _) =
-                response.decoded(self.resources()).await?;
+            let (applied, _): (Applied<StatusReply>, _) = response
+                .decoded(self.resources())
+                .await
+                .map_err(mutation_uncertain)?;
             if !matches!(applied.reply, StatusReply::ScopedQueueFenced { transition_id, epoch, applied_at }
                 if transition_id == transfer.id && epoch == ScopedStatusEpoch::from_placement(&transfer.next)
                     && applied_at.term != 0 && applied_at.index != 0

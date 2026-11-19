@@ -158,6 +158,8 @@ impl ReadRequest {
             self,
             Self::Current
                 | Self::ColdPin { .. }
+                | Self::GroupInventoryRevision
+                | Self::Groups { .. }
                 | Self::Group { .. }
                 | Self::GroupMembers { .. }
                 | Self::ScopedQueue { .. }
@@ -1119,11 +1121,12 @@ impl ControlClient {
         let deadline = request
             .supports_bounded_failover()
             .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
+        let use_route_hint = deadline.is_some() || matches!(request, ReadRequest::ChangeScopedQueue { .. });
         let mut last = unavailable();
         loop {
             let configured_preferred = self.routes.preferred();
             let preferred = match configured_preferred {
-                None if deadline.is_some() => self.preferred_read_route()?,
+                None if use_route_hint => self.preferred_read_route()?,
                 value => value,
             };
             let mut first = preferred;
@@ -1248,7 +1251,7 @@ impl ControlClient {
                         return Err(invalid("Control response payload differs"));
                     }
                 }
-                if deadline.is_some()
+                if use_route_hint
                     && configured_preferred.is_none()
                     && !preferred_attempt
                     && let Ok(mut route) = self.last_read_route.lock()
