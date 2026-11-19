@@ -29,7 +29,8 @@ from oltp_terminal_copy_acceptance import CHILD, read_json, wait_for
 
 BARRIERS = Path('/scoped-acceptance')
 HTTP_TIMEOUT = 24
-DRIVER_TIMEOUT = 330
+# Includes separate copy deadlines, expiry waits and the owner-loss window.
+DRIVER_TIMEOUT = 540
 RETENTION_MS = 25_000
 PRIMARY = 'https://api:8000'
 SECONDARY = 'https://localhost:8001'
