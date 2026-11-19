@@ -1,9 +1,9 @@
 use super::*;
 use crate::oltp_replication::authority::proof::SealedTerminalProof;
 use crate::oltp_replication::authority::timestamp::{
-    IndexMetadataPin, PointDecision, ScopedAdmissionClosure, ScopedCopyProof, ScopedPinRelease,
-    ScopedTerminalStatement, ScopedTimestampEpoch, TimestampDecisionLocator, TimestampPointBinding,
-    VerifiedArchiveClosure,
+    DirectTimestampRange, DirectTimestampSource, IndexMetadataPin, MAX_DIRECT_COUNT, PointDecision,
+    ScopedAdmissionClosure, ScopedCopyProof, ScopedPinRelease, ScopedTerminalStatement,
+    ScopedTimestampEpoch, TimestampDecisionLocator, TimestampPointBinding, VerifiedArchiveClosure,
     archive::ArchiveClosureStatement,
     cold::{ColdPinCursor, ColdPinStep},
 };
@@ -203,6 +203,12 @@ enum Request {
         authority: Authority,
         owner: crate::oltp::backup::BackupOwnerRef,
     },
+    /// Sent only after the caller's `data.direct.v1` view is active, so an
+    /// older Timestamp leader never receives it in normal operation. An older
+    /// leader rejects the unknown variant at decode.
+    AllocateDirect {
+        count: u64,
+    },
 }
 impl Request {
     fn method(&self) -> Method {
@@ -247,6 +253,7 @@ impl Request {
             Self::Backup { .. } => 14,
             Self::Cancel { .. } => 15,
             Self::CloseBackup { .. } => 16,
+            Self::AllocateDirect { .. } => 41,
         };
         Method::TimestampCall {
             operation,
@@ -361,6 +368,14 @@ impl TimestampEndpoint {
                         ServiceAction::StatusProof { .. } | ServiceAction::ScopedQueueRead { .. }
                     )
             }
+            // A Data/Catalog replica (the range leader) or the queue owner.
+            Method::TimestampCall {
+                operation: 41,
+                mutation: true,
+            } => matches!(
+                head.action,
+                ServiceAction::Owner | ServiceAction::ParticipantProof { .. }
+            ),
             Method::TimestampCall {
                 operation: 3,
                 mutation: true,
@@ -860,6 +875,9 @@ impl TimestampEndpoint {
                 }
                 encode(shared, self.handle.allocate_commit(actual).await?).await
             }
+            Request::AllocateDirect { count } => {
+                encode(shared, self.handle.allocate_direct(count).await?).await
+            }
             Request::Allocation { permit } => {
                 let statement = permit.statement();
                 let group = self.status.manifest(statement.txn, statement.manifest)?;
@@ -1350,6 +1368,7 @@ impl TimestampClient {
                 | Request::Allocate { .. }
                 | Request::Allocation { .. }
                 | Request::Released { .. }
+                | Request::AllocateDirect { .. }
         );
         self.client.named(request.method(), request, converge).await
     }
@@ -1597,6 +1616,19 @@ impl TimestampClient {
         permit: SealedCommitPermit,
     ) -> Result<CommitStamp, ProtocolError> {
         self.value(Request::Allocate { permit }).await
+    }
+    /// `AllocateDirect { count }` on the Timestamp leader. Repeating a call
+    /// after a lost reply is safe: unused reserved values are skipped, and the
+    /// repeat returns values above every completed allocation.
+    pub(crate) async fn allocate_direct(
+        &self,
+        count: u64,
+    ) -> Result<DirectTimestampRange, ProtocolError> {
+        if count == 0 || count > MAX_DIRECT_COUNT {
+            return Err(invalid());
+        }
+        let range: DirectTimestampRange = self.value(Request::AllocateDirect { count }).await?;
+        range.expect_len(count)
     }
     pub(crate) async fn confirmed_allocation(
         &self,
@@ -1936,6 +1968,11 @@ impl TimestampClient {
     }
 }
 
+impl DirectTimestampSource for TimestampClient {
+    fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
+        Box::pin(TimestampClient::allocate_direct(self, count))
+    }
+}
 impl TimestampService for TimestampClient {
     fn native_archive_page<'a>(&'a self,closure:&'a VerifiedArchiveClosure,after:Option<Vec<u8>>)->ConsensusFuture<'a,crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage>{
         Box::pin(async move {
