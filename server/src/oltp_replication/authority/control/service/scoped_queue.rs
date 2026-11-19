@@ -48,9 +48,6 @@ impl ControlHandle {
             else {
                 return view.encode(&Option::<ScopedQueueTransition>::None);
             };
-            if matches!(state.pending, Some(Pending::Fence(_))) {
-                return Err(unauthorized());
-            }
             let holder = (transition.previous.has_holder(worker)
                 || transition.next.has_holder(worker))
                 && load::<WorkerIdentity>(
@@ -61,6 +58,9 @@ impl ControlHandle {
                 && !scoped_transfer_replica(view, source_group, &transition.next.group, worker)?
             {
                 return Err(unauthorized());
+            }
+            if matches!(state.pending, Some(Pending::Fence(_))) {
+                return Err(stale_placement());
             }
             view.encode(&Some(transition))
         })

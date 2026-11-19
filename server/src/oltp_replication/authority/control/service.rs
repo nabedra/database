@@ -1364,7 +1364,7 @@ impl ControlHandle {
                             || state.invalid_ready != 0
                             || state.pending.is_some()
                         {
-                            return Err(unauthorized());
+                            return Err(stale());
                         }
                         (state.owner, None)
                     };
@@ -1403,12 +1403,14 @@ impl ControlHandle {
                         return Err(unauthorized());
                     }
                     ServiceAction::Owner => {
-                        if state.owner != Some(remote)
-                            || state.ready.ready_count == 0
+                        if state.owner != Some(remote) {
+                            return Err(unauthorized());
+                        }
+                        if state.ready.ready_count == 0
                             || state.invalid_ready != 0
                             || state.pending.is_some()
                         {
-                            return Err(unauthorized());
+                            return Err(stale());
                         }
                         None
                     }

@@ -638,16 +638,20 @@ impl WorkerRuntime {
                 code: ErrorCode::StorageUnavailable,
                 ..
             }) => {
-                if self
+                let retired = self
                     .services
                     .status
                     .retired_scoped_receipt(run, id, Some(reservation.digest))
-                    .await?
-                    .is_some()
-                {
-                    return Ok(None);
+                    .await;
+                match retired {
+                    Ok(Some(_)) => return Ok(None),
+                    // The API enrollment was verified before routing. The
+                    // internal Status role can retire with the old owner.
+                    Ok(None) | Err(ProtocolError { code: ErrorCode::Unauthorized, .. }) => {
+                        return Err(unknown());
+                    }
+                    Err(error) => return Err(error),
                 }
-                return Err(unknown());
             }
             Err(error) => return Err(error),
         };
