@@ -272,16 +272,19 @@ impl LocalServices {
             };
             worker.open_secondary_pools(&control, pins).await?;
             let operator = &worker.operator;
-            while !rolling {
-                let mut complete = true;
-                for enrollment in &enrollments {
-                    complete &=
-                        startup_read(deadline, &error_trace, "peer enrollment", || control.worker(enrollment.worker_id)).await?.as_ref() == Some(enrollment);
+            // A rolling restart reads the directory below instead of waiting for every enrollment.
+            if !rolling {
+                loop {
+                    let mut complete = true;
+                    for enrollment in &enrollments {
+                        complete &=
+                            startup_read(deadline, &error_trace, "peer enrollment", || control.worker(enrollment.worker_id)).await?.as_ref() == Some(enrollment);
+                    }
+                    if complete {
+                        break;
+                    }
+                    wait_startup(deadline).await?;
                 }
-                if complete {
-                    break;
-                }
-                wait_startup(deadline).await?;
             }
             startup_read(deadline, &error_trace, "peer directory", || async {
                 worker.directory.refresh(&rpc).await.map_err(|error| {
