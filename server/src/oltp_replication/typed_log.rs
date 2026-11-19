@@ -65,6 +65,34 @@ const META: TransactionBudget = TransactionBudget {
 };
 const MAX_COLLECTED: usize = 128;
 const MAX_COLLECTED_BYTES: usize = 32 << 20;
+/// One synced append and one replication read hold at most this many entries.
+pub(crate) const MAX_APPEND_ENTRIES: usize = 64;
+/// ... and at most this many encoded bytes, unless a single entry is larger.
+pub(crate) const MAX_APPEND_BYTES: usize = 1 << 20;
+
+/// Splits consecutive encoded entry sizes into synced write batches of at most
+/// `MAX_APPEND_ENTRIES` entries and `MAX_APPEND_BYTES` bytes. An entry larger
+/// than the byte bound forms its own batch.
+pub(crate) fn append_chunks(sizes: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (index, size) in sizes.iter().enumerate() {
+        if index > start
+            && (index - start == MAX_APPEND_ENTRIES
+                || bytes.saturating_add(*size) > MAX_APPEND_BYTES)
+        {
+            chunks.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(*size);
+    }
+    if start < sizes.len() {
+        chunks.push(start..sizes.len());
+    }
+    chunks
+}
 
 #[derive(Clone)]
 pub struct TypedLogStore<C: TypedConfig> {
@@ -346,15 +374,19 @@ impl<C: TypedConfig> TypedLogStore<C> {
         end: Option<u64>,
         limited: bool,
     ) -> io::Result<Vec<OwnedRaftEntry<C::Command>>> {
-        let mut out = Vec::with_capacity(MAX_COLLECTED);
+        // A limited read feeds one replication payload, bounded like a synced
+        // append. A full-range read keeps the larger recovery collection bound.
+        let (max_entries, max_bytes) = if limited {
+            (MAX_APPEND_ENTRIES, MAX_APPEND_BYTES)
+        } else {
+            (MAX_COLLECTED, MAX_COLLECTED_BYTES)
+        };
+        let mut out = Vec::with_capacity(max_entries);
         let mut cursor = start;
         let mut bytes = 0usize;
         while let Some((entry, size)) = self.next(cursor, end).await? {
-            if out.len() == MAX_COLLECTED
-                || (!out.is_empty()
-                    && bytes
-                        .checked_add(size)
-                        .is_none_or(|n| n > MAX_COLLECTED_BYTES))
+            if out.len() == max_entries
+                || (!out.is_empty() && bytes.checked_add(size).is_none_or(|n| n > max_bytes))
             {
                 if limited {
                     break;
@@ -520,9 +552,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             .map_err(disk)?;
         Ok(())
     }
+    /// Unsynced: OpenRaft treats the commit marker as a recovery hint and
+    /// raises it to the applied index on startup. The next synced write of
+    /// this pool's WAL persists it.
     async fn save_committed(&mut self, id: Option<LogId>) -> io::Result<()> {
         self.store
-            .log_transaction_metadata(META, move |tx| {
+            .log_transaction_metadata_unsynced(META, move |tx| {
                 if let Some(raw) = tx.get(b"committed")? {
                     let old: Option<LogId> = serde_json::from_slice(raw.as_slice())
                         .map_err(|_| protocol("corrupt durable commit marker"))?;
@@ -547,7 +582,10 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
-        if matches!(self.store.identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+        if matches!(
+            self.store.identity().kind,
+            GroupKind::Data { .. } | GroupKind::Catalog
+        ) {
             tracing::debug!(group=%self.store.identity().group_id, node=self.node_id,
                 index=id.map(|id| id.index), "typed Raft durable commit saved");
         }
@@ -565,7 +603,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         I::IntoIter: Send,
     {
         // Own a bounded append before the first write. The typed host config
-        // admits one client write per batch and one replicated payload per RPC.
+        // admits at most `MAX_APPEND_ENTRIES` entries per append; the writer
+        // splits them into synced batches of at most `MAX_APPEND_BYTES`.
         // This is a transaction/frame bound, never a total log-size bound.
         let mut batch = Vec::new();
         let mut previous: Option<u64> = None;
@@ -626,7 +665,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     _ => ExecutionClass::Query,
                 };
                 let request = batch[0].index();
-                let (batch, wire_bytes) = store
+                let (batch, sizes) = store
                     .resources()
                     .execute(class, request, 0, move || {
                         struct Counter(usize);
@@ -636,48 +675,58 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                                     .0
                                     .checked_add(bytes.len())
                                     .filter(|n| *n <= MAX_FIXED_COMMAND_BYTES)
-                                    .ok_or_else(|| invalid("oversized Raft append batch"))?;
+                                    .ok_or_else(|| invalid("oversized Raft append entry"))?;
                                 Ok(bytes.len())
                             }
                             fn flush(&mut self) -> io::Result<()> {
                                 Ok(())
                             }
                         }
-                        let mut counter = Counter(0);
+                        let mut sizes = Vec::with_capacity(batch.len());
                         for entry in batch.iter() {
+                            let mut counter = Counter(0);
                             serde_json::to_writer(&mut counter, entry)
-                                .map_err(|_| protocol("oversized or invalid Raft append batch"))?;
+                                .map_err(|_| protocol("oversized or invalid Raft append entry"))?;
+                            sizes.push(counter.0);
                         }
-                        Ok((batch, counter.0))
+                        Ok((batch, sizes))
                     })
                     .await
                     .map_err(disk)?;
-                store
-                    .log_transaction(
-                        TransactionBudget {
-                            scratch_bytes: wire_bytes + (64 << 10),
-                            batch_bytes: wire_bytes + (64 << 10),
-                            output_bytes: 0,
-                        },
-                        move |tx| {
-                            #[cfg(test)]
-                            if let Some(hook) = append_hook {
-                                hook();
-                            }
-                            for entry in batch.iter() {
-                                entry.ensure_charged()?;
-                                let index = entry.index();
-                                let bytes = tx.encode_value(&entry)?;
-                                let id = tx.encode_value(&entry.log_id)?;
-                                tx.put(&index_key(ENTRY, index), bytes.as_slice())?;
-                                tx.put(&index_key(ID, index), id.as_slice())?;
-                                tx.put(TAIL, id.as_slice())?;
-                            }
-                            Ok(Transition::Commit(tx.copy_output(b"")?))
-                        },
-                    )
-                    .await
-                    .map_err(disk)?;
+                // One synced WriteBatch per bounded chunk, in log order. A
+                // crash between chunks leaves a consecutive durable prefix.
+                for chunk in append_chunks(&sizes) {
+                    let wire_bytes: usize = sizes[chunk.clone()].iter().sum();
+                    let batch = batch.clone();
+                    #[cfg(test)]
+                    let append_hook = append_hook.clone();
+                    store
+                        .log_transaction(
+                            TransactionBudget {
+                                scratch_bytes: wire_bytes + (64 << 10),
+                                batch_bytes: wire_bytes + (64 << 10),
+                                output_bytes: 0,
+                            },
+                            move |tx| {
+                                #[cfg(test)]
+                                if let Some(hook) = append_hook {
+                                    hook();
+                                }
+                                for entry in &batch[chunk] {
+                                    entry.ensure_charged()?;
+                                    let index = entry.index();
+                                    let bytes = tx.encode_value(&entry)?;
+                                    let id = tx.encode_value(&entry.log_id)?;
+                                    tx.put(&index_key(ENTRY, index), bytes.as_slice())?;
+                                    tx.put(&index_key(ID, index), id.as_slice())?;
+                                    tx.put(TAIL, id.as_slice())?;
+                                }
+                                Ok(Transition::Commit(tx.copy_output(b"")?))
+                            },
+                        )
+                        .await
+                        .map_err(disk)?;
+                }
                 Ok(())
             }
             .await;
@@ -735,6 +784,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     }
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
         let _order = self.writes.lock().await;
+        // Application state may be unsynced. Never purge entries whose applied
+        // state a crash could still lose: they are its only replay source.
+        self.store
+            .ensure_applied_durable(id.index)
+            .await
+            .map_err(disk)?;
         self.store
             .log_transaction(META, move |tx| {
                 let previous: Option<LogId> = tx
