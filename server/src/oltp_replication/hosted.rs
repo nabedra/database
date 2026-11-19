@@ -325,11 +325,11 @@ where
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
 }
-/// Entries per AppendEntries RPC. The typed Raft wire carries one entry per
-/// frame, and an older peer cannot decode more, so replication stays at one
-/// until a negotiated multi-entry frame exists. Reading more here would only
-/// decode entries the network then drops.
-pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = 1;
+/// Entries per AppendEntries RPC. A peer whose `nabedra-otp/2` session
+/// negotiated multi-entry appends receives up to this many entries (and about
+/// 1 MiB) per RPC, which its log writes as synced batches. The typed network
+/// sends one entry per RPC to an older one-shot peer.
+pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = MAX_APPEND_ENTRIES as u64;
 /// Byte-bounded batching. Client writes coalesce into one log append of at
 /// most `MAX_APPEND_ENTRIES` entries without lingering, and the log writes
 /// each append as synced batches of at most 1 MiB. Bounds transient batches

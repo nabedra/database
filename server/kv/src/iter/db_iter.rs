@@ -18,7 +18,8 @@ use crate::iter::range_del::RangeDelAggregator;
 use crate::source::InternalIterator;
 use crate::types::{Kind, Locator, MAX_SEQ, SEEK_KIND_BYTE, Seq, parse_internal_key};
 
-/// After this many consecutive hidden entries going forward, re-seek past them instead.
+/// After this many consecutive hidden entries (either direction), or visible versions of
+/// one key going backward, re-seek instead of stepping.
 const MAX_SEQUENTIAL_SKIPS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,9 +357,20 @@ impl<I: InternalIterator> DbIter<I> {
 
     /// Moves backward to the newest visible version of the previous live user key.
     /// Leaves the inner iterator just before that key's versions.
+    ///
+    /// Going backward a key's versions arrive oldest first, so the newest visible one is
+    /// the last seen. After more than [`MAX_SEQUENTIAL_SKIPS`] visible versions of one key
+    /// it seeks straight to the newest instead of stepping through the rest, and after as
+    /// many versions above the snapshot in a row it seeks before their key: every version
+    /// of that key still ahead is newer, so hidden too.
     fn find_prev(&mut self) {
         self.valid = false;
         let mut found = false;
+        // Whether `self.key` holds a key met in this search.
+        let mut have_key = false;
+        // Visible versions of `self.key`, and versions above the snapshot, met in a row.
+        let mut versions = 0;
+        let mut hidden = 0;
         while self.inner.valid() {
             let Some(parsed) = parse_internal_key(self.inner.key()) else {
                 return self.corrupt_key();
@@ -366,32 +378,88 @@ impl<I: InternalIterator> DbIter<I> {
             if self.below_lower(parsed.user_key) {
                 break;
             }
-            if parsed.seq <= self.seq {
-                if found && parsed.user_key.cmp(&self.key) == Ordering::Less {
-                    // The versions of the found key are all behind us.
-                    break;
+            if parsed.seq > self.seq {
+                hidden += 1;
+                if hidden > MAX_SEQUENTIAL_SKIPS {
+                    hidden = 0;
+                    put_key(&mut self.target, parsed.user_key, u64::MAX);
+                    self.inner.seek_for_prev(&self.target);
+                } else {
+                    self.inner.prev();
                 }
-                let live = match parsed.kind {
+                continue;
+            }
+            hidden = 0;
+            if found && parsed.user_key.cmp(&self.key) == Ordering::Less {
+                // The versions of the found key are all behind us.
+                break;
+            }
+            let same_key = have_key && parsed.user_key == self.key.as_slice();
+            versions = if same_key { versions + 1 } else { 1 };
+            if versions > MAX_SEQUENTIAL_SKIPS {
+                // Many versions of `self.key`: read its newest visible one directly, then
+                // go before all of its versions.
+                versions = 0;
+                put_key(&mut self.target, &self.key, visible_trailer(self.seq));
+                self.inner.seek(&self.target);
+                if !self.inner.valid() {
+                    return self.lost_visible_version();
+                }
+                let Some(newest) = parse_internal_key(self.inner.key()) else {
+                    return self.corrupt_key();
+                };
+                if newest.user_key != self.key.as_slice() || newest.seq > self.seq {
+                    return self.lost_visible_version();
+                }
+                found = match newest.kind {
                     Kind::Put | Kind::JournalPut => {
-                        !self.tombstones.covers(parsed.user_key, parsed.seq)
+                        !self.tombstones.covers(newest.user_key, newest.seq)
                     }
                     Kind::Delete => false,
                     Kind::RangeDelete => return self.corrupt_key(),
                 };
-                // Versions of one key arrive oldest first, so the last one seen wins.
-                self.key.clear();
-                self.key.extend_from_slice(parsed.user_key);
-                if live {
-                    self.kind = parsed.kind;
+                if found {
+                    self.kind = newest.kind;
                     self.value = self.inner.value();
                 }
-                found = live;
+                put_key(&mut self.target, &self.key, u64::MAX);
+                self.inner.seek_for_prev(&self.target);
+                continue;
             }
+            let live = match parsed.kind {
+                Kind::Put | Kind::JournalPut => {
+                    !self.tombstones.covers(parsed.user_key, parsed.seq)
+                }
+                Kind::Delete => false,
+                Kind::RangeDelete => return self.corrupt_key(),
+            };
+            // Versions of one key arrive oldest first, so the last one seen wins.
+            self.key.clear();
+            self.key.extend_from_slice(parsed.user_key);
+            have_key = true;
+            if live {
+                self.kind = parsed.kind;
+                self.value = self.inner.value();
+            }
+            found = live;
             self.inner.prev();
         }
         if let Err(error) = self.inner.status() {
             return self.fail(error);
         }
         self.valid = found;
+    }
+
+    /// A re-seek to a visible version just stepped over did not find it: an inner
+    /// error, or sources that changed under the iterator.
+    fn lost_visible_version(&mut self) {
+        match self.inner.status() {
+            Err(error) => self.fail(error),
+            Ok(()) => self.fail(Error::Corruption {
+                file: FileId::Other,
+                offset: 0,
+                what: "iterator lost a visible version on a re-seek",
+            }),
+        }
     }
 }

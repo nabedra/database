@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use common::*;
-use nabedra_kv::fs::FaultFs;
+use nabedra_kv::fs::{FaultFs, PowerLoss};
 use nabedra_kv::{Background, Durability, Store};
 
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -54,7 +54,7 @@ fn workload(
     fs: &FaultFs,
     bg: &Arc<Background>,
     list: &[ModelBatch],
-    cut: Option<(usize, u64)>,
+    cut: Option<(usize, u64, PowerLoss)>,
 ) -> Outcome {
     let (_, dir) = (0, std::path::PathBuf::from("/db/kv"));
     let mut outcome = Outcome {
@@ -67,10 +67,14 @@ fn workload(
     };
     let store = opened.store;
     for (i, b) in list.iter().enumerate() {
-        if let Some((at, seed)) = cut
+        if let Some((at, seed, model)) = cut
             && at == i
         {
-            outcome.cut = Some((fs.power_loss(seed), outcome.submitted, outcome.durable));
+            outcome.cut = Some((
+                fs.power_loss_with(seed, model),
+                outcome.submitted,
+                outcome.durable,
+            ));
         }
         let durability = if i % 4 == 0 {
             Durability::Sync
@@ -195,16 +199,15 @@ fn ns04_crash_at_every_mutating_operation() {
     }
 }
 
-#[test]
-fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
+fn power_loss_campaign(model: PowerLoss, seeds_var: &str, default_seeds: u64) {
     let bg = Background::new(2);
     let (list, models) = batches(7);
     let total = mutating_ops(&list, &bg);
     let mut rng = Rng(55);
-    let seeds: u64 = std::env::var("NS05_SEEDS")
+    let seeds: u64 = std::env::var(seeds_var)
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(150);
+        .unwrap_or(default_seeds);
     for seed in 0..seeds {
         let (fs, _) = fault_fs();
         if rng.chance(50) {
@@ -213,17 +216,17 @@ fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
             fs.crash_after(n);
             let outcome = workload(&fs, &bg, &list, None);
             verify(
-                fs.power_loss(seed),
+                fs.power_loss_with(seed, model),
                 &bg,
                 &models,
                 outcome.submitted,
                 outcome.durable,
-                &format!("seed {seed} crash_after {n} + power loss"),
+                &format!("seed {seed} crash_after {n} + power loss {model:?}"),
             );
         } else {
             // Lose power while the store is running, between two batches.
             let at = rng.below(BATCHES as u64) as usize;
-            let outcome = workload(&fs, &bg, &list, Some((at, seed)));
+            let outcome = workload(&fs, &bg, &list, Some((at, seed, model)));
             let (image, submitted, durable) = outcome.cut.expect("cut taken");
             verify(
                 image,
@@ -231,8 +234,20 @@ fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
                 &models,
                 submitted,
                 durable,
-                &format!("seed {seed} power loss before batch {at}"),
+                &format!("seed {seed} power loss {model:?} before batch {at}"),
             );
         }
     }
+}
+
+#[test]
+fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
+    power_loss_campaign(PowerLoss::default(), "NS05_SEEDS", 150);
+}
+
+/// NS05 with 4 KiB device units that a power loss may destroy whole (zeros or garbage),
+/// durable bytes in the unit included (KVfix1's `power_loss_with`).
+#[test]
+fn ns05_power_loss_with_4k_units_zero_and_garbage() {
+    power_loss_campaign(PowerLoss::destroy_4k(), "NS05_4K_SEEDS", 150);
 }

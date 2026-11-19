@@ -18,12 +18,21 @@
 //! - [`FaultFs::power_loss`]: durable state survives, and for each unsynced 512-byte sector
 //!   written since its file's last sync, independently, the new bytes, the old bytes or a
 //!   torn prefix of the new bytes survive. An unsynced length change survives or not, and
-//!   each unsynced directory operation independently survives or is lost (a rename is one
-//!   atomic operation). Choices are deterministic for a given seed.
+//!   each unsynced directory operation survives or is lost (a rename is one atomic
+//!   operation). Directory operations are independent except along a chain: once an
+//!   operation is lost, every later one that names a path it linked or unlinked is lost
+//!   too, so a lost rename never leaves one file under two names (A→B lost, B→C kept is
+//!   impossible). Choices are deterministic for a given seed.
+//! - [`FaultFs::power_loss_with`] takes a [`PowerLoss`] mode: a larger atomic unit (for
+//!   example a 4 KiB device page, decided as a whole), and units that read back as zeros
+//!   or as garbage. A zeroed or garbage unit loses the *whole* unit, including bytes an
+//!   earlier sync covered, as a page reprogrammed during the power loss would.
 //!
 //! [`FaultFs::crash_after`] freezes the state after the n-th mutating operation, so a test
 //! can run a workload once, read [`FaultFs::mutating_ops`], and then enumerate every crash
-//! boundary. [`FaultFs::inject`] fails chosen calls with EIO or ENOSPC.
+//! boundary. [`FaultFs::inject`] fails chosen calls with EIO or ENOSPC; a fault can be
+//! limited to reads or writes that touch a byte range ([`Fault::range`]), which models a
+//! region that reads back as EIO.
 //!
 //! A failed `sync_data`/`sync_all` behaves like Linux after an fsync error ("fsyncgate"):
 //! the dirty sectors are marked clean without reaching the durable layer, so a later
@@ -41,8 +50,42 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{Fs, FsFile, FsLock, OpenMode};
 
-/// Size of the unit a power loss keeps, drops or tears.
+/// Size of the unit a power loss keeps, drops or tears (the default [`PowerLoss`] unit).
 pub const POWER_LOSS_SECTOR: u64 = 512;
+
+/// How [`FaultFs::power_loss_with`] treats each unit written since its file's last sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerLoss {
+    /// The atomic unit, a multiple of [`POWER_LOSS_SECTOR`] (512 or 4096, say). Each
+    /// dirty unit keeps the new bytes, keeps the old bytes, or is torn (new bytes up to a
+    /// random point inside the unit, old bytes after it).
+    pub unit: u64,
+    /// A dirty unit may also read back as all zeros (the whole unit).
+    pub zero: bool,
+    /// A dirty unit may also read back as garbage (the whole unit).
+    pub garbage: bool,
+}
+
+impl Default for PowerLoss {
+    fn default() -> Self {
+        PowerLoss {
+            unit: POWER_LOSS_SECTOR,
+            zero: false,
+            garbage: false,
+        }
+    }
+}
+
+impl PowerLoss {
+    /// A 4 KiB device page that is destroyed whole: new, old, torn, zeros or garbage.
+    pub fn destroy_4k() -> PowerLoss {
+        PowerLoss {
+            unit: 4096,
+            zero: true,
+            garbage: true,
+        }
+    }
+}
 
 /// An operation on [`Fs`] or [`FsFile`], as recorded in the call log and matched by faults.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,6 +156,7 @@ pub struct Fault {
     nth: u64,
     error: FaultError,
     path_prefix: Option<PathBuf>,
+    range: Option<(u64, u64)>,
     repeat: bool,
     seen: u64,
 }
@@ -125,6 +169,7 @@ impl Fault {
             nth: 1,
             error: FaultError::Eio,
             path_prefix: None,
+            range: None,
             repeat: false,
             seen: 0,
         }
@@ -148,6 +193,14 @@ impl Fault {
         self
     }
 
+    /// Only reads and writes whose bytes overlap `[offset, offset + len)` match (other
+    /// operations never do). With [`Fault::repeat`] and `FsOp::Read`, this is a region
+    /// that reads back as EIO.
+    pub fn range(mut self, offset: u64, len: u64) -> Fault {
+        self.range = Some((offset, len));
+        self
+    }
+
     /// Keeps failing every matching call from the n-th on, until [`FaultFs::clear_faults`]
     /// (for example a full disk that later frees up).
     pub fn repeat(mut self) -> Fault {
@@ -155,7 +208,7 @@ impl Fault {
         self
     }
 
-    fn fires(&mut self, op: FsOp, path: &Path) -> bool {
+    fn fires(&mut self, op: FsOp, path: &Path, bytes: Option<(u64, u64)>) -> bool {
         if op != self.op {
             return false;
         }
@@ -163,6 +216,14 @@ impl Fault {
             && !path.starts_with(prefix)
         {
             return false;
+        }
+        if let Some((offset, len)) = self.range {
+            let overlaps = bytes.is_some_and(|(at, n)| {
+                n > 0 && len > 0 && at < offset.saturating_add(len) && offset < at.saturating_add(n)
+            });
+            if !overlaps {
+                return false;
+            }
         }
         self.seen += 1;
         self.seen == self.nth || (self.repeat && self.seen > self.nth)
@@ -209,8 +270,8 @@ impl Inode {
             || self.min_len as usize != self.durable.len()
     }
 
-    /// The bytes a power loss leaves, choosing per sector from `rng`.
-    fn after_power_loss(&self, rng: &mut SplitMix) -> Vec<u8> {
+    /// The bytes a power loss leaves, choosing per unit from `rng`.
+    fn after_power_loss(&self, rng: &mut SplitMix, mode: PowerLoss) -> Vec<u8> {
         if !self.unsynced() {
             return self.durable.clone();
         }
@@ -224,22 +285,55 @@ impl Inode {
             self.durable.clone()
         };
         let limit = bytes.len().min(self.os.len());
-        for &sector in &self.dirty {
-            let (start, end) = sector_range(sector, limit);
+        let per_unit = (mode.unit / POWER_LOSS_SECTOR).max(1);
+        let unit_len = per_unit * POWER_LOSS_SECTOR;
+        let outcomes = 3 + u64::from(mode.zero) + u64::from(mode.garbage);
+        let mut dirty = self.dirty.iter().copied().peekable();
+        while let Some(&first) = dirty.peek() {
+            let unit = first / per_unit;
+            // The unit's dirty sectors, in order.
+            let mut sectors = Vec::new();
+            while let Some(&s) = dirty.peek() {
+                if s / per_unit != unit {
+                    break;
+                }
+                sectors.push(s);
+                dirty.next();
+            }
+            let (start, end) = (
+                ((unit * unit_len) as usize).min(limit),
+                (((unit + 1) * unit_len) as usize).min(limit),
+            );
             if start >= end {
                 continue;
             }
-            match rng.below(3) {
-                0 => bytes[start..end].copy_from_slice(&self.os[start..end]),
+            // New bytes of the dirty sectors below `cut`.
+            let copy_new = |bytes: &mut Vec<u8>, cut: usize| {
+                for &s in &sectors {
+                    let (a, b) = sector_range(s, cut);
+                    if a < b {
+                        bytes[a..b].copy_from_slice(&self.os[a..b]);
+                    }
+                }
+            };
+            match rng.below(outcomes) {
+                0 => copy_new(&mut bytes, end),
                 1 => {}
-                _ => {
+                2 => {
                     let n = end - start;
                     let keep = if n > 1 {
                         1 + rng.below(n as u64 - 1) as usize
                     } else {
                         n
                     };
-                    bytes[start..start + keep].copy_from_slice(&self.os[start..start + keep]);
+                    copy_new(&mut bytes, start + keep);
+                }
+                3 if mode.zero => bytes[start..end].fill(0),
+                _ => {
+                    for chunk in bytes[start..end].chunks_mut(8) {
+                        let word = rng.next().to_le_bytes();
+                        chunk.copy_from_slice(&word[..chunk.len()]);
+                    }
                 }
             }
         }
@@ -355,6 +449,17 @@ impl State {
     /// Runs the crash and fault checks for one call. On `Err` the call must have no effect.
     /// `mutating` calls advance the crash counter.
     fn admit(&mut self, op: FsOp, path: &Path, mutating: bool) -> io::Result<()> {
+        self.admit_bytes(op, path, mutating, None)
+    }
+
+    /// [`State::admit`] for a read or write of `bytes = (offset, len)`.
+    fn admit_bytes(
+        &mut self,
+        op: FsOp,
+        path: &Path,
+        mutating: bool,
+        bytes: Option<(u64, u64)>,
+    ) -> io::Result<()> {
         if self.crashed {
             return Err(crashed());
         }
@@ -369,7 +474,7 @@ impl State {
             self.mutating_ops += 1;
         }
         for fault in &mut self.faults {
-            if fault.fires(op, path) {
+            if fault.fires(op, path, bytes) {
                 return Err(fault.error.to_io());
             }
         }
@@ -549,21 +654,38 @@ impl FaultFs {
     /// unsynced directory operation, the new state, the old state or (sectors only) a torn
     /// prefix of the new bytes. Deterministic for a given `seed`.
     pub fn power_loss(&self, seed: u64) -> FaultFs {
+        self.power_loss_with(seed, PowerLoss::default())
+    }
+
+    /// [`FaultFs::power_loss`] with another unit and more outcomes per unit (see
+    /// [`PowerLoss`]).
+    pub fn power_loss_with(&self, seed: u64, mode: PowerLoss) -> FaultFs {
+        assert!(
+            mode.unit >= POWER_LOSS_SECTOR && mode.unit.is_multiple_of(POWER_LOSS_SECTOR),
+            "the unit is a multiple of 512 bytes"
+        );
         let state = self.state();
         let mut rng = SplitMix(seed);
         let mut ns = state.durable.clone();
+        // Paths a lost operation linked or unlinked: a later operation naming one of them
+        // depends on it and is lost too.
+        let mut lost: BTreeSet<&Path> = BTreeSet::new();
         for op in &state.pending {
-            if rng.below(2) == 0 {
+            let coin = rng.below(2) == 0;
+            let depends = op.iter().any(|effect| lost.contains(effect.path()));
+            if coin && !depends {
                 for effect in op {
                     ns.apply(effect);
                 }
+            } else {
+                lost.extend(op.iter().map(Effect::path));
             }
         }
         // Decide every inode's bytes in inode order, so the result depends only on the seed.
         let bytes: BTreeMap<Ino, Vec<u8>> = state
             .inodes
             .iter()
-            .map(|(&ino, inode)| (ino, inode.after_power_loss(&mut rng)))
+            .map(|(&ino, inode)| (ino, inode.after_power_loss(&mut rng, mode)))
             .collect();
         FaultFs::from_state(State::rebuilt(ns, |ino| bytes[&ino].clone()))
     }
@@ -875,13 +997,16 @@ impl FaultFile {
         body: impl FnOnce(&mut Inode) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut state = lock(&self.state);
-        let result = state.admit(op, &self.path, mutating).and_then(|()| {
-            if mutating && !self.writable {
-                return Err(io::ErrorKind::PermissionDenied.into());
-            }
-            let inode = state.inodes.get_mut(&self.ino).expect("open inode exists");
-            body(inode)
-        });
+        let bytes = matches!(op, FsOp::Read | FsOp::Write).then_some((offset, len));
+        let result = state
+            .admit_bytes(op, &self.path, mutating, bytes)
+            .and_then(|()| {
+                if mutating && !self.writable {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                let inode = state.inodes.get_mut(&self.ino).expect("open inode exists");
+                body(inode)
+            });
         state.log(op, &self.path, None, offset, len, result.is_ok());
         result
     }
@@ -1539,5 +1664,112 @@ mod tests {
             ]
         );
         assert!(calls.iter().all(|c| c.ok));
+    }
+
+    /// RV-KV1 F7.1: chained renames of one file, lost independently, could leave it under
+    /// two names. A lost operation takes every later one on the same path with it.
+    #[test]
+    fn ns_unit_fault_power_loss_never_links_a_renamed_file_twice() {
+        let mut outcomes = BTreeSet::new();
+        for seed in 0..64 {
+            let fs = FaultFs::new();
+            fs.create_dir_all_durable(&p("/d"));
+            fs.create_dir_all_durable(&p("/e"));
+            let f = durable_file(&fs, "/d/a", b"x");
+            fs.rename(&p("/d/a"), &p("/d/b")).unwrap();
+            fs.rename(&p("/d/b"), &p("/d/c")).unwrap();
+            // A new file reusing the first name, and a cross-directory rename.
+            let g = fs.open(&p("/d/a"), OpenMode::CreateNew).unwrap();
+            g.write_all_at(b"y", 0).unwrap();
+            g.sync_data().unwrap();
+            fs.rename(&p("/d/c"), &p("/e/z")).unwrap();
+            drop((f, g));
+            let after = fs.power_loss(seed);
+            let mut names = after.list(&p("/d")).unwrap();
+            names.extend(after.list(&p("/e")).unwrap());
+            let x_names: Vec<&PathBuf> = names
+                .iter()
+                .filter(|n| read_all(&after, n.to_str().unwrap()).as_deref() == Some(b"x"))
+                .collect();
+            assert_eq!(x_names.len(), 1, "seed {seed}: {names:?}");
+            outcomes.insert(x_names[0].clone());
+        }
+        assert!(outcomes.len() >= 3, "{outcomes:?}");
+    }
+
+    #[test]
+    fn ns_unit_fault_read_faults_hit_only_their_range() {
+        let fs = with_db();
+        let file = durable_file(&fs, "/db/f", &[7u8; 8192]);
+        fs.inject(
+            Fault::on(FsOp::Read)
+                .path_prefix("/db/f")
+                .range(4096, 512)
+                .repeat(),
+        );
+        let mut buf = [0u8; 512];
+        file.read_exact_at(&mut buf, 0).unwrap();
+        file.read_exact_at(&mut buf, 4096 - 512).unwrap();
+        file.read_exact_at(&mut buf, 4608).unwrap();
+        for at in [4096 - 511, 4096, 4096 + 511] {
+            let err = file.read_exact_at(&mut buf, at).unwrap_err();
+            assert!(matches!(Error::from(err), Error::Io(_)), "{at}");
+        }
+        // Writes, syncs and other files never match a read fault.
+        file.write_all_at(&[1; 10], 4096).unwrap();
+        file.sync_data().unwrap();
+        let other = durable_file(&fs, "/db/g", &[1u8; 8192]);
+        other.read_exact_at(&mut buf, 4096).unwrap();
+        fs.clear_faults();
+        file.read_exact_at(&mut buf, 4096).unwrap();
+        assert_eq!(&buf[..10], &[1; 10]);
+    }
+
+    #[test]
+    fn ns_unit_fault_power_loss_with_4k_units_destroys_whole_units() {
+        let fs = with_db();
+        let old = vec![1u8; 8192];
+        let file = durable_file(&fs, "/db/f", &old);
+        // New bytes inside the second 4 KiB unit, never synced.
+        file.write_all_at(&[2u8; 3000], 4096 + 500).unwrap();
+        let mut new = old.clone();
+        new[4596..7596].fill(2);
+        let mut seen = BTreeSet::new();
+        for seed in 0..200 {
+            let after = fs.power_loss_with(seed, PowerLoss::destroy_4k());
+            let bytes = read_all(&after, "/db/f").unwrap();
+            assert_eq!(bytes.len(), 8192);
+            assert_eq!(
+                &bytes[..4096],
+                &old[..4096],
+                "a clean unit is never touched"
+            );
+            let unit = &bytes[4096..];
+            let kind = if unit == &new[4096..] {
+                "new"
+            } else if unit == &old[4096..] {
+                "old"
+            } else if unit.iter().all(|&b| b == 0) {
+                "zero"
+            } else if unit[..500].iter().all(|&b| b == 1)
+                && unit[3500..].iter().all(|&b| b == 1)
+                && unit[500..3500].windows(2).all(|w| w[0] >= w[1])
+            {
+                // A prefix of the new bytes, then the old ones.
+                "torn"
+            } else {
+                // Garbage replaces the whole unit, durable bytes included.
+                assert!(unit[..500].iter().any(|&b| b != 1), "seed {seed}");
+                "garbage"
+            };
+            seen.insert(kind);
+        }
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        // The default mode is unchanged: 512-byte sectors, no zero or garbage outcome.
+        for seed in 0..64 {
+            let bytes = read_all(&fs.power_loss(seed), "/db/f").unwrap();
+            assert_eq!(&bytes[..4596], &old[..4596]);
+            assert_eq!(&bytes[7596..], &old[7596..]);
+        }
     }
 }

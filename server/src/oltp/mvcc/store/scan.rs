@@ -72,6 +72,7 @@ impl ParticipantMachine {
         {
             return Err(invalid());
         }
+        self.observe_snapshot(request.read_ts).await?;
         let bytes = request
             .max_bytes
             .checked_mul(2)
@@ -446,6 +447,37 @@ fn domain_prefix(domain: &ScanDomain) -> Result<Vec<u8>, ProtocolError> {
 pub(super) fn decode_key(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
     if bytes.first() == Some(&13) {
         return super::archive::decode_logical(bytes);
+    }
+    if bytes.first() == Some(&super::direct::DEDUP_TAG) {
+        // Row-shaped anchor followed by the 16-byte request id.
+        let split = bytes
+            .len()
+            .checked_sub(16)
+            .filter(|n| *n > 33)
+            .ok_or_else(recovery_unknown)?;
+        if bytes[17..33] != [0; 16] {
+            return Err(recovery_unknown());
+        }
+        let mut row = Vec::new();
+        row.try_reserve_exact(split).map_err(|_| invalid())?;
+        row.push(1);
+        row.extend_from_slice(&bytes[1..split]);
+        let MvccKey::Row {
+            table_id,
+            primary_key,
+        } = decode_key(&row)?
+        else {
+            return Err(recovery_unknown());
+        };
+        let request_id = Uuid::from_slice(&bytes[split..]).map_err(|_| recovery_unknown())?;
+        if request_id.is_nil() {
+            return Err(recovery_unknown());
+        }
+        return Ok(MvccKey::DirectDedup {
+            table_id,
+            anchor: primary_key,
+            request_id,
+        });
     }
     if bytes.len() < 33 {
         return Err(recovery_unknown());

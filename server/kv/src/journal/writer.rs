@@ -14,11 +14,17 @@ use crate::types::{Locator, Seq};
 
 use super::format::{
     self, BLOCK, FLAG_CLOSE, FLAG_ROLL, FLAG_SYNC, MIN_PAD, Payload, RECORD_HEADER_LEN,
-    RecordFields, RecordType,
+    RECORDS_START, RecordFields, RecordType,
 };
 use super::recovery::{End, Recovered};
 use super::segment::{self, FreeSeg, LiveSeg};
 use super::{Item, JournalSink, RecordKind, Shared, Table, TableSeg, lock};
+
+/// Free segments the preparer keeps ready for the next roll (bounded: it never creates a
+/// file while this many are free).
+const SPARES: usize = 1;
+/// A failed background preparation is retried no sooner than this.
+const PREPARE_RETRY: Duration = Duration::from_secs(1);
 
 /// Why a step failed.
 enum Fail {
@@ -70,8 +76,6 @@ pub(super) struct Writer {
     active_dirty: bool,
     /// Earlier segments with bytes no sync has covered yet.
     prev_unsynced: Vec<Arc<dyn FsFile>>,
-    spare: Option<FreeSeg>,
-    spare_failed_at: Option<Instant>,
     next_write_seq: Seq,
     durable: Seq,
     /// Inclusive range of sequence numbers whose writes failed with `NoSpace` and that a
@@ -84,9 +88,14 @@ pub(super) struct Writer {
 }
 
 impl Writer {
-    /// Applies the repair recovery decided on (free the segments after the end, fence or
-    /// re-epoch the end segment, sync the replay range, fill a gap up to `replay_after`),
+    /// Applies the repair recovery decided on (delete unused header-less segments, free
+    /// the segments after the end, fence or re-epoch the end segment, write the open pad
+    /// after a clean close, sync every live segment, fill a gap up to `replay_after`),
     /// fills the segment table and returns a writer positioned for the next record.
+    ///
+    /// Every live segment is synced before `durable_seq` is published over it, including
+    /// segments below the replay range: their records hold journal values that flushed
+    /// runs may reference (RV-KV1 F5).
     pub(super) fn finish_open(
         shared: Arc<Shared>,
         recovered: Recovered,
@@ -95,15 +104,25 @@ impl Writer {
         let Recovered {
             mut live,
             mut free,
-            start,
             end,
             next_seq,
             max_durable,
+            discard,
             ..
         } = recovered;
         let fs = &*shared.fs;
         let dir = &shared.dir;
         let options = &shared.options;
+
+        // Unused header-less segments (L4) hold nothing; delete them first.
+        if !discard.is_empty() {
+            for h in discard {
+                let path = h.path;
+                drop(h.file);
+                fs.remove(&path).map_err(segment::io)?;
+            }
+            fs.sync_dir(dir).map_err(segment::io)?;
+        }
 
         // Segments after the end hold nothing the journal keeps. Free them before any
         // fence is written, so a crash in between cannot chain into them.
@@ -119,25 +138,27 @@ impl Writer {
         }
 
         let sync_range = |live: &[LiveSeg], to: usize| -> Result<()> {
-            for seg in &live[start.min(to)..to] {
+            for seg in &live[..to] {
                 seg.file.sync_data().map_err(segment::io)?;
             }
             Ok(())
         };
         let mut new_active = false;
+        let mut open_pad = false;
         let pos = match end {
             End::Fresh => {
                 new_active = true;
-                BLOCK
+                RECORDS_START
             }
             End::Append { idx, pos } => {
                 sync_range(&live, idx + 1)?;
+                open_pad = true;
                 pos
             }
             End::Reepoch { idx } => {
                 sync_range(&live, idx)?;
                 segment::reepoch(&mut live[idx])?;
-                BLOCK
+                RECORDS_START
             }
             End::Fence { idx, pad_at } => {
                 let seg = &live[idx];
@@ -160,7 +181,7 @@ impl Writer {
                 }
                 sync_range(&live, idx + 1)?;
                 new_active = true;
-                BLOCK
+                RECORDS_START
             }
         };
         if new_active {
@@ -172,6 +193,7 @@ impl Writer {
                     shared.next_number.fetch_add(1, Ordering::Relaxed),
                     options.segment_bytes,
                     options.zero_fill,
+                    None,
                 )?,
             };
             let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
@@ -200,8 +222,6 @@ impl Writer {
             pos,
             active_dirty: false,
             prev_unsynced: Vec::new(),
-            spare: None,
-            spare_failed_at: None,
             next_write_seq: next_seq,
             durable: next_seq - 1,
             void: None,
@@ -210,6 +230,12 @@ impl Writer {
             status: Vec::new(),
             locators: Vec::new(),
         };
+        if open_pad {
+            // Appending after a clean close: first a synced pad without FLAG_CLOSE, so a
+            // record this run loses later never sits right after the close pad (F1).
+            writer.push_pad(FLAG_SYNC, next_seq, 0, (BLOCK - MIN_PAD) as usize);
+            writer.sync_aligned(0).map_err(Fail::into_error)?;
+        }
         if replay_after >= next_seq {
             // The store flushed state the journal no longer holds (a torn unsynced tail).
             // Void those numbers so the sequence stays continuous and is never reused.
@@ -370,6 +396,15 @@ impl Writer {
             wants_sync |= *sync;
         }
 
+        if wants_sync && fail.is_none() && self.void.is_some() {
+            // A group of only `Sync` items after a `NoSpace`: void the failed numbers now,
+            // so the sync can cover them once space is back (RV-KV1 F4).
+            match self.emit_void() {
+                Ok(()) => {}
+                Err(Fail::NoSpace) => fail = Some(Status::NoSpace),
+                Err(Fail::Fatal(_)) => fail = Some(Status::Failed),
+            }
+        }
         let mut ok = fail != Some(Status::Failed);
         let mut synced = false;
         if ok {
@@ -523,18 +558,15 @@ impl Writer {
         if self.at() + len <= self.active.len {
             return Ok(());
         }
-        let next = match self.spare.take() {
-            Some(spare) => spare,
-            None => self.prepare_spare().map_err(|e| match e {
-                Error::NoSpace => Fail::NoSpace,
-                other => Fail::Fatal(other),
-            })?,
-        };
+        let next = self.take_spare().map_err(|e| match e {
+            Error::NoSpace => Fail::NoSpace,
+            other => Fail::Fatal(other),
+        })?;
         if self.active.len - self.at() >= MIN_PAD {
             self.push_pad(FLAG_ROLL, self.next_write_seq, 0, 0);
         }
         if let Err(fail) = self.flush_buf() {
-            self.spare = Some(next);
+            lock(&self.shared.table).free.push(next);
             return Err(fail);
         }
         if self.active_dirty {
@@ -553,11 +585,26 @@ impl Writer {
             table.active = number;
         }
         self.active = new;
-        self.pos = BLOCK;
+        self.pos = RECORDS_START;
         Ok(())
     }
 
-    fn prepare_spare(&mut self) -> Result<FreeSeg> {
+    /// The free segment for a roll: a ready one from the pool; else the one the preparer
+    /// is finishing; else (no spare at all) one created inline on this thread.
+    fn take_spare(&mut self) -> Result<FreeSeg> {
+        if let Some(free) = lock(&self.shared.table).free.pop() {
+            return Ok(free);
+        }
+        {
+            let mut prep = lock(&self.shared.prep);
+            while prep.busy {
+                prep = self
+                    .shared
+                    .prep_done
+                    .wait(prep)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
         if let Some(free) = lock(&self.shared.table).free.pop() {
             return Ok(free);
         }
@@ -569,28 +616,26 @@ impl Writer {
             number,
             options.segment_bytes,
             options.zero_fill,
+            None,
         )
     }
 
-    /// Prepares the next segment ahead of the roll once the active one is half used,
-    /// after the group's waiters completed. A failure is retried a second later.
+    /// Once the active segment is half used and no free segment is ready, asks the
+    /// preparer thread for one, so the roll never waits for a zero fill (RV-KV1 F8).
     fn maybe_prepare_spare(&mut self) {
-        if self.spare.is_some() || self.latched() || self.at() < self.active.len / 2 {
+        if self.latched() || self.at() < self.active.len / 2 {
             return;
         }
-        if self
-            .spare_failed_at
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
-        {
+        if lock(&self.shared.table).free.len() >= SPARES {
             return;
         }
-        match self.prepare_spare() {
-            Ok(spare) => {
-                self.spare = Some(spare);
-                self.spare_failed_at = None;
-            }
-            Err(_) => self.spare_failed_at = Some(Instant::now()),
+        let mut prep = lock(&self.shared.prep);
+        if prep.busy || prep.wanted || prep.failed_at.is_some_and(|t| t.elapsed() < PREPARE_RETRY) {
+            return;
         }
+        prep.wanted = true;
+        drop(prep);
+        self.shared.prep_work.notify_one();
     }
 
     fn flush_buf(&mut self) -> Result<(), Fail> {
@@ -673,6 +718,67 @@ impl Writer {
         } else {
             self.shared.durable.store(self.durable, Ordering::Release);
         }
+    }
+}
+
+/// What the writer and the preparer thread share.
+#[derive(Default)]
+pub(super) struct Prep {
+    pub(super) wanted: bool,
+    pub(super) busy: bool,
+    pub(super) stop: bool,
+    pub(super) failed_at: Option<Instant>,
+}
+
+/// The spare preparer: creates (preallocates, zero-fills, syncs) a free segment whenever
+/// the writer asks and fewer than [`SPARES`] are free. It never touches a live segment and
+/// never latches: a failure (`NoSpace` included) leaves the writer to create the file
+/// inline at the roll, where `NoSpace` is reported as usual.
+pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("kv-journal-prep".into())
+        .spawn(move || prepare_loop(&shared))
+        .map_err(segment::io)
+}
+
+fn prepare_loop(shared: &Shared) {
+    loop {
+        {
+            let mut prep = lock(&shared.prep);
+            while !prep.stop && !prep.wanted {
+                prep = shared
+                    .prep_work
+                    .wait(prep)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            if prep.stop {
+                return;
+            }
+            prep.wanted = false;
+            if lock(&shared.table).free.len() >= SPARES {
+                continue;
+            }
+            prep.busy = true;
+        }
+        let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
+        let options = &shared.options;
+        let made = segment::create_free(
+            &*shared.fs,
+            &shared.dir,
+            number,
+            options.segment_bytes,
+            options.zero_fill,
+            Some(&shared.prep_cancel),
+        );
+        let failed = made.is_err();
+        if let Ok(free) = made {
+            lock(&shared.table).free.push(free);
+        }
+        let mut prep = lock(&shared.prep);
+        prep.busy = false;
+        prep.failed_at = failed.then(Instant::now);
+        drop(prep);
+        shared.prep_done.notify_all();
     }
 }
 

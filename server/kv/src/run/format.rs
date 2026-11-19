@@ -1,23 +1,34 @@
 //! Run file layout.
 //!
 //! ```text
-//! run    = data_block* ‖ range_del_block ‖ bloom_block ‖ props_block ‖ index_block ‖ footer
-//! block  = contents ‖ masked_crc32c(contents):u32le
-//! footer = magic:u64le ‖ version:u32le ‖ index ‖ bloom ‖ range_del ‖ props
-//!          ‖ masked_crc32c(footer[0..60]):u32le                       (64 bytes)
-//! handle = offset:u64le ‖ size:u32le                  (in the footer, 12 bytes)
+//! run        = data_block* ‖ range_del_block ‖ partitions ‖ props_block ‖ top_index ‖ footer
+//! partitions = (filter_partition ‖ index_partition)*         (one pair per partition)
+//! block      = contents ‖ masked_crc32c(contents):u32le
+//! footer     = magic:u64le ‖ version:u32le ‖ top_index ‖ partitions ‖ range_del ‖ props
+//!              ‖ masked_crc32c(footer[0..60]):u32le                   (64 bytes)
+//! handle     = offset:u64le ‖ size:u32le                  (in the footer, 12 bytes)
 //! ```
 //!
-//! Index entries map the last internal key of each data block to a varint handle
-//! (`varint64 offset ‖ varint64 size`). The range-delete block maps
-//! `internal_key(start, seq, RangeDelete)` to `end`. Sizes exclude the CRC trailer.
+//! The index and the bloom filter are **partitioned** (two-level): an index partition
+//! maps the last internal key of each of a run of consecutive data blocks to a varint
+//! handle (`varint64 offset ‖ varint64 size`), and is cut once it reaches the data block
+//! size (4 KiB by default). Its filter partition holds the bloom filter of every user key
+//! with an entry in those data blocks. The top-level index maps the last internal key of
+//! each partition to `index handle ‖ filter handle` (four varints). Only the top-level
+//! index stays resident per open run (about 45 bytes per partition, so about 7 KiB for a
+//! 64 MiB run); every partition is a small block that goes through the block cache.
+//!
+//! The `partitions` handle in the footer covers the whole partition region (its size
+//! includes the partitions' trailers). The range-delete block maps
+//! `internal_key(start, seq, RangeDelete)` to `end`. Block sizes exclude the CRC trailer.
 
 use crate::coding::{get_varint64, put_varint64, read_u32_le, read_u64_le};
 use crate::crc;
 use crate::types::{Seq, parse_internal_key};
 
 pub(crate) const MAGIC: u64 = u64::from_le_bytes(*b"NBKVRUN1");
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// Version 2: partitioned index and filter (version 1 had monolithic ones).
+pub(crate) const FORMAT_VERSION: u32 = 2;
 pub const FOOTER_LEN: usize = 64;
 pub(crate) const BLOCK_TRAILER_LEN: usize = 4;
 
@@ -34,9 +45,26 @@ impl BlockHandle {
     }
 
     pub(crate) fn decode_varint(input: &[u8]) -> Option<BlockHandle> {
+        let (handle, used) = BlockHandle::decode_prefix(input)?;
+        (used == input.len()).then_some(handle)
+    }
+
+    fn decode_prefix(input: &[u8]) -> Option<(BlockHandle, usize)> {
         let (offset, a) = get_varint64(input)?;
         let (size, b) = get_varint64(&input[a..])?;
-        (a + b == input.len()).then_some(BlockHandle { offset, size })
+        Some((BlockHandle { offset, size }, a + b))
+    }
+
+    /// A top-level index value: the index partition's handle, then the filter's.
+    pub(crate) fn encode_pair(index: BlockHandle, filter: BlockHandle, out: &mut Vec<u8>) {
+        index.encode_varint(out);
+        filter.encode_varint(out);
+    }
+
+    pub(crate) fn decode_pair(input: &[u8]) -> Option<(BlockHandle, BlockHandle)> {
+        let (index, a) = BlockHandle::decode_prefix(input)?;
+        let filter = BlockHandle::decode_varint(&input[a..])?;
+        Some((index, filter))
     }
 
     /// Offset just past the block's CRC trailer.
@@ -64,10 +92,19 @@ pub(crate) fn block_checksum_ok(block: &[u8]) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Footer {
+    /// The top-level index block.
     pub(crate) index: BlockHandle,
-    pub(crate) bloom: BlockHandle,
+    /// The partition region: every filter and index partition, trailers included.
+    pub(crate) partitions: BlockHandle,
     pub(crate) range_del: BlockHandle,
     pub(crate) props: BlockHandle,
+}
+
+impl Footer {
+    /// Offset just past the partition region.
+    pub(crate) fn partitions_end(&self) -> Option<u64> {
+        self.partitions.offset.checked_add(self.partitions.size)
+    }
 }
 
 impl Footer {
@@ -75,7 +112,7 @@ impl Footer {
         let mut out = [0u8; FOOTER_LEN];
         out[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         out[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        for (i, handle) in [self.index, self.bloom, self.range_del, self.props]
+        for (i, handle) in [self.index, self.partitions, self.range_del, self.props]
             .iter()
             .enumerate()
         {
@@ -109,7 +146,7 @@ impl Footer {
         };
         Ok(Footer {
             index: handle(0),
-            bloom: handle(1),
+            partitions: handle(1),
             range_del: handle(2),
             props: handle(3),
         })
@@ -222,7 +259,7 @@ mod tests {
                 offset: 1 << 33,
                 size: 77,
             },
-            bloom: BlockHandle { offset: 5, size: 6 },
+            partitions: BlockHandle { offset: 5, size: 6 },
             range_del: BlockHandle { offset: 7, size: 0 },
             props: BlockHandle {
                 offset: 9,
@@ -267,5 +304,15 @@ mod tests {
         assert_eq!(BlockHandle::decode_varint(&buf), Some(handle));
         buf.push(0);
         assert_eq!(BlockHandle::decode_varint(&buf), None);
+        let mut pair = Vec::new();
+        let filter = BlockHandle {
+            offset: 1 << 40,
+            size: 77,
+        };
+        BlockHandle::encode_pair(handle, filter, &mut pair);
+        assert_eq!(BlockHandle::decode_pair(&pair), Some((handle, filter)));
+        assert_eq!(BlockHandle::decode_pair(&pair[..pair.len() - 1]), None);
+        pair.push(0);
+        assert_eq!(BlockHandle::decode_pair(&pair), None);
     }
 }

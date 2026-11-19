@@ -1,8 +1,10 @@
 //! Immutable sorted runs (task NS4).
 //!
-//! A run is a file of 4 KiB data blocks of internal-key-sorted point entries, an index
-//! block, a whole-user-key bloom filter, a range-tombstone block, a properties block and
-//! a 64-byte footer; every block and the footer carry a masked CRC32C (see [`format`]).
+//! A run is a file of 4 KiB data blocks of internal-key-sorted point entries, a
+//! partitioned (two-level) index and whole-user-key bloom filter, a range-tombstone block,
+//! a properties block and a 64-byte footer; every block and the footer carry a masked
+//! CRC32C (see [`format`]). An open run keeps only its top-level index in memory (charged
+//! to the block cache); every index and filter partition is a small cached unit.
 //! [`RunWriter`] builds one, [`Run`] reads one through the worker-shared
 //! [`crate::cache::BlockCache`], and [`TableCache`] bounds the open descriptors.
 

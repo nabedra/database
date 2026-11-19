@@ -6,11 +6,11 @@ use super::{
     entry::{LogId, OwnedRaftEntry, Vote},
     hosted::{HostedState, TypedMachine, TypedSnapshot},
     multiplex::{
-        AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, Purpose,
-        RAFT_PROGRESS_DECODE_BYTES, RAFT_PROGRESS_HEADER_BYTES, ReceivePlan, ReplicaLease,
-        RequestError, TrafficClass, WorkerClient,
+        AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
+        Purpose, RAFT_PROGRESS_DECODE_BYTES, RAFT_PROGRESS_HEADER_BYTES, ReceivePlan, ReplicaLease,
+        RequestError, RequestTarget, TrafficClass, WorkerClient,
     },
-    typed_log::TypedConfig,
+    typed_log::{MAX_APPEND_BYTES, MAX_APPEND_ENTRIES, TypedConfig},
     types::{GroupKind, ReplicaMember},
 };
 use crate::{
@@ -56,6 +56,12 @@ struct Header {
     vote: Vote,
     prev_log_id: Option<LogId>,
     leader_commit: Option<LogId>,
+    /// Entry count of a multi-entry append (see [`MultiEntry`]). Absent for
+    /// zero or one entry, whose frames stay byte-identical to the one-entry
+    /// wire that older peers decode. Sent only to peers whose session
+    /// negotiated [`PeerFeature::MultiEntryAppend`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entries: Option<u32>,
 }
 impl Header {
     fn route(self, kind: &GroupKind) -> (Purpose, TrafficClass) {
@@ -67,6 +73,71 @@ impl Header {
         }
     }
 }
+/// Multi-entry append payload: each entry's one-entry encoding, prefixed by
+/// its length as a big-endian `u32`, in log order.
+struct MultiEntry;
+impl MultiEntry {
+    /// Framed bytes per append, so one append stays near the log's synced
+    /// batch bound. A single larger entry still travels alone.
+    const BUDGET: usize = MAX_APPEND_BYTES + 4 * MAX_APPEND_ENTRIES;
+    fn encode(
+        shared: &WorkerSharedResources,
+        class: TrafficClass,
+        entries: &[ChargedBytes],
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let total = entries.iter().map(|entry| 4 + entry.len()).sum();
+        let mut out = shared.allocate_bytes(class.byte_class(), total)?;
+        let mut at = 0;
+        let buffer = out.as_mut_slice();
+        for entry in entries {
+            let len = u32::try_from(entry.len()).map_err(|_| invalid("append entry too large"))?;
+            buffer[at..at + 4].copy_from_slice(&len.to_be_bytes());
+            buffer[at + 4..at + 4 + entry.len()].copy_from_slice(entry.as_slice());
+            at += 4 + entry.len();
+        }
+        Ok(out.freeze())
+    }
+    fn decode<D: crate::oltp_replication::entry::CommandData>(
+        shared: &WorkerSharedResources,
+        class: TrafficClass,
+        input: &ChargedBytes,
+        count: usize,
+    ) -> Result<Vec<OwnedRaftEntry<D>>, ProtocolError> {
+        let bytes = input.as_slice();
+        let mut entries = Vec::with_capacity(count);
+        let mut at = 0usize;
+        for _ in 0..count {
+            let len = bytes
+                .get(at..at + 4)
+                .map(|len| u32::from_be_bytes(len.try_into().expect("four bytes")) as usize)
+                .ok_or_else(|| invalid("truncated multi-entry append"))?;
+            let body = bytes
+                .get(at + 4..at + 4 + len)
+                .ok_or_else(|| invalid("truncated multi-entry append"))?;
+            let part = shared.copy_bytes_in(class.byte_class(), body)?;
+            entries.push(OwnedRaftEntry::decode(
+                &part,
+                shared,
+                class.byte_class(),
+                usize::MAX,
+            )?);
+            at += 4 + len;
+        }
+        if at != bytes.len() {
+            return Err(invalid("multi-entry append has trailing bytes"));
+        }
+        Ok(entries)
+    }
+}
+
+/// Test evidence: appends a receiver decoded per (group, node), as
+/// (RPCs, entries, multi-entry RPCs).
+#[cfg(test)]
+pub(crate) static RECEIVED_APPENDS: Mutex<BTreeMap<(uuid::Uuid, u64), ReceivedAppends>> =
+    Mutex::new(BTreeMap::new());
+#[cfg(test)]
+pub(crate) type ReceivedAppends = (u64, u64, u64);
+
 fn header(bytes: &[u8]) -> Result<Header, ProtocolError> {
     crate::protocol::json_input(bytes, 1024)
         .map_err(|_| invalid("invalid typed Raft header bounds"))?;
@@ -129,6 +200,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
         header: Header,
         payload: Option<ChargedBytes>,
         ttl: Duration,
+        target: RequestTarget,
     ) -> Result<R, ProtocolError> {
         if self.node.node_id != self.target {
             return Err(invalid("target node disagrees with membership"));
@@ -155,7 +227,7 @@ impl<C: TypedConfig> TypedNetwork<C> {
             ttl,
             self.factory.client.request_classified(
                 group,
-                self.node.worker_id,
+                target,
                 purpose,
                 encoded,
                 [payload, None, None],
@@ -203,34 +275,83 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         mut rpc: AppendEntriesRequest<C>,
         option: RPCOption,
     ) -> Result<AppendResult<C>, RPCError<C>> {
-        // Every producer path uses one entry per RPC. Translate success against
-        // the sent prefix, never the unsent original request tail.
-        rpc.entries.truncate(1);
-        let previous = rpc.prev_log_id;
-        let last = rpc.last_log_id();
-        let payload = if let Some(entry) = rpc.entries.pop() {
-            let shared = self.factory.shared.clone();
-            let class = self.factory.class();
-            let entry = entry
-                .charge_resident(&self.factory.resident)
-                .map_err(|_| unreachable())?;
-            Some(
-                shared
-                    .execute(execution(class), self.target, 0, {
-                        let shared = shared.clone();
-                        move || {
-                            shared.encode_in(
-                                class.byte_class(),
-                                &entry,
-                                crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
-                            )
-                        }
-                    })
-                    .await
-                    .map_err(|_| unreachable())?,
+        // A peer whose session negotiated multi-entry appends gets up to
+        // MAX_APPEND_ENTRIES entries and about 1 MiB per RPC; any other peer
+        // gets one entry per RPC. Success is translated against the sent
+        // prefix, never the unsent original request tail.
+        let class = self.factory.class();
+        let multi = if rpc.entries.len() > 1 {
+            self.factory.client.peer_supports(
+                self.node.worker_id,
+                class,
+                PeerFeature::MultiEntryAppend,
             )
         } else {
             None
+        };
+        rpc.entries.truncate(if multi.is_some() {
+            MAX_APPEND_ENTRIES
+        } else {
+            1
+        });
+        let budget = MultiEntry::BUDGET.min(self.factory.client.payload_limit(class));
+        let mut encoded = if rpc.entries.is_empty() {
+            Vec::new()
+        } else {
+            let shared = self.factory.shared.clone();
+            let resident = self.factory.resident.clone();
+            let entries = rpc.entries.clone();
+            shared
+                .execute(execution(class), self.target, 0, {
+                    let shared = shared.clone();
+                    move || {
+                        let mut encoded = Vec::with_capacity(entries.len());
+                        let mut framed = 0usize;
+                        for entry in entries {
+                            let bytes = entry.charge_resident(&resident).and_then(|entry| {
+                                shared.encode_in(
+                                    class.byte_class(),
+                                    &entry,
+                                    crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
+                                )
+                            });
+                            let bytes = match bytes {
+                                Ok(bytes) => bytes,
+                                Err(error) if encoded.is_empty() => return Err(error),
+                                Err(_) => break,
+                            };
+                            framed += 4 + bytes.len();
+                            if !encoded.is_empty() && framed > budget {
+                                break;
+                            }
+                            encoded.push(bytes);
+                        }
+                        Ok(encoded)
+                    }
+                })
+                .await
+                .map_err(|_| unreachable())?
+        };
+        rpc.entries.truncate(encoded.len());
+        let previous = rpc.prev_log_id;
+        let last = rpc.last_log_id();
+        let (payload, entries, target) = match encoded.len() {
+            0 => (None, None, RequestTarget::from(self.node.worker_id)),
+            1 => (
+                encoded.pop(),
+                None,
+                RequestTarget::from(self.node.worker_id),
+            ),
+            count => {
+                let identity = multi.expect("several entries only for a multi-entry peer");
+                let payload = MultiEntry::encode(&self.factory.shared, class, &encoded)
+                    .map_err(|_| unreachable())?;
+                (
+                    Some(payload),
+                    Some(count as u32),
+                    RequestTarget::from(identity),
+                )
+            }
         };
         let header = Header {
             from_node: self.factory.local.node_id,
@@ -241,9 +362,10 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             vote: rpc.vote,
             prev_log_id: previous,
             leader_commit: rpc.leader_commit,
+            entries,
         };
         let reply: AppendEntriesResponse<C> = self
-            .rpc(header, payload, option.soft_ttl())
+            .rpc(header, payload, option.soft_ttl(), target)
             .await
             .map_err(|_| unreachable())?;
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
@@ -271,9 +393,11 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 vote: rpc.vote,
                 prev_log_id: rpc.last_log_id,
                 leader_commit: None,
+                entries: None,
             },
             None,
             option.soft_ttl(),
+            RequestTarget::from(self.node.worker_id),
         )
         .await
         .map_err(|_| unreachable())
@@ -451,10 +575,19 @@ where
             ));
         }
         match head.method {
-            Method::Vote if head.payload_bytes != 0 || head.leader_commit.is_some() => {
+            Method::Vote
+                if head.payload_bytes != 0
+                    || head.leader_commit.is_some()
+                    || head.entries.is_some() =>
+            {
                 return Err(invalid("invalid vote frame fields"));
             }
-            Method::Append if head.leadership_transfer_from.is_some() => {
+            Method::Append
+                if head.leadership_transfer_from.is_some()
+                    || head.entries.is_some_and(|count| {
+                        !(2..=MAX_APPEND_ENTRIES as u32).contains(&count) || head.payload_bytes == 0
+                    }) =>
+            {
                 return Err(invalid("invalid append frame fields"));
             }
             _ => {}
@@ -546,32 +679,49 @@ where
             observe("received", "pending");
             let header = match head.method {
                 Method::Append => {
-                    let entry = if head.payload_bytes == 0 {
-                        None
+                    let entries = if head.payload_bytes == 0 {
+                        Vec::new()
                     } else {
-                        Some(
-                            shared
-                                .execute(execution(traffic), head.from_node, 0, {
-                                    let shared = shared.clone();
-                                    move || {
-                                        let input = sections
-                                            .section(0)
-                                            .ok_or_else(|| invalid("missing append payload"))?;
-                                        OwnedRaftEntry::<C::Command>::decode(
+                        shared
+                            .execute(execution(traffic), head.from_node, 0, {
+                                let shared = shared.clone();
+                                move || {
+                                    let input = sections
+                                        .section(0)
+                                        .ok_or_else(|| invalid("missing append payload"))?;
+                                    match head.entries {
+                                        Some(count) => MultiEntry::decode::<C::Command>(
+                                            &shared,
+                                            traffic,
+                                            input,
+                                            count as usize,
+                                        ),
+                                        None => OwnedRaftEntry::<C::Command>::decode(
                                             input,
                                             &shared,
                                             traffic.byte_class(),
                                             usize::MAX,
                                         )
+                                        .map(|entry| vec![entry]),
                                     }
-                                })
-                                .await?,
-                        )
+                                }
+                            })
+                            .await?
                     };
+                    #[cfg(test)]
+                    if !entries.is_empty() {
+                        let mut received = RECEIVED_APPENDS.lock().unwrap();
+                        let group = received
+                            .entry((self.resident.identity().group_id, self.resident.node_id()))
+                            .or_default();
+                        group.0 += 1;
+                        group.1 += entries.len() as u64;
+                        group.2 += u64::from(entries.len() > 1);
+                    }
                     let rpc = AppendEntriesRequest::<C> {
                         vote: head.vote,
                         prev_log_id: head.prev_log_id,
-                        entries: entry.into_iter().collect(),
+                        entries,
                         leader_commit: head.leader_commit,
                     };
                     let reply = self.raft.append_entries(rpc).await.map_err(|_| {

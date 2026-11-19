@@ -618,7 +618,7 @@ fn ns25_short_segment_end_and_older_epoch_records_read_as_ends() {
     let (journal, _, sink) = open(real(), dir.path(), options.clone(), 0).unwrap();
     // One record leaving fewer than 48 bytes in the first segment: the next one rolls
     // without a roll pad.
-    let room = options.segment_bytes - BLOCK;
+    let room = options.segment_bytes - format::RECORDS_START;
     let mut big = WriteBatch::new();
     big.put_journal(b"k", &vec![7u8; (room - 20 - 48 - 6) as usize]);
     assert_eq!(48 + big.encoded_bytes() as u64, room - 20);
@@ -666,7 +666,17 @@ fn ns25_short_segment_end_and_older_epoch_records_read_as_ends() {
     // The recycled active segment ends mid-file, followed by records of an older epoch.
     let (journal, report, replayed) =
         open(real(), dir.path(), options.clone(), replay_after).unwrap();
-    assert_eq!(report.tail, TailOutcome::Clean);
+    // The end reads as an older-epoch record (L1) when an old record starts exactly
+    // there, and as a damaged header without evidence (L2) when the end falls inside an
+    // old record: both keep exactly the written records.
+    let last = written.last().unwrap();
+    let end = last.first_seq + u64::from(last.count);
+    assert!(
+        matches!(report.tail, TailOutcome::Clean)
+            || matches!(report.tail, TailOutcome::TornTail { truncated_at_seq, .. } if truncated_at_seq == end),
+        "{:?}",
+        report.tail
+    );
     assert_eq!(replayed.records(), written[before..]);
     journal.crash();
     drop(journal);

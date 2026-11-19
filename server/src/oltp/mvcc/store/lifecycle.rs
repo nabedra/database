@@ -585,6 +585,8 @@ pub(super) fn validate_guards(
     }
     for write in writes {
         let (table, exclusive) = match &write.key {
+            // Dedup records are written only by direct commits.
+            MvccKey::DirectDedup { .. } => return Ok(false),
             MvccKey::Row { table_id, .. } | MvccKey::IndexEntry { table_id, .. } => {
                 (*table_id, false)
             }

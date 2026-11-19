@@ -271,6 +271,26 @@ Compare three targets on the same host, one at a time, under the existing 4 CPU 
 
 Targets, in order: serial update p50 at or below 15 ms; zero rejections through 200 updates/s with p99 at or below 25 ms; then the ±20% band from [the shard refactor](oltp-shard-refactor.md). Nabedra's `update` reads the row before writing and returns whether it existed, which ScyllaDB only does with lightweight transactions. Report that difference next to the numbers.
 
+## Addendum 2026-11-19: exactly-once across paths, backups, splits
+
+Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing the Decisions table.
+
+- **A request ID that may have run directly is settled at its anchor before it goes queued.** Before any eligible
+  operation takes the queued path (a `Fallback` on an intent, a multi-range `insert_many` after a split, an oversized
+  entry, `direct_oltp: false` while `data.direct.v1` is active), the anchor key's range leader commits
+  `DirectForward { request_id, digest }`. If a dedup record already exists it returns `Replayed` instead. Otherwise it
+  writes a *forward marker* under the same `'D'` key. A later direct attempt of that request ID sees the marker and
+  returns `Fallback`, so it can never apply after the queued path accepted it. Markers expire with dedup records.
+  When the anchor leader cannot be reached, the gateway returns `outcome_unknown` rather than going queued.
+- **Backups.** Incremental backups export only Status-decided transactions, so they would miss direct commits. While
+  `data.direct.v1` is active, incremental backups are refused and a full backup is taken instead, until incremental
+  export scans images for changes since the previous backup.
+- **Splits under write load.** The split coordinator stops direct commits with a replicated barrier entry in the source
+  range before allocating the cut, so a leader change cannot lose the pause. A frozen range answers a dedicated
+  `SplitInProgress`, which the gateway treats as `Fallback`, not as a stale route.
+- **Range clock.** A pending commit is bound to the leadership generation in which its timestamp was fetched, and a
+  leadership change fails reads that were waiting on pending commits instead of releasing them.
+
 ## Out of scope
 
 Removing the queued point path or the scoped queue from PR #19. Both stay in the tree, and the scoped queue stays off by default. A thread-per-core runtime. Hash partitioning. Follower reads. Cross-range one-phase commit.

@@ -621,3 +621,7 @@ async fn o06_o11_wide_append_writes_bounded_synced_batches() {
     }
     assert_eq!(next, 64);
 }
+
+/// T1b: real typed Raft voters over mTLS worker transports.
+#[path = "replicated_tests.rs"]
+mod replicated;
