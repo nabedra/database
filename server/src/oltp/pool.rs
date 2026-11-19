@@ -39,11 +39,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+pub use storage::StorageStats;
 use storage::{
     GROUP_SCOPE_BYTES, RawIter, commit_error, group_scope, prefix_end, storage_error,
     unsupported_format, wait_commit,
 };
-pub use storage::StorageStats;
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -83,7 +83,7 @@ impl PoolIdentity {
 
 struct PoolInner {
     /// Declared first so the store closes before the slot, charges and mount drop.
-    store: Store,
+    store: OwnedStore,
     identity: PoolIdentity,
     path: std::path::PathBuf,
     shared: Arc<WorkerSharedResources>,
@@ -235,9 +235,8 @@ impl OltpPool {
         if let Some(bytes) = segment_bytes {
             options.journal.segment_bytes = bytes;
         }
-        let opened =
-            Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
-        let store = opened.store;
+        let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
+        let store = OwnedStore(Some(opened.store));
         // R6 at pool level: a damaged open that quarantines more than 8 groups, or
         // more than 10% of the pool's groups (always allowing one), is more likely
         // systemic than local, so the pool is refused instead (plan section 3).
@@ -1886,6 +1885,36 @@ fn storage_error_message() -> ProtocolError {
         ErrorCode::StorageUnavailable,
         "typed physical pool unavailable or identity mismatch",
     )
+}
+/// Owns a pool's store. Closing a store waits for its background jobs and joins
+/// its journal thread, so the last pool owner, which may be an async task, never
+/// closes it while holding a multi-threaded runtime worker: the worker's other
+/// tasks move to another thread first (KVfix1 note 8). A current-thread runtime
+/// has no other worker; the close needs nothing from the runtime, so it only
+/// blocks that thread briefly, as dropping the RocksDB handle did.
+struct OwnedStore(Option<Store>);
+impl std::ops::Deref for OwnedStore {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        self.0
+            .as_ref()
+            .expect("the store is open until its owner drops")
+    }
+}
+impl Drop for OwnedStore {
+    fn drop(&mut self) {
+        let Some(store) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(move || drop(store));
+            }
+            _ => drop(store),
+        }
+    }
 }
 /// The group a quarantined scope names (`0x40 ‖ id`).
 fn group_of_scope(scope: &[u8]) -> Option<Uuid> {

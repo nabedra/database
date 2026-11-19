@@ -1,23 +1,37 @@
 //! NS6: the pool on `nabedra-kv`. Fault and crash scenarios run the store on
 //! `FaultFs`; their power-loss evidence is a fault model, not a physical cut.
 use super::*;
-use nabedra_kv::fs::{FaultError, FaultFs, Fault, Fs, FsFile, FsLock, FsOp, OpenMode};
+use nabedra_kv::fs::{Fault, FaultError, FaultFs, Fs, FsFile, FsLock, FsOp, OpenMode};
 use std::sync::atomic::AtomicUsize;
 
-fn fault_pool(dir: &Dir, fault: &FaultFs, identity: PoolIdentity, shared: Arc<WorkerSharedResources>) -> OltpPool {
+fn fault_pool(
+    dir: &Dir,
+    fault: &FaultFs,
+    identity: PoolIdentity,
+    shared: Arc<WorkerSharedResources>,
+) -> OltpPool {
     fs::create_dir_all(&dir.0).unwrap();
     fault.create_dir_all_durable(&dir.0);
     let fs: Arc<dyn Fs> = Arc::new(fault.clone());
     OltpPool::open_development_on(&dir.0, identity, shared, fs).unwrap()
 }
-fn reopen(dir: &Dir, fault: &FaultFs, identity: PoolIdentity, shared: Arc<WorkerSharedResources>) -> Result<OltpPool, ProtocolError> {
+fn reopen(
+    dir: &Dir,
+    fault: &FaultFs,
+    identity: PoolIdentity,
+    shared: Arc<WorkerSharedResources>,
+) -> Result<OltpPool, ProtocolError> {
     let fs: Arc<dyn Fs> = Arc::new(fault.clone());
     OltpPool::open_development_on(&dir.0, identity, shared, fs)
 }
 fn journal_dir(dir: &Dir) -> PathBuf {
     dir.0.join("kv").join("journal")
 }
-fn put_entry(index: u64, key: &'static [u8], value: Vec<u8>) -> impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError> + Send + 'static {
+fn put_entry(
+    index: u64,
+    key: &'static [u8],
+    value: Vec<u8>,
+) -> impl FnOnce(&mut GroupTransaction<'_>) -> Result<Transition, ProtocolError> + Send + 'static {
     move |tx| {
         tx.put(key, &value)?;
         Ok(Transition::Commit(tx.copy_output(&index.to_be_bytes())?))
@@ -54,12 +68,16 @@ async fn o11_rejected_entry_writes_nothing_and_redelivery_returns_the_stored_rep
         assert_eq!(get(&group, b"row").await, b"kept");
         assert!(
             group
-                .read(budget(), |view| view.get(b"other").and_then(|v| v.ok_or_else(capacity)))
+                .read(budget(), |view| view
+                    .get(b"other")
+                    .and_then(|v| v.ok_or_else(capacity)))
                 .await
                 .is_err()
         );
         let replay = group
-            .transaction(meta(1), budget(), |_| panic!("redelivery reran the transition"))
+            .transaction(meta(1), budget(), |_| {
+                panic!("redelivery reran the transition")
+            })
             .await
             .unwrap();
         assert_eq!(replay.as_slice(), b"conflict");
@@ -67,7 +85,9 @@ async fn o11_rejected_entry_writes_nothing_and_redelivery_returns_the_stored_rep
     let pool = OltpPool::open_development(&dir.0, identity, resources.clone()).unwrap();
     let group = pool.retained_group(group_id).await.unwrap();
     let replay = group
-        .transaction(meta(1), budget(), |_| panic!("redelivery reran the transition"))
+        .transaction(meta(1), budget(), |_| {
+            panic!("redelivery reran the transition")
+        })
         .await
         .unwrap();
     assert_eq!(replay.as_slice(), b"conflict");
@@ -77,7 +97,15 @@ async fn o11_rejected_entry_writes_nothing_and_redelivery_returns_the_stored_rep
     // An older position is not the latest applied entry: refused, never rerun.
     assert!(replay.is_err());
     assert_eq!(get(&group, b"row").await, b"kept");
-    assert_eq!(group.applied_state(budget()).await.unwrap().unwrap().position, meta(1).position);
+    assert_eq!(
+        group
+            .applied_state(budget())
+            .await
+            .unwrap()
+            .unwrap()
+            .position,
+        meta(1).position
+    );
 }
 
 /// O29 and NS09 at pool level, injected through FaultFs: EIO on the journal
@@ -107,14 +135,26 @@ async fn o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_
     .unwrap();
     let independent = healthy.group(group_identity(&healthy)).await.unwrap();
     group
-        .transaction(meta(0), budget(), put_entry(0, b"row/original", b"original".to_vec()))
+        .transaction(
+            meta(0),
+            budget(),
+            put_entry(0, b"row/original", b"original".to_vec()),
+        )
         .await
         .unwrap();
     let baseline = resources.scheduler().usage();
     let visible = pool.inner.store.visible_seq();
-    fault.inject(Fault::on(FsOp::SyncData).path_prefix(journal_dir(&dir)).error(FaultError::Eio));
+    fault.inject(
+        Fault::on(FsOp::SyncData)
+            .path_prefix(journal_dir(&dir))
+            .error(FaultError::Eio),
+    );
     let result = group
-        .transaction(meta(1), budget(), put_entry(1, b"row/new", b"ambiguous".to_vec()))
+        .transaction(
+            meta(1),
+            budget(),
+            put_entry(1, b"row/new", b"ambiguous".to_vec()),
+        )
         .await;
     assert_eq!(result.err().unwrap(), recovery_unknown());
     assert!(pool.requires_recovery());
@@ -122,7 +162,17 @@ async fn o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_
     assert!(!healthy.requires_recovery());
     // The failed write never became visible.
     assert_eq!(pool.inner.store.visible_seq(), visible);
-    assert!(pool.get_latest(&[group.prefix(&pool.snapshot(), false).unwrap(), b"row/new".to_vec()].concat()).unwrap().is_none());
+    assert!(
+        pool.get_latest(
+            &[
+                group.prefix(&pool.snapshot(), false).unwrap(),
+                b"row/new".to_vec()
+            ]
+            .concat()
+        )
+        .unwrap()
+        .is_none()
+    );
     let callbacks = Arc::new(AtomicUsize::new(0));
     for candidate in [&group, &alias] {
         let observed = callbacks.clone();
@@ -139,16 +189,25 @@ async fn o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_
         assert_eq!(retry.await.err().unwrap(), recovery_unknown());
     }
     assert_eq!(callbacks.load(Ordering::Relaxed), 0);
-    assert_eq!(alias_pool.group(group_id.clone()).await.err().unwrap(), recovery_unknown());
+    assert_eq!(
+        alias_pool.group(group_id.clone()).await.err().unwrap(),
+        recovery_unknown()
+    );
     // Nothing retried the sync.
     let syncs = fault
         .calls()
         .iter()
-        .filter(|call| call.op == FsOp::SyncData && call.path.starts_with(journal_dir(&dir)) && !call.ok)
+        .filter(|call| {
+            call.op == FsOp::SyncData && call.path.starts_with(journal_dir(&dir)) && !call.ok
+        })
         .count();
     assert_eq!(syncs, 1);
     independent
-        .transaction(meta(0), budget(), put_entry(0, b"value", b"healthy".to_vec()))
+        .transaction(
+            meta(0),
+            budget(),
+            put_entry(0, b"value", b"healthy".to_vec()),
+        )
         .await
         .unwrap();
     assert_eq!(get(&independent, b"value").await, b"healthy");
@@ -162,9 +221,21 @@ async fn o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_
     assert!(!pool.requires_recovery());
     let group = pool.retained_group(group_id).await.unwrap();
     assert_eq!(get(&group, b"row/original").await, b"original");
-    assert_eq!(group.applied_state(budget()).await.unwrap().unwrap().position, meta(0).position);
+    assert_eq!(
+        group
+            .applied_state(budget())
+            .await
+            .unwrap()
+            .unwrap()
+            .position,
+        meta(0).position
+    );
     let applied = group
-        .transaction(meta(1), budget(), put_entry(1, b"row/new", b"after-recovery".to_vec()))
+        .transaction(
+            meta(1),
+            budget(),
+            put_entry(1, b"row/new", b"after-recovery".to_vec()),
+        )
         .await
         .unwrap();
     assert_eq!(applied.as_slice(), 1u64.to_be_bytes());
@@ -269,7 +340,13 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     let config = SharedResourceConfig::default();
     assert_eq!((config.query_threads, config.control_threads), (1, 1));
     let resources = shared(config);
-    let pool = OltpPool::open_development_on(&dir.0, identity.clone(), resources.clone(), Arc::new(gated.clone())).unwrap();
+    let pool = OltpPool::open_development_on(
+        &dir.0,
+        identity.clone(),
+        resources.clone(),
+        Arc::new(gated.clone()),
+    )
+    .unwrap();
     let mut groups = Vec::new();
     for _ in 0..GROUPS {
         let group = pool.group(group_identity(&pool)).await.unwrap();
@@ -295,7 +372,11 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
                         0 => group.transaction(meta(round), budget(), work).await,
                         1 => group.log_transaction(budget(), work).await,
                         2 => group.log_transaction_metadata(budget(), work).await,
-                        _ => group.log_transaction_metadata_unsynced(budget(), work).await,
+                        _ => {
+                            group
+                                .log_transaction_metadata_unsynced(budget(), work)
+                                .await
+                        }
                     }
                     .unwrap();
                 }
@@ -337,8 +418,16 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     assert!(waiting.iter().all(|task| !task.is_finished()));
     let read = tokio::time::timeout(Duration::from_secs(5), get(&groups[20], b"state")).await;
     assert_eq!(read.expect("query read waited behind storage"), b"20/0/2");
-    let control = tokio::time::timeout(Duration::from_secs(5), groups[21].applied_state(budget())).await;
-    assert_eq!(control.expect("control read waited behind storage").unwrap().unwrap().position, meta(ROUNDS - 1).position);
+    let control =
+        tokio::time::timeout(Duration::from_secs(5), groups[21].applied_state(budget())).await;
+    assert_eq!(
+        control
+            .expect("control read waited behind storage")
+            .unwrap()
+            .unwrap()
+            .position,
+        meta(ROUNDS - 1).position
+    );
     gated.set(false);
     for task in waiting {
         task.await.unwrap();
@@ -348,11 +437,18 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     // keeps all of them (prefix durability across the pool).
     for (n, group) in groups.iter().enumerate() {
         group
-            .transaction(meta(ROUNDS), budget(), put_entry(ROUNDS, b"state", format!("{n}/final").into_bytes()))
+            .transaction(
+                meta(ROUNDS),
+                budget(),
+                put_entry(ROUNDS, b"state", format!("{n}/final").into_bytes()),
+            )
             .await
             .unwrap();
         group
-            .log_transaction_metadata_unsynced(budget(), put_entry(0, b"committed", format!("{n}/hint").into_bytes()))
+            .log_transaction_metadata_unsynced(
+                budget(),
+                put_entry(0, b"committed", format!("{n}/hint").into_bytes()),
+            )
             .await
             .unwrap();
         assert_eq!(group.write_stats().unsynced_applied_index, Some(ROUNDS));
@@ -369,7 +465,10 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     assert!(stats["journal_syncs"].as_u64().unwrap() > 0, "{stats}");
     assert!(stats["synced_commits"].as_u64().unwrap() > 0, "{stats}");
     assert!(stats["pools"].as_u64().unwrap() >= 1, "{stats}");
-    let ids: Vec<_> = groups.iter().map(|group| group.identity().clone()).collect();
+    let ids: Vec<_> = groups
+        .iter()
+        .map(|group| group.identity().clone())
+        .collect();
     fault.halt();
     drop(groups);
     drop(pool);
@@ -377,13 +476,23 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     let pool = reopen(&dir, &fault, identity, resources.clone()).unwrap();
     for (n, id) in ids.into_iter().enumerate() {
         let group = pool.retained_group(id).await.unwrap();
-        assert_eq!(get(&group, b"state").await, format!("{n}/final").into_bytes());
         assert_eq!(
-            group.applied_state(budget()).await.unwrap().unwrap().position,
+            get(&group, b"state").await,
+            format!("{n}/final").into_bytes()
+        );
+        assert_eq!(
+            group
+                .applied_state(budget())
+                .await
+                .unwrap()
+                .unwrap()
+                .position,
             meta(ROUNDS).position
         );
         let hint = group
-            .log_read(budget(), |view| view.get(b"committed").and_then(|v| v.ok_or_else(capacity)))
+            .log_read(budget(), |view| {
+                view.get(b"committed").and_then(|v| v.ok_or_else(capacity))
+            })
             .await
             .unwrap();
         assert_eq!(hint.as_slice(), format!("{n}/hint").as_bytes());
@@ -398,7 +507,8 @@ async fn o11_separate_pool_log_keeps_application_synced() {
     let first_dir = Dir::new();
     let second_dir = Dir::new();
     let identity = pool_identity();
-    let first = OltpPool::open_development(&first_dir.0, identity.clone(), resources.clone()).unwrap();
+    let first =
+        OltpPool::open_development(&first_dir.0, identity.clone(), resources.clone()).unwrap();
     let second = OltpPool::open_development(
         &second_dir.0,
         PoolIdentity {
@@ -415,7 +525,11 @@ async fn o11_separate_pool_log_keeps_application_synced() {
     assert!(!state.applies_deferred());
     for index in 0..4 {
         state
-            .transaction(meta(index), budget(), put_entry(index, b"row", b"v".to_vec()))
+            .transaction(
+                meta(index),
+                budget(),
+                put_entry(index, b"row", b"v".to_vec()),
+            )
             .await
             .unwrap();
     }
@@ -460,7 +574,11 @@ async fn o11_concurrent_groups_track_unsynced_applies_against_an_oracle() {
             let index = applied[n];
             tasks.push(tokio::spawn(async move {
                 group
-                    .transaction(meta(index), budget(), put_entry(index, b"row", index.to_be_bytes().to_vec()))
+                    .transaction(
+                        meta(index),
+                        budget(),
+                        put_entry(index, b"row", index.to_be_bytes().to_vec()),
+                    )
                     .await
                     .unwrap();
             }));
@@ -470,7 +588,10 @@ async fn o11_concurrent_groups_track_unsynced_applies_against_an_oracle() {
             task.await.unwrap();
         }
         for &n in &chosen {
-            assert_eq!(groups[n].write_stats().unsynced_applied_index, Some(applied[n] - 1));
+            assert_eq!(
+                groups[n].write_stats().unsynced_applied_index,
+                Some(applied[n] - 1)
+            );
         }
         assert!(pool.has_unsynced_writes());
         // A synced append of some group, or an explicit sync, covers them all.
@@ -556,12 +677,20 @@ fn ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched() {
         pool_format_version: 1,
         ..identity.clone()
     };
-    fs::write(format_one.0.join(POOL_MANIFEST), serde_json::to_vec(&old).unwrap()).unwrap();
+    fs::write(
+        format_one.0.join(POOL_MANIFEST),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
     let raw = Dir::new();
     rocksdb_files(&raw.0);
     let legacy = Dir::new();
     rocksdb_files(&legacy.0);
-    fs::write(legacy.0.join("NABEDRA_OLTP.json"), b"{\"engine\":\"oltp\",\"store_format_version\":2}").unwrap();
+    fs::write(
+        legacy.0.join("NABEDRA_OLTP.json"),
+        b"{\"engine\":\"oltp\",\"store_format_version\":2}",
+    )
+    .unwrap();
 
     for dir in [&format_one, &raw, &legacy] {
         let before = tree(&dir.0);
@@ -569,8 +698,16 @@ fn ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched() {
             .err()
             .expect("an old store was opened");
         assert_eq!(error.code, ErrorCode::StorageUnavailable);
-        assert!(error.message.contains("unsupported store format"), "{}", error.message);
-        assert!(error.message.contains(&dir.0.display().to_string()), "{}", error.message);
+        assert!(
+            error.message.contains("unsupported store format"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains(&dir.0.display().to_string()),
+            "{}",
+            error.message
+        );
         assert_eq!(tree(&dir.0), before, "{} changed", dir.0.display());
     }
     // A format 1 identity is not a valid identity for opening either.
@@ -578,12 +715,28 @@ fn ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched() {
     // A RocksDB directory inside a format 2 pool's store path is refused by the engine.
     let nested = Dir::new();
     fs::create_dir_all(&nested.0).unwrap();
-    fs::write(nested.0.join(POOL_MANIFEST), serde_json::to_vec(&identity).unwrap()).unwrap();
+    fs::write(
+        nested.0.join(POOL_MANIFEST),
+        serde_json::to_vec(&identity).unwrap(),
+    )
+    .unwrap();
     rocksdb_files(&nested.0.join("kv"));
     let before = tree(&nested.0);
-    let error = OltpPool::open_development(&nested.0, identity, resources).err().unwrap();
-    assert!(error.message.contains("unsupported store format"), "{}", error.message);
-    assert!(error.message.contains(&nested.0.join("kv").display().to_string()), "{}", error.message);
+    let error = OltpPool::open_development(&nested.0, identity, resources)
+        .err()
+        .unwrap();
+    assert!(
+        error.message.contains("unsupported store format"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains(&nested.0.join("kv").display().to_string()),
+        "{}",
+        error.message
+    );
     assert_eq!(tree(&nested.0), before);
 }
 
@@ -591,8 +744,13 @@ fn ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched() {
 fn damage_journal_value(dir: &Dir, fault: &FaultFs, needle: &[u8]) {
     for path in fault.list(&journal_dir(dir)).unwrap() {
         let bytes = fault.contents(&path).unwrap();
-        if let Some(at) = bytes.windows(needle.len()).position(|window| window == needle) {
-            fault.flip_bit(&path, (at + needle.len() / 2) as u64, 3).unwrap();
+        if let Some(at) = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+        {
+            fault
+                .flip_bit(&path, (at + needle.len() / 2) as u64, 3)
+                .unwrap();
             return;
         }
     }
@@ -633,14 +791,23 @@ async fn o06_ns07_damaged_group_is_quarantined_reported_and_never_started() {
     assert_eq!(pool.quarantined_groups(), vec![ids[3].group_id]);
     assert_eq!(resources.storage_stats().quarantined_groups, 1);
     let refused = pool.retained_group(ids[3].clone()).await.err().unwrap();
-    assert!(refused.message.contains("quarantined"), "{}", refused.message);
+    assert!(
+        refused.message.contains("quarantined"),
+        "{}",
+        refused.message
+    );
     for (n, id) in ids.iter().enumerate().filter(|(n, _)| *n != 3) {
         let group = pool.retained_group(id.clone()).await.unwrap();
         let entry = group
-            .log_read(budget(), |view| view.get(b"entry").and_then(|v| v.ok_or_else(capacity)))
+            .log_read(budget(), |view| {
+                view.get(b"entry").and_then(|v| v.ok_or_else(capacity))
+            })
             .await
             .unwrap();
-        assert_eq!(entry.as_slice(), format!("damage-target-{n:02}-0123456789abcdef").as_bytes());
+        assert_eq!(
+            entry.as_slice(),
+            format!("damage-target-{n:02}-0123456789abcdef").as_bytes()
+        );
     }
     drop(pool);
 
@@ -707,17 +874,24 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
         tasks.push(tokio::spawn(async move {
             for row in 0..rows_per_pool as u64 {
                 group
-                    .log_transaction(TransactionBudget { batch_bytes: 64 << 10, ..budget() }, move |tx| {
-                        tx.put(&row.to_be_bytes(), &vec![row as u8; 8 << 10])?;
-                        Ok(Transition::Commit(tx.copy_output(b"")?))
-                    })
+                    .log_transaction(
+                        TransactionBudget {
+                            batch_bytes: 64 << 10,
+                            ..budget()
+                        },
+                        move |tx| {
+                            tx.put(&row.to_be_bytes(), &vec![row as u8; 8 << 10])?;
+                            Ok(Transition::Commit(tx.copy_output(b"")?))
+                        },
+                    )
                     .await
                     .unwrap();
                 if row % 7 == 0 && row > 0 {
                     let probe = row / 2;
                     let value = group
                         .log_read(budget(), move |view| {
-                            view.get(&probe.to_be_bytes()).and_then(|v| v.ok_or_else(capacity))
+                            view.get(&probe.to_be_bytes())
+                                .and_then(|v| v.ok_or_else(capacity))
                         })
                         .await
                         .unwrap();
@@ -733,7 +907,8 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
         for row in (0..rows_per_pool as u64).step_by(13) {
             let value = group
                 .log_read(budget(), move |view| {
-                    view.get(&row.to_be_bytes()).and_then(|v| v.ok_or_else(capacity))
+                    view.get(&row.to_be_bytes())
+                        .and_then(|v| v.ok_or_else(capacity))
                 })
                 .await
                 .unwrap();
@@ -743,7 +918,10 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
     sampling.store(false, Ordering::Relaxed);
     sampler.join().unwrap();
     let peak = peak.load(Ordering::Relaxed);
-    let flushed: u64 = pools.iter().map(|pool| pool.inner.store.stats().flush_bytes).sum();
+    let flushed: u64 = pools
+        .iter()
+        .map(|pool| pool.inner.store.stats().flush_bytes)
+        .sum();
     eprintln!(
         "ns10 scaled: loaded {} MiB into 2 pools, memtable peak {} KiB of {} KiB, flushed {} MiB",
         (2 * rows_per_pool * value_bytes) >> 20,
@@ -752,7 +930,10 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
         flushed >> 20
     );
     // A writer may overshoot by the batch it inserts before the next stall check.
-    assert!(peak <= config.write_buffer_bytes + (128 << 10), "memtables used {peak}");
+    assert!(
+        peak <= config.write_buffer_bytes + (128 << 10),
+        "memtables used {peak}"
+    );
     assert!(flushed > 0);
     assert_eq!(resources.scheduler().usage(), baseline);
     assert_eq!(resources.control_bytes_used(), 0);
@@ -764,7 +945,8 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
 #[test]
 fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
     const FLAG: &str = "NABEDRA_NS6_THREAD_PROBE";
-    const NAME: &str = "oltp::pool::tests::kv::o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool";
+    const NAME: &str =
+        "oltp::pool::tests::kv::o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool";
     if std::env::var_os(FLAG).is_none() {
         for background in ["2", "5"] {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -772,7 +954,10 @@ fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
                 .env(FLAG, background)
                 .status()
                 .unwrap();
-            assert!(status.success(), "O05 probe child failed with background={background}");
+            assert!(
+                status.success(),
+                "O05 probe child failed with background={background}"
+            );
         }
         return;
     }
@@ -827,7 +1012,8 @@ fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
     let identity = pool_identity();
     let first_dir = Dir::new();
     let second_dir = Dir::new();
-    let first = OltpPool::open_development(&first_dir.0, identity.clone(), resources.clone()).unwrap();
+    let first =
+        OltpPool::open_development(&first_dir.0, identity.clone(), resources.clone()).unwrap();
     let after_first = count();
     let second = OltpPool::open_development(
         &second_dir.0,

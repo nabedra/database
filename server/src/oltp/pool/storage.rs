@@ -6,8 +6,7 @@ use super::{PoolInner, failure, recovery_unknown};
 use crate::protocol::{ErrorCode, ProtocolError};
 use bytes::Bytes;
 use nabedra_kv::{
-    Background, BlockCache, Commit, MemtableBudget, Options, Seq, StoreStats,
-    fs::Fs,
+    Background, BlockCache, Commit, MemtableBudget, Options, Seq, StoreStats, fs::Fs,
 };
 use serde::Serialize;
 use std::{
@@ -218,11 +217,7 @@ impl RawIter {
         upper: &[u8],
         fill_cache: bool,
     ) -> Self {
-        Self(snapshot.iter(
-            Bound::Included(lower),
-            Bound::Excluded(upper),
-            fill_cache,
-        ))
+        Self(snapshot.iter(Bound::Included(lower), Bound::Excluded(upper), fill_cache))
     }
     pub(super) fn seek(&mut self, target: &[u8]) {
         self.0.seek(target);
@@ -276,4 +271,3 @@ pub(super) fn legacy_store_marker(path: &Path) -> Option<String> {
     }
     None
 }
-

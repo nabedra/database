@@ -32,7 +32,11 @@ pub struct NativeThreadBudget {
 }
 impl NativeThreadBudget {
     /// A budget for one store (the legacy engine, deleted by NS8).
-    pub(super) fn new(query: usize, control: usize, background: i32) -> Result<Self, ProtocolError> {
+    pub(super) fn new(
+        query: usize,
+        control: usize,
+        background: i32,
+    ) -> Result<Self, ProtocolError> {
         Self::with_pools(query, control, background, 1)
     }
     pub(super) fn with_pools(

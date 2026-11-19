@@ -46,8 +46,12 @@ impl GroupStore {
                     return Err(recovery_unknown());
                 }
                 let log_prefix = group_key(group.identity().group_id, b'l', &[]);
-                let mut log =
-                    RawIter::bounded(tx.read.snapshot, &log_prefix, &prefix_end(&log_prefix), true);
+                let mut log = RawIter::bounded(
+                    tx.read.snapshot,
+                    &log_prefix,
+                    &prefix_end(&log_prefix),
+                    true,
+                );
                 log.seek(&log_prefix);
                 if log.key().is_some_and(|key| key.starts_with(&log_prefix)) {
                     return Err(recovery_unknown());

@@ -15,6 +15,7 @@ use crate::{
         types::{GroupIdentity, ReplicaMember, Text},
     },
 };
+use nabedra_kv::fs::{FaultFs, Fs};
 use openraft::{
     RaftLogReader,
     entry::RaftEntry,
@@ -23,12 +24,11 @@ use openraft::{
     raft::{AppendEntriesRequest, AppendResult, SnapshotResponse, VoteRequest, VoteResponse},
     storage::{IOFlushed, RaftLogStorage},
 };
-use nabedra_kv::fs::{FaultFs, Fs};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -369,9 +369,8 @@ async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
     let fs = || -> Arc<dyn Fs> { Arc::new(fault.clone()) };
     {
         // Inspect storage before Raft replays anything.
-        let pool =
-            OltpPool::open_development_on(&path, layout.pool.clone(), shared.clone(), fs())
-                .unwrap();
+        let pool = OltpPool::open_development_on(&path, layout.pool.clone(), shared.clone(), fs())
+            .unwrap();
         let store = pool.retained_group(layout.group.clone()).await.unwrap();
         let applied = store.applied_state(BUDGET).await.unwrap().unwrap();
         assert!(
@@ -411,10 +410,7 @@ async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
         .await
         .unwrap();
     assert_eq!(node.count().await, commands);
-    assert_eq!(
-        read_markers(&node.store, 0..commands).await,
-        commands
-    );
+    assert_eq!(read_markers(&node.store, 0..commands).await, commands);
     // A new write still applies exactly once after the replay.
     node.propose_all(commands..commands + 1).await;
     assert_eq!(node.count().await, commands + 1);
