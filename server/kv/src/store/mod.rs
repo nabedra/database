@@ -27,6 +27,7 @@
 mod background;
 mod budget;
 mod journal_gc;
+mod level_iter;
 mod read;
 mod snapshots;
 #[cfg(test)]
@@ -328,7 +329,6 @@ pub(crate) struct Inner {
     l0_lock: Mutex<()>,
     damage_hook: RwLock<Option<DamageHook>>,
     pending_damage: Mutex<Vec<Damage>>,
-    pending_release: Mutex<Vec<(Bytes, Seq)>>,
     counters: Counters,
     recovery_ms: AtomicU64,
     lock_file: Mutex<Option<FsLock>>,
@@ -502,7 +502,6 @@ impl Store {
             l0_lock: Mutex::new(()),
             damage_hook: RwLock::new(None),
             pending_damage: Mutex::new(Vec::new()),
-            pending_release: Mutex::new(Vec::new()),
             counters: Counters::default(),
             recovery_ms: AtomicU64::new(0),
             lock_file: Mutex::new(Some(opened.lock)),
@@ -685,9 +684,13 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes everything under `prefix` and, once that is durable and flushed, lifts
-    /// its quarantine and drops its damaged runs (plan section 3, rule 4).
-    pub fn release_scope(&self, prefix: &[u8]) -> Result<Commit> {
+    /// Deletes everything under `prefix`, makes that durable, flushes past it, records the
+    /// release in the manifest, lifts the scope's quarantine and drops its damaged runs
+    /// (plan section 3, rule 4). Returns the release's sequence once all of that is
+    /// done, so writes under `prefix` after it returns survive any crash (RV-KV2
+    /// finding 8). Blocks on a sync and a flush: must not be called on an async runtime
+    /// thread.
+    pub fn release_scope(&self, prefix: &[u8]) -> Result<Seq> {
         self.inner.check_usable()?;
         let end = prefix_successor(prefix).ok_or(Error::InvalidArgument(
             "release_scope needs a bounded prefix",
@@ -695,13 +698,14 @@ impl Store {
         let mut batch = WriteBatch::new();
         batch.set_scope(prefix);
         batch.delete_range(prefix, &end);
-        let commit = self
+        let seq = self
             .inner
             .journal()
-            .submit(batch, Durability::Sync, Box::new(()))?;
-        lock(&self.inner.pending_release).push((Bytes::copy_from_slice(prefix), commit.seq()));
-        self.inner.schedule_compaction();
-        Ok(commit)
+            .submit(batch, Durability::Sync, Box::new(()))?
+            .wait()?;
+        self.inner
+            .finish_release(Bytes::copy_from_slice(prefix), seq)?;
+        Ok(seq)
     }
 
     /// Called for damage found at run time (G2 blocks, G3 values). Store-wide damage also
@@ -810,14 +814,13 @@ impl Job for Inner {
             Err(_) => None,
         };
         self.end_job();
-        let releases_waiting = !lock(&self.pending_release).is_empty();
         let pending_damage = !lock(&self.pending_damage).is_empty();
         match result {
             Ok(true) => {
                 self.schedule_compaction();
                 None
             }
-            Ok(false) if releases_waiting || pending_damage => {
+            Ok(false) if pending_damage => {
                 self.compaction_queued.store(true, Ordering::Release);
                 Some(Duration::from_millis(10))
             }
@@ -1161,12 +1164,19 @@ impl Inner {
         let rate = self.levels.delayed_write_rate.max(1);
         let cost = (bytes as u64).saturating_mul(1_000_000_000) / rate;
         let now = self.epoch.elapsed().as_nanos() as u64;
-        let prev = self
-            .pace_until_ns
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |until| {
-                Some(until.max(now).saturating_add(cost))
-            })
-            .unwrap_or(now);
+        let mut prev = self.pace_until_ns.load(Ordering::Acquire);
+        loop {
+            let next = prev.max(now).saturating_add(cost);
+            match self.pace_until_ns.compare_exchange_weak(
+                prev,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
         let until = prev.max(now).saturating_add(cost);
         let delay = until - now;
         if delay < 1_000_000 {
@@ -1668,7 +1678,7 @@ impl Inner {
         Ok(())
     }
 
-    /// Writes quarantines found at run time and completed releases to the manifest.
+    /// Writes quarantines found at run time whose immediate edit failed.
     fn persist_pending(&self) -> Result<()> {
         let damage: Vec<Damage> = std::mem::take(&mut *lock(&self.pending_damage));
         if !damage.is_empty() {
@@ -1684,56 +1694,38 @@ impl Inner {
                 return Err(e);
             }
         }
-        let releases: Vec<(Bytes, Seq)> = std::mem::take(&mut *lock(&self.pending_release));
-        if releases.is_empty() {
-            return Ok(());
-        }
-        let durable = self.journal().durable_seq();
-        let (ready, waiting): (Vec<_>, Vec<_>) =
-            releases.into_iter().partition(|(_, seq)| *seq <= durable);
-        lock(&self.pending_release).extend(waiting);
-        if ready.is_empty() {
-            return Ok(());
-        }
-        // The release must be flushed, so a later replay never meets the damaged
-        // records of the scope again.
-        let max_seq = ready.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        Ok(())
+    }
+
+    /// The durable part of [`Store::release_scope`]: once the release's range delete at
+    /// `seq` is durable, flush past it (so a later replay never meets the scope's
+    /// damaged records again), then record the release, drop the scope's quarantined
+    /// runs and lift its quarantine.
+    fn finish_release(&self, scope: Bytes, seq: Seq) -> Result<()> {
         let flushed = lock(&self.vs).state.flushed_seq;
-        if flushed < max_seq {
+        if flushed < seq {
             self.freeze_active();
-            if let Err(e) = self.flush_imms() {
-                lock(&self.pending_release).extend(ready);
-                return Err(e);
-            }
+            self.flush_imms()?;
         }
         let mut vs = lock(&self.vs);
-        let mut dropped = Vec::new();
-        for (scope, _) in &ready {
-            dropped.extend(
-                vs.state
-                    .quarantined_runs
-                    .iter()
-                    .filter(|(_, s)| *s == scope)
-                    .map(|(&id, _)| id),
-            );
-        }
-        if let Err(e) = self.log_edit(
+        let dropped: Vec<u64> = vs
+            .state
+            .quarantined_runs
+            .iter()
+            .filter(|(_, s)| **s == scope)
+            .map(|(&id, _)| id)
+            .collect();
+        self.log_edit(
             &mut vs,
             VersionEdit {
-                released: ready.clone(),
+                released: vec![(scope.clone(), seq)],
                 dropped_quarantined_runs: dropped.clone(),
                 ..VersionEdit::default()
             },
-        ) {
-            drop(vs);
-            lock(&self.pending_release).extend(ready);
-            return Err(e);
-        }
+        )?;
         drop(vs);
         self.remove_runs(dropped);
-        for (scope, _) in ready {
-            self.quarantine.remove(&scope);
-        }
+        self.quarantine.remove(&scope);
         Ok(())
     }
 

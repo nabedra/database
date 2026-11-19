@@ -154,8 +154,8 @@ fn ns07_g1_group_record_damage_quarantines_only_that_group() {
     assert!(is_corruption(&s.snapshot().get(&group_key(1, 1))));
 
     // Release: the group's keys are deleted and the quarantine is lifted.
-    s.release_scope(&g1).unwrap().wait().unwrap();
-    wait_until("release", || s.quarantined().is_empty());
+    s.release_scope(&g1).unwrap();
+    assert!(s.quarantined().is_empty());
     assert_eq!(s.snapshot().get(&group_key(1, 1)).unwrap(), None);
     // A new replica of the group can write under the same prefix.
     write_kv(
@@ -166,6 +166,23 @@ fn ns07_g1_group_record_damage_quarantines_only_that_group() {
         false,
         Durability::Sync,
     );
+    // RV-KV2 finding 8: a crash right after release_scope returned and a synced write
+    // under the prefix completed must keep both (the release is recorded already, so
+    // replay does not skip the scope's later records as G1).
+    let cut = image.crash();
+    let opened = Store::open(&dir, options(&cut, &bg)).unwrap();
+    assert!(opened.quarantined.is_empty(), "{:?}", opened.quarantined);
+    assert_eq!(
+        opened
+            .store
+            .snapshot()
+            .get(&group_key(1, 9))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        val("g1-new")
+    );
+    drop(opened);
     s.close().unwrap();
     let opened = Store::open(&dir, options(&image.crash(), &bg)).unwrap();
     assert!(opened.quarantined.is_empty(), "{:?}", opened.quarantined);
@@ -362,8 +379,8 @@ fn ns07_g2_run_footer_damage_at_open() {
         drop(opened);
         assert_eq!(files_under(&fs, &dir.join("runs")).len(), 1);
         let s = open(&dir, options(&fs, &bg));
-        s.release_scope(&group_prefix(1)).unwrap().wait().unwrap();
-        wait_until("release", || s.quarantined().is_empty());
+        s.release_scope(&group_prefix(1)).unwrap();
+        assert!(s.quarantined().is_empty());
         assert!(!files_under(&fs, &dir.join("runs")).contains(&runs[0]));
     }
 }

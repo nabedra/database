@@ -24,6 +24,7 @@ use crate::types::{Kind, Locator, Seq};
 use crate::version::{RunFile, SuperVersion};
 
 use super::Inner;
+use super::level_iter::LevelIter;
 use super::snapshots::Registered;
 
 /// A consistent read view. Cheap to clone; a clone registers the sequence again.
@@ -229,7 +230,11 @@ impl Snapshot {
             Bound::Included(k) | Bound::Excluded(k) => Some(k),
             Bound::Unbounded => None,
         };
-        for file in self.sv.version.runs().filter(|r| r.overlaps(lo, hi)) {
+        // L0 runs overlap each other: one child each (they are pinned open anyway).
+        for file in self.sv.version.levels[0]
+            .iter()
+            .filter(|r| r.overlaps(lo, hi))
+        {
             let run = match file.pinned() {
                 Some(run) => Ok(run.clone()),
                 None => self.inner.table_cache.get(file.id()),
@@ -242,6 +247,43 @@ impl Snapshot {
                     children.push(Box::new(run.iter(fill_cache)));
                 }
                 Err(e) => children.push(Box::new(FailedIter(e))),
+            }
+        }
+        // Deeper levels: one lazy child per level, which opens one run at a time. Range
+        // tombstones are gathered up front from each run's cached set (a run whose set is
+        // not cached yet is opened once through the table cache, and not held).
+        for level in &self.sv.version.levels[1..] {
+            let runs: Vec<Arc<RunFile>> = level
+                .iter()
+                .filter(|r| r.overlaps(lo, hi))
+                .cloned()
+                .collect();
+            if runs.is_empty() {
+                continue;
+            }
+            let mut failed = None;
+            for file in &runs {
+                let set = match file.cached_tombstones() {
+                    Some(set) => set,
+                    None => match self.inner.table_cache.get(file.id()) {
+                        Ok(run) => run_tombstones(file, &run),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    },
+                };
+                if !set.is_empty() {
+                    tombstones.add(set);
+                }
+            }
+            match failed {
+                Some(e) => children.push(Box::new(FailedIter(e))),
+                None => children.push(Box::new(LevelIter::new(
+                    self.inner.clone(),
+                    runs,
+                    fill_cache,
+                ))),
             }
         }
         let resolver: Arc<dyn ValueResolver> =

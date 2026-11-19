@@ -276,6 +276,11 @@ impl RunFile {
             .clone()
     }
 
+    /// The fragmented range tombstones, if a reader loaded them already.
+    pub fn cached_tombstones(&self) -> Option<Arc<FragmentedRangeTombstones>> {
+        self.handle.tombstones.get().cloned()
+    }
+
     /// Keeps `run` open for as long as this object lives (L0 runs).
     pub fn pin(&self, run: Arc<Run>) {
         let _ = self.pinned.set(run);
