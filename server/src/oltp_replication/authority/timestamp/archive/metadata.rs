@@ -1,6 +1,7 @@
 //! Source allocations and maintenance identities remain historical metadata.
 //! They never enter live COMMIT_PREFIX or authorize a target Resolve proof.
 use super::super::*;
+use super::point;
 use crate::oltp::{
     backup::{
         history::{HistoryFrame, MetadataImage},
@@ -9,6 +10,7 @@ use crate::oltp::{
     mvcc::{MvccKey, index::IndexRecord},
     pool::ByteClass,
 };
+use crate::oltp_replication::authority::status::TimestampPointProjection;
 use crate::oltp_replication::authority::status::identity::{
     RestoredHistoryOrigin, transaction::archive_images::MetadataArchivePage,
 };
@@ -22,6 +24,11 @@ enum Historical {
         key: Vec<u8>,
         allocation: CommitAllocation,
     },
+    Point {
+        origin: RestoredHistoryOrigin,
+        source: GroupIdentity,
+        proof: Box<TimestampPointProjection>,
+    },
     Maintenance {
         origin: RestoredHistoryOrigin,
         source: GroupIdentity,
@@ -29,13 +36,34 @@ enum Historical {
         pin: StoragePin,
     },
 }
+fn restored_point_key(source: &GroupIdentity, proof: &TimestampPointProjection) -> Vec<u8> {
+    [
+        HISTORY,
+        b"point/",
+        source.cluster_id.as_bytes(),
+        source.group_id.as_bytes(),
+        point::image_key(proof).as_slice(),
+    ]
+    .concat()
+}
+
 impl Historical {
-    fn timestamp(&self) -> CommitTs {
+    fn timestamp(&self) -> Option<CommitTs> {
         match self {
-            Self::Allocation { allocation, .. } => allocation.stamp.commit_ts,
-            Self::Maintenance { pin, .. } => pin.read_ts,
+            Self::Allocation { allocation, .. } => Some(allocation.stamp.commit_ts),
+            Self::Point { proof, .. } => point::commit_ts(proof),
+            Self::Maintenance { pin, .. } => Some(pin.read_ts),
         }
     }
+    fn validate_storage_key(&self, key: &[u8]) -> Result<(), ProtocolError> {
+        if let Self::Point { source, proof, .. } = self
+            && key != restored_point_key(source, proof)
+        {
+            return Err(unknown());
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ProtocolError> {
         let (origin, source) = match self {
             Self::Allocation {
@@ -52,6 +80,18 @@ impl Historical {
                             allocation.permit.statement().txn,
                         )
                 {
+                    return Err(unknown());
+                }
+                (origin, source)
+            }
+            Self::Point {
+                origin,
+                source,
+                proof,
+            } => {
+                let locator = proof.completion().decision().locator();
+                proof.validate_for(locator)?;
+                if &locator.binding.timestamps_group != source {
                     return Err(unknown());
                 }
                 (origin, source)
@@ -78,7 +118,7 @@ impl Historical {
         if source.cluster_id != origin.source_cluster
             || origin.restore_id.is_nil()
             || origin.source_archive.is_nil()
-            || self.timestamp() > origin.through_cut
+            || self.timestamp().is_some_and(|ts| ts > origin.through_cut)
         {
             return Err(unknown());
         }
@@ -122,7 +162,7 @@ impl TimestampHandle {
                         let Some(row) = view.first_from(b"ts/", &cursor)? else {
                             break;
                         };
-                        let commit_ts = if row.key().starts_with(COMMIT_PREFIX) {
+                        let visible = if row.key().starts_with(COMMIT_PREFIX) {
                             if row.value().len() > 16 << 10 {
                                 return Err(unknown());
                             }
@@ -138,7 +178,7 @@ impl TimestampHandle {
                             {
                                 return Err(unknown());
                             }
-                            Some(allocation.stamp.commit_ts)
+                            Some(Some(allocation.stamp.commit_ts))
                         } else if row.key().starts_with(HISTORY) {
                             if row.value().len() > 64 << 10 {
                                 return Err(unknown());
@@ -146,11 +186,13 @@ impl TimestampHandle {
                             let history: Historical =
                                 serde_json::from_slice(row.value()).map_err(|_| unknown())?;
                             history.validate()?;
+                            history.validate_storage_key(row.key())?;
                             Some(history.timestamp())
                         } else {
                             None
                         };
-                        if let Some(commit_ts) = commit_ts.filter(|ts| *ts <= cut) {
+                        if let Some(commit_ts) = visible.filter(|ts| ts.is_none_or(|ts| ts <= cut))
+                        {
                             let cost = row
                                 .value()
                                 .len()
@@ -170,7 +212,7 @@ impl TimestampHandle {
                             items.push(MetadataImage {
                                 group: group.clone(),
                                 key: row.key().to_vec(),
-                                commit_ts: Some(commit_ts),
+                                commit_ts,
                                 value: std::str::from_utf8(row.value())
                                     .map_err(|_| unknown())?
                                     .to_owned(),
@@ -267,11 +309,43 @@ pub(crate) async fn install_metadata(
                     ]
                     .concat();
                     tx.put_serialized(&key, &history)?;
+                } else if image.key.starts_with(point::POINT_IMAGE) {
+                    if image.value.len() > point::MAX_POINT_IMAGE_BYTES {
+                        return Err(unknown());
+                    }
+                    let proof: TimestampPointProjection =
+                        serde_json::from_str(&image.value).map_err(|_| unknown())?;
+                    if image.key != point::image_key(&proof)
+                        || image.commit_ts != point::commit_ts(&proof)
+                    {
+                        return Err(unknown());
+                    }
+                    let key = restored_point_key(&image.group, &proof);
+                    let history = Historical::Point {
+                        origin,
+                        source: image.group.clone(),
+                        proof: Box::new(proof),
+                    };
+                    history.validate()?;
+                    if let Some(previous) = load::<Historical>(tx, &key)? {
+                        previous.validate()?;
+                        // Delta segments can repeat a point witness. Keep the
+                        // first source archive and require the same exact proof.
+                        if matches!((&previous, &history),
+                            (Historical::Point { source: old, proof: a, .. },
+                             Historical::Point { source: new, proof: b, .. }) if old == new && a == b)
+                        {
+                            return Ok(());
+                        }
+                        return Err(unknown());
+                    }
+                    tx.put_serialized(&key, &history)?;
                 } else if image.key.starts_with(HISTORY) {
                     let history: Historical =
                         serde_json::from_str(&image.value).map_err(|_| unknown())?;
                     history.validate()?;
-                    if image.commit_ts != Some(history.timestamp()) {
+                    history.validate_storage_key(&image.key)?;
+                    if image.commit_ts != history.timestamp() {
                         return Err(unknown());
                     }
                     tx.put(&image.key, image.value.as_bytes())?;
@@ -347,9 +421,7 @@ pub(in crate::oltp_replication::authority::timestamp) fn has_restored_maintenanc
     tx: &mut GroupTransaction<'_>,
     owner: MaintenanceOwnerRef,
 ) -> Result<bool, ProtocolError> {
-    use crate::oltp::mvcc::store::index::{
-        RESTORED_INDEX_CLOSURE_TSO, restored_index_closure_key,
-    };
+    use crate::oltp::mvcc::store::index::{RESTORED_INDEX_CLOSURE_TSO, restored_index_closure_key};
     let closure = restored_index_closure_key(RESTORED_INDEX_CLOSURE_TSO, &owner)?;
     let identity = [HISTORY, b"maintenance/", maintenance_key(&owner).as_slice()].concat();
     Ok(tx.pinned(&closure)?.is_some() || tx.pinned(&identity)?.is_some())

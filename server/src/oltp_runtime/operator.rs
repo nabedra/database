@@ -5,7 +5,7 @@ use super::worker_runtime::WorkerRuntime;
 use crate::{
     oltp::pool::ExecutionClass,
     oltp_replication::{
-        authority::control::{ApiEnrollment, ControlReply, DataWorkerIntent, EksReplacementAction, RestartIntent, SignedEksReplacement, WorkerDrainIntent},
+        authority::control::{ApiEnrollment, ControlReply, DataWorkerIntent, EksReplacementAction, RestartIntent, ScopedQueueCapability, SignedEksReplacement, WorkerDrainIntent},
         types::*,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
@@ -27,6 +27,21 @@ struct Enrollment {
     expected: Option<WorkerIdentity>,
     next: ApiEnrollment,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedAdmissionChange {
+    expected: ScopedQueueCapability,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedTransfer {
+    group_id: Uuid,
+    next_owner: WorkerIdentity,
+    replaces: Option<Uuid>,
+}
+
 impl WorkerRuntime {
     pub(super) async fn enroll_api_admin(
         self: Arc<Self>,
@@ -60,13 +75,20 @@ impl WorkerRuntime {
                     serde_json::from_str::<EksReplacementAction>(request.payload.get()).map_err(|_| invalid())?;
                 } else if request.operation == "worker.replacement.apply" {
                     serde_json::from_str::<SignedEksReplacement>(request.payload.get()).map_err(|_| invalid())?;
+                } else if request.operation == "queue.scoped.admission" {
+                    serde_json::from_str::<ScopedAdmissionChange>(request.payload.get()).map_err(|_| invalid())?;
+                } else if request.operation == "queue.scoped.transfer" {
+                    let transfer: ScopedTransfer = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    if transfer.group_id.is_nil() || transfer.next_owner.validate().is_err() {
+                        return Err(invalid());
+                    }
                 } else if Self::validate_growth_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_archive_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_split_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_index_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_pool_drain_admin(&request.operation, request.payload.get())? {
                 } else if Self::validate_placement_admin(&request.operation, request.payload.get())? {
-                } else if !matches!(request.operation.as_str(), "cluster.connection" | "query.statistics" | "worker.drain.status" | "worker.stop_permit" | "worker.replacement.status")
+                } else if !matches!(request.operation.as_str(), "cluster.connection" | "query.statistics" | "worker.drain.status" | "worker.stop_permit" | "worker.replacement.status" | "queue.scoped.status")
                     || request.payload.get().trim() != "{}"
                 {
                     return Err(invalid());
@@ -83,6 +105,37 @@ impl WorkerRuntime {
         }
         if request.operation == "query.statistics" {
             return self.query_statistics_admin(request.request_id).await;
+        }
+        if request.operation.starts_with("queue.scoped.") {
+            let control = self.scoped_operator_client()?;
+            return match request.operation.as_str() {
+                "queue.scoped.status" => Ok(response::encode_success(
+                    request.request_id, &control.scoped_queue_capability().await?, false,
+                )),
+                "queue.scoped.admission" => {
+                    let payload: ScopedAdmissionChange =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    control.set_scoped_queue_admission(
+                        request.request_id, payload.expected, payload.enabled,
+                    ).await?;
+                    Ok(response::encode_success(
+                        request.request_id, &control.scoped_queue_capability().await?, true,
+                    ))
+                }
+                "queue.scoped.transfer" => {
+                    let payload: ScopedTransfer =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    let previous = control.scoped_queue_predecessor(payload.group_id).await?
+                        .ok_or_else(|| ProtocolError::new(
+                            ErrorCode::NotFound, "scoped queue placement unavailable", Outcome::NotApplied,
+                        ))?;
+                    let transfer = control.begin_scoped_queue_transfer(
+                        request.request_id, previous, payload.next_owner, payload.replaces,
+                    ).await?;
+                    Ok(response::encode_success(request.request_id, &transfer, true))
+                }
+                _ => Err(invalid()),
+            };
         }
         if request.operation == "worker.restart.prepare" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;

@@ -155,11 +155,14 @@ function validateOltp(value: unknown): JsonObject {
   }
   listen(config.bind, config.tls)
 
-  const basic = fields(config.topology, ["mode"], ["data_dir", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers"])
+  const basic = fields(config.topology, ["mode"], ["data_dir", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers", "scoped_oltp"])
   if (basic.mode === "local") {
     text(fields(basic, ["mode", "data_dir"]).data_dir)
   } else if (basic.mode === "remote") {
-    const topology = fields(basic, ["mode", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers"])
+    const topology = fields(basic, ["mode", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers"], ["scoped_oltp"])
+    if ("scoped_oltp" in topology && typeof topology.scoped_oltp !== "boolean") {
+      throw new ConfigError("scoped_oltp must be a boolean")
+    }
     for (const key of ["cluster_id", "control_group_id"]) validateUuid(topology[key], false)
     for (const path of Object.values(fields(topology.worker_tls, ["cert_file", "key_file", "ca_file"]))) text(path)
     const api = fields(topology.enrollment, ["database", "enrollment"])

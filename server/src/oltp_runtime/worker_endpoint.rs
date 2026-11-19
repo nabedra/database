@@ -2,6 +2,7 @@
 //! listener. Application operations are admitted and executed by WorkerRuntime
 //! under the durable Control/TSO/Status authority.
 use super::replica::*;
+use crate::oltp_replication::authority::timestamp::ScopedTerminalStatement;
 use crate::{
     oltp::pool::{ByteClass, ExecutionClass, ScratchLease, WorkerSharedResources},
     oltp_replication::{multiplex::*, owned::serialized_digest, service_rpc::ReadGrant, types::*},
@@ -14,6 +15,9 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use uuid::Uuid;
+
+mod scoped_payload;
+mod scoped_retirement;
 
 /// Implementations use the separate Authority transport lane. They must not
 /// acquire queue-data/control body permits or recursively authenticate Control
@@ -69,6 +73,67 @@ pub enum QueueRequest {
     Install {
         record: RecordHeader,
     },
+    ScopedPayloadV2 {
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        record: Box<RecordHeader>,
+    },
+    ScopedPayloadWitnessV2 {
+        scope: QueueScope,
+        view: AuthorityView,
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        request: RequestBinding,
+        version: RecordVersion,
+    },
+    ScopedMarkerV2 {
+        scope: QueueScope,
+        view: AuthorityView,
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        request: RequestBinding,
+        version: RecordVersion,
+        witness: bool,
+    },
+    ScopedTerminalV2 {
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        record: Box<RecordHeader>,
+        version: RecordVersion,
+    },
+    ScopedTerminalRepairV2 {
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        record: Box<scoped_store::ScopedTransferRecord>,
+    },
+    ScopedTerminalWitnessV2 {
+        scope: QueueScope,
+        view: AuthorityView,
+        queue_group_id: Uuid,
+        data_generation: Uuid,
+        queue_generation: Uuid,
+        request: RequestBinding,
+        payload: RecordVersion,
+        terminal: RecordVersion,
+    },
+    #[allow(private_interfaces)]
+    ScopedTerminalStateV2 {
+        scope: QueueScope,
+        source_group: Uuid,
+        statement: Box<ScopedTerminalStatement>,
+    },
+    ScopedSurvivorV2 {
+        scope: QueueScope,
+        view: AuthorityView,
+        queue_group_id: Uuid,
+        transfer_id: Uuid,
+        after: Option<Uuid>,
+    },
     JoinPage {
         scope: QueueScope,
         view: AuthorityView,
@@ -118,6 +183,10 @@ impl QueueRequest {
     fn scope(&self) -> &QueueScope {
         match self {
             Self::Install { record } => &record.scope,
+            Self::ScopedPayloadV2 { record, .. } | Self::ScopedTerminalV2 { record, .. } => {
+                &record.scope
+            }
+            Self::ScopedTerminalRepairV2 { record, .. } => &record.payload_header().scope,
             Self::State { scope, .. }
             | Self::Ping { scope, .. }
             | Self::RemovalRecord { scope, .. }
@@ -127,6 +196,11 @@ impl QueueRequest {
             | Self::AdmissionState { scope, .. }
             | Self::ReadGrantCopy { scope, .. }
             | Self::ReadGrantSettle { scope, .. }
+            | Self::ScopedPayloadWitnessV2 { scope, .. }
+            | Self::ScopedMarkerV2 { scope, .. }
+            | Self::ScopedTerminalWitnessV2 { scope, .. }
+            | Self::ScopedTerminalStateV2 { scope, .. }
+            | Self::ScopedSurvivorV2 { scope, .. }
             | Self::Result { scope, .. }
             | Self::JoinPage { scope, .. } => scope,
         }
@@ -134,7 +208,12 @@ impl QueueRequest {
     fn view(&self) -> AuthorityView {
         match self {
             Self::Install { record } => record.ready.view,
+            Self::ScopedPayloadV2 { record, .. } | Self::ScopedTerminalV2 { record, .. } => {
+                record.ready.view
+            }
+            Self::ScopedTerminalRepairV2 { record, .. } => record.payload_header().ready.view,
             Self::RemovalRecord { ticket, .. } => ticket.source_ready.view,
+            Self::ScopedTerminalStateV2 { statement, .. } => statement.epoch.view,
             Self::State { view, .. }
             | Self::Ping { view, .. }
             | Self::RemovalStatement { view, .. }
@@ -143,6 +222,10 @@ impl QueueRequest {
             | Self::AdmissionState { view, .. }
             | Self::ReadGrantCopy { view, .. }
             | Self::ReadGrantSettle { view, .. }
+            | Self::ScopedPayloadWitnessV2 { view, .. }
+            | Self::ScopedMarkerV2 { view, .. }
+            | Self::ScopedTerminalWitnessV2 { view, .. }
+            | Self::ScopedSurvivorV2 { view, .. }
             | Self::Result { view, .. }
             | Self::JoinPage { view, .. } => *view,
         }
@@ -258,6 +341,8 @@ pub struct QueueEndpoint {
     admission: OnceLock<Arc<super::admission_tickets::AdmissionTickets>>,
     join_mount: OnceLock<Mutex<[Option<(crate::oltp::pool::OltpPool, u64)>; 2]>>,
     retirement: OnceLock<Arc<dyn crate::oltp_replication::authority::status::StatusService>>,
+    scoped_payload: OnceLock<scoped_payload::ScopedPayloadReaders>,
+    scoped_peer: OnceLock<Arc<QueuePeerClient>>,
 }
 
 #[derive(Clone)]
@@ -601,6 +686,15 @@ impl QueuePeerClient {
         frame: &RecordFrame,
     ) -> Result<CopyAcknowledgement, ProtocolError> {
         let expected = frame.record_version().map_err(QueueError::protocol)?;
+        self.install_version(target, frame, expected).await
+    }
+
+    pub(super) async fn install_version(
+        &self,
+        target: WorkerIdentity,
+        frame: &RecordFrame,
+        expected: RecordVersion,
+    ) -> Result<CopyAcknowledgement, ProtocolError> {
         let header = self.shared.encode(
             &QueueRequest::Install {
                 record: frame.decode_header().map_err(QueueError::protocol)?,
@@ -1022,6 +1116,8 @@ impl QueueEndpoint {
             admission: OnceLock::new(),
             join_mount: OnceLock::new(),
             retirement: OnceLock::new(),
+            scoped_payload: OnceLock::new(),
+            scoped_peer: OnceLock::new(),
         }))
     }
     pub(crate) fn install_retirement_reader(
@@ -1053,6 +1149,9 @@ impl QueueEndpoint {
             && !matches!(
                 request,
                 QueueRequest::Install { .. }
+                    | QueueRequest::ScopedPayloadV2 { .. }
+                    | QueueRequest::ScopedTerminalV2 { .. }
+                    | QueueRequest::ScopedTerminalRepairV2 { .. }
                     | QueueRequest::JoinPage { .. }
                     | QueueRequest::ReadGrantCopy { .. }
             )
@@ -1071,13 +1170,21 @@ impl QueueEndpoint {
                     | QueueRequest::TerminalState { .. }
                     | QueueRequest::JoinStatement { .. }
                     | QueueRequest::AdmissionState { .. }
+                    | QueueRequest::ScopedPayloadWitnessV2 { .. }
+                    | QueueRequest::ScopedMarkerV2 { .. }
+                    | QueueRequest::ScopedTerminalWitnessV2 { .. }
+                    | QueueRequest::ScopedTerminalStateV2 { .. }
                     | QueueRequest::ReadGrantCopy { .. }
                     | QueueRequest::ReadGrantSettle { .. },
                 Purpose::QueueControl
             ) | (
                 QueueRequest::Install { .. }
+                    | QueueRequest::ScopedPayloadV2 { .. }
+                    | QueueRequest::ScopedTerminalV2 { .. }
+                    | QueueRequest::ScopedTerminalRepairV2 { .. }
                     | QueueRequest::Result { .. }
                     | QueueRequest::RemovalRecord { .. }
+                    | QueueRequest::ScopedSurvivorV2 { .. }
                     | QueueRequest::JoinPage { .. },
                 Purpose::QueueData
             )
@@ -1210,6 +1317,18 @@ impl QueueEndpoint {
         let task_limit = self.task_memory_bytes;
         let ready_count = record.ready.ready_count;
         let prepared = self.shared.prepare(ExecutionClass::Query).await?;
+        let grant = prepared.reserve_compute(self.next_decode_job()?, 0).await?;
+        let (record, (grant, held)) = prepared
+            .run_with_guard((grant, held), move || {
+                prepare_queue_record(&shared, task_limit, ready_count, environment, &work_held)
+            })
+            .await?;
+        drop(grant);
+        let (record, scratch) = record?;
+        Ok((record, Arc::new(scratch), held))
+    }
+
+    fn next_decode_job(&self) -> Result<u64, ProtocolError> {
         let mut job = self.next_job.load(Ordering::Acquire);
         loop {
             let next = job.checked_add(1).ok_or_else(unavailable)?;
@@ -1219,19 +1338,10 @@ impl QueueEndpoint {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return Ok(job),
                 Err(observed) => job = observed,
             }
         }
-        let grant = prepared.reserve_compute(job, 0).await?;
-        let (record, (grant, held)) = prepared
-            .run_with_guard((grant, held), move || {
-                prepare_queue_record(&shared, task_limit, ready_count, environment, &work_held)
-            })
-            .await?;
-        drop(grant);
-        let (record, scratch) = record?;
-        Ok((record, Arc::new(scratch), held))
     }
 }
 
@@ -1291,6 +1401,72 @@ impl Endpoint for QueueEndpoint {
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
             let request = self.parse(session, header)?;
+            if let QueueRequest::ScopedPayloadV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+            } = &request
+            {
+                return self
+                    .preflight_scoped_payload(
+                        session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        record,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+                ..
+            } = &request
+            {
+                return self
+                    .preflight_scoped_terminal(
+                        session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        record,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalRepairV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+            } = &request
+            {
+                return self
+                    .preflight_scoped_terminal_repair(
+                        session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        record,
+                    )
+                    .await;
+            }
+            if matches!(
+                request,
+                QueueRequest::ScopedPayloadWitnessV2 { .. }
+                    | QueueRequest::ScopedMarkerV2 { .. }
+                    | QueueRequest::ScopedTerminalWitnessV2 { .. }
+                    | QueueRequest::ScopedTerminalStateV2 { .. }
+            ) {
+                return Ok(ReceivePlan {
+                    class: TrafficClass::QueueControl,
+                    section_lengths: [0; 3],
+                    decode_budget_bytes: 0,
+                });
+            }
+            if matches!(request, QueueRequest::ScopedSurvivorV2 { .. }) {
+                return Ok(ReceivePlan {
+                    class: TrafficClass::QueueData,
+                    section_lengths: [0; 3],
+                    decode_budget_bytes: 0,
+                });
+            }
             self.check(session, &request).await?;
             let (class, section_lengths, decode_budget_bytes) = match request {
                 QueueRequest::Install { record }
@@ -1314,6 +1490,14 @@ impl Endpoint for QueueEndpoint {
                     (TrafficClass::QueueData, [0; 3], 0)
                 }
                 QueueRequest::JoinPage { record: None, .. } => (TrafficClass::QueueData, [0; 3], 0),
+                QueueRequest::ScopedPayloadV2 { .. }
+                | QueueRequest::ScopedPayloadWitnessV2 { .. }
+                | QueueRequest::ScopedMarkerV2 { .. }
+                | QueueRequest::ScopedTerminalWitnessV2 { .. }
+                | QueueRequest::ScopedTerminalStateV2 { .. }
+                | QueueRequest::ScopedSurvivorV2 { .. }
+                | QueueRequest::ScopedTerminalV2 { .. } => return Err(unavailable()),
+                QueueRequest::ScopedTerminalRepairV2 { .. } => return Err(unavailable()),
             };
             Ok(ReceivePlan {
                 class,
@@ -1331,7 +1515,165 @@ impl Endpoint for QueueEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let request = self.parse(&session, header.as_ref())?;
-            let current = self.check(&session, &request).await?;
+            if let QueueRequest::ScopedPayloadV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+            } = &request
+            {
+                return self
+                    .install_scoped_payload(
+                        &session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        record,
+                        &sections,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedPayloadWitnessV2 {
+                view,
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                request,
+                version,
+                ..
+            } = &request
+            {
+                if (0..3).any(|index| sections.section(index).is_some()) {
+                    return Err(malformed("scoped payload witness has unexpected sections"));
+                }
+                return self
+                    .scoped_payload_witness(
+                        &session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        *view,
+                        *request,
+                        *version,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedMarkerV2 {
+                view,
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                request,
+                version,
+                witness,
+                ..
+            } = &request
+            {
+                if (0..3).any(|index| sections.section(index).is_some()) {
+                    return Err(malformed("scoped marker has unexpected sections"));
+                }
+                return self
+                    .scoped_marker(
+                        &session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        *view,
+                        (*request, *version, *witness),
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+                version,
+            } = &request
+            {
+                return self
+                    .install_scoped_terminal(
+                        &session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        record,
+                        *version,
+                        &sections,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalRepairV2 {
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                record,
+            } = request
+            {
+                return self
+                    .install_scoped_terminal_repair(
+                        &session,
+                        [queue_group_id, data_generation, queue_generation],
+                        *record,
+                        &sections,
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalWitnessV2 {
+                view,
+                queue_group_id,
+                data_generation,
+                queue_generation,
+                request,
+                payload,
+                terminal,
+                ..
+            } = &request
+            {
+                if (0..3).any(|index| sections.section(index).is_some()) {
+                    return Err(malformed("scoped terminal witness has unexpected sections"));
+                }
+                return self
+                    .scoped_terminal_witness(
+                        &session,
+                        [*queue_group_id, *data_generation, *queue_generation],
+                        *view,
+                        (*request, *payload, *terminal),
+                    )
+                    .await;
+            }
+            if let QueueRequest::ScopedTerminalStateV2 {
+                source_group, statement, ..
+            } = &request
+            {
+                if (0..3).any(|index| sections.section(index).is_some()) {
+                    return Err(malformed("scoped terminal state has unexpected sections"));
+                }
+                return self
+                    .scoped_terminal_state(&session, *source_group, statement)
+                    .await;
+            }
+            if let QueueRequest::ScopedSurvivorV2 {
+                view,
+                queue_group_id,
+                transfer_id,
+                after,
+                ..
+            } = &request
+            {
+                if (0..3).any(|index| sections.section(index).is_some()) {
+                    return Err(malformed("scoped export has unexpected sections"));
+                }
+                return self
+                    .export_scoped_survivor(&session, *queue_group_id, *transfer_id, *view, *after)
+                    .await;
+            }
+            let current = if let QueueRequest::Install { record } = &request {
+                // Preflight authorizes reception. Check the local view before
+                // decoding, then recheck Control immediately before installation.
+                let current = self.replica.lock().map_err(|_| unavailable())?.authority();
+                if session.remote() != current.owner {
+                    return Err(QueueError::Stale.protocol());
+                }
+                record
+                    .preflight(&self.scope, current)
+                    .map_err(QueueError::protocol)?;
+                current
+            } else {
+                self.check(&session, &request).await?
+            };
             let confirm = |digest| {
                 Ok(ChargedReply {
                     header: self.shared.encode_in(ByteClass::Progress,
@@ -1340,6 +1682,14 @@ impl Endpoint for QueueEndpoint {
                 })
             };
             match request {
+                QueueRequest::ScopedPayloadV2 { .. }
+                | QueueRequest::ScopedPayloadWitnessV2 { .. }
+                | QueueRequest::ScopedMarkerV2 { .. }
+                | QueueRequest::ScopedTerminalWitnessV2 { .. }
+                | QueueRequest::ScopedTerminalStateV2 { .. }
+                | QueueRequest::ScopedSurvivorV2 { .. }
+                | QueueRequest::ScopedTerminalV2 { .. } => Err(unavailable()),
+                QueueRequest::ScopedTerminalRepairV2 { .. } => Err(unavailable()),
                 QueueRequest::ReadGrantCopy { request_id, set, .. } => {
                     let digest = serialized_digest(&(request_id, &set))?;
                     self.replica.lock().map_err(|_| unavailable())?
@@ -1582,6 +1932,10 @@ impl Endpoint for QueueEndpoint {
                         .prepare_payload(&session, current, &record, &sections)
                         .await?;
                     #[cfg(test)]
+                    if record.state.terminal() {
+                        super::recovery_tests::pause("before-terminal-copy", record.request_id).await;
+                    }
+                    #[cfg(test)]
                     if record.ready.view.owner_term > 1 {
                         super::recovery_tests::pause("removal_install", record.request_id).await;
                     }
@@ -1622,14 +1976,22 @@ impl Endpoint for QueueEndpoint {
                         return Err(QueueError::Stale.protocol());
                     }
                     let record = replica
-                        .retained_record(request_id, now_ms())
-                        .map_err(QueueError::protocol)?;
+                        .record(request_id)
+                        .ok_or_else(|| QueueError::NotFound.protocol())?;
+                    if !record.accepted {
+                        return Err(QueueError::Unavailable.protocol());
+                    }
+                    let copies_complete = if record.state.terminal() {
+                        replica.terminal_copy_confirmation(current, record).is_some()
+                    } else {
+                        replica.copies_complete(request_id)
+                    };
                     let reply = QueueReply::State(QueueState {
                         request_id,
                         run_id: view.run_id,
                         version: record.version,
                         state: record.state,
-                        copies_complete: replica.copies_complete(request_id),
+                        copies_complete,
                     });
                     Ok(ChargedReply {
                         header: self.shared.encode_in(
@@ -1678,7 +2040,7 @@ impl Endpoint for QueueEndpoint {
                     let record = replica
                         .retained_record(request_id, now_ms())
                         .map_err(QueueError::protocol)?;
-                    if !replica.copies_complete(request_id) {
+                    if replica.terminal_copy_confirmation(current, record).is_none() {
                         return Err(QueueError::Unavailable.protocol());
                     }
                     if record.version != version {

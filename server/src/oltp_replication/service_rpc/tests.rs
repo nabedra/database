@@ -58,6 +58,7 @@ struct ConvergingTimestamp {
     control: Arc<ControlClient>,
     node: u64,
     preflights: AtomicU64,
+    legacy_placement_probes: AtomicU64,
     attempts: std::sync::Mutex<Vec<(WorkerIdentity, Uuid, Digest)>>,
     applied: std::sync::OnceLock<StoragePin>,
 }
@@ -68,8 +69,20 @@ impl Endpoint for ConvergingTimestamp {
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
-            self.preflights.fetch_add(1, Ordering::Relaxed);
             let head = parse(session, self.service.identity(), self.node, bytes)?;
+            if head.placement_generation.is_some() {
+                assert_eq!(
+                    head.method,
+                    Method::TimestampCall {
+                        operation: 0,
+                        mutation: false
+                    }
+                );
+                self.legacy_placement_probes.fetch_add(1, Ordering::Relaxed);
+                // An older worker's strict service header parser rejects the marker.
+                return Err(invalid());
+            }
+            self.preflights.fetch_add(1, Ordering::Relaxed);
             assert_eq!(
                 head.method,
                 Method::TimestampCall {
@@ -210,6 +223,7 @@ async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergenc
             control: services.control_client.clone(),
             node: member.node_id,
             preflights: AtomicU64::new(0),
+            legacy_placement_probes: AtomicU64::new(0),
             attempts: Default::default(),
             applied: Default::default(),
         });
@@ -242,6 +256,7 @@ async fn o06_o14_timestamp_service_retries_same_snapshot_after_leader_convergenc
             }
         }
         let pin = begin.await.unwrap();
+        assert!(endpoint.legacy_placement_probes.load(Ordering::Relaxed) >= 1);
         assert_eq!(Some(&pin), endpoint.applied.get());
         {
             let attempts = endpoint.attempts.lock().unwrap();

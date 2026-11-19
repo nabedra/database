@@ -357,6 +357,14 @@ impl ReplicaDispatcher {
             .cloned()
             .ok_or_else(|| invalid("worker does not host target replica node"))
     }
+
+    fn route(
+        &self,
+        session: &AuthenticatedSession,
+        bytes: &[u8],
+    ) -> Result<Arc<DispatchRoute>, ProtocolError> {
+        self.get(snapshot::target_node(bytes, session.purpose())?)
+    }
     /// Remove this permanent node route and join requests already admitted by
     /// it. A retained preflight handle cannot reopen it after removal.
     pub(in crate::oltp_replication) async fn retire(&self, node: u64) -> Result<(), ProtocolError> {
@@ -376,11 +384,7 @@ impl Endpoint for ReplicaDispatcher {
         session: &'a AuthenticatedSession,
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
-        Box::pin(async move {
-            self.get(snapshot::target_node(bytes)?)?
-                .preflight(session, bytes)
-                .await
-        })
+        Box::pin(async move { self.route(session, bytes)?.preflight(session, bytes).await })
     }
     fn handle<'a>(
         &'a self,
@@ -389,7 +393,7 @@ impl Endpoint for ReplicaDispatcher {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
-            self.get(snapshot::target_node(bytes.as_slice())?)?
+            self.route(&session, bytes.as_slice())?
                 .handle(session, bytes, sections)
                 .await
         })

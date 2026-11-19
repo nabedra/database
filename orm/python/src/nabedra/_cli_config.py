@@ -122,12 +122,16 @@ def _validate_oltp(config):
                 text(path)
     listen(config['bind'], tls)
     topology = config['topology']
-    fields(topology, ('mode',), ('data_dir', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'))
+    fields(topology, ('mode',), ('data_dir', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls',
+                                'control_peers', 'scoped_oltp'))
     if topology['mode'] == 'local':
         fields(topology, ('mode', 'data_dir'))
         text(topology['data_dir'])
     elif topology['mode'] == 'remote':
-        fields(topology, ('mode', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'))
+        fields(topology, ('mode', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'),
+               ('scoped_oltp',))
+        if 'scoped_oltp' in topology and type(topology['scoped_oltp']) is not bool:
+            raise ConfigError('scoped_oltp must be a boolean')
         for key in ('cluster_id', 'control_group_id'):
             if str(UUID(topology[key])) != topology[key] or not UUID(topology[key]).int:
                 raise ConfigError('Invalid OLTP group identity')

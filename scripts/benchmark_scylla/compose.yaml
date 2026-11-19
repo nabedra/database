@@ -1,0 +1,43 @@
+x-database: &database
+  image: scylladb/scylla:6.2.3@sha256:a9d904089abe9a4f8b5b893ebb5b5bf8b5a1bd0dc6658921cf05f89d3712289c
+  cpus: 1
+  mem_limit: 2150000000
+  memswap_limit: 2150000000
+  command:
+    - --smp=1
+    - --memory=1700M
+    - --reserve-memory=256M
+    - --overprovisioned=1
+    - --developer-mode=1
+    - --io-setup=0
+    - --reactor-backend=epoll
+    - --disable-version-check
+    - --seeds=scylla1
+    - --commitlog-sync=batch
+
+services:
+  scylla1:
+    <<: *database
+    volumes:
+      - scylla1:/var/lib/scylla
+  scylla2:
+    <<: *database
+    volumes:
+      - scylla2:/var/lib/scylla
+  scylla3:
+    <<: *database
+    volumes:
+      - scylla3:/var/lib/scylla
+  driver:
+    build: .
+    cpus: 0.65
+    mem_limit: 900000000
+    memswap_limit: 900000000
+    volumes:
+      - ..:/benchmark:ro
+      - ${SCYLLA_BENCHMARK_OUTPUT:?set by the benchmark runner}:/output
+
+volumes:
+  scylla1:
+  scylla2:
+  scylla3:

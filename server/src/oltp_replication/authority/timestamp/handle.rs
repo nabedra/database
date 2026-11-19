@@ -1,24 +1,26 @@
 //! Consensus-backed timestamp service. Every mutation below returns only after
 //! its native state and applied metadata have committed in the same sync batch.
+use super::super::status::ScopedAdmission;
 use super::*;
 use crate::{
     oltp::pool::ByteClass,
     oltp_replication::authority::consensus::{Applied, Consensus},
+    oltp_runtime::replica::OriginalAuthorization,
 };
 
 #[derive(Clone)]
 pub(crate) struct TimestampHandle {
     pub(super) machine: TimestampMachine,
     pub(super) consensus: Arc<dyn Consensus<TimestampCommand, TimestampReply>>,
-    release_reader: Arc<std::sync::OnceLock<ReleaseReader>>,
-    release_proof: Arc<tokio::sync::Mutex<()>>,
+    pub(super) release_reader: Arc<std::sync::OnceLock<ReleaseReader>>,
+    pub(super) release_proof: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     release_pause: Arc<std::sync::OnceLock<ReleasePause>>,
 }
 #[derive(Clone)]
-struct ReleaseReader {
-    control: Arc<super::super::control::ControlClient>,
-    queue: Arc<crate::oltp_runtime::worker_endpoint::QueuePeerClient>,
+pub(super) struct ReleaseReader {
+    pub(super) control: Arc<super::super::control::ControlClient>,
+    pub(super) queue: Arc<crate::oltp_runtime::worker_endpoint::QueuePeerClient>,
 }
 #[cfg(test)]
 struct ReleasePause {
@@ -389,6 +391,9 @@ impl TimestampHandle {
             .machine
             .store()
             .read_metadata(BUDGET, move |view| {
+                if point_decision::record_exists(permit.statement().txn.request_id, |key| view.get(key))? {
+                    return Err(unknown());
+                }
                 let key = commit_key(
                     permit.statement().manifest.status_group_id,
                     permit.statement().txn,
@@ -439,7 +444,8 @@ impl TimestampHandle {
                     .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
                     .transpose()?
                     .ok_or_else(unknown)?;
-                if record.identity != check.pin_identity
+                if record.reservation.scoped.is_some()
+                    || record.identity != check.pin_identity
                     || record.pin != check.storage_pin
                     || record.request != Some(check.request)
                     || record.purpose != PinPurpose::Application
@@ -456,7 +462,11 @@ impl TimestampHandle {
                         response_hash,
                         terminal_version,
                     } => (proof, applied_at, response_hash, terminal_version),
-                    PinState::Cancelled | PinState::ColdReleased | PinState::MetadataReleased { .. } => {
+                    PinState::ScopedReleased { .. }
+                    | PinState::ScopeSuperseded { .. }
+                    | PinState::Cancelled
+                    | PinState::ColdReleased
+                    | PinState::MetadataReleased { .. } => {
                         return Err(unknown());
                     }
                 };
@@ -515,6 +525,9 @@ impl TimestampHandle {
         identity: PinIdentity,
         reservation: IdentityReservation,
     ) -> Result<StoragePin, ProtocolError> {
+        if reservation.scoped.is_some() {
+            return Err(invalid());
+        }
         match self
             .submit(TimestampCommand::BeginSnapshot {
                 view,
@@ -526,6 +539,30 @@ impl TimestampHandle {
             .reply
         {
             TimestampReply::Snapshot(pin) => Ok(pin),
+            reply => Err(rejected(reply)),
+        }
+    }
+    pub(crate) async fn begin_scoped_snapshot_with_origin(
+        &self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+        epoch: ScopedTimestampEpoch,
+        origin: OriginalAuthorization,
+    ) -> Result<(StoragePin, OriginalAuthorization), ProtocolError> {
+        match self
+            .submit(TimestampCommand::ScopedSnapshot(scoped_admission::Command::Begin {
+                epoch,
+                view,
+                identity,
+                reservation,
+                pin_id: uuid::Uuid::new_v4(),
+                origin,
+            }))
+            .await?
+            .reply
+        {
+            TimestampReply::ScopedSnapshot { pin, origin } => Ok((pin, origin)),
             reply => Err(rejected(reply)),
         }
     }
@@ -550,6 +587,163 @@ impl TimestampHandle {
             reply => Err(rejected(reply)),
         }
     }
+    pub(crate) async fn bind_scoped_snapshot_context(
+        &self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+        epoch: ScopedTimestampEpoch,
+    ) -> Result<(), ProtocolError> {
+        match self
+            .submit(TimestampCommand::ScopedSnapshot(scoped_admission::Command::Bind {
+                epoch,
+                view,
+                identity,
+                pin,
+                request,
+            }))
+            .await?
+            .reply
+        {
+            TimestampReply::ContextBound(bound) if bound == pin => Ok(()),
+            reply => Err(rejected(reply)),
+        }
+    }
+    pub(crate) async fn verify_scoped_snapshot(
+        &self,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+        reservation: IdentityReservation,
+    ) -> Result<(), ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        self.machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: State = view
+                    .get(STATE)?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                let record: PinRecord = view
+                    .get(&pin_key(identity.nonce))?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                if state.authority.run_id != request.run_id
+                    || state.authority != state.ready.view.authority()
+                    || reservation.scoped.is_none()
+                    || !reservation.binds(request)
+                    || record.identity != identity
+                    || record.pin != pin
+                    || record.request != Some(request)
+                    || record.reservation != reservation
+                    || record.purpose != PinPurpose::Application
+                    || !matches!(record.state, PinState::Active)
+                    || !view
+                        .get(&active_key(pin))?
+                        .is_some_and(|nonce| nonce.as_slice() == identity.nonce.as_bytes())
+                {
+                    return Err(invalid());
+                }
+                view.encode(&())
+            })
+            .await
+            .map(|_| ())
+    }
+    /// Find the exact active application pin through its unique allocated
+    /// timestamp, then verify its original request and scoped admission.
+    pub(crate) async fn verify_scoped_read_pin(
+        &self,
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        status_group_id: uuid::Uuid,
+        kind: Option<super::super::status::RequestKind>,
+        admission_read: bool,
+    ) -> Result<(), ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        self.machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: State = view
+                    .get(STATE)?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                let mut prefix = [0; ACTIVE_PREFIX.len() + 8];
+                prefix[..ACTIVE_PREFIX.len()].copy_from_slice(ACTIVE_PREFIX);
+                prefix[ACTIVE_PREFIX.len()..].copy_from_slice(&scope.read_ts.get().to_be_bytes());
+                let (key, nonce) = {
+                    let entry = view.first_from(&prefix, &prefix)?.ok_or_else(invalid)?;
+                    (
+                        <[u8; ACTIVE_PREFIX.len() + 24]>::try_from(entry.key())
+                            .map_err(|_| unknown())?,
+                        uuid::Uuid::from_slice(entry.value()).map_err(|_| unknown())?,
+                    )
+                };
+                let record: PinRecord = view
+                    .get(&pin_key(nonce))?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                if state.authority.run_id != scope.queue_view.run_id
+                    || scope.request.run_id != state.authority.run_id
+                    || (!admission_read && record.request != Some(scope.request))
+                    || !record.reservation.binds(scope.request)
+                    || record.identity.nonce != nonce
+                    || record.identity.run_id != scope.request.run_id
+                    || record.identity.request_id != scope.request.request_id
+                    || record.identity.digest != scope.request.digest
+                    || record.reservation.reservation_id != nonce
+                    || record.reservation.scoped
+                        != Some(ScopedAdmission {
+                            protocol_version: ScopedAdmission::VERSION,
+                            queue_group_id: scope.queue_group_id,
+                            queue_generation: scope.queue_generation,
+                            status_group_id,
+                        })
+                    || kind.is_some_and(|kind| kind != record.reservation.kind)
+                    || record.pin.read_ts != scope.read_ts
+                    || active_key(record.pin) != key
+                    || record.purpose != PinPurpose::Application
+                    || !matches!(record.state, PinState::Active)
+                {
+                    return Err(invalid());
+                }
+                view.encode(&())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn verify_snapshot_policy(
+        &self,
+        identity: PinIdentity,
+        pin: StoragePin,
+        scope: Option<ScopedAdmission>,
+    ) -> Result<(), ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        self.machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let record: PinRecord = view
+                    .get(&pin_key(identity.nonce))?
+                    .map(|raw| serde_json::from_slice(raw.as_slice()).map_err(|_| unknown()))
+                    .transpose()?
+                    .ok_or_else(unknown)?;
+                if record.identity != identity
+                    || record.pin != pin
+                    || record.reservation.scoped != scope
+                    || record.purpose != PinPurpose::Application
+                {
+                    return Err(invalid());
+                }
+                view.encode(&())
+            })
+            .await
+            .map(|_| ())
+    }
+
     pub(crate) async fn allocate_commit(
         &self,
         permit: SealedCommitPermit,

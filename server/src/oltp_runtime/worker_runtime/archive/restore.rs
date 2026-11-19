@@ -1,6 +1,5 @@
 use super::restore_graph::{RestoreGraph, SplitTranscript};
 use super::*;
-use crate::oltp_backup_repository::Repository;
 use crate::oltp::{
     backup::{
         history::{OwnedImage, split_child_scope},
@@ -14,6 +13,7 @@ use crate::oltp::{
     },
     pool::{OltpPool, TransactionBudget, WorkerSharedResources},
 };
+use crate::oltp_backup_repository::Repository;
 use std::io::Seek;
 
 pub(crate) struct VerifiedNativeRestore {
@@ -86,8 +86,10 @@ impl VerifiedNativeRestore {
             let mut reader = HistoryReader::new(&mut file)?;
             let mut group = None;
             let mut split = SplitTranscript::default();
+            let mut point_transcript = point_history::PointTranscript::default();
             while let Some(frame) = reader.next(&shared)? {
                 split.observe(&graph, &frame, manifest.scope.cut)?;
+                point_transcript.observe(frame.payload()?, &shared)?;
                 match frame.payload()? {
                     HistoryFrame::StatusClosure(closure) => {
                         if target_run == Some(closure.authority.run_id) {
@@ -156,6 +158,7 @@ impl VerifiedNativeRestore {
                     _ => {}
                 }
             }
+            point_transcript.finish()?;
             let history = reader.verified()?;
             if history.scope() != &manifest.scope
                 || history.root() != manifest.history_root

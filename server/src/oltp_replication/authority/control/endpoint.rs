@@ -1,12 +1,24 @@
 //! Strong Control reads share the authenticated worker listener. This endpoint
 //! grants no raw Raft proposal or caller-supplied proof capability.
 use super::{
-    ControlHandle, DataWorkerGrowthProof, GroupRecord, ServiceAction, ServiceAuthorization,
+    ControlCommand, ControlHandle, ControlReply, DataWorkerGrowthProof, Fault, GroupRecord,
+    SCOPED_QUEUE_VERSION, ScopedQueueCapability, ScopedQueuePlacement, ScopedQueueTransferReport,
+    ScopedQueueTransition, ServiceAction, ServiceAuthorization, TimestampPointRoute,
+    scoped_queue::ScopedQueueOperation, unsupported_service_route,
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
     oltp_deployment::live::InventoryPin,
-    oltp_replication::{multiplex::*, types::*},
+    oltp_replication::{
+        authority::{
+            consensus::Consensus,
+            status::{StatusReply, StatusTopology, identity::ScopedStatusEpoch},
+            timestamp::{ScopedTimestampEpoch, TimestampReply},
+        },
+        multiplex::*,
+        service_rpc::{ParticipantClient, StatusClient, TimestampClient},
+        types::*,
+    },
     oltp_runtime::{
         replica::{QueueAuthority, QueueScope},
         worker_endpoint::AuthorityReader,
@@ -16,12 +28,16 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     mem::size_of,
-    sync::{Arc, Mutex},
-    time::Instant,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
+use tokio::time::{self, Instant as TokioInstant};
 use uuid::Uuid;
 
 const HEADER_LIMIT: usize = 4096;
+const READ_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_PEER_TIMEOUT: Duration = Duration::from_millis(750);
+const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 mod route_tests;
@@ -54,7 +70,9 @@ enum ReadRequest {
         pin: InventoryPin,
         claim_id: Uuid,
     },
-    PoolReplicaRetired { stamp: Box<super::ReplicaRetiredStamp> },
+    PoolReplicaRetired {
+        stamp: Box<super::ReplicaRetiredStamp>,
+    },
     RemoteReplicaMove {
         id: Uuid,
     },
@@ -65,6 +83,27 @@ enum ReadRequest {
     Group {
         group_id: Uuid,
     },
+    ScopedQueue {
+        group_id: Uuid,
+    },
+    ScopedQueueCapability,
+    ScopedQueueTransition {
+        group_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_group: Option<Uuid>,
+    },
+    ScopedQueuePredecessor {
+        group_id: Uuid,
+    },
+    ScopedQueueEpochRetired {
+        group_id: Uuid,
+        queue_generation: Uuid,
+        view: AuthorityView,
+    },
+    ChangeScopedQueue {
+        operation_id: Uuid,
+        action: ScopedQueueOperation,
+    },
     SplitSource {
         expected: Box<GroupRecord>,
         authority: Authority,
@@ -73,6 +112,19 @@ enum ReadRequest {
         remote: WorkerIdentity,
         action: ServiceAction,
         target: Box<GroupIdentity>,
+    },
+    ServiceRoleAtReplica {
+        remote: WorkerIdentity,
+        target: Box<GroupIdentity>,
+        node_id: u64,
+        generation: Uuid,
+    },
+    TimestampPointProof {
+        remote: WorkerIdentity,
+        target: Box<GroupIdentity>,
+        node_id: u64,
+        route: TimestampPointRoute,
+        decision_source: Option<(ServiceAction, Digest)>,
     },
     TerminalReader {
         remote: WorkerIdentity,
@@ -99,6 +151,28 @@ enum ReadRequest {
         after: Option<u64>,
     },
 }
+
+impl ReadRequest {
+    fn supports_bounded_failover(&self) -> bool {
+        matches!(
+            self,
+            Self::Current
+                | Self::ColdPin { .. }
+                | Self::GroupInventoryRevision
+                | Self::Groups { .. }
+                | Self::Group { .. }
+                | Self::GroupMembers { .. }
+                | Self::ScopedQueue { .. }
+                | Self::ScopedQueueCapability
+                | Self::ScopedQueueTransition { .. }
+                | Self::ScopedQueuePredecessor { .. }
+                | Self::ScopedQueueEpochRetired { .. }
+                | Self::ServiceRole { .. }
+                | Self::ServiceRoleAtReplica { .. }
+                | Self::TimestampPointProof { .. }
+        )
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadReply {
@@ -109,12 +183,29 @@ struct ReadReply {
 pub(crate) struct ControlEndpoint {
     handle: Arc<ControlHandle>,
     shared: Arc<WorkerSharedResources>,
+    scoped_queue_fences: OnceLock<ScopedQueueFenceReaders>,
+}
+
+struct ScopedQueueFenceReaders {
+    status: Vec<Arc<StatusClient>>,
+    timestamps: Arc<TimestampClient>,
+    catalog: Arc<ParticipantClient>,
+    transport: WorkerClient,
+    control: Arc<ControlClient>,
 }
 impl ControlEndpoint {
-    pub(super) async fn read_eks_replacement(&self, worker: WorkerIdentity, token_digest: Digest) -> Result<ChargedBytes, ProtocolError> {
+    pub(super) async fn read_eks_replacement(
+        &self,
+        worker: WorkerIdentity,
+        token_digest: Digest,
+    ) -> Result<ChargedBytes, ProtocolError> {
         self.handle.own_eks_replacement(worker, token_digest).await
     }
-    pub(super) async fn authorize_data_worker_join(&self, worker: WorkerIdentity, token: Option<Digest>) -> Result<(), ProtocolError> {
+    pub(super) async fn authorize_data_worker_join(
+        &self,
+        worker: WorkerIdentity,
+        token: Option<Digest>,
+    ) -> Result<(), ProtocolError> {
         self.handle.authorize_data_worker_join(worker, token).await
     }
     pub(crate) fn new(
@@ -124,7 +215,126 @@ impl ControlEndpoint {
         if !Arc::ptr_eq(handle.resources(), &shared) {
             return Err(invalid("Control endpoint has a foreign worker budget"));
         }
-        Ok(Arc::new(Self { handle, shared }))
+        Ok(Arc::new(Self {
+            handle,
+            shared,
+            scoped_queue_fences: OnceLock::new(),
+        }))
+    }
+
+    pub(crate) fn install_scoped_queue_fence_readers(
+        &self,
+        topology: StatusTopology,
+        status: Vec<Arc<StatusClient>>,
+        timestamps: Arc<TimestampClient>,
+        catalog: GroupIdentity,
+        transport: WorkerClient,
+        control: Arc<ControlClient>,
+    ) -> Result<(), ProtocolError> {
+        let scope = self.handle.identity();
+        let same_scope = |group: &GroupIdentity| {
+            group.cluster_id == scope.cluster_id && group.database == scope.database
+        };
+        if !topology
+            .groups()
+            .iter()
+            .eq(status.iter().map(|client| client.identity()))
+            || status.iter().any(|client| {
+                !same_scope(client.identity()) || !Arc::ptr_eq(client.resources(), &self.shared)
+            })
+            || !same_scope(timestamps.identity())
+            || timestamps.identity().kind != GroupKind::Timestamps
+            || !Arc::ptr_eq(timestamps.resources(), &self.shared)
+            || !same_scope(&catalog)
+            || catalog.kind != GroupKind::Catalog
+            || control.group != *scope
+            || !Arc::ptr_eq(&control.shared, &self.shared)
+            || transport.local_identity() != control.client.local_identity()
+        {
+            return Err(invalid("Control endpoint has foreign scoped fence readers"));
+        }
+        let catalog = ParticipantClient::new(
+            catalog,
+            self.shared.clone(),
+            transport.clone(),
+            control.clone(),
+            ServiceAction::Owner,
+        )?;
+        self.scoped_queue_fences
+            .set(ScopedQueueFenceReaders {
+                status,
+                timestamps,
+                catalog,
+                transport,
+                control,
+            })
+            .map_err(|_| invalid("Control endpoint already has scoped fence readers"))
+    }
+
+    async fn verify_scoped_queue_publication(
+        &self,
+        owner: WorkerIdentity,
+        group_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<(), ProtocolError> {
+        use super::scoped_queue::stale;
+
+        let raw = self
+            .handle
+            .read_scoped_queue_transition(owner, group_id, None)
+            .await?;
+        let transfer = super::machine::decode::<Option<ScopedQueueTransition>>(raw.as_slice())?;
+        let Some(transfer) = transfer.filter(|transfer| transfer.id == transfer_id) else {
+            // An exact retry of a committed operation can replay its Control
+            // receipt without re-reading the Status fences.
+            return if self
+                .handle
+                .scoped_queue_publication_replayed(owner, group_id, transfer_id)
+                .await?
+            {
+                Ok(())
+            } else {
+                Err(stale())
+            };
+        };
+        if transfer.next.owner != owner
+            || transfer.basis()?.is_none()
+            || !transfer.has_installed_quorum()
+        {
+            return Err(stale());
+        }
+        let readers = self.scoped_queue_fences.get().ok_or_else(stale)?;
+        let epoch = ScopedStatusEpoch::from_placement(&transfer.next);
+        for reader in &readers.status {
+            if !matches!(
+                reader.scoped_queue_fence_receipt(&transfer).await?,
+                Some(StatusReply::ScopedQueueFenced {
+                    transition_id, epoch: applied, applied_at
+                }) if transition_id == transfer.id && applied == epoch
+                    && applied_at.term != 0 && applied_at.node_id != 0 && applied_at.index != 0
+            ) {
+                return Err(stale());
+            }
+        }
+        let epoch = ScopedTimestampEpoch::from_placement(&transfer.next)?;
+        if !matches!(
+            readers.timestamps.scoped_queue_fence_receipt(&transfer).await?,
+            Some(TimestampReply::ScopedQueueFenced { transition_id, epoch: applied, applied_at })
+                if transition_id == transfer.id && applied == epoch
+                    && applied_at.term != 0 && applied_at.node_id != 0 && applied_at.index != 0
+        ) {
+            return Err(stale());
+        }
+        readers.catalog.verify_scoped_queue_fence(&transfer).await?;
+        let data = ParticipantClient::new(
+            transfer.next.group.clone(),
+            self.shared.clone(),
+            readers.transport.clone(),
+            readers.control.clone(),
+            ServiceAction::Owner,
+        )?;
+        data.verify_scoped_queue_fence(&transfer).await?;
+        Ok(())
     }
     fn parse(
         &self,
@@ -166,6 +376,17 @@ impl Endpoint for ControlEndpoint {
         header: ChargedBytes,
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
+        self.handle_with_leader(session, header, sections, None)
+    }
+}
+impl ControlEndpoint {
+    pub(super) fn handle_with_leader<'a>(
+        &'a self,
+        session: AuthenticatedSession,
+        header: ChargedBytes,
+        sections: ChargedSections,
+        leader: Option<&'a dyn Consensus<ControlCommand, ControlReply>>,
+    ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let request = self.parse(&session, header.as_ref())?;
             if (0..3).any(|i| sections.section(i).is_some()) {
@@ -181,9 +402,71 @@ impl Endpoint for ControlEndpoint {
                     self.shared
                         .encode_in(ByteClass::Progress, &group, HEADER_LIMIT)?
                 }
-                ReadRequest::SplitSource { expected, authority } => {
-                    self.handle.split_source(*expected, authority).await?
+                ReadRequest::ScopedQueue { group_id } => {
+                    self.handle.read_scoped_queue(group_id).await?
                 }
+                ReadRequest::ScopedQueueCapability => {
+                    let state = self.handle.scoped_queue_capability().await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::ScopedQueueTransition {
+                    group_id,
+                    source_group,
+                } => {
+                    self.handle
+                        .read_scoped_queue_transition(session.remote(), group_id, source_group)
+                        .await?
+                }
+                ReadRequest::ScopedQueuePredecessor { group_id } => {
+                    self.handle
+                        .read_scoped_queue_predecessor(session.remote(), group_id)
+                        .await?
+                }
+                ReadRequest::ScopedQueueEpochRetired {
+                    group_id,
+                    queue_generation,
+                    view,
+                } => {
+                    self.handle
+                        .read_scoped_queue_epoch_retired(
+                            session.remote(),
+                            group_id,
+                            queue_generation,
+                            view,
+                        )
+                        .await?
+                }
+                ReadRequest::ChangeScopedQueue {
+                    operation_id,
+                    action,
+                } => {
+                    if operation_id.is_nil() {
+                        return Err(invalid("missing scoped queue operation ID"));
+                    }
+                    if let ScopedQueueOperation::PublishTransfer {
+                        group_id,
+                        transfer_id,
+                    } = &action
+                    {
+                        self.verify_scoped_queue_publication(
+                            session.remote(),
+                            *group_id,
+                            *transfer_id,
+                        )
+                        .await?;
+                    }
+                    let reply = self
+                        .handle
+                        .apply_scoped_queue_rpc(&session, operation_id, action, leader)
+                        .await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &reply, HEADER_LIMIT)?
+                }
+                ReadRequest::SplitSource {
+                    expected,
+                    authority,
+                } => self.handle.split_source(*expected, authority).await?,
                 ReadRequest::ServiceRole {
                     remote,
                     action,
@@ -195,6 +478,44 @@ impl Endpoint for ControlEndpoint {
                         .await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &grant, HEADER_LIMIT)?
+                }
+                ReadRequest::ServiceRoleAtReplica {
+                    remote,
+                    target,
+                    node_id,
+                    generation,
+                } => {
+                    let grant = self
+                        .handle
+                        .service_role_at_replica(
+                            &scope,
+                            remote,
+                            *target,
+                            session.remote(),
+                            node_id,
+                            generation,
+                        )
+                        .await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &grant, HEADER_LIMIT)?
+                }
+                ReadRequest::TimestampPointProof {
+                    remote,
+                    target,
+                    node_id,
+                    route,
+                    decision_source,
+                } => {
+                    self.handle
+                        .timestamp_point_route(
+                            remote,
+                            session.remote(),
+                            *target,
+                            node_id,
+                            route,
+                            decision_source,
+                        )
+                        .await?
                 }
                 ReadRequest::EnrollmentRevision => {
                     let revision = self
@@ -213,7 +534,8 @@ impl Endpoint for ControlEndpoint {
                         .await?
                         .ok_or_else(unavailable)?
                         .group_inventory_revision;
-                    self.shared.encode_in(ByteClass::Progress, &revision, HEADER_LIMIT)?
+                    self.shared
+                        .encode_in(ByteClass::Progress, &revision, HEADER_LIMIT)?
                 }
                 ReadRequest::RestartPreparation { revision } => {
                     let preparation = self.handle.restart_preparation(revision).await?;
@@ -230,7 +552,9 @@ impl Endpoint for ControlEndpoint {
                     self.shared
                         .encode_in(ByteClass::Progress, &excluded, HEADER_LIMIT)?
                 }
-                ReadRequest::OwnWorkerDrain => self.handle.own_worker_drain(session.remote()).await?,
+                ReadRequest::OwnWorkerDrain => {
+                    self.handle.own_worker_drain(session.remote()).await?
+                }
                 ReadRequest::OwnGrowthSample { pin, claim_id } => {
                     self.handle
                         .data_worker_growth_proof(session.remote(), claim_id, pin)
@@ -241,13 +565,16 @@ impl Endpoint for ControlEndpoint {
                         return Err(invalid("replica retirement is for a different worker"));
                     }
                     let retired = self.handle.verify_pool_replica_retired(*stamp).await?;
-                    self.shared.encode_in(ByteClass::Progress, &retired, HEADER_LIMIT)?
+                    self.shared
+                        .encode_in(ByteClass::Progress, &retired, HEADER_LIMIT)?
                 }
                 ReadRequest::RemoteReplicaMove { id } => {
                     self.handle.remote_move_view(id, session.remote()).await?
                 }
                 ReadRequest::RemoteReplicaVoter { id, node } => {
-                    self.handle.replica_move_voter_read(id, node, session.remote()).await?
+                    self.handle
+                        .replica_move_voter_read(id, node, session.remote())
+                        .await?
                 }
                 ReadRequest::Current => {
                     let current = self.handle.current(&scope).await?;
@@ -267,7 +594,8 @@ impl Endpoint for ControlEndpoint {
                 }
                 ReadRequest::QueueRemoval { owner, ticket } => {
                     let current = self.handle.removal_view(&scope, owner, ticket).await?;
-                    self.shared.encode_in(ByteClass::Progress, &current, HEADER_LIMIT)?
+                    self.shared
+                        .encode_in(ByteClass::Progress, &current, HEADER_LIMIT)?
                 }
                 ReadRequest::TerminalReader {
                     remote,
@@ -323,9 +651,332 @@ pub(crate) struct ControlClient {
     shared: Arc<WorkerSharedResources>,
     group: GroupIdentity,
     routes: Arc<dyn ControlRoutes>,
+    last_read_route: Mutex<Option<(Option<Uuid>, Uuid)>>,
     replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
 }
 impl ControlClient {
+    pub(crate) async fn scoped_queue_capability(
+        &self,
+    ) -> Result<ScopedQueueCapability, ProtocolError> {
+        let reply = self.read(&ReadRequest::ScopedQueueCapability).await?;
+        let capability = *reply.decode_section::<ScopedQueueCapability>(0)?;
+        if capability.version != SCOPED_QUEUE_VERSION
+            || capability.run_id.is_nil()
+            || capability.activation.is_some()
+                && capability.activation != capability.configuration_id
+        {
+            return Err(invalid("invalid Control scoped queue capability"));
+        }
+        Ok(capability)
+    }
+
+    pub(crate) async fn advertise_scoped_queue(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<(), ProtocolError> {
+        self.update_scoped_queue(
+            operation_id,
+            ScopedQueueOperation::Advertise {
+                version: SCOPED_QUEUE_VERSION,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn set_scoped_queue_admission(
+        &self,
+        operation_id: Uuid,
+        expected: ScopedQueueCapability,
+        enabled: bool,
+    ) -> Result<(), ProtocolError> {
+        self.update_scoped_queue(
+            operation_id,
+            ScopedQueueOperation::SetAdmission { expected, enabled },
+        )
+        .await
+    }
+
+    pub(crate) async fn ensure_scoped_queue(
+        &self,
+        operation_id: Uuid,
+        group: &GroupIdentity,
+    ) -> Result<ScopedQueuePlacement, ProtocolError> {
+        let reply = self
+            .change_scoped_queue(
+                operation_id,
+                ScopedQueueOperation::Ensure {
+                    group: group.clone(),
+                },
+            )
+            .await?;
+        let ControlReply::ScopedQueue(placement) = reply else {
+            return Err(invalid("unexpected Control scoped queue reply"));
+        };
+        placement.validate(group)?;
+        Ok(*placement)
+    }
+
+    pub(crate) async fn scoped_queue_transition(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<ScopedQueueTransition>, ProtocolError> {
+        self.scoped_queue_transition_read(group_id, None).await
+    }
+
+    pub(crate) async fn scoped_queue_transition_for_replica(
+        &self,
+        group_id: Uuid,
+        source_group: Uuid,
+    ) -> Result<Option<ScopedQueueTransition>, ProtocolError> {
+        self.scoped_queue_transition_read(group_id, Some(source_group))
+            .await
+    }
+
+    async fn scoped_queue_transition_read(
+        &self,
+        group_id: Uuid,
+        source_group: Option<Uuid>,
+    ) -> Result<Option<ScopedQueueTransition>, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ScopedQueueTransition {
+                group_id,
+                source_group,
+            })
+            .await?;
+        let transfer = reply.decode_section::<Option<ScopedQueueTransition>>(0)?;
+        if let Some(transfer) = transfer.as_ref() {
+            let group = &transfer.previous.group;
+            if group.group_id != group_id
+                || group.cluster_id != self.group.cluster_id
+                || group.database != self.group.database
+            {
+                return Err(invalid("foreign Control scoped queue transfer"));
+            }
+            transfer.previous.validate(group)?;
+            transfer.next.validate(group)?;
+        }
+        Ok((*transfer).clone())
+    }
+
+    /// Operator recovery input only. A fenced predecessor confers no authority.
+    pub(crate) async fn scoped_queue_predecessor(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        self.scoped_placement(ReadRequest::ScopedQueuePredecessor { group_id }, group_id)
+            .await
+    }
+
+    /// Checks the committed epoch even when a newer transfer fences routing.
+    pub(crate) async fn scoped_queue_epoch_retired(
+        &self,
+        group_id: Uuid,
+        queue_generation: Uuid,
+        view: AuthorityView,
+    ) -> Result<bool, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ScopedQueueEpochRetired {
+                group_id,
+                queue_generation,
+                view,
+            })
+            .await?;
+        Ok(*reply.decode_section::<bool>(0)?)
+    }
+
+    pub(crate) async fn begin_scoped_queue_transfer(
+        &self,
+        operation_id: Uuid,
+        expected: ScopedQueuePlacement,
+        next_owner: WorkerIdentity,
+        replaces: Option<Uuid>,
+    ) -> Result<ScopedQueueTransition, ProtocolError> {
+        let group_id = expected.group.group_id;
+        let reply = self
+            .change_scoped_queue(
+                operation_id,
+                ScopedQueueOperation::BeginTransfer {
+                    expected: Box::new(expected),
+                    next_owner,
+                    replaces,
+                },
+            )
+            .await?;
+        if !matches!(reply, ControlReply::ScopedQueueTransfer(_)) {
+            return Err(invalid("unexpected Control scoped queue transfer reply"));
+        }
+        self.scoped_queue_transition(group_id)
+            .await?
+            .filter(|current| current.id == operation_id)
+            .ok_or_else(super::scoped_queue::stale)
+    }
+
+    pub(crate) async fn report_scoped_queue_transfer(
+        &self,
+        operation_id: Uuid,
+        group_id: Uuid,
+        transfer_id: Uuid,
+        report: ScopedQueueTransferReport,
+    ) -> Result<(), ProtocolError> {
+        self.update_scoped_queue(
+            operation_id,
+            ScopedQueueOperation::ReportTransfer {
+                group_id,
+                transfer_id,
+                report,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn rebase_scoped_queue_transfer(
+        &self,
+        operation_id: Uuid,
+        group_id: Uuid,
+        transfer_id: Uuid,
+        removed: WorkerIdentity,
+        next_owner: WorkerIdentity,
+    ) -> Result<(), ProtocolError> {
+        let reply = self
+            .change_scoped_queue(
+                operation_id,
+                ScopedQueueOperation::RebaseTransfer {
+                    group_id,
+                    transfer_id,
+                    removed,
+                    next_owner,
+                },
+            )
+            .await?;
+        if !matches!(reply, ControlReply::ScopedQueueTransfer(transfer)
+            if transfer.id == operation_id && transfer.previous.group.group_id == group_id
+                && transfer.next.owner == next_owner && transfer.next.unavailable_holder == Some(removed))
+        {
+            return Err(invalid("unexpected Control scoped queue rebase reply"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn publish_scoped_queue_transfer(
+        &self,
+        operation_id: Uuid,
+        group_id: Uuid,
+        transfer_id: Uuid,
+    ) -> Result<ScopedQueuePlacement, ProtocolError> {
+        let reply = self
+            .change_scoped_queue(
+                operation_id,
+                ScopedQueueOperation::PublishTransfer {
+                    group_id,
+                    transfer_id,
+                },
+            )
+            .await?;
+        let ControlReply::ScopedQueue(placement) = reply else {
+            return Err(invalid("unexpected Control scoped queue publication reply"));
+        };
+        if placement.group.group_id != group_id
+            || placement.group.cluster_id != self.group.cluster_id
+            || placement.group.database != self.group.database
+        {
+            return Err(invalid("foreign Control scoped queue publication"));
+        }
+        placement.validate(&placement.group)?;
+        Ok(*placement)
+    }
+
+    async fn update_scoped_queue(
+        &self,
+        operation_id: Uuid,
+        action: ScopedQueueOperation,
+    ) -> Result<(), ProtocolError> {
+        match self.change_scoped_queue(operation_id, action).await? {
+            ControlReply::ScopedQueueUpdated => Ok(()),
+            _ => Err(invalid("unexpected Control scoped queue update reply")),
+        }
+    }
+
+    async fn change_scoped_queue(
+        &self,
+        operation_id: Uuid,
+        action: ScopedQueueOperation,
+    ) -> Result<ControlReply, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ChangeScopedQueue {
+                operation_id,
+                action,
+            })
+            .await?;
+        let reply = reply.decode_section::<ControlReply>(0)?;
+        match &*reply {
+            ControlReply::Rejected(Fault::Unauthorized) => Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "scoped queue authority rejected the caller",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(Fault::Invalid) => {
+                Err(invalid("invalid scoped queue operation"))
+            }
+            ControlReply::Rejected(Fault::Conflict) => Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "scoped queue operation conflicts with existing state",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(_) => Err(super::scoped_queue::stale()),
+            _ => Ok((*reply).clone()),
+        }
+    }
+
+    pub(crate) async fn scoped_queue(
+        &self,
+        group: &GroupIdentity,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        if group.cluster_id != self.group.cluster_id
+            || group.database != self.group.database
+            || group.validate().is_err()
+            || !matches!(group.kind, GroupKind::Data { .. })
+        {
+            return Err(invalid("foreign scoped queue group"));
+        }
+        let placement = self.scoped_queue_by_id(group.group_id).await?;
+        if let Some(placement) = &placement {
+            placement.validate(group)?;
+        }
+        Ok(placement)
+    }
+
+    pub(crate) async fn scoped_queue_by_id(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        self.scoped_placement(ReadRequest::ScopedQueue { group_id }, group_id)
+            .await
+    }
+
+    async fn scoped_placement(
+        &self,
+        request: ReadRequest,
+        group_id: Uuid,
+    ) -> Result<Option<ScopedQueuePlacement>, ProtocolError> {
+        if group_id.is_nil() {
+            return Err(invalid("invalid scoped queue group ID"));
+        }
+        let reply = self.read(&request).await?;
+        let reply = self.reserve_section_decode(reply).await?;
+        let placement = reply.decode_section::<Option<ScopedQueuePlacement>>(0)?;
+        if let Some(placement) = &*placement {
+            let group = &placement.group;
+            if group.group_id != group_id
+                || group.cluster_id != self.group.cluster_id
+                || group.database != self.group.database
+            {
+                return Err(invalid("foreign scoped queue placement"));
+            }
+            placement.validate(group)?;
+        }
+        Ok((*placement).clone())
+    }
+
     pub(crate) async fn published_cold_fence(
         &self,
         authority: Authority,
@@ -368,11 +1019,16 @@ impl ControlClient {
         &self,
         expected: &GroupRecord,
         authority: Authority,
-    ) -> Result<crate::oltp_replication::authority::timestamp::split::SplitSourcePlacement, ProtocolError> {
-        let reply = self.read(&ReadRequest::SplitSource {
-            expected: Box::new(expected.clone()),
-            authority,
-        }).await?;
+    ) -> Result<
+        crate::oltp_replication::authority::timestamp::split::SplitSourcePlacement,
+        ProtocolError,
+    > {
+        let reply = self
+            .read(&ReadRequest::SplitSource {
+                expected: Box::new(expected.clone()),
+                authority,
+            })
+            .await?;
         let reply = self.reserve_section_decode(reply).await?;
         let decoded = reply.decode_section::<crate::oltp_replication::authority::timestamp::split::SplitSourcePlacement>(0)?;
         if decoded.record != *expected {
@@ -382,17 +1038,29 @@ impl ControlClient {
         Ok((*decoded).clone())
     }
 
-    pub(crate) async fn own_worker_drain(&self) -> Result<Option<super::WorkerDrainRecord>, ProtocolError> {
+    pub(crate) async fn own_worker_drain(
+        &self,
+    ) -> Result<Option<super::WorkerDrainRecord>, ProtocolError> {
         let reply = self.read(&ReadRequest::OwnWorkerDrain).await?;
         let record = reply.decode_section::<Option<super::WorkerDrainRecord>>(0)?;
-        if record.as_ref().is_some_and(|record| record.intent.worker != self.client.local_identity()) {
+        if record
+            .as_ref()
+            .is_some_and(|record| record.intent.worker != self.client.local_identity())
+        {
             return Err(invalid("Control worker drain identity differs"));
         }
         Ok((*record).clone())
     }
 
-    pub(crate) async fn verify_pool_replica_retired(&self, stamp: super::ReplicaRetiredStamp) -> Result<bool, ProtocolError> {
-        let reply = self.read(&ReadRequest::PoolReplicaRetired { stamp: Box::new(stamp) }).await?;
+    pub(crate) async fn verify_pool_replica_retired(
+        &self,
+        stamp: super::ReplicaRetiredStamp,
+    ) -> Result<bool, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::PoolReplicaRetired {
+                stamp: Box::new(stamp),
+            })
+            .await?;
         Ok(*reply.decode_section::<bool>(0)?)
     }
 
@@ -406,7 +1074,11 @@ impl ControlClient {
         let local = self.client.local_identity();
         if record.plan.id != id
             || (record.plan.request.worker != local
-                && !record.plan.remote_source.as_ref().is_some_and(|source| source.worker == local))
+                && !record
+                    .plan
+                    .remote_source
+                    .as_ref()
+                    .is_some_and(|source| source.worker == local))
         {
             return Err(invalid("Control remote placement identity differs"));
         }
@@ -419,7 +1091,9 @@ impl ControlClient {
         node: u64,
     ) -> Result<Decoded<(super::ReplicaMove, WorkerIdentity)>, ProtocolError> {
         use super::ReplicaMovePhase;
-        let reply = self.read(&ReadRequest::RemoteReplicaVoter { id, node }).await?;
+        let reply = self
+            .read(&ReadRequest::RemoteReplicaVoter { id, node })
+            .await?;
         let reply = self.reserve_section_decode(reply).await?;
         let record = reply.decode_section::<(super::ReplicaMove, WorkerIdentity)>(0)?;
         let (plan, voter) = &*record;
@@ -434,7 +1108,9 @@ impl ControlClient {
             && plan.request.worker == local;
         if plan.id != id
             || (local != *voter && !learner_check)
-            || !members.iter().any(|member| member.node_id == node && member.worker_id == voter.worker_id)
+            || !members
+                .iter()
+                .any(|member| member.node_id == node && member.worker_id == voter.worker_id)
         {
             return Err(invalid("Control remote voter identity differs"));
         }
@@ -459,6 +1135,7 @@ impl ControlClient {
             shared,
             group,
             routes,
+            last_read_route: Mutex::new(None),
             replica_routes,
         }))
     }
@@ -466,114 +1143,174 @@ impl ControlClient {
         let header = self
             .shared
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
-        // The ServiceRole endpoint finishes using Control consensus and its
-        // local state. It does not make another outgoing Authority read.
-        let role_dependency = matches!(request, ReadRequest::ServiceRole { .. });
+        let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
+        let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
-        let preferred = self.routes.preferred();
-        let mut first = preferred;
-        let mut after = None;
-        let mut error = unavailable();
+        let deadline = request
+            .supports_bounded_failover()
+            .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
+        let use_route_hint = deadline.is_some() || matches!(request, ReadRequest::ChangeScopedQueue { .. });
+        let mut last = unavailable();
         loop {
-            let worker = if let Some(worker) = first.take() {
-                worker
-            } else {
-                let Some(worker) = self.routes.next(after)? else {
-                    break;
-                };
-                if after.is_some_and(|previous| worker <= previous) {
-                    return Err(invalid("Control routes are not strictly ordered"));
-                }
-                after = Some(worker);
-                if Some(worker) == preferred {
-                    continue;
-                }
-                worker
+            let configured_preferred = self.routes.preferred();
+            let preferred = match configured_preferred {
+                None if use_route_hint => self.preferred_read_route()?,
+                value => value,
             };
-            if worker.is_nil() {
-                return Err(invalid("nil Control route"));
-            }
-            let reply = if role_dependency {
-                match self
-                    .client
-                    .request_authority_dependency(&self.group, worker, header.clone(), 64 << 10)
-                    .await
-                {
-                    // Every route shares this local lane. Exhaustion cannot
-                    // improve by selecting another peer.
-                    Err(RequestError::OutgoingLaneFull) => {
-                        return Err(RequestError::OutgoingLaneFull.into());
+            let mut first = preferred;
+            let mut after = None;
+            let mut attempted = false;
+            let mut legacy_placement_role = false;
+            loop {
+                let cursor = after;
+                let (worker, preferred_attempt) = if let Some(worker) = first.take() {
+                    (worker, true)
+                } else {
+                    let Some(worker) = self.routes.next(after)? else {
+                        break;
+                    };
+                    if after.is_some_and(|previous| worker <= previous) {
+                        return Err(invalid("Control routes are not strictly ordered"));
                     }
-                    result => result.map_err(ProtocolError::from),
+                    after = Some(worker);
+                    if Some(worker) == preferred {
+                        continue;
+                    }
+                    (worker, false)
+                };
+                if worker.is_nil() {
+                    return Err(invalid("nil Control route"));
                 }
-            } else if exact_sample {
-                match self
-                    .client
-                    .request_classified(
-                        &self.group,
-                        worker,
-                        Purpose::Authority,
-                        header.clone(),
-                        [None, None, None],
-                        64 << 10,
-                    )
-                    .await
-                {
-                    Ok(reply) => Ok(reply),
-                    Err(RequestError::Unreachable) => Err(RequestError::Unreachable.into()),
-                    Err(RequestError::PeerRejected { worker: peer, error }) => {
+                attempted = true;
+                let exchange = async {
+                    if role_dependency {
+                        // This endpoint uses Control consensus and its local state.
+                        // It does not make another outgoing Authority read.
+                        self.client
+                            .request_authority_dependency(
+                                &self.group,
+                                worker,
+                                header.clone(),
+                                64 << 10,
+                            )
+                            .await
+                    } else {
+                        self.client
+                            .request_classified(
+                                &self.group,
+                                worker,
+                                Purpose::Authority,
+                                header.clone(),
+                                [None, None, None],
+                                64 << 10,
+                            )
+                            .await
+                    }
+                };
+                let result = if let Some(deadline) = deadline {
+                    let now = TokioInstant::now();
+                    if now >= deadline {
+                        return Err(last);
+                    }
+                    time::timeout_at(deadline.min(now + READ_PEER_TIMEOUT), exchange)
+                        .await
+                        .unwrap_or(Err(RequestError::Unreachable))
+                } else {
+                    exchange.await
+                };
+                let reply = match result {
+                    Ok(reply) => reply,
+                    Err(RequestError::PeerRejected {
+                        worker: peer,
+                        error,
+                    }) if exact_sample || deadline.is_some() => {
                         if peer.worker_id != worker {
-                            return Err(invalid("Control growth sample error binding differs"));
+                            return Err(invalid(
+                                "Control error response transport binding differs",
+                            ));
                         }
-                        tracing::debug!(%worker, code=?error.code, outcome=?error.outcome,
-                            message=error.message, "Control own growth sample rejected");
-                        if !growth_sample_peer_unavailable(&error) {
+                        if placement_role && error == invalid("invalid Control authority request") {
+                            // Older Control voters reject this closed request in their parser.
+                            legacy_placement_role = true;
+                            continue;
+                        }
+                        let retryable = if exact_sample {
+                            growth_sample_peer_unavailable(&error)
+                        } else {
+                            control_read_peer_unavailable(&error)
+                        };
+                        if !retryable {
                             return Err(error);
                         }
-                        Err(error)
+                        last = error;
+                        continue;
                     }
-                    // Local exhaustion applies to every route. An invalid
-                    // exchange cannot be replaced with a different peer reply.
-                    Err(failure) => return Err(failure.into()),
-                }
-            } else {
-                self.client
-                    .request(
-                        &self.group,
-                        worker,
-                        Purpose::Authority,
-                        header.clone(),
-                        [None, None, None],
-                        64 << 10,
-                    )
-                    .await
-            };
-            match reply {
-                Ok(reply) => {
-                    if reply.remote_identity().worker_id != worker
-                        || reply.group() != &self.group
-                        || reply.purpose() != Purpose::Authority
-                        || reply.sections[1].is_some()
-                        || reply.sections[2].is_some()
-                    {
-                        return Err(invalid("Control response transport binding differs"));
-                    }
-                    {
-                        let decoded = reply.decode_header::<ReadReply>()?;
-                        if decoded.nonce != reply.nonce()
-                            || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64)
-                                != Some(decoded.bytes)
+                    Err(failure) => {
+                        if (exact_sample || deadline.is_some())
+                            && !matches!(failure, RequestError::Unreachable)
+                            && !matches!(
+                                &failure,
+                                RequestError::Protocol(error) if peer_enrollment_unavailable(error)
+                                    && deadline.is_some()
+                            )
                         {
-                            return Err(invalid("Control response payload differs"));
+                            // A local lane refusal or invalid exchange cannot
+                            // improve by selecting another peer.
+                            return Err(failure.into());
                         }
+                        last = failure.into();
+                        continue;
                     }
-                    return Ok(reply);
+                };
+                if reply.remote_identity().worker_id != worker
+                    || reply.group() != &self.group
+                    || reply.purpose() != Purpose::Authority
+                    || reply.sections[1].is_some()
+                    || reply.sections[2].is_some()
+                {
+                    return Err(invalid("Control response transport binding differs"));
                 }
-                Err(failure) => error = failure,
+                {
+                    let decoded = reply.decode_header::<ReadReply>()?;
+                    if decoded.nonce != reply.nonce()
+                        || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64)
+                            != Some(decoded.bytes)
+                    {
+                        return Err(invalid("Control response payload differs"));
+                    }
+                }
+                if use_route_hint
+                    && configured_preferred.is_none()
+                    && !preferred_attempt
+                    && let Ok(mut route) = self.last_read_route.lock()
+                {
+                    *route = Some((cursor, worker));
+                }
+                return Ok(reply);
             }
+            if legacy_placement_role {
+                return Err(unsupported_service_route());
+            }
+            let Some(deadline) = deadline else {
+                return Err(last);
+            };
+            if !attempted || TokioInstant::now() >= deadline {
+                return Err(last);
+            }
+            // A new election may make a peer usable after the first round.
+            time::sleep_until(deadline.min(TokioInstant::now() + READ_RETRY_DELAY)).await;
         }
-        Err(error)
     }
+
+    fn preferred_read_route(&self) -> Result<Option<Uuid>, ProtocolError> {
+        let hint = self.last_read_route.lock().ok().and_then(|route| *route);
+        let Some((cursor, worker)) = hint else {
+            return Ok(None);
+        };
+        // Recheck membership before using a previously responsive route.
+        Ok((self.routes.next(cursor)? == Some(worker)).then_some(worker))
+    }
+
     async fn authority(
         &self,
         scope: &QueueScope,
@@ -638,6 +1375,74 @@ impl ControlClient {
             .await?;
         Ok(*reply.decode_section::<ServiceAuthorization>(0)?)
     }
+
+    pub(crate) async fn verify_timestamp_point_route(
+        &self,
+        session: &AuthenticatedSession,
+        node_id: u64,
+        route: TimestampPointRoute,
+    ) -> Result<(), ProtocolError> {
+        self.read_timestamp_point_route(session, node_id, route, None)
+            .await
+    }
+
+    pub(crate) async fn verify_timestamp_point_decision_route(
+        &self,
+        session: &AuthenticatedSession,
+        node_id: u64,
+        route: TimestampPointRoute,
+        action: ServiceAction,
+        source_digest: Digest,
+    ) -> Result<(), ProtocolError> {
+        self.read_timestamp_point_route(session, node_id, route, Some((action, source_digest)))
+            .await
+    }
+
+    async fn read_timestamp_point_route(
+        &self,
+        session: &AuthenticatedSession,
+        node_id: u64,
+        route: TimestampPointRoute,
+        decision_source: Option<(ServiceAction, Digest)>,
+    ) -> Result<(), ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::TimestampPointProof {
+                remote: session.remote(),
+                target: Box::new(session.group().clone()),
+                node_id,
+                route,
+                decision_source,
+            })
+            .await?;
+        Ok(*reply.decode_section::<()>(0)?)
+    }
+    pub(crate) async fn service_role_at_replica(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        target: GroupIdentity,
+        node_id: u64,
+        generation: Uuid,
+    ) -> Result<(), ProtocolError> {
+        if scope.cluster_id != self.group.cluster_id || scope.database != self.group.database {
+            return Err(invalid("foreign service authorization scope"));
+        }
+        let reply = self
+            .read(&ReadRequest::ServiceRoleAtReplica {
+                remote,
+                target: Box::new(target),
+                node_id,
+                generation,
+            })
+            .await?;
+        let grant = reply.decode_section::<ServiceAuthorization>(0)?;
+        if grant.owner != Some(remote) {
+            return Err(invalid(
+                "receiver placement grant differs from request owner",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) async fn ready_page(
         &self,
         expected: ReadyMembership,
@@ -645,6 +1450,18 @@ impl ControlClient {
     ) -> Result<ReceivedReply, ProtocolError> {
         self.read(&ReadRequest::Ready { expected, after }).await
     }
+}
+
+fn peer_enrollment_unavailable(error: &ProtocolError) -> bool {
+    error.code == ErrorCode::StorageUnavailable
+        && error.outcome == Outcome::Unknown
+        && error.message == "peer enrollment view is unavailable"
+}
+
+fn control_read_peer_unavailable(error: &ProtocolError) -> bool {
+    growth_sample_peer_unavailable(error)
+        || peer_enrollment_unavailable(error)
+        || error.code == ErrorCode::Overloaded
 }
 
 fn growth_sample_peer_unavailable(error: &ProtocolError) -> bool {
@@ -712,7 +1529,50 @@ pub(crate) type ReplicaRoutes = Arc<VerifiedReplicaRoutes>;
 pub(crate) struct VerifiedReplicaRoutes {
     pub record: GroupRecord,
     pub members: Vec<ReplicaMember>,
+    hint: Mutex<ReplicaRouteHint>,
     _owner: ScratchLease,
+}
+
+#[derive(Default)]
+struct ReplicaRouteHint {
+    last_successful_node: Option<u64>,
+    receiver: Option<(u64, WorkerIdentity)>,
+    probe_after: Option<Instant>,
+}
+
+impl VerifiedReplicaRoutes {
+    pub(crate) fn last_successful_node(&self) -> Option<u64> {
+        self.hint.lock().ok()?.last_successful_node
+    }
+
+    pub(crate) fn record_successful_node(&self, node_id: u64) {
+        if let Ok(mut hint) = self.hint.lock() {
+            hint.last_successful_node = Some(node_id);
+        }
+    }
+
+    pub(crate) fn hinted_receiver(&self, node_id: u64) -> Option<WorkerIdentity> {
+        let (node, receiver) = self.hint.lock().ok()?.receiver?;
+        (node == node_id).then_some(receiver)
+    }
+
+    pub(crate) fn begin_receiver_probe(&self) -> bool {
+        let Ok(mut hint) = self.hint.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if hint.probe_after.is_some_and(|after| after > now) {
+            return false;
+        }
+        hint.probe_after = Some(now + Duration::from_secs(1));
+        true
+    }
+
+    pub(crate) fn confirm_hinted_receiver(&self, node_id: u64, receiver: WorkerIdentity) {
+        if let Ok(mut hint) = self.hint.lock() {
+            hint.receiver = Some((node_id, receiver));
+        }
+    }
 }
 
 const ROUTE_CACHE_ENTRIES: usize = 64;
@@ -765,6 +1625,9 @@ impl ReplicaRouteCache {
     }
 }
 impl ControlClient {
+    pub(crate) fn cached_replica_routes(&self, group: &GroupIdentity) -> Option<ReplicaRoutes> {
+        self.route_cache()?.slot(group)?.clone()
+    }
     pub(crate) async fn enrollment_revision(&self) -> Result<u64, ProtocolError> {
         let reply = self.read(&ReadRequest::EnrollmentRevision).await?;
         Ok(*reply.decode_section::<u64>(0)?)
@@ -815,6 +1678,21 @@ impl ControlClient {
     pub(crate) async fn replica_routes(
         &self,
         expected: &GroupIdentity,
+    ) -> Result<ReplicaRoutes, ProtocolError> {
+        self.replica_routes_inner(expected, 0).await
+    }
+
+    pub(crate) async fn timestamp_point_routes(
+        &self,
+        expected: &GroupIdentity,
+    ) -> Result<ReplicaRoutes, ProtocolError> {
+        self.replica_routes_inner(expected, 8).await
+    }
+
+    async fn replica_routes_inner(
+        &self,
+        expected: &GroupIdentity,
+        progress_member_limit: usize,
     ) -> Result<ReplicaRoutes, ProtocolError> {
         if expected.cluster_id != self.group.cluster_id || expected.database != self.group.database
         {
@@ -868,15 +1746,23 @@ impl ControlClient {
         let (owner, retain) = match self.shared.reserve_scratch(ByteClass::Data, bytes) {
             Ok(owner) => (owner, true),
             Err(error) => {
-                let Some(mut cache) = self.route_cache() else {
-                    return Err(error);
+                let retried = if let Some(mut cache) = self.route_cache()
+                    && cache.entries.iter().any(Option::is_some)
+                {
+                    cache.entries.fill(None);
+                    drop(cache);
+                    self.shared.reserve_scratch(ByteClass::Data, bytes)
+                } else {
+                    Err(error)
                 };
-                if cache.entries.iter().all(Option::is_none) {
-                    return Err(error);
+                match retried {
+                    Ok(owner) => (owner, false),
+                    Err(error) if count > progress_member_limit => return Err(error),
+                    Err(_) => (
+                        self.shared.reserve_scratch(ByteClass::Progress, bytes)?,
+                        false,
+                    ),
                 }
-                cache.entries.fill(None);
-                drop(cache);
-                (self.shared.reserve_scratch(ByteClass::Data, bytes)?, false)
             }
         };
         let record = record.clone();
@@ -902,6 +1788,7 @@ impl ControlClient {
         let route = Arc::new(VerifiedReplicaRoutes {
             record,
             members,
+            hint: Mutex::new(ReplicaRouteHint::default()),
             _owner: owner,
         });
         let cacheable = retain && retained <= ROUTE_CACHE_ENTRY_BYTES;

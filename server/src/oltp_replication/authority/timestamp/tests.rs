@@ -14,20 +14,20 @@ use crate::{
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-struct Dir(std::path::PathBuf);
+pub(super) struct Dir(pub(super) std::path::PathBuf);
 impl Drop for Dir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-struct Fixture {
-    machine: TimestampMachine,
-    pool: OltpPool,
-    dir: Dir,
-    next: u64,
+pub(super) struct Fixture {
+    pub(super) machine: TimestampMachine,
+    pub(super) pool: OltpPool,
+    pub(super) dir: Dir,
+    pub(super) next: u64,
 }
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let dir = Dir(std::env::temp_dir().join(format!("oltp-timestamps-{}", Uuid::new_v4())));
         let shared = WorkerSharedResources::new(
             9,
@@ -67,7 +67,7 @@ impl Fixture {
             next: 0,
         }
     }
-    async fn apply(&mut self, command: TimestampCommand) -> TimestampReply {
+    pub(super) async fn apply(&mut self, command: TimestampCommand) -> TimestampReply {
         let resources = self.pool.resources();
         let command = OwnedCommand::new_owned(command, resources, ByteClass::Progress).unwrap();
         let encoded = resources
@@ -88,7 +88,7 @@ impl Fixture {
         let result = self.machine.apply(meta, command).await.unwrap();
         serde_json::from_slice(result.as_slice()).unwrap()
     }
-    async fn initialize(&mut self, ready: ReadyMembership) {
+    pub(super) async fn initialize(&mut self, ready: ReadyMembership) {
         assert!(matches!(
             self.apply(TimestampCommand::Fence {
                 transition_id: Uuid::new_v4(),
@@ -104,7 +104,7 @@ impl Fixture {
         ));
     }
 }
-fn worker() -> WorkerIdentity {
+pub(super) fn worker() -> WorkerIdentity {
     WorkerIdentity {
         worker_id: Uuid::new_v4(),
         incarnation: Uuid::new_v4(),
@@ -112,7 +112,7 @@ fn worker() -> WorkerIdentity {
         enrollment_revision: 1,
     }
 }
-fn ready(member: WorkerIdentity) -> ReadyMembership {
+pub(super) fn ready(member: WorkerIdentity) -> ReadyMembership {
     let mut hash = ReadySetHasher::default();
     hash.push(member).unwrap();
     ReadyMembership {
@@ -156,6 +156,7 @@ fn begin(
             original_run: request.run_id,
             reservation_id: identity.nonce,
             kind: super::super::status::RequestKind::Read,
+            scoped: None,
         },
         pin_id: Uuid::new_v4(),
     }
@@ -243,6 +244,7 @@ async fn o09_o15_o19_r04_cold_release_advances_floor_past_abandoned_application_
         original_run: old.view.run_id,
         digest: index_identity.digest,
         kind: RequestKind::Mutation,
+        scoped: None,
     };
     let TimestampReply::Snapshot(index) = f
         .apply(TimestampCommand::BeginIndexMetadata {
@@ -1127,6 +1129,7 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     let reservation = IdentityReservation {
         request_id: split_id,
         kind: RequestKind::Mutation,
+        scoped: None,
         reservation_id: Uuid::new_v4(),
         original_run: authority.run_id,
         digest: intent.digest().unwrap(),

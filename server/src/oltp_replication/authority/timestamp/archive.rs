@@ -1,10 +1,15 @@
 //! A backup cut closes only after every older allocated commit timestamp has
 //! an immutable, fully resolved Status decision. Closure is durable metadata.
 pub(crate) mod metadata;
+pub(crate) mod point;
 use super::*;
 use crate::oltp::backup::BackupOwnerRef;
 use crate::oltp::pool::ByteClass;
-use crate::oltp_replication::{authority::status::StatusService, owned::serialized_digest};
+use crate::oltp_replication::{
+    authority::status::{MutationOutcome, StatusService},
+    owned::serialized_digest,
+};
+use point::PointArchiveCut;
 const CLOSURES: &[u8] = b"ts/archive-closure/v1/";
 const PAGE_BUDGET: TransactionBudget = TransactionBudget {
     scratch_bytes: 256 << 10,
@@ -31,6 +36,8 @@ pub(crate) struct ArchiveClosureStatement {
     pub decision_root: Digest,
     pub allocation_count: u64,
     pub allocation_root: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_history: Option<PointArchiveCut>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,8 +109,14 @@ impl VerifiedArchiveClosure {
     }
 }
 #[derive(Serialize, Deserialize)]
+enum ArchiveCandidate {
+    Legacy(CommitAllocation),
+    Point(point_decision::PointDecision),
+}
+
+#[derive(Serialize, Deserialize)]
 struct AllocationPage {
-    items: Page<CommitAllocation>,
+    items: Page<ArchiveCandidate>,
     after: Option<TxnId>,
     exhausted: bool,
 }
@@ -207,6 +220,12 @@ impl TimestampHandle {
                 ),
             ));
         }
+        let cut = status.archive_cut(authority).await?;
+        let status_applied = cut.statement().applied;
+        // Take this barrier after the Status cut. Every point already projected
+        // there must have been ordered here, including untimestamped ABORTs.
+        let timestamp_applied = self.consensus.ensure_linearizable().await?.applied;
+        let mut point_history = PointArchiveCut::new(timestamp_applied);
         let mut root = serialized_digest(&(
             b"nabedra/archive-allocation-seed/v1".as_slice(),
             self.identity(),
@@ -220,87 +239,104 @@ impl TimestampHandle {
         let mut decision_root = serialized_digest(&b"nabedra/archive-decisions/v1".as_slice())?;
         let mut after = None;
         loop {
-            let prefix = [COMMIT_PREFIX, group.group_id.as_bytes()].concat();
-            let page_prefix = prefix.clone();
+            let page_group = group.clone();
+            let timestamps = self.identity().clone();
             let raw = self
                 .machine
                 .store()
-                .read_archive(PAGE_BUDGET, move |view, _| {
-                    let mut cursor = after
-                        .map(|txn| commit_key(group.group_id, txn).to_vec())
-                        .unwrap_or_else(|| page_prefix.clone());
-                    if after.is_some() {
-                        cursor.push(0);
+                .read_archive(PAGE_BUDGET, move |view, applied| {
+                    if !point::at_or_before(timestamp_applied, applied) {
+                        return Err(unknown());
                     }
-                    let mut items = Vec::with_capacity(64);
-                    let mut next = after;
-                    for _ in 0..64 {
-                        let Some(row) = view.first_from(&page_prefix, &cursor)? else {
-                            break;
-                        };
-                        if row.key().len() != COMMIT_PREFIX.len() + 40
-                            || row.value().len() > 16 << 10
-                        {
-                            return Err(unknown());
-                        }
-                        let allocation: CommitAllocation =
-                            serde_json::from_slice(row.value()).map_err(|_| unknown())?;
-                        let binding = allocation.permit.statement();
-                        if binding.manifest.status_group_id != group.group_id
-                            || row.key() != commit_key(group.group_id, binding.txn)
-                            || allocation.stamp.permit_digest
-                                != allocation.permit.allocation_digest()?
-                        {
-                            return Err(unknown());
-                        }
-                        next = Some(binding.txn);
-                        cursor = row.key().to_vec();
-                        cursor.push(0);
-                        if allocation.stamp.commit_ts <= pin.read_ts {
-                            items.push(allocation);
-                        }
-                    }
-                    let exhausted = view.first_from(&page_prefix, &cursor)?.is_none();
-                    view.encode(&AllocationPage {
-                        items: Page::new(items).map_err(|_| unknown())?,
-                        after: next,
-                        exhausted,
-                    })
+                    allocation_page(
+                        view,
+                        &page_group,
+                        &timestamps,
+                        pin,
+                        timestamp_applied,
+                        after,
+                    )
                 })
                 .await?;
-            let decode = Arc::new(
-                self.resources()
-                    .reserve_scratch_wait(
-                        ByteClass::Data,
-                        crate::oltp::mvcc::json_decode_budget(raw.as_slice())?,
-                        0,
-                    )
-                    .await?,
-            );
+            let _decode = self
+                .resources()
+                .reserve_scratch_wait(
+                    ByteClass::Data,
+                    crate::oltp::mvcc::json_decode_budget(raw.as_slice())?,
+                    0,
+                )
+                .await?;
             let page: AllocationPage =
                 serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())?;
-            for allocation in page.items.iter() {
-                let binding = allocation.permit.statement();
+            for item in page.items.iter() {
+                let (txn, manifest, request) = match item {
+                    ArchiveCandidate::Legacy(allocation) => {
+                        let binding = allocation.permit.statement();
+                        (binding.txn, binding.manifest, binding.request)
+                    }
+                    ArchiveCandidate::Point(decision) => {
+                        let locator = decision.locator();
+                        (
+                            locator.binding.txn,
+                            locator.manifest,
+                            locator.binding.request,
+                        )
+                    }
+                };
                 let decision = status
-                    .lookup_decision(binding.txn, binding.manifest)
+                    .lookup_decision(txn, manifest)
                     .await?
                     .ok_or_else(unsettled)?;
                 let statement = decision.statement();
-                if statement.request != binding.request
-                    || matches!(statement.decision, TxnDecision::Commit { commit_ts } if commit_ts != allocation.stamp.commit_ts)
+                let settled = status.settled_proof(txn, manifest).await?.into_sealed();
+                let evidence = settled.validate_for(txn, &request, &manifest)?;
+                if evidence.decision != *statement
+                    || statement.decided_at.index > status_applied.index
+                    || evidence.settled_at.index > status_applied.index
                 {
-                    return Err(unknown());
+                    return Err(unsettled());
                 }
-                let settled = status
-                    .settled_proof(binding.txn, binding.manifest)
-                    .await?
-                    .into_sealed();
-                let evidence =
-                    settled.validate_for(binding.txn, &binding.request, &binding.manifest)?;
-                if evidence.decision != *statement {
-                    return Err(unknown());
+                match item {
+                    ArchiveCandidate::Legacy(allocation) => {
+                        if matches!(statement.decision, TxnDecision::Commit { commit_ts }
+                            if commit_ts != allocation.stamp.commit_ts)
+                        {
+                            return Err(unknown());
+                        }
+                        root = serialized_digest(&(
+                            b"nabedra/archive-allocation-step/v1".as_slice(),
+                            root,
+                            &allocation.permit,
+                            allocation.stamp,
+                            evidence,
+                        ))?;
+                        count = count.checked_add(1).ok_or_else(unknown)?;
+                    }
+                    ArchiveCandidate::Point(authoritative) => {
+                        let (proof, _owner) = status
+                            .timestamp_point_projection(authority, authoritative.locator())
+                            .await?
+                            .ok_or_else(unsettled)?;
+                        if proof.completion().decision() != authoritative
+                            || proof.projected_at() != evidence.settled_at
+                        {
+                            return Err(unknown());
+                        }
+                        point::validate_projection(
+                            &proof,
+                            self.identity(),
+                            &group,
+                            timestamp_applied,
+                            status_applied,
+                            pin.read_ts,
+                            statement,
+                            decision.outcome().ok_or_else(unknown)?,
+                        )?;
+                        point_history.push(&proof)?;
+                    }
                 }
-                if matches!(statement.decision, TxnDecision::Commit { commit_ts } if base_exclusive.is_none_or(|base| commit_ts > base))
+                if matches!(statement.decision, TxnDecision::Commit { commit_ts }
+                    if base_exclusive.is_none_or(|base| commit_ts > base))
                 {
                     decision_root = serialized_digest(&(
                         b"nabedra/archive-decision/v1".as_slice(),
@@ -309,16 +345,7 @@ impl TimestampHandle {
                     ))?;
                     committed_count = committed_count.checked_add(1).ok_or_else(unknown)?;
                 }
-                root = serialized_digest(&(
-                    b"nabedra/archive-allocation-step/v1".as_slice(),
-                    root,
-                    &allocation.permit,
-                    allocation.stamp,
-                    evidence,
-                ))?;
-                count = count.checked_add(1).ok_or_else(unknown)?;
             }
-            drop(decode);
             if page.exhausted {
                 break;
             }
@@ -327,7 +354,6 @@ impl TimestampHandle {
             }
             after = page.after;
         }
-        let cut = status.archive_cut(authority).await?;
         let statement = ArchiveClosureStatement {
             timestamps: self.identity().clone(),
             status: status.identity().clone(),
@@ -343,6 +369,7 @@ impl TimestampHandle {
             decision_root,
             allocation_count: count,
             allocation_root: root,
+            point_history: (point_history.count != 0).then_some(point_history),
         };
         let proof = SealedArchiveClosure::verified(statement.clone())?;
         match self
@@ -357,10 +384,126 @@ impl TimestampHandle {
         }
     }
 }
+fn allocation_page(
+    view: &mut crate::oltp::pool::GroupRead<'_>,
+    status: &GroupIdentity,
+    timestamps: &GroupIdentity,
+    pin: StoragePin,
+    timestamp_applied: AppliedPosition,
+    after: Option<TxnId>,
+) -> Result<ChargedBytes, ProtocolError> {
+    fn next<'a>(
+        view: &mut crate::oltp::pool::GroupRead<'a>,
+        prefix: &[u8],
+        after: Option<TxnId>,
+    ) -> Result<Option<(TxnId, crate::oltp::pool::ScopedRecord<'a>)>, ProtocolError> {
+        let mut key = prefix.to_vec();
+        if let Some(txn) = after {
+            key.extend_from_slice(txn.request_id.as_bytes());
+            key.extend_from_slice(&txn.attempt.to_be_bytes());
+            key.push(0);
+        }
+        let Some(row) = view.first_from(prefix, &key)? else {
+            return Ok(None);
+        };
+        let key = row
+            .key()
+            .strip_prefix(prefix)
+            .filter(|key| key.len() == 24)
+            .ok_or_else(unknown)?;
+        let txn = TxnId {
+            request_id: uuid::Uuid::from_slice(&key[..16]).map_err(|_| unknown())?,
+            attempt: u64::from_be_bytes(key[16..].try_into().map_err(|_| unknown())?),
+        };
+        Ok(Some((txn, row)))
+    }
+
+    let legacy_prefix = [COMMIT_PREFIX, status.group_id.as_bytes()].concat();
+    let point_prefix = [point_decision::STATUS_INDEX, status.group_id.as_bytes()].concat();
+    let state: State =
+        serde_json::from_slice(&view.pinned(STATE)?.ok_or_else(unknown)?).map_err(|_| unknown())?;
+    let mut cursor = after;
+    let mut items = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let legacy = next(view, &legacy_prefix, cursor)?;
+        let point = next(view, &point_prefix, cursor)?;
+        if matches!((&legacy, &point), (Some((old, _)), Some((new, _))) if old.request_id == new.request_id)
+        {
+            return Err(unknown());
+        }
+        match (legacy, point) {
+            (Some((txn, row)), other) if other.as_ref().is_none_or(|(new, _)| txn < *new) => {
+                if row.value().len() > 16 << 10 {
+                    return Err(unknown());
+                }
+                let allocation: CommitAllocation =
+                    serde_json::from_slice(row.value()).map_err(|_| unknown())?;
+                let binding = allocation.permit.statement();
+                if binding.manifest.status_group_id != status.group_id
+                    || binding.txn != txn
+                    || allocation.stamp.permit_digest != allocation.permit.allocation_digest()?
+                {
+                    return Err(unknown());
+                }
+                cursor = Some(txn);
+                if allocation.stamp.commit_ts <= pin.read_ts {
+                    items.push(ArchiveCandidate::Legacy(allocation));
+                }
+            }
+            (_, Some((txn, row))) => {
+                if row.value().len() != 32 {
+                    return Err(unknown());
+                }
+                let record = point_decision::read_record_by_uuid(
+                    timestamps,
+                    &state,
+                    txn.request_id,
+                    |key| view.get(key),
+                )?
+                .ok_or_else(unknown)?;
+                let locator = record.locator();
+                record.verify_locator(locator)?;
+                if locator.binding.txn != txn
+                    || &locator.binding.status_group != status
+                    || &locator.binding.timestamps_group != timestamps
+                {
+                    return Err(unknown());
+                }
+                cursor = Some(txn);
+                let at_barrier = point::at_or_before(record.decided_at(), timestamp_applied);
+                match record.decision() {
+                    TxnDecision::Commit { commit_ts } if commit_ts <= pin.read_ts => {
+                        if !at_barrier {
+                            return Err(unknown());
+                        }
+                        items.push(ArchiveCandidate::Point(record));
+                    }
+                    TxnDecision::Abort { .. } if at_barrier => {
+                        items.push(ArchiveCandidate::Point(record));
+                    }
+                    _ => {}
+                }
+            }
+            (None, None) => {
+                return view.encode(&AllocationPage {
+                    items: Page::new(items).map_err(|_| unknown())?,
+                    after: cursor,
+                    exhausted: true,
+                });
+            }
+            (Some(_), None) => return Err(unknown()),
+        }
+    }
+    view.encode(&AllocationPage {
+        items: Page::new(items).map_err(|_| unknown())?,
+        after: cursor,
+        exhausted: false,
+    })
+}
 fn unsettled() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
-        "archive cut waits for an immutable fully settled pre-cut allocation",
+        "archive cut waits for a fully settled decision at its Status cut",
         Outcome::Unknown,
     )
 }
@@ -380,6 +523,10 @@ pub(super) fn apply_closure(
     if statement.timestamps != *scope
         || statement.authority != state.authority
         || statement.archive_id.is_nil()
+        || statement
+            .point_history
+            .as_ref()
+            .is_some_and(|history| !history.valid())
         || !matches!(statement.status.kind, GroupKind::Status { .. })
         || statement.status.cluster_id != scope.cluster_id
         || statement.status.database != scope.database

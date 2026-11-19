@@ -33,6 +33,9 @@ fn hash(bytes: &[u8]) -> Digest {
 
 mod queue_latency;
 use queue_latency::{AcceptanceTiming, QueueLatency, QueueLatencySnapshot};
+#[cfg(test)]
+pub(super) mod scoped;
+pub(super) mod scoped_store;
 mod removal;
 mod read_grants;
 pub use read_grants::ReadGrantSet;
@@ -451,6 +454,7 @@ struct CopyBarrier {
     version: RecordVersion,
     ready: ReadySetHasher,
     complete: bool,
+    terminal_confirmed: bool,
     acceptance_timing: AcceptanceTiming,
 }
 
@@ -464,6 +468,7 @@ pub struct WorkerReplica {
     authority: QueueAuthority,
     members: Arc<BTreeMap<Uuid, WorkerIdentity>>,
     queue: RequestQueue,
+    scoped: Option<Box<scoped_store::ScopedQueueStore>>,
     barriers: BTreeMap<Uuid, CopyBarrier>,
     queue_latency: QueueLatency,
     terminal_metadata: BTreeMap<Uuid, TerminalMetadata>,
@@ -495,6 +500,24 @@ pub(crate) struct QueueStats {
     pub charged_result_bytes: usize,
 }
 impl WorkerReplica {
+    /// Bootstrap splits this worker's physical limits before attaching a store.
+    pub(super) fn install_scoped_queues(&mut self, limits: QueueLimits) -> Result<(), QueueError> {
+        if self.scoped.is_some() || limits.result_retention_ms != self.retention_ms {
+            return Err(QueueError::Invalid);
+        }
+        self.scoped = Some(Box::new(scoped_store::ScopedQueueStore::new(
+            self.shared.clone(),
+            self.scope.clone(),
+            self.local,
+            limits,
+        )?));
+        Ok(())
+    }
+
+    pub(crate) fn scoped_queues(&mut self) -> Result<&mut scoped_store::ScopedQueueStore, QueueError> {
+        self.scoped.as_deref_mut().ok_or(QueueError::Unavailable)
+    }
+
     pub(crate) fn growth_queue_observation(&self) -> Option<(usize, Option<(Uuid, u64)>)> {
         let mut queued = 0;
         let mut oldest: Option<&RequestRecord> = None;
@@ -705,6 +728,7 @@ impl WorkerReplica {
             authority,
             members: Arc::new(ordered),
             queue,
+            scoped: None,
             barriers: BTreeMap::new(),
             queue_latency: QueueLatency::default(),
             terminal_metadata: BTreeMap::new(),
@@ -864,7 +888,8 @@ impl WorkerReplica {
     fn needs_recovery(&self, record: &RequestRecord, now: u64) -> bool {
         self.has_read_grants(record.request_id)
             || !record.state.terminal()
-            || (!self.terminal_expired(record, now) && !self.copies_complete(record.request_id))
+            || (!self.terminal_expired(record, now)
+                && self.terminal_copy_confirmation(self.authority, record).is_none())
     }
     pub(crate) fn has_recovery_work(&self, now: u64, active: &BTreeSet<Uuid>) -> bool {
         self.queue
@@ -1015,6 +1040,19 @@ impl WorkerReplica {
             .nth(barrier.ready.count() as usize)
             .copied()
             .ok_or(QueueError::Stale)
+    }
+    pub(crate) fn next_copy_batch(
+        &self,
+        id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<WorkerIdentity>, QueueError> {
+        let first = self.next_copy_member(id)?;
+        Ok(self
+            .members
+            .range(first.worker_id..)
+            .take(limit)
+            .map(|(_, worker)| *worker)
+            .collect())
     }
     pub fn retained_record(&self, id: Uuid, now_ms: u64) -> Result<&RequestRecord, QueueError> {
         let record = self.queue.record(id).ok_or(QueueError::NotFound)?;
@@ -1187,12 +1225,14 @@ impl WorkerReplica {
                     barrier.version = version;
                     barrier.ready = ReadySetHasher::default();
                     barrier.complete = false;
+                    barrier.terminal_confirmed = false;
                 }
             })
             .or_insert_with(|| CopyBarrier {
                 version,
                 ready: ReadySetHasher::default(),
                 complete: false,
+                terminal_confirmed: false,
                 acceptance_timing: AcceptanceTiming::Untracked,
             });
         Ok(frame)
@@ -1233,20 +1273,13 @@ impl WorkerReplica {
         if required != &ack.worker {
             return Err(QueueError::Stale);
         }
+        let record = self.queue.acknowledge_copy(
+            ack.record.request_id,
+            ack.record.version,
+            ack.worker.worker_id,
+            promote,
+        )?;
         barrier.ready.push(ack.worker).map_err(invalid)?;
-        let record = if promote {
-            self.queue.acknowledge_version(
-                ack.record.request_id,
-                ack.record.version,
-                ack.worker.worker_id,
-            )?
-        } else {
-            self.queue.acknowledge_payload_version(
-                ack.record.request_id,
-                ack.record.version,
-                ack.worker.worker_id,
-            )?
-        };
         if barrier.ready.count() != current.ready.ready_count {
             return Ok(None);
         }
@@ -1256,9 +1289,9 @@ impl WorkerReplica {
         barrier.complete = true;
         if record.version != ack.record.version {
             barrier.acceptance_timing = AcceptanceTiming::Copying;
-            self.changed(record.request_id)?;
+            self.changed(ack.record.request_id)?;
             // The final payload ACK creates the acceptance-evidence version.
-            return self.begin_barrier(record.request_id).map(Some);
+            return self.begin_barrier(ack.record.request_id).map(Some);
         }
         if record.accepted
             && record.state == RequestState::Queued
@@ -1303,6 +1336,48 @@ impl WorkerReplica {
                     barrier.complete && barrier.version.version == record.version
                 })
         })
+    }
+
+    /// Record the coordinator's final Control check on the exact copied version.
+    pub(super) fn confirm_terminal_copy(
+        &mut self,
+        current: QueueAuthority,
+        copied: RecordVersion,
+    ) -> Result<(), QueueError> {
+        self.check_owner(current, self.local)?;
+        let record = self
+            .queue
+            .record(copied.request_id)
+            .ok_or(QueueError::NotFound)?;
+        if !record.accepted || !record.state.terminal() || record.version != copied.version {
+            return Err(QueueError::Stale);
+        }
+        let barrier = self
+            .barriers
+            .get_mut(&copied.request_id)
+            .ok_or(QueueError::Stale)?;
+        if !barrier.complete || barrier.version != copied {
+            return Err(QueueError::Stale);
+        }
+        barrier.terminal_confirmed = true;
+        Ok(())
+    }
+
+    pub(super) fn terminal_copy_confirmation(
+        &self,
+        current: QueueAuthority,
+        record: &RequestRecord,
+    ) -> Option<RecordVersion> {
+        if current != self.authority
+            || current.owner != self.local
+            || !record.accepted
+            || !record.state.terminal()
+        {
+            return None;
+        }
+        let barrier = self.barriers.get(&record.request_id)?;
+        (barrier.complete && barrier.terminal_confirmed && barrier.version.version == record.version)
+            .then_some(barrier.version)
     }
 
     pub fn start(&mut self, current: QueueAuthority, id: Uuid) -> Result<RecordFrame, QueueError> {

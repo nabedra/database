@@ -3,7 +3,7 @@
 use super::{
     CanonicalJson, Change, MvccKey, PreparedWrite,
     catalog::{
-        CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, RouteRead,
+        CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, PointCatalog, RouteRead,
         RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
     },
     store::{
@@ -13,7 +13,10 @@ use super::{
 };
 use crate::{
     oltp::{failure, pool::ChargedBytes},
-    oltp_replication::types::{GroupIdentity, Page, RequestBinding, TxnId},
+    oltp_replication::{
+        authority::control::ScopedCatalogRead,
+        types::{GroupIdentity, GroupKind, Page, RequestBinding, TxnId},
+    },
     protocol::{self, ErrorCode, Key, Operation, ProtocolError, Row, TableDescriptor},
 };
 use sha2::{Digest as _, Sha256};
@@ -23,6 +26,10 @@ mod backup;
 mod index;
 mod index_build;
 mod migration;
+#[cfg(test)]
+mod point_route;
+#[cfg(test)]
+pub(crate) use point_route::PointRoute;
 mod query;
 use query::schedule::QueryScheduler;
 mod query_metrics;
@@ -41,6 +48,46 @@ pub(crate) trait ParticipantResolver: Send + Sync {
         table: &'a TableDescriptor,
         pin: &'a PinnedCatalog,
     ) -> ResolveFuture<'a, ShardRoute>;
+}
+pub(crate) struct ScopedParticipantResolver {
+    pub resolver: Arc<dyn ParticipantResolver>,
+    pub scope: ScopedCatalogRead,
+}
+impl ParticipantResolver for ScopedParticipantResolver {
+    fn participant<'a>(
+        &'a self,
+        group: &'a GroupIdentity,
+    ) -> ResolveFuture<'a, Arc<ParticipantHandle>> {
+        Box::pin(async move {
+            if group.group_id != self.scope.queue_group_id
+                || !matches!(group.kind, GroupKind::Data { table_id, .. } if table_id == self.scope.table_id)
+            {
+                return Err(failure(
+                    ErrorCode::StorageUnavailable,
+                    "pinned row belongs to another data group",
+                ));
+            }
+            Ok(Arc::new(
+                self.resolver
+                    .participant(group)
+                    .await?
+                    .with_scoped_execution(self.scope)?,
+            ))
+        })
+    }
+
+    fn create_data<'a>(
+        &'a self,
+        _: &'a TableDescriptor,
+        _: &'a PinnedCatalog,
+    ) -> ResolveFuture<'a, ShardRoute> {
+        Box::pin(async {
+            Err(failure(
+                ErrorCode::UnsupportedOperation,
+                "scoped requests use an existing data group",
+            ))
+        })
+    }
 }
 #[derive(Debug)]
 pub(crate) enum PlanError {
@@ -109,6 +156,49 @@ impl NativePlanner {
             query_scheduler,
         })
     }
+    pub(crate) fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            catalog: CatalogHandle::new(Arc::new(
+                self.catalog.participant().with_scoped_execution(scope)?,
+            ))?,
+            resolver: Arc::new(ScopedParticipantResolver {
+                resolver: self.resolver.clone(),
+                scope,
+            }),
+            query_metrics: self.query_metrics.clone(),
+            query_scheduler: self.query_scheduler.clone(),
+        })
+    }
+
+    pub(crate) async fn plan_scoped(
+        &self,
+        scope: ScopedCatalogRead,
+        operation: Operation,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        owner: Arc<crate::oltp::pool::ScratchLease>,
+        point: Option<&PointCatalog>,
+    ) -> Result<PlannedOperation, PlanError> {
+        if !matches!(&operation, Operation::Get(_) | Operation::Update(_))
+            || table_id(&operation) != Some(scope.table_id)
+            || txn.request_id != scope.request.request_id
+            || txn.attempt != 1
+            || pin.read_ts != scope.read_ts
+            || pin.authority.run_id != scope.request.run_id
+        {
+            return Err(failure(
+                ErrorCode::ValidationError,
+                "operation differs from scoped request",
+            )
+            .into());
+        }
+        self.with_scoped_execution(scope)?
+            .plan(operation, pin, txn, scope.request, owner, point)
+            .await
+    }
     pub(crate) fn query_statistics(&self) -> query_metrics::QueryStatistics {
         self.query_metrics.snapshot()
     }
@@ -122,6 +212,7 @@ impl NativePlanner {
         txn: TxnId,
         request: RequestBinding,
         owner: Arc<crate::oltp::pool::ScratchLease>,
+        point: Option<&PointCatalog>,
     ) -> Result<PlannedOperation, PlanError> {
         let operation = self
             .cpu(owner.clone(), move || {
@@ -164,8 +255,14 @@ impl NativePlanner {
             _ => {}
         }
         let id = table_id(&operation).ok_or_else(not_found)?;
-        let (version, record) = value(self.catalog.describe(pin, id).await?)?;
-        let table = record.ok_or_else(not_found)?;
+        let point = point.filter(|point| point.table.descriptor.id == id);
+        let (version, table) = match point {
+            Some(point) => (point.table_version, point.table.clone()),
+            None => {
+                let (version, record) = value(self.catalog.describe(pin, id).await?)?;
+                (version, record.ok_or_else(not_found)?)
+            }
+        };
         let checked_table = table.clone();
         let operation = self
             .cpu(owner.clone(), move || {
@@ -180,7 +277,8 @@ impl NativePlanner {
                 .map(PlannedOperation::Mutation);
         }
         if let Operation::Get(payload) = operation {
-            let (_, row) = self.row(pin, &table, &payload.key).await?;
+            let (participant, _) = self.route(pin, id, &payload.key, point).await?;
+            let (_, row) = self.row_on(pin, id, &payload.key, &participant).await?;
             let shared = self.catalog.resources().clone();
             return Ok(PlannedOperation::Read(
                 self.cpu(owner.clone(), move || match row {
@@ -238,8 +336,9 @@ impl NativePlanner {
                     p.rows.into_iter().map(|r| (r, true)).collect()
                 }
                 Operation::Update(p) => {
-                    let (participant, group) =
-                        self.mutation_route(pin, id, &p.key, &mut metadata).await?;
+                    let (participant, group) = self
+                        .mutation_route(pin, id, &p.key, &mut metadata, point)
+                        .await?;
                     let (expected, row) = self.row_on(pin, id, &p.key, &participant).await?;
                     let old_index_row = row.clone();
                     let change = if let Some(row) = row {
@@ -302,7 +401,7 @@ impl NativePlanner {
                 }
                 Operation::Delete(p) => {
                     let (participant, group) =
-                        self.mutation_route(pin, id, &p.key, &mut metadata).await?;
+                        self.mutation_route(pin, id, &p.key, &mut metadata, None).await?;
                     let (expected, row) = self.row_on(pin, id, &p.key, &participant).await?;
                     let found = row.is_some();
                     result = serde_json::Value::Bool(found);
@@ -369,7 +468,7 @@ impl NativePlanner {
                     );
                 }
                 let (participant, group) =
-                    self.mutation_route(pin, id, &key, &mut metadata).await?;
+                    self.mutation_route(pin, id, &key, &mut metadata, None).await?;
                 // Bound both native request ownership and its escaped JSON wire
                 // encoding. Oversized individual keys retain the scalar path.
                 let cost = match &key {
@@ -726,8 +825,9 @@ impl NativePlanner {
         pin: &PinnedCatalog,
         table_id: Uuid,
         key: &Key,
+        point: Option<&PointCatalog>,
     ) -> Result<(Arc<ParticipantHandle>, GroupIdentity), PlanError> {
-        match self.catalog.route(pin, table_id, key).await? {
+        match self.route_page(pin, table_id, key, point).await? {
             RouteRead::Blocked(i) => Err(PlanError::Blocked(i)),
             RouteRead::Route { page, index } => {
                 let group = page.shards[index].group.clone();
@@ -736,21 +836,27 @@ impl NativePlanner {
             RouteRead::Missing => Err(not_found().into()),
         }
     }
-    async fn row(
+    async fn route_page(
         &self,
         pin: &PinnedCatalog,
-        table: &TableRecord,
+        table_id: Uuid,
         key: &Key,
-    ) -> Result<
-        (
-            Option<crate::oltp_replication::types::CommitTs>,
-            Option<OwnedRecord<Row>>,
-        ),
-        PlanError,
-    > {
-        let (participant, _) = self.route(pin, table.descriptor.id, key).await?;
-        self.row_on(pin, table.descriptor.id, key, &participant)
-            .await
+        point: Option<&PointCatalog>,
+    ) -> Result<RouteRead, ProtocolError> {
+        match point {
+            Some(point) => {
+                if let Some((page, index)) = &point.selected
+                    && point.table.descriptor.id == table_id
+                    && page.shards[*index].contains_key(key)
+                {
+                    return Ok(RouteRead::Route { page: page.clone(), index: *index });
+                }
+                self.catalog
+                    .route_pages(pin, table_id, key, point.first_page)
+                    .await
+            }
+            None => self.catalog.route(pin, table_id, key).await,
+        }
     }
     async fn row_on(
         &self,
@@ -938,6 +1044,7 @@ impl NativePlanner {
         table_id: Uuid,
         key: &Key,
         metadata: &mut MutationMetadata,
+        point: Option<&PointCatalog>,
     ) -> Result<(Arc<ParticipantHandle>, GroupIdentity), PlanError> {
         if let Some((page, selected, participant)) = &metadata.route {
             if super::catalog::contains(&page.shards[*selected].span, key) {
@@ -954,7 +1061,7 @@ impl NativePlanner {
                 return Ok((participant, group));
             }
         }
-        match self.catalog.route(pin, table_id, key).await? {
+        match self.route_page(pin, table_id, key, point).await? {
             RouteRead::Blocked(i) => Err(PlanError::Blocked(i)),
             RouteRead::Missing => Err(not_found().into()),
             RouteRead::Route { page, index } => {

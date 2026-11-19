@@ -3,6 +3,10 @@
 use super::{
     machine::*,
     model::*,
+    scoped_queue::{
+        ScopedQueueInventory, ScopedQueueOperation, ScopedQueueTransferReport,
+        ScopedQueueTransition,
+    },
     service::{ControlHandle, InventoryPage, OperatorPolicy},
 };
 use crate::{
@@ -231,7 +235,17 @@ impl Fixture {
         };
         current_members.push(target);
         current_members.sort_by_key(|w| w.worker_id);
-        for page in current_members.chunks(128) {
+        self.publish_ready_members(ticket, current_members, state.owner.unwrap_or(target))
+            .await
+    }
+    async fn publish_ready_members(
+        &mut self,
+        ticket: JoinTicket,
+        members: &[WorkerIdentity],
+        owner: WorkerIdentity,
+    ) -> ReadyMembership {
+        let id = ticket.ticket_id;
+        for page in members.chunks(128) {
             assert!(matches!(
                 self.apply(ControlCommand::ReadyPage {
                     operation_id: Uuid::new_v4(),
@@ -269,7 +283,7 @@ impl Fixture {
         .await;
         let proof = QueueCopyStatement {
             ticket,
-            source: state.owner.unwrap_or(target),
+            source: owner,
             snapshot_id: Uuid::new_v4(),
             snapshot_cut: 0,
             final_cut: 0,
@@ -284,10 +298,82 @@ impl Fixture {
             .await,
             ControlReply::Published {
                 ready: next,
-                owner: state.owner.or(Some(target))
+                owner: Some(owner)
             }
         );
         next
+    }
+
+    async fn scoped(
+        &mut self,
+        actor: WorkerIdentity,
+        action: ScopedQueueOperation,
+    ) -> ControlReply {
+        let operation_id = Uuid::new_v4();
+        let authorization = action.requires_operator().then(|| AuthorizationStamp {
+            authorization_id: operation_id,
+            subject: actor.certificate_sha256,
+            evidence: serialized_digest(&(self.machine.store().identity(), actor, &action))
+                .unwrap(),
+            ..authorization()
+        });
+        self.apply(ControlCommand::ScopedQueue {
+            operation_id,
+            actor,
+            action: Box::new(action),
+            authorization,
+        })
+        .await
+    }
+
+    async fn install_scoped_transfer(
+        &mut self,
+        transfer: &ScopedQueueTransition,
+        holders: [WorkerIdentity; 2],
+    ) {
+        let group_id = transfer.next.group.group_id;
+        let transfer_id = transfer.id;
+        let inventory = ScopedQueueInventory {
+            count: 1,
+            root: hash(b"scoped survivor cut"),
+        };
+        let mut frozen = transfer.clone();
+        for worker in holders {
+            assert_eq!(
+                self.scoped(
+                    worker,
+                    ScopedQueueOperation::ReportTransfer {
+                        group_id,
+                        transfer_id,
+                        report: ScopedQueueTransferReport::Frozen(inventory),
+                    }
+                )
+                .await,
+                ControlReply::ScopedQueueUpdated
+            );
+            let slot = frozen
+                .previous
+                .members
+                .iter()
+                .position(|member| *member == worker)
+                .unwrap();
+            frozen.frozen[slot] = Some(inventory);
+        }
+        let basis = frozen.basis().unwrap().unwrap();
+        for worker in holders {
+            assert_eq!(
+                self.scoped(
+                    worker,
+                    ScopedQueueOperation::ReportTransfer {
+                        group_id,
+                        transfer_id,
+                        report: ScopedQueueTransferReport::Installed { basis, inventory },
+                    }
+                )
+                .await,
+                ControlReply::ScopedQueueUpdated
+            );
+        }
     }
 }
 fn identities() -> (GroupIdentity, PoolIdentity) {
@@ -326,6 +412,183 @@ fn worker(number: u128) -> WorkerEnrollment {
         server_name: Text::try_from("localhost").unwrap(),
         enrollment_revision: 1,
     }
+}
+
+#[tokio::test]
+async fn o31_r01_r03_installed_scoped_transfer_rebases_after_ready_removal() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    let initial = fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let removed = fixture.enroll(2).await;
+    let peer = fixture.enroll(3).await;
+    let mut members = Vec::new();
+    for worker in [owner, removed, peer] {
+        fixture.add_ready(worker, &mut members).await;
+        assert_eq!(
+            fixture
+                .scoped(
+                    worker,
+                    ScopedQueueOperation::Advertise {
+                        version: super::scoped_queue::SCOPED_QUEUE_VERSION,
+                    }
+                )
+                .await,
+            ControlReply::ScopedQueueUpdated
+        );
+    }
+    let group = fixture
+        .register_group(
+            GroupKind::Data {
+                table_id: Uuid::new_v4(),
+                shard_id: Uuid::new_v4(),
+            },
+            members
+                .iter()
+                .enumerate()
+                .map(|(index, worker)| ReplicaMember {
+                    node_id: index as u64 + 1,
+                    worker_id: worker.worker_id,
+                    pool_id: Uuid::new_v4(),
+                })
+                .collect(),
+        )
+        .await;
+    let id = Uuid::new_v4();
+    let run_id = initial.view.run_id;
+    let ControlReply::ScopedQueue(previous) = fixture
+        .apply(ControlCommand::EnsureScopedQueue {
+            operation_id: id,
+            expected: Box::new(group.clone()),
+            run_id,
+            authorization: AuthorizationStamp {
+                authorization_id: id,
+                evidence: super::machine::scoped_queue::creation_digest(&group, run_id).unwrap(),
+                ..authorization()
+            },
+        })
+        .await
+    else {
+        panic!("expected a published scoped queue");
+    };
+    let ControlReply::ScopedQueueTransfer(transfer) = fixture
+        .scoped(
+            owner,
+            ScopedQueueOperation::BeginTransfer {
+                expected: previous.clone(),
+                next_owner: owner,
+                replaces: None,
+            },
+        )
+        .await
+    else {
+        panic!("expected a pending scoped transfer");
+    };
+    fixture
+        .install_scoped_transfer(&transfer, [owner, peer])
+        .await;
+
+    let group_id = group.identity.group_id;
+    let rebase = ScopedQueueOperation::RebaseTransfer {
+        group_id,
+        transfer_id: transfer.id,
+        removed,
+        next_owner: owner,
+    };
+    let publish = ScopedQueueOperation::PublishTransfer {
+        group_id,
+        transfer_id: transfer.id,
+    };
+    assert_eq!(
+        fixture.scoped(owner, rebase.clone()).await,
+        ControlReply::Rejected(Fault::NotReady)
+    );
+    let expected = fixture.state().await.ready.view;
+    let ControlReply::JoinBegun { ticket, .. } = fixture
+        .apply(ControlCommand::BeginRemoval {
+            operation_id: Uuid::new_v4(),
+            expected,
+            target: removed,
+            exclusion: ExclusionStamp {
+                worker: removed,
+                authorization: authorization(),
+                ownership_fence: hash(b"removed worker"),
+            },
+        })
+        .await
+    else {
+        panic!("expected a pending Ready removal");
+    };
+    assert_eq!(
+        fixture.scoped(owner, rebase.clone()).await,
+        ControlReply::Rejected(Fault::Stale)
+    );
+    fixture
+        .publish_ready_members(ticket, &[owner, peer], owner)
+        .await;
+    assert_eq!(
+        fixture.scoped(owner, publish.clone()).await,
+        ControlReply::Rejected(Fault::NotReady)
+    );
+    assert_eq!(
+        fixture.scoped(removed, rebase.clone()).await,
+        ControlReply::Rejected(Fault::Unauthorized)
+    );
+    let wrong_removal = ScopedQueueOperation::RebaseTransfer {
+        group_id,
+        transfer_id: transfer.id,
+        removed: peer,
+        next_owner: owner,
+    };
+    assert_eq!(
+        fixture.scoped(owner, wrong_removal).await,
+        ControlReply::Rejected(Fault::NotReady)
+    );
+
+    let ControlReply::ScopedQueueTransfer(rebased) = fixture.scoped(owner, rebase.clone()).await
+    else {
+        panic!("expected an exact replacement of the obsolete transfer");
+    };
+    assert_eq!(rebased.previous, *previous);
+    assert_ne!(rebased.id, transfer.id);
+    assert_eq!(rebased.next.members, transfer.next.members);
+    assert_eq!(rebased.next.unavailable_holder, Some(removed));
+    assert_eq!(rebased.next.view.run_id, run_id);
+    assert_eq!(
+        rebased.next.view.owner_term,
+        transfer.next.view.owner_term + 1
+    );
+    assert_eq!(
+        rebased.next.queue_generation,
+        transfer.next.queue_generation
+    );
+    assert_eq!(rebased.next.data_generation, transfer.next.data_generation);
+    assert!(rebased.basis().unwrap().is_none() && !rebased.has_installed_quorum());
+    assert_eq!(
+        fixture.scoped(owner, rebase).await,
+        ControlReply::Rejected(Fault::Stale)
+    );
+    assert_eq!(
+        fixture.scoped(owner, publish).await,
+        ControlReply::Rejected(Fault::Stale)
+    );
+
+    let publish_rebased = ScopedQueueOperation::PublishTransfer {
+        group_id,
+        transfer_id: rebased.id,
+    };
+    assert_eq!(
+        fixture.scoped(owner, publish_rebased.clone()).await,
+        ControlReply::Rejected(Fault::Incomplete)
+    );
+    fixture
+        .install_scoped_transfer(&rebased, [owner, peer])
+        .await;
+    assert_eq!(
+        fixture.scoped(owner, publish_rebased).await,
+        ControlReply::ScopedQueue(Box::new(rebased.next))
+    );
 }
 
 #[tokio::test]
@@ -524,6 +787,152 @@ async fn o06_control_enrollment_cas_requires_exclusion_and_preserves_permanent_g
         .await
         .unwrap();
     assert_eq!(bytes.as_ref(), b"null");
+}
+
+#[tokio::test]
+async fn o14_o16_owner_service_checks_exact_receiver_in_published_membership() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool).await;
+    fixture.initialize().await;
+    let owner = fixture.enroll(1).await;
+    let ready = fixture.add_ready(owner, &mut Vec::new()).await;
+    let receiver = fixture.enroll(2).await;
+    let member = ReplicaMember {
+        node_id: 41,
+        worker_id: receiver.worker_id,
+        pool_id: Uuid::new_v4(),
+    };
+    let original = fixture
+        .register_group(GroupKind::Timestamps, vec![member.clone()])
+        .await;
+    let generation = Uuid::new_v4();
+    let successor = ReplicaMember {
+        node_id: 42,
+        pool_id: Uuid::new_v4(),
+        ..member.clone()
+    };
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginGroupReplacement {
+                operation_id: Uuid::new_v4(),
+                generation,
+                expected: original.clone(),
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![successor.clone()]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+
+    let model = Arc::new(NativeModelConsensus {
+        machine: fixture.machine.clone(),
+        next: AtomicU64::new(fixture.next),
+        reads: AtomicU64::new(0),
+    });
+    let handle = ControlHandle::new(
+        fixture.machine.clone(),
+        model.clone(),
+        OperatorPolicy {
+            policy: authorization().policy,
+            certificate_pins: Default::default(),
+        },
+    );
+    let queue_scope = QueueScope {
+        cluster_id: scope.cluster_id,
+        database: scope.database,
+    };
+    let check = |receiver, node, generation| {
+        handle.service_role_at_replica(
+            &queue_scope,
+            owner,
+            original.identity.clone(),
+            receiver,
+            node,
+            generation,
+        )
+    };
+    assert_eq!(
+        check(receiver, member.node_id, original.generation)
+            .await
+            .unwrap()
+            .owner,
+        Some(owner)
+    );
+    assert_eq!(model.reads.swap(0, Ordering::Relaxed), 1);
+    assert_eq!(
+        check(receiver, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::SealGroup {
+                operation_id: Uuid::new_v4(),
+                generation,
+                proof: GroupMembershipStamp {
+                    group: original.identity.clone(),
+                    generation,
+                    replica_count: 1,
+                    replica_root: group_root(1, group_step(group_seed(), &successor)),
+                    applied_at: AppliedPosition {
+                        index: original.membership_position.index + 1,
+                        ..original.membership_position
+                    },
+                    authority: ready.view.authority(),
+                },
+            })
+            .await,
+        ControlReply::GroupRegistered { .. }
+    ));
+
+    assert_eq!(
+        check(receiver, member.node_id, original.generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(receiver, member.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(owner, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    let wrong_incarnation = WorkerIdentity {
+        incarnation: Uuid::new_v4(),
+        ..receiver
+    };
+    assert_eq!(
+        check(wrong_incarnation, successor.node_id, generation)
+            .await
+            .unwrap_err(),
+        stale_service_route()
+    );
+    assert_eq!(
+        check(receiver, successor.node_id, generation)
+            .await
+            .unwrap()
+            .owner,
+        Some(owner)
+    );
+    assert_eq!(model.reads.load(Ordering::Relaxed), 6);
 }
 
 #[tokio::test]

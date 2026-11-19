@@ -24,8 +24,9 @@ mod data_worker;
 mod growth;
 mod placement;
 mod pool_drain;
-mod restart;
 mod replacement;
+mod restart;
+mod scoped_queue;
 mod worker_drain;
 
 /// Authentication configuration, supplied by the operator rather than a worker
@@ -888,7 +889,9 @@ impl ControlHandle {
     ) -> Result<bool, ProtocolError> {
         let raw = self
             .read(move |view| {
-                if load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))? == Some(worker) {
+                if load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
+                    == Some(worker)
+                {
                     return view.encode(&true);
                 }
                 let record: Option<WorkerRecord> =
@@ -1154,6 +1157,147 @@ impl ControlHandle {
         action: ServiceAction,
         target: GroupIdentity,
     ) -> Result<ServiceAuthorization, ProtocolError> {
+        self.service_role_inner(scope, remote, action, target, None)
+            .await
+    }
+    pub(super) async fn service_role_at_replica(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        target: GroupIdentity,
+        receiver: WorkerIdentity,
+        node_id: u64,
+        generation: Uuid,
+    ) -> Result<ServiceAuthorization, ProtocolError> {
+        if node_id == 0 || generation.is_nil() || target.kind == GroupKind::Control {
+            return Err(unauthorized());
+        }
+        self.service_role_inner(
+            scope,
+            remote,
+            ServiceAction::Owner,
+            target,
+            Some((receiver, node_id, generation)),
+        )
+        .await
+    }
+
+    pub(super) async fn timestamp_point_route(
+        &self,
+        remote: WorkerIdentity,
+        receiver: WorkerIdentity,
+        target: GroupIdentity,
+        node_id: u64,
+        route: TimestampPointRoute,
+        decision_source: Option<(ServiceAction, Digest)>,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let control = self.identity();
+        let target_kind = match decision_source {
+            None => matches!(
+                target.kind,
+                GroupKind::Data { .. } | GroupKind::Status { .. }
+            ),
+            Some((ServiceAction::StatusProof { .. }, _)) => {
+                matches!(target.kind, GroupKind::Timestamps | GroupKind::Data { .. })
+            }
+            Some((ServiceAction::ParticipantProof { .. }, _)) => {
+                target.kind == GroupKind::Timestamps
+            }
+            _ => false,
+        };
+        if target.cluster_id != control.cluster_id
+            || target.database != control.database
+            || target.validate().is_err()
+            || !target_kind
+            || node_id == 0
+            || route.source_group.is_nil()
+            || route.source_generation.is_nil()
+            || route.target_generation.is_nil()
+            || route.authority.validate().is_err()
+        {
+            return Err(unauthorized());
+        }
+        self.read(move |view| {
+            let state = state(view)?;
+            if state.ready.view.authority() != route.authority
+                || state.pending.is_some()
+                || state.restart.is_some()
+            {
+                return Err(stale_service_route());
+            }
+            let source: GroupRecord =
+                load(view, &machine::key(GROUPS, route.source_group))?.ok_or_else(unauthorized)?;
+            let permitted = match decision_source {
+                None => {
+                    source.identity.kind == GroupKind::Timestamps
+                        || matches!(target.kind, GroupKind::Status { .. })
+                            && matches!(source.identity.kind, GroupKind::Data { .. })
+                }
+                Some((action, digest)) => {
+                    matches!(
+                        (action, &source.identity.kind),
+                        (ServiceAction::StatusProof { source_group }, GroupKind::Status { .. })
+                        | (ServiceAction::ParticipantProof { source_group }, GroupKind::Data { .. })
+                            if source_group == route.source_group
+                    ) && crate::oltp_replication::owned::serialized_digest(&source.identity)?
+                        == digest
+                }
+            };
+            if !permitted
+                || source.identity.group_id != route.source_group
+                || source.identity.cluster_id != target.cluster_id
+                || source.identity.database != target.database
+                || source.replica_count == 0
+                || source.identity.validate().is_err()
+            {
+                return Err(unauthorized());
+            }
+            if source.generation != route.source_generation {
+                return Err(stale_service_route());
+            }
+            let issuer: ReplicaMember = load(
+                view,
+                &machine::member_worker_key(source.generation, remote.worker_id),
+            )?
+            .ok_or_else(unauthorized)?;
+            if issuer.validate().is_err() || issuer.worker_id != remote.worker_id {
+                return Err(unauthorized());
+            }
+            for identity in [remote, receiver] {
+                let worker: WorkerRecord = load(view, &machine::key(WORKERS, identity.worker_id))?
+                    .ok_or_else(unauthorized)?;
+                if WorkerIdentity::from(&worker.enrollment) != identity {
+                    return Err(unauthorized());
+                }
+            }
+            let served: GroupRecord = load(view, &machine::key(GROUPS, target.group_id))?
+                .filter(|record: &GroupRecord| {
+                    record.identity == target
+                        && record.generation == route.target_generation
+                        && record.replica_count != 0
+                })
+                .ok_or_else(stale_service_route)?;
+            let member: ReplicaMember =
+                load(view, &machine::member_key(served.generation, node_id))?
+                    .ok_or_else(stale_service_route)?;
+            if member.validate().is_err()
+                || member.node_id != node_id
+                || member.worker_id != receiver.worker_id
+            {
+                return Err(stale_service_route());
+            }
+            view.encode(&())
+        })
+        .await
+    }
+    async fn service_role_inner(
+        &self,
+        scope: &QueueScope,
+        remote: WorkerIdentity,
+        action: ServiceAction,
+        target: GroupIdentity,
+        placement: Option<(WorkerIdentity, u64, Uuid)>,
+    ) -> Result<ServiceAuthorization, ProtocolError> {
         if scope.cluster_id != self.identity().cluster_id
             || scope.database != self.identity().database
             || target.cluster_id != scope.cluster_id
@@ -1171,24 +1315,65 @@ impl ControlHandle {
         let raw = self
             .read(move |view| {
                 let state = state(view)?;
-                if action == ServiceAction::ApiIngress {
+                if matches!(
+                    action,
+                    ServiceAction::ApiIngress | ServiceAction::ScopedQueueIngress { .. }
+                ) {
                     let api: ApiEnrollment = load(view, &machine::key(APIS, remote.worker_id))?
                         .ok_or_else(unauthorized)?;
                     if WorkerIdentity::from(api.transport()) != remote
                         || api.database != database
                         || target != control
-                        || state.owner.is_none()
-                        || state.ready.ready_count == 0
-                        || state.invalid_ready != 0
-                        || state.pending.is_some()
                     {
                         return Err(unauthorized());
                     }
+                    let (owner, scoped_ingress) = if let ServiceAction::ScopedQueueIngress {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        owner,
+                    } = action
+                    {
+                        let advertised = load::<WorkerIdentity>(
+                            view,
+                            &machine::scoped_queue::capability::reader_key(remote),
+                        )?;
+                        if advertised != Some(remote) {
+                            return Err(unauthorized());
+                        }
+                        let queue = scoped_queue::current_placement(
+                            view,
+                            &control,
+                            &state,
+                            queue_group_id,
+                        )?
+                        .ok_or_else(stale_service_route)?;
+                        if queue.queue_generation != queue_generation
+                            || queue.view != queue_view
+                            || queue.owner != owner
+                        {
+                            return Err(stale_service_route());
+                        }
+                        (
+                            Some(queue.owner),
+                            Some(ScopedIngressGrant::from_placement(&queue)?),
+                        )
+                    } else {
+                        if state.owner.is_none()
+                            || state.ready.ready_count == 0
+                            || state.invalid_ready != 0
+                            || state.pending.is_some()
+                        {
+                            return Err(stale());
+                        }
+                        (state.owner, None)
+                    };
                     return view.encode(&ServiceAuthorization {
                         ready: state.ready,
-                        owner: state.owner,
+                        owner,
                         effective_authority: state.ready.view.authority(),
                         pending_ready: None,
+                        scoped_ingress,
                     });
                 }
                 let worker: WorkerRecord = load(view, &machine::key(WORKERS, remote.worker_id))?
@@ -1198,7 +1383,8 @@ impl ControlHandle {
                 }
                 let target_record: Option<GroupRecord> =
                     load(view, &machine::key(GROUPS, target.group_id))?;
-                if action != ServiceAction::Operator
+                if placement.is_none()
+                    && action != ServiceAction::Operator
                     && target_record
                         .as_ref()
                         .is_none_or(|record| record.identity != target)
@@ -1210,18 +1396,145 @@ impl ControlHandle {
                     owner: state.owner,
                     effective_authority: state.ready.view.authority(),
                     pending_ready: None,
+                    scoped_ingress: None,
                 };
                 let source = match action {
-                    ServiceAction::ApiIngress => return Err(unauthorized()),
+                    ServiceAction::ApiIngress | ServiceAction::ScopedQueueIngress { .. } => {
+                        return Err(unauthorized());
+                    }
                     ServiceAction::Owner => {
-                        if state.owner != Some(remote)
-                            || state.ready.ready_count == 0
+                        if state.owner != Some(remote) {
+                            return Err(unauthorized());
+                        }
+                        if state.ready.ready_count == 0
                             || state.invalid_ready != 0
                             || state.pending.is_some()
                         {
-                            return Err(unauthorized());
+                            return Err(stale());
                         }
                         None
+                    }
+                    ServiceAction::ScopedCatalogRead(read)
+                    | ServiceAction::ScopedQueueExecute(read) => {
+                        let execute = matches!(action, ServiceAction::ScopedQueueExecute(_));
+                        if read.request.request_id.is_nil()
+                            || read.request.run_id != read.queue_view.run_id
+                            || read.table_id.is_nil()
+                        {
+                            return Err(unauthorized());
+                        }
+                        let queue = scoped_queue::current_placement(
+                            view,
+                            &control,
+                            &state,
+                            read.queue_group_id,
+                        )?
+                        .ok_or_else(unauthorized)?;
+                        let target_allowed = if execute {
+                            matches!(
+                                target.kind,
+                                GroupKind::Catalog
+                                    | GroupKind::Timestamps
+                                    | GroupKind::Status { .. }
+                            ) || target == queue.group
+                        } else {
+                            target.kind == GroupKind::Catalog
+                        };
+                        if queue.data_generation != read.data_generation
+                            || queue.queue_generation != read.queue_generation
+                            || queue.view != read.queue_view
+                            || !queue.has_holder(remote)
+                            || execute && queue.owner != remote
+                            || !target_allowed
+                            || !matches!(queue.group.kind, GroupKind::Data { table_id, .. }
+                                if table_id == read.table_id)
+                        {
+                            return Err(unauthorized());
+                        }
+                        grant.owner = Some(queue.owner);
+                        if !execute {
+                            grant.effective_authority = queue.view.authority();
+                        }
+                        None
+                    }
+                    ServiceAction::ScopedQueueReserve {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                    }
+                    | ServiceAction::ScopedQueueAdmit {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                        ..
+                    }
+                    | ServiceAction::ScopedQueueRead {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                    } => {
+                        let owner_only = !matches!(action, ServiceAction::ScopedQueueRead { .. });
+                        if request_id.is_nil()
+                            || !(matches!(target.kind, GroupKind::Status { .. })
+                                || target.kind == GroupKind::Timestamps)
+                        {
+                            return Err(unauthorized());
+                        }
+                        if let ServiceAction::ScopedQueueAdmit { activation, .. } = action {
+                            use machine::scoped_queue::capability::Admission;
+                            let admission = load(view, Admission::key())?;
+                            let gate = Admission::capability(admission, &state);
+                            if !matches!(target.kind, GroupKind::Status { .. })
+                                || gate.activation != Some(activation)
+                            {
+                                return Err(unauthorized());
+                            }
+                        }
+                        let queue = scoped_queue::current_placement(
+                            view,
+                            &control,
+                            &state,
+                            queue_group_id,
+                        )?
+                        .ok_or_else(unauthorized)?;
+                        if queue.queue_generation != queue_generation
+                            || queue.view != queue_view
+                            || !queue.has_holder(remote)
+                            || owner_only && queue.owner != remote
+                        {
+                            return Err(unauthorized());
+                        }
+                        grant.owner = Some(queue.owner);
+                        None
+                    }
+                    ServiceAction::ScopedQueueFenceReceipt {
+                        queue_group_id,
+                        transfer_id,
+                    } => {
+                        use machine::scoped_queue::transfer_key;
+                        if state.pending.is_some()
+                            || state.restart.is_some()
+                            || !load::<super::ScopedQueueTransition>(
+                                view,
+                                &transfer_key(queue_group_id),
+                            )?
+                            .is_some_and(|transfer| {
+                                transfer.id == transfer_id
+                                    && transfer.next.view.run_id == state.ready.view.run_id
+                                    && (matches!(
+                                        target.kind,
+                                        GroupKind::Status { .. }
+                                            | GroupKind::Timestamps
+                                            | GroupKind::Catalog
+                                    ) || target == transfer.next.group)
+                            })
+                        {
+                            return Err(unauthorized());
+                        }
+                        Some((control.group_id, 3))
                     }
                     ServiceAction::QueueRetirement => {
                         let member: Option<WorkerIdentity> = load(
@@ -1263,7 +1576,12 @@ impl ControlHandle {
                     }
                     ServiceAction::Operator => {
                         if !operator
-                            || view.get(&machine::key(machine::data_worker::REGISTERED, remote.worker_id))?.is_some()
+                            || view
+                                .get(&machine::key(
+                                    machine::data_worker::REGISTERED,
+                                    remote.worker_id,
+                                ))?
+                                .is_some()
                         {
                             return Err(unauthorized());
                         }
@@ -1291,6 +1609,29 @@ impl ControlHandle {
                         .is_none()
                     {
                         return Err(unauthorized());
+                    }
+                }
+                if let Some((receiver, node_id, generation)) = placement {
+                    let record = target_record
+                        .as_ref()
+                        .filter(|record| {
+                            record.identity == target
+                                && record.generation == generation
+                                && record.replica_count != 0
+                        })
+                        .ok_or_else(stale_service_route)?;
+                    let member: ReplicaMember =
+                        load(view, &machine::member_key(record.generation, node_id))?
+                            .ok_or_else(stale_service_route)?;
+                    let enrolled: WorkerRecord =
+                        load(view, &machine::key(WORKERS, receiver.worker_id))?
+                            .ok_or_else(stale_service_route)?;
+                    if member.validate().is_err()
+                        || member.node_id != node_id
+                        || member.worker_id != receiver.worker_id
+                        || WorkerIdentity::from(&enrolled.enrollment) != receiver
+                    {
+                        return Err(stale_service_route());
                     }
                 }
                 view.encode(&grant)

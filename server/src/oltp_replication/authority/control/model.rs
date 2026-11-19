@@ -1,4 +1,5 @@
 use super::super::timestamp::ReadyFenceReceipt;
+use super::scoped_queue::ScopedQueueOperation;
 use crate::{
     oltp::pool::ScratchLease,
     oltp_replication::{ReadySetHasher, owned::OwnedPayload, types::*},
@@ -171,6 +172,18 @@ impl ApiEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlCommand {
+    ScopedQueue {
+        operation_id: Uuid,
+        actor: WorkerIdentity,
+        action: Box<ScopedQueueOperation>,
+        authorization: Option<AuthorizationStamp>,
+    },
+    EnsureScopedQueue {
+        operation_id: Uuid,
+        expected: Box<GroupRecord>,
+        run_id: Uuid,
+        authorization: AuthorizationStamp,
+    },
     BeginWorkerDrain {
         operation_id: Uuid,
         worker: WorkerIdentity,
@@ -393,7 +406,9 @@ pub(crate) enum ControlCommand {
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::PoolDrain { operation_id, .. }
+            Self::ScopedQueue { operation_id, .. }
+            | Self::EnsureScopedQueue { operation_id, .. }
+            | Self::PoolDrain { operation_id, .. }
             | Self::BeginWorkerDrain { operation_id, .. }
             | Self::BeginWorkerDrainRemoval { operation_id, .. }
             | Self::CloseDataWorker { operation_id, .. }
@@ -442,6 +457,12 @@ impl fmt::Display for ControlCommand {
 impl OwnedPayload for ControlCommand {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         Ok(match self {
+            Self::ScopedQueue { action, .. } => {
+                size_of::<ScopedQueueOperation>() + action.heap_bytes()
+            }
+            Self::EnsureScopedQueue { expected, .. } => {
+                size_of::<GroupRecord>() + expected.identity.database.capacity_bytes()
+            }
             Self::PoolDrain { command, .. } => command.heap_bytes(),
             Self::BeginWorkerDrain { intent, .. } => intent.heap_bytes(),
             Self::CloseDataWorker { proof, .. } => proof.heap_bytes(),
@@ -516,6 +537,9 @@ pub(crate) enum Fault {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
+    ScopedQueueUpdated,
+    ScopedQueueTransfer(Box<super::ScopedQueueTransition>),
+    ScopedQueue(Box<super::ScopedQueuePlacement>),
     WorkerDrain(Box<super::WorkerDrainRecord>),
     EksReplacement(Box<super::worker_drain::EksReplacementRecord>),
     PoolDrain(Box<super::pool_drain::PoolDrainRecord>),
@@ -580,12 +604,57 @@ pub(super) fn unavailable(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::StorageUnavailable, message, Outcome::Unknown)
 }
 
+/// A current queue member reads point routing metadata at the request's
+/// original timestamp. The participant checks the exact key and table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedCatalogRead {
+    pub queue_group_id: Uuid,
+    pub data_generation: Uuid,
+    pub queue_generation: Uuid,
+    pub queue_view: AuthorityView,
+    pub request: RequestBinding,
+    pub table_id: Uuid,
+    pub read_ts: ReadTs,
+}
+
 /// The source group is bound independently of a physical worker, which can
 /// host many logical replicas. A wire caller never receives raw proposal power.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ServiceAction {
     Owner,
+    ScopedCatalogRead(ScopedCatalogRead),
+    ScopedQueueExecute(ScopedCatalogRead),
+    ScopedQueueIngress {
+        queue_group_id: Uuid,
+        queue_generation: Uuid,
+        queue_view: AuthorityView,
+        owner: WorkerIdentity,
+    },
+    ScopedQueueReserve {
+        queue_group_id: Uuid,
+        queue_generation: Uuid,
+        queue_view: AuthorityView,
+        request_id: Uuid,
+    },
+    ScopedQueueAdmit {
+        queue_group_id: Uuid,
+        queue_generation: Uuid,
+        queue_view: AuthorityView,
+        request_id: Uuid,
+        activation: Uuid,
+    },
+    ScopedQueueRead {
+        queue_group_id: Uuid,
+        queue_generation: Uuid,
+        queue_view: AuthorityView,
+        request_id: Uuid,
+    },
+    ScopedQueueFenceReceipt {
+        queue_group_id: Uuid,
+        transfer_id: Uuid,
+    },
     QueueRetirement,
     ApiIngress,
     StatusProof { source_group: Uuid },
@@ -601,4 +670,84 @@ pub(crate) struct ServiceAuthorization {
     pub owner: Option<WorkerIdentity>,
     pub effective_authority: Authority,
     pub pending_ready: Option<ReadyMembership>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_ingress: Option<ScopedIngressGrant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedIngressGrant {
+    group_id: Uuid,
+    table_id: Uuid,
+    shard_id: Uuid,
+    data_generation: Uuid,
+    queue_generation: Uuid,
+    view: AuthorityView,
+    owner: WorkerIdentity,
+    members: [WorkerIdentity; 3],
+    unavailable_holder: Option<WorkerIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TimestampPointRoute {
+    pub source_group: Uuid,
+    pub source_generation: Uuid,
+    pub target_generation: Uuid,
+    pub authority: Authority,
+}
+
+impl ScopedIngressGrant {
+    pub(super) fn from_placement(queue: &super::ScopedQueuePlacement) -> Result<Self, ProtocolError> {
+        let GroupKind::Data { table_id, shard_id } = queue.group.kind else {
+            return Err(stale_service_route());
+        };
+        Ok(Self {
+            group_id: queue.group.group_id,
+            table_id,
+            shard_id,
+            data_generation: queue.data_generation,
+            queue_generation: queue.queue_generation,
+            view: queue.view,
+            owner: queue.owner,
+            members: queue.members,
+            unavailable_holder: queue.unavailable_holder,
+        })
+    }
+
+    pub(crate) fn placement(self, control: &GroupIdentity) -> Result<super::ScopedQueuePlacement, ProtocolError> {
+        let queue = super::ScopedQueuePlacement {
+            group: GroupIdentity {
+                cluster_id: control.cluster_id,
+                database: control.database.clone(),
+                group_id: self.group_id,
+                kind: GroupKind::Data { table_id: self.table_id, shard_id: self.shard_id },
+                group_format_version: GROUP_FORMAT_VERSION,
+            },
+            data_generation: self.data_generation,
+            queue_generation: self.queue_generation,
+            view: self.view,
+            owner: self.owner,
+            members: self.members,
+            unavailable_holder: self.unavailable_holder,
+        };
+        queue.validate(&queue.group)?;
+        Ok(queue)
+    }
+}
+
+pub(crate) fn stale_service_route() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "service receiver placement changed",
+        Outcome::NotApplied,
+    )
+}
+
+pub(crate) fn unsupported_service_route() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::UnsupportedOperation,
+        "service receiver placement check unavailable",
+        Outcome::NotApplied,
+    )
 }

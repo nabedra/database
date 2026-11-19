@@ -25,6 +25,7 @@ pub(crate) mod recovery_tests;
 #[cfg(unix)]
 mod remote_api;
 pub mod replica;
+mod scoped_worker;
 mod transaction;
 pub mod worker_endpoint;
 pub(crate) mod worker_runtime;

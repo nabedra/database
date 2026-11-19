@@ -1096,7 +1096,7 @@ fn q04_q06_idle_preflight_preserves_recovery_and_expired_result_work() {
             Err(QueueError::NotFound)
         ));
         assert!(owner.has_retirement_work(102, &active));
-        assert_eq!(owner.has_recovery_work(101, &active), count > 1);
+        assert!(owner.has_recovery_work(101, &active));
         assert!(!owner.has_recovery_work(102, &active));
         for follower in &mut followers {
             let ack = follower
@@ -1105,6 +1105,9 @@ fn q04_q06_idle_preflight_preserves_recovery_and_expired_result_work() {
             owner.acknowledge(fixture.authority, ack).unwrap();
             assert!(follower.has_retirement_work(102, &active));
         }
+        owner
+            .confirm_terminal_copy(fixture.authority, terminal.record_version().unwrap())
+            .unwrap();
         assert!(!owner.has_recovery_work(1, &active));
         assert!(owner.has_retirement_work(102, &active));
     }
@@ -1197,6 +1200,90 @@ fn q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy
         owner.record(id).unwrap().response_body.as_ref(),
         Some(&response)
     );
+}
+
+#[test]
+fn q06_o14_o23_terminal_confirmation_requires_the_exact_ready_view_and_version() {
+    let fixture = Fixture::new(3);
+    let mut owner = fixture.replica(0);
+    let mut replicas = [fixture.replica(1), fixture.replica(2)];
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let context = fixture.context(id, &body);
+    let previous = fixture.authority;
+    let confirmed = |replica: &WorkerReplica, authority| {
+        replica
+            .terminal_copy_confirmation(authority, replica.record(id).unwrap())
+            .is_some()
+    };
+    let payload = owner.propose(previous, body, context.clone(), 1).unwrap();
+    let accepted = copy(&mut owner, &mut replicas, &payload).unwrap();
+    copy(&mut owner, &mut replicas, &accepted);
+    let running = owner.start(previous, id).unwrap();
+    copy(&mut owner, &mut replicas, &running);
+    let response = format!(r#"{{"request_id":"{id}","data":["exact"]}}"#).into_bytes();
+    let terminal = owner.finish(previous, id, 200, response.clone(), 2).unwrap();
+    let previous_version = terminal.record_version().unwrap();
+    assert_eq!(
+        owner.confirm_terminal_copy(previous, previous_version),
+        Err(QueueError::Stale)
+    );
+    copy(&mut owner, &mut replicas, &terminal);
+    assert!(owner.copies_complete(id));
+    assert!(!confirmed(&owner, previous));
+    assert_eq!(owner.recovery_ids(2, None, 1), vec![id]);
+
+    let mut current = previous;
+    current.ready.view.membership_revision += 1;
+    owner
+        .fenced_takeover(previous, current, fixture.members.clone())
+        .unwrap();
+    for replica in &mut replicas {
+        replica
+            .fenced_takeover(previous, current, fixture.members.clone())
+            .unwrap();
+    }
+    assert!(!confirmed(&owner, current));
+    assert!(!confirmed(&owner, previous));
+    let rebased = owner.resume(current, id).unwrap();
+    let current_version = rebased.record_version().unwrap();
+    assert_ne!(current_version.version, previous_version.version);
+    assert_ne!(current_version.digest, previous_version.digest);
+    copy(&mut owner, &mut replicas, &rebased);
+    for (authority, version) in [
+        (previous, previous_version),
+        (current, previous_version),
+        (
+            current,
+            RecordVersion {
+                digest: previous_version.digest,
+                ..current_version
+            },
+        ),
+    ] {
+        assert_eq!(
+            owner.confirm_terminal_copy(authority, version),
+            Err(QueueError::Stale)
+        );
+    }
+    assert!(!confirmed(&owner, current));
+    owner
+        .confirm_terminal_copy(current, current_version)
+        .unwrap();
+    assert!(confirmed(&owner, current));
+    assert!(!confirmed(&owner, previous));
+    let (record, bytes) = owner.response(current.ready.view.run_id, id, 2).unwrap();
+    assert_eq!(record.version, current_version.version);
+    assert_eq!(bytes.unwrap().as_ref(), response.as_slice());
+    assert_eq!(
+        owner.terminal_statement(id).unwrap().storage_pin,
+        context.read.unwrap().storage_pin
+    );
+    let mut grants = owner.read_grant_set(id);
+    grants.revision += 1;
+    assert!(owner.record_read_grants(id, grants));
+    assert!(!confirmed(&owner, current));
+    assert_eq!(owner.recovery_ids(2, None, 1), vec![id]);
 }
 
 #[test]
@@ -1814,3 +1901,5 @@ fn o13_q06_delayed_install_cannot_restore_retired_terminal_and_new_sequences_ski
     receiver.install_prepared_checked(prepared, None).unwrap();
     assert!(receiver.record(new_id).is_some());
 }
+
+mod scoped_acceptance;

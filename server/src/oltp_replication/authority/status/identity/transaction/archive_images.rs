@@ -123,7 +123,7 @@ impl StatusHandle {
                         }
                         committed_at = Some(history.commit_ts);
                         true
-                    } else if key.starts_with(TXNS) {
+                    } else if key.starts_with(TXNS) && key.get(TXNS.len()) != Some(&b'q') {
                         if key.len() < TXNS.len() + 25
                             || key.len() > 4096
                             || row.value().len() > 64 << 10
@@ -432,7 +432,7 @@ pub(crate) async fn install_archived_decision(
 /// One immutable metadata projection at the advertised Status applied cut.
 /// Data-cut clipping happens only when restoring the known identity, so the
 /// coverage digest also protects metadata-only pending/post-cut UUIDs.
-fn project_identity(
+pub(super) fn project_identity(
     mut record: IdentityRecord,
     applied: AppliedPosition,
 ) -> Option<IdentityRecord> {
@@ -491,6 +491,55 @@ pub(crate) fn identity_metadata_step(
         record.reservation.request_id,
         identity_step(root, &record)?,
     )))
+}
+/// Both Status identity frame forms must restore the same UUID receipt.
+pub(crate) fn receipt_step(
+    root: Digest,
+    identity: &super::archive::ArchivedIdentity,
+) -> Result<Digest, ProtocolError> {
+    serialized_digest(&(
+        b"nabedra/archive-identity-receipt/v1".as_slice(),
+        root,
+        &identity.origin,
+        identity.reservation,
+        identity.reserved_at,
+        &identity.disposition,
+    ))
+}
+pub(crate) fn identity_receipt_metadata_step(
+    shared: &crate::oltp::pool::WorkerSharedResources,
+    root: Digest,
+    image: &MetadataImage,
+    cut: CommitTs,
+) -> Result<Option<Digest>, ProtocolError> {
+    if !image.key.starts_with(IDENTITIES) {
+        return Ok(None);
+    }
+    if image.value.len() > 64 << 10 {
+        return Err(unknown());
+    }
+    let _owner = shared.reserve_scratch(
+        ByteClass::Data,
+        crate::oltp::mvcc::json_decode_budget(image.value.as_bytes())?,
+    )?;
+    let identity: IdentityRecord = serde_json::from_str(&image.value).map_err(|_| unknown())?;
+    if image.key != key(IDENTITIES, identity.reservation.request_id) || image.commit_ts.is_some() {
+        return Err(invalid());
+    }
+    let archived = super::archive::ArchivedIdentity {
+        origin: identity.restore_origin,
+        reservation: identity.reservation,
+        reserved_at: identity.reserved_at,
+        disposition: super::archive::identity_disposition(
+            identity.reservation,
+            identity.terminal,
+            identity.rejection,
+            cut,
+        ),
+        point_projection: None,
+        owner: None,
+    };
+    Ok(Some(receipt_step(root, &archived)?))
 }
 #[derive(Serialize, Deserialize)]
 struct InventoryFoldPage {

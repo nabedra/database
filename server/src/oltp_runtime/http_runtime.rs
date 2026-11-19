@@ -1,13 +1,13 @@
 //! One HTTP admission/receipt surface for standalone and hosted worker runtimes.
 //! Authentication, wire validation and response ownership remain in http.rs.
-use super::LocalRuntime;
+use super::{LocalRuntime, application::PointRequest};
 use crate::{
     executor::Executor,
     oltp_replication::multiplex::EndpointFuture,
     protocol::{ErrorCode, Outcome, ProtocolError},
     request_queue::{Receipt, RequestRecord},
     response::EncodedResponse,
-    scheduling::ResourceScheduler,
+    scheduling::{MemoryCharge, ResourceScheduler},
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -36,7 +36,12 @@ pub(crate) trait HttpRuntime: Send + Sync + 'static {
     fn ingress(&self) -> &Executor;
     fn scheduler(&self) -> ResourceScheduler;
     fn scheduler_node_id(&self) -> u64;
-    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord>;
+    fn submit(
+        self: Arc<Self>,
+        body: Vec<u8>,
+        parsing_charge: MemoryCharge,
+        point: Option<PointRequest>,
+    ) -> EndpointFuture<'static, RequestRecord>;
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt>;
     fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse>;
     fn health(&self) -> EndpointFuture<'_, EncodedResponse>;
@@ -76,8 +81,17 @@ impl HttpRuntime for LocalRuntime {
     fn scheduler_node_id(&self) -> u64 {
         0
     }
-    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
-        Box::pin(async move { LocalRuntime::submit(&self, body).await })
+    fn submit(
+        self: Arc<Self>,
+        body: Vec<u8>,
+        parsing_charge: MemoryCharge,
+        _point: Option<PointRequest>,
+    ) -> EndpointFuture<'static, RequestRecord> {
+        Box::pin(async move {
+            let submitted = LocalRuntime::submit(&self, body).await;
+            drop(parsing_charge);
+            submitted
+        })
     }
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
         Box::pin(async move { LocalRuntime::receipt(self, run, id).await.map(Into::into) })

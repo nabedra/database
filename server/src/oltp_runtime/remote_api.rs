@@ -1,7 +1,7 @@
 //! A stateless API attaches to enrolled workers over the existing mTLS service.
 //! It opens no data pool and cannot create a run or worker readiness.
 use super::{
-    application::ApplicationClient,
+    application::{ApplicationClient, PointRequest},
     http_runtime::{HttpRuntime, OwnedReceipt},
     replica::QueueScope,
     worker_endpoint::AuthorityReader,
@@ -22,7 +22,7 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     request_queue::{Receipt, RequestRecord, RequestState},
     response::{self, EncodedResponse},
-    scheduling::ResourceScheduler,
+    scheduling::{MemoryCharge, ResourceScheduler},
 };
 use serde::Deserialize;
 use std::{
@@ -44,6 +44,8 @@ pub(crate) struct RemoteConfig {
     pub enrollment: ApiEnrollment,
     pub worker_tls: PrivateTls,
     pub control_peers: Vec<WorkerEnrollment>,
+    #[serde(default)]
+    pub scoped_oltp: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,12 +191,21 @@ impl RemoteRuntime {
             if grant.owner.is_none() {
                 return Err(unavailable());
             }
+            if config.scoped_oltp {
+                let local = WorkerIdentity::from(config.enrollment.transport());
+                let operation = super::authority_fence::transition_id(
+                    "scoped-queue-api-capability-v2",
+                    &local,
+                )?;
+                control.advertise_scoped_queue(operation).await?;
+            }
             let client = ApplicationClient::new(
                 shared.clone(),
                 transport.client(),
                 control.clone(),
                 group,
                 token,
+                config.scoped_oltp,
             )?;
             Ok((scope, client))
         }
@@ -312,12 +323,33 @@ impl HttpRuntime for RemoteRuntime {
     fn scheduler_node_id(&self) -> u64 {
         self.shared.scheduler_node_id()
     }
-    fn submit(self: Arc<Self>, body: Vec<u8>) -> EndpointFuture<'static, RequestRecord> {
+    fn submit(
+        self: Arc<Self>,
+        body: Vec<u8>,
+        mut parsing_charge: MemoryCharge,
+        point: Option<PointRequest>,
+    ) -> EndpointFuture<'static, RequestRecord> {
         Box::pin(async move {
             if !self.accepting.load(Ordering::Acquire) {
                 return Err(unavailable());
             }
-            self.client.submit(self.shared.copy_bytes(&body)?).await
+            // Decoding is complete. Charge both representations during the
+            // handoff, then retain only the transport's charged body.
+            let point_bytes = point.as_ref().map_or(0, |point| match &point.key {
+                crate::protocol::Key::Utf8(key) => key.capacity(),
+                crate::protocol::Key::Int64(_) => 0,
+            });
+            parsing_charge.shrink_to(
+                body.capacity()
+                    .checked_add(point_bytes)
+                    .ok_or_else(unavailable)? as u64,
+            )?;
+            let transport_body = self.shared.copy_bytes(&body)?;
+            drop(body);
+            parsing_charge.shrink_to(point_bytes as u64)?;
+            let result = self.client.submit_routed(transport_body, point).await;
+            drop(parsing_charge);
+            result
         })
     }
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt> {
@@ -327,26 +359,75 @@ impl HttpRuntime for RemoteRuntime {
         Box::pin(async move {
             // Observation uses fresh authoritative routing and mTLS. Avoid
             // making a long-running request generate a stream of quorum reads.
-            // The caller's observation timeout remains independent of execution.
+            // Start a bounded observation window when execution reaches the
+            // receipt phase or when a scoped receipt needs reconciliation.
             let mut interval = std::time::Duration::from_millis(50);
+            let scoped = self
+                .client
+                .has_scoped_receipt(record.run_id, record.request_id);
+            let mut copy_deadline = None;
             loop {
-                let observed = self
-                    .client
-                    .observe(record.run_id, record.request_id)
-                    .await?;
-                let metadata = &observed.metadata.record;
-                if metadata.digest != record.digest || metadata.state == RequestState::Reconciling {
+                let observe = self.client.observe(record.run_id, record.request_id);
+                let observed = match copy_deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, observe)
+                        .await
+                        .map_err(|_| unavailable())?,
+                    None => observe.await,
+                };
+                let state = match observed {
+                    Ok(observed) => {
+                        let metadata = &observed.metadata.record;
+                        if metadata.digest != record.digest
+                            || metadata.state == RequestState::Reconciling && !scoped
+                        {
+                            return Err(unavailable());
+                        }
+                        let state = metadata.state;
+                        if state.terminal() {
+                            let status = metadata.response_status.ok_or_else(unavailable)?;
+                            let result = self.client.result(observed);
+                            let body = match copy_deadline.filter(|_| scoped) {
+                                Some(deadline) => tokio::time::timeout_at(deadline, result)
+                                    .await
+                                    .map_err(|_| unavailable())?,
+                                None => result.await,
+                            };
+                            match body {
+                                Ok(body) => {
+                                    return Ok(EncodedResponse {
+                                        status,
+                                        body: body.as_ref().to_vec(),
+                                    });
+                                }
+                                Err(error) if scoped && receipt_retryable(&error) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        state
+                    }
+                    Err(error) if scoped && receipt_retryable(&error) => RequestState::Reconciling,
+                    Err(error) => return Err(error),
+                };
+                let now = tokio::time::Instant::now();
+                if copy_deadline.is_some_and(|end| now >= end) {
                     return Err(unavailable());
                 }
-                if metadata.state.terminal() {
-                    let status = metadata.response_status.ok_or_else(unavailable)?;
-                    let body = self.client.result(observed).await?;
-                    return Ok(EncodedResponse {
-                        status,
-                        body: body.as_ref().to_vec(),
-                    });
+                if (state == RequestState::Committing
+                    || scoped && state == RequestState::Reconciling)
+                    && copy_deadline.is_none()
+                {
+                    let timeout = if scoped {
+                        // The worker's copy round is allowed to recover one
+                        // slow peer. The read marker can need another quorum.
+                        super::scoped_worker::COPY_TIMEOUT
+                    } else {
+                        super::RECEIPT_OBSERVATION_TIMEOUT
+                    };
+                    copy_deadline = Some(now + timeout);
                 }
-                tokio::time::sleep(interval).await;
+                let next_poll = now + interval;
+                tokio::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))
+                    .await;
                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
             }
         })
@@ -376,6 +457,12 @@ fn invalid() -> ProtocolError {
         ErrorCode::ValidationError,
         "invalid enrolled API gateway configuration",
         Outcome::NotApplied,
+    )
+}
+fn receipt_retryable(error: &ProtocolError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown | ErrorCode::Overloaded
     )
 }
 fn unavailable() -> ProtocolError {

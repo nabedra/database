@@ -27,6 +27,39 @@ pub(crate) trait TimestampService: Send + Sync {
         base_exclusive: Option<CommitTs>,
         status: Arc<dyn crate::oltp_replication::authority::status::StatusService>,
     ) -> ConsensusFuture<'a, VerifiedArchiveClosure>;
+    fn with_scoped_execution(
+        &self,
+        _scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+    ) -> Result<Arc<dyn TimestampService>, ProtocolError> {
+        Err(super::invalid())
+    }
+    fn commit_timestamp_point<'a>(
+        &'a self,
+        _locator: &'a TimestampDecisionLocator,
+        _reconcile: bool,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(async { Err(unknown()) })
+    }
+    fn abort_timestamp_point<'a>(
+        &'a self,
+        _locator: &'a TimestampDecisionLocator,
+        _reconcile: bool,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(async { Err(unknown()) })
+    }
+    fn observe_timestamp_point<'a>(
+        &'a self,
+        _locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(PointDecision, Arc<ScratchLease>)>> {
+        Box::pin(async { Err(unknown()) })
+    }
+    fn abandon_timestamp_point<'a>(
+        &'a self,
+        _locator: &'a TimestampDecisionLocator,
+        _transition_id: Uuid,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(async { Err(unknown()) })
+    }
     fn identity(&self) -> &GroupIdentity;
     fn resources(&self) -> &Arc<WorkerSharedResources>;
     fn begin_import_metadata<'a>(

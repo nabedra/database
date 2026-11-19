@@ -15,6 +15,7 @@ pub(super) mod replacement;
 pub(super) mod restart;
 pub(super) mod placement;
 pub(super) mod pool_drain;
+pub(super) mod scoped_queue;
 pub(super) mod worker_drain;
 
 pub(super) const STATE: &[u8] = b"ct/state";
@@ -231,6 +232,15 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        ScopedQueue { operation_id, actor, action, authorization } => {
+            scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
+        }
+        EnsureScopedQueue {
+            operation_id,
+            expected,
+            run_id,
+            authorization,
+        } => scoped_queue::ensure(tx, scope, state, *operation_id, expected, *run_id, authorization),
         BeginWorkerDrain { operation_id, worker, authorization, intent } =>
             worker_drain::begin(tx, state, *operation_id, *worker, authorization, intent),
         BeginWorkerDrainRemoval { operation_id, worker, authorization, id, expected, placement_revision, policy, growth_revision } =>

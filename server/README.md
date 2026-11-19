@@ -87,9 +87,8 @@ the Xcode command line tools and make libclang available to bindgen. The lockfil
 pins RocksDB's Rust binding to 0.25.0 and its native library to 11.8.1.
 `nabedra-db --version` identifies the compiled engine.
 
-The current OLTP topology is one standalone worker and one data directory.
-Distributed consensus, multi-worker transactions, automatic shard/volume growth,
-and S3 backup are still required by [the implementation plan](../plans/oltp-engine.md).
+The standalone topology uses one worker and one data directory. Registered
+workers can run replicated OLTP groups behind a remote gateway.
 Enabling `s3` with `oltp` only includes the optional transport dependencies; it
 does not implement a backup or enable the OLAP engine.
 
@@ -104,6 +103,29 @@ The installer keeps OLAP's S3 default and omits AWS dependencies for OLTP unless
 `--with-s3` is explicit. `--without-s3` also works for OLAP. It verifies the built
 binary's engine before creating the installation prefix. Existing prefixes are
 refused so selecting another engine cannot silently replace an installation.
+
+### Scoped OLTP on registered RF3 workers
+
+The scoped path is opt-in. Upgrade all Control voters before enabling capability
+advertisements. Upgrade the Data, Catalog, Timestamp, and Status replicas and
+the recovery and restore tooling before activating it for a database.
+
+- Set `node.scoped_oltp` to `true` in each registered worker bootstrap.
+  Data-only workers use the top-level `scoped_oltp` setting.
+- Set `topology.scoped_oltp` to `true` in each remote gateway configuration.
+- Use the registered worker's admin endpoint to call `queue.scoped.status`
+  with an empty payload. Pass the returned capability as `expected` to
+  `queue.scoped.admission`, with `enabled` set to `true`. Control verifies the
+  current capability and membership before activating admission.
+- To pause new scoped admissions, submit the latest capability with `enabled`
+  set to `false`. Keep scoped support enabled on the processes while existing
+  UUIDs settle under their recorded policy. A full-stop restart requires a
+  fresh activation and abandons pending work while preserving durable decisions.
+
+Primary-key `Get` and `Update` use the owning Data range's RF3 queue when
+eligible. Other operations and preexisting all-ready identities retain their
+original execution paths. The [OLTP contract](../docs/testing/oltp-contract.md)
+specifies the acceptance, recovery, and receipt boundaries.
 
 Docker uses the same choices. The OLAP image retains its existing Python CLI
 entrypoint; the OLTP image invokes `nabedra-db` directly:

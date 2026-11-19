@@ -2,7 +2,7 @@
 //! backend: this component never proposes application bodies to a Raft group.
 use super::{
     replica::*,
-    worker_endpoint::{AuthorityReader, QueuePeerClient},
+    worker_endpoint::{AuthorityReader, QueuePeerClient, QueueState},
 };
 use crate::{
     oltp::pool::ExecutionClass,
@@ -15,19 +15,22 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     request_queue::{QueueError, RequestState},
 };
+use futures_util::{StreamExt, stream::FuturesOrdered};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 use tokio::{
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, Semaphore},
     time::{Instant, sleep_until, timeout_at},
 };
 use uuid::Uuid;
 
 const READ_GRANT_COPY_DEADLINE: Duration = Duration::from_secs(30);
 const READ_GRANT_COPY_BACKOFF: Duration = Duration::from_millis(25);
+const MAX_PARALLEL_QUEUE_COPIES: usize = 4;
+const QUEUE_COPY_SLOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub trait ReplicaTransport: Send + Sync + 'static {
     fn install<'a>(
@@ -35,6 +38,23 @@ pub trait ReplicaTransport: Send + Sync + 'static {
         target: WorkerIdentity,
         frame: &'a RecordFrame,
     ) -> EndpointFuture<'a, CopyAcknowledgement>;
+    fn install_version<'a>(
+        &'a self,
+        target: WorkerIdentity,
+        frame: &'a RecordFrame,
+        _expected: RecordVersion,
+    ) -> EndpointFuture<'a, CopyAcknowledgement> {
+        self.install(target, frame)
+    }
+    fn state(
+        &self,
+        _target: WorkerIdentity,
+        _scope: QueueScope,
+        _view: AuthorityView,
+        _id: Uuid,
+    ) -> EndpointFuture<'_, QueueState> {
+        Box::pin(async { Err(QueueError::Unavailable.protocol()) })
+    }
     fn copy_read_grants(
         &self, _target: WorkerIdentity, _scope: QueueScope, _view: AuthorityView,
         _id: Uuid, _set: ReadGrantSet,
@@ -55,6 +75,23 @@ impl ReplicaTransport for QueuePeerClient {
     ) -> EndpointFuture<'a, CopyAcknowledgement> {
         Box::pin(QueuePeerClient::install(self, target, frame))
     }
+    fn install_version<'a>(
+        &'a self,
+        target: WorkerIdentity,
+        frame: &'a RecordFrame,
+        expected: RecordVersion,
+    ) -> EndpointFuture<'a, CopyAcknowledgement> {
+        Box::pin(QueuePeerClient::install_version(self, target, frame, expected))
+    }
+    fn state(
+        &self,
+        target: WorkerIdentity,
+        scope: QueueScope,
+        view: AuthorityView,
+        id: Uuid,
+    ) -> EndpointFuture<'_, QueueState> {
+        Box::pin(QueuePeerClient::state(self, target, scope, view, id))
+    }
     fn copy_read_grants(
         &self, target: WorkerIdentity, scope: QueueScope, view: AuthorityView,
         id: Uuid, set: ReadGrantSet,
@@ -73,6 +110,7 @@ pub struct QueueCoordinator {
     authority: Arc<dyn AuthorityReader>,
     peers: Arc<dyn ReplicaTransport>,
     progress: Mutex<BTreeMap<Uuid, Weak<AsyncMutex<()>>>>,
+    copy_slots: Semaphore,
 }
 impl QueueCoordinator {
     /// Collect survivor records before sealing the source inventory. Readiness
@@ -278,6 +316,7 @@ impl QueueCoordinator {
             authority,
             peers,
             progress: Mutex::new(BTreeMap::new()),
+            copy_slots: Semaphore::new(MAX_PARALLEL_QUEUE_COPIES),
         })
     }
     fn gate(&self, id: Uuid) -> Result<Arc<AsyncMutex<()>>, ProtocolError> {
@@ -301,6 +340,22 @@ impl QueueCoordinator {
             .scope()
             .clone();
         self.authority.current(&scope).await
+    }
+
+    pub(super) async fn owner_record_state(
+        &self,
+        current: QueueAuthority,
+        id: Uuid,
+    ) -> Result<QueueState, ProtocolError> {
+        let scope = self
+            .replica
+            .lock()
+            .map_err(|_| QueueError::Unavailable.protocol())?
+            .scope()
+            .clone();
+        self.peers
+            .state(current.owner, scope, current.ready.view, id)
+            .await
     }
 
     /// Transfer a live queue with bounded pages, then obtain a transport-bound
@@ -472,7 +527,7 @@ impl QueueCoordinator {
         let gate = self.gate(id)?;
         let _progress = gate.lock().await;
         loop {
-            let (frame, local, target) = {
+            let (frame, local, targets) = {
                 let mut replica = self
                     .replica
                     .lock()
@@ -492,51 +547,73 @@ impl QueueCoordinator {
                     )
                 } else {
                     let frame = replica.resume(current, id).map_err(QueueError::protocol)?;
-                    let target = replica.next_copy_member(id).map_err(QueueError::protocol)?;
-                    (frame, replica.local_identity(), Some(target))
+                    let targets = replica
+                        .next_copy_batch(id, MAX_PARALLEL_QUEUE_COPIES)
+                        .map_err(QueueError::protocol)?;
+                    (frame, replica.local_identity(), Some(targets))
                 }
             };
-            let Some(target) = target else {
+            let Some(targets) = targets else {
                 if self.current().await? != current {
                     return Err(QueueError::Stale.protocol());
                 }
+                let version = frame.record_version().map_err(QueueError::protocol)?;
+                // The result section is present only on terminal frames.
+                if promote && frame.sections[2].is_some() {
+                    self.replica
+                        .lock()
+                        .map_err(|_| QueueError::Unavailable.protocol())?
+                        .confirm_terminal_copy(current, version)
+                        .map_err(QueueError::protocol)?;
+                }
                 #[cfg(test)]
                 super::recovery_tests::observe_load_copy(id, &frame, None);
-                return frame.record_version().map_err(QueueError::protocol);
+                return Ok(version);
             };
-            // No queue lock, compute grant or native execution slot crosses
-            // this network wait. The exact raw frame retains only byte charges.
-            #[cfg(test)]
-            let copy_started = std::time::Instant::now();
-            let ack = if target == local {
-                CopyAcknowledgement::authenticated(
-                    local,
-                    frame.record_version().map_err(QueueError::protocol)?,
-                )
-            } else {
-                self.peers
-                    .install(target, &frame)
-                    .await
-                    .map_err(|mut error| {
-                        // This RPC describes one RAM installation, not proof that
-                        // the logical request was never accepted/applied elsewhere.
-                        error.outcome = crate::protocol::Outcome::Unknown;
-                        error
-                    })?
-            };
-            #[cfg(test)]
-            let copy_elapsed = copy_started.elapsed();
-            self.replica
-                .lock()
-                .map_err(|_| QueueError::Unavailable.protocol())?
-                .acknowledge_phase(current, ack, promote)
-                .map_err(QueueError::protocol)?;
-            #[cfg(test)]
-            super::recovery_tests::observe_load_copy(
-                id,
-                &frame,
-                Some((target, copy_elapsed)),
-            );
+            // All sends borrow the same charged frame. Apply their authenticated
+            // replies in ready-set order, regardless of which send finishes first.
+            let version = frame.record_version().map_err(QueueError::protocol)?;
+            let mut copies = FuturesOrdered::new();
+            for target in targets {
+                let frame = &frame;
+                copies.push_back(async move {
+                    #[cfg(test)]
+                    let started = std::time::Instant::now();
+                    let ack = if target == local {
+                        CopyAcknowledgement::authenticated(local, version)
+                    } else {
+                        let deadline = Instant::now() + QUEUE_COPY_SLOT_TIMEOUT;
+                        let _slot = timeout_at(deadline, self.copy_slots.acquire())
+                            .await
+                            .map_err(|_| QueueError::Unavailable.protocol())?
+                            .map_err(|_| QueueError::Unavailable.protocol())?;
+                        self.peers
+                            .install_version(target, frame, version)
+                            .await
+                            .map_err(|mut error| {
+                                // This send cannot establish that no peer
+                                // accepted or applied the logical request.
+                                error.outcome = Outcome::Unknown;
+                                error
+                            })?
+                    };
+                    #[cfg(test)]
+                    let timing = (target, started.elapsed());
+                    #[cfg(not(test))]
+                    let timing = ();
+                    Ok::<_, ProtocolError>((ack, timing))
+                });
+            }
+            while let Some(copy) = copies.next().await {
+                let (ack, _timing) = copy?;
+                self.replica
+                    .lock()
+                    .map_err(|_| QueueError::Unavailable.protocol())?
+                    .acknowledge_phase(current, ack, promote)
+                    .map_err(QueueError::protocol)?;
+                #[cfg(test)]
+                super::recovery_tests::observe_load_copy(id, &frame, Some(_timing));
+            }
         }
     }
 

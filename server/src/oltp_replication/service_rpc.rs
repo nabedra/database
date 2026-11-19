@@ -17,23 +17,31 @@ mod participant_full;
 #[cfg(test)]
 pub(crate) use participant_full::continuation_fixture;
 mod read_attempt;
-#[cfg(test)]
-pub(crate) use read_attempt::fixture as read_fixture;
-pub(crate) use read_attempt::{ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead};
 pub(crate) use metadata::{
     AdmissionTicketIssuer, AuthenticatedMetadataReply, BackupPublicationReader,
     OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket, StatusClient,
-    StatusEndpoint, TimestampClient, TimestampEndpoint,
+    StatusEndpoint, TimestampClient, TimestampEndpoint, VerifiedTimestampPointDecision,
+};
+#[cfg(test)]
+pub(crate) use read_attempt::fixture as read_fixture;
+pub(crate) use read_attempt::{
+    ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead,
 };
 mod status;
-pub(crate) use participant::{ParticipantProofClient, ParticipantProofEndpoint};
+pub(crate) use participant::{
+    ParticipantProofClient, ParticipantProofEndpoint, VerifiedTimestampPointRejection,
+    VerifiedTimestampPointResolution, VerifiedTimestampPointSeal,
+};
 pub(crate) use participant_full::{ParticipantClient, ParticipantEndpoint};
 #[cfg(test)]
 mod tests;
-pub(crate) use status::{StatusProofClient, StatusProofEndpoint};
+pub(crate) use status::{StatusProofClient, StatusProofEndpoint, VerifiedTimestampPointLocator};
 
 use super::{
-    authority::control::{ControlClient, ServiceAction},
+    authority::control::{
+        ControlClient, ReplicaRoutes, ServiceAction, ServiceAuthorization, stale_service_route,
+        unsupported_service_route,
+    },
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, ReceivePlan,
         RequestError, RequestTarget, TrafficClass, WorkerClient,
@@ -50,6 +58,10 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 // Registered election timeouts reach three seconds. Leave time to refresh
 // routes and reach the new leader without using the full public wait budget.
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
+const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -62,6 +74,11 @@ enum Method {
         operation: u8,
         mutation: bool,
     },
+    TimestampPointDecisionRead {
+        route: super::authority::control::TimestampPointRoute,
+        source_digest: Digest,
+        locator_digest: Digest,
+    },
     StatusDecision {
         txn: TxnId,
         manifest: ManifestRef,
@@ -69,6 +86,14 @@ enum Method {
     StatusSettlement {
         txn: TxnId,
         manifest: ManifestRef,
+    },
+    StatusPointLocator {
+        route: super::authority::control::TimestampPointRoute,
+        txn: TxnId,
+        request_digest: Digest,
+        manifest: ManifestRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<super::authority::control::ScopedCatalogRead>,
     },
     ParticipantSeal {
         txn: TxnId,
@@ -78,7 +103,24 @@ enum Method {
         txn: TxnId,
         manifest: ManifestRef,
     },
+    ParticipantTimestampPointSeal {
+        route: super::authority::control::TimestampPointRoute,
+        locator_digest: Digest,
+    },
+    ParticipantTimestampPointRejection {
+        route: super::authority::control::TimestampPointRoute,
+        locator_digest: Digest,
+    },
+    ParticipantTimestampPointResolution {
+        route: super::authority::control::TimestampPointRoute,
+        source_digest: Digest,
+        locator_digest: Digest,
+    },
+    ParticipantResolveTimestampPoint,
     ParticipantGuard,
+    ParticipantScopedGuard {
+        txn: TxnId,
+    },
     ParticipantIndexClosed {
         owner: MaintenanceOwnerRef,
     },
@@ -86,6 +128,11 @@ enum Method {
         txn: TxnId,
         manifest: ManifestRef,
         group_id: uuid::Uuid,
+    },
+    ScopedStatusParticipant {
+        scope: super::authority::control::ScopedCatalogRead,
+        txn: TxnId,
+        manifest: ManifestRef,
     },
     ParticipantRead {
         read_ts: ReadTs,
@@ -136,6 +183,7 @@ impl Method {
             Self::ParticipantAcquire
             | Self::ParticipantScanOpen { .. }
             | Self::ParticipantFence { .. }
+            | Self::ParticipantResolveTimestampPoint
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
             _ => Purpose::Authority,
         }
@@ -147,6 +195,23 @@ impl Method {
             Purpose::ServiceMutation => TrafficClass::ServiceMutation,
             _ => TrafficClass::ServiceAuthority,
         }
+    }
+    fn can_repeat_read(self) -> bool {
+        matches!(self.purpose(), Purpose::Authority | Purpose::Storage)
+            && !matches!(
+                self,
+                Self::ParticipantPropose { .. } | Self::ParticipantScanRun { .. }
+            )
+    }
+    fn can_repeat_scoped_read(self, action: ServiceAction) -> bool {
+        self.can_repeat_read()
+            && (matches!(
+                action,
+                ServiceAction::ScopedCatalogRead(_)
+                    | ServiceAction::ScopedQueueExecute(_)
+                    | ServiceAction::ScopedQueueRead { .. }
+                    | ServiceAction::ScopedQueueFenceReceipt { .. }
+            ) || matches!(self, Self::ScopedStatusParticipant { .. }))
     }
     fn input_limit(self) -> usize {
         match self {
@@ -161,6 +226,11 @@ impl Method {
                 crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES
             }
             Self::ParticipantPropose { progress: true } => 128 << 10,
+            Self::TimestampPointDecisionRead { .. }
+            | Self::ParticipantTimestampPointSeal { .. }
+            | Self::ParticipantTimestampPointRejection { .. }
+            | Self::ParticipantTimestampPointResolution { .. }
+            | Self::ParticipantResolveTimestampPoint => 8 << 10,
             _ => 0,
         }
     }
@@ -183,6 +253,8 @@ struct Header {
     action: ServiceAction,
     method: Method,
     payload_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement_generation: Option<uuid::Uuid>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -260,8 +332,11 @@ impl Client {
         method: Method,
         payload: Option<ChargedBytes>,
     ) -> Result<ServiceResponse, ProtocolError> {
+        if method.can_repeat_scoped_read(action) {
+            return self.repeat_as(action, method, payload).await;
+        }
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied)
+        self.call_round(action, method, &payload, &mut possibly_applied, None)
             .await
             .map_err(Into::into)
     }
@@ -270,14 +345,40 @@ impl Client {
         method: Method,
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
-        let payload = Some(payload);
+        self.converge_as(self.action, method, Some(payload), false).await
+    }
+
+    /// Call only for a repeatable read or an exact, idempotent command.
+    async fn repeat_as(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        self.converge_as(action, method, payload, true).await
+    }
+
+    async fn converge_as(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        bound_mutation_attempt: bool,
+    ) -> Result<ServiceResponse, ProtocolError> {
         let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        let peer_deadline = (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
         let mut delay = Duration::from_millis(50);
         let mut possibly_applied = false;
         loop {
             let attempt = timeout_at(
                 deadline,
-                self.call_round(self.action, method, &payload, &mut possibly_applied),
+                self.call_round(
+                    action,
+                    method,
+                    &payload,
+                    &mut possibly_applied,
+                    peer_deadline,
+                ),
             )
             .await
             .map_err(|_| unavailable())?;
@@ -290,7 +391,7 @@ impl Client {
                     RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
                 )) if error.code == ErrorCode::Overloaded => {
                     // An outer transport refusal can outlive an applied command.
-                    // Retry the same idempotent metadata operation with fresh TLS context.
+                    // Retry the same idempotent operation with fresh TLS context.
                     possibly_applied = true;
                     tracing::debug!(group=%self.group.group_id, method=?method, retry_ms=delay.as_millis(), "service transport temporarily overloaded");
                     false
@@ -302,9 +403,12 @@ impl Client {
                 }
                 result => {
                     return result.map_err(|error| {
-                        let mut error = ProtocolError::from(error);
-                        if possibly_applied && method.purpose() == Purpose::ServiceMutation {
-                            error.outcome = Outcome::Unknown;
+                        let error = ProtocolError::from(error);
+                        if possibly_applied
+                            && (method.purpose() == Purpose::ServiceMutation
+                                || bound_mutation_attempt && !method.can_repeat_read())
+                        {
+                            return mutation_uncertain(error);
                         }
                         error
                     });
@@ -328,33 +432,90 @@ impl Client {
         method: Method,
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
+        convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
+        let mut failed_read_hint = None;
+        if action == ServiceAction::Owner
+            && let Some(result) = self
+                .call_hinted(method, payload, possibly_applied, &mut failed_read_hint)
+                .await
+        {
+            return result;
+        }
         tracing::debug!(group=%self.group.group_id, method=?method, "service replica routes start");
         let routes = self.control.replica_routes(&self.group).await.map_err(|error| {
             tracing::debug!(group=%self.group.group_id, method=?method, code=?error.code, outcome=?error.outcome, "service replica routes failed");
             error
         })?;
         tracing::debug!(group=%self.group.group_id, method=?method, replicas=routes.members.len(), "service replica routes ready");
-        let preferred = self.leader.load(Ordering::Relaxed);
-        // Try the last observed leader, then every currently registered member.
-        // The hint never grants authority and every response checks actual TLS.
-        for pass in 0..2 {
-            for member in routes
-                .members
-                .iter()
-                .filter(|member| (member.node_id == preferred) == (pass == 0))
-            {
-                match self
-                    .call_member(
-                        action,
-                        method,
-                        payload,
-                        member.node_id,
-                        member.worker_id.into(),
-                    )
-                    .await
-                {
-                    Ok(Ok(response)) => return Ok(response),
+        let retry_last = failed_read_hint
+            .filter(|(generation, _)| *generation == routes.record.generation)
+            .map(|(_, node)| node);
+        self.call_routed(
+            action,
+            method,
+            payload,
+            possibly_applied,
+            &routes,
+            retry_last,
+            convergence_deadline,
+        )
+        .await
+    }
+
+    async fn call_routed(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        possibly_applied: &mut bool,
+        routes: &ReplicaRoutes,
+        retry_last: Option<u64>,
+        convergence_deadline: Option<Instant>,
+    ) -> Result<ServiceResponse, CallError> {
+        let preferred = match self.leader.load(Ordering::Relaxed) {
+            0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
+            node => node,
+        };
+        // Prefer the observed leader, but let other replicas answer before
+        // spending another transport deadline on a failed cached receiver.
+        for pass in 0..3 {
+            for member in routes.members.iter().filter(|member| {
+                let priority = if Some(member.node_id) == retry_last {
+                    2
+                } else {
+                    u8::from(member.node_id != preferred)
+                };
+                priority == pass
+            }) {
+                let call = self.call_member(
+                    action,
+                    method,
+                    payload,
+                    member.node_id,
+                    member.worker_id.into(),
+                );
+                let reply = if let Some(deadline) = convergence_deadline {
+                    // Leave time to reach the next leader when one peer stalls.
+                    let attempt = if method.can_repeat_read() {
+                        HINTED_READ_TIMEOUT
+                    } else {
+                        SCOPED_MUTATION_TIMEOUT
+                    };
+                    let peer_deadline = deadline.min(Instant::now() + attempt);
+                    timeout_at(peer_deadline, call)
+                        .await
+                        .unwrap_or(Err(CallError::Transport(RequestError::Unreachable)))
+                } else {
+                    call.await
+                };
+                match reply {
+                    Ok(Ok(response)) => {
+                        if action == ServiceAction::Owner || convergence_deadline.is_some() {
+                            routes.record_successful_node(member.node_id);
+                        }
+                        return Ok(response);
+                    }
                     Ok(Err(error)) if route_unavailable(&error) => {
                         *possibly_applied = true;
                         continue;
@@ -384,8 +545,188 @@ impl Client {
         }
         // Local saturation and definitive errors already returned above. On
         // exhaustion the next call must verify the membership pages again.
-        self.control.invalidate_replica_routes(&routes);
+        self.control.invalidate_replica_routes(routes);
         Err(unavailable().into())
+    }
+
+    async fn call_timestamp_point_proof(
+        &self,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        source: &ReplicaRoutes,
+        target: &ReplicaRoutes,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        let mut completed = false;
+        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        timeout_at(
+            deadline,
+            self.call_routed(
+                self.action,
+                method,
+                &payload,
+                &mut completed,
+                target,
+                None,
+                Some(deadline),
+            ),
+        )
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|error| {
+            let error = ProtocolError::from(error);
+            if placement_rejected_before_execution(&error) {
+                self.control.invalidate_replica_routes(source);
+                self.control.invalidate_replica_routes(target);
+                stale_service_route()
+            } else {
+                error
+            }
+        })
+    }
+    async fn call_hinted(
+        &self,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        possibly_applied: &mut bool,
+        failed_read_hint: &mut Option<(uuid::Uuid, u64)>,
+    ) -> Option<Result<ServiceResponse, CallError>> {
+        if *possibly_applied
+            || matches!(
+                method,
+                Method::ParticipantScanOpen { .. } | Method::ParticipantScanRun { .. }
+            )
+        {
+            return None;
+        }
+        let routes = self.control.cached_replica_routes(&self.group)?;
+        let preferred = routes
+            .last_successful_node()
+            .unwrap_or_else(|| self.leader.load(Ordering::Relaxed));
+        let member = routes
+            .members
+            .iter()
+            .find(|member| member.node_id == preferred)
+            .or_else(|| routes.members.first())?;
+        let generation = Some(routes.record.generation);
+        let receiver = match routes.hinted_receiver(member.node_id) {
+            Some(receiver) => receiver,
+            None if routes.begin_receiver_probe() => {
+                // Probe using existing read-only methods. An old replica can
+                // reject the marker without seeing the application request.
+                let (probe, input) = match self.group.kind {
+                    GroupKind::Status { .. } => (
+                        Method::StatusCall {
+                            operation: 0,
+                            mutation: false,
+                        },
+                        Some("Current"),
+                    ),
+                    GroupKind::Timestamps => (
+                        Method::TimestampCall {
+                            operation: 0,
+                            mutation: false,
+                        },
+                        Some("Current"),
+                    ),
+                    GroupKind::Catalog | GroupKind::Data { .. } => {
+                        (Method::ParticipantActivation, None)
+                    }
+                    GroupKind::Control => return None,
+                };
+                let input = input
+                    .map(|input| self.shared.encode_in(ByteClass::Progress, &input, 4096))
+                    .transpose()
+                    .ok()?;
+                let response = tokio::time::timeout(
+                    RECEIVER_PROBE_TIMEOUT,
+                    self.call_member_at(
+                        ServiceAction::Owner,
+                        probe,
+                        &input,
+                        member.node_id,
+                        member.worker_id.into(),
+                        generation,
+                    ),
+                )
+                .await
+                .ok()?
+                .ok()?
+                .ok()?;
+                let receiver = response.reply.remote_identity();
+                routes.confirm_hinted_receiver(member.node_id, receiver);
+                receiver
+            }
+            None => return None,
+        };
+        tracing::debug!(group=%self.group.group_id, method=?method, node=member.node_id, "service replica route hint");
+        let call = self.call_member_at(
+            ServiceAction::Owner,
+            method,
+            payload,
+            member.node_id,
+            receiver.into(),
+            generation,
+        );
+        let attempt = if method.can_repeat_read() {
+            match tokio::time::timeout(HINTED_READ_TIMEOUT, call).await {
+                Ok(result) => result,
+                Err(_) => Err(CallError::Transport(RequestError::Unreachable)),
+            }
+        } else {
+            call.await
+        };
+        let route_failure = match attempt {
+            Ok(Ok(response)) => {
+                routes.record_successful_node(member.node_id);
+                return Some(Ok(response));
+            }
+            Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                if worker == receiver && placement_rejected_before_execution(&error) =>
+            {
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
+            Err(CallError::Local(error)) if error == unsupported_service_route() => return None,
+            Err(CallError::Transport(RequestError::Protocol(error)))
+                if error
+                    == ProtocolError::new(
+                        ErrorCode::ValidationError,
+                        "target incarnation differs from cached enrollment",
+                        Outcome::NotApplied,
+                    ) =>
+            {
+                // The transport rejects an exact incarnation mismatch before dialing.
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
+            Err(CallError::Transport(RequestError::Unreachable)) => unavailable(),
+            Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                if worker == receiver =>
+            {
+                if route_unavailable(&error) {
+                    error
+                } else {
+                    if error == invalid() {
+                        self.control.invalidate_replica_routes(&routes);
+                    }
+                    return Some(Err(CallError::Transport(RequestError::PeerRejected {
+                        worker,
+                        error,
+                    })));
+                }
+            }
+            Ok(Err(error)) | Err(CallError::Local(error)) if route_unavailable(&error) => error,
+            Ok(Err(error)) => return Some(Err(error.into())),
+            Err(error) => return Some(Err(error)),
+        };
+        self.control.invalidate_replica_routes(&routes);
+        if method.can_repeat_read() {
+            // A healthy leader can still serve the read within this route round.
+            *failed_read_hint = Some((routes.record.generation, member.node_id));
+            return None;
+        }
+        *possibly_applied = true;
+        Some(Err(route_failure.into()))
     }
     async fn call_member(
         &self,
@@ -395,6 +736,18 @@ impl Client {
         node: u64,
         worker: RequestTarget,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
+        self.call_member_at(action, method, payload, node, worker, None)
+            .await
+    }
+    async fn call_member_at(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        node: u64,
+        worker: RequestTarget,
+        placement_generation: Option<uuid::Uuid>,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
         let header = self.shared.encode_in(
             method.class().byte_class(),
             &Header {
@@ -402,9 +755,14 @@ impl Client {
                 action,
                 method,
                 payload_bytes: payload.as_ref().map_or(0, |bytes| bytes.len() as u64),
+                placement_generation,
             },
-            4096,
+            SERVICE_HEADER_BYTES,
         )?;
+        // Older replicas use a 1024-byte routing header for owner hints.
+        if placement_generation.is_some() && header.len() > 1024 {
+            return Err(unsupported_service_route().into());
+        }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let reply = self
             .transport
@@ -486,10 +844,7 @@ impl Client {
             reply.reserve_reply_decode(&self.shared, bytes).await?
         };
         tracing::debug!(group=%self.group.group_id, method=?method, node=node, "service reply decode reserved");
-        if !matches!(
-            method,
-            Method::ParticipantScanOpen { .. }
-        ) {
+        if !matches!(method, Method::ParticipantScanOpen { .. }) {
             self.leader.store(node, Ordering::Relaxed);
         }
         Ok(Ok(ServiceResponse {
@@ -518,7 +873,10 @@ impl ServiceResponse {
                     Method::ParticipantResolution { .. },
                     ParticipantProofKind::Resolution
                 )
-                | (Method::ParticipantGuard, ParticipantProofKind::Lifecycle)
+                | (
+                    Method::ParticipantGuard | Method::ParticipantScopedGuard { .. },
+                    ParticipantProofKind::Lifecycle
+                )
                 | (Method::ParticipantAcquire, ParticipantProofKind::Lifecycle)
                 | (
                     Method::ParticipantIndexClosed { .. },
@@ -617,7 +975,7 @@ fn parse(
     {
         return Err(invalid());
     }
-    crate::protocol::json_input(bytes, 4096).map_err(|_| invalid())?;
+    crate::protocol::json_input(bytes, SERVICE_HEADER_BYTES).map_err(|_| invalid())?;
     let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     if header.to_node != node
         || session.purpose() != header.method.purpose()
@@ -626,16 +984,27 @@ fn parse(
         } else {
             header.payload_bytes != 0
         })
+        || (header.placement_generation.is_some()
+            && (header.action != ServiceAction::Owner
+                || matches!(
+                    header.method,
+                    Method::ParticipantScanOpen { .. } | Method::ParticipantScanRun { .. }
+                )))
     {
         return Err(invalid());
     }
     Ok(header)
 }
-async fn authorize(
+fn scoped_admission_read(scope: super::authority::control::ScopedCatalogRead) -> bool {
+    // A fresh scoped admission captures Catalog lineage before there is an
+    // accepted context to hash. Only the queue owner gets this read privilege.
+    scope.request.accepted_context == Digest::from_bytes([0; 32])
+}
+async fn service_grant(
     control: &ControlClient,
     session: &AuthenticatedSession,
     header: &Header,
-) -> Result<(), ProtocolError> {
+) -> Result<ServiceAuthorization, ProtocolError> {
     let scope = crate::oltp_runtime::replica::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
@@ -647,8 +1016,30 @@ async fn authorize(
             header.action,
             session.group().clone(),
         )
-        .await?;
-    Ok(())
+        .await
+}
+
+async fn authorize(
+    control: &ControlClient,
+    session: &AuthenticatedSession,
+    header: &Header,
+) -> Result<(), ProtocolError> {
+    let scope = crate::oltp_runtime::replica::QueueScope {
+        cluster_id: session.group().cluster_id,
+        database: session.group().database.clone(),
+    };
+    if let Some(generation) = header.placement_generation {
+        return control
+            .service_role_at_replica(
+                &scope,
+                session.remote(),
+                session.group().clone(),
+                header.to_node,
+                generation,
+            )
+            .await;
+    }
+    service_grant(control, session, header).await.map(|_| ())
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,
@@ -714,6 +1105,20 @@ fn route_unavailable(error: &ProtocolError) -> bool {
         error.code,
         ErrorCode::StorageUnavailable | ErrorCode::OutcomeUnknown
     ) && error.outcome == Outcome::Unknown
+}
+
+fn mutation_uncertain(mut error: ProtocolError) -> ProtocolError {
+    error.outcome = Outcome::Unknown;
+    error
+}
+
+fn placement_rejected_before_execution(error: &ProtocolError) -> bool {
+    *error == stale_service_route()
+        || *error == unsupported_service_route()
+        // The permanent node dispatcher has no endpoint to execute the request.
+        || (error.code == ErrorCode::ValidationError
+            && error.outcome == Outcome::NotApplied
+            && error.message == "worker does not host target replica node")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
