@@ -1,4 +1,18 @@
 import { DB, Database, col, type Query, type Table } from "nabedra"
+import { Cache, type CacheOptions } from "nabedra/cache"
+
+const cacheOptions: CacheOptions = { namespace: "catalog", timeoutMs: 250, poolSize: 4 }
+const cache = await Cache.connect("redis://localhost:6379", cacheOptions)
+const cacheValue: Uint8Array | null = await cache.get("sku:42")
+void cacheValue
+const counter: bigint = await cache.increment("count", 1n)
+void counter
+await cache.set("sku:42", Uint8Array.of(128, 0, 255), { when: "absent", ttlMs: 20_000 })
+// @ts-expect-error The cache counter API requires a bigint.
+await cache.increment("count", 1)
+// @ts-expect-error The cache accepts binary values.
+await cache.set("sku:42", "text")
+await cache.close()
 
 const db: Database = new DB({ apiUrl: "https://example.test", caFile: "/ca.pem" })
 const sameMode: "oltp" | "olap" = new Database("https://example.test", "token", { mode: "olap" }).mode

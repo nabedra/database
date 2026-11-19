@@ -90,7 +90,7 @@ class PackageCommandTests(unittest.TestCase):
         for args in (['--version', '--json'], ['database', '--version', '--json']):
             with patch('nabedra.cli.resolve_server_binary', return_value='/server'), patch('nabedra.cli.binary_version', return_value='0.1.0'), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(cli.main(args), 0)
-                self.assertEqual(json.loads(output.getvalue())['cli'], '0.1.0')
+                self.assertEqual(json.loads(output.getvalue())['cli'], '0.2.0')
 
 
 if __name__ == '__main__':

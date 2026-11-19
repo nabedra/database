@@ -91,3 +91,29 @@ worker images use their configured in-container bootstrap commands.
 Set `NABEDRA_TEST_PYTHON` to an absolute Python 3.11+ executable for the
 differential tests. Set `NABEDRA_TEST_OLAP_BINARY` as well to test live row and
 Arrow streaming with the repository's OLAP process fixture.
+
+## Cache
+
+Connect to a Nabedra Cache endpoint and close the pool after use.
+
+```typescript
+import { Cache } from "nabedra/cache"
+
+const cache = await Cache.connect("rediss://cache.example.com:6379", {
+  username, password, namespace: "catalog", caFile: "/path/to/ca.pem",
+})
+try {
+  await cache.set("sku:42", new TextEncoder().encode("in stock"), { ttlMs: 30_000, when: "absent" })
+  const value = await cache.get("sku:42")
+} finally {
+  await cache.close()
+}
+```
+
+`Cache` is also exported from `nabedra`. Call `delete`, `expire`, `persist`,
+`ttlMs` and `increment` on the same handle. `get` returns exact bytes or
+`null`, and counters accept and return `bigint`. Use `cluster: true` with
+bootstrap endpoints and `allowedNodes` or `allowedNodeSuffix` when node names
+differ from the seeds. The
+[shared contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+describes deadlines, routing and errors.

@@ -1,3 +1,5 @@
+#![cfg(any(feature = "olap", feature = "oltp"))]
+
 use nabedra_database_server::protocol::*;
 use serde_json::{Value, json};
 

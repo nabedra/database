@@ -21,11 +21,12 @@ from .query import Query
 from .stream import BatchStream, StreamSnapshot
 from .table import Table
 from .client import Database, DB, RequestReceipt
+from .cache import Cache
 from .cluster import Cluster
 
 __all__ = [
     "Scalar", "Key", "Row", "Schema",
-    "Database", "DB", "RequestReceipt", "Cluster", "Expr", "col", "Query", "Table",
+    "Cache", "Database", "DB", "RequestReceipt", "Cluster", "Expr", "col", "Query", "Table",
     "NabedraError", "ValidationError", "AuthenticationError", "NotFoundError",
     "ConflictError", "LimitExceededError", "OverloadedError", "StorageError",
     "TransportError", "ProtocolError", "UnknownOutcomeError",

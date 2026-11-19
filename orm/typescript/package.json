@@ -1,7 +1,7 @@
 {
   "name": "nabedra",
-  "version": "0.1.0",
-  "description": "TypeScript client for the Nabedra Database HTTP API",
+  "version": "0.2.0",
+  "description": "Asynchronous TypeScript client for Nabedra Database and Cache",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -21,6 +21,10 @@
     "./aws": {
       "types": "./dist/aws.d.ts",
       "default": "./dist/aws.js"
+    },
+    "./cache": {
+      "types": "./dist/cache.d.ts",
+      "default": "./dist/cache.js"
     },
     "./cli": {
       "types": "./dist/cli.d.ts",
