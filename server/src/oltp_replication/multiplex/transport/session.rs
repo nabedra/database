@@ -12,15 +12,28 @@
 //! group- and purpose-specific. A session closes when its peer's incarnation
 //! leaves the local directory. A request that fails after its frame was
 //! written has an unknown outcome, as with the one-shot exchange.
+//!
+//! Liveness: a caller pings a session that has been silent too long and
+//! closes it when nothing comes back, and also closes it when a reply times
+//! out with nothing received since the request was written. TCP keepalive is
+//! on for both sides. A receiver closes sessions that never name a lane and
+//! sessions idle for four ping intervals.
+//!
+//! Capacity: each traffic class has its own pool of accepted sessions. A
+//! session takes a pending slot during the handshake and its lane slot with
+//! its first verified request. A full lane answers that request with a typed
+//! overload and closes the session after the reply.
 use super::*;
 use crate::oltp_replication::types::WorkerEnrollment;
 use std::{
     collections::HashMap,
     io::IoSlice,
+    pin::Pin,
     sync::{MutexGuard, PoisonError, atomic::AtomicU64},
+    task::{Context, Poll},
 };
 use tokio::{
-    io::ReadHalf,
+    io::{ReadBuf, ReadHalf},
     sync::{mpsc, oneshot, watch},
     task::AbortHandle,
 };
@@ -28,11 +41,16 @@ use tokio_rustls::{client, server};
 
 pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
-pub(super) const MAX_SERVER_SESSIONS: usize = 1024;
 const FRAME_BYTES: usize = 13;
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
 const CANCEL: u8 = 4;
+/// Caller liveness probe; the receiver answers `PONG` with the same id.
+const PING: u8 = 8;
+const PONG: u8 = 16;
+/// A receiver closes a session with no streams after this many ping intervals
+/// without receiving a byte. A live caller pings every interval.
+const SERVER_IDLE_PINGS: u32 = 4;
 const SECTION_PREFIX_BYTES: usize = 8 * MAX_SECTIONS;
 const DRAIN_BYTES: usize = 16 << 10;
 const DIRECTORY_CHECK: Duration = Duration::from_secs(1);
@@ -64,6 +82,60 @@ impl StreamFrame {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Optional protocol features a caller may use on a negotiated session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerFeature {
+    /// AppendEntries frames carrying more than one entry.
+    MultiEntryAppend,
+}
+
+/// Counts bytes read, so liveness checks see progress inside large frames.
+struct Counted<R> {
+    inner: R,
+    bytes: Arc<AtomicU64>,
+}
+impl<R: AsyncRead + Unpin> AsyncRead for Counted<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let read = buf.filled().len() - before;
+        if read != 0 {
+            self.bytes.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+/// Tracks when a byte counter last moved, sampled by a supervisor tick.
+struct Progress {
+    bytes: Arc<AtomicU64>,
+    seen: u64,
+    at: Instant,
+}
+impl Progress {
+    fn new(bytes: Arc<AtomicU64>) -> Self {
+        Self {
+            seen: bytes.load(Ordering::Relaxed),
+            bytes,
+            at: Instant::now(),
+        }
+    }
+    /// Time since the counter last moved, sampled now.
+    fn silence(&mut self) -> Duration {
+        let now = Instant::now();
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        if bytes != self.seen {
+            self.seen = bytes;
+            self.at = now;
+        }
+        now - self.at
+    }
 }
 
 /// The reply prefix shared by the one-shot exchange and session replies.
@@ -155,11 +227,11 @@ struct Outbound {
     ack: Option<oneshot::Sender<WriteOutcome>>,
 }
 impl Outbound {
-    fn cancel(stream_id: u64) -> Self {
+    fn control(stream_id: u64, flags: u8) -> Self {
         Self {
             head: StreamFrame {
                 stream_id,
-                flags: CANCEL,
+                flags,
                 len: 0,
             }
             .encode()
@@ -167,6 +239,9 @@ impl Outbound {
             parts: Vec::new(),
             ack: None,
         }
+    }
+    fn cancel(stream_id: u64) -> Self {
+        Self::control(stream_id, CANCEL)
     }
 }
 
@@ -188,36 +263,55 @@ async fn write_frame(stream: &mut (impl AsyncWrite + Unpin), frame: &Outbound) -
     stream.flush().await
 }
 
-/// Serializes frames from all streams. A failed write closes the session; the
-/// frame being written reports `Failed` (unknown outcome) and queued frames
-/// report `NotSent`.
+async fn stopped(stop: &mut Option<watch::Receiver<bool>>) {
+    match stop {
+        Some(stop) => {
+            let _ = stop.wait_for(|stopped| *stopped).await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Serializes frames from all streams. A failed or stopped write closes the
+/// session; the frame being written reports `Failed` (unknown outcome) and
+/// queued frames report `NotSent`. `hold` (tests only) keeps the next frame
+/// unwritten while it reads `true`; a stop meanwhile reports it `NotSent`.
 async fn write_frames(
     mut stream: impl AsyncWrite + Unpin,
     mut queue: mpsc::Receiver<Outbound>,
     mut stop: Option<watch::Receiver<bool>>,
+    mut hold: Option<watch::Receiver<bool>>,
     deadline: Duration,
 ) -> bool {
     let healthy = loop {
-        let frame = match stop.as_mut() {
-            Some(stop) => tokio::select! {
-                biased;
-                changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() {
-                        break true;
-                    }
-                    continue;
-                }
-                frame = queue.recv() => frame,
-            },
-            None => queue.recv().await,
+        let frame = tokio::select! {
+            biased;
+            _ = stopped(&mut stop) => break true,
+            frame = queue.recv() => frame,
         };
         let Some(frame) = frame else {
             break true;
         };
-        let written = matches!(
-            timeout(deadline, write_frame(&mut stream, &frame)).await,
-            Ok(Ok(()))
-        );
+        if let Some(hold) = hold.as_mut() {
+            let held_until_stop = tokio::select! {
+                biased;
+                _ = stopped(&mut stop) => true,
+                _ = hold.wait_for(|held| !*held) => false,
+            };
+            if held_until_stop {
+                if let Some(ack) = frame.ack {
+                    let _ = ack.send(WriteOutcome::NotSent);
+                }
+                break true;
+            }
+        }
+        let written = tokio::select! {
+            biased;
+            written = timeout(deadline, write_frame(&mut stream, &frame)) => {
+                matches!(written, Ok(Ok(())))
+            }
+            _ = stopped(&mut stop) => false,
+        };
         if let Some(ack) = frame.ack {
             let _ = ack.send(if written {
                 WriteOutcome::Written
@@ -282,6 +376,11 @@ struct ClientSession {
     closed: watch::Sender<bool>,
     next: AtomicU64,
     reader: Mutex<Option<AbortHandle>>,
+    /// Bytes received on this connection.
+    received: Arc<AtomicU64>,
+    /// A stream that waited this long for a reply with nothing at all
+    /// received meanwhile marks the connection dead (the ping timeout).
+    silent_limit: Duration,
 }
 impl ClientSession {
     fn start(
@@ -293,6 +392,7 @@ impl ClientSession {
         let (read, write) = tokio::io::split(stream);
         let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
         let (closed, stop) = watch::channel(false);
+        let received = Arc::new(AtomicU64::new(0));
         let session = Arc::new(Self {
             identity: WorkerIdentity::from(&enrollment),
             enrollment,
@@ -304,49 +404,103 @@ impl ClientSession {
             closed,
             next: AtomicU64::new(1),
             reader: Mutex::new(None),
+            received: received.clone(),
+            silent_limit: common.config.ping_timeout,
         });
         let deadline = common.config.deadline;
+        #[cfg(test)]
+        let hold = Some(common.hold_writes.subscribe());
+        #[cfg(not(test))]
+        let hold = None;
         tokio::spawn({
             let session = session.clone();
             async move {
-                write_frames(write, queue, Some(stop), deadline).await;
+                write_frames(write, queue, Some(stop), hold, deadline).await;
                 session.close();
             }
         });
-        let mut reader = tokio::spawn(read_replies(
+        let reader = tokio::spawn(read_replies(
             session.clone(),
-            read,
+            Counted {
+                inner: read,
+                bytes: received,
+            },
             class,
             common.config.clone(),
             common.shared.clone(),
         ));
         *lock(&session.reader) = Some(reader.abort_handle());
-        let directory = common.directory.clone();
-        tokio::spawn({
-            let session = session.clone();
-            async move {
-                let mut stop = session.closed.subscribe();
-                let mut check = tokio::time::interval(DIRECTORY_CHECK);
-                check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = &mut reader => break,
-                        changed = stop.changed() => {
-                            if changed.is_err() || *stop.borrow() {
-                                break;
-                            }
+        tokio::spawn(session.clone().supervise(
+            reader,
+            common.directory.clone(),
+            common.config.ping_idle,
+            common.config.ping_timeout,
+        ));
+        session
+    }
+    /// Close the session when its reader ends, the peer's incarnation leaves
+    /// the directory, or a ping goes unanswered. A ping is sent after
+    /// `ping_idle` of silence, or after `ping_timeout` while a stream waits.
+    /// Its deadline starts once it reaches the socket, so a long write ahead
+    /// of it is not mistaken for a dead peer.
+    async fn supervise(
+        self: Arc<Self>,
+        mut reader: tokio::task::JoinHandle<()>,
+        directory: Arc<dyn PeerDirectory>,
+        ping_idle: Duration,
+        ping_timeout: Duration,
+    ) {
+        let mut stop = self.closed.subscribe();
+        let mut check = tokio::time::interval(
+            DIRECTORY_CHECK
+                .min(ping_timeout / 2)
+                .max(Duration::from_millis(10)),
+        );
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut progress = Progress::new(self.received.clone());
+        let mut queued: Option<oneshot::Receiver<WriteOutcome>> = None;
+        let mut written: Option<(Instant, u64)> = None;
+        loop {
+            tokio::select! {
+                _ = &mut reader => break,
+                _ = stop.wait_for(|closed| *closed) => break,
+                outcome = async { queued.as_mut().expect("ping queued").await }, if queued.is_some() => {
+                    queued = None;
+                    if !matches!(outcome, Ok(WriteOutcome::Written)) {
+                        break;
+                    }
+                    written = Some((Instant::now(), self.received.load(Ordering::Relaxed)));
+                }
+                _ = check.tick() => {
+                    if !enrolled(&*directory, self.identity) {
+                        break;
+                    }
+                    let silence = progress.silence();
+                    if let Some((at, mark)) = written {
+                        if self.received.load(Ordering::Relaxed) != mark {
+                            written = None;
+                        } else if at.elapsed() >= ping_timeout {
+                            tracing::debug!(peer=%self.identity.worker_id,
+                                "peer session ping unanswered; closing");
+                            break;
                         }
-                        _ = check.tick() => {
-                            if !enrolled(&*directory, session.identity) {
-                                break;
-                            }
+                    }
+                    let limit = if self.waiting() { ping_timeout } else { ping_idle };
+                    if queued.is_none() && written.is_none() && silence >= limit {
+                        let (ack, outcome) = oneshot::channel();
+                        let mut ping = Outbound::control(0, PING);
+                        ping.ack = Some(ack);
+                        if self.outgoing.try_send(ping).is_ok() {
+                            queued = Some(outcome);
                         }
                     }
                 }
-                session.close();
             }
-        });
-        session
+        }
+        self.close();
+    }
+    fn waiting(&self) -> bool {
+        !lock(&self.waiters).streams.is_empty()
     }
     fn alive(&self) -> bool {
         !*self.closed.borrow()
@@ -399,7 +553,8 @@ impl ClientSession {
         let mut guard = StreamGuard {
             session: self,
             stream_id,
-            written: false,
+            queued: false,
+            written: None,
             settled: false,
         };
         let mut head = Vec::with_capacity(FRAME_BYTES + PROLOGUE_BYTES);
@@ -429,17 +584,19 @@ impl ClientSession {
             ack: Some(ack),
         };
         match timeout_at(deadline, self.outgoing.send(frame)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => guard.queued = true,
             Ok(Err(_)) => return Err(CallError::NotSent),
             Err(_) => return Err(CallError::Failed(RequestError::Unreachable)),
         }
         match timeout_at(deadline, written).await {
-            Ok(Ok(WriteOutcome::Written)) => guard.written = true,
-            Ok(Ok(WriteOutcome::NotSent)) => return Err(CallError::NotSent),
-            _ => {
-                guard.written = true;
-                return Err(CallError::Failed(RequestError::Unreachable));
+            Ok(Ok(WriteOutcome::Written)) => {
+                guard.written = Some((Instant::now(), self.received.load(Ordering::Relaxed)));
             }
+            Ok(Ok(WriteOutcome::NotSent)) => {
+                guard.queued = false;
+                return Err(CallError::NotSent);
+            }
+            _ => return Err(CallError::Failed(RequestError::Unreachable)),
         }
         *phase = RaftTransportPhase::ReceiveReply;
         match timeout_at(deadline, response).await {
@@ -451,17 +608,28 @@ impl ClientSession {
                 guard.settled = true;
                 Err(CallError::Failed(RequestError::Unreachable))
             }
+            // The guard decides whether the silent session is dead.
             Err(_) => Err(CallError::Failed(RequestError::Unreachable)),
         }
     }
 }
 
 /// A dropped or expired caller withdraws its waiter. Once its frame was
-/// written, the peer is asked to discard the reply; the handler still runs.
+/// queued, the peer is asked to discard the reply; the handler still runs.
+/// The `CANCEL` follows the request on the same ordered queue, so it never
+/// overtakes it; if the request is never sent, neither is the `CANCEL`.
+///
+/// A reply timeout, after the stream waited at least the ping timeout with
+/// nothing at all received on the connection since its request was written,
+/// closes the session: later calls reconnect instead of waiting out their
+/// own deadlines on a dead connection. Shorter waits (Raft's own RPC TTLs)
+/// are left to the ping.
 struct StreamGuard<'a> {
     session: &'a Arc<ClientSession>,
     stream_id: u64,
-    written: bool,
+    queued: bool,
+    /// When the request reached the socket, and the bytes received by then.
+    written: Option<(Instant, u64)>,
     settled: bool,
 }
 impl Drop for StreamGuard<'_> {
@@ -470,18 +638,27 @@ impl Drop for StreamGuard<'_> {
             return;
         }
         let pending = self.session.waiter(self.stream_id).is_some();
-        if pending && self.written {
+        if pending && self.queued {
             let _ = self
                 .session
                 .outgoing
                 .try_send(Outbound::cancel(self.stream_id));
+        }
+        if let Some((at, mark)) = self.written
+            && pending
+            && at.elapsed() >= self.session.silent_limit
+            && self.session.received.load(Ordering::Relaxed) == mark
+        {
+            tracing::debug!(peer=%self.session.identity.worker_id,
+                "peer session silent past a reply deadline; closing");
+            self.session.close();
         }
     }
 }
 
 async fn read_replies(
     session: Arc<ClientSession>,
-    mut stream: ReadHalf<client::TlsStream<TcpStream>>,
+    mut stream: Counted<ReadHalf<client::TlsStream<TcpStream>>>,
     class: TrafficClass,
     config: TransportConfig,
     shared: Arc<WorkerSharedResources>,
@@ -519,6 +696,8 @@ async fn read_replies(
                     let _ = waiter.send(Err(RequestError::Unreachable));
                 }
             }
+            // Liveness only: the bytes were already counted.
+            PONG if frame.len == 0 && frame.stream_id == 0 => {}
             _ => {
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(Err(RequestError::Unreachable));
@@ -599,6 +778,9 @@ struct Slot {
     current: Mutex<Option<Arc<ClientSession>>>,
     legacy: Mutex<Option<WorkerEnrollment>>,
     connecting: tokio::sync::Mutex<()>,
+    /// When the last connect under `connecting` failed. Callers that queued
+    /// behind it share that failure instead of retrying one after another.
+    failed: Mutex<Option<Instant>>,
 }
 
 /// Caller-side sessions, keyed by peer worker, incarnation and lane.
@@ -609,14 +791,46 @@ pub(super) struct PeerSessions {
 }
 impl Drop for PeerSessions {
     fn drop(&mut self) {
+        self.close_all();
+    }
+}
+impl PeerSessions {
+    /// Whether the live session to this peer incarnation on `class` offers
+    /// `feature`. Every `nabedra-otp/2` session supports every feature listed
+    /// in [`PeerFeature`]; one-shot peers support none.
+    pub(super) fn supports(
+        &self,
+        peer: &WorkerEnrollment,
+        class: TrafficClass,
+        feature: PeerFeature,
+    ) -> bool {
+        let key = (peer.worker_id, peer.incarnation, class as usize);
+        let Some(slot) = lock(&self.slots).get(&key).cloned() else {
+            return false;
+        };
+        let live = lock(&slot.current)
+            .as_ref()
+            .is_some_and(|session| session.alive() && session.enrollment == *peer);
+        match feature {
+            PeerFeature::MultiEntryAppend => live,
+        }
+    }
+    /// Streams waiting for replies on this caller's sessions.
+    #[cfg(test)]
+    pub(super) fn waiting_for_test(&self) -> usize {
+        lock(&self.slots)
+            .values()
+            .filter_map(|slot| lock(&slot.current).clone())
+            .map(|session| lock(&session.waiters).streams.len())
+            .sum()
+    }
+    pub(super) fn close_all(&self) {
         for slot in lock(&self.slots).values() {
             if let Some(session) = lock(&slot.current).take() {
                 session.close();
             }
         }
     }
-}
-impl PeerSessions {
     /// TLS connections this caller opened, sessions and one-shot exchanges.
     #[cfg(test)]
     pub(super) fn connections(&self) -> u64 {
@@ -650,7 +864,8 @@ impl PeerSessions {
         common: &Common,
         peer: &WorkerEnrollment,
         class: TrafficClass,
-        probe_resolving: Option<&mut bool>,
+        deadline: Instant,
+        mut probe_resolving: Option<&mut bool>,
         phase: &mut RaftTransportPhase,
     ) -> Result<Route, RequestError> {
         let slot = self.slot(peer, class);
@@ -668,13 +883,51 @@ impl PeerSessions {
         let _connecting = if legacy {
             None
         } else {
-            let guard = slot.connecting.lock().await;
+            let queued = Instant::now();
+            // Waiting on another caller's local connect is as indeterminate
+            // as waiting on the resolver, for a liveness probe.
+            if let Some(resolving) = probe_resolving.as_deref_mut() {
+                *resolving = true;
+            }
+            let guard = timeout_at(deadline, slot.connecting.lock())
+                .await
+                .map_err(|_| RequestError::Unreachable)?;
+            if let Some(resolving) = probe_resolving.as_deref_mut() {
+                *resolving = false;
+            }
             if let Some(session) = current() {
                 return Ok(Route::Session(session));
             }
+            if lock(&slot.failed).is_some_and(|failed| failed > queued) {
+                return Err(RequestError::Unreachable);
+            }
             Some(guard)
         };
-        let stream = connect(common, peer, class, probe_resolving, phase).await?;
+        let attempt = deadline.min(Instant::now() + common.config.connect_timeout);
+        let connected = timeout_at(
+            attempt,
+            connect(common, peer, class, probe_resolving.as_deref_mut(), phase),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            if probe_resolving.as_deref().copied() == Some(true) {
+                Err(unavailable().into())
+            } else {
+                Err(RequestError::Unreachable)
+            }
+        });
+        let stream = match connected {
+            Ok(stream) => {
+                *lock(&slot.failed) = None;
+                stream
+            }
+            Err(error) => {
+                if !legacy {
+                    *lock(&slot.failed) = Some(Instant::now());
+                }
+                return Err(error);
+            }
+        };
         self.connections.fetch_add(1, Ordering::Relaxed);
         if stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN) {
             let session = ClientSession::start(stream, peer.clone(), class, common);
@@ -709,7 +962,14 @@ impl PeerSessions {
     ) -> Result<RawReply, RequestError> {
         for attempt in 0..2 {
             let session = match self
-                .route(common, peer, class, probe_resolving.as_deref_mut(), phase)
+                .route(
+                    common,
+                    peer,
+                    class,
+                    deadline,
+                    probe_resolving.as_deref_mut(),
+                    phase,
+                )
                 .await?
             {
                 Route::Session(session) => session,
@@ -772,7 +1032,7 @@ async fn connect(
         TcpStream::connect(addresses.as_ref()).await
     }
     .map_err(|_| RequestError::Unreachable)?;
-    let _ = socket.set_nodelay(true);
+    tune_socket(&socket);
     *phase = RaftTransportPhase::Tls;
     let stream = common
         .connector
@@ -859,12 +1119,56 @@ async fn one_shot(
 
 // ---------------------------------------------------------------- server side
 
-#[derive(Default)]
 struct ServerSession {
     /// The sender incarnation every later prologue must carry.
     bound: Mutex<Option<WorkerIdentity>>,
     /// Streams in flight; `true` once the caller cancelled the reply.
     active: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    /// The handshake's pending slot, held until the first verified request
+    /// moves the session into its lane's pool.
+    pending: Mutex<Option<OwnedSemaphorePermit>>,
+    /// The session's lane and its slot in that lane's pool.
+    lane: Mutex<Option<(TrafficClass, OwnedSemaphorePermit)>>,
+    /// Set when the lane was full: the session ends after its typed reply.
+    closing: AtomicBool,
+    received: Arc<AtomicU64>,
+}
+enum Lane {
+    Held,
+    Full,
+    Mismatch,
+}
+impl ServerSession {
+    fn new(pending: OwnedSemaphorePermit) -> Self {
+        Self {
+            bound: Mutex::new(None),
+            active: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Some(pending)),
+            lane: Mutex::new(None),
+            closing: AtomicBool::new(false),
+            received: Arc::new(AtomicU64::new(0)),
+        }
+    }
+    /// Callers keep one lane per connection. The first verified request takes
+    /// a slot in that lane's pool and releases the pending slot.
+    fn claim(&self, common: &Common, class: TrafficClass) -> Lane {
+        let mut lane = lock(&self.lane);
+        match &*lane {
+            Some((held, _)) if *held == class => Lane::Held,
+            Some(_) => Lane::Mismatch,
+            None => match common.session_slots[class as usize]
+                .clone()
+                .try_acquire_owned()
+            {
+                Ok(slot) => {
+                    *lane = Some((class, slot));
+                    lock(&self.pending).take();
+                    Lane::Held
+                }
+                Err(_) => Lane::Full,
+            },
+        }
+    }
 }
 
 struct StreamWork {
@@ -910,25 +1214,31 @@ pub(super) async fn serve(
     stream: server::TlsStream<TcpStream>,
     certificate: Digest,
     mut stop: watch::Receiver<bool>,
-    _slot: OwnedSemaphorePermit,
+    pending: OwnedSemaphorePermit,
 ) {
     if *stop.borrow() {
         return;
     }
     let (read, write) = tokio::io::split(stream);
     let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
-    let deadline = transport.common.config.deadline;
-    let writer = tokio::spawn(write_frames(write, queue, None, deadline));
-    let state = Arc::new(ServerSession::default());
+    let config = &transport.common.config;
+    let deadline = config.deadline;
+    let writer = tokio::spawn(write_frames(write, queue, None, None, deadline));
+    let state = Arc::new(ServerSession::new(pending));
     let mut reader = tokio::spawn(serve_frames(
         transport.clone(),
-        read,
+        Counted {
+            inner: read,
+            bytes: state.received.clone(),
+        },
         outgoing,
         certificate,
         state.clone(),
     ));
     let mut check = tokio::time::interval(DIRECTORY_CHECK);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = Instant::now();
+    let mut progress = Progress::new(state.received.clone());
     let read_finished = loop {
         tokio::select! {
             _ = &mut reader => break true,
@@ -940,6 +1250,17 @@ pub(super) async fn serve(
             _ = check.tick() => {
                 let bound = *lock(&state.bound);
                 if bound.is_some_and(|peer| !enrolled(&*transport.common.directory, peer)) {
+                    break false;
+                }
+                // Sessions that never name a lane, and idle sessions whose
+                // caller stopped pinging, give their slot back.
+                let silence = progress.silence();
+                if lock(&state.active).is_empty()
+                    && (lock(&state.lane).is_none() && started.elapsed() >= config.ping_idle
+                        || silence >= config.ping_idle * SERVER_IDLE_PINGS)
+                {
+                    tracing::debug!(peer=?bound.map(|peer| peer.worker_id),
+                        "closing an idle or unidentified peer session");
                     break false;
                 }
             }
@@ -954,7 +1275,7 @@ pub(super) async fn serve(
 
 async fn serve_frames(
     transport: Arc<WorkerTransport>,
-    mut stream: ReadHalf<server::TlsStream<TcpStream>>,
+    mut stream: Counted<ReadHalf<server::TlsStream<TcpStream>>>,
     outgoing: mpsc::Sender<Outbound>,
     certificate: Digest,
     state: Arc<ServerSession>,
@@ -1003,7 +1324,9 @@ async fn serve_frames(
                             return;
                         };
                         let frame = reply_frame(frame.stream_id, nonce, 1, reply);
-                        if outgoing.send(frame).await.is_err() {
+                        if outgoing.send(frame).await.is_err()
+                            || state.closing.load(Ordering::Acquire)
+                        {
                             return;
                         }
                     }
@@ -1013,6 +1336,15 @@ async fn serve_frames(
             CANCEL if frame.len == 0 => {
                 if let Some(cancelled) = lock(&state.active).get(&frame.stream_id) {
                     cancelled.store(true, Ordering::Release);
+                }
+            }
+            PING if frame.len == 0 => {
+                if outgoing
+                    .send(Outbound::control(frame.stream_id, PONG))
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
             _ => return,
@@ -1141,6 +1473,10 @@ async fn run_stream(
         Err(_) => (None, None),
     };
     trace.phase = RaftTransportPhase::SendReply;
+    #[cfg(test)]
+    if cancelled.load(Ordering::Acquire) {
+        common.cancelled_replies.fetch_add(1, Ordering::AcqRel);
+    }
     if !cancelled.load(Ordering::Acquire) {
         let mut frame = frame.unwrap_or_else(|| Outbound::cancel(stream_id));
         let (ack, written) = oneshot::channel();
@@ -1161,7 +1497,7 @@ impl WorkerTransport {
     /// allocated, as in the one-shot listener.
     async fn receive(
         &self,
-        stream: &mut ReadHalf<server::TlsStream<TcpStream>>,
+        stream: &mut Counted<ReadHalf<server::TlsStream<TcpStream>>>,
         frame: StreamFrame,
         certificate: Digest,
         state: &ServerSession,
@@ -1220,6 +1556,19 @@ impl WorkerTransport {
             return Ok(Received::Abort);
         };
         lock(&state.bound).get_or_insert(hello.from);
+        match state.claim(common, class) {
+            Lane::Held => {}
+            Lane::Mismatch => return Ok(Received::Close),
+            Lane::Full => {
+                drain(stream, rest).await?;
+                state.closing.store(true, Ordering::Release);
+                return Ok(Received::Reject {
+                    nonce: hello.nonce,
+                    class,
+                    error: overloaded("worker session capacity full"),
+                });
+            }
+        }
         if sections_total > common.config.payload_bytes[class as usize] {
             drain(stream, rest).await?;
             return Ok(Received::Reject {
@@ -1228,14 +1577,27 @@ impl WorkerTransport {
                 error: malformed("worker receive plan exceeds class limits"),
             });
         }
+        // Definite rejections before any execution get a typed reply: the
+        // caller knows the request was not applied.
         let Ok(preflight) = common.preflight[class as usize].clone().try_acquire_owned() else {
             drain(stream, rest).await?;
-            return Ok(Received::Abort);
+            return Ok(Received::Reject {
+                nonce: hello.nonce,
+                class,
+                error: overloaded("worker preflight lane full"),
+            });
         };
         let byte_class = class.byte_class();
-        let Ok(mut header) = common.shared.allocate_bytes(byte_class, hello.header_len) else {
-            drain(stream, rest).await?;
-            return Ok(Received::Abort);
+        let mut header = match common.shared.allocate_bytes(byte_class, hello.header_len) {
+            Ok(header) => header,
+            Err(error) => {
+                drain(stream, rest).await?;
+                return Ok(Received::Reject {
+                    nonce: hello.nonce,
+                    class,
+                    error,
+                });
+            }
         };
         stream.read_exact(header.as_mut_slice()).await?;
         let mut rest = rest - hello.header_len;
