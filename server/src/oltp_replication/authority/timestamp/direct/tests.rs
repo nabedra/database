@@ -67,6 +67,9 @@ struct LogState {
 struct Cluster {
     nodes: Vec<Node>,
     log: tokio::sync::Mutex<LogState>,
+    /// While set, proposals never complete, like a leader partitioned after
+    /// passing its read barrier.
+    stalled: AtomicBool,
 }
 impl Cluster {
     async fn new(size: usize) -> Arc<Self> {
@@ -91,11 +94,14 @@ impl Cluster {
                 missed: vec![Vec::new(); size],
                 proposals: Vec::new(),
             }),
+            stalled: AtomicBool::new(false),
         })
     }
+    /// The handle gets its own `TimestampMachine` over the node's store, as
+    /// `bootstrap.rs` builds the service handle beside the hosted machine.
     fn handle(self: &Arc<Self>, node: usize) -> Arc<TimestampHandle> {
         TimestampHandle::new(
-            self.nodes[node].fx.machine.clone(),
+            TimestampMachine::new(self.nodes[node].fx.machine.store().clone()).unwrap(),
             Arc::new(ModelConsensus {
                 cluster: self.clone(),
                 node,
@@ -137,6 +143,25 @@ impl Cluster {
         }
         log.connected[node] = true;
     }
+    /// Commit an entry from the current leader and apply it through each
+    /// node's hosted machine only, never through a handle.
+    async fn commit_external(&self, command: TimestampCommand) -> TimestampReply {
+        let mut log = self.log.lock().await;
+        log.index += 1;
+        let position = AppliedPosition {
+            term: log.term,
+            node_id: log.leader as u64 + 1,
+            index: log.index,
+        };
+        let mut reply = None;
+        for (index, node) in self.nodes.iter().enumerate() {
+            let applied = node.apply_at(position, command.clone()).await.unwrap();
+            if index == log.leader {
+                reply = Some(applied);
+            }
+        }
+        reply.unwrap()
+    }
     async fn reserve_window_proposals(&self) -> usize {
         self.log
             .lock()
@@ -164,6 +189,9 @@ impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
         command: OwnedCommand<TimestampCommand>,
     ) -> ConsensusFuture<'_, Applied<TimestampReply>> {
         Box::pin(async move {
+            if self.cluster.stalled.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let mut log = self.cluster.log.lock().await;
             if log.leader != self.node || !log.connected[self.node] {
                 return Err(not_leader());
@@ -271,10 +299,10 @@ async fn o09_d06_direct_and_queued_allocations_interleave_monotonically() {
         assert!(low > last, "allocation {low} is not above completed {last}");
         last = high;
     }
-    let windows = handle.direct_windows();
-    assert!(windows.reservations() > 1);
+    let stats = handle.direct_window_stats();
+    assert!(stats.reservations > 1);
     assert!(
-        windows.discards() > 0,
+        stats.discards > 0,
         "queued allocations must discard windows"
     );
 }
@@ -288,22 +316,22 @@ async fn o09_d06_watermark_move_discards_the_rest_of_the_window() {
     let a = handle.allocate_direct(1).await.unwrap().first().get();
     let b = handle.allocate_direct(2).await.unwrap();
     assert_eq!(b.first().get(), a + 1, "values come from one window");
-    assert_eq!(handle.direct_windows().reservations(), 1);
+    assert_eq!(handle.direct_window_stats().reservations, 1);
     let q = queued(&handle, authority).await;
     assert_eq!(
         q,
         a + DEFAULT_DIRECT_WINDOW,
         "the window is durable watermark"
     );
-    assert_eq!(handle.direct_windows().discards(), 1);
+    assert_eq!(handle.direct_window_stats().discards, 1);
     let c = handle.allocate_direct(1).await.unwrap().first().get();
     assert!(c > q, "direct value {c} after queued {q} must be higher");
-    assert_eq!(handle.direct_windows().reservations(), 2);
+    assert_eq!(handle.direct_window_stats().reservations, 2);
     assert_eq!(cluster.reserve_window_proposals().await, 2);
 }
 
 #[tokio::test]
-async fn o09_d06_reservation_raced_by_a_queued_allocation_is_not_installed() {
+async fn o09_d06_raced_reservation_serves_its_head_and_installs_nothing() {
     let mut f = Fixture::new().await;
     let ready = ready(worker());
     let authority = ready.view.authority();
@@ -326,20 +354,35 @@ async fn o09_d06_reservation_raced_by_a_queued_allocation_is_not_installed() {
     })
     .await;
     let windows = f.machine.direct.clone();
-    assert_eq!(
-        windows.install_and_take(1, authority, first.get(), last.get(), 1),
-        None
-    );
+    let leader = (1, 1);
+    // The caller still gets the head of its reservation; the rest is skipped.
+    let head = windows
+        .install_and_take(leader, authority, first.get(), last.get(), 2)
+        .unwrap();
+    assert_eq!((head.first(), head.len()), (first, 2));
+    assert_eq!(windows.stats().raced, 1);
+    assert_eq!(windows.take(leader, 1), None, "nothing was installed");
     let TimestampReply::Window { first, last, .. } = f.apply(reserve).await else {
         panic!("expected a window")
     };
     let taken = windows
-        .install_and_take(1, authority, first.get(), last.get(), 1)
+        .install_and_take(leader, authority, first.get(), last.get(), 1)
         .unwrap();
     assert_eq!(taken.first(), first);
-    // A barrier from another term cannot use the window.
-    assert_eq!(windows.take(2, 1), None);
-    assert_eq!(windows.take(1, 1), None, "the term mismatch discarded it");
+    // A caller whose barrier saw an older leader leaves the newer window alone.
+    assert_eq!(windows.take((1, 0), 1), None);
+    assert_eq!(
+        windows.take(leader, 1).unwrap().first().get(),
+        first.get() + 1
+    );
+    // Another leader in the same term (advanced leader IDs) cannot use it.
+    assert_eq!(windows.take((1, 2), 1), None);
+    assert_eq!(
+        windows.take(leader, 1),
+        None,
+        "the stale window was discarded"
+    );
+    assert_eq!(windows.stats().discards, 1);
 }
 
 #[tokio::test]
@@ -427,7 +470,7 @@ async fn o09_d06_leader_change_never_reissues_old_window_values() {
     cluster.elect(0).await;
     let c = handles[0].allocate_direct(1).await.unwrap().first().get();
     assert!(c > q, "resumed leader value {c} must be above {q}");
-    assert_eq!(handles[0].direct_windows().reservations(), 2);
+    assert_eq!(handles[0].direct_window_stats().reservations, 2);
 }
 
 #[tokio::test]
@@ -445,7 +488,7 @@ async fn o09_d06_regained_leadership_reserves_a_new_window_by_term() {
     cluster.elect(0).await;
     let c = handles[0].allocate_direct(1).await.unwrap().first().get();
     assert_eq!(c, a + DEFAULT_DIRECT_WINDOW);
-    assert_eq!(handles[0].direct_windows().reservations(), 2);
+    assert_eq!(handles[0].direct_window_stats().reservations, 2);
 }
 
 #[tokio::test]
@@ -527,6 +570,7 @@ struct Source {
     hold: tokio::sync::Semaphore,
     held: AtomicBool,
     fail: AtomicBool,
+    panic: AtomicBool,
     entered: AtomicUsize,
 }
 impl Source {
@@ -537,6 +581,7 @@ impl Source {
             hold: tokio::sync::Semaphore::new(0),
             held: AtomicBool::new(held),
             fail: AtomicBool::new(false),
+            panic: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
         })
     }
@@ -555,6 +600,7 @@ impl DirectTimestampSource for Source {
             if self.fail.load(Ordering::SeqCst) {
                 return Err(not_leader());
             }
+            assert!(!self.panic.load(Ordering::SeqCst), "modelled driver panic");
             let mut next = self.next.lock().unwrap();
             let range = DirectTimestampRange::from_bounds(*next, *next + count - 1)?;
             *next += count;
@@ -669,4 +715,231 @@ async fn o09_d06_coalescing_client_follows_a_timestamp_leader_change() {
     let c = client.commit_ts().await.unwrap().get();
     assert!(b < q && q < c);
     assert_eq!(client.local_calls(), 1);
+}
+
+#[tokio::test]
+async fn o09_coalescing_client_falls_back_when_the_local_leader_never_answers() {
+    // The local source never completes, like a leader partitioned mid-write.
+    let local = Source::new(true);
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::with_local_deadline(
+        Some(local.clone()),
+        remote.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    let value = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+        .await
+        .expect("the driver must not wedge on the local route")
+        .unwrap();
+    assert_eq!(value.get(), 1);
+    assert_eq!(local.entered.load(Ordering::SeqCst), 1);
+    assert_eq!(remote.calls(), vec![1]);
+    let next = client.commit_ts().await.unwrap();
+    assert!(next > value);
+    assert_eq!(
+        local.entered.load(Ordering::SeqCst),
+        1,
+        "the stuck local replica is skipped during the backoff"
+    );
+    assert_eq!(client.local_calls(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o09_d06_local_deadline_releases_a_refill_stuck_in_reserve_window() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    cluster.stalled.store(true, Ordering::SeqCst);
+    let remote = Source::new(false);
+    let local: Arc<dyn DirectTimestampSource> = handle.clone();
+    let client = DirectTimestampClient::with_local_deadline(
+        Some(local),
+        remote.clone(),
+        std::time::Duration::from_millis(50),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+        .await
+        .expect("the driver must not wedge on a stalled ReserveWindow")
+        .unwrap();
+    assert_eq!(remote.calls(), vec![1]);
+    // The abandoned local attempt released the store's refill lock.
+    cluster.stalled.store(false, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), handle.allocate_direct(1))
+        .await
+        .expect("the refill lock must be free")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn o09_d06_hosted_apply_discards_the_window_of_an_independent_handle_machine() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let a = handle.allocate_direct(1).await.unwrap().first().get();
+    assert_eq!(handle.direct_window_stats().reservations, 1);
+    // Applied through the hosted machine only, never through the handle.
+    let TimestampReply::Snapshot(pin) = cluster
+        .commit_external(TimestampCommand::BeginBackup {
+            authority,
+            owner: crate::oltp::backup::BackupOwnerRef {
+                backup_id: Uuid::new_v4(),
+                attempt: 1,
+            },
+            pin_id: Uuid::new_v4(),
+        })
+        .await
+    else {
+        panic!("expected a pin")
+    };
+    let q = pin.read_ts.get();
+    assert_eq!(q, a + DEFAULT_DIRECT_WINDOW);
+    assert_eq!(handle.direct_window_stats().discards, 1);
+    let c = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(
+        c > q,
+        "direct value {c} after hosted queued {q} must be higher"
+    );
+    assert_eq!(handle.direct_window_stats().reservations, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o09_d06_concurrent_queued_and_direct_allocations_keep_real_time_order() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    handle.set_direct_window_size(8).unwrap();
+    let clock = Arc::new(AtomicU64::new(0));
+    let tasks: Vec<_> = (0..8u64)
+        .map(|task| {
+            let handle = handle.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                let mut events = Vec::new();
+                let mut seed = 0x2026_1119 ^ (task + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                for _ in 0..40 {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let start = clock.fetch_add(1, Ordering::SeqCst);
+                    let (low, high) = if seed >> 62 == 0 {
+                        let value = queued(&handle, authority).await;
+                        (value, value)
+                    } else {
+                        let range = handle.allocate_direct((seed >> 33) % 3 + 1).await.unwrap();
+                        (range.first().get(), range.last().get())
+                    };
+                    let end = clock.fetch_add(1, Ordering::SeqCst);
+                    events.push((start, end, low, high));
+                }
+                events
+            })
+        })
+        .collect();
+    let mut events = Vec::new();
+    for task in tasks {
+        events.extend(task.await.unwrap());
+    }
+    let mut values: Vec<u64> = events.iter().flat_map(|e| e.2..=e.3).collect();
+    let issued = values.len();
+    values.sort_unstable();
+    values.dedup();
+    assert_eq!(values.len(), issued, "no value is issued twice");
+    for before in &events {
+        for after in &events {
+            if before.1 < after.0 {
+                assert!(
+                    after.2 > before.3,
+                    "call {after:?} started after {before:?} finished but is not above it"
+                );
+            }
+        }
+    }
+    let stats = handle.direct_window_stats();
+    assert!(stats.reservations > 1 && stats.discards > 0, "{stats:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o09_coalescing_client_survives_callers_dropped_mid_batch() {
+    let remote = Source::new(true);
+    let client = DirectTimestampClient::new(None, remote.clone());
+    let spawn = |client: &DirectTimestampClient| {
+        let client = client.clone();
+        tokio::spawn(async move { client.allocate(1).await })
+    };
+    let in_flight = spawn(&client);
+    until(|| remote.entered.load(Ordering::SeqCst) == 1).await;
+    // Enqueue one at a time so arrival order, hence slice order, is fixed.
+    let kept = spawn(&client);
+    until(|| client.waiting() == 1).await;
+    let dropped = spawn(&client);
+    until(|| client.waiting() == 2).await;
+    let kept_too = spawn(&client);
+    until(|| client.waiting() == 3).await;
+    in_flight.abort();
+    dropped.abort();
+    assert!(in_flight.await.unwrap_err().is_cancelled());
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    remote.hold.add_permits(3);
+    let kept = kept.await.unwrap().unwrap();
+    let kept_too = kept_too.await.unwrap().unwrap();
+    let later = tokio::time::timeout(std::time::Duration::from_secs(5), client.allocate(1))
+        .await
+        .expect("no hang after dropped callers")
+        .unwrap();
+    // Dropped callers' values are skipped, never handed to anyone else.
+    assert_eq!(remote.calls(), vec![1, 3, 1]);
+    assert_eq!((kept.first().get(), kept_too.first().get()), (2, 4));
+    assert_eq!(later.first().get(), 5);
+}
+
+#[tokio::test]
+async fn o09_coalescing_client_recovers_after_the_driver_panics() {
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::new(None, remote.clone());
+    let before = client.commit_ts().await.unwrap();
+    remote.panic.store(true, Ordering::SeqCst);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+        .await
+        .expect("waiters of a panicked driver must not hang")
+        .unwrap_err();
+    assert_eq!(error.outcome, Outcome::Unknown);
+    remote.panic.store(false, Ordering::SeqCst);
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+        .await
+        .expect("a new driver must start")
+        .unwrap();
+    assert!(after > before);
+}
+
+#[test]
+fn o09_coalescing_client_recovers_after_its_runtime_cancels_the_driver() {
+    let remote = Source::new(true);
+    let client = DirectTimestampClient::new(None, remote.clone());
+    let first = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    first.block_on(async {
+        let client = client.clone();
+        tokio::spawn(async move { client.allocate(1).await });
+        until(|| remote.entered.load(Ordering::SeqCst) == 1).await;
+    });
+    // Dropping the runtime cancels the driver mid-call.
+    drop(first);
+    remote.held.store(false, Ordering::SeqCst);
+    let second = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let value = second.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.commit_ts())
+            .await
+            .expect("a cancelled driver must not leave the client stuck")
+            .unwrap()
+    });
+    assert_eq!(value.get(), 1, "the cancelled call issued nothing");
+    assert_eq!(remote.calls(), vec![1, 1]);
 }
