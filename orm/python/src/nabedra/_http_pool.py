@@ -16,6 +16,7 @@ import select
 import ssl
 import threading
 import time
+import weakref
 from urllib.request import Request
 
 MAX_IDLE_CONNECTIONS = 4
@@ -61,6 +62,11 @@ class ConnectionPool:
         self._lock = threading.Lock()
         self._idle: list[tuple[HTTPConnection, float]] = []
         self._pid = os.getpid()
+        if hasattr(os, 'register_at_fork'):
+            # A lock held by another thread at fork time would block the child forever.
+            # The hook holds a weak reference so it does not keep discarded pools alive.
+            pool = weakref.ref(self)
+            os.register_at_fork(after_in_child=lambda: _reset_after_fork(pool()))
 
     def _connect(self, timeout: float) -> HTTPConnection:
         if self._https:
@@ -156,3 +162,8 @@ class PooledResponse:
             self._pool.release(connection)
         else:
             connection.close()
+
+
+def _reset_after_fork(pool: ConnectionPool | None) -> None:
+    if pool is not None:
+        pool._lock = threading.Lock()

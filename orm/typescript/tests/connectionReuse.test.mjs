@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import dns from "node:dns"
 import { once } from "node:events"
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:https"
@@ -19,7 +20,7 @@ async function keepAliveServer(t) {
   const cert = join(work, "cert")
   const config = join(work, "openssl.cnf")
   await writeFile(config, "[req]\nprompt = no\ndistinguished_name = dn\nx509_extensions = v3\n" +
-    "[dn]\nCN = local-nabedra\n[v3]\nsubjectAltName = IP:127.0.0.1\n")
+    "[dn]\nCN = local-nabedra\n[v3]\nsubjectAltName = IP:127.0.0.1, DNS:localhost\n")
   const generated = spawnSync("openssl", [
     "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", config, "-keyout", key, "-out", cert,
   ], { encoding: "utf8" })
@@ -34,6 +35,7 @@ async function keepAliveServer(t) {
     const { request_id, operation } = parseJson(Buffer.concat(chunks))
     state.seen.push({ connection: numbers.get(request.socket), operation, requestId: request_id })
     const action = state.actions.shift() ?? "ok"
+    if (action === "slow") await sleep(3_000)
     if (action === "hangup") return request.socket.destroy()
     if (action === "malformed") {
       request.socket.end("HTTP/1.1 invalid\r\nContent-Length: 0\r\n\r\n")
@@ -145,4 +147,34 @@ test("O01 the default agent closes connections idle for two seconds", async (t) 
   assert.deepEqual(state.closed, [1])
   await transport.request("table.get", {})
   assert.equal(state.accepted, 2)
+})
+
+test("O01 the default agent leaves DNS and connect under the request timeout", async (t) => {
+  const fixture = await keepAliveServer(t)
+  if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
+  const { url, cert, state } = fixture
+  const lookup = dns.lookup
+  t.after(() => { dns.lookup = lookup })
+  // A 3 s resolver is slower than the 2 s idle limit and faster than the 10 s request timeout.
+  dns.lookup = (hostname, options, callback) => {
+    if (typeof options === "function") [callback, options] = [options, {}]
+    setTimeout(() => options?.all
+      ? callback(null, [{ address: "127.0.0.1", family: 4 }])
+      : callback(null, "127.0.0.1", 4), 3_000)
+  }
+  const transport = new Transport(url.replace("127.0.0.1", "localhost"), "token", { caFile: cert, timeout: 10 })
+  assert.deepEqual(await transport.request("table.get", {}), [])
+  assert.equal(state.accepted, 1)
+})
+
+test("O01 a reused connection waits the request timeout for a late response", async (t) => {
+  const fixture = await keepAliveServer(t)
+  if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
+  const { url, cert, state } = fixture
+  const transport = new Transport(url, "token", { caFile: cert, timeout: 10 })
+  await transport.request("table.get", {})
+  state.actions.push("slow")
+  assert.deepEqual(await transport.request("table.insert", {}), [])
+  assert.equal(state.accepted, 1)
+  assert.deepEqual(state.seen.map(seen => seen.connection), [1, 1])
 })

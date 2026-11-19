@@ -2,6 +2,7 @@ import { randomUUID, X509Certificate } from "node:crypto"
 import { readFileSync } from "node:fs"
 import * as http from "node:http"
 import * as https from "node:https"
+import type * as net from "node:net"
 import * as tls from "node:tls"
 import {
   AuthenticationError,
@@ -454,14 +455,27 @@ export class Transport {
     this.#database = database
     this.timeout = timeout
     // Reused sockets never carry a retry: a failed exchange destroys its socket and surfaces as before.
-    this.#agent = agent ?? this.createAgent({ maxFreeSockets: maxIdleSockets, timeout: idleSocketMs })
+    this.#agent = agent ?? this.createAgent({ maxFreeSockets: maxIdleSockets }, idleSocketMs)
   }
 
-  createAgent(limits: http.AgentOptions = { maxSockets: 1, maxFreeSockets: 1 }): http.Agent {
+  // `idleMs` limits only sockets waiting in the free pool. Node's agent `timeout` option would also
+  // arm during DNS lookup and connect, cutting the caller's request timeout short.
+  createAgent(limits: http.AgentOptions = { maxSockets: 1, maxFreeSockets: 1 }, idleMs?: number): http.Agent {
     const options = { ...limits, keepAlive: true }
-    return this.#url.protocol === "https:"
+    const agent = this.#url.protocol === "https:"
       ? new https.Agent({ ...options, secureContext: this.#tls, rejectUnauthorized: true })
       : new http.Agent(options)
+    if (idleMs !== undefined) {
+      const keepSocketAlive = agent.keepSocketAlive.bind(agent)
+      agent.keepSocketAlive = (socket) => {
+        // Node returns whether the socket stays pooled, although the typings declare void.
+        const kept = (keepSocketAlive(socket) as unknown) !== false
+        // The agent destroys a free socket when it times out; reuse replaces this with the request timeout.
+        if (kept) (socket as net.Socket).setTimeout(idleMs)
+        return kept
+      }
+    }
+    return agent
   }
 
   async exchange(method: string, route: string, options: ExchangeOptions = {}): Promise<HttpResponse> {

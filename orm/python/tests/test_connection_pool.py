@@ -2,6 +2,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import os
 import socket
 import ssl
 import sys
@@ -254,6 +255,16 @@ class ConnectionReuseTests(unittest.TestCase):
         with patch('nabedra._http_pool.os.getpid', return_value=-1):
             self.transport.request('table.get', {})
         self.assertEqual(self.server.accepted, 2)
+
+    @unittest.skipUnless(hasattr(os, 'fork') and hasattr(os, 'register_at_fork'), 'needs fork')
+    def test_o01_fork_while_the_pool_lock_is_held_does_not_block_the_child(self):
+        # Another thread holding the lock at fork time must not deadlock the child.
+        with self.pool._lock:
+            pid = os.fork()
+            if pid == 0:
+                os._exit(0 if self.pool._lock.acquire(timeout=2) else 1)
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
 
 
 class ProxyFallbackTests(unittest.TestCase):
