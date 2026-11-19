@@ -29,7 +29,7 @@ from oltp_terminal_copy_acceptance import CHILD, read_json, wait_for
 
 BARRIERS = Path('/scoped-acceptance')
 HTTP_TIMEOUT = 24
-DRIVER_TIMEOUT = 230
+DRIVER_TIMEOUT = 330
 RETENTION_MS = 25_000
 PRIMARY = 'https://api:8000'
 SECONDARY = 'https://localhost:8001'
@@ -233,9 +233,9 @@ class Driver:
         assert decision['decided_at']['term'] > 0 and decision['decided_at']['index'] > 0, decision
         return decision
 
-    def terminal(self, client, request_id, result, *, before_acceptance=False):
+    def terminal(self, client, request_id, result, *, before_acceptance=False, timeout=HTTP_TIMEOUT):
         expected = pending_receipt(self.run_id, request_id, 'succeeded') | {'result': result}
-        deadline = time.monotonic() + HTTP_TIMEOUT
+        deadline = time.monotonic() + timeout
         while True:
             status, reply = self.receipt(client, request_id)
             if status == 200 and reply == expected:
@@ -552,6 +552,38 @@ class Driver:
                ready_members_during_pause=health['ready_workers'],
                legacy_admission_while_paused=legacy_reply, legacy_receipt=legacy_receipt)
 
+    def takeover_after_acceptance(self, primary):
+        request = self.point('table.update', 5, {'value': 105})
+        request_id = request['request_id']
+        self.select_checkpoints(request_id)
+        config = self.instruments[self.owner] / 'transaction-gates.json'
+        selected = read_json(config)
+        selected[request_id]['scoped-dispatch'] = True
+        write_json(config, selected)
+        dispatch = self.record_file(self.owner, request_id, 'scoped-dispatch')
+        release = dispatch.with_name(f'release-{dispatch.stem}')
+        others = [role for role in self.roles if role != self.owner]
+        try:
+            self.accepted(self.submit(primary, request), request_id)
+            accepted = self.copy_evidence(request, ('payload', 'marker'))
+            assert wait_for([dispatch], read_json) == accepted['marker']['stamp']['request']
+            assert not any(path.exists() for path in self.checkpoints(request_id, 'scoped-decision'))
+            with self.pause_worker(self.owner):
+                terminal = self.terminal(primary, request_id, True, timeout=80)
+                decision = wait_for([self.record_file(role, request_id, 'scoped-decision')
+                                     for role in others], read_json)
+                assert decision['request'] == accepted['marker']['stamp']['request'], decision
+                assert 'commit' in decision['decision'], decision
+                assert self.table.get(5) == {'id': 5, 'value': 105}
+        finally:
+            release.touch()
+        assert self.table.update(5, {'value': 106}) is True
+        self.accepted(self.submit(primary, request), request_id)
+        assert self.terminal(primary, request_id, True) == terminal
+        assert self.table.get(5) == {'id': 5, 'value': 106}
+        report('O31/R01/R03 takeover after acceptance', original_owner=self.worker_identity(self.owner),
+               exact_binding=decision['request'], later_row=self.table.get(5), recovered_receipt=terminal)
+
     def run(self, binary):
         with self.stack:
             self.stack.callback(self.database.close)
@@ -568,6 +600,7 @@ class Driver:
                 self.query_expiration(primary, secondary, mutations)
                 if self.instrumented:
                     self.minority_admission(COPY_PAYLOAD, 4, primary, secondary, executor, gateway)
+                    self.takeover_after_acceptance(primary)
         report('coverage', build='registered test child' if self.instrumented else 'release binary',
                serialized_copy_checkpoints=self.instrumented,
                o30_asserted=(['two follower payload copies held', 'two follower marker copies held',
@@ -589,11 +622,11 @@ def launch_driver(cluster, module, barriers, test_executable):
     return driver
 
 
-def supervise_driver(cluster, driver, barriers, workers, paused, instrumented):
+def supervise_driver(cluster, driver, barriers, workers, paused):
     command_path = barriers / 'host-fault.json'
     deadline = time.monotonic() + DRIVER_TIMEOUT
     while time.monotonic() < deadline:
-        if not instrumented and command_path.exists():
+        if command_path.exists():
             command = read_json(command_path)
             command_id = str(UUID(command['command_id']))
             answer = barriers / f'host-fault-{command_id}.json'
@@ -708,7 +741,7 @@ def start_fixture(module, args):
             write_json(fixture / 'scoped-metadata.json', metadata)
             write_json(args.output / 'fixture.json', metadata)
             driver = launch_driver(cluster, module, barriers, test_executable)
-            supervise_driver(cluster, driver, barriers, workers, paused, bool(test_executable))
+            supervise_driver(cluster, driver, barriers, workers, paused)
         finally:
             cleanup_errors = []
             for role in paused:
