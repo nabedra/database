@@ -1058,3 +1058,56 @@ fn ns07_read_value_rejects_overflowing_locators_and_reports_recycled_segments() 
     assert_eq!(what(j.read_value(&l)), VALUE_CHECKSUM);
     j.crash();
 }
+
+// ---------------------------------------------------------------------------------------
+// F8: spare segments are prepared in the background
+
+/// Once the active segment is half used, the `kv-journal-prep` thread prepares one free
+/// segment without any commit asking for it, the roll takes that spare, and the number of
+/// prepared files stays bounded.
+#[test]
+fn ns08_spare_segments_are_prepared_off_the_commit_path() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let options = JournalOptions {
+        segment_bytes: 16 << 10,
+        ..opts()
+    };
+    let dir = Path::new("/db/journal");
+    let sink = Arc::new(Sink::default());
+    let (j, _) = Journal::open(Arc::new(fs.clone()), dir, options, 0, sink).unwrap();
+    let free = |j: &Journal| lock(&j.shared.table).free.len();
+    let wait_for_spare = |j: &Journal| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while free(j) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no spare prepared");
+            std::thread::yield_now();
+        }
+    };
+    assert_eq!(free(&j), 0, "a fresh journal has no spare yet");
+    // Past the half of the first segment: the preparer makes one spare.
+    for i in 0..3u8 {
+        j.submit(sized(&[b'h', i], 1500), Durability::Sync, Box::new(()))
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    wait_for_spare(&j);
+    let segments = j.segments().len();
+    for round in 0..10u8 {
+        // Fill until the journal rolls, then the spare comes back.
+        while j.segments().len() == segments + usize::from(round) {
+            wait_for_spare(&j);
+            j.submit(sized(&[b'r', round], 1500), Durability::Sync, Box::new(()))
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        assert!(free(&j) <= 1, "bounded: {} spares", free(&j));
+    }
+    // Every roll took a prepared spare: the commit thread never created a file, so the
+    // files are the live segments plus at most one spare.
+    let files = fs.list(dir).unwrap().len();
+    assert!(files <= j.segments().len() + 1, "{files} files");
+    j.crash();
+}
