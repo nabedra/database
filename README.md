@@ -1,8 +1,8 @@
 # Nabedra
 
-Nabedra is a monorepo for the database server and its language clients. The
-database stores immutable Parquet snapshots in object storage and exposes an
-HTTP API. The Rust server and synchronous Python ORM are the current components.
+Nabedra includes a Rust server and Python and TypeScript ORMs. The OLAP engine
+stores immutable Parquet snapshots in object storage. The OLTP engine stores
+durable indexed tables. The native Cache engine serves in-memory keys over RESP2.
 
 ## Repository layout
 
@@ -10,17 +10,16 @@ HTTP API. The Rust server and synchronous Python ORM are the current components.
 server/          Rust database server, getting started and operational docs
 orm/
   python/        Python ORM, CLI, application gateway and package tests
+  typescript/    TypeScript ORM, CLI and package tests
 scripts/         Repository installer and cross-component acceptance runners
 docs/testing/    Shared test contracts, audits and recorded execution evidence
 plans/           Design plans and implementation requirements
 ```
 
-Start with the [server guide](server/README.md) to run the database, then the
-[Python guide](orm/python/README.md) to connect and query it. The
-[task tracker tutorial](server/TUTORIAL.md) walks through both components.
-
-Python is the only implemented ORM language. Future clients may include
-TypeScript/JavaScript, Java/Kotlin, Go or Rust, each under `orm/<language>/`.
+Start with the [server guide](server/README.md) to run the database. See the
+[Python guide](orm/python/README.md) and the [TypeScript guide](orm/typescript/README.md)
+for client examples. The [task tracker tutorial](server/TUTORIAL.md) walks
+through the server and the Python client.
 
 ## Working in this repository
 
@@ -35,3 +34,13 @@ contracts in `docs/testing/`. GitHub Actions are not used.
 
 Read [CONTRIBUTION.md](CONTRIBUTION.md) before opening an issue or pull request,
 and follow [AGENTS.md](AGENTS.md) when changing worker execution or recovery.
+
+## Native Cache
+
+Build `nabedra-db` with the `cache` Cargo feature for the RESP2-compatible
+in-memory engine. The standalone and private cluster paths use the same
+commands and Cache ORMs.
+
+- [Standalone configuration and TLS](docs/cache/standalone.md)
+- [Private EC2 deployment](docs/cache/ec2.md)
+- [Benchmark reproduction](docs/testing/cache-benchmark.md)

@@ -1,0 +1,12 @@
+{
+  "environment": "Docker, one kernel clock",
+  "binary_sha256": "f650a441a5b6564f0b7aea9798edaf0d68725abe85783d6d3438a377b66c4fe3",
+  "executed_assertions": [
+    "K01 direct MOVED, same-slot order and cross-slot mutation rejection",
+    "K03 acknowledged replica prefix, paused primary, advanced epoch, fenced old write and unaffected slot",
+    "K03 minority controller cannot authorize after lease expiry",
+    "K03 partial WAL tail, restart and recovery of quorum",
+    "K03 verified online move preserved value and absolute expiry",
+    "K03 full-fleet restart and generation change kept both old values absent"
+  ]
+}

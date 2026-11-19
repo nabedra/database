@@ -1,0 +1,23 @@
+[
+  {"command":["PING"],"reply":{"simple":"PONG"}},
+  {"command":["GET","nb:catalog:{stock}:missing"],"reply":null},
+  {"command":["SET","nb:catalog:{stock}:empty","","NX"],"reply":{"simple":"OK"}},
+  {"command":["GET","nb:catalog:{stock}:empty"],"reply":{"hex":""}},
+  {"command":["SET","nb:catalog:{stock}:value",{"hex":"00ff12800d0a"},"PX",20000],"reply":{"simple":"OK"}},
+  {"command":["SET","nb:catalog:{stock}:value","wrong","NX"],"reply":null},
+  {"command":["PTTL","nb:catalog:{stock}:value"],"reply":{"range":[1,20000]}},
+  {"command":["MGET","nb:catalog:{stock}:value","nb:catalog:{stock}:missing","nb:catalog:{stock}:empty","nb:catalog:{stock}:value"],"reply":[{"hex":"00ff12800d0a"},null,{"hex":""},{"hex":"00ff12800d0a"}]},
+  {"command":["EXISTS","nb:catalog:{stock}:value","nb:catalog:{stock}:value","nb:catalog:{stock}:missing"],"reply":2},
+  {"command":["DEL","nb:catalog:{stock}:empty","nb:catalog:{stock}:empty"],"reply":1},
+  {"command":["DEL","nb:catalog:{stock}:counter"],"reply":{"range":[0,1]}},
+  {"command":["INCRBY","nb:catalog:{stock}:counter","-9223372036854775808"],"reply":{"integer":"-9223372036854775808"}},
+  {"command":["GET","nb:catalog:{stock}:counter"],"reply":{"hex":"2d39323233333732303336383534373735383038"}},
+  {"command":["INCRBY","nb:catalog:{stock}:counter","-1"],"reply":{"error":"overflow"}},
+  {"command":["SET","nb:catalog:{stock}:counter","9223372036854775807"],"reply":{"simple":"OK"}},
+  {"command":["INCRBY","nb:catalog:{stock}:counter","0"],"reply":{"integer":"9223372036854775807"}},
+  {"command":["GET","nb:catalog:{stock}:counter"],"reply":{"hex":"39323233333732303336383534373735383037"}},
+  {"command":["INCRBY","nb:catalog:{stock}:counter","1"],"reply":{"error":"overflow"}},
+  {"command":["PEXPIRE","nb:catalog:{stock}:value",0],"reply":1},
+  {"command":["PTTL","nb:catalog:{stock}:value"],"reply":-2},
+  {"command":["DEL","nb:catalog:{stock}:counter"],"reply":1}
+]
