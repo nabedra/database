@@ -234,7 +234,8 @@ fn run_model(seed: u64, ops: u64) {
         stats.flush_bytes,
         stats.compaction_bytes
     );
-    assert!(stats.compaction_bytes > 0 && stats.flush_bytes > 0);
+    // Stats count since the last open; the forced counts cover the whole run.
+    assert!(counts[3] > 0 && counts[4] > 0);
 }
 
 #[test]
