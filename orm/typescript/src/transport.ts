@@ -616,6 +616,14 @@ export class Transport {
     return { status, value }
   }
 
+  /** Destroys idle pooled sockets. In-flight exchanges finish, and later ones reconnect as needed. */
+  close(): void {
+    if (this.#agent === false) return
+    for (const sockets of Object.values(this.#agent.freeSockets)) {
+      for (const socket of sockets ?? []) socket.destroy()
+    }
+  }
+
   async request<T = unknown>(
     operation: string,
     payload: JsonObject,

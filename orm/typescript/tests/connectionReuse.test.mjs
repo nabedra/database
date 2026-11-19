@@ -178,3 +178,19 @@ test("O01 a reused connection waits the request timeout for a late response", as
   assert.equal(state.accepted, 1)
   assert.deepEqual(state.seen.map(seen => seen.connection), [1, 1])
 })
+
+test("O01 Database.close and Symbol.dispose close idle connections", async (t) => {
+  const fixture = await keepAliveServer(t)
+  if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
+  const { url, cert, state } = fixture
+  // TypeScript callers write `using db = ...`; this Node release lacks the syntax in plain .mjs.
+  const db = new Database(url, "token", { caFile: cert })
+  await db.tables()
+  assert.equal(state.accepted, 1)
+  db.close()
+  while (!state.closed.includes(1)) await sleep(10)
+  await db.tables()   // still usable after close
+  assert.equal(state.accepted, 2)
+  db[Symbol.dispose]()
+  while (!state.closed.includes(2)) await sleep(10)
+})

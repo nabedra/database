@@ -155,6 +155,17 @@ class ConnectionReuseTests(unittest.TestCase):
         self.assertEqual({seen[0] for seen in self.server.seen}, {1})
         self.assertEqual(len({seen[2] for seen in self.server.seen}), len(operations))
 
+    def test_o01_database_close_and_context_manager_close_idle_connections(self):
+        with Database(self.url, 'test-token', ca_file=str(self.material.ca_cert), timeout=5) as db:
+            db._transport.request('table.list', {})
+            self.assertEqual(self.server.accepted, 1)
+            db.close()
+            self.wait_for_server_close()
+            db._transport.request('table.list', {})   # still usable after close
+            self.assertEqual(self.server.accepted, 2)
+        self.wait_for_server_close()
+        self.assertEqual(len(db._transport._opener._idle), 0)
+
     def test_o01_database_calls_reuse_one_connection(self):
         db = Database(self.url, 'test-token', ca_file=str(self.material.ca_cert), timeout=5)
         try:

@@ -135,6 +135,10 @@ class _Transport:
         else:
             self._opener = ConnectionPool(url.scheme, url.hostname, url.port, context)
 
+    def close(self) -> None:
+        if isinstance(self._opener, ConnectionPool):
+            self._opener.close()
+
     def _require_token(self) -> str:
         if self._token is None:
             raise AuthenticationError('Set NABEDRA_TOKEN or pass token before making a request')
@@ -484,6 +488,16 @@ class Database:
             return tables
 
         return self._transport.request('table.list', {}, decode=list_result)
+
+    def close(self) -> None:
+        """Close idle pooled connections. The database stays usable and reconnects as needed."""
+        self._transport.close()
+
+    def __enter__(self) -> Database:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
 
 
 # Convenience alias within the nabedra package.
