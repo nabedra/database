@@ -1,5 +1,5 @@
-//! Cold publication invalidates a run's executable copies. Status still owns
-//! durable decisions and participant settlement after that publication.
+//! Cold publication invalidates a run's executable copies. Durable decisions
+//! and their participant settlement remain available through their homes.
 use super::*;
 use crate::oltp::pool::GroupRead;
 use std::future::Future;
@@ -111,7 +111,8 @@ impl TimestampHandle {
                     return Err(unknown());
                 }
                 let fence: Option<FenceReceipt> = read(view, &fence_key(transition_id))?;
-                let cutoff = cold_epoch(fence, authority, transition_id).ok_or_else(invalid)?;
+                let (cutoff, _) =
+                    cold_fence(fence.as_ref(), authority, transition_id).ok_or_else(invalid)?;
                 let mut entries = [None; 32];
                 let mut count = 0;
                 let start = after.map(ColdPinCursor::key);
@@ -245,12 +246,12 @@ fn read<T: DeserializeOwned>(
         .transpose()
 }
 
-fn cold_epoch(
-    fence: Option<FenceReceipt>,
+fn cold_fence(
+    fence: Option<&FenceReceipt>,
     authority: Authority,
     transition_id: Uuid,
-) -> Option<u64> {
-    match fence?.reply {
+) -> Option<(u64, &GroupIdentity)> {
+    match &fence?.reply {
         TimestampReply::Fenced {
             allocator_epoch,
             receipt,
@@ -262,7 +263,7 @@ fn cold_epoch(
                 .expected
                 .is_some_and(|prior| prior.run_id != authority.run_id) =>
         {
-            Some(allocator_epoch)
+            Some((*allocator_epoch, &receipt.group))
         }
         _ => None,
     }
@@ -282,7 +283,7 @@ pub(super) fn release(
         return reject(tx, Fault::StaleAuthority);
     }
     let fence = load::<FenceReceipt>(tx, &fence_key(transition_id))?;
-    let Some(cutoff) = cold_epoch(fence, authority, transition_id) else {
+    let Some((cutoff, scope)) = cold_fence(fence.as_ref(), authority, transition_id) else {
         return reject(tx, Fault::InvalidBinding);
     };
     if pin.identity.run_id == authority.run_id || pin.pin.allocator_epoch >= cutoff {
@@ -294,6 +295,26 @@ pub(super) fn release(
     };
     if record.purpose != PinPurpose::Application || ColdApplicationPin::from(&record) != *pin {
         return reject(tx, Fault::InvalidBinding);
+    }
+    // The service verified exact point settlement in Status before proposing
+    // release. Recheck the immutable Timestamp half in the native batch.
+    if pin.reservation.scoped.is_some() {
+        if let Some(decision) =
+            point_decision::read_record_by_uuid(scope, &state, pin.reservation.request_id, |key| {
+                tx.get(key)
+            })?
+        {
+            let binding = &decision.locator().binding;
+            if binding.reservation != pin.reservation
+                || binding.pin_identity != pin.identity
+                || binding.storage_pin != pin.pin
+                || Some(binding.request) != pin.request
+                || !pin.reservation.binds(binding.request)
+                || binding.pin_identity.nonce != pin.reservation.reservation_id
+            {
+                return reject(tx, Fault::InvalidBinding);
+            }
+        }
     }
     if matches!(record.state, PinState::ColdReleased) {
         return commit(tx, &TimestampReply::Released);
@@ -307,6 +328,7 @@ pub(super) fn release(
         return reject(tx, Fault::InvalidBinding);
     }
     record.state = PinState::ColdReleased;
+    record.scoped_copy_proof = None;
     put(tx, &key, &record)?;
     tx.delete(&active)?;
     commit(tx, &TimestampReply::Released)

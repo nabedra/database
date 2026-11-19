@@ -238,8 +238,11 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
             Err(error) => return Ok((state, scan_request_id(&bytes), Err(error))),
         };
         let id = Some(parsed.request_id);
+        let point = super::application::PointRequest::from_operation(
+            parsed.request_id, &parsed.operation,
+        );
         drop(parsed);
-        let record = state.runtime.clone().submit(bytes, staging).await;
+        let record = state.runtime.clone().submit(bytes, staging, point).await;
         Ok((state, id, record))
     });
     let (state, id, record) = match operation {

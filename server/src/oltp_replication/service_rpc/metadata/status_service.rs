@@ -1,27 +1,55 @@
 use super::*;
 use crate::oltp::mvcc::store::ParticipantHandle;
-use crate::oltp_replication::authority::status::identity::transaction::ColdRecoveryPage;
+use crate::oltp_replication::authority::status::identity::transaction::{
+    ColdRecoveryPage, timestamp_point::mode_conflict,
+};
 use crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage;
 use crate::oltp_replication::authority::status::{CommitPermitStatement, StatusTopology};
 use crate::oltp_replication::authority::timestamp::cold::ColdApplicationPin;
 use crate::oltp_replication::authority::{
-    control::ScopedQueuePlacement,
+    control::{ScopedCatalogRead, ScopedQueuePlacement, ScopedQueueTransition},
     status::{
-        ArchiveCursor, CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, ScopedAdmission,
-        IdentityReservation,
-        StatusArchiveCutStatement, VerifiedStatusArchiveCut,
+        ArchiveCursor, CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage,
+        IdentityReservation, ScopedAdmission, ScopedTerminalReceipt, StatusArchiveCutStatement, VerifiedStatusArchiveCut,
+        identity::{ScopedStatusEpoch, scoped_route_moved_failure},
     },
-    timestamp::{VerifiedArchiveClosure, archive::ArchiveClosureStatement},
+    timestamp::{
+        ScopedAdmissionClosure, ScopedAdmissionFailure, ScopedRetirementMarker,
+        ScopedTerminalStatement, ScopedTimestampEpoch, VerifiedArchiveClosure,
+        archive::ArchiveClosureStatement,
+    },
 };
 use uuid::Uuid;
 
 const INSTALL_POINT_MANIFEST: u8 = 26;
 const POINT_CALL_PAYLOAD_LIMIT: usize = 4096;
+const INSTALL_TIMESTAMP_POINT: u8 = 36;
+const TIMESTAMP_POINT_HOME: u8 = 37;
+const PROJECT_TIMESTAMP_POINT: u8 = 39;
+const READ_TIMESTAMP_POINT_PROJECTION: u8 = 40;
+const REJECT_SCOPED_ROUTE_MOVED: u8 = 41;
 
 // External tags preserve CanonicalJson's RawValue decoder.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Request {
+    InstallTimestampPoint {
+        authority: Authority,
+        point: Box<TimestampPointManifest>,
+    },
+    TimestampPointHome {
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+    },
+    ProjectTimestampPoint {
+        authority: Authority,
+        locator: Box<TimestampDecisionLocator>,
+    },
+    ReadTimestampPointProjection {
+        authority: Authority,
+        locator: Box<TimestampDecisionLocator>,
+    },
     ArchiveMetadata {
         closure: ArchiveClosureStatement,
         after: Option<Vec<u8>>,
@@ -49,9 +77,18 @@ enum Request {
     Reject {
         ticket: super::admission::OwnerAdmissionTicket,
     },
+    RejectScopedRouteMoved {
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: ScopedAdmissionClosure,
+    },
     Lookup {
         request_id: Uuid,
         digest: Option<Digest>,
+    },
+    ProbeScopedIdentity {
+        request_id: Uuid,
+        digest: Digest,
     },
     Reserve {
         authority: Authority,
@@ -60,6 +97,15 @@ enum Request {
         kind: RequestKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scoped: Option<ScopedAdmission>,
+    },
+    FenceScopedQueue {
+        group_id: Uuid,
+        transition_id: Uuid,
+    },
+    ScopedQueueFenceReceipt {
+        transition_id: Uuid,
+        previous: ScopedStatusEpoch,
+        next: ScopedStatusEpoch,
     },
     InstallPointManifest(PointManifest),
     Begin {
@@ -147,6 +193,23 @@ enum Request {
         txn: TxnId,
         request: RequestBinding,
     },
+    RecordScopedRetirement {
+        statement: ScopedTerminalStatement,
+    },
+    RetiredScopedReceipt {
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    },
+    PriorScopedReceipt {
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    },
+    ScopedTerminalReceipt {
+        request_id: Uuid,
+        digest: Option<Digest>,
+    },
     Retire {
         statement: TerminalCopyStatement,
     },
@@ -158,10 +221,18 @@ enum Request {
 impl Request {
     fn request_id(&self) -> Option<Uuid> {
         match self {
-            Self::Lookup { request_id, .. }
+            Self::TimestampPointHome { request_id, .. }
+            | Self::Lookup { request_id, .. }
             | Self::Reserve { request_id, .. }
-            | Self::Retirement { request_id, .. } => Some(*request_id),
+            | Self::ProbeScopedIdentity { request_id, .. }
+            | Self::Retirement { request_id, .. }
+            | Self::RetiredScopedReceipt { request_id, .. }
+            | Self::PriorScopedReceipt { request_id, .. }
+            | Self::ScopedTerminalReceipt { request_id, .. } => Some(*request_id),
             Self::InstallPointManifest(point) => Some(point.txn.request_id),
+            Self::InstallTimestampPoint { point, .. } => Some(point.binding.txn.request_id),
+            Self::ProjectTimestampPoint { locator, .. }
+            | Self::ReadTimestampPointProjection { locator, .. } => Some(locator.binding.txn.request_id),
             Self::Begin { txn, .. }
             | Self::Page { txn, .. }
             | Self::Seal { txn, .. }
@@ -178,10 +249,14 @@ impl Request {
             | Self::FailureSettlement { txn, .. } => Some(txn.request_id),
             Self::Failure { request, .. } => Some(request.request_id),
             Self::Retire { statement, .. } => Some(statement.request.request_id),
+            Self::RecordScopedRetirement { statement } => Some(statement.request.request_id),
             Self::Reject { ticket } => Some(ticket.expected.reservation.request_id),
+            Self::RejectScopedRouteMoved { reservation, .. } => Some(reservation.request_id),
             Self::ColdRecovery { after, .. } => after.map(|txn| txn.request_id),
             Self::ColdApplicationPin { pin, .. } => Some(pin.reservation.request_id),
             Self::Current
+            | Self::FenceScopedQueue { .. }
+            | Self::ScopedQueueFenceReceipt { .. }
             | Self::Fence { .. }
             | Self::ArchiveCut { .. }
             | Self::ArchiveDecisions { .. }
@@ -200,7 +275,18 @@ impl Request {
             Self::Current => 0,
             Self::Lookup { .. } => 1,
             Self::Reserve { .. } => 2,
+            Self::ProbeScopedIdentity { .. } => 29,
+            Self::FenceScopedQueue { .. } => 30,
+            Self::ScopedQueueFenceReceipt { .. } => 31,
+            Self::RecordScopedRetirement { .. } => 32,
+            Self::ScopedTerminalReceipt { .. } => 33,
+            Self::PriorScopedReceipt { .. } => 34,
+            Self::RetiredScopedReceipt { .. } => 35,
             Self::InstallPointManifest(_) => INSTALL_POINT_MANIFEST,
+            Self::InstallTimestampPoint { .. } => INSTALL_TIMESTAMP_POINT,
+            Self::TimestampPointHome { .. } => TIMESTAMP_POINT_HOME,
+            Self::ProjectTimestampPoint { .. } => PROJECT_TIMESTAMP_POINT,
+            Self::ReadTimestampPointProjection { .. } => READ_TIMESTAMP_POINT_PROJECTION,
             Self::Begin { .. } => 3,
             Self::Page { .. } => 4,
             Self::Seal { .. } => 5,
@@ -221,13 +307,21 @@ impl Request {
             Self::Retirement { .. } => 24,
             Self::ColdApplicationPin { .. } => 25,
             Self::Reject { .. } => 18,
+            Self::RejectScopedRouteMoved { .. } => REJECT_SCOPED_ROUTE_MOVED,
         };
         Method::StatusCall {
             operation,
             mutation: !matches!(
                 self,
                 Self::Current
+                    | Self::TimestampPointHome { .. }
+                    | Self::ReadTimestampPointProjection { .. }
                     | Self::Lookup { .. }
+                    | Self::ProbeScopedIdentity { .. }
+                    | Self::ScopedQueueFenceReceipt { .. }
+                    | Self::ScopedTerminalReceipt { .. }
+                    | Self::PriorScopedReceipt { .. }
+                    | Self::RetiredScopedReceipt { .. }
                     | Self::Inspect { .. }
                     | Self::Permit { .. }
                     | Self::Manifest { .. }
@@ -317,6 +411,24 @@ impl StatusEndpoint {
             bytes,
         )?;
         let allowed = match header.method {
+            Method::StatusCall { operation: INSTALL_TIMESTAMP_POINT, mutation: true } => {
+                matches!(header.action, ServiceAction::ScopedQueueExecute(_))
+            }
+            Method::StatusCall {
+                operation: READ_TIMESTAMP_POINT_PROJECTION,
+                mutation: false,
+            } => {
+                matches!(header.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
+                    || matches!(header.action, ServiceAction::TimestampProof { source_group }
+                        if source_group == self.timestamps.group_id)
+            }
+            Method::StatusCall {
+                operation: TIMESTAMP_POINT_HOME,
+                mutation: false,
+            }
+            | Method::StatusCall { operation: PROJECT_TIMESTAMP_POINT, mutation: true } => {
+                matches!(header.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
+            }
             Method::StatusCall {
                 operation: 1,
                 mutation: false,
@@ -325,14 +437,18 @@ impl StatusEndpoint {
                 ServiceAction::Owner
                     | ServiceAction::TimestampProof { .. }
                     | ServiceAction::ScopedQueueRead { .. }
+                    | ServiceAction::ScopedQueueExecute(_)
             ),
             Method::StatusCall {
                 operation: 2,
                 mutation: true,
             } => matches!(
                 header.action,
-                ServiceAction::Owner | ServiceAction::ScopedQueueReserve { .. }
+                ServiceAction::Owner | ServiceAction::ScopedQueueAdmit { .. }
             ),
+            Method::StatusCall { operation: REJECT_SCOPED_ROUTE_MOVED, mutation: true } => {
+                matches!(header.action, ServiceAction::ScopedQueueReserve { .. })
+            }
             Method::StatusCall {
                 operation: 15,
                 mutation: true,
@@ -341,7 +457,7 @@ impl StatusEndpoint {
                 ServiceAction::ControlFence { .. } | ServiceAction::Operator
             ),
             Method::StatusCall {
-                operation: 0 | 12 | 16 | 19,
+                operation: 0 | 19,
                 mutation: false,
             } => matches!(
                 header.action,
@@ -356,6 +472,45 @@ impl StatusEndpoint {
                 mutation: false,
             } => matches!(header.action, ServiceAction::TimestampProof { source_group }
                 if source_group == self.timestamps.group_id),
+            Method::StatusCall {
+                operation: 30,
+                mutation: true,
+            } => {
+                matches!(header.action, ServiceAction::ParticipantProof { .. })
+            }
+            Method::StatusCall {
+                operation: 31,
+                mutation: false,
+            } => matches!(header.action, ServiceAction::ScopedQueueFenceReceipt { .. }),
+            Method::StatusCall {
+                operation: 29,
+                mutation: false,
+            } => {
+                matches!(header.action, ServiceAction::ScopedQueueRead { .. })
+            }
+            Method::StatusCall {
+                operation: 12 | 16,
+                mutation: false,
+            } => matches!(
+                header.action,
+                ServiceAction::Owner
+                    | ServiceAction::TimestampProof { .. }
+                    | ServiceAction::ScopedQueueExecute(_)
+            ),
+            Method::StatusCall {
+                operation: 3..=11 | 13 | 14 | INSTALL_POINT_MANIFEST
+                    | POINT_PREPARED_PERMIT | POINT_COMMIT_DECISION,
+                ..
+            } => matches!(
+                header.action,
+                ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
+            ),
+            Method::StatusCall { operation: 32, mutation: true } => {
+                header.action == (ServiceAction::TimestampProof { source_group: self.timestamps.group_id })
+            }
+            Method::StatusCall { operation: 33, mutation: false } => {
+                matches!(header.action, ServiceAction::ScopedQueueRead { .. })
+            }
             Method::StatusCall { .. } => header.action == ServiceAction::Owner,
             _ => false,
         };
@@ -363,7 +518,10 @@ impl StatusEndpoint {
             || (matches!(
                 header.method,
                 Method::StatusCall {
-                    operation: INSTALL_POINT_MANIFEST | POINT_PREPARED_PERMIT | POINT_COMMIT_DECISION,
+                    operation: INSTALL_POINT_MANIFEST | POINT_PREPARED_PERMIT | POINT_COMMIT_DECISION
+                        | INSTALL_TIMESTAMP_POINT | TIMESTAMP_POINT_HOME
+                        | PROJECT_TIMESTAMP_POINT | READ_TIMESTAMP_POINT_PROJECTION
+                        | REJECT_SCOPED_ROUTE_MOVED,
                     ..
                 }
             ) && header.payload_bytes > POINT_CALL_PAYLOAD_LIMIT as u64)
@@ -389,6 +547,223 @@ impl StatusEndpoint {
             },
         )
     }
+    async fn validate_scoped_call(
+        &self,
+        session: &AuthenticatedSession,
+        header: &Header,
+        scope: ScopedCatalogRead,
+        request: &Request,
+    ) -> Result<(), ProtocolError> {
+        let handle = &self.proof.handle;
+        if request.request_id() != Some(scope.request.request_id) {
+            return Err(invalid());
+        }
+        handle.verify_scoped_admission(scope).await?;
+        if matches!(request, Request::Lookup { digest: Some(digest), .. } if *digest == scope.request.digest)
+        {
+            return Ok(());
+        }
+        match request {
+            Request::TimestampPointHome { digest, .. } if *digest == scope.request.digest => {
+                return Ok(());
+            }
+            Request::ReadTimestampPointProjection { locator, .. }
+                if locator.binding.matches_scope(scope) =>
+            {
+                return Ok(());
+            }
+            _ => {}
+        }
+        let group_matches = |group: &GroupIdentity| {
+            group.group_id == scope.queue_group_id
+                && group.cluster_id == handle.identity().cluster_id
+                && group.database == handle.identity().database
+                && matches!(group.kind, GroupKind::Data { table_id, .. } if table_id == scope.table_id)
+        };
+        let txn_matches =
+            |txn: TxnId| txn.request_id == scope.request.request_id && txn.attempt == 1;
+        let (authority, txn, needs_pin) = match request {
+            Request::Begin {
+                authority,
+                txn,
+                request,
+                read_ts,
+                participants,
+                ..
+            } if *request == scope.request && *read_ts == scope.read_ts && *participants <= 1 => {
+                (Some(*authority), *txn, true)
+            }
+            Request::InstallTimestampPoint { authority, point }
+                if point.binding.matches_scope(scope)
+                    && group_matches(&point.binding.participant.group) =>
+            {
+                (Some(*authority), point.binding.txn, false)
+            }
+            Request::ProjectTimestampPoint { authority, locator }
+                if locator.binding.matches_scope(scope)
+                    && group_matches(&locator.binding.participant.group) =>
+            {
+                (Some(*authority), locator.binding.txn, false)
+            }
+            Request::InstallPointManifest(point)
+                if point.request == scope.request
+                    && point.read_ts == scope.read_ts
+                    && group_matches(&point.plan.group) =>
+            {
+                (Some(point.authority), point.txn, true)
+            }
+            Request::Page {
+                authority,
+                txn,
+                participants,
+                ..
+            } if participants.len() == 1
+                && participants
+                    .iter()
+                    .all(|plan| plan.read_ts == scope.read_ts && group_matches(&plan.group)) =>
+            {
+                (Some(*authority), *txn, true)
+            }
+            Request::Prepared {
+                authority,
+                txn,
+                group,
+                ..
+            }
+            | Request::PointPreparedPermit {
+                authority,
+                txn,
+                group,
+                ..
+            } if group_matches(group) => (Some(*authority), *txn, true),
+            Request::Resolved {
+                authority,
+                txn,
+                group,
+                ..
+            } if group_matches(group) => (Some(*authority), *txn, false),
+            Request::Seal { authority, txn } | Request::Permit { authority, txn } => {
+                (Some(*authority), *txn, true)
+            }
+            Request::Commit { authority, txn, permit, .. }
+            | Request::PointCommitDecision { authority, txn, permit, .. }
+                if permit.statement().request == scope.request
+                && permit.statement().read_ts == scope.read_ts =>
+            {
+                (Some(*authority), *txn, true)
+            }
+            Request::Abort { authority, txn, .. } | Request::Abandon { authority, txn } => {
+                (Some(*authority), *txn, false)
+            }
+            Request::Inspect { txn } | Request::Manifest { txn, .. } => (None, *txn, false),
+            Request::FailureSettlement { txn, request } if *request == scope.request => {
+                (None, *txn, false)
+            }
+            Request::Failure {
+                authority, request, ..
+            } if *request == scope.request => (
+                Some(*authority),
+                TxnId {
+                    request_id: scope.request.request_id,
+                    attempt: 1,
+                },
+                true,
+            ),
+            _ => return Err(invalid()),
+        };
+        if !txn_matches(txn) {
+            return Err(invalid());
+        }
+        if authority.is_some() {
+            let grant = service_grant(&self.proof.control, session, header).await?;
+            if authority != Some(grant.effective_authority) || grant.owner != Some(session.remote())
+            {
+                return Err(invalid());
+            }
+        }
+        if !matches!(
+            request,
+            Request::Begin { .. } | Request::InstallPointManifest(_) | Request::Failure { .. }
+                | Request::InstallTimestampPoint { .. } | Request::ProjectTimestampPoint { .. }
+        ) {
+            if !handle.scoped_transaction_matches(scope, txn).await?
+                && !matches!(
+                    request,
+                    Request::Inspect { .. } | Request::FailureSettlement { .. }
+                )
+            {
+                return Err(unavailable());
+            }
+        }
+        // Permit is a read on the reserved authority lane. Its durable draft
+        // already binds the pin. Timestamp rechecks that pin before allocation.
+        if needs_pin && !matches!(request, Request::Permit { .. }) {
+            let timestamps = TimestampClient::new(
+                self.timestamps.clone(),
+                self.proof.shared.clone(),
+                self.transport.clone(),
+                self.proof.control.clone(),
+                ServiceAction::StatusProof {
+                    source_group: handle.identity().group_id,
+                },
+            )?;
+            timestamps
+                .verify_scoped_read_pin(scope, Some(RequestKind::Mutation))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn project_authoritative_point(
+        &self,
+        session: &AuthenticatedSession,
+        header: &Header,
+        handle: &StatusHandle,
+        authority: Authority,
+        locator: TimestampDecisionLocator,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        locator.validate()?;
+        let binding = &locator.binding;
+        let group = handle.identity();
+        if &binding.status_group != group
+            || binding.timestamps_group != self.timestamps
+            || self.topology.manifest(binding.txn, locator.manifest)? != group
+        {
+            return Err(invalid());
+        }
+        if let Some((record, owner)) = handle
+            .read_timestamp_point_projection(authority, locator.clone())
+            .await?
+        {
+            let raw = encode(&self.proof.shared, record).await;
+            drop(owner);
+            return raw;
+        }
+        if header.action == ServiceAction::Owner
+            && (binding.request.run_id == authority.run_id
+                || self.proof.control.published_cold_fence(authority, binding.request.run_id)
+                    .await?.is_none())
+        {
+            return Err(unavailable());
+        }
+        let participant = ParticipantProofClient::new(
+            binding.participant.group.clone(),
+            self.proof.shared.clone(),
+            self.transport.clone(),
+            self.proof.control.clone(),
+            ServiceAction::StatusProof { source_group: group.group_id },
+        )?;
+        let proof = participant.timestamp_point_resolution(&locator, authority).await?;
+        if service_grant(&self.proof.control, session, header).await?.effective_authority != authority {
+            return Err(unavailable());
+        }
+        let (record, owner) = handle.apply_timestamp_point_projection(authority, proof).await?;
+        record.validate_for(&locator)?;
+        let raw = encode(&self.proof.shared, record).await;
+        drop(owner);
+        raw
+    }
+
     async fn dispatch(
         &self,
         session: &AuthenticatedSession,
@@ -413,8 +788,131 @@ impl StatusEndpoint {
             }
             _ => {}
         }
+        if let ServiceAction::ScopedQueueExecute(scope) = header.action {
+            self.validate_scoped_call(session, header, scope, &request)
+                .await?;
+        } else if let ServiceAction::Owner = header.action {
+            let new_execution = match &request {
+                Request::Begin { request, .. } | Request::Failure { request, .. } => Some(*request),
+                Request::InstallPointManifest(point) => Some(point.request),
+                _ => None,
+            };
+            if let Some(request) = new_execution {
+                if handle
+                    .admission_reservation(request.request_id)
+                    .await?
+                    .is_some_and(|reservation| reservation.scoped.is_some())
+                {
+                    return Err(invalid());
+                }
+            }
+        }
+        let scoped_handle = match header.action {
+            ServiceAction::ScopedQueueExecute(scope) => {
+                Some(handle.with_scoped_epoch(ScopedStatusEpoch::from_scope(scope)))
+            }
+            ServiceAction::ScopedQueueAdmit {
+                queue_group_id,
+                queue_generation,
+                queue_view,
+                ..
+            } => Some(handle.with_scoped_epoch(ScopedStatusEpoch {
+                queue_group_id,
+                queue_generation,
+                view: queue_view,
+            })),
+            _ => None,
+        };
+        let handle = scoped_handle.as_ref().unwrap_or(handle);
         let shared = &self.proof.shared;
         match request {
+            Request::InstallTimestampPoint { authority, point } => {
+                if point.binding.status_group != *handle.identity()
+                    || point.binding.timestamps_group != self.timestamps
+                {
+                    return Err(invalid());
+                }
+                let ServiceAction::ScopedQueueExecute(scope) = header.action else {
+                    return Err(invalid());
+                };
+                if scope == point.binding.original_scope {
+                    let placement = self.proof.control.scoped_queue(&point.binding.participant.group)
+                        .await?.ok_or_else(stale_service_route)?;
+                    if placement.data_generation != scope.data_generation
+                        || ScopedTimestampEpoch::from_placement(&placement)? != point.binding.original_epoch
+                    {
+                        return Err(stale_service_route());
+                    }
+                }
+                let timestamps = TimestampClient::new(
+                    self.timestamps.clone(),
+                    self.proof.shared.clone(),
+                    self.transport.clone(),
+                    self.proof.control.clone(),
+                    ServiceAction::StatusProof { source_group: handle.identity().group_id },
+                )?;
+                timestamps.verify_timestamp_point_pin(&point.binding).await?;
+                let manifest = handle.install_timestamp_point(authority, *point).await?;
+                encode(shared, manifest).await
+            }
+            Request::TimestampPointHome { authority, request_id, digest } => {
+                let current_scope = match header.action {
+                    ServiceAction::ScopedQueueExecute(scope) => Some(scope),
+                    _ => None,
+                };
+                handle.timestamp_point_home_bytes(authority, request_id, digest, current_scope).await
+            }
+            Request::ReadTimestampPointProjection { authority, locator } => {
+                if locator.binding.timestamps_group != self.timestamps {
+                    return Err(invalid());
+                }
+                self.topology.manifest(locator.binding.txn, locator.manifest)?;
+                handle.timestamp_point_projection_bytes(authority, *locator).await
+            }
+            Request::ProjectTimestampPoint { authority, locator } => {
+                self.project_authoritative_point(session, header, handle, authority, *locator).await
+            }
+            Request::ScopedQueueFenceReceipt { transition_id, previous, next } => {
+                if !matches!(header.action, ServiceAction::ScopedQueueFenceReceipt {
+                    queue_group_id, transfer_id
+                } if transfer_id == transition_id
+                    && queue_group_id == previous.queue_group_id
+                    && queue_group_id == next.queue_group_id)
+                {
+                    return Err(invalid());
+                }
+                encode(shared, handle.scoped_queue_fence_receipt(
+                    transition_id, previous, next,
+                ).await?).await
+            }
+            Request::FenceScopedQueue {
+                group_id,
+                transition_id,
+            } => {
+                if !matches!(header.action, ServiceAction::ParticipantProof { source_group } if source_group == group_id)
+                {
+                    return Err(invalid());
+                }
+                let transfer = self
+                    .proof
+                    .control
+                    .scoped_queue_transition(group_id)
+                    .await?
+                    .ok_or_else(unavailable)?;
+                if transfer.id != transition_id
+                    || transfer.next.owner != session.remote()
+                    || transfer.basis()?.is_none()
+                {
+                    return Err(invalid());
+                }
+                let previous = ScopedStatusEpoch::from_placement(&transfer.previous);
+                let next = ScopedStatusEpoch::from_placement(&transfer.next);
+                let applied = handle
+                    .fence_scoped_queue(transfer.id, previous, next)
+                    .await?;
+                encode(shared, applied).await
+            }
+
             Request::ArchiveCut { authority } => {
                 encode(
                     shared,
@@ -459,6 +957,50 @@ impl StatusEndpoint {
                 let rejection = handle.reject_owner_observation(proof).await?;
                 encode(shared, rejection.into_sealed()).await
             }
+            Request::RejectScopedRouteMoved { authority, reservation, closure } => {
+                let ServiceAction::ScopedQueueReserve {
+                    queue_group_id,
+                    queue_generation,
+                    queue_view,
+                    request_id,
+                } = header.action else {
+                    return Err(invalid());
+                };
+                let epoch = ScopedStatusEpoch {
+                    queue_group_id,
+                    queue_generation,
+                    view: queue_view,
+                };
+                if request_id != reservation.request_id
+                    || queue_view.run_id != authority.run_id
+                    || reservation.scoped != Some(ScopedAdmission {
+                        protocol_version: ScopedAdmission::VERSION,
+                        queue_group_id,
+                        queue_generation,
+                        status_group_id: handle.identity().group_id,
+                    })
+                    || closure.reservation != reservation
+                    || closure.failure != ScopedAdmissionFailure::ScopeSuperseded
+                {
+                    return Err(invalid());
+                }
+                let timestamps = TimestampClient::new(
+                    self.timestamps.clone(),
+                    shared.clone(),
+                    self.transport.clone(),
+                    self.proof.control.clone(),
+                    ServiceAction::StatusProof { source_group: handle.identity().group_id },
+                )?;
+                timestamps.verify_scoped_admission_closure(&closure).await?;
+                let grant = service_grant(&self.proof.control, session, header).await?;
+                if grant.owner != Some(session.remote()) || grant.effective_authority != authority {
+                    return Err(stale_service_route());
+                }
+                let rejection = handle.with_scoped_epoch(epoch)
+                    .record_scoped_route_moved(authority, reservation, closure)
+                    .await?;
+                encode(shared, rejection).await
+            }
             Request::Current => encode(shared, handle.current_authority().await?).await,
             Request::Lookup { request_id, digest } => {
                 if let ServiceAction::ScopedQueueRead {
@@ -473,7 +1015,8 @@ impl StatusEndpoint {
                     }
                     let value = handle.lookup_identity(request_id, digest).await?;
                     let reservation = match value {
-                        Some(IdentityLookup::Reserved(reservation)) => reservation,
+                        Some(IdentityLookup::Reserved(reservation))
+                        | Some(IdentityLookup::TimestampPoint(reservation)) => reservation,
                         _ => return Err(unavailable()),
                     };
                     if reservation.original_run != queue_view.run_id
@@ -489,7 +1032,26 @@ impl StatusEndpoint {
                     return encode(shared, reservation).await;
                 }
                 let value = handle.lookup_identity(request_id, digest).await?;
+                if let ServiceAction::ScopedQueueExecute(scope) = header.action
+                    && matches!(&value, Some(IdentityLookup::Terminal(terminal))
+                        if terminal.request_binding() != scope.request)
+                {
+                    return Err(invalid());
+                }
                 encode(shared, value).await
+            }
+            Request::ProbeScopedIdentity { request_id, digest } => {
+                if !matches!(header.action, ServiceAction::ScopedQueueRead {
+                    request_id: authorized, ..
+                } if authorized == request_id)
+                {
+                    return Err(invalid());
+                }
+                encode(
+                    shared,
+                    handle.lookup_identity(request_id, Some(digest)).await?,
+                )
+                .await
             }
             Request::Reserve {
                 authority,
@@ -501,11 +1063,12 @@ impl StatusEndpoint {
                 match (header.action, scoped) {
                     (ServiceAction::Owner, None) => {}
                     (
-                        ServiceAction::ScopedQueueReserve {
+                        ServiceAction::ScopedQueueAdmit {
                             queue_group_id,
                             queue_generation,
                             queue_view,
                             request_id: authorized_id,
+                            ..
                         },
                         Some(binding),
                     ) if binding.protocol_version == ScopedAdmission::VERSION
@@ -785,6 +1348,53 @@ impl StatusEndpoint {
                 }
                 encode(shared, handle.fence(transition_id, expected, next).await?).await
             }
+            Request::RecordScopedRetirement { statement } => {
+                let placement = self.proof.control.scoped_queue_by_id(statement.epoch.queue_group_id)
+                    .await?.ok_or_else(unavailable)?;
+                statement.for_placement(&placement)?;
+                let timestamps = TimestampClient::new(
+                    self.timestamps.clone(),
+                    shared.clone(),
+                    self.transport.clone(),
+                    self.proof.control.clone(),
+                    ServiceAction::StatusProof { source_group: handle.identity().group_id },
+                )?;
+                let proof = timestamps.scoped_copy_proof(statement).await?;
+                let handle = handle.with_scoped_epoch(ScopedStatusEpoch::from_placement(&placement));
+                encode(shared, handle.record_scoped_retirement(proof).await?).await
+            }
+            Request::RetiredScopedReceipt { run, request_id, digest } => {
+                let grant = service_grant(&self.proof.control, session, header).await?;
+                if grant.ready.view.run_id != run || grant.effective_authority.run_id != run {
+                    return Err(unavailable());
+                }
+                handle.scoped_terminal_receipt(None, run, request_id, digest).await
+            }
+            Request::PriorScopedReceipt { run, request_id, digest } => {
+                let grant = service_grant(&self.proof.control, session, header).await?;
+                let authority = grant.effective_authority;
+                if grant.ready.view.authority() != authority || run == authority.run_id {
+                    return Err(invalid());
+                }
+                let published_cold = self.proof.control.published_cold_fence(authority, run)
+                    .await?.is_some();
+                handle.prior_scoped_receipt(authority, run, request_id, digest, published_cold).await
+            }
+            Request::ScopedTerminalReceipt { request_id, digest } => {
+                let ServiceAction::ScopedQueueRead {
+                    queue_group_id, queue_generation, queue_view, request_id: authorized,
+                } = header.action else {
+                    return Err(invalid());
+                };
+                let placement = self.proof.control.scoped_queue_by_id(queue_group_id)
+                    .await?.ok_or_else(unavailable)?;
+                if authorized != request_id || placement.queue_generation != queue_generation
+                    || placement.view != queue_view || !placement.has_holder(session.remote())
+                {
+                    return Err(invalid());
+                }
+                handle.scoped_terminal_receipt(Some(ScopedTimestampEpoch::from_placement(&placement)?), queue_view.run_id, request_id, digest).await
+            }
             Request::Retire { statement } => {
                 let scope = crate::oltp_runtime::replica::QueueScope {
                     cluster_id: handle.identity().cluster_id,
@@ -889,6 +1499,36 @@ impl Endpoint for StatusEndpoint {
     }
 }
 
+fn verify_prior_scoped_receipt(
+    identity: &IdentityLookup,
+    group: Uuid,
+    run: Uuid,
+    request_id: Uuid,
+    digest: Option<Digest>,
+) -> Result<(), ProtocolError> {
+    let reservation = match identity {
+        IdentityLookup::Terminal(
+            TerminalIdentity::ReadExpired { reservation, .. }
+            | TerminalIdentity::Committed { reservation, .. }
+            | TerminalIdentity::Failed { reservation, .. },
+        )
+        | IdentityLookup::Abandoned(reservation)
+        | IdentityLookup::TimestampPoint(reservation) => reservation,
+        IdentityLookup::Rejected(rejection) => &rejection.reservation,
+        IdentityLookup::Reserved(_) => return Err(invalid()),
+    };
+    if reservation.request_id != request_id
+        || reservation.original_run != run
+        || digest.is_some_and(|digest| digest != reservation.digest)
+        || !reservation.scoped.is_some_and(|admission| {
+            admission.protocol_version == ScopedAdmission::VERSION && admission.status_group_id == group
+        })
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct StatusClient {
     client: Arc<Client>,
@@ -896,6 +1536,24 @@ pub(crate) struct StatusClient {
     admission: Arc<std::sync::OnceLock<Arc<dyn super::admission::AdmissionTicketIssuer>>>,
 }
 impl StatusClient {
+    pub(crate) async fn scoped_queue_fence_receipt(
+        &self,
+        transfer: &crate::oltp_replication::authority::control::ScopedQueueTransition,
+    ) -> Result<Option<StatusReply>, ProtocolError> {
+        let action = ServiceAction::ScopedQueueFenceReceipt {
+            queue_group_id: transfer.previous.group.group_id,
+            transfer_id: transfer.id,
+        };
+        let request = Request::ScopedQueueFenceReceipt {
+            transition_id: transfer.id,
+            previous: ScopedStatusEpoch::from_placement(&transfer.previous),
+            next: ScopedStatusEpoch::from_placement(&transfer.next),
+        };
+        let method = request.method();
+        let payload = encode(self.resources(), request).await?;
+        Ok(self.client.call_as(action, method, Some(payload)).await?
+            .decoded(&self.client.shared).await?.0)
+    }
     pub(crate) async fn cold_application_pin_settled(
         &self,
         authority: Authority,
@@ -1033,6 +1691,64 @@ impl StatusClient {
         let (sealed, _): (SealedAdmissionRejection, _) = response.decoded(self.resources()).await?;
         VerifiedAdmissionRejection::from_service(context, sealed, 18)
     }
+    async fn reject_scoped_route_moved(
+        &self,
+        placement: &ScopedQueuePlacement,
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: &ScopedAdmissionClosure,
+    ) -> Result<RejectedIdentity, ProtocolError> {
+        placement.validate(&placement.group)?;
+        if placement.group.cluster_id != self.identity().cluster_id
+            || placement.group.database != self.identity().database
+            || placement.owner != self.client.transport.local_identity()
+            || placement.view.run_id != authority.run_id
+            || placement.view.run_id != reservation.original_run
+            || reservation.scoped != Some(ScopedAdmission {
+                protocol_version: ScopedAdmission::VERSION,
+                queue_group_id: placement.group.group_id,
+                queue_generation: placement.queue_generation,
+                status_group_id: self.identity().group_id,
+            })
+            || closure.reservation != reservation
+            || closure.failure != ScopedAdmissionFailure::ScopeSuperseded
+        {
+            return Err(invalid());
+        }
+        let action = ServiceAction::ScopedQueueReserve {
+            queue_group_id: placement.group.group_id,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request_id: reservation.request_id,
+        };
+        let request = Request::RejectScopedRouteMoved {
+            authority,
+            reservation,
+            closure: closure.clone(),
+        };
+        let method = request.method();
+        let payload = encode(self.resources(), request).await?;
+        let response = self.client.call_as(action, method, Some(payload)).await
+            .map_err(owner_operation_uncertain)?;
+        let context = response.metadata_context()?;
+        let (mut rejection, owner): (RejectedIdentity, _) = response.decoded(self.resources()).await
+            .map_err(owner_operation_uncertain)?;
+        context.status(REJECT_SCOPED_ROUTE_MOVED, &rejection)?;
+        if rejection.reservation != reservation
+            || rejection.view.run_id != reservation.original_run
+            || rejection.identity != closure.identity
+            || rejection.pin != Some(closure.pin)
+            || rejection.request.is_some()
+            || rejection.failure != scoped_route_moved_failure()?
+            || rejection.recorded_at.term == 0
+            || rejection.recorded_at.node_id == 0
+            || rejection.recorded_at.index == 0
+        {
+            return Err(unavailable());
+        }
+        rejection.failure.retain_owner(owner);
+        Ok(rejection)
+    }
     pub(crate) fn identity(&self) -> &GroupIdentity {
         &self.client.group
     }
@@ -1101,11 +1817,14 @@ impl StatusClient {
                 {
                     return Err(unavailable());
                 }
-                let action = ServiceAction::ScopedQueueReserve {
+                let activation = self.client.control.scoped_queue_capability().await?
+                    .activation.ok_or_else(unavailable)?;
+                let action = ServiceAction::ScopedQueueAdmit {
                     queue_group_id: binding.queue_group_id,
                     queue_generation: binding.queue_generation,
                     queue_view: queue.view,
                     request_id,
+                    activation,
                 };
                 let method = request.method();
                 let payload = encode(self.resources(), request).await?;
@@ -1216,13 +1935,23 @@ impl StatusClient {
         Ok(Some(reply))
     }
 
+    async fn try_point_response(
+        &self,
+        request: Request,
+    ) -> Result<Option<ServiceResponse>, ProtocolError> {
+        if matches!(self.client.action, ServiceAction::ScopedQueueExecute(_)) {
+            return self.response(request).await.map(Some).map_err(owner_operation_uncertain);
+        }
+        self.try_preferred_owner_response(request).await
+    }
+
     async fn try_point_manifest(
         &self,
         point: PointManifest,
     ) -> Result<Option<(ManifestRef, Digest)>, ProtocolError> {
         let expected_result = MutationOutcome::from_success(&point.result)?.digest()?;
         let Some(reply) = self
-            .try_preferred_owner_response(Request::InstallPointManifest(point))
+            .try_point_response(Request::InstallPointManifest(point))
             .await?
         else {
             return Ok(None);
@@ -1329,7 +2058,7 @@ impl StatusClient {
         manifest: ManifestRef,
     ) -> Result<Result<SealedCommitPermit, ProtocolError>, ProtocolError> {
         let reply = self
-            .try_preferred_owner_response(Request::PointPreparedPermit {
+            .try_point_response(Request::PointPreparedPermit {
                 authority,
                 group: group.clone(),
                 txn,
@@ -1378,7 +2107,7 @@ impl StatusClient {
         let txn = permit.statement().txn;
         if permit.statement().manifest.participant_count == 1
             && let Some(reply) = self
-                .try_preferred_owner_response(Request::PointCommitDecision {
+                .try_point_response(Request::PointCommitDecision {
                     authority,
                     txn,
                     permit: permit.clone(),
@@ -1545,6 +2274,80 @@ impl StatusClient {
         let (statement, _): (SettlementStatement, _) = response.decoded(self.resources()).await?;
         VerifiedSettlement::from_failure_service(context, statement, txn, request)
     }
+    pub(crate) async fn record_scoped_retirement(
+        &self,
+        statement: ScopedTerminalStatement,
+    ) -> Result<ScopedRetirementMarker, ProtocolError> {
+        statement.validate()?;
+        let response = self.response(Request::RecordScopedRetirement { statement: statement.clone() }).await?;
+        let context = response.metadata_context()?;
+        let (marker, _): (ScopedRetirementMarker, _) = response.decoded(self.resources()).await?;
+        context.status(32, &marker)?;
+        marker.validate(&statement)?;
+        Ok(marker)
+    }
+
+    pub(crate) async fn retired_scoped_receipt(
+        &self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> Result<Option<ScopedTerminalReceipt>, ProtocolError> {
+        let response = self.response(Request::RetiredScopedReceipt { run, request_id, digest }).await?;
+        let context = response.metadata_context()?;
+        let (mut receipt, owner): (Option<ScopedTerminalReceipt>, _) = response.decoded(self.resources()).await?;
+        context.status(35, &receipt)?;
+        if let Some(receipt) = &mut receipt {
+            receipt.validate(None, run, self.identity().group_id, request_id, digest)?;
+            receipt.terminal.retain_owner(owner);
+        }
+        Ok(receipt)
+    }
+
+    pub(crate) async fn prior_scoped_receipt(
+        &self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> Result<Option<IdentityLookup>, ProtocolError> {
+        let response = self.response(Request::PriorScopedReceipt { run, request_id, digest }).await?;
+        let context = response.metadata_context()?;
+        let (mut identity, owner): (Option<IdentityLookup>, _) = response.decoded(self.resources()).await?;
+        context.status(34, &identity)?;
+        if let Some(identity) = &mut identity {
+            verify_prior_scoped_receipt(identity, self.identity().group_id, run, request_id, digest)?;
+            identity.retain_owner(owner);
+        }
+        Ok(identity)
+    }
+
+    pub(crate) async fn scoped_terminal_receipt(
+        &self,
+        placement: &ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> Result<Option<ScopedTerminalReceipt>, ProtocolError> {
+        let epoch = ScopedTimestampEpoch::from_placement(placement)?;
+        let action = ServiceAction::ScopedQueueRead {
+            queue_group_id: epoch.queue_group_id,
+            queue_generation: epoch.queue_generation,
+            queue_view: epoch.view,
+            request_id,
+        };
+        let request = Request::ScopedTerminalReceipt { request_id, digest };
+        let method = request.method();
+        let payload = encode(self.resources(), request).await?;
+        let response = self.client.call_as(action, method, Some(payload)).await?;
+        let context = response.metadata_context()?;
+        let (mut receipt, owner): (Option<ScopedTerminalReceipt>, _) = response.decoded(self.resources()).await?;
+        context.status(33, &receipt)?;
+        if let Some(receipt) = &mut receipt {
+            receipt.validate(Some(epoch), epoch.view.run_id, self.identity().group_id, request_id, digest)?;
+            receipt.terminal.retain_owner(owner);
+        }
+        Ok(receipt)
+    }
+
     pub(crate) async fn retire_terminal(
         &self,
         release: VerifiedPinRelease,
@@ -1650,6 +2453,140 @@ impl StatusService for StatusClient {
     fn identity(&self) -> &GroupIdentity {
         StatusClient::identity(self)
     }
+    fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Arc<dyn StatusService>, ProtocolError> {
+        Ok(Self::new(
+            self.identity().clone(),
+            self.resources().clone(),
+            self.client.transport.clone(),
+            self.client.control.clone(),
+            ServiceAction::ScopedQueueExecute(scope),
+        )?)
+    }
+    fn fence_scoped_queue<'a>(
+        &'a self,
+        transfer: &'a ScopedQueueTransition,
+    ) -> ConsensusFuture<'a, ()> {
+        Box::pin(async move {
+            let request = Request::FenceScopedQueue {
+                group_id: transfer.previous.group.group_id,
+                transition_id: transfer.id,
+            };
+            let method = request.method();
+            let body = encode(self.resources(), request).await?;
+            let response = self
+                .client
+                .call_as(
+                    ServiceAction::ParticipantProof {
+                        source_group: transfer.next.group.group_id,
+                    },
+                    method,
+                    Some(body),
+                )
+                .await?;
+            let (applied, _): (Applied<StatusReply>, _) =
+                response.decoded(self.resources()).await?;
+            if !matches!(applied.reply, StatusReply::ScopedQueueFenced { transition_id, epoch, applied_at }
+                if transition_id == transfer.id && epoch == ScopedStatusEpoch::from_placement(&transfer.next)
+                    && applied_at.term != 0 && applied_at.index != 0
+                    && applied_at.index <= applied.position.index)
+            {
+                return Err(unavailable());
+            }
+            Ok(())
+        })
+    }
+    fn scoped_receipt<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        request: RequestBinding,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, (VerifiedStatusDecision, VerifiedSettlement)> {
+        Box::pin(async move {
+            if txn.request_id != request.request_id
+                || txn.attempt != 1
+                || manifest.status_group_id != self.identity().group_id
+                || request.run_id != placement.view.run_id
+            {
+                return Err(invalid());
+            }
+            let client = StatusProofClient::new(
+                self.identity().clone(),
+                self.resources().clone(),
+                self.client.transport.clone(),
+                self.client.control.clone(),
+                ServiceAction::ScopedQueueRead {
+                    queue_group_id: placement.group.group_id,
+                    queue_generation: placement.queue_generation,
+                    queue_view: placement.view,
+                    request_id: request.request_id,
+                },
+            )?;
+            let decision = client
+                .decision(txn, manifest)
+                .await?
+                .ok_or_else(unavailable)?;
+            let settled = client.settlement(txn, manifest).await?;
+            if decision.statement().request != request
+                || settled.statement().decision != *decision.statement()
+            {
+                return Err(invalid());
+            }
+            Ok((decision, settled))
+        })
+    }
+    fn retired_scoped_receipt<'a>(
+        &'a self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        Box::pin(StatusClient::retired_scoped_receipt(self, run, request_id, digest))
+    }
+    fn prior_scoped_receipt<'a>(
+        &'a self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        Box::pin(StatusClient::prior_scoped_receipt(self, run, request_id, digest))
+    }
+    fn scoped_terminal_receipt<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        Box::pin(StatusClient::scoped_terminal_receipt(self, placement, request_id, digest))
+    }
+    fn lookup_identity_for_scoped<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        Box::pin(async move {
+            let action = ServiceAction::ScopedQueueRead {
+                queue_group_id: placement.group.group_id,
+                queue_generation: placement.queue_generation,
+                queue_view: placement.view,
+                request_id,
+            };
+            let request = Request::ProbeScopedIdentity { request_id, digest };
+            let method = request.method();
+            let payload = encode(self.resources(), request).await?;
+            let response = self.client.call_as(action, method, Some(payload)).await?;
+            let (mut value, owner): (Option<IdentityLookup>, _) =
+                response.decoded(self.resources()).await?;
+            if let Some(value) = &mut value {
+                value.retain_owner(owner);
+            }
+            Ok(value)
+        })
+    }
     fn resources(&self) -> &Arc<WorkerSharedResources> {
         StatusClient::resources(self)
     }
@@ -1754,6 +2691,15 @@ impl StatusService for StatusClient {
     ) -> ConsensusFuture<'a, VerifiedAdmissionRejection> {
         Box::pin(async move { StatusClient::reject_unaccepted(self, cap).await })
     }
+    fn reject_scoped_route_moved<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: &'a ScopedAdmissionClosure,
+    ) -> ConsensusFuture<'a, RejectedIdentity> {
+        Box::pin(StatusClient::reject_scoped_route_moved(self, placement, authority, reservation, closure))
+    }
     fn rejected_identity<'a>(
         &'a self,
         expected: &'a RejectedIdentity,
@@ -1773,6 +2719,105 @@ impl StatusService for StatusClient {
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>> {
         Box::pin(StatusClient::retirement(self, request_id, digest))
     }
+    fn install_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        point: TimestampPointManifest,
+    ) -> ConsensusFuture<'a, ManifestRef> {
+        Box::pin(async move {
+            let ServiceAction::ScopedQueueExecute(scope) = self.client.action else {
+                return Err(invalid());
+            };
+            if self.identity() != &point.binding.status_group || !point.binding.matches_scope(scope) {
+                return Err(invalid());
+            }
+            let expected = point.manifest()?;
+            let locator = TimestampDecisionLocator { binding: point.binding.clone(), manifest: expected };
+            let outcome = point.outcome.clone();
+            let request_id = point.binding.txn.request_id;
+            let digest = point.binding.request.digest;
+            let result = tokio::time::timeout(SERVICE_CONVERGENCE, self.value::<ManifestRef>(
+                Request::InstallTimestampPoint { authority, point: Box::new(point) },
+            )).await;
+            if matches!(result, Ok(Ok((manifest, _))) if manifest == expected) {
+                return Ok(expected);
+            }
+            match self.timestamp_point_home(authority, request_id, digest).await? {
+                TimestampPointHome::Installed(actual) if actual.locator == locator && actual.outcome == outcome => {
+                    Ok(expected)
+                }
+                TimestampPointHome::Installed(_) | TimestampPointHome::Legacy => Err(mode_conflict()),
+                TimestampPointHome::Absent => Err(unavailable()),
+            }
+        })
+    }
+
+    fn timestamp_point_home<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, TimestampPointHome> {
+        Box::pin(async move {
+            let (mut home, owner): (TimestampPointHome, _) = tokio::time::timeout(
+                SERVICE_CONVERGENCE,
+                self.value(Request::TimestampPointHome { authority, request_id, digest }),
+            ).await.map_err(|_| unavailable())??;
+            if let TimestampPointHome::Installed(actual) = &mut home {
+                let binding = &actual.locator.binding;
+                actual.locator.validate()?;
+                if &binding.status_group != self.identity()
+                    || binding.txn.request_id != request_id
+                    || binding.request.digest != digest
+                    || actual.outcome.digest()? != binding.result_digest
+                    || matches!(self.client.action, ServiceAction::ScopedQueueExecute(scope)
+                        if !binding.matches_scope(scope))
+                {
+                    return Err(invalid());
+                }
+                actual.outcome.retain_owner(owner);
+            }
+            Ok(home)
+        })
+    }
+
+    fn timestamp_point_projection<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(TimestampPointProjection, Arc<ScratchLease>)>> {
+        Box::pin(async move {
+            let (record, owner): (Option<TimestampPointProjection>, _) = tokio::time::timeout(
+                SERVICE_CONVERGENCE,
+                self.value(Request::ReadTimestampPointProjection { authority, locator: Box::new(locator.clone()) }),
+            ).await.map_err(|_| unavailable())??;
+            if let Some(record) = &record {
+                record.validate_for(locator)?;
+            }
+            Ok(record.map(|record| (record, owner)))
+        })
+    }
+
+    fn project_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, (TimestampPointProjection, Arc<ScratchLease>)> {
+        Box::pin(async move {
+            let result = tokio::time::timeout(
+                SERVICE_CONVERGENCE,
+                self.value::<TimestampPointProjection>(Request::ProjectTimestampPoint {
+                    authority, locator: Box::new(locator.clone()),
+                }),
+            ).await;
+            if let Ok(Ok((record, owner))) = result {
+                record.validate_for(locator)?;
+                return Ok((record, owner));
+            }
+            self.timestamp_point_projection(authority, locator).await?.ok_or_else(unavailable)
+        })
+    }
+
     fn try_install_point_manifest<'a>(
         &'a self,
         point: PointManifest,

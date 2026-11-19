@@ -3,20 +3,22 @@
 use super::{
     authority_fence::transition_id,
     bootstrap::{
-        queue_limits,
+        queue_limits_for_formats,
         registered::{startup_read, wait_startup},
         registered_raft_config,
     },
     replica::{QueueAuthority, QueueScope, WorkerReplica},
-    worker_endpoint::{AuthorityReader, QueueEndpoint},
+    scoped_worker::{ScopedParticipants, ScopedWorker, ScopedWorkerServices},
+    worker_endpoint::{AuthorityReader, QueueEndpoint, QueuePeerClient},
     worker_runtime::retirement,
 };
 use crate::{
     config::{ExecutionConfig, WorkerResources},
-    oltp::pool::{
+    executor::Executor,
+    oltp::{mvcc::{catalog::CatalogHandle, planner::ParticipantResolver}, pool::{
         ByteClass, ExecutionClass, OltpPool, SharedResourceConfig, WorkerSharedResources,
         mount::VerifiedPoolMount,
-    },
+    }},
     oltp_deployment::{
         inventory::WorkerPoolInventory,
         live::{InventoryPin, UsageSample, process_counters},
@@ -35,7 +37,7 @@ use crate::{
             AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerClient,
             WorkerTransport,
         },
-        service_rpc::StatusClient,
+        service_rpc::{StatusClient, TimestampClient},
         types::*,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
@@ -75,6 +77,8 @@ struct Config {
     node: Node,
     resources: WorkerResources,
     execution: ExecutionConfig,
+    #[serde(default)]
+    scoped_oltp: bool,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +127,7 @@ struct Joined {
     placement: Arc<RemotePlacementTarget>,
     auth: Auth,
     sample_slot: Semaphore,
+    scoped: Option<(Arc<ScopedWorker>, crate::scheduling::MemoryCharge)>,
 }
 
 pub async fn run(path: PathBuf) -> Result<(), &'static str> {
@@ -419,18 +424,22 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 _ => return Err(refused("Control refused data worker queue join")),
             }
         };
-        let replica = Arc::new(Mutex::new(
-            WorkerReplica::new_joining(
+        let (legacy_limits, scoped_limits) = queue_limits_for_formats(
+            &config.execution, config.scoped_oltp,
+        );
+        let mut replica = WorkerReplica::new_joining(
                 shared.clone(),
                 scope.clone(),
                 local,
                 source,
                 members,
-                queue_limits(&config.execution),
+                legacy_limits,
                 ticket,
-            )
-            .map_err(QueueError::protocol)?,
-        ));
+            ).map_err(QueueError::protocol)?;
+        if let Some(limits) = scoped_limits {
+            replica.install_scoped_queues(limits).map_err(QueueError::protocol)?;
+        }
+        let replica = Arc::new(Mutex::new(replica));
         shared.bind_read_replica(&replica)?;
         let endpoint = QueueEndpoint::new(
             replica.clone(),
@@ -479,6 +488,47 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         }
         endpoint.release_join_mount()?;
         let manager = HostedGroupManager::new(shared.clone(), client.clone(), registry.clone());
+        let scoped = if let Some(limits) = scoped_limits {
+            let resolver = ScopedParticipants::new(shared.clone(), client.clone(), control.clone());
+            let catalog_handle = CatalogHandle::new(resolver.participant(&catalog.identity).await?)?;
+            let timestamps_client = TimestampClient::new(
+                timestamps.clone(), shared.clone(), client.clone(), control.clone(), ServiceAction::Owner,
+            )?;
+            let peer = Arc::new(QueuePeerClient::new(client.clone(), shared.clone(), group.clone())?);
+            endpoint.install_scoped_payload_readers(
+                group.clone(), control.clone(), catalog_handle.clone(), timestamps_client.clone(),
+            )?;
+            endpoint.install_scoped_queue_peer(peer.clone())?;
+            let charge = shared.scheduler().charge_memory(
+                shared.scheduler_node_id(),
+                WorkerSharedResources::request_actor_bytes(&config.execution).ok_or_else(invalid)?,
+            )?;
+            let worker = ScopedWorker::new(
+                ScopedWorkerServices {
+                    local, control: control.clone(), timestamps: timestamps_client,
+                    status: status.clone(), catalog: catalog_handle, resolver, replica: replica.clone(),
+                    endpoint: endpoint.clone(), peer, operator: false,
+                    max_result_bytes: limits.max_retained_result_bytes_per_worker,
+                },
+                group.clone(),
+                &auth.data_token,
+                config.execution.max_workers_per_request,
+                config.execution.result_retention_ms,
+                Executor::new(2, 16)?,
+                Executor::new(config.execution.max_pending_requests as usize, 0)?,
+            )?;
+            let application = super::application::ApplicationEndpoint::scoped(&worker);
+            registration.bind(Purpose::ApiIngress, application.clone())?;
+            registration.bind(Purpose::ApiObservation, application)?;
+            let operation = transition_id("scoped-queue-capability-v2", &local.incarnation)?;
+            startup_read(deadline, &last_error, "advertise data worker queue capability", || {
+                control.advertise_scoped_queue(operation)
+            }).await?;
+            worker.start_maintenance()?;
+            Some((worker, charge))
+        } else {
+            None
+        };
         let placement = RemotePlacementTarget::new(
             manager.clone(),
             control.clone(),
@@ -516,6 +566,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             placement,
             auth,
             sample_slot: Semaphore::new(1),
+            scoped,
         }))
     })
     .await
@@ -541,7 +592,10 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 placement.settle(settling).await;
                 placement.shutdown().await
             });
-            let result = serve(http, joined).await;
+            let result = serve(http, joined.clone()).await;
+            if let Some((scoped, _)) = &joined.scoped {
+                scoped.drain().await;
+            }
             let _ = drain_stop.send(true);
             let _ = drain.await;
             let _ = settle_stop.send(true);

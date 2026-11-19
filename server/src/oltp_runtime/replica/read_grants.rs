@@ -26,7 +26,7 @@ const _: () = assert!(
 );
 
 impl ReadGrantSet {
-    pub(super) fn initial() -> Self {
+    pub(in crate::oltp_runtime) fn initial() -> Self {
         Self {
             revision: 1,
             grants: Vec::new(),

@@ -232,6 +232,9 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        ScopedQueue { operation_id, actor, action, authorization } => {
+            scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
+        }
         EnsureScopedQueue {
             operation_id,
             expected,

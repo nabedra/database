@@ -72,6 +72,7 @@ pub(crate) struct LocalServices {
     pub placement: Option<Arc<crate::oltp_replication::manager::ReplicaPlacement>>,
     pub replica: Arc<Mutex<WorkerReplica>>,
     pub queue: Arc<QueueCoordinator>,
+    pub(super) scoped: Option<super::scoped_worker::ScopedWorkerServices>,
     pub manager: Arc<HostedGroupManager>,
     pub directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     refresh: Mutex<Option<JoinHandle<()>>>,
@@ -679,6 +680,7 @@ impl LocalServices {
                 placement: None,
                 replica,
                 queue,
+                scoped: None,
                 manager,
                 directory,
                 refresh: Mutex::new(directory_refresh),
@@ -1044,6 +1046,26 @@ pub(super) fn queue_limits(execution: &ExecutionConfig) -> QueueLimits {
             as usize,
         result_retention_ms: execution.result_retention_ms,
     }
+}
+
+pub(super) fn queue_limits_for_formats(
+    execution: &ExecutionConfig,
+    scoped: bool,
+) -> (QueueLimits, Option<QueueLimits>) {
+    let mut legacy = queue_limits(execution);
+    if !scoped {
+        return (legacy, None);
+    }
+    let scoped = QueueLimits {
+        max_pending_requests: legacy.max_pending_requests / 2,
+        max_queue_bytes_per_replica: legacy.max_queue_bytes_per_replica / 2,
+        max_retained_result_bytes_per_worker: legacy.max_retained_result_bytes_per_worker / 2,
+        result_retention_ms: legacy.result_retention_ms,
+    };
+    legacy.max_pending_requests -= scoped.max_pending_requests;
+    legacy.max_queue_bytes_per_replica -= scoped.max_queue_bytes_per_replica;
+    legacy.max_retained_result_bytes_per_worker -= scoped.max_retained_result_bytes_per_worker;
+    (legacy, Some(scoped))
 }
 fn accepted(reply: ControlReply) -> Result<(), ProtocolError> {
     use crate::oltp_replication::authority::control::Fault;

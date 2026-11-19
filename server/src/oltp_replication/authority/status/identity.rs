@@ -2,6 +2,15 @@
 //! cannot reconstruct application work: there is no operation, body, queue
 //! position or authorization text. A new run never relabels an old reservation.
 use super::*;
+use transaction::timestamp_point::{
+    LocatedTimestampManifest, TimestampPointManifest, home_key, projection,
+};
+use crate::oltp::mvcc::store::timestamp_resolution::TimestampPointResolution;
+use crate::oltp_replication::authority::timestamp::{
+    ScopedAdmissionClosure, ScopedAdmissionFailure, ScopedCopyProof, ScopedRetirementMarker,
+};
+mod scoped_retirement;
+pub(crate) use scoped_retirement::ScopedTerminalReceipt;
 use crate::{
     oltp::pool::{
         ApplyMeta, ByteClass, ChargedBytes, GroupRead, GroupStore, GroupTransaction, ScratchLease,
@@ -115,6 +124,7 @@ impl TerminalIdentity {
 pub(crate) enum IdentityLookup {
     Reserved(IdentityReservation),
     Abandoned(IdentityReservation),
+    TimestampPoint(IdentityReservation),
     Terminal(TerminalIdentity),
     Rejected(RejectedIdentity),
 }
@@ -172,6 +182,24 @@ pub(crate) struct RejectedIdentity {
     pub request: Option<RequestBinding>,
     pub failure: super::MutationOutcome,
     pub recorded_at: AppliedPosition,
+}
+impl RejectedIdentity {
+    fn same_disposition(&self, expected: &Self) -> bool {
+        self.reservation == expected.reservation
+            && self.view == expected.view
+            && self.identity == expected.identity
+            && self.pin == expected.pin
+            && self.request == expected.request
+            && self.failure == expected.failure
+    }
+}
+
+pub(crate) fn scoped_route_moved_failure() -> Result<MutationOutcome, ProtocolError> {
+    MutationOutcome::failure(ProtocolError::new(
+        ErrorCode::Conflict,
+        "pinned Catalog route moved before queue admission",
+        Outcome::NotApplied,
+    ))
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,9 +265,70 @@ impl VerifiedAdmissionRejection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScopedStatusEpoch {
+    pub queue_group_id: Uuid,
+    pub queue_generation: Uuid,
+    pub view: AuthorityView,
+}
+
+impl ScopedStatusEpoch {
+    pub(crate) fn from_scope(
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+    ) -> Self {
+        Self {
+            queue_group_id: scope.queue_group_id,
+            queue_generation: scope.queue_generation,
+            view: scope.queue_view,
+        }
+    }
+    pub(crate) fn from_placement(
+        placement: &crate::oltp_replication::authority::control::ScopedQueuePlacement,
+    ) -> Self {
+        Self {
+            queue_group_id: placement.group.group_id,
+            queue_generation: placement.queue_generation,
+            view: placement.view,
+        }
+    }
+    fn key(self) -> [u8; 50] {
+        let mut key = [0; 50];
+        key[..2].copy_from_slice(b"sq");
+        key[2..18].copy_from_slice(self.queue_group_id.as_bytes());
+        key[18..34].copy_from_slice(self.queue_generation.as_bytes());
+        key[34..].copy_from_slice(self.view.run_id.as_bytes());
+        key
+    }
+    fn valid(self, current: Option<Authority>) -> bool {
+        !self.queue_group_id.is_nil()
+            && !self.queue_generation.is_nil()
+            && self.view.validate().is_ok()
+            && current.is_some_and(|authority| authority.run_id == self.view.run_id)
+    }
+    fn admits(self, binding: Option<ScopedAdmission>, status_group: Uuid) -> bool {
+        binding
+            == Some(ScopedAdmission {
+                protocol_version: ScopedAdmission::VERSION,
+                queue_group_id: self.queue_group_id,
+                queue_generation: self.queue_generation,
+                status_group_id: status_group,
+            })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum StatusCommand {
+    FenceScopedQueue {
+        transition_id: Uuid,
+        previous: ScopedStatusEpoch,
+        next: ScopedStatusEpoch,
+    },
+    Scoped {
+        epoch: ScopedStatusEpoch,
+        command: Box<StatusCommand>,
+    },
     Fence {
         transition_id: Uuid,
         expected: Option<Authority>,
@@ -263,6 +352,9 @@ pub(crate) enum StatusCommand {
         proof: SealedTerminalProof,
         timestamp_position: AppliedPosition,
     },
+    RecordScopedRetirement {
+        proof: ScopedCopyProof,
+    },
     RejectUnaccepted {
         view: AuthorityView,
         reservation: IdentityReservation,
@@ -270,6 +362,19 @@ pub(crate) enum StatusCommand {
         pin: Option<StoragePin>,
         request: Option<RequestBinding>,
         failure: super::MutationOutcome,
+    },
+    RejectScopedRouteMoved {
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: ScopedAdmissionClosure,
+    },
+    InstallTimestampPoint {
+        authority: Authority,
+        point: Box<TimestampPointManifest>,
+    },
+    ProjectTimestampPoint {
+        authority: Authority,
+        completion: Box<TimestampPointResolution>,
     },
     BeginManifest {
         authority: Authority,
@@ -319,11 +424,17 @@ pub(crate) enum StatusCommand {
 impl fmt::Display for StatusCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::FenceScopedQueue { .. } => "status.fence_scoped_queue",
+            Self::Scoped { .. } => "status.scoped",
             Self::Fence { .. } => "status.fence",
             Self::ReserveIdentity { .. } => "status.reserve_identity",
             Self::RetireRead { .. } => "status.retire_read",
             Self::RetireTerminal { .. } => "status.retire_terminal",
+            Self::RecordScopedRetirement { .. } => "status.record_scoped_retirement",
             Self::RejectUnaccepted { .. } => "status.reject_unaccepted",
+            Self::RejectScopedRouteMoved { .. } => "status.reject_scoped_route_moved",
+            Self::InstallTimestampPoint { .. } => "status.install_timestamp_point",
+            Self::ProjectTimestampPoint { .. } => "status.project_timestamp_point",
             Self::BeginManifest { .. } => "status.begin_manifest",
             Self::ManifestPage { .. } => "status.manifest_page",
             Self::SealManifest { .. } => "status.seal_manifest",
@@ -338,10 +449,19 @@ impl fmt::Display for StatusCommand {
 impl OwnedPayload for StatusCommand {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         Ok(match self {
+            Self::Scoped { command, .. } => {
+                return Ok(std::mem::size_of::<Self>() + command.heap_bytes()?);
+            }
             Self::BeginManifest { outcome, .. }
             | Self::Abort { outcome, .. }
             | Self::TerminalFailure { outcome, .. } => outcome.heap_bytes(),
             Self::RejectUnaccepted { failure, .. } => failure.heap_bytes(),
+            Self::InstallTimestampPoint { point, .. } => {
+                std::mem::size_of::<TimestampPointManifest>() + point.heap_bytes()
+            }
+            Self::ProjectTimestampPoint { completion, .. } => {
+                std::mem::size_of::<TimestampPointResolution>() + completion.heap_bytes()
+            }
             Self::ManifestPage { participants, .. } => {
                 participants.capacity() * std::mem::size_of::<ParticipantPlan>()
                     + participants
@@ -382,15 +502,22 @@ pub(crate) enum StatusFault {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum StatusReply {
+    ScopedQueueFenced {
+        transition_id: Uuid,
+        epoch: ScopedStatusEpoch,
+        applied_at: AppliedPosition,
+    },
     Fenced(GroupFenceReceipt),
     Identity(IdentityLookup),
     Rejected(StatusFault),
     Manifest(super::ManifestDraft),
     ManifestSealed(ManifestRef),
+    TimestampPointProjected(Box<projection::TimestampPointProjection>),
     Prepared { count: u64, complete: bool },
     Decided(DecisionStatement),
     Resolved { count: u64, complete: bool },
     Retired(RetirementCertificate),
+    ScopedRetired(ScopedRetirementMarker),
 }
 impl StatusReply {
     pub(crate) fn retain_owner(&mut self, owner: Arc<ScratchLease>) {
@@ -462,7 +589,135 @@ fn apply(
     command: &StatusCommand,
 ) -> Result<Transition, ProtocolError> {
     let current: Option<Authority> = load(tx, STATE)?;
+    let (epoch, command) = match command {
+        StatusCommand::Scoped { epoch, command } => {
+            if !epoch.valid(current) {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            let key = epoch.key();
+            if let Some(fence) = load::<ScopedStatusEpoch>(tx, &key)? {
+                if fence != *epoch {
+                    return reject(tx, StatusFault::StaleAuthority);
+                }
+            } else {
+                if !matches!(command.as_ref(), StatusCommand::ReserveIdentity { .. }) {
+                    return reject(tx, StatusFault::StaleAuthority);
+                }
+                put(tx, &key, epoch)?;
+            }
+            (Some(*epoch), command.as_ref())
+        }
+        _ => (None, command),
+    };
+    if let StatusCommand::FenceScopedQueue {
+        transition_id,
+        previous,
+        next,
+    } = command
+    {
+        let receipt_key = key(b"status/scoped-fence/", *transition_id);
+        if let Some((stored_digest, reply)) = load::<(Digest, StatusReply)>(tx, &receipt_key)? {
+            return if stored_digest == digest {
+                commit(tx, reply)
+            } else {
+                reject(tx, StatusFault::TransitionConflict)
+            };
+        }
+        if epoch.is_some()
+            || transition_id.is_nil()
+            || !previous.valid(current)
+            || !next.valid(current)
+            || previous.key() != next.key()
+            || previous.view.owner_term >= next.view.owner_term
+            || previous.view.membership_revision > next.view.membership_revision
+        {
+            return reject(tx, StatusFault::InvalidBinding);
+        }
+        let key = next.key();
+        if let Some(stored) = load::<ScopedStatusEpoch>(tx, &key)? {
+            if stored.view.owner_term > next.view.owner_term
+                || stored.view.owner_term == next.view.owner_term && stored != *next
+            {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+        }
+        let reply = StatusReply::ScopedQueueFenced {
+            transition_id: *transition_id,
+            epoch: *next,
+            applied_at: position,
+        };
+        put(tx, &key, next)?;
+        put(tx, &receipt_key, &(digest, &reply))?;
+        return commit(tx, reply);
+    }
+    let identity_request = match command {
+        StatusCommand::RejectScopedRouteMoved { reservation, .. } => Some(reservation.request_id),
+        StatusCommand::InstallTimestampPoint { point, .. } => Some(point.binding.txn.request_id),
+        StatusCommand::ProjectTimestampPoint { completion, .. } => {
+            Some(completion.decision().locator().binding.txn.request_id)
+        }
+        StatusCommand::BeginManifest { txn, .. }
+        | StatusCommand::ManifestPage { txn, .. }
+        | StatusCommand::SealManifest { txn, .. }
+        | StatusCommand::Abort { txn, .. } => Some(txn.request_id),
+        StatusCommand::RecordPrepared { evidence, .. } => Some(evidence.txn.request_id),
+        StatusCommand::DecideCommit { permit, .. } => Some(permit.statement().txn.request_id),
+        StatusCommand::RecordResolved { evidence, .. } => Some(evidence.txn.request_id),
+        StatusCommand::TerminalFailure { request, .. } => Some(request.request_id),
+        StatusCommand::RecordScopedRetirement { proof } => Some(proof.statement().request.request_id),
+        _ => None,
+    };
+    if let Some(request_id) = identity_request {
+        let identity = load::<IdentityRecord>(tx, &key(IDENTITIES, request_id))?;
+        let marked = tx.get(&home_key(request_id))?.is_some();
+        if marked
+            && !matches!(
+                command,
+                StatusCommand::InstallTimestampPoint { .. }
+                    | StatusCommand::ProjectTimestampPoint { .. }
+                    | StatusCommand::RecordScopedRetirement { .. }
+            )
+        {
+            return reject(tx, StatusFault::TransitionConflict);
+        }
+        if let Some(epoch) = epoch {
+            if !identity.as_ref().is_some_and(|record| {
+                epoch.admits(record.reservation.scoped, scope.group_id)
+                    && (!marked || record.reservation.original_run == epoch.view.run_id)
+            }) {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+        } else if identity.as_ref().is_some_and(|record| {
+            record.reservation.scoped.is_some()
+                && current
+                    .is_some_and(|authority| authority.run_id == record.reservation.original_run)
+        }) {
+            return reject(tx, StatusFault::StaleAuthority);
+        }
+    } else if epoch.is_some() && !matches!(command, StatusCommand::ReserveIdentity { .. }) {
+        return reject(tx, StatusFault::InvalidBinding);
+    }
     match command {
+        StatusCommand::InstallTimestampPoint { authority, point } => {
+            let Some(epoch) = epoch else {
+                return reject(tx, StatusFault::StaleAuthority);
+            };
+            if current != Some(*authority) {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            transaction::timestamp_point::install(tx, scope, *authority, epoch, point)
+        }
+        StatusCommand::ProjectTimestampPoint { authority, completion } => {
+            let binding = &completion.decision().locator().binding;
+            if current != Some(*authority)
+                || (epoch.is_none()
+                    && (binding.request.run_id == authority.run_id
+                        || binding.created_authority.owner_term >= authority.owner_term))
+            {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            projection::apply(tx, scope, position, *authority, completion)
+        }
         StatusCommand::Fence {
             transition_id,
             expected,
@@ -524,6 +779,7 @@ fn apply(
             if request_id.is_nil()
                 || reservation_id.is_nil()
                 || scoped.is_some_and(|binding| !binding.valid_for(scope.group_id))
+                || epoch.is_some_and(|epoch| !epoch.admits(*scoped, scope.group_id))
             {
                 return reject(tx, StatusFault::InvalidBinding);
             }
@@ -541,7 +797,11 @@ fn apply(
                 if scoped.is_some() && record.reservation.scoped != *scoped {
                     return reject(tx, StatusFault::StaleAuthority);
                 }
-                return commit(tx, StatusReply::Identity(lookup(current, record)));
+                let home: Option<LocatedTimestampManifest> = load(tx, &home_key(*request_id))?;
+                if let Some(home) = &home {
+                    projection::verify_in_apply(tx, scope, &record, home, current, Some(position))?;
+                }
+                return commit(tx, StatusReply::Identity(classify_home(current, record, home.is_some())));
             }
             let reservation = IdentityReservation {
                 request_id: *request_id,
@@ -593,46 +853,63 @@ fn apply(
             {
                 return reject(tx, StatusFault::InvalidBinding);
             }
-            let identity_key = key(IDENTITIES, reservation.request_id);
-            let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
-                return reject(tx, StatusFault::UnknownIdentity);
-            };
-            if record.reservation != *reservation
-                || record.terminal.is_some()
-                || transaction::has_transaction(tx, reservation.request_id)?
-            {
-                return reject(tx, StatusFault::TerminalConflict);
-            }
-            let candidate = RejectedIdentity {
-                reservation: *reservation,
-                view: *view,
-                identity: identity.clone(),
-                pin: *pin,
-                request: *request,
-                failure: failure.clone(),
-                recorded_at: position,
-            };
-            if let Some(existing) = record.rejection {
-                if existing.reservation != candidate.reservation
-                    || existing.view != candidate.view
-                    || existing.identity != candidate.identity
-                    || existing.pin != candidate.pin
-                    || existing.request != candidate.request
-                    || existing.failure != candidate.failure
-                {
-                    return reject(tx, StatusFault::TerminalConflict);
-                }
-                return commit(
-                    tx,
-                    StatusReply::Identity(IdentityLookup::Rejected(existing)),
-                );
-            }
-            record.rejection = Some(candidate.clone());
-            put(tx, &identity_key, &record)?;
-            commit(
+            record_rejection(
                 tx,
-                StatusReply::Identity(IdentityLookup::Rejected(candidate)),
+                RejectedIdentity {
+                    reservation: *reservation,
+                    view: *view,
+                    identity: identity.clone(),
+                    pin: *pin,
+                    request: *request,
+                    failure: failure.clone(),
+                    recorded_at: position,
+                },
+                false,
             )
+        }
+        StatusCommand::RejectScopedRouteMoved {
+            authority,
+            reservation,
+            closure,
+        } => {
+            let Some(epoch) = epoch else {
+                return reject(tx, StatusFault::StaleAuthority);
+            };
+            if current != Some(*authority) || epoch.view.run_id != reservation.original_run {
+                return reject(tx, StatusFault::StaleAuthority);
+            }
+            if !epoch.admits(reservation.scoped, scope.group_id)
+                || closure.reservation != *reservation
+                || closure.failure != ScopedAdmissionFailure::ScopeSuperseded
+                || closure.identity.run_id != reservation.original_run
+                || closure.identity.request_id != reservation.request_id
+                || closure.identity.digest != reservation.digest
+                || closure.identity.nonce != reservation.reservation_id
+                || closure.identity.nonce.is_nil()
+                || closure.pin.pin_id.is_nil()
+                || closure.pin.allocator_epoch == 0
+                || closure.applied_at.term == 0
+                || closure.applied_at.node_id == 0
+                || closure.applied_at.index == 0
+            {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+            record_rejection(
+                tx,
+                RejectedIdentity {
+                    reservation: *reservation,
+                    view: epoch.view,
+                    identity: closure.identity.clone(),
+                    pin: Some(closure.pin),
+                    request: None,
+                    failure: scoped_route_moved_failure()?,
+                    recorded_at: position,
+                },
+                true,
+            )
+        }
+        StatusCommand::RecordScopedRetirement { proof } => {
+            scoped_retirement::record(tx, scope, position, epoch, proof)
         }
         StatusCommand::RetireRead { authority, proof } => {
             let Some(current) = current else {
@@ -654,7 +931,7 @@ fn apply(
             let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
                 return reject(tx, StatusFault::UnknownIdentity);
             };
-            if record.reservation.kind != RequestKind::Read {
+            if record.reservation.kind != RequestKind::Read || record.reservation.scoped.is_some() {
                 return reject(tx, StatusFault::ReadOnlyIdentity);
             }
             if record.reservation.original_run != statement.request.run_id
@@ -718,7 +995,8 @@ fn apply(
             let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
                 return reject(tx, StatusFault::UnknownIdentity);
             };
-            if record.reservation.original_run != statement.request.run_id
+            if record.reservation.scoped.is_some()
+                || record.reservation.original_run != statement.request.run_id
                 || record.reservation.digest != statement.request.digest
                 || record.rejection.is_some()
             {
@@ -779,6 +1057,39 @@ fn apply(
     }
 }
 
+fn record_rejection(
+    tx: &mut GroupTransaction<'_>,
+    mut candidate: RejectedIdentity,
+    require_live: bool,
+) -> Result<Transition, ProtocolError> {
+    let request_id = candidate.reservation.request_id;
+    let identity_key = key(IDENTITIES, request_id);
+    let Some(mut record) = load::<IdentityRecord>(tx, &identity_key)? else {
+        return reject(tx, StatusFault::UnknownIdentity);
+    };
+    if record.reservation != candidate.reservation
+        || record.terminal.is_some()
+        || require_live && (record.restore_origin.is_some() || record.retirement.is_some())
+        || tx.get(&home_key(request_id))?.is_some()
+        || transaction::has_transaction(tx, request_id)?
+    {
+        return reject(tx, StatusFault::TerminalConflict);
+    }
+    if let Some(existing) = record.rejection {
+        if require_live {
+            // A transferred owner can present the same immutable closure.
+            candidate.view = existing.view;
+        }
+        if !existing.same_disposition(&candidate) {
+            return reject(tx, StatusFault::TerminalConflict);
+        }
+        return commit(tx, StatusReply::Identity(IdentityLookup::Rejected(existing)));
+    }
+    record.rejection = Some(candidate.clone());
+    put(tx, &identity_key, &record)?;
+    commit(tx, StatusReply::Identity(IdentityLookup::Rejected(candidate)))
+}
+
 fn verify_lookup_record(
     scope: &GroupIdentity,
     record: &IdentityRecord,
@@ -826,6 +1137,13 @@ fn verify_lookup_record(
         }
         _ => Err(unknown()),
     }
+}
+
+fn classify_home(authority: Authority, record: IdentityRecord, marked: bool) -> IdentityLookup {
+    if marked && record.terminal.is_none() {
+        return IdentityLookup::TimestampPoint(record.reservation);
+    }
+    lookup(authority, record)
 }
 
 fn lookup(authority: Authority, record: IdentityRecord) -> IdentityLookup {
@@ -884,7 +1202,7 @@ fn reject(tx: &mut GroupTransaction<'_>, fault: StatusFault) -> Result<Transitio
         tx.encode(&StatusReply::Rejected(fault))?,
     ))
 }
-fn unknown() -> ProtocolError {
+pub(super) fn unknown() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,
         "durable Status identity cannot be read authoritatively",
@@ -897,8 +1215,29 @@ fn unknown() -> ProtocolError {
 pub(crate) struct StatusHandle {
     machine: StatusMachine,
     consensus: Arc<dyn Consensus<StatusCommand, StatusReply>>,
+    scoped: Option<ScopedStatusEpoch>,
 }
 impl StatusHandle {
+    pub(crate) async fn record_scoped_route_moved(
+        &self,
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: ScopedAdmissionClosure,
+    ) -> Result<RejectedIdentity, ProtocolError> {
+        let applied = self
+            .submit(StatusCommand::RejectScopedRouteMoved {
+                authority,
+                reservation,
+                closure,
+            })
+            .await?;
+        match applied.reply {
+            StatusReply::Identity(IdentityLookup::Rejected(rejection)) => Ok(rejection),
+            StatusReply::Rejected(StatusFault::StaleAuthority) => Err(unknown()),
+            _ => Err(invalid()),
+        }
+    }
+
     /// The caller retains the actual admission gate through uncertainty. An
     /// error never grants permission to release its pin or admit the UUID again.
     pub(crate) async fn reject_unaccepted(
@@ -966,13 +1305,7 @@ impl StatusHandle {
         else {
             return Err(unknown());
         };
-        if rejection.reservation != expected.reservation
-            || rejection.view != expected.view
-            || rejection.identity != expected.identity
-            || rejection.pin != expected.pin
-            || rejection.request != expected.request
-            || rejection.failure != expected.failure
-        {
+        if !rejection.same_disposition(&expected) {
             return Err(unknown());
         }
         self.seal_rejection(rejection)
@@ -1095,8 +1428,68 @@ impl StatusHandle {
         machine: StatusMachine,
         consensus: Arc<dyn Consensus<StatusCommand, StatusReply>>,
     ) -> Arc<Self> {
-        Arc::new(Self { machine, consensus })
+        Arc::new(Self {
+            machine,
+            consensus,
+            scoped: None,
+        })
     }
+    pub(crate) fn with_scoped_epoch(&self, epoch: ScopedStatusEpoch) -> Self {
+        Self {
+            machine: self.machine.clone(),
+            consensus: self.consensus.clone(),
+            scoped: Some(epoch),
+        }
+    }
+
+    pub(crate) async fn fence_scoped_queue(
+        &self,
+        transition_id: Uuid,
+        previous: ScopedStatusEpoch,
+        next: ScopedStatusEpoch,
+    ) -> Result<Applied<StatusReply>, ProtocolError> {
+        self.submit(StatusCommand::FenceScopedQueue {
+            transition_id,
+            previous,
+            next,
+        })
+        .await
+    }
+
+    pub(crate) async fn scoped_queue_fence_receipt(
+        &self,
+        transition_id: Uuid,
+        previous: ScopedStatusEpoch,
+        next: ScopedStatusEpoch,
+    ) -> Result<Option<StatusReply>, ProtocolError> {
+        let digest = serialized_digest(&StatusCommand::FenceScopedQueue {
+            transition_id, previous, next,
+        })?;
+        let barrier = self.consensus.ensure_linearizable().await?;
+        let value = self.machine.store().read_metadata(BUDGET, move |view| {
+            let receipt = read::<(Digest, StatusReply)>(
+                view, &key(b"status/scoped-fence/", transition_id),
+            )?;
+            let current: Option<Authority> = read(view, STATE)?;
+            let Some((stored_digest, reply)) = receipt else {
+                return view.encode(&None::<StatusReply>);
+            };
+            if stored_digest != digest
+                || !next.valid(current)
+                || read::<ScopedStatusEpoch>(view, &next.key())? != Some(next)
+                || !matches!(&reply, StatusReply::ScopedQueueFenced {
+                    transition_id: id, epoch, applied_at,
+                } if *id == transition_id && *epoch == next
+                    && applied_at.term > 0 && applied_at.index > 0
+                    && applied_at.index <= barrier.applied.index && applied_at.term <= barrier.applied.term)
+            {
+                return Err(unknown());
+            }
+            view.encode(&Some(reply))
+        }).await?;
+        serde_json::from_slice(value.as_slice()).map_err(|_| unknown())
+    }
+
     pub(crate) async fn reserve_identity(
         &self,
         authority: Authority,
@@ -1115,32 +1508,29 @@ impl StatusHandle {
         kind: RequestKind,
         scoped: Option<ScopedAdmission>,
     ) -> Result<Applied<StatusReply>, ProtocolError> {
-        let command = OwnedCommand::new_owned(
-            StatusCommand::ReserveIdentity {
-                authority,
-                request_id,
-                digest,
-                kind,
-                reservation_id: Uuid::new_v4(),
-                scoped,
-            },
-            self.machine.store().resources(),
-            ByteClass::Progress,
-        )?;
-        self.propose_owned(command).await
+        self.submit(StatusCommand::ReserveIdentity {
+            authority,
+            request_id,
+            digest,
+            kind,
+            reservation_id: Uuid::new_v4(),
+            scoped,
+        })
+        .await
     }
     pub(crate) async fn lookup(
         &self,
         request_id: Uuid,
         digest: Option<Digest>,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        let barrier = self.consensus.ensure_linearizable().await?;
         let scope = self.identity().clone();
         self.machine
             .store()
             .read(BUDGET, move |view| {
                 let authority: Authority = read(view, STATE)?.ok_or_else(unknown)?;
                 let record: Option<IdentityRecord> = read(view, &key(IDENTITIES, request_id))?;
+                let home: Option<LocatedTimestampManifest> = read(view, &home_key(request_id))?;
                 if let Some(record) = &record {
                     if record.reservation.request_id != request_id {
                         return Err(unknown());
@@ -1148,14 +1538,72 @@ impl StatusHandle {
                     verify_lookup_record(&scope, record, |decision, outcome| {
                         transaction::verify_terminal_in_read(view, decision, outcome)
                     })?;
-                    if digest.is_some_and(|digest| record.reservation.digest != digest) {
-                        return Err(invalid());
+                    if let Some(home) = &home {
+                        projection::verify_in_read(view, &scope, record, home, authority, Some(barrier.applied))?;
                     }
+                    if digest.is_some_and(|digest| record.reservation.digest != digest) {
+                        return Err(if record.reservation.scoped.is_some() {
+                            crate::request_queue::QueueError::Conflict.protocol()
+                        } else {
+                            invalid()
+                        });
+                    }
+                } else if home.is_some() {
+                    return Err(unknown());
                 }
-                view.encode(&record.map(|record| lookup(authority, record)))
+                view.encode(&record.map(|record| classify_home(authority, record, home.is_some())))
             })
             .await
     }
+    pub(crate) async fn admission_reservation(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<IdentityReservation>, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        let scope = self.identity().clone();
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let record: Option<IdentityRecord> = read(view, &key(IDENTITIES, request_id))?;
+                if record.as_ref().is_some_and(|record| {
+                    record.reservation.request_id != request_id
+                        || record
+                            .reservation
+                            .scoped
+                            .is_some_and(|policy| !policy.valid_for(scope.group_id))
+                }) {
+                    return Err(unknown());
+                }
+                view.encode(&record.map(|record| record.reservation))
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())
+    }
+
+    pub(crate) async fn verify_scoped_admission(
+        &self,
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+    ) -> Result<(), ProtocolError> {
+        let reservation = self
+            .admission_reservation(scope.request.request_id)
+            .await?
+            .ok_or_else(invalid)?;
+        if !reservation.binds(scope.request)
+            || reservation.kind != RequestKind::Mutation
+            || reservation.scoped
+                != Some(ScopedAdmission {
+                    protocol_version: ScopedAdmission::VERSION,
+                    queue_group_id: scope.queue_group_id,
+                    queue_generation: scope.queue_generation,
+                    status_group_id: self.identity().group_id,
+                })
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn lookup_identity(
         &self,
         request_id: Uuid,

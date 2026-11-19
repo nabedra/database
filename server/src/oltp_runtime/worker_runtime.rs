@@ -11,12 +11,12 @@ mod migration;
 mod placement;
 mod pool_drain;
 mod query_statistics;
-#[cfg(test)]
-mod shard_route;
-mod worker_drain;
 mod recovery;
 pub(super) mod retirement;
+#[cfg(test)]
+mod shard_route;
 mod split;
+mod worker_drain;
 use super::{
     admission::{DurableAdmission, ReservationResult},
     application::{
@@ -68,6 +68,7 @@ pub(crate) struct WorkerRuntime {
     admission: DurableAdmission,
     planner: NativePlanner,
     transactions: TransactionCoordinator,
+    scoped: Option<Arc<super::scoped_worker::ScopedWorker>>,
     ingress: Executor,
     actors: Executor,
     control_ingress: Executor,
@@ -143,7 +144,7 @@ impl WorkerRuntime {
         Self::from_services(services, token, execution).await
     }
     async fn from_services(
-        services: LocalServices,
+        mut services: LocalServices,
         token: &str,
         execution: ExecutionConfig,
     ) -> Result<Arc<Self>, ProtocolError> {
@@ -181,6 +182,22 @@ impl WorkerRuntime {
         )?;
         let actor_capacity = execution.max_pending_requests as usize;
         let actors = Executor::new(actor_capacity, 0)?;
+        let ingress = Executor::new(2, 16)?;
+        let scoped = services
+            .scoped
+            .take()
+            .map(|scoped| {
+                super::scoped_worker::ScopedWorker::new(
+                    scoped,
+                    services.control.identity().clone(),
+                    token,
+                    execution.max_workers_per_request,
+                    execution.result_retention_ms,
+                    ingress.clone(),
+                    actors.clone(),
+                )
+            })
+            .transpose()?;
         let (admission_cleanup, cleanup_queue, cleanup_stop) =
             admission_cleanup::AdmissionCleanup::new(actor_capacity);
         let runtime = Arc::new(Self {
@@ -188,11 +205,12 @@ impl WorkerRuntime {
             admission,
             planner,
             transactions,
-            ingress: Executor::new(2, 16)?,
+            ingress,
             control_ingress: Executor::new(2, 0)?,
             index_builds: Executor::new(1, 0)?,
             supervision: Executor::new(1, 0)?,
             actors,
+            scoped,
             active: Mutex::new(BTreeSet::new()),
             recovery_cursor: Mutex::new(None),
             retirement_cursor: Mutex::new(None),
@@ -250,6 +268,18 @@ impl WorkerRuntime {
             crate::oltp_replication::multiplex::Purpose::ApiObservation,
             endpoint,
         )?;
+        if let Some(scoped) = &runtime.scoped {
+            let operation = super::authority_fence::transition_id(
+                "scoped-queue-capability-v2",
+                &runtime.services.local.incarnation,
+            )?;
+            runtime
+                .services
+                .control_client
+                .advertise_scoped_queue(operation)
+                .await?;
+            scoped.start_maintenance()?;
+        }
         if runtime.services.cold_history.is_some() {
             *runtime.cold_cleanup.lock().map_err(|_| unknown())? =
                 Some(cold_history::spawn(&runtime));
@@ -438,6 +468,194 @@ impl WorkerRuntime {
             owner: self.services.local,
         })
     }
+
+    pub(super) fn scoped_worker(&self) -> Option<&Arc<super::scoped_worker::ScopedWorker>> {
+        self.scoped.as_ref()
+    }
+
+    pub(super) fn scoped_operator_client(
+        &self,
+    ) -> Result<&crate::oltp_replication::authority::control::ControlClient, ProtocolError> {
+        self.scoped.as_ref().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::UnsupportedOperation,
+                "scoped queue support is disabled on this worker",
+                Outcome::NotApplied,
+            )
+        })?;
+        Ok(&self.services.control_client)
+    }
+
+    pub(super) async fn resolve_scoped_point(
+        &self,
+        authority: QueueAuthority,
+        point: &super::application::PointRequest,
+        digest: Digest,
+    ) -> Result<super::application::PointRouting, ProtocolError> {
+        use super::application::{PointRouting, ScopedTarget};
+        if self.scoped.is_none() {
+            return Ok(PointRouting::Legacy);
+        }
+        let status = self
+            .services
+            .status
+            .lookup_identity(point.request_id, Some(digest))
+            .await?;
+        let control = &self.services.control_client;
+        if let Some(status) = status {
+            let reservation = match &status {
+                IdentityLookup::Reserved(reservation)
+                | IdentityLookup::TimestampPoint(reservation) => reservation,
+                IdentityLookup::Abandoned(_) => return Err(QueueError::Abandoned.protocol()),
+                IdentityLookup::Terminal(terminal) => {
+                    super::scoped_worker::terminal_reservation(terminal)
+                }
+                IdentityLookup::Rejected(rejection) => {
+                    return Err(rejection.failure.result().err().ok_or_else(unknown)?);
+                }
+            };
+            let Some(policy) = reservation.scoped else {
+                return Ok(PointRouting::Legacy);
+            };
+            if reservation.original_run != authority.ready.view.run_id {
+                if matches!(status, IdentityLookup::Terminal(_)) {
+                    // The legacy receipt reader uses the exact durable outcome
+                    // for a fenced prior run with no executable RAM queue.
+                    return Ok(PointRouting::Legacy);
+                }
+                if matches!(status, IdentityLookup::TimestampPoint(_)) {
+                    return Err(unknown());
+                }
+                return Err(QueueError::Abandoned.protocol());
+            }
+            match control.scoped_queue_by_id(policy.queue_group_id).await {
+                Ok(Some(placement))
+                    if placement.view.run_id == reservation.original_run
+                        && placement.queue_generation == policy.queue_generation =>
+                {
+                    return Ok(PointRouting::Owner(ScopedTarget::from(&placement)));
+                }
+                Ok(_)
+                | Err(ProtocolError {
+                    code: ErrorCode::StorageUnavailable,
+                    ..
+                }) => {}
+                Err(error) => return Err(error),
+            }
+            if self
+                .services
+                .status
+                .retired_scoped_receipt(
+                    reservation.original_run,
+                    reservation.request_id,
+                    Some(reservation.digest),
+                )
+                .await?
+                .is_some()
+            {
+                return Ok(PointRouting::Legacy);
+            }
+            return Err(unknown());
+        }
+        if control
+            .scoped_queue_capability()
+            .await?
+            .activation
+            .is_none()
+        {
+            return Ok(PointRouting::Legacy);
+        }
+        let hint = self.services.catalog.snapshot(
+            Timestamp::new(u64::MAX).map_err(|_| unknown())?,
+            authority.ready.view.authority(),
+        )?;
+        let route = self
+            .services
+            .catalog
+            .route(&hint, point.table_id, &point.key)
+            .await?;
+        let Some(shard) = route.route() else {
+            return Ok(PointRouting::Legacy);
+        };
+        let placement = match control.scoped_queue(&shard.group).await? {
+            Some(placement) => placement,
+            None => {
+                let operation = super::authority_fence::transition_id(
+                    "scoped-queue-create-v2",
+                    &(shard.group.group_id, authority.ready.view.run_id),
+                )?;
+                control.ensure_scoped_queue(operation, &shard.group).await?
+            }
+        };
+        if placement.view.run_id != authority.ready.view.run_id || placement.group != shard.group {
+            return Err(super::application::stale_route());
+        }
+        Ok(PointRouting::range(
+            shard.clone(),
+            ScopedTarget::from(&placement),
+        ))
+    }
+
+    pub(super) async fn resolve_scoped_receipt(
+        &self,
+        authority: QueueAuthority,
+        run: Uuid,
+        id: Uuid,
+    ) -> Result<Option<super::application::ScopedReceiptRoute>, ProtocolError> {
+        if self.scoped.is_none() || run != authority.ready.view.run_id {
+            return Ok(None);
+        }
+        let lookup = self.durable_lookup(id).await?;
+        let reservation = match lookup.as_ref() {
+            Some(
+                IdentityLookup::Reserved(reservation) | IdentityLookup::TimestampPoint(reservation),
+            ) => reservation,
+            Some(IdentityLookup::Terminal(terminal)) => {
+                super::scoped_worker::terminal_reservation(terminal)
+            }
+            _ => return Ok(None),
+        };
+        let Some(policy) = reservation.scoped else {
+            return Ok(None);
+        };
+        if reservation.original_run != run {
+            return Err(QueueError::Abandoned.protocol());
+        }
+        let placement = match self
+            .services
+            .control_client
+            .scoped_queue_by_id(policy.queue_group_id)
+            .await
+        {
+            Ok(Some(placement))
+                if placement.view.run_id == run
+                    && placement.queue_generation == policy.queue_generation =>
+            {
+                placement
+            }
+            Ok(_)
+            | Err(ProtocolError {
+                code: ErrorCode::StorageUnavailable,
+                ..
+            }) => {
+                if self
+                    .services
+                    .status
+                    .retired_scoped_receipt(run, id, Some(reservation.digest))
+                    .await?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+                return Err(unknown());
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(Some(super::application::ScopedReceiptRoute {
+            target: super::application::ScopedTarget::from(&placement),
+            digest: reservation.digest,
+        }))
+    }
     pub(crate) async fn submit_charged(
         self: &Arc<Self>,
         body: ChargedBytes,
@@ -496,7 +714,10 @@ impl WorkerRuntime {
         result_class: ByteClass,
         expected: Option<&ApplicationObservation>,
     ) -> Result<ObservedApplication, ProtocolError> {
-        let ApplicationReadView { authority, terminal } = view;
+        let ApplicationReadView {
+            authority,
+            terminal,
+        } = view;
         let confirmed = |replica: &WorkerReplica, record: &RequestRecord| {
             terminal.is_some() && replica.terminal_copy_confirmation(authority, record) == terminal
         };
@@ -549,6 +770,9 @@ impl WorkerRuntime {
             Ok(Some(IdentityLookup::Terminal(terminal))) => {
                 #[cfg(test)]
                 super::recovery_tests::transaction_checkpoint("status-lookup", id, &terminal).await;
+                let terminal = self
+                    .application_terminal(terminal, run, authority.ready.view.run_id)
+                    .await?;
                 let reservation = terminal_reservation(&terminal)?;
                 if reservation.original_run != run {
                     return Err(QueueError::Abandoned.protocol());
@@ -593,6 +817,12 @@ impl WorkerRuntime {
                 )
             }
             Ok(Some(IdentityLookup::Abandoned(_))) => Err(QueueError::Abandoned.protocol()),
+            Ok(Some(IdentityLookup::TimestampPoint(reservation))) => {
+                if reservation.original_run != run {
+                    return Err(QueueError::Abandoned.protocol());
+                }
+                Err(unknown())
+            }
             Ok(Some(IdentityLookup::Rejected(rejection))) => {
                 Err(rejection.failure.result().err().ok_or_else(unknown)?)
             }
@@ -658,6 +888,9 @@ impl WorkerRuntime {
     }
     pub(crate) fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Release);
+        if let Some(scoped) = &self.scoped {
+            scoped.stop_accepting();
+        }
         self.admission_cleanup.stop();
         self.ingress.stop_accepting();
         self.actors.stop_accepting();
@@ -667,6 +900,9 @@ impl WorkerRuntime {
     }
     pub(crate) async fn drain(&self) -> Result<(), ProtocolError> {
         self.accepting.store(false, Ordering::Release);
+        if let Some(scoped) = &self.scoped {
+            scoped.drain().await;
+        }
         self.admission_cleanup.stop();
         self.ingress.drain().await;
         self.actors.drain().await;
@@ -791,11 +1027,19 @@ impl WorkerRuntime {
                 }
                 self.admission
                     .queue()
-                    .stage(current, reserved.body.as_ref().to_vec(), context.clone(), now())
+                    .stage(
+                        current,
+                        reserved.body.as_ref().to_vec(),
+                        context.clone(),
+                        now(),
+                    )
                     .await?;
                 #[cfg(test)]
                 super::recovery_tests::pause("tentative", id).await;
-                let binding = self.admission.bind_staged(current.ready.view, &context).await?;
+                let binding = self
+                    .admission
+                    .bind_staged(current.ready.view, &context)
+                    .await?;
                 request_binding = Some(binding);
                 #[cfg(test)]
                 super::recovery_tests::pause("bound", id).await;
@@ -909,7 +1153,9 @@ impl WorkerRuntime {
         let original: AcceptedContext =
             serde_json::from_slice(context.as_ref()).map_err(|_| unknown())?;
         self.services.queue.ensure_staged(current, id).await?;
-        self.admission.bind_staged(current.ready.view, &original).await?;
+        self.admission
+            .bind_staged(current.ready.view, &original)
+            .await?;
         self.services.queue.accept_staged(current, id).await
     }
     async fn decode_raw(
@@ -1224,6 +1470,45 @@ impl WorkerRuntime {
     async fn durable_lookup(&self, id: Uuid) -> Result<Option<IdentityLookup>, ProtocolError> {
         self.services.status.lookup_identity(id, None).await
     }
+
+    async fn application_terminal(
+        &self,
+        terminal: TerminalIdentity,
+        requested_run: Uuid,
+        current_run: Uuid,
+    ) -> Result<TerminalIdentity, ProtocolError> {
+        let reservation = *super::scoped_worker::terminal_reservation(&terminal);
+        if reservation.original_run != requested_run {
+            return Err(QueueError::Abandoned.protocol());
+        }
+        if reservation.scoped.is_none() {
+            return Ok(terminal);
+        }
+        let status = &self.services.status;
+        if requested_run == current_run {
+            return status
+                .retired_scoped_receipt(
+                    requested_run,
+                    reservation.request_id,
+                    Some(reservation.digest),
+                )
+                .await?
+                .map(|receipt| receipt.terminal)
+                .ok_or_else(unknown);
+        }
+        match status
+            .prior_scoped_receipt(
+                requested_run,
+                reservation.request_id,
+                Some(reservation.digest),
+            )
+            .await?
+        {
+            Some(IdentityLookup::Terminal(terminal)) => Ok(terminal),
+            Some(IdentityLookup::Abandoned(_)) => Err(QueueError::Abandoned.protocol()),
+            _ => Err(unknown()),
+        }
+    }
     async fn terminal_receipt_ready(
         &self,
         run: Uuid,
@@ -1260,13 +1545,15 @@ impl WorkerRuntime {
         }
     }
     async fn receipt_owned(&self, run: Uuid, id: Uuid) -> Result<OwnedReceipt, ProtocolError> {
-        let committing = || OwnedReceipt::from(Receipt {
-            request_id: id,
-            run_id: run,
-            state: RequestState::Committing,
-            result: None,
-            error: None,
-        });
+        let committing = || {
+            OwnedReceipt::from(Receipt {
+                request_id: id,
+                run_id: run,
+                state: RequestState::Committing,
+                result: None,
+                error: None,
+            })
+        };
         let local = self
             .services
             .replica
@@ -1275,7 +1562,10 @@ impl WorkerRuntime {
             .response(run, id, now());
         match local {
             Ok((record, Some(bytes))) => {
-                if !self.terminal_receipt_ready(run, id, Some(record.version)).await? {
+                if !self
+                    .terminal_receipt_ready(run, id, Some(record.version))
+                    .await?
+                {
                     return Ok(committing());
                 }
                 let shared = self.services.shared.clone();
@@ -1323,6 +1613,16 @@ impl WorkerRuntime {
         }
         match self.durable_lookup(id).await? {
             Some(IdentityLookup::Terminal(terminal)) => {
+                let terminal = if super::scoped_worker::terminal_reservation(&terminal)
+                    .scoped
+                    .is_some()
+                {
+                    let current = self.services.control.current(&self.services.scope).await?;
+                    self.application_terminal(terminal, run, current.ready.view.run_id)
+                        .await?
+                } else {
+                    terminal
+                };
                 let record = terminal_record(&terminal)?;
                 if record.run_id != run {
                     return Err(QueueError::Abandoned.protocol());
@@ -1361,9 +1661,10 @@ impl WorkerRuntime {
                 Err(rejection.failure.result().err().ok_or_else(unknown)?)
             }
             Some(IdentityLookup::Abandoned(_)) => Err(QueueError::Abandoned.protocol()),
-            Some(IdentityLookup::Reserved(reservation)) if reservation.original_run != run => {
-                Err(QueueError::Abandoned.protocol())
-            }
+            Some(
+                IdentityLookup::Reserved(reservation) | IdentityLookup::TimestampPoint(reservation),
+            ) if reservation.original_run != run => Err(QueueError::Abandoned.protocol()),
+            Some(IdentityLookup::TimestampPoint(_)) => Err(unknown()),
             _ => match local {
                 Ok((record, _)) => Ok(OwnedReceipt::from(Receipt {
                     request_id: id,
@@ -1391,6 +1692,7 @@ impl HttpRuntime for WorkerRuntime {
         self: Arc<Self>,
         body: Vec<u8>,
         parsing_charge: MemoryCharge,
+        _point: Option<super::application::PointRequest>,
     ) -> EndpointFuture<'static, RequestRecord> {
         Box::pin(async move {
             let submitted = self.submit_owned(body).await;
@@ -1432,8 +1734,8 @@ impl HttpRuntime for WorkerRuntime {
                 if receipt.state == RequestState::Committing || copy_deadline.is_some() {
                     // A remote owner's confirmation does not notify this worker.
                     let now = tokio::time::Instant::now();
-                    let deadline = *copy_deadline
-                        .get_or_insert(now + super::RECEIPT_OBSERVATION_TIMEOUT);
+                    let deadline =
+                        *copy_deadline.get_or_insert(now + super::RECEIPT_OBSERVATION_TIMEOUT);
                     if now >= deadline {
                         return Err(unavailable());
                     }
@@ -1523,7 +1825,7 @@ impl Drop for Settlement {
         self.runtime.changed.notify_waiters();
     }
 }
-fn terminal_response(
+pub(super) fn terminal_response(
     id: Uuid,
     terminal: &TerminalIdentity,
 ) -> Result<EncodedResponse, ProtocolError> {
@@ -1551,7 +1853,10 @@ fn terminal_record(terminal: &TerminalIdentity) -> Result<RequestRecord, Protoco
     let response = terminal_response(reservation.request_id, terminal)?;
     Ok(terminal_record_with_status(reservation, response.status))
 }
-fn terminal_record_with_status(reservation: &IdentityReservation, status: u16) -> RequestRecord {
+pub(super) fn terminal_record_with_status(
+    reservation: &IdentityReservation,
+    status: u16,
+) -> RequestRecord {
     RequestRecord {
         context: None,
         run_id: reservation.original_run,
@@ -1617,7 +1922,7 @@ fn pending_terminal_copy(
     )
 }
 
-fn attach_result(
+pub(super) fn attach_result(
     metadata: ApplicationObservation,
     expected: Option<&ApplicationObservation>,
     body: impl FnOnce() -> Result<Option<ChargedBytes>, ProtocolError>,

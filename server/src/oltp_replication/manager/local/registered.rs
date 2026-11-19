@@ -105,6 +105,8 @@ impl SystemPlacement {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisteredConfig {
     pub format: u32,
+    #[serde(default, skip_serializing_if = "disabled")]
+    pub scoped_oltp: bool,
     pub directory: PathBuf,
     pub pool_id: Uuid,
     pub scheduler_node_id: u64,
@@ -135,6 +137,10 @@ pub(crate) struct RegisteredConfig {
     pub cold: Option<cold::ColdStart>,
     #[serde(default)]
     pub rolling: Option<restart::RollingStart>,
+}
+
+fn disabled(value: &bool) -> bool {
+    !*value
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -500,47 +500,18 @@ pub(crate) struct QueueStats {
     pub charged_result_bytes: usize,
 }
 impl WorkerReplica {
-    /// One physical queue lease owns both formats. An enabled worker must
-    /// carve scoped capacity out of the existing queue envelope.
-    pub(crate) fn new_with_scoped_queues(
-        shared: Arc<WorkerSharedResources>,
-        scope: QueueScope,
-        local: WorkerIdentity,
-        authority: QueueAuthority,
-        members: impl IntoIterator<Item = WorkerIdentity>,
-        total: QueueLimits,
-        scoped: QueueLimits,
-    ) -> Result<Self, QueueError> {
-        if scoped.result_retention_ms != total.result_retention_ms {
+    /// Bootstrap splits this worker's physical limits before attaching a store.
+    pub(super) fn install_scoped_queues(&mut self, limits: QueueLimits) -> Result<(), QueueError> {
+        if self.scoped.is_some() || limits.result_retention_ms != self.retention_ms {
             return Err(QueueError::Invalid);
         }
-        let legacy = QueueLimits {
-            max_pending_requests: total
-                .max_pending_requests
-                .checked_sub(scoped.max_pending_requests)
-                .ok_or(QueueError::Invalid)?,
-            max_queue_bytes_per_replica: total
-                .max_queue_bytes_per_replica
-                .checked_sub(scoped.max_queue_bytes_per_replica)
-                .ok_or(QueueError::Invalid)?,
-            max_retained_result_bytes_per_worker: total
-                .max_retained_result_bytes_per_worker
-                .checked_sub(scoped.max_retained_result_bytes_per_worker)
-                .ok_or(QueueError::Invalid)?,
-            result_retention_ms: total.result_retention_ms,
-        };
-        let mut replica = Self::new(
-            shared.clone(),
-            scope.clone(),
-            local,
-            authority,
-            members,
-            legacy,
-        )?;
-        replica.scoped = Some(Box::new(scoped_store::ScopedQueueStore::new(
-            shared, scope, local, scoped,
+        self.scoped = Some(Box::new(scoped_store::ScopedQueueStore::new(
+            self.shared.clone(),
+            self.scope.clone(),
+            self.local,
+            limits,
         )?));
-        Ok(replica)
+        Ok(())
     }
 
     pub(crate) fn scoped_queues(&mut self) -> Result<&mut scoped_store::ScopedQueueStore, QueueError> {

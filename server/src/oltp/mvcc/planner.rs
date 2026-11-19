@@ -13,7 +13,10 @@ use super::{
 };
 use crate::{
     oltp::{failure, pool::ChargedBytes},
-    oltp_replication::types::{GroupIdentity, Page, RequestBinding, TxnId},
+    oltp_replication::{
+        authority::control::ScopedCatalogRead,
+        types::{GroupIdentity, GroupKind, Page, RequestBinding, TxnId},
+    },
     protocol::{self, ErrorCode, Key, Operation, ProtocolError, Row, TableDescriptor},
 };
 use sha2::{Digest as _, Sha256};
@@ -45,6 +48,46 @@ pub(crate) trait ParticipantResolver: Send + Sync {
         table: &'a TableDescriptor,
         pin: &'a PinnedCatalog,
     ) -> ResolveFuture<'a, ShardRoute>;
+}
+pub(crate) struct ScopedParticipantResolver {
+    pub resolver: Arc<dyn ParticipantResolver>,
+    pub scope: ScopedCatalogRead,
+}
+impl ParticipantResolver for ScopedParticipantResolver {
+    fn participant<'a>(
+        &'a self,
+        group: &'a GroupIdentity,
+    ) -> ResolveFuture<'a, Arc<ParticipantHandle>> {
+        Box::pin(async move {
+            if group.group_id != self.scope.queue_group_id
+                || !matches!(group.kind, GroupKind::Data { table_id, .. } if table_id == self.scope.table_id)
+            {
+                return Err(failure(
+                    ErrorCode::StorageUnavailable,
+                    "pinned row belongs to another data group",
+                ));
+            }
+            Ok(Arc::new(
+                self.resolver
+                    .participant(group)
+                    .await?
+                    .with_scoped_execution(self.scope)?,
+            ))
+        })
+    }
+
+    fn create_data<'a>(
+        &'a self,
+        _: &'a TableDescriptor,
+        _: &'a PinnedCatalog,
+    ) -> ResolveFuture<'a, ShardRoute> {
+        Box::pin(async {
+            Err(failure(
+                ErrorCode::UnsupportedOperation,
+                "scoped requests use an existing data group",
+            ))
+        })
+    }
 }
 #[derive(Debug)]
 pub(crate) enum PlanError {
@@ -112,6 +155,49 @@ impl NativePlanner {
             query_metrics,
             query_scheduler,
         })
+    }
+    pub(crate) fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            catalog: CatalogHandle::new(Arc::new(
+                self.catalog.participant().with_scoped_execution(scope)?,
+            ))?,
+            resolver: Arc::new(ScopedParticipantResolver {
+                resolver: self.resolver.clone(),
+                scope,
+            }),
+            query_metrics: self.query_metrics.clone(),
+            query_scheduler: self.query_scheduler.clone(),
+        })
+    }
+
+    pub(crate) async fn plan_scoped(
+        &self,
+        scope: ScopedCatalogRead,
+        operation: Operation,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        owner: Arc<crate::oltp::pool::ScratchLease>,
+        point: Option<&PointCatalog>,
+    ) -> Result<PlannedOperation, PlanError> {
+        if !matches!(&operation, Operation::Get(_) | Operation::Update(_))
+            || table_id(&operation) != Some(scope.table_id)
+            || txn.request_id != scope.request.request_id
+            || txn.attempt != 1
+            || pin.read_ts != scope.read_ts
+            || pin.authority.run_id != scope.request.run_id
+        {
+            return Err(failure(
+                ErrorCode::ValidationError,
+                "operation differs from scoped request",
+            )
+            .into());
+        }
+        self.with_scoped_execution(scope)?
+            .plan(operation, pin, txn, scope.request, owner, point)
+            .await
     }
     pub(crate) fn query_statistics(&self) -> query_metrics::QueryStatistics {
         self.query_metrics.snapshot()
@@ -758,7 +844,17 @@ impl NativePlanner {
         point: Option<&PointCatalog>,
     ) -> Result<RouteRead, ProtocolError> {
         match point {
-            Some(point) => self.catalog.route_pages(pin, table_id, key, point.first_page).await,
+            Some(point) => {
+                if let Some((page, index)) = &point.selected
+                    && point.table.descriptor.id == table_id
+                    && page.shards[*index].contains_key(key)
+                {
+                    return Ok(RouteRead::Route { page: page.clone(), index: *index });
+                }
+                self.catalog
+                    .route_pages(pin, table_id, key, point.first_page)
+                    .await
+            }
             None => self.catalog.route(pin, table_id, key).await,
         }
     }

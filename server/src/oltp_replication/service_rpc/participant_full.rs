@@ -13,14 +13,28 @@ use crate::oltp::mvcc::{
         lifecycle::{GuardMode, LifecycleBinding, LifecycleCommand, VerifiedLifecycleGuard},
         point::PointReadRequest,
         scan::{ScanDomain, ScanPage, ScanRequest},
+        scoped_queue::{self, QueueFence, QueueFenceReceipt},
     },
 };
 use crate::oltp_replication::{
-    authority::{consensus::Applied, control::ScopedCatalogRead, status::StatusTopology},
+    authority::{
+        consensus::Applied,
+        control::{GroupRecord, InventoryPage, ScopedCatalogRead, ScopedQueueTransition},
+        status::{RequestKind, StatusTopology},
+    },
     owned::{OwnedCommand, OwnedPayload},
 };
 
+#[path = "participant_full_timestamp_point.rs"]
+mod timestamp_point;
+
 const SCOPED_CATALOG_KEY_BYTES: usize = 512;
+// The scoped Raft command adds the authenticated scope and entry framing.
+const SCOPED_PREPARE_PAYLOAD_BYTES: usize = MAX_FIXED_COMMAND_BYTES - (4 << 10);
+
+fn current_catalog_route_hint(scope: ScopedCatalogRead) -> bool {
+    scoped_admission_read(scope) && scope.read_ts.get() == u64::MAX
+}
 
 #[cfg(test)]
 #[path = "participant_full/continuation_fixture.rs"]
@@ -30,6 +44,7 @@ pub(crate) struct ParticipantEndpoint {
     proof: Arc<ParticipantProofEndpoint>,
     transport: WorkerClient,
     status_topology: Option<StatusTopology>,
+    timestamps: tokio::sync::OnceCell<GroupIdentity>,
 }
 impl ParticipantEndpoint {
     pub(crate) fn new(
@@ -43,6 +58,7 @@ impl ParticipantEndpoint {
             proof: ParticipantProofEndpoint::new(handle, node, control)?,
             transport,
             status_topology,
+            timestamps: tokio::sync::OnceCell::new(),
         }))
     }
     fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
@@ -52,6 +68,17 @@ impl ParticipantEndpoint {
             self.proof.node,
             bytes,
         )?;
+        if matches!(
+            head.action,
+            ServiceAction::ScopedQueueExecute(scope) | ServiceAction::ScopedCatalogRead(scope)
+                if current_catalog_route_hint(scope)
+        ) && !(matches!(head.action, ServiceAction::ScopedQueueExecute(_))
+            && self.proof.handle.identity().kind == GroupKind::Catalog
+            && matches!(head.method, Method::ParticipantRead { .. })
+            && head.payload_bytes <= SCOPED_CATALOG_KEY_BYTES as u64)
+        {
+            return Err(invalid());
+        }
         let allowed = match head.method {
             Method::ParticipantRead { read_ts } => match head.action {
                 ServiceAction::Owner => true,
@@ -60,31 +87,225 @@ impl ParticipantEndpoint {
                         && scope.read_ts == read_ts
                         && head.payload_bytes <= SCOPED_CATALOG_KEY_BYTES as u64
                 }
+                ServiceAction::ScopedQueueExecute(scope) => scope.read_ts == read_ts,
                 _ => false,
             },
+            Method::ParticipantScopedGuard { txn } => matches!(
+                head.action, ServiceAction::ScopedQueueExecute(scope)
+                    if self.proof.handle.identity().kind == GroupKind::Catalog
+                        && txn.request_id == scope.request.request_id && txn.attempt == 1
+            ),
             Method::ParticipantReadPage
-            | Method::ParticipantImages
+            | Method::ParticipantAcquire
+            | Method::ParticipantActivation => {
+                matches!(
+                    head.action,
+                    ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
+                )
+            }
+            Method::ParticipantImages
             | Method::ParticipantArchiveEffects { .. }
             | Method::ParticipantScan
             | Method::ParticipantScanOpen { .. }
             | Method::ParticipantScanRun { .. }
-            | Method::ParticipantActivation
-            | Method::ParticipantAcquire
             | Method::ParticipantHolder { .. } => head.action == ServiceAction::Owner,
+            Method::ParticipantResolveTimestampPoint => {
+                matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
+                    && matches!(head.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
+            }
             Method::ParticipantPropose { .. } => {
-                head.action == ServiceAction::Owner
-                    || matches!(head.action,ServiceAction::ParticipantProof{source_group} if source_group==self.proof.handle.identity().group_id)
+                matches!(
+                    head.action,
+                    ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
+                ) || matches!(head.action,ServiceAction::ParticipantProof{source_group} if source_group==self.proof.handle.identity().group_id)
             }
-            Method::ParticipantFence { transition_id, .. } => {
-                matches!(head.action,ServiceAction::ControlFence{transition_id:actual} if actual==transition_id)
-            }
+            Method::ParticipantFence { transition_id, .. } => match head.action {
+                ServiceAction::ControlFence { transition_id: actual }
+                | ServiceAction::ScopedQueueFenceReceipt { transfer_id: actual, .. } => {
+                    actual == transition_id
+                }
+                ServiceAction::ParticipantProof { source_group } => {
+                    let target = self.proof.handle.identity();
+                    target.kind == GroupKind::Catalog || target.group_id == source_group
+                }
+                _ => false,
+            },
             _ => false,
         };
         if !allowed {
             return Err(invalid());
         }
+        if matches!(head.action, ServiceAction::ScopedQueueExecute(_))
+            && matches!(head.method, Method::ParticipantPropose { progress: false })
+            && head.payload_bytes > SCOPED_PREPARE_PAYLOAD_BYTES as u64
+        {
+            return Err(crate::oltp::failure(
+                ErrorCode::LimitExceeded,
+                "scoped participant command exceeds the Raft entry limit",
+            ));
+        }
         Ok(head)
     }
+    async fn encode_scoped_fence(
+        &self,
+        receipt: QueueFenceReceipt,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let shared = self.proof.shared.clone();
+        self.proof
+            .shared
+            .execute(ExecutionClass::Control, self.proof.node, 0, move || {
+                shared.encode_in(ByteClass::Progress, &receipt, 4096)
+            })
+            .await
+    }
+    // The topology has one stable Timestamp identity. Discover it through
+    // Control's revision-pinned inventory on first use; the client resolves
+    // its current replicas on every call.
+    async fn timestamps(&self) -> Result<&GroupIdentity, ProtocolError> {
+        self.timestamps
+            .get_or_try_init(|| async {
+                let control = &self.proof.control;
+                let revision = control.group_inventory_revision().await?;
+                let mut after = None;
+                loop {
+                    let reply = control.groups(revision, after).await?;
+                    let page = reply.decode_section::<InventoryPage<GroupRecord>>(0)?;
+                    if page.revision != revision || (!page.done && page.after <= after) {
+                        return Err(unavailable());
+                    }
+                    if let Some(group) = page
+                        .items
+                        .iter()
+                        .find(|record| record.identity.kind == GroupKind::Timestamps)
+                    {
+                        return Ok(group.identity.clone());
+                    }
+                    if page.done {
+                        return Err(unavailable());
+                    }
+                    after = page.after;
+                }
+            })
+            .await
+    }
+
+    async fn verify_pin(
+        &self,
+        session: &AuthenticatedSession,
+        head: &Header,
+        scope: ScopedCatalogRead,
+        kind: Option<RequestKind>,
+    ) -> Result<(), ProtocolError> {
+        let group = self.proof.handle.identity();
+        if group.kind != GroupKind::Catalog
+            && (group.group_id != scope.queue_group_id
+                || !matches!(group.kind, GroupKind::Data { table_id, .. } if table_id == scope.table_id))
+        {
+            return Err(invalid());
+        }
+        let timestamps = TimestampClient::new(
+            self.timestamps().await?.clone(),
+            self.proof.shared.clone(),
+            self.transport.clone(),
+            self.proof.control.clone(),
+            ServiceAction::ParticipantProof {
+                source_group: group.group_id,
+            },
+        )?;
+        if group.kind == GroupKind::Catalog
+            && kind.is_none()
+            && matches!(head.action, ServiceAction::ScopedQueueExecute(_))
+            && scoped_admission_read(scope)
+        {
+            timestamps.verify_scoped_admission_pin(scope).await?;
+        } else {
+            timestamps.verify_scoped_read_pin(scope, kind).await?;
+        }
+        authorize(&self.proof.control, session, head).await
+    }
+
+    async fn validate_scoped_proposal(
+        &self,
+        session: &AuthenticatedSession,
+        head: &Header,
+        scope: ScopedCatalogRead,
+        command: &ParticipantCommand,
+    ) -> Result<(), ProtocolError> {
+        let group = self.proof.handle.identity();
+        if !scoped_queue::bound_to_scope(group, scope, command) {
+            return Err(invalid());
+        }
+        let authority = match command {
+            ParticipantCommand::PrepareTimestampPoint { locator, page }
+            | ParticipantCommand::RejectTimestampPoint { locator, page } => {
+                let page = page.payload()?;
+                let ParticipantCommand::PreparePage { authority, .. } = page else {
+                    return Err(invalid());
+                };
+                if !crate::oltp::mvcc::store::timestamp_resolution::matches_page(locator, page)? {
+                    return Err(invalid());
+                }
+                self.status(locator.binding.txn, locator.manifest)
+                    .await?
+                    .timestamp_point_manifest(*authority, locator, Some(scope))
+                    .await?;
+                self.verify_pin(session, head, scope, Some(RequestKind::Mutation))
+                    .await?;
+                *authority
+            }
+            ParticipantCommand::SealTimestampPoint { authority, locator } => {
+                self.status(locator.binding.txn, locator.manifest)
+                    .await?
+                    .timestamp_point_manifest(*authority, locator, Some(scope))
+                    .await?;
+                self.verify_pin(session, head, scope, Some(RequestKind::Mutation))
+                    .await?;
+                *authority
+            }
+            ParticipantCommand::PreparePage {
+                authority, txn, manifest, plan, ..
+            } => {
+                if self
+                    .status(*txn, *manifest)
+                    .await?
+                    .scoped_plan(scope, *txn, *manifest)
+                    .await?
+                    != *plan
+                {
+                    return Err(invalid());
+                }
+                self.verify_pin(session, head, scope, Some(RequestKind::Mutation))
+                    .await?;
+                *authority
+            }
+            ParticipantCommand::Seal {
+                authority, txn, manifest, ..
+            } => {
+                let plan = self
+                    .status(*txn, *manifest)
+                    .await?
+                    .scoped_plan(scope, *txn, *manifest)
+                    .await?;
+                if plan.group != *group || plan.read_ts != scope.read_ts {
+                    return Err(invalid());
+                }
+                self.verify_pin(session, head, scope, Some(RequestKind::Mutation))
+                    .await?;
+                *authority
+            }
+            ParticipantCommand::Resolve { authority, .. }
+            | ParticipantCommand::Lifecycle(LifecycleCommand::Release { authority, .. }) => {
+                *authority
+            }
+            _ => return Err(invalid()),
+        };
+        let grant = service_grant(&self.proof.control, session, head).await?;
+        if grant.effective_authority != authority || grant.owner != Some(session.remote()) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     fn read_scope(
         shared: &WorkerSharedResources,
         session: &AuthenticatedSession,
@@ -185,7 +406,23 @@ impl ParticipantEndpoint {
         command: &ParticipantCommand,
         head: &Header,
     ) -> Result<(), ProtocolError> {
-        match command {
+        let scoped = match head.action {
+            ServiceAction::ScopedQueueExecute(scope) => {
+                self.validate_scoped_proposal(session, head, scope, command)
+                    .await?;
+                true
+            }
+            _ => false,
+        };
+        let validated = match command {
+            ParticipantCommand::PrepareTimestampPoint { page, .. }
+            | ParticipantCommand::RejectTimestampPoint { page, .. } if scoped => page.payload()?,
+            ParticipantCommand::PrepareTimestampPoint { .. }
+            | ParticipantCommand::RejectTimestampPoint { .. }
+            | ParticipantCommand::SealTimestampPoint { .. } if !scoped => return Err(invalid()),
+            _ => command,
+        };
+        match validated {
             ParticipantCommand::SplitFreeze { .. }
             | ParticipantCommand::SplitStage { .. }
             | ParticipantCommand::SplitImportPage { .. }
@@ -195,7 +432,7 @@ impl ParticipantEndpoint {
             }
             ParticipantCommand::PreparePage { txn, manifest, guards, .. } => {
                 self.check_status(*txn, *manifest)?;
-                if head.action != ServiceAction::Owner {
+                if !scoped && head.action != ServiceAction::Owner {
                     return Err(invalid());
                 }
                 for guard in guards.iter() {
@@ -222,7 +459,7 @@ impl ParticipantEndpoint {
                 }
             }
             ParticipantCommand::Seal { txn, manifest, .. } => {
-                if head.action != ServiceAction::Owner {
+                if !scoped && head.action != ServiceAction::Owner {
                     return Err(invalid());
                 }
                 self.check_status(*txn, *manifest)?;
@@ -257,7 +494,7 @@ impl ParticipantEndpoint {
                 }
             }
             ParticipantCommand::Lifecycle(LifecycleCommand::Release { guard, settled, .. }) => {
-                if head.action != ServiceAction::Owner {
+                if !scoped && head.action != ServiceAction::Owner {
                     return Err(invalid());
                 }
                 let binding = guard.binding();
@@ -325,15 +562,15 @@ impl ParticipantEndpoint {
                     return Err(invalid());
                 }
             }
-            ParticipantCommand::Fence { .. } => return Err(invalid()),
-            _ if head.action != ServiceAction::Owner => return Err(invalid()),
+            ParticipantCommand::Fence { .. }
+            | ParticipantCommand::FenceScopedQueue(_)
+            | ParticipantCommand::ResolveTimestampPoint { .. }
+            | ParticipantCommand::Scoped { .. } => return Err(invalid()),
+            _ if !scoped && head.action != ServiceAction::Owner => return Err(invalid()),
             _ => {}
         }
         if matches!(head.method, Method::ParticipantPropose { progress: true })
-            && matches!(
-                command,
-                ParticipantCommand::PreparePage { .. } | ParticipantCommand::SplitImportPage { .. }
-            )
+            && command.uses_prepare_lane()
         {
             return Err(invalid());
         }
@@ -347,6 +584,9 @@ fn proof_method(method: Method) -> bool {
             | Method::ParticipantResolution { .. }
             | Method::ParticipantGuard
             | Method::ParticipantIndexClosed { .. }
+            | Method::ParticipantTimestampPointSeal { .. }
+            | Method::ParticipantTimestampPointRejection { .. }
+            | Method::ParticipantTimestampPointResolution { .. }
     )
 }
 impl Endpoint for ParticipantEndpoint {
@@ -374,7 +614,11 @@ impl Endpoint for ParticipantEndpoint {
             Ok(ReceivePlan {
                 class: head.method.class(),
                 section_lengths: [head.payload_bytes, 0, 0],
-                decode_budget_bytes: 0,
+                decode_budget_bytes: if head.method == Method::ParticipantResolveTimestampPoint {
+                    timestamp_point::DECODE_BYTES
+                } else {
+                    0
+                },
             })
         })
     }
@@ -514,11 +758,44 @@ impl Endpoint for ParticipantEndpoint {
                             })
                             .await?;
                         let key = key.payload()?.0.clone();
-                        if let ServiceAction::ScopedCatalogRead(scope) = head.action {
-                            authorize(&self.proof.control, &session, &head).await?;
-                            self.proof.handle.read_scoped_catalog(scope, key).await
-                        } else {
-                            self.proof.handle.read_at(read_ts, key).await
+                        match head.action {
+                            ServiceAction::ScopedCatalogRead(scope) => {
+                                self.verify_pin(&session, &head, scope, None).await?;
+                                self.proof.handle.read_verified_scoped_catalog(scope, key).await
+                            }
+                            ServiceAction::ScopedQueueExecute(scope) => {
+                                if self.proof.handle.identity().kind == GroupKind::Catalog {
+                                    let current_route = current_catalog_route_hint(scope);
+                                    if scoped_admission_read(scope) {
+                                        let table_id = match &key {
+                                            MvccKey::CatalogRoutingRoot { table_id }
+                                            | MvccKey::CatalogRoutingPage { table_id, .. } => *table_id,
+                                            MvccKey::CatalogTable { table_id } if !current_route => *table_id,
+                                            _ => return Err(invalid()),
+                                        };
+                                        if table_id != scope.table_id {
+                                            return Err(invalid());
+                                        }
+                                    }
+                                    if current_route {
+                                        authorize(&self.proof.control, &session, &head).await?;
+                                    } else {
+                                        self.verify_pin(&session, &head, scope, None).await?;
+                                    }
+                                    self.proof.handle.read_verified_scoped_catalog(scope, key).await
+                                } else {
+                                    let kind = match &key {
+                                        MvccKey::Row { table_id, .. } if *table_id == scope.table_id => None,
+                                        MvccKey::IndexEntry { table_id, .. } if *table_id == scope.table_id => {
+                                            Some(RequestKind::Mutation)
+                                        }
+                                        _ => return Err(invalid()),
+                                    };
+                                    self.verify_pin(&session, &head, scope, kind).await?;
+                                    self.proof.handle.read_at(read_ts, key).await
+                                }
+                            }
+                            _ => self.proof.handle.read_at(read_ts, key).await,
                         }
                     }
                     Method::ParticipantReadPage => {
@@ -536,6 +813,17 @@ impl Endpoint for ParticipantEndpoint {
                                 }
                             })
                             .await?;
+                        if let ServiceAction::ScopedQueueExecute(scope) = head.action {
+                            let input = request.payload()?;
+                            if self.proof.handle.identity().group_id != scope.queue_group_id
+                                || input.read_ts != scope.read_ts || input.keys.len() != 1
+                                || !input.keys.iter().all(|key| matches!(key,
+                                    MvccKey::Row { table_id, .. } if *table_id == scope.table_id))
+                            {
+                                return Err(invalid());
+                            }
+                            self.verify_pin(&session, &head, scope, None).await?;
+                        }
                         let page = self.proof.handle.read_page(request).await?;
                         let shared = self.proof.shared.clone();
                         self.proof
@@ -616,6 +904,17 @@ impl Endpoint for ParticipantEndpoint {
                             })
                             .await
                     }
+                    Method::ParticipantScopedGuard { txn } => {
+                        let ServiceAction::ScopedQueueExecute(scope) = head.action else {
+                            return Err(invalid());
+                        };
+                        let guard = self.proof.handle.scoped_lifecycle_guard(scope, txn).await?
+                            .map(VerifiedLifecycleGuard::into_sealed);
+                        let shared = self.proof.shared.clone();
+                        self.proof.shared.execute(ExecutionClass::Control, self.proof.node, 0, move || {
+                            shared.encode_in(ByteClass::Progress, &guard, 16 << 10)
+                        }).await
+                    }
                     Method::ParticipantAcquire => {
                         let shared = self.proof.shared.clone();
                         let (binding, mode): (LifecycleBinding, GuardMode) = shared
@@ -631,10 +930,30 @@ impl Endpoint for ParticipantEndpoint {
                                 }
                             })
                             .await?;
+                        let scope = if let ServiceAction::ScopedQueueExecute(scope) = head.action {
+                            if self.proof.handle.identity().kind != GroupKind::Catalog
+                                || mode != GuardMode::Shared || binding.table_id != scope.table_id
+                                || binding.txn.request_id != scope.request.request_id
+                                || binding.txn.attempt != 1 || binding.request != scope.request
+                                || binding.read_ts != scope.read_ts
+                            {
+                                return Err(invalid());
+                            }
+                            self.verify_pin(&session, &head, scope, Some(RequestKind::Mutation)).await?;
+                            let grant = service_grant(&self.proof.control, &session, &head).await?;
+                            if grant.effective_authority != binding.authority
+                                || grant.owner != Some(session.remote())
+                            {
+                                return Err(invalid());
+                            }
+                            Some(scope)
+                        } else {
+                            None
+                        };
                         let value = self
                             .proof
                             .handle
-                            .acquire_lifecycle(binding, mode)
+                            .acquire_verified_lifecycle(binding, mode, scope)
                             .await?
                             .map(VerifiedLifecycleGuard::into_sealed);
                         let shared = self.proof.shared.clone();
@@ -650,20 +969,52 @@ impl Endpoint for ParticipantEndpoint {
                         expected,
                         next,
                     } => {
-                        let scope = crate::oltp_runtime::replica::QueueScope {
-                            cluster_id: session.group().cluster_id,
-                            database: session.group().database.clone(),
-                        };
-                        let grant = self
-                            .proof
-                            .control
-                            .service_role(
-                                &scope,
-                                session.remote(),
-                                head.action,
-                                session.group().clone(),
-                            )
-                            .await?;
+                        match head.action {
+                            ServiceAction::ParticipantProof { source_group } => {
+                                let transfer = self
+                                    .proof
+                                    .control
+                                    .scoped_queue_transition_for_replica(
+                                        source_group,
+                                        self.proof.handle.identity().group_id,
+                                    )
+                                    .await?
+                                    .ok_or_else(unavailable)?;
+                                if transfer.id != transition_id
+                                    || transfer.next.owner != session.remote()
+                                    || transfer.previous.view.authority() != expected
+                                    || transfer.next.view.authority() != next
+                                {
+                                    return Err(invalid());
+                                }
+                                let fence = QueueFence::for_transition(
+                                    self.proof.handle.identity(),
+                                    &transfer,
+                                )?;
+                                let receipt = self
+                                    .proof
+                                    .handle
+                                    .apply_scoped_queue_fence(fence)
+                                    .await?;
+                                return self.encode_scoped_fence(receipt).await;
+                            }
+                            ServiceAction::ScopedQueueFenceReceipt { queue_group_id, .. } => {
+                                authorize(&self.proof.control, &session, &head).await?;
+                                let receipt = self
+                                    .proof
+                                    .handle
+                                    .scoped_queue_fence(
+                                        queue_group_id,
+                                        transition_id,
+                                        expected,
+                                        next,
+                                    )
+                                    .await?;
+                                return self.encode_scoped_fence(receipt).await;
+                            }
+                            _ => {}
+                        }
+                        let grant = service_grant(&self.proof.control, &session, &head).await?;
                         if grant.effective_authority != next {
                             return Err(invalid());
                         }
@@ -679,6 +1030,9 @@ impl Endpoint for ParticipantEndpoint {
                                 shared.encode_in(ByteClass::Progress, &value, 128 << 10)
                             })
                             .await
+                    }
+                    Method::ParticipantResolveTimestampPoint => {
+                        self.resolve_timestamp_point(&session, &head, sections).await
                     }
                     Method::ParticipantPropose { progress } => {
                         let shared = self.proof.shared.clone();
@@ -710,7 +1064,12 @@ impl Endpoint for ParticipantEndpoint {
                             )
                             .await?;
                         self.validate(&session, command.payload()?, &head).await?;
-                        let value = self.proof.handle.propose(command).await?;
+                        let value = match head.action {
+                            ServiceAction::ScopedQueueExecute(scope) => {
+                                self.proof.handle.propose_verified_scoped(scope, command).await?
+                            }
+                            _ => self.proof.handle.propose(command).await?,
+                        };
                         let shared = self.proof.shared.clone();
                         self.proof
                             .shared
@@ -800,6 +1159,53 @@ impl ParticipantClient {
             proof: ParticipantProofClient::new(group, shared, transport, control, action)?,
         }))
     }
+    pub(crate) async fn verify_scoped_queue_fence(
+        &self,
+        transfer: &ScopedQueueTransition,
+    ) -> Result<(), ProtocolError> {
+        self.call_scoped_queue_fence(
+            transfer,
+            ServiceAction::ScopedQueueFenceReceipt {
+                queue_group_id: transfer.next.group.group_id,
+                transfer_id: transfer.id,
+            },
+        )
+        .await
+    }
+
+    async fn call_scoped_queue_fence(
+        &self,
+        transfer: &ScopedQueueTransition,
+        action: ServiceAction,
+    ) -> Result<(), ProtocolError> {
+        let client = &self.proof.client;
+        let fence = QueueFence::for_transition(&client.group, transfer)?;
+        let response = client
+            .call_as(
+                action,
+                Method::ParticipantFence {
+                    transition_id: transfer.id,
+                    expected: transfer.previous.view.authority(),
+                    next: transfer.next.view.authority(),
+                },
+                None,
+            )
+            .await?;
+        client
+            .shared
+            .execute(ExecutionClass::Control, 0, 0, move || {
+                let raw = response.reply.sections[0].as_ref().ok_or_else(invalid)?;
+                let receipt: QueueFenceReceipt =
+                    serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())?;
+                if receipt.verifies(fence) {
+                    Ok(())
+                } else {
+                    Err(unavailable())
+                }
+            })
+            .await
+    }
+
     async fn decoded<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         method: Method,
@@ -847,15 +1253,32 @@ impl ParticipantClient {
     }
 }
 impl RemoteParticipant for ParticipantClient {
+    fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Arc<dyn RemoteParticipant>, ProtocolError> {
+        let client = &self.proof.client;
+        Ok(Self::new(
+            client.group.clone(),
+            client.shared.clone(),
+            client.transport.clone(),
+            client.control.clone(),
+            ServiceAction::ScopedQueueExecute(scope),
+        )?)
+    }
     fn propose(
         &self,
         command: OwnedCommand<ParticipantCommand>,
     ) -> ParticipantFuture<'_, Applied<ParticipantReply>> {
         Box::pin(async move {
-            let progress = !matches!(
-                command.payload()?,
-                ParticipantCommand::PreparePage { .. } | ParticipantCommand::SplitImportPage { .. }
-            );
+            let progress = !command.payload()?.uses_prepare_lane();
+            let limit = if progress {
+                128 << 10
+            } else if matches!(self.proof.client.action, ServiceAction::ScopedQueueExecute(_)) {
+                SCOPED_PREPARE_PAYLOAD_BYTES
+            } else {
+                MAX_FIXED_COMMAND_BYTES
+            };
             let shared = self.proof.client.shared.clone();
             let payload = self
                 .proof
@@ -877,11 +1300,7 @@ impl RemoteParticipant for ParticipantClient {
                                 ByteClass::Data
                             },
                             &command,
-                            if progress {
-                                128 << 10
-                            } else {
-                                MAX_FIXED_COMMAND_BYTES
-                            },
+                            limit,
                         )
                     },
                 )
@@ -892,6 +1311,14 @@ impl RemoteParticipant for ParticipantClient {
             Ok(Applied::owned(value.position, value.reply, owner))
         })
     }
+    fn resolve_timestamp_point(
+        &self,
+        authority: Authority,
+        locator: crate::oltp_replication::authority::status::TimestampDecisionLocator,
+    ) -> ParticipantFuture<'_, Applied<ParticipantReply>> {
+        Box::pin(self.resolve_point(authority, locator))
+    }
+
     fn read_at(&self, read_ts: ReadTs, key: MvccKey) -> ParticipantFuture<'_, ChargedBytes> {
         Box::pin(self.read_at_as(self.proof.client.action, read_ts, key, MAX_FIXED_COMMAND_BYTES))
     }
@@ -1222,6 +1649,31 @@ impl RemoteParticipant for ParticipantClient {
     ) -> ParticipantFuture<'_, VerifiedParticipantResolution> {
         Box::pin(async move { self.proof.resolution(txn, manifest).await })
     }
+    fn scoped_lifecycle_guard(
+        &self,
+        txn: TxnId,
+    ) -> ParticipantFuture<'_, Option<VerifiedLifecycleGuard>> {
+        Box::pin(async move {
+            use crate::oltp::mvcc::store::lifecycle::SealedLifecycleGuard;
+            let client = &self.proof.client;
+            let ServiceAction::ScopedQueueExecute(scope) = client.action else {
+                return Err(invalid());
+            };
+            let response = client.read(Method::ParticipantScopedGuard { txn }).await?;
+            let Some(guard) = (*response.reply.decode_section::<Option<SealedLifecycleGuard>>(0)?).clone() else {
+                return Ok(None);
+            };
+            let binding = guard.binding().clone();
+            if guard.mode() != GuardMode::Shared || binding.txn != txn || binding.table_id != scope.table_id
+                || binding.request != scope.request || binding.read_ts != scope.read_ts
+            {
+                return Err(invalid());
+            }
+            VerifiedLifecycleGuard::from_authenticated(
+                response.participant_context(ParticipantProofKind::Lifecycle)?, guard, &binding,
+            ).map(Some)
+        })
+    }
     fn strong_index_attempt_closed(
         &self,
         owner: MaintenanceOwnerRef,
@@ -1285,6 +1737,18 @@ impl RemoteParticipant for ParticipantClient {
                 .map(|(value, _)| value)
         })
     }
+    fn fence_scoped_queue<'a>(
+        &'a self,
+        transfer: &'a ScopedQueueTransition,
+    ) -> ParticipantFuture<'a, ()> {
+        Box::pin(self.call_scoped_queue_fence(
+            transfer,
+            ServiceAction::ParticipantProof {
+                source_group: transfer.next.group.group_id,
+            },
+        ))
+    }
+
     fn fence_current(
         &self,
         transition_id: uuid::Uuid,

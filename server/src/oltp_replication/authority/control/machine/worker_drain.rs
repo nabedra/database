@@ -160,6 +160,9 @@ pub(super) fn begin_removal(
     let Some(mut record) = load::<WorkerDrainRecord>(tx, &record_key(id))? else {
         return fault(Fault::NotFound);
     };
+    if scoped_queue::holds_scoped_queues(tx, state, record.intent.worker)? {
+        return fault(Fault::Busy);
+    }
     if record.phase != WorkerDrainPhase::Draining
         || state.ready != expected
         || state.ready.view.run_id != record.intent.run_id
@@ -224,6 +227,9 @@ pub(super) fn close(
     let Some(mut record) = load::<WorkerDrainRecord>(tx, &record_key(proof.id))? else {
         return fault(Fault::NotFound);
     };
+    if scoped_queue::holds_scoped_queues(tx, state, proof.worker)? {
+        return fault(Fault::Busy);
+    }
     let Some(registration) = registration(tx, proof.worker)? else {
         return fault(Fault::Unauthorized);
     };

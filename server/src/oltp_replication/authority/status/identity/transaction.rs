@@ -17,6 +17,7 @@ const TXNS: &[u8] = b"status/txn/";
 mod archive;
 pub(crate) mod archive_images;
 mod cold;
+pub(crate) mod timestamp_point;
 pub(crate) use archive::{
     ArchiveCursor, ArchivedDecision, ArchivedIdentity, ArchivedIdentityDisposition,
     CommittedArchivePage, IdentityArchiveCursor, IdentityArchivePage, StatusArchiveCutStatement,
@@ -105,6 +106,22 @@ pub(super) fn verify_terminal_in_apply(
     verify_terminal_transaction(state, decision, outcome)
 }
 
+pub(super) fn verify_settled_terminal_in_apply(
+    tx: &mut GroupTransaction<'_>,
+    decision: &DecisionStatement,
+    outcome: &MutationOutcome,
+) -> Result<(), ProtocolError> {
+    let state: Transaction = load(tx, &txn_key(b't', decision.txn, &[]))?.ok_or_else(unknown)?;
+    if state.resolved != state.expected
+        || state.settled_at.is_none_or(|position| {
+            position.term == 0 || position.index < decision.decided_at.index
+        })
+    {
+        return Err(unknown());
+    }
+    verify_terminal_transaction(Some(state), decision, outcome)
+}
+
 fn verify_terminal_transaction(
     state: Option<Transaction>,
     decision: &DecisionStatement,
@@ -126,22 +143,20 @@ pub(super) fn has_transaction(
     tx: &mut GroupTransaction<'_>,
     request_id: Uuid,
 ) -> Result<bool, ProtocolError> {
-    let mut prefix = txn_key(
-        b't',
-        TxnId {
-            request_id,
-            attempt: 0,
-        },
-        &[],
-    );
-    prefix.truncate(prefix.len() - 8);
     let mut found = false;
-    tx.scan_page(&prefix, None, 1, |_, _| {
+    tx.scan_page(&transaction_prefix(request_id), None, 1, |_, _| {
         found = true;
         Ok(())
     })?;
     Ok(found)
 }
+
+fn transaction_prefix(request_id: Uuid) -> Vec<u8> {
+    let mut prefix = txn_key(b't', TxnId { request_id, attempt: 0 }, &[]);
+    prefix.truncate(prefix.len() - 8);
+    prefix
+}
+
 fn root_step(prior: Digest, participant: &ParticipantPlan) -> Result<Digest, ProtocolError> {
     super::super::metadata_digest(
         b"nabedra/status-manifest-participant/v1\0",
@@ -218,6 +233,12 @@ pub(super) fn apply(
                 return reject(tx, StatusFault::InvalidBinding);
             }
             return commit(tx, StatusReply::Manifest(old.draft()));
+        }
+        // A scoped UUID has exactly one attempt and remains at its original
+        // Status home. A retry must recover that attempt instead of minting
+        // a second manifest after an ambiguous RPC.
+        if identity.reservation.scoped.is_some() && (*participant_count > 1 || txn.attempt != 1) {
+            return reject(tx, StatusFault::InvalidBinding);
         }
         let initial = super::super::metadata_digest(
             b"nabedra/status-manifest/v1\0",
@@ -617,6 +638,9 @@ impl StatusHandle {
         self.machine
             .store()
             .read_metadata(BUDGET, move |view| {
+                if read::<LocatedTimestampManifest>(view, &home_key(txn.request_id))?.is_some() {
+                    return Err(unknown());
+                }
                 let state: Transaction =
                     read(view, &txn_key(b't', txn, &[]))?.ok_or_else(unknown)?;
                 if state.manifest != Some(manifest) {
@@ -672,6 +696,13 @@ impl StatusHandle {
         &self,
         command: StatusCommand,
     ) -> Result<Applied<StatusReply>, ProtocolError> {
+        let command = match self.scoped {
+            Some(epoch) => StatusCommand::Scoped {
+                epoch,
+                command: Box::new(command),
+            },
+            None => command,
+        };
         let command = OwnedCommand::new_owned(
             command,
             self.machine.store().resources(),
@@ -834,7 +865,8 @@ impl StatusHandle {
         &self,
         txn: TxnId,
     ) -> Result<(Authority, Transaction), ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
+        let barrier = self.consensus.ensure_linearizable().await?;
+        let scope = self.identity().clone();
         let raw = self
             .machine
             .store()
@@ -842,6 +874,14 @@ impl StatusHandle {
                 let authority: Authority = read(view, STATE)?.ok_or_else(unknown)?;
                 let state: Transaction =
                     read(view, &txn_key(b't', txn, &[]))?.ok_or_else(unknown)?;
+                if let Some(home) = read::<LocatedTimestampManifest>(view, &home_key(txn.request_id))? {
+                    if home.locator.binding.txn != txn {
+                        return Err(unknown());
+                    }
+                    let identity = read::<IdentityRecord>(view, &key(IDENTITIES, txn.request_id))?
+                        .ok_or_else(unknown)?;
+                    projection::verify_in_read(view, &scope, &identity, &home, authority, Some(barrier.applied))?;
+                }
                 view.encode(&(authority, state))
             })
             .await?;
@@ -894,12 +934,15 @@ impl StatusHandle {
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
         let txn = permit.statement().txn;
         let manifest = permit.statement().manifest;
-        self.submit(StatusCommand::DecideCommit {
+        let applied = self.submit(StatusCommand::DecideCommit {
             authority,
             permit,
             stamp,
         })
         .await?;
+        if applied.reply == StatusReply::Rejected(StatusFault::TransitionConflict) {
+            return Err(timestamp_point::mode_conflict());
+        }
         self.lookup_decision(txn, manifest)
             .await?
             .ok_or_else(unknown)
@@ -911,13 +954,16 @@ impl StatusHandle {
         reason: AbortReason,
         error: ProtocolError,
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
-        self.submit(StatusCommand::Abort {
+        let applied = self.submit(StatusCommand::Abort {
             authority,
             txn,
             reason,
             outcome: MutationOutcome::failure(error)?,
         })
         .await?;
+        if applied.reply == StatusReply::Rejected(StatusFault::TransitionConflict) {
+            return Err(timestamp_point::mode_conflict());
+        }
         let (_, state) = self.read_transaction(txn).await?;
         VerifiedStatusDecision::with_outcome(
             state.decision.ok_or_else(unknown)?,
@@ -930,6 +976,27 @@ impl StatusHandle {
         txn: TxnId,
         manifest: ManifestRef,
     ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
+        if manifest.participant_count == 0 && txn.attempt == 1 {
+            if let Some(IdentityLookup::Terminal(TerminalIdentity::Failed {
+                reservation,
+                request,
+                outcome,
+                ..
+            })) = self.lookup_identity(txn.request_id, None).await?
+                && reservation.scoped.is_some()
+            {
+                let proof = self.failure_settled_proof(txn, request).await?;
+                if proof.statement().manifest != manifest {
+                    return Err(invalid());
+                }
+                return VerifiedStatusDecision::with_outcome(
+                    proof.statement().decision.clone(),
+                    outcome,
+                    None,
+                )
+                .map(Some);
+            }
+        }
         let (_, state) = self.read_transaction(txn).await?;
         if state.manifest != Some(manifest) {
             return Err(invalid());
@@ -1162,6 +1229,31 @@ impl TransactionInspection {
     }
 }
 impl StatusHandle {
+    pub(crate) async fn scoped_transaction_matches(
+        &self,
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        txn: TxnId,
+    ) -> Result<bool, ProtocolError> {
+        self.consensus.ensure_linearizable().await?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let state: Option<Transaction> = read(view, &txn_key(b't', txn, &[]))?;
+                if let Some(state) = &state {
+                    if state.txn != txn
+                        || state.request != scope.request
+                        || state.read_ts != scope.read_ts
+                    {
+                        return Err(invalid());
+                    }
+                }
+                view.encode(&state.is_some())
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| unknown())
+    }
+
     pub(crate) async fn inspect_transaction(
         &self,
         txn: TxnId,

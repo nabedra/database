@@ -16,6 +16,7 @@ pub(crate) use admission::{
     AdmissionTicketIssuer, OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket,
 };
 pub(crate) use status_service::{StatusClient, StatusEndpoint};
+pub(crate) use timestamp_service::VerifiedTimestampPointDecision;
 pub(crate) use timestamp_service::{BackupPublicationReader, TimestampClient, TimestampEndpoint};
 
 const LIMIT: usize = 128 << 10;
@@ -131,6 +132,22 @@ impl AuthenticatedMetadataReply {
     pub(crate) fn group(&self) -> &GroupIdentity {
         &self.group
     }
+    fn timestamp_point_decision(
+        &self,
+        expected: Method,
+        group: &GroupIdentity,
+        value: &impl Serialize,
+    ) -> Result<(), ProtocolError> {
+        if !matches!(expected, Method::TimestampPointDecisionRead { .. })
+            || self.method != expected
+            || &self.group != group
+            || self.group.kind != GroupKind::Timestamps
+            || serialized_digest(value)? != self.digest
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub(crate) fn owner(&self) -> Arc<ScratchLease> {
         self.owner.clone()
     }
@@ -139,7 +156,9 @@ impl ServiceResponse {
     fn metadata_context(&self) -> Result<AuthenticatedMetadataReply, ProtocolError> {
         if !matches!(
             self.method,
-            Method::StatusCall { .. } | Method::TimestampCall { .. }
+            Method::StatusCall { .. }
+                | Method::TimestampCall { .. }
+                | Method::TimestampPointDecisionRead { .. }
         ) || self.node == 0
             || self.reply.nonce().is_nil()
             || self.reply.remote_identity().validate().is_err()

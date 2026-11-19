@@ -1,6 +1,12 @@
 //! Participant proof reads execute on the actual group leader. A Status/TSO
 //! replica can request only the proof methods authorized by current Control.
 use super::*;
+
+#[path = "participant_timestamp_point.rs"]
+pub(super) mod timestamp_point;
+pub(crate) use timestamp_point::{
+    VerifiedTimestampPointRejection, VerifiedTimestampPointResolution, VerifiedTimestampPointSeal,
+};
 use crate::oltp::mvcc::store::{
     ParticipantHandle, ResolutionEvidence, VerifiedParticipantResolution, VerifiedParticipantSeal,
     index::{IndexClosureReply, VerifiedIndexAttemptClosed},
@@ -38,10 +44,21 @@ impl ParticipantProofEndpoint {
     fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
         let header = parse(session, self.handle.identity(), self.node, bytes)?;
         let permitted = match header.method {
-            Method::ParticipantSeal { manifest, .. }
-            | Method::ParticipantResolution { manifest, .. } => {
+            Method::ParticipantSeal { txn, manifest }
+            | Method::ParticipantResolution { txn, manifest } => {
                 matches!(header.action, ServiceAction::Owner)
                     || matches!(header.action,ServiceAction::StatusProof{source_group} if source_group==manifest.status_group_id)
+                    || matches!(header.action, ServiceAction::ScopedQueueExecute(scope)
+                        if scope.queue_group_id == self.handle.identity().group_id
+                            && txn.request_id == scope.request.request_id && txn.attempt == 1)
+            }
+            Method::ParticipantTimestampPointSeal { .. } | Method::ParticipantTimestampPointRejection { .. } => {
+                matches!(self.handle.identity().kind, GroupKind::Data { .. })
+                    && matches!(header.action, ServiceAction::TimestampProof { .. })
+            }
+            Method::ParticipantTimestampPointResolution { .. } => {
+                matches!(self.handle.identity().kind, GroupKind::Data { .. })
+                    && matches!(header.action, ServiceAction::StatusProof { .. })
             }
             Method::ParticipantGuard => {
                 self.handle.identity().kind == GroupKind::Catalog
@@ -77,7 +94,12 @@ impl Endpoint for ParticipantProofEndpoint {
             Ok(ReceivePlan {
                 class: TrafficClass::ServiceAuthority,
                 section_lengths: [header.payload_bytes, 0, 0],
-                decode_budget_bytes: 0,
+                decode_budget_bytes: match header.method {
+                    Method::ParticipantTimestampPointSeal { .. }
+                    | Method::ParticipantTimestampPointRejection { .. }
+                    | Method::ParticipantTimestampPointResolution { .. } => timestamp_point::DECODE_BYTES,
+                    _ => 0,
+                },
             })
         })
     }
@@ -93,6 +115,11 @@ impl Endpoint for ParticipantProofEndpoint {
                 match header.method {
                     Method::ParticipantSeal { txn, manifest } => {
                         let proof = self.handle.strong_seal(txn, manifest).await?;
+                        if let ServiceAction::ScopedQueueExecute(scope) = header.action
+                            && proof.evidence().participant.read_ts != scope.read_ts
+                        {
+                            return Err(invalid());
+                        }
                         let shared = self.shared.clone();
                         self.shared
                             .execute(ExecutionClass::Control, self.node, 0, move || {
@@ -102,12 +129,22 @@ impl Endpoint for ParticipantProofEndpoint {
                     }
                     Method::ParticipantResolution { txn, manifest } => {
                         let proof = self.handle.strong_resolution(txn, manifest).await?;
+                        if let ServiceAction::ScopedQueueExecute(scope) = header.action
+                            && proof.evidence().request != scope.request
+                        {
+                            return Err(invalid());
+                        }
                         let shared = self.shared.clone();
                         self.shared
                             .execute(ExecutionClass::Control, self.node, 0, move || {
                                 shared.encode_in(ByteClass::Progress, proof.evidence(), 128 << 10)
                             })
                             .await
+                    }
+                    Method::ParticipantTimestampPointSeal { .. }
+                    | Method::ParticipantTimestampPointRejection { .. }
+                    | Method::ParticipantTimestampPointResolution { .. } => {
+                        self.read_point_evidence(&session, &header, sections).await
                     }
                     Method::ParticipantGuard => {
                         let shared = self.shared.clone();

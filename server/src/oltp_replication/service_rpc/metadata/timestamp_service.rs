@@ -1,12 +1,22 @@
-use crate::oltp_replication::authority::status::StatusTopology;
 use super::*;
 use crate::oltp_replication::authority::proof::SealedTerminalProof;
 use crate::oltp_replication::authority::timestamp::{
-    IndexMetadataPin, VerifiedArchiveClosure, archive::ArchiveClosureStatement,
+    IndexMetadataPin, PointDecision, ScopedAdmissionClosure, ScopedCopyProof, ScopedPinRelease,
+    ScopedTerminalStatement, ScopedTimestampEpoch, TimestampDecisionLocator, TimestampPointBinding,
+    VerifiedArchiveClosure,
+    archive::ArchiveClosureStatement,
     cold::{ColdPinCursor, ColdPinStep},
 };
+use crate::oltp_replication::authority::{
+    control::{ScopedCatalogRead, ScopedQueuePlacement, ScopedQueueTransition},
+    status::StatusTopology,
+};
+use crate::oltp_runtime::replica::OriginalAuthorization;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+mod point_decision;
+pub(crate) use point_decision::VerifiedTimestampPointDecision;
 
 // The owner shares the four outgoing service mutation slots with foreground
 // timestamp and Status operations. Cleanup can occupy at most two of them.
@@ -64,14 +74,75 @@ enum Request {
         pin: StoragePin,
         request: RequestBinding,
     },
+    BeginScoped {
+        view: AuthorityView,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+        origin: OriginalAuthorization,
+    },
+    BindScoped {
+        view: AuthorityView,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+    },
+    CloseSupersededScopedAdmission {
+        view: AuthorityView,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+        pin: StoragePin,
+    },
+    ScopedAdmissionClosure {
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+    },
     ScopedSnapshot {
         identity: PinIdentity,
         pin: StoragePin,
         request: RequestBinding,
         reservation: IdentityReservation,
     },
+    ScopedReadPin {
+        scope: ScopedCatalogRead,
+        kind: Option<RequestKind>,
+        admission_read: bool,
+    },
+    ReleaseScoped {
+        statement: ScopedTerminalStatement,
+    },
+    ConfirmedScopedRelease {
+        statement: ScopedTerminalStatement,
+    },
+    ScopedCopyProof {
+        statement: ScopedTerminalStatement,
+    },
+    FenceScopedQueue {
+        group_id: Uuid,
+        transition_id: Uuid,
+    },
+    ScopedQueueFenceReceipt {
+        transition_id: Uuid,
+        previous: ScopedTimestampEpoch,
+        next: ScopedTimestampEpoch,
+    },
     Allocate {
         permit: SealedCommitPermit,
+    },
+    VerifyTimestampPointPin(Box<TimestampPointBinding>),
+    CommitTimestampPoint {
+        locator: TimestampDecisionLocator,
+        reconcile: bool,
+    },
+    AbortTimestampPoint {
+        locator: TimestampDecisionLocator,
+        reconcile: bool,
+    },
+    ObserveTimestampPoint {
+        locator: TimestampDecisionLocator,
+    },
+    AbandonTimestampPoint {
+        locator: TimestampDecisionLocator,
+        transition_id: Uuid,
     },
     Allocation {
         permit: SealedCommitPermit,
@@ -156,6 +227,21 @@ impl Request {
             Self::IndexMetadataPin { .. } => 23,
             Self::ColdPins { .. } => 24,
             Self::ScopedSnapshot { .. } => 25,
+            Self::ScopedReadPin { .. } => 26,
+            Self::ReleaseScoped { .. } => 27,
+            Self::ScopedCopyProof { .. } => 28,
+            Self::FenceScopedQueue { .. } => 29,
+            Self::ScopedQueueFenceReceipt { .. } => 30,
+            Self::ConfirmedScopedRelease { .. } => 31,
+            Self::CommitTimestampPoint { .. } => 32,
+            Self::ObserveTimestampPoint { .. } => 33,
+            Self::AbandonTimestampPoint { .. } => 34,
+            Self::AbortTimestampPoint { .. } => 35,
+            Self::VerifyTimestampPointPin(_) => 36,
+            Self::BeginScoped { .. } => 37,
+            Self::BindScoped { .. } => 38,
+            Self::CloseSupersededScopedAdmission { .. } => 39,
+            Self::ScopedAdmissionClosure { .. } => 40,
             Self::ImportMetadata { .. } => 12,
             Self::ReleaseMetadata { .. } => 13,
             Self::Backup { .. } => 14,
@@ -173,6 +259,13 @@ impl Request {
                     | Self::ArchiveMetadata { .. }
                     | Self::IndexMetadataPin { .. }
                     | Self::ScopedSnapshot { .. }
+                    | Self::ScopedReadPin { .. }
+                    | Self::ScopedCopyProof { .. }
+                    | Self::ScopedQueueFenceReceipt { .. }
+                    | Self::ConfirmedScopedRelease { .. }
+                    | Self::ObserveTimestampPoint { .. }
+                    | Self::VerifyTimestampPointPin(_)
+                    | Self::ScopedAdmissionClosure { .. }
             ),
         }
     }
@@ -238,6 +331,77 @@ impl TimestampEndpoint {
                 matches!(head.action, ServiceAction::ScopedQueueRead { .. })
                     && head.placement_generation.is_none()
             }
+            Method::TimestampCall {
+                operation: 26,
+                mutation: false,
+            } => matches!(
+                head.action,
+                ServiceAction::StatusProof { .. }
+                    | ServiceAction::ParticipantProof { .. }
+                    | ServiceAction::ScopedQueueExecute(_)
+            ),
+            Method::TimestampCall {
+                operation: 1 | 2,
+                mutation: true,
+            } => head.action == ServiceAction::Owner,
+            Method::TimestampCall {
+                operation: 37 | 38 | 39,
+                mutation: true,
+            } => {
+                head.placement_generation.is_none()
+                    && matches!(head.action, ServiceAction::ScopedQueueReserve { .. })
+            }
+            Method::TimestampCall {
+                operation: 40,
+                mutation: false,
+            } => {
+                head.placement_generation.is_none()
+                    && matches!(
+                        head.action,
+                        ServiceAction::StatusProof { .. } | ServiceAction::ScopedQueueRead { .. }
+                    )
+            }
+            Method::TimestampCall {
+                operation: 3,
+                mutation: true,
+            } => matches!(
+                head.action,
+                ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
+            ),
+            Method::TimestampCall { operation: 27, mutation: true } => {
+                matches!(head.action, ServiceAction::ScopedQueueReserve { .. })
+            }
+            Method::TimestampCall { operation: 28, mutation: false } => {
+                matches!(head.action, ServiceAction::StatusProof { .. })
+            }
+            Method::TimestampCall { operation: 29, mutation: true } => {
+                matches!(head.action, ServiceAction::ParticipantProof { .. })
+            }
+            Method::TimestampCall { operation: 30, mutation: false } => {
+                matches!(head.action, ServiceAction::ScopedQueueFenceReceipt { .. })
+            }
+            Method::TimestampCall { operation: 31, mutation: false } => {
+                matches!(head.action, ServiceAction::ScopedQueueRead { .. })
+            }
+            Method::TimestampCall { operation: 32 | 35, mutation: true } => {
+                matches!(head.action, ServiceAction::ScopedQueueExecute(_))
+            }
+            Method::TimestampCall { operation: 33, mutation: false } => {
+                matches!(head.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
+            }
+            Method::TimestampCall { operation: 36, mutation: false } => {
+                matches!(head.action, ServiceAction::StatusProof { source_group }
+                    if self.status.groups().iter().any(|status| status.group_id == source_group))
+            }
+            Method::TimestampPointDecisionRead { route, .. } => {
+                head.placement_generation.is_none()
+                    && matches!(
+                        head.action,
+                        ServiceAction::ParticipantProof { source_group }
+                            | ServiceAction::StatusProof { source_group }
+                            if source_group == route.source_group
+                    )
+            }
             Method::TimestampCall { .. } => head.action == ServiceAction::Owner,
             _ => false,
         };
@@ -273,6 +437,67 @@ impl TimestampEndpoint {
             _ => Err(invalid()),
         }
     }
+    async fn snapshot_epoch(
+        &self,
+        session: &AuthenticatedSession,
+        head: &Header,
+        view: AuthorityView,
+        identity: &PinIdentity,
+    ) -> Result<ScopedTimestampEpoch, ProtocolError> {
+        let ServiceAction::ScopedQueueReserve {
+            queue_group_id,
+            queue_generation,
+            queue_view,
+            request_id,
+        } = head.action
+        else {
+            return Err(invalid());
+        };
+        let (grant, placement) = tokio::try_join!(
+            service_grant(&self.control, session, head),
+            self.control.scoped_queue_by_id(queue_group_id),
+        )?;
+        let placement = placement.ok_or_else(stale_service_route)?;
+        if grant.ready.view != view
+            || grant.owner != Some(session.remote())
+            || grant.effective_authority != view.authority()
+            || placement.owner != session.remote()
+            || placement.queue_generation != queue_generation
+            || placement.view != queue_view
+            || request_id != identity.request_id
+            || identity.run_id != queue_view.run_id
+            || queue_view.run_id != view.run_id
+        {
+            return Err(stale_service_route());
+        }
+        ScopedTimestampEpoch::from_placement(&placement)
+    }
+
+    async fn scoped_placement(
+        &self,
+        statement: &ScopedTerminalStatement,
+    ) -> Result<ScopedQueuePlacement, ProtocolError> {
+        let placement = self.control.scoped_queue_by_id(statement.epoch.queue_group_id)
+            .await?
+            .ok_or_else(unavailable)?;
+        statement.for_placement(&placement)?;
+        Ok(placement)
+    }
+
+    async fn pending_scoped_transfer(
+        &self,
+        group_id: Uuid,
+        transition_id: Uuid,
+    ) -> Result<ScopedQueueTransition, ProtocolError> {
+        let transfer = self.control.scoped_queue_transition_for_replica(group_id, self.handle.identity().group_id).await?
+            .filter(|transfer| transfer.id == transition_id)
+            .ok_or_else(unavailable)?;
+        if transfer.basis()?.is_none() {
+            return Err(invalid());
+        }
+        Ok(transfer)
+    }
+
     async fn dispatch(
         &self,
         session: &AuthenticatedSession,
@@ -444,11 +669,49 @@ impl TimestampEndpoint {
                     .await?;
                 encode(shared, step).await
             }
+            Request::ScopedReadPin {
+                scope,
+                kind,
+                admission_read,
+            } => {
+                let home = self.status.request(scope.request.request_id);
+                match head.action {
+                    ServiceAction::StatusProof { source_group }
+                        if source_group == home.group_id && !admission_read => {}
+                    ServiceAction::ParticipantProof { source_group } => {
+                        let source = registered_target(&self.control, source_group).await?;
+                        if admission_read
+                            && (source.kind != GroupKind::Catalog
+                                || kind.is_some()
+                                || !scoped_admission_read(scope))
+                        {
+                            return Err(invalid());
+                        }
+                        if source.kind != GroupKind::Catalog
+                            && (source.group_id != scope.queue_group_id
+                                || !matches!(source.kind, GroupKind::Data { table_id, .. }
+                                    if table_id == scope.table_id))
+                        {
+                            return Err(invalid());
+                        }
+                    }
+                    ServiceAction::ScopedQueueExecute(expected)
+                        if expected == scope && !admission_read => {}
+                    _ => return Err(invalid()),
+                }
+                self.handle
+                    .verify_scoped_read_pin(scope, home.group_id, kind, admission_read)
+                    .await?;
+                encode(shared, ()).await
+            }
             Request::Begin {
                 view,
                 identity,
                 reservation,
             } => {
+                if reservation.scoped.is_some() {
+                    return Err(invalid());
+                }
                 self.reservation(reservation).await?;
                 encode(
                     shared,
@@ -464,14 +727,141 @@ impl TimestampEndpoint {
                 pin,
                 request,
             } => {
+                // The pin's policy is immutable once allocated.
+                self.handle
+                    .verify_snapshot_policy(identity.clone(), pin, None)
+                    .await?;
                 self.handle
                     .bind_snapshot_context(view, identity, pin, request)
                     .await?;
                 encode(shared, ()).await
             }
+            Request::BeginScoped {
+                view,
+                identity,
+                reservation,
+                origin,
+            } => {
+                let epoch = self.snapshot_epoch(session, head, view, &identity).await?;
+                if reservation.scoped != Some(ScopedAdmission {
+                    protocol_version: ScopedAdmission::VERSION,
+                    queue_group_id: epoch.queue_group_id,
+                    queue_generation: epoch.queue_generation,
+                    status_group_id: self.status.request(identity.request_id).group_id,
+                }) {
+                    return Err(invalid());
+                }
+                self.reservation(reservation).await?;
+                encode(
+                    shared,
+                    self.handle
+                        .begin_scoped_snapshot_with_origin(view, identity, reservation, epoch, origin)
+                        .await?,
+                )
+                .await
+            }
+            Request::BindScoped {
+                view,
+                identity,
+                pin,
+                request,
+            } => {
+                let epoch = self.snapshot_epoch(session, head, view, &identity).await?;
+                self.handle
+                    .bind_scoped_snapshot_context(view, identity, pin, request, epoch)
+                    .await?;
+                encode(shared, ()).await
+            }
+            Request::CloseSupersededScopedAdmission {
+                view,
+                identity,
+                reservation,
+                pin,
+            } => {
+                let epoch = self.snapshot_epoch(session, head, view, &identity).await?;
+                encode(
+                    shared,
+                    self.handle
+                        .close_superseded_scoped_admission(view, identity, reservation, pin, epoch)
+                        .await?,
+                )
+                .await
+            }
+            Request::ScopedAdmissionClosure {
+                identity,
+                reservation,
+            } => {
+                let scoped = reservation.scoped.ok_or_else(invalid)?;
+                if identity.run_id != reservation.original_run
+                    || identity.request_id != reservation.request_id
+                    || identity.digest != reservation.digest
+                    || identity.nonce != reservation.reservation_id
+                    || scoped.protocol_version != ScopedAdmission::VERSION
+                    || scoped.status_group_id != self.status.request(identity.request_id).group_id
+                {
+                    return Err(invalid());
+                }
+                match head.action {
+                    ServiceAction::StatusProof { source_group }
+                        if source_group == scoped.status_group_id => {}
+                    ServiceAction::ScopedQueueRead {
+                        queue_group_id,
+                        queue_generation,
+                        queue_view,
+                        request_id,
+                    } if queue_group_id == scoped.queue_group_id
+                        && queue_generation == scoped.queue_generation
+                        && queue_view.run_id == identity.run_id
+                        && request_id == identity.request_id => {}
+                    _ => return Err(invalid()),
+                }
+                let closure = self
+                    .handle
+                    .scoped_admission_closure(identity, reservation)
+                    .await?;
+                authorize(&self.control, session, head).await?;
+                Ok(closure)
+            }
+            Request::VerifyTimestampPointPin(binding) => {
+                self.verify_point_pin(session, head, *binding).await
+            }
+            Request::CommitTimestampPoint { locator, reconcile } => {
+                self.decide_point(
+                    session, head, &locator, point_decision::PointOperation::Commit, reconcile,
+                ).await
+            }
+            Request::AbortTimestampPoint { locator, reconcile } => {
+                self.decide_point(
+                    session, head, &locator, point_decision::PointOperation::Abort, reconcile,
+                ).await
+            }
+            Request::ObserveTimestampPoint { locator } => {
+                self.observe_point(session, head, locator).await
+            }
+            Request::AbandonTimestampPoint { locator, transition_id } => {
+                self.abandon_point(session, head, &locator, transition_id).await
+            }
             Request::Allocate { permit } => {
                 let statement = permit.statement();
                 let group = self.status.manifest(statement.txn, statement.manifest)?;
+                if let ServiceAction::ScopedQueueExecute(scope) = head.action {
+                    let grant = service_grant(&self.control, session, head).await?;
+                    if grant.owner != Some(session.remote())
+                        || grant.effective_authority != statement.authority
+                        || scope.request != statement.request
+                        || scope.read_ts != statement.read_ts
+                    {
+                        return Err(invalid());
+                    }
+                    self.handle
+                        .verify_scoped_read_pin(
+                            scope,
+                            group.group_id,
+                            Some(RequestKind::Mutation),
+                            false,
+                        )
+                        .await?;
+                }
                 let actual = self
                     .status_client(group)
                     .await?
@@ -489,6 +879,71 @@ impl TimestampEndpoint {
                     return Err(invalid());
                 }
                 encode(shared, self.handle.confirmed_allocation(permit).await?).await
+            }
+            Request::ReleaseScoped { statement } => {
+                if head.action != scoped_retirement_owner(&statement) {
+                    return Err(invalid());
+                }
+                let placement = self.scoped_placement(&statement).await?;
+                if placement.owner != session.remote() {
+                    return Err(invalid());
+                }
+                if let Some(release) = self.handle.confirmed_scoped_release(statement.clone()).await? {
+                    return encode(shared, release).await;
+                }
+                let proof = self.handle.witness_scoped_terminal(&placement, statement.clone()).await?;
+                let status = self.status_client(self.status.request(statement.request.request_id)).await?;
+                let marker = status.record_scoped_retirement(statement.clone()).await?;
+                if marker.proof != proof || self.scoped_placement(&statement).await? != placement {
+                    return Err(unavailable());
+                }
+                encode(shared, self.handle.complete_scoped_release(marker).await?).await
+            }
+            Request::ConfirmedScopedRelease { statement } => {
+                if head.action != scoped_retirement_holder(&statement) {
+                    return Err(invalid());
+                }
+                let placement = self.scoped_placement(&statement).await?;
+                if !placement.has_holder(session.remote()) {
+                    return Err(invalid());
+                }
+                encode(shared, self.handle.confirmed_scoped_release(statement).await?).await
+            }
+            Request::ScopedCopyProof { statement } => {
+                let status = self.status.request(statement.request.request_id);
+                if head.action != (ServiceAction::StatusProof { source_group: status.group_id }) {
+                    return Err(invalid());
+                }
+                self.scoped_placement(&statement).await?;
+                let proof = self.handle.scoped_copy_proof(statement).await?.ok_or_else(unavailable)?;
+                encode(shared, proof).await
+            }
+            Request::FenceScopedQueue { group_id, transition_id } => {
+                if head.action != (ServiceAction::ParticipantProof { source_group: group_id }) {
+                    return Err(invalid());
+                }
+                let transfer = self.pending_scoped_transfer(group_id, transition_id).await?;
+                if transfer.next.owner != session.remote()
+                    || !has_installed_scoped_quorum(&transfer)
+                {
+                    return Err(invalid());
+                }
+                encode(shared, self.handle.fence_scoped_queue(
+                    transition_id,
+                    ScopedTimestampEpoch::from_placement(&transfer.previous)?,
+                    ScopedTimestampEpoch::from_placement(&transfer.next)?,
+                ).await?).await
+            }
+            Request::ScopedQueueFenceReceipt { transition_id, previous, next } => {
+                if next.queue_group_id != previous.queue_group_id
+                    || head.action != (ServiceAction::ScopedQueueFenceReceipt {
+                        queue_group_id: next.queue_group_id,
+                        transfer_id: transition_id,
+                    })
+                {
+                    return Err(invalid());
+                }
+                encode(shared, self.handle.scoped_queue_fence_receipt(transition_id, previous, next).await?).await
             }
             Request::Release { statement } => {
                 let release = self.handle.release(statement).await?;
@@ -701,6 +1156,21 @@ impl Endpoint for TimestampEndpoint {
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
             let head = self.parse(session, bytes)?;
+            if let Method::TimestampPointDecisionRead { route, source_digest, .. } = head.method {
+                tokio::time::timeout(
+                    SERVICE_CONVERGENCE,
+                    self.control.verify_timestamp_point_decision_route(
+                        session, self.node, route, head.action, source_digest,
+                    ),
+                )
+                .await
+                .map_err(|_| unavailable())??;
+                return Ok(ReceivePlan {
+                    class: head.method.class(),
+                    section_lengths: [head.payload_bytes, 0, 0],
+                    decode_budget_bytes: point_decision::LOCATOR_DECODE_BYTES,
+                });
+            }
             authorize(&self.control, session, &head).await?;
             Ok(ReceivePlan {
                 class: head.method.class(),
@@ -717,6 +1187,12 @@ impl Endpoint for TimestampEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let head = self.parse(&session, bytes.as_slice())?;
+            if let Method::TimestampPointDecisionRead { route, source_digest, locator_digest } = head.method {
+                let result = self.read_point_decision(
+                    sections, head.action, route, source_digest, locator_digest,
+                ).await;
+                return reply(self.handle.resources(), &session, self.node, result).await;
+            }
             let result = async {
                 let (request, owner) = decode(self.handle.resources(), sections).await?;
                 let result = self.dispatch(&session, &head, request).await;
@@ -728,6 +1204,49 @@ impl Endpoint for TimestampEndpoint {
         })
     }
 }
+fn scoped_retirement_owner(statement: &ScopedTerminalStatement) -> ServiceAction {
+    ServiceAction::ScopedQueueReserve {
+        queue_group_id: statement.epoch.queue_group_id,
+        queue_generation: statement.epoch.queue_generation,
+        queue_view: statement.epoch.view,
+        request_id: statement.request.request_id,
+    }
+}
+
+fn scoped_retirement_holder(statement: &ScopedTerminalStatement) -> ServiceAction {
+    ServiceAction::ScopedQueueRead {
+        queue_group_id: statement.epoch.queue_group_id,
+        queue_generation: statement.epoch.queue_generation,
+        queue_view: statement.epoch.view,
+        request_id: statement.request.request_id,
+    }
+}
+
+fn has_installed_scoped_quorum(transfer: &ScopedQueueTransition) -> bool {
+    let Some(index) = transfer.next.members.iter().position(|member| *member == transfer.next.owner)
+    else {
+        return false;
+    };
+    transfer.installed[index].is_some_and(|owner_report| {
+        transfer.installed.iter().zip(transfer.next.members).filter(|(report, worker)| {
+            transfer.next.has_holder(*worker) && **report == Some(owner_report)
+        }).count() >= 2
+    })
+}
+
+fn verify_scoped_fence_reply(
+    transfer: &ScopedQueueTransition,
+    reply: &TimestampReply,
+) -> Result<(), ProtocolError> {
+    let epoch = ScopedTimestampEpoch::from_placement(&transfer.next)?;
+    match reply {
+        TimestampReply::ScopedQueueFenced { transition_id, epoch: stored, applied_at }
+            if *transition_id == transfer.id && *stored == epoch
+                && applied_at.term != 0 && applied_at.index != 0 => Ok(()),
+        _ => Err(unavailable()),
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TimestampClient {
     client: Arc<Client>,
@@ -844,6 +1363,172 @@ impl TimestampClient {
         })
         .await
     }
+    async fn scoped_snapshot_value<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        placement: &ScopedQueuePlacement,
+        request_id: Uuid,
+        request: Request,
+    ) -> Result<T, ProtocolError> {
+        let action = ServiceAction::ScopedQueueReserve {
+            queue_group_id: placement.group.group_id,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request_id,
+        };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        Ok(self
+            .client
+            .call_as(action, method, Some(payload))
+            .await?
+            .decoded(&self.client.shared)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn begin_scoped_snapshot_with_origin(
+        &self,
+        placement: &ScopedQueuePlacement,
+        view: AuthorityView,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+        origin: OriginalAuthorization,
+    ) -> Result<(StoragePin, OriginalAuthorization), ProtocolError> {
+        self.scoped_snapshot_value(
+            placement,
+            identity.request_id,
+            Request::BeginScoped {
+                view,
+                identity,
+                reservation,
+                origin,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn bind_scoped_snapshot_context(
+        &self,
+        placement: &ScopedQueuePlacement,
+        view: AuthorityView,
+        identity: PinIdentity,
+        pin: StoragePin,
+        request: RequestBinding,
+    ) -> Result<(), ProtocolError> {
+        self.scoped_snapshot_value(
+            placement,
+            identity.request_id,
+            Request::BindScoped {
+                view,
+                identity,
+                pin,
+                request,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn close_superseded_scoped_admission(
+        &self,
+        placement: &ScopedQueuePlacement,
+        view: AuthorityView,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+        pin: StoragePin,
+    ) -> Result<ScopedAdmissionClosure, ProtocolError> {
+        self.scoped_snapshot_value(
+            placement,
+            identity.request_id,
+            Request::CloseSupersededScopedAdmission {
+                view,
+                identity,
+                reservation,
+                pin,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn lookup_scoped_admission_closure(
+        &self,
+        placement: &ScopedQueuePlacement,
+        identity: PinIdentity,
+        reservation: IdentityReservation,
+    ) -> Result<Option<ScopedAdmissionClosure>, ProtocolError> {
+        let action = ServiceAction::ScopedQueueRead {
+            queue_group_id: placement.group.group_id,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request_id: identity.request_id,
+        };
+        let request = Request::ScopedAdmissionClosure {
+            identity,
+            reservation,
+        };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        Ok(self
+            .client
+            .call_as(action, method, Some(payload))
+            .await?
+            .decoded(&self.client.shared)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn verify_scoped_admission_closure(
+        &self,
+        closure: &ScopedAdmissionClosure,
+    ) -> Result<(), ProtocolError> {
+        let scoped = closure.reservation.scoped.ok_or_else(invalid)?;
+        if self.client.action
+            != (ServiceAction::StatusProof {
+                source_group: scoped.status_group_id,
+            })
+        {
+            return Err(invalid());
+        }
+        let response = self
+            .response(Request::ScopedAdmissionClosure {
+                identity: closure.identity.clone(),
+                reservation: closure.reservation,
+            })
+            .await?;
+        let context = response.metadata_context()?;
+        let (actual, _): (Option<ScopedAdmissionClosure>, _) =
+            response.decoded(&self.client.shared).await?;
+        context.timestamp(40, &actual)?;
+        if actual.as_ref() != Some(closure) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_scoped_read_pin(
+        &self,
+        scope: ScopedCatalogRead,
+        kind: Option<RequestKind>,
+    ) -> Result<(), ProtocolError> {
+        self.value(Request::ScopedReadPin {
+            scope,
+            kind,
+            admission_read: false,
+        })
+        .await
+    }
+
+    pub(crate) async fn verify_scoped_admission_pin(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<(), ProtocolError> {
+        self.value(Request::ScopedReadPin {
+            scope,
+            kind: None,
+            admission_read: true,
+        })
+        .await
+    }
+
     pub(crate) async fn verify_scoped_snapshot(
         &self,
         placement: &crate::oltp_replication::authority::control::ScopedQueuePlacement,
@@ -885,6 +1570,106 @@ impl TimestampClient {
     ) -> Result<CommitStamp, ProtocolError> {
         self.value(Request::Allocation { permit }).await
     }
+    pub(crate) async fn release_scoped_terminal(
+        &self,
+        statement: ScopedTerminalStatement,
+    ) -> Result<ScopedPinRelease, ProtocolError> {
+        statement.validate()?;
+        let _release = self.releases.try_acquire().map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Overloaded,
+                "timestamp terminal release calls already in progress",
+                Outcome::NotApplied,
+            )
+        })?;
+        let action = scoped_retirement_owner(&statement);
+        let request = Request::ReleaseScoped { statement: statement.clone() };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        let response = self.client.call_as(action, method, Some(payload)).await?;
+        let context = response.metadata_context()?;
+        let (release, _): (ScopedPinRelease, _) = response.decoded(&self.client.shared).await?;
+        context.timestamp(27, &release)?;
+        release.validate(&statement)?;
+        Ok(release)
+    }
+
+    pub(crate) async fn confirm_scoped_terminal_release(
+        &self,
+        statement: ScopedTerminalStatement,
+    ) -> Result<Option<ScopedPinRelease>, ProtocolError> {
+        statement.validate()?;
+        let action = scoped_retirement_holder(&statement);
+        let request = Request::ConfirmedScopedRelease { statement: statement.clone() };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        let response = self.client.call_as(action, method, Some(payload)).await?;
+        let context = response.metadata_context()?;
+        let (release, _): (Option<ScopedPinRelease>, _) = response.decoded(&self.client.shared).await?;
+        context.timestamp(31, &release)?;
+        if let Some(release) = &release {
+            release.validate(&statement)?;
+        }
+        Ok(release)
+    }
+
+    pub(crate) async fn scoped_copy_proof(
+        &self,
+        statement: ScopedTerminalStatement,
+    ) -> Result<ScopedCopyProof, ProtocolError> {
+        let response = self.response(Request::ScopedCopyProof { statement: statement.clone() }).await?;
+        let context = response.metadata_context()?;
+        let (proof, _): (ScopedCopyProof, _) = response.decoded(&self.client.shared).await?;
+        context.timestamp(28, &proof)?;
+        proof.validate()?;
+        if proof.statement() != &statement {
+            return Err(invalid());
+        }
+        Ok(proof)
+    }
+
+    pub(crate) async fn fence_scoped_queue(
+        &self,
+        transfer: &ScopedQueueTransition,
+    ) -> Result<(), ProtocolError> {
+        let group_id = transfer.next.group.group_id;
+        let request = Request::FenceScopedQueue { group_id, transition_id: transfer.id };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        let response = self.client.call_as(
+            ServiceAction::ParticipantProof { source_group: group_id }, method, Some(payload),
+        ).await?;
+        let context = response.metadata_context()?;
+        let (applied, _): (Applied<TimestampReply>, _) = response.decoded(&self.client.shared).await?;
+        context.timestamp(29, &applied)?;
+        verify_scoped_fence_reply(transfer, &applied.reply)
+    }
+
+    pub(crate) async fn scoped_queue_fence_receipt(
+        &self,
+        transfer: &ScopedQueueTransition,
+    ) -> Result<Option<TimestampReply>, ProtocolError> {
+        let group_id = transfer.next.group.group_id;
+        let request = Request::ScopedQueueFenceReceipt {
+            transition_id: transfer.id,
+            previous: ScopedTimestampEpoch::from_placement(&transfer.previous)?,
+            next: ScopedTimestampEpoch::from_placement(&transfer.next)?,
+        };
+        let method = request.method();
+        let payload = encode(&self.client.shared, request).await?;
+        let response = self.client.call_as(
+            ServiceAction::ScopedQueueFenceReceipt { queue_group_id: group_id, transfer_id: transfer.id },
+            method, Some(payload),
+        ).await?;
+        let context = response.metadata_context()?;
+        let (proof, _): (Option<TimestampReply>, _) = response.decoded(&self.client.shared).await?;
+        context.timestamp(30, &proof)?;
+        if let Some(reply) = &proof {
+            verify_scoped_fence_reply(transfer, reply)?;
+        }
+        Ok(proof)
+    }
+
     pub(crate) async fn release(
         &self,
         statement: TerminalCopyStatement,
@@ -1170,6 +1955,45 @@ impl TimestampService for TimestampClient {
                 status.identity(),
             )
         })
+    }
+    fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Arc<dyn TimestampService>, ProtocolError> {
+        Ok(Self::new(
+            self.identity().clone(),
+            self.resources().clone(),
+            self.client.transport.clone(),
+            self.client.control.clone(),
+            ServiceAction::ScopedQueueExecute(scope),
+        )?)
+    }
+    fn commit_timestamp_point<'a>(
+        &'a self,
+        locator: &'a TimestampDecisionLocator,
+        reconcile: bool,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(TimestampClient::commit_timestamp_point(self, locator, reconcile))
+    }
+    fn abort_timestamp_point<'a>(
+        &'a self,
+        locator: &'a TimestampDecisionLocator,
+        reconcile: bool,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(TimestampClient::abort_timestamp_point(self, locator, reconcile))
+    }
+    fn observe_timestamp_point<'a>(
+        &'a self,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(PointDecision, Arc<ScratchLease>)>> {
+        Box::pin(TimestampClient::observe_timestamp_point(self, locator))
+    }
+    fn abandon_timestamp_point<'a>(
+        &'a self,
+        locator: &'a TimestampDecisionLocator,
+        transition_id: Uuid,
+    ) -> ConsensusFuture<'a, (PointDecision, Arc<ScratchLease>)> {
+        Box::pin(TimestampClient::abandon_timestamp_point(self, locator, transition_id))
     }
     fn identity(&self) -> &GroupIdentity {
         TimestampClient::identity(self)

@@ -20,7 +20,7 @@ mod read_attempt;
 pub(crate) use metadata::{
     AdmissionTicketIssuer, AuthenticatedMetadataReply, BackupPublicationReader,
     OwnerAdmissionObservation, OwnerAdmissionReader, OwnerAdmissionTicket, StatusClient,
-    StatusEndpoint, TimestampClient, TimestampEndpoint,
+    StatusEndpoint, TimestampClient, TimestampEndpoint, VerifiedTimestampPointDecision,
 };
 #[cfg(test)]
 pub(crate) use read_attempt::fixture as read_fixture;
@@ -28,15 +28,19 @@ pub(crate) use read_attempt::{
     ReadAttempts, ReadGrant, ReadScope, ScheduledReadError, UnsettledRead,
 };
 mod status;
-pub(crate) use participant::{ParticipantProofClient, ParticipantProofEndpoint};
+pub(crate) use participant::{
+    ParticipantProofClient, ParticipantProofEndpoint, VerifiedTimestampPointRejection,
+    VerifiedTimestampPointResolution, VerifiedTimestampPointSeal,
+};
 pub(crate) use participant_full::{ParticipantClient, ParticipantEndpoint};
 #[cfg(test)]
 mod tests;
-pub(crate) use status::{StatusProofClient, StatusProofEndpoint};
+pub(crate) use status::{StatusProofClient, StatusProofEndpoint, VerifiedTimestampPointLocator};
 
 use super::{
     authority::control::{
-        ControlClient, ServiceAction, stale_service_route, unsupported_service_route,
+        ControlClient, ReplicaRoutes, ServiceAction, ServiceAuthorization, stale_service_route,
+        unsupported_service_route,
     },
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, ReceivePlan,
@@ -68,6 +72,11 @@ enum Method {
         operation: u8,
         mutation: bool,
     },
+    TimestampPointDecisionRead {
+        route: super::authority::control::TimestampPointRoute,
+        source_digest: Digest,
+        locator_digest: Digest,
+    },
     StatusDecision {
         txn: TxnId,
         manifest: ManifestRef,
@@ -75,6 +84,14 @@ enum Method {
     StatusSettlement {
         txn: TxnId,
         manifest: ManifestRef,
+    },
+    StatusPointLocator {
+        route: super::authority::control::TimestampPointRoute,
+        txn: TxnId,
+        request_digest: Digest,
+        manifest: ManifestRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<super::authority::control::ScopedCatalogRead>,
     },
     ParticipantSeal {
         txn: TxnId,
@@ -84,7 +101,24 @@ enum Method {
         txn: TxnId,
         manifest: ManifestRef,
     },
+    ParticipantTimestampPointSeal {
+        route: super::authority::control::TimestampPointRoute,
+        locator_digest: Digest,
+    },
+    ParticipantTimestampPointRejection {
+        route: super::authority::control::TimestampPointRoute,
+        locator_digest: Digest,
+    },
+    ParticipantTimestampPointResolution {
+        route: super::authority::control::TimestampPointRoute,
+        source_digest: Digest,
+        locator_digest: Digest,
+    },
+    ParticipantResolveTimestampPoint,
     ParticipantGuard,
+    ParticipantScopedGuard {
+        txn: TxnId,
+    },
     ParticipantIndexClosed {
         owner: MaintenanceOwnerRef,
     },
@@ -92,6 +126,11 @@ enum Method {
         txn: TxnId,
         manifest: ManifestRef,
         group_id: uuid::Uuid,
+    },
+    ScopedStatusParticipant {
+        scope: super::authority::control::ScopedCatalogRead,
+        txn: TxnId,
+        manifest: ManifestRef,
     },
     ParticipantRead {
         read_ts: ReadTs,
@@ -142,6 +181,7 @@ impl Method {
             Self::ParticipantAcquire
             | Self::ParticipantScanOpen { .. }
             | Self::ParticipantFence { .. }
+            | Self::ParticipantResolveTimestampPoint
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
             _ => Purpose::Authority,
         }
@@ -174,6 +214,11 @@ impl Method {
                 crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES
             }
             Self::ParticipantPropose { progress: true } => 128 << 10,
+            Self::TimestampPointDecisionRead { .. }
+            | Self::ParticipantTimestampPointSeal { .. }
+            | Self::ParticipantTimestampPointRejection { .. }
+            | Self::ParticipantTimestampPointResolution { .. }
+            | Self::ParticipantResolveTimestampPoint => 8 << 10,
             _ => 0,
         }
     }
@@ -358,10 +403,30 @@ impl Client {
             error
         })?;
         tracing::debug!(group=%self.group.group_id, method=?method, replicas=routes.members.len(), "service replica routes ready");
-        let preferred = self.leader.load(Ordering::Relaxed);
         let retry_last = failed_read_hint
             .filter(|(generation, _)| *generation == routes.record.generation)
             .map(|(_, node)| node);
+        self.call_routed(
+            action,
+            method,
+            payload,
+            possibly_applied,
+            &routes,
+            retry_last,
+        )
+        .await
+    }
+
+    async fn call_routed(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        possibly_applied: &mut bool,
+        routes: &ReplicaRoutes,
+        retry_last: Option<u64>,
+    ) -> Result<ServiceResponse, CallError> {
+        let preferred = self.leader.load(Ordering::Relaxed);
         // Prefer the observed leader, but let other replicas answer before
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
@@ -418,8 +483,34 @@ impl Client {
         }
         // Local saturation and definitive errors already returned above. On
         // exhaustion the next call must verify the membership pages again.
-        self.control.invalidate_replica_routes(&routes);
+        self.control.invalidate_replica_routes(routes);
         Err(unavailable().into())
+    }
+
+    async fn call_timestamp_point_proof(
+        &self,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        source: &ReplicaRoutes,
+        target: &ReplicaRoutes,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        let mut completed = false;
+        timeout_at(
+            Instant::now() + SERVICE_CONVERGENCE,
+            self.call_routed(self.action, method, &payload, &mut completed, target, None),
+        )
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|error| {
+            let error = ProtocolError::from(error);
+            if placement_rejected_before_execution(&error) {
+                self.control.invalidate_replica_routes(source);
+                self.control.invalidate_replica_routes(target);
+                stale_service_route()
+            } else {
+                error
+            }
+        })
     }
     async fn call_hinted(
         &self,
@@ -711,7 +802,10 @@ impl ServiceResponse {
                     Method::ParticipantResolution { .. },
                     ParticipantProofKind::Resolution
                 )
-                | (Method::ParticipantGuard, ParticipantProofKind::Lifecycle)
+                | (
+                    Method::ParticipantGuard | Method::ParticipantScopedGuard { .. },
+                    ParticipantProofKind::Lifecycle
+                )
                 | (Method::ParticipantAcquire, ParticipantProofKind::Lifecycle)
                 | (
                     Method::ParticipantIndexClosed { .. },
@@ -830,6 +924,30 @@ fn parse(
     }
     Ok(header)
 }
+fn scoped_admission_read(scope: super::authority::control::ScopedCatalogRead) -> bool {
+    // A fresh scoped admission captures Catalog lineage before there is an
+    // accepted context to hash. Only the queue owner gets this read privilege.
+    scope.request.accepted_context == Digest::from_bytes([0; 32])
+}
+async fn service_grant(
+    control: &ControlClient,
+    session: &AuthenticatedSession,
+    header: &Header,
+) -> Result<ServiceAuthorization, ProtocolError> {
+    let scope = crate::oltp_runtime::replica::QueueScope {
+        cluster_id: session.group().cluster_id,
+        database: session.group().database.clone(),
+    };
+    control
+        .service_role(
+            &scope,
+            session.remote(),
+            header.action,
+            session.group().clone(),
+        )
+        .await
+}
+
 async fn authorize(
     control: &ControlClient,
     session: &AuthenticatedSession,
@@ -850,15 +968,7 @@ async fn authorize(
             )
             .await;
     }
-    control
-        .service_role(
-            &scope,
-            session.remote(),
-            header.action,
-            session.group().clone(),
-        )
-        .await?;
-    Ok(())
+    service_grant(control, session, header).await.map(|_| ())
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,

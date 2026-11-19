@@ -5,7 +5,7 @@ use crate::{
     oltp::pool::{ExecutionClass, ScratchLease},
     oltp_replication::authority::{
         consensus::{Applied, Consensus},
-        control::ScopedCatalogRead,
+        control::{ScopedCatalogRead, ScopedQueueTransition},
     },
 };
 const META: TransactionBudget = TransactionBudget {
@@ -26,7 +26,23 @@ pub(crate) type ScheduledReadFuture<'a> = std::pin::Pin<
             + 'a,
     >,
 >;
+mod timestamp_point;
+pub(crate) use timestamp_point::PointEvidenceRead;
+
 pub(crate) trait RemoteParticipant: Send + Sync {
+    fn resolve_timestamp_point(
+        &self,
+        _authority: Authority,
+        _locator: TimestampDecisionLocator,
+    ) -> ParticipantFuture<'_, Applied<ParticipantReply>> {
+        Box::pin(async { Err(invalid()) })
+    }
+    fn with_scoped_execution(
+        &self,
+        _scope: ScopedCatalogRead,
+    ) -> Result<Arc<dyn RemoteParticipant>, ProtocolError> {
+        Err(invalid())
+    }
     fn propose(
         &self,
         command: OwnedCommand<ParticipantCommand>,
@@ -87,6 +103,12 @@ pub(crate) trait RemoteParticipant: Send + Sync {
         &self,
         binding: super::lifecycle::LifecycleBinding,
     ) -> ParticipantFuture<'_, Option<super::lifecycle::VerifiedLifecycleGuard>>;
+    fn scoped_lifecycle_guard(
+        &self,
+        _txn: TxnId,
+    ) -> ParticipantFuture<'_, Option<super::lifecycle::VerifiedLifecycleGuard>> {
+        Box::pin(async { Err(invalid()) })
+    }
     fn strong_index_attempt_closed(
         &self,
         owner: crate::oltp_replication::types::MaintenanceOwnerRef,
@@ -97,6 +119,10 @@ pub(crate) trait RemoteParticipant: Send + Sync {
         expected: Authority,
         next: Authority,
     ) -> ParticipantFuture<'_, crate::oltp_replication::types::GroupFenceReceipt>;
+    fn fence_scoped_queue<'a>(
+        &'a self,
+        transfer: &'a ScopedQueueTransition,
+    ) -> ParticipantFuture<'a, ()>;
 }
 #[derive(Clone)]
 pub(crate) struct ParticipantHandle {
@@ -242,6 +268,28 @@ impl ParticipantHandle {
 
         self.local_consensus().propose(command).await
     }
+    pub(crate) async fn propose_verified_scoped(
+        &self,
+        scope: ScopedCatalogRead,
+        command: OwnedCommand<ParticipantCommand>,
+    ) -> Result<Applied<ParticipantReply>, ProtocolError> {
+        if self.remote.is_some()
+            || !scoped_queue::bound_to_scope(self.identity(), scope, command.payload()?)
+        {
+            return Err(invalid());
+        }
+        let class = if command.payload()?.uses_prepare_lane() {
+            crate::oltp::pool::ByteClass::Data
+        } else {
+            crate::oltp::pool::ByteClass::Progress
+        };
+        self.propose(OwnedCommand::new_owned(
+            ParticipantCommand::Scoped { scope, command },
+            self.resources(),
+            class,
+        )?)
+        .await
+    }
     pub(crate) async fn prepare_page(
         &self,
         command: OwnedCommand<ParticipantCommand>,
@@ -351,7 +399,28 @@ impl ParticipantHandle {
         self.local_consensus().ensure_linearizable().await?;
         self.local_machine().read_at(read_ts, key).await
     }
+    pub(crate) fn with_scoped_execution(
+        &self,
+        scope: ScopedCatalogRead,
+    ) -> Result<Self, ProtocolError> {
+        let remote = self
+            .remote
+            .as_ref()
+            .ok_or_else(invalid)?
+            .with_scoped_execution(scope)?;
+        Self::remote(self.identity.clone(), self.resources.clone(), remote)
+    }
+
     pub(crate) async fn read_scoped_catalog(
+        &self,
+        scope: ScopedCatalogRead,
+        key: MvccKey,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let remote = self.remote.as_ref().ok_or_else(invalid)?;
+        remote.read_scoped_catalog(scope, key).await
+    }
+
+    pub(crate) async fn read_verified_scoped_catalog(
         &self,
         scope: ScopedCatalogRead,
         key: MvccKey,
@@ -362,13 +431,13 @@ impl ParticipantHandle {
                 MvccKey::CatalogTable { table_id }
                     | MvccKey::CatalogRoutingRoot { table_id }
                     | MvccKey::CatalogRoutingPage { table_id, .. }
+                    | MvccKey::CatalogIndex { table_id, .. }
+                    | MvccKey::CatalogIndexesRoot { table_id }
+                    | MvccKey::CatalogIndexesPage { table_id, .. }
                     if *table_id == scope.table_id
             )
         {
             return Err(invalid());
-        }
-        if let Some(remote) = &self.remote {
-            return remote.read_scoped_catalog(scope, key).await;
         }
         self.read_at(scope.read_ts, key).await
     }
@@ -401,7 +470,7 @@ impl ParticipantHandle {
                     return Err(recovery_unknown());
                 }
                 let state: Txn = serde_json::from_slice(&state).map_err(|_| recovery_unknown())?;
-                if state.manifest != manifest || state.decision.is_some() {
+                if state.manifest != manifest || state.decision.is_some() || state.point_home.is_some() {
                     return Err(invalid());
                 }
                 let evidence = state.sealed.ok_or_else(invalid)?;

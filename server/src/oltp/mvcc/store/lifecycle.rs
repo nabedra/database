@@ -154,12 +154,17 @@ struct GuardRecord {
     binding: LifecycleBinding,
     mode: GuardMode,
     granted_at: Option<AppliedPosition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_queue: Option<scoped_queue::QueueBinding>,
 }
 fn holder_key(binding: &LifecycleBinding) -> [u8; 41] {
+    table_holder_key(binding.table_id, binding.txn)
+}
+fn table_holder_key(table_id: Uuid, txn: TxnId) -> [u8; 41] {
     let mut key = [0; 41];
     key[0] = b'G';
-    key[1..17].copy_from_slice(binding.table_id.as_bytes());
-    key[17..].copy_from_slice(&txn_key(b'_', binding.txn)[1..]);
+    key[1..17].copy_from_slice(table_id.as_bytes());
+    key[17..].copy_from_slice(&txn_key(b'_', txn)[1..]);
     key
 }
 fn exclusive_key(table: Uuid) -> [u8; 17] {
@@ -184,6 +189,7 @@ pub(super) fn apply(
     config: &Config,
     position: AppliedPosition,
     command: &LifecycleCommand,
+    scoped_queue: Option<scoped_queue::QueueBinding>,
 ) -> Result<Transition, ProtocolError> {
     if let LifecycleCommand::RecoverIndexPublication {
         authority,
@@ -250,6 +256,8 @@ pub(super) fn apply(
             if record.binding != *binding
                 || record.mode != guard.mode
                 || record.granted_at != Some(guard.acquired_at)
+                || (binding.request.run_id == authority.run_id
+                    && record.scoped_queue != scoped_queue)
             {
                 return reject(tx, Fault::InvalidBinding);
             }
@@ -299,7 +307,11 @@ pub(super) fn apply(
         let same_run = old.binding.authority.run_id == binding.authority.run_id
             && old.binding.authority.owner_term <= binding.authority.owner_term;
         adopted.authority = binding.authority;
-        if !same_run || adopted != *binding || old.mode != *mode {
+        if !same_run
+            || adopted != *binding
+            || old.mode != *mode
+            || old.scoped_queue != scoped_queue
+        {
             return reject(tx, Fault::Conflict);
         }
         if old.granted_at.is_some() {
@@ -310,6 +322,7 @@ pub(super) fn apply(
                         binding: binding.clone(),
                         mode: *mode,
                         granted_at: Some(position),
+                        scoped_queue,
                     },
                 )?;
             }
@@ -367,8 +380,10 @@ pub(super) fn apply(
         binding: binding.clone(),
         mode: *mode,
         granted_at: None,
+        scoped_queue,
     });
     record.binding = binding.clone();
+    record.scoped_queue = scoped_queue;
     if matches!(mode, GuardMode::Exclusive | GuardMode::MetadataCleanup) {
         let mut blocked = None;
         tx.scan_page(&holder_prefix(binding.table_id), None, 1, |_, raw| {
@@ -697,6 +712,45 @@ impl ParticipantHandle {
         )?)
         .await
     }
+    pub(crate) async fn scoped_lifecycle_guard(
+        &self,
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        txn: TxnId,
+    ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
+        if self.identity().kind != GroupKind::Catalog || txn.request_id != scope.request.request_id || txn.attempt != 1 {
+            return Err(invalid());
+        }
+        if let Some(remote) = &self.remote {
+            return remote.scoped_lifecycle_guard(txn).await;
+        }
+        self.local_consensus().ensure_linearizable().await?;
+        let group_id = self.identity().group_id;
+        let raw = self.local_machine().store.read_metadata(
+            TransactionBudget { scratch_bytes: 64 << 10, batch_bytes: 0, output_bytes: 16 << 10 },
+            move |view| {
+                let Some(bytes) = view.pinned(&table_holder_key(scope.table_id, txn))? else {
+                    return view.encode(&Option::<SealedLifecycleGuard>::None);
+                };
+                if bytes.len() > METADATA_BYTES {
+                    return Err(recovery_unknown());
+                }
+                let record: GuardRecord = serde_json::from_slice(&bytes).map_err(|_| recovery_unknown())?;
+                let binding = record.binding;
+                if record.mode != GuardMode::Shared
+                    || binding.catalog_group_id != group_id || binding.table_id != scope.table_id
+                    || binding.txn != txn || binding.request != scope.request || binding.read_ts != scope.read_ts
+                    || record.scoped_queue != Some(scoped_queue::QueueBinding::from_scope(scope))
+                {
+                    return Err(invalid());
+                }
+                let guard = SealedLifecycleGuard::new(binding, record.mode, record.granted_at.ok_or_else(recovery_unknown)?)?;
+                view.encode(&Some(guard))
+            },
+        ).await?;
+        let guard: Option<SealedLifecycleGuard> = serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())?;
+        Ok(guard.map(|guard| VerifiedLifecycleGuard { guard }))
+    }
+
     /// One durable blocking holder at a time. Drop helpers consult its current
     /// Status outside native capacity, settle declared participants, then retry.
     pub(crate) async fn lifecycle_holder(
@@ -799,22 +853,35 @@ impl ParticipantHandle {
         if let Some(remote) = &self.remote {
             return remote.acquire_lifecycle(binding, mode).await;
         }
+        self.acquire_verified_lifecycle(binding, mode, None).await
+    }
 
+    pub(crate) async fn acquire_verified_lifecycle(
+        &self,
+        binding: LifecycleBinding,
+        mode: GuardMode,
+        scope: Option<crate::oltp_replication::authority::control::ScopedCatalogRead>,
+    ) -> Result<Option<VerifiedLifecycleGuard>, ProtocolError> {
         let command = ParticipantCommand::Lifecycle(LifecycleCommand::Acquire {
             authority: binding.authority,
             binding: binding.clone(),
             mode,
         });
-        let applied = self
-            .propose(OwnedCommand::new_owned(
-                command,
-                self.resources(),
-                crate::oltp::pool::ByteClass::Progress,
-            )?)
-            .await?;
+        let command = OwnedCommand::new_owned(
+            command,
+            self.resources(),
+            crate::oltp::pool::ByteClass::Progress,
+        )?;
+        let applied = match scope {
+            Some(scope) => self.propose_verified_scoped(scope, command).await?,
+            None => self.propose(command).await?,
+        };
         match applied.reply {
             ParticipantReply::Lifecycle(LifecycleReply::Granted) => {}
             ParticipantReply::Lifecycle(LifecycleReply::Pending { .. }) => return Ok(None),
+            ParticipantReply::Rejected(Fault::StaleAuthority) if scope.is_some() => {
+                return Err(recovery_unknown());
+            }
             ParticipantReply::Rejected(Fault::Conflict | Fault::RolledBack)
             | ParticipantReply::Lifecycle(LifecycleReply::Rejected(
                 Fault::Conflict | Fault::RolledBack,
@@ -1000,6 +1067,7 @@ mod index_recovery_tests {
             binding: binding.clone(),
             mode: GuardMode::Exclusive,
             granted_at: None,
+            scoped_queue: None,
         };
         let mut index = 0;
         async fn apply(
@@ -1163,6 +1231,7 @@ mod index_recovery_tests {
                         binding,
                         mode: GuardMode::Shared,
                     },
+                    None,
                 )
             }
         };

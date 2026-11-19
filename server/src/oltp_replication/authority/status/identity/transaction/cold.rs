@@ -17,8 +17,9 @@ impl StatusHandle {
         authority: Authority,
         pin: ColdApplicationPin,
     ) -> Result<ChargedBytes, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        let status_group_id = self.identity().group_id;
+        let barrier = self.consensus.ensure_linearizable().await?;
+        let status_group = self.identity().clone();
+        let status_group_id = status_group.group_id;
         self.machine
             .store()
             .read_metadata(BUDGET, move |view| {
@@ -48,6 +49,18 @@ impl StatusHandle {
                     })
                 {
                     return Err(invalid());
+                }
+                if let Some(home) = read::<LocatedTimestampManifest>(view, &home_key(reservation.request_id))? {
+                    let binding = &home.locator.binding;
+                    let stored = projection::verify_in_read(
+                        view, &status_group, &identity, &home, authority, Some(barrier.applied),
+                    )?;
+                    let safe = binding.reservation == reservation
+                        && binding.pin_identity == pin.identity
+                        && binding.storage_pin == pin.pin
+                        && Some(binding.request) == pin.request
+                        && stored.is_some();
+                    return view.encode(&safe);
                 }
                 // Application execution has one durable transaction attempt per
                 // reserved UUID. Check the UUID prefix for both absence and

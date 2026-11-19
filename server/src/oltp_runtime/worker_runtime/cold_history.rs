@@ -1,9 +1,13 @@
 //! Settle old durable decisions and release abandoned application pins.
 //! The queue and application request decoder are outside this path.
 use super::*;
+use crate::oltp::mvcc::store::ParticipantReply;
 use crate::oltp_replication::{
     authority::{
-        status::{StatusHandle, identity::transaction::ColdRecoveryPage},
+        status::{
+            IdentityLookup, StatusHandle, StatusService, TerminalIdentity, TimestampPointHome,
+            identity::transaction::ColdRecoveryPage,
+        },
         timestamp::{
             TimestampHandle,
             cold::{ColdPinCursor, ColdPinStep},
@@ -78,7 +82,7 @@ pub(super) fn spawn(runtime: &Arc<WorkerRuntime>) -> tokio::task::JoinHandle<()>
             };
             if let Some((after, retry_pass)) = cursors[bucket] {
                 match runtime
-                    .cold_history_step(sources, bucket, authority, after)
+                    .cold_history_step(sources, bucket, authority, transition_id, after)
                     .await
                 {
                     Ok((page, retry)) => {
@@ -121,6 +125,7 @@ impl WorkerRuntime {
         sources: &Sources,
         bucket: usize,
         authority: Authority,
+        transition_id: Uuid,
         after: Option<TxnId>,
     ) -> Result<(ColdRecoveryPage, bool), ProtocolError> {
         let page: ColdRecoveryPage = match sources {
@@ -136,9 +141,23 @@ impl WorkerRuntime {
         };
         let mut retry = false;
         if let Some(txn) = page.transaction {
-            match self.transactions.recover(authority, txn).await {
-                Ok(Some(_)) => {}
-                Ok(None) => retry = true,
+            let status: &dyn StatusService = match sources {
+                Sources::Registered { .. } => self.services.remote_status[bucket].as_ref(),
+                Sources::Local { status, .. } => status.as_ref(),
+            };
+            let recovered: Result<bool, ProtocolError> = async {
+                if self
+                    .cold_point_history(status, authority, transition_id, txn)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                Ok(self.transactions.recover(authority, txn).await?.is_some())
+            }
+            .await;
+            match recovered {
+                Ok(true) => {}
+                Ok(false) => retry = true,
                 Err(error) => {
                     tracing::debug!(request=%txn.request_id, code=?error.code,
                         message=error.message, "cold transaction settlement awaits retry");
@@ -147,6 +166,101 @@ impl WorkerRuntime {
             }
         }
         Ok((page, retry))
+    }
+
+    /// Reconcile only the installed metadata. The protected cold decision and
+    /// Data resolution paths also cover a marked attempt with no Data prepare.
+    async fn cold_point_history(
+        &self,
+        status: &dyn StatusService,
+        authority: Authority,
+        transition_id: Uuid,
+        txn: TxnId,
+    ) -> Result<bool, ProtocolError> {
+        let identity = status
+            .lookup_identity(txn.request_id, None)
+            .await?
+            .ok_or_else(unknown)?;
+        let (reservation, marked) = match identity {
+            IdentityLookup::TimestampPoint(reservation) => (reservation, true),
+            IdentityLookup::Reserved(reservation)
+            | IdentityLookup::Abandoned(reservation)
+            | IdentityLookup::Terminal(TerminalIdentity::Committed { reservation, .. }) => {
+                (reservation, false)
+            }
+            _ => return Ok(false),
+        };
+        if reservation.scoped.is_none() {
+            return if marked { Err(unknown()) } else { Ok(false) };
+        }
+        let home = status
+            .timestamp_point_home(authority, txn.request_id, reservation.digest)
+            .await?;
+        let locator = match home {
+            TimestampPointHome::Installed(home) => home.locator,
+            TimestampPointHome::Legacy if !marked => return Ok(false),
+            TimestampPointHome::Absent | TimestampPointHome::Legacy => return Err(unknown()),
+        };
+        let binding = &locator.binding;
+        if binding.txn != txn
+            || &binding.status_group != status.identity()
+            || &binding.timestamps_group != self.services.timestamps.identity()
+            || reservation != binding.reservation
+            || binding.created_authority.run_id == authority.run_id
+            || binding.created_authority.owner_term >= authority.owner_term
+            || self
+                .services
+                .control
+                .published_cold_fence(authority, Some(reservation.original_run))
+                .await?
+                != Some(transition_id)
+        {
+            return Err(unknown());
+        }
+
+        let timestamps = &self.services.timestamps;
+        let (decision, _decision_owner) = match timestamps.observe_timestamp_point(&locator).await?
+        {
+            Some(proof) => proof,
+            None => {
+                timestamps
+                    .abandon_timestamp_point(&locator, transition_id)
+                    .await?
+            }
+        };
+        decision.verify_locator(&locator)?;
+        if let Some((projection, _owner)) = status
+            .timestamp_point_projection(authority, &locator)
+            .await?
+        {
+            if projection.completion().decision() != &decision {
+                return Err(unknown());
+            }
+            return Ok(true);
+        }
+
+        let participant = self
+            .services
+            .resolver
+            .participant(&binding.participant.group)
+            .await?;
+        let applied = participant
+            .resolve_timestamp_point(authority, locator.clone())
+            .await?;
+        if !matches!(
+            applied.reply,
+            ParticipantReply::Resolved { complete: true, .. }
+        ) {
+            return Err(unknown());
+        }
+        let (projection, _projection_owner) =
+            status.project_timestamp_point(authority, &locator).await?;
+        if projection.completion().decision() != &decision
+            || projection.completion().completed_at() != applied.position
+        {
+            return Err(unknown());
+        }
+        Ok(true)
     }
 
     async fn cold_pin_step(

@@ -67,15 +67,16 @@ O13/M03 retained-reply regression: hold part of a reply arena, enqueue a reply r
 
 ## Scoped queue protocol version 2
 
-The [shard refactor plan](../../plans/oltp-shard-refactor.md) proposes this
-protocol for newly admitted identities in an enabled database. Each admission
-binds the exact UUID, body digest, original run, queue policy, placement and
-decision home. Retries and drain use that binding. Identities admitted under
-the all-ready policy keep its copy and receipt requirements.
+The [shard refactor](../../plans/oltp-shard-refactor.md) adds this protocol
+for `Get` and `Update` in opted-in registered RF3 databases. Admission binds
+the exact UUID, body digest, original run, and queue policy. The pinned
+snapshot determines the Data range. Once a mutation records its decision
+home, retries and drain reconcile at that home. Identities admitted under
+the all-ready policy keep their original copy and receipt requirements.
 
-The point-operation prototype pairs an RF3 queue placement with the Data shard
-selected at the original snapshot. It runs only in Rust test fixtures.
-Production qualification requires all of the following process assertions.
+The live scoped path requires explicit activation. The following process
+assertions are release requirements. Test evidence records which fault
+cuts were exercised on a specific build.
 
 | ID | Scenario | Required assertions |
 | --- | --- | --- |

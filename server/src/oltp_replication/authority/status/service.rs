@@ -5,9 +5,12 @@ use crate::oltp::{
         CanonicalJson,
         store::ParticipantHandle,
     },
-    pool::{ChargedBytes, WorkerSharedResources},
+    pool::{ChargedBytes, ScratchLease, WorkerSharedResources},
 };
 use crate::oltp_replication::authority::timestamp::VerifiedPinRelease;
+use crate::oltp_replication::authority::{
+    control::ScopedQueuePlacement, timestamp::ScopedAdmissionClosure,
+};
 use crate::oltp_replication::{
     authority::consensus::{Applied, ConsensusFuture},
     types::*,
@@ -60,6 +63,59 @@ pub(crate) trait StatusService: Send + Sync {
     fn identity(&self) -> &GroupIdentity;
     fn group_for_request(&self, _request_id: Uuid) -> &GroupIdentity {
         self.identity()
+    }
+    fn with_scoped_execution(
+        &self,
+        _scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+    ) -> Result<Arc<dyn StatusService>, ProtocolError> {
+        Err(super::invalid())
+    }
+    fn fence_scoped_queue<'a>(
+        &'a self,
+        _transfer: &'a crate::oltp_replication::authority::control::ScopedQueueTransition,
+    ) -> ConsensusFuture<'a, ()> {
+        Box::pin(async { Err(super::invalid()) })
+    }
+    fn scoped_receipt<'a>(
+        &'a self,
+        _placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        _request: RequestBinding,
+        _txn: TxnId,
+        _manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, (VerifiedStatusDecision, VerifiedSettlement)> {
+        Box::pin(async { Err(super::invalid()) })
+    }
+    fn retired_scoped_receipt<'a>(
+        &'a self,
+        _run: Uuid,
+        _request_id: Uuid,
+        _digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        Box::pin(async { Err(super::invalid()) })
+    }
+    fn prior_scoped_receipt<'a>(
+        &'a self,
+        _run: Uuid,
+        _request_id: Uuid,
+        _digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        Box::pin(async { Err(super::invalid()) })
+    }
+    fn scoped_terminal_receipt<'a>(
+        &'a self,
+        _placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        _request_id: Uuid,
+        _digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        Box::pin(async { Err(super::invalid()) })
+    }
+    fn lookup_identity_for_scoped<'a>(
+        &'a self,
+        _placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        _request_id: Uuid,
+        _digest: Digest,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        Box::pin(async { Err(super::invalid()) })
     }
     fn resources(&self) -> &Arc<WorkerSharedResources>;
     fn reserve_identity<'a>(
@@ -118,6 +174,15 @@ pub(crate) trait StatusService: Send + Sync {
         &'a self,
         cap: &'a crate::oltp_runtime::worker_runtime::VerifiedNeverAccepted,
     ) -> ConsensusFuture<'a, VerifiedAdmissionRejection>;
+    fn reject_scoped_route_moved<'a>(
+        &'a self,
+        _placement: &'a ScopedQueuePlacement,
+        _authority: Authority,
+        _reservation: IdentityReservation,
+        _closure: &'a ScopedAdmissionClosure,
+    ) -> ConsensusFuture<'a, RejectedIdentity> {
+        Box::pin(async { Err(super::invalid()) })
+    }
     fn rejected_identity<'a>(
         &'a self,
         expected: &'a RejectedIdentity,
@@ -131,6 +196,27 @@ pub(crate) trait StatusService: Send + Sync {
         request_id: Uuid,
         digest: Digest,
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>>;
+    fn install_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        point: TimestampPointManifest,
+    ) -> ConsensusFuture<'a, ManifestRef>;
+    fn timestamp_point_home<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, TimestampPointHome>;
+    fn timestamp_point_projection<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(TimestampPointProjection, Arc<ScratchLease>)>>;
+    fn project_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, (TimestampPointProjection, Arc<ScratchLease>)>;
     fn try_install_point_manifest<'a>(
         &'a self,
         _point: PointManifest,
@@ -341,6 +427,39 @@ impl StatusService for StatusHandle {
         digest: Digest,
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>> {
         Box::pin(StatusHandle::retirement(self, request_id, digest))
+    }
+    fn install_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        point: TimestampPointManifest,
+    ) -> ConsensusFuture<'a, ManifestRef> {
+        Box::pin(StatusHandle::install_timestamp_point(self, authority, point))
+    }
+    fn timestamp_point_home<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, TimestampPointHome> {
+        Box::pin(StatusHandle::timestamp_point_home(self, authority, request_id, digest))
+    }
+    fn timestamp_point_projection<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(TimestampPointProjection, Arc<ScratchLease>)>> {
+        Box::pin(self.read_timestamp_point_projection(authority, locator.clone()))
+    }
+    fn project_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, (TimestampPointProjection, Arc<ScratchLease>)> {
+        Box::pin(async move {
+            self.read_timestamp_point_projection(authority, locator.clone())
+                .await?
+                .ok_or_else(super::identity::unknown)
+        })
     }
     fn begin_manifest<'a>(
         &'a self,

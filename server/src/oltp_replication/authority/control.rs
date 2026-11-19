@@ -29,7 +29,12 @@ pub(crate) use pool_drain::{DrainMount, PoolDrainPhase, PoolDrainRecord, Retaine
 pub(crate) use worker_drain::{WorkerCloseAttestation, WorkerDrainIntent, WorkerDrainPhase, WorkerDrainRecord};
 pub(crate) use worker_drain::{EksReplacementAction, EksReplacementPermit, SignedEksReplacement};
 pub(crate) use restart::{RestartIntent, RestartMountKey, RestartPreparation};
-pub(crate) use scoped_queue::ScopedQueuePlacement;
+pub(crate) use scoped_queue::{
+    ScopedQueueCapability, ScopedQueuePlacement, ScopedQueueTransferReport, ScopedQueueTransition,
+    SCOPED_QUEUE_VERSION,
+};
+#[allow(unused_imports)]
+pub(crate) use scoped_queue::ScopedQueueInventory;
 pub(crate) use service::{
     ControlHandle, InventoryPage, LocalOperatorPermit, OperatorPolicy, ReplicaInventoryPage,
     VerifiedExclusion, VerifiedMembership, VerifiedQueueCopy,

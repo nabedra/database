@@ -371,6 +371,7 @@ pub(super) fn apply(
                 pin: snapshot,
                 state: PinState::Active,
                 purpose: PinPurpose::SplitMetadata { txn },
+                scoped_copy_proof: None,
             },
         )?;
         tx.put(&active_key(snapshot), identity.nonce.as_bytes())?;

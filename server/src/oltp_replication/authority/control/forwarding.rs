@@ -531,7 +531,9 @@ impl Endpoint for HostedControlEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let Some(request) = self.request(&session, bytes.as_slice())? else {
-                return self.reads.handle(session, bytes, sections).await;
+                return self.reads.handle_with_leader(
+                    session, bytes, sections, Some(self.local.as_ref()),
+                ).await;
             };
             let result = async {
                 let token = sections.section(1).map(|bytes| {
@@ -583,9 +585,8 @@ impl Endpoint for HostedControlEndpoint {
                                 if WorkerIdentity::from(&intent.next) == session.remote() => {}
                             (Operation::Propose, ControlCommand::CompleteRestart { .. })
                             | (Operation::CompleteRestart, _) => return Err(invalid()),
-                            // Scoped queue placement cannot be activated before
-                            // its execution and takeover protocols are wired.
-                            (_, ControlCommand::EnsureScopedQueue { .. }) => return Err(invalid()),
+                            (_, ControlCommand::EnsureScopedQueue { .. } | ControlCommand::ScopedQueue { .. }) =>
+                                return Err(invalid()),
                             (
                                 Operation::Propose,
                                 ControlCommand::RegisterRestartMount { worker, .. },

@@ -2,6 +2,7 @@
 //! allocated timestamp at/below the cut can acquire a later COMMIT decision.
 //! UUID history has a separately recorded Status applied cut; it is never
 //! described as an untimestamped MVCC snapshot at the application data cut.
+use super::timestamp_point::projection::{TimestampPointProjection, read_for_transaction};
 use super::*;
 use crate::oltp_replication::authority::timestamp::VerifiedArchiveClosure;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +117,10 @@ pub(crate) struct ArchivedIdentity {
     /// None denotes source records from before reservation-position tracking.
     pub reserved_at: Option<AppliedPosition>,
     pub disposition: ArchivedIdentityDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_projection: Option<Box<TimestampPointProjection>>,
     #[serde(skip)]
-    owner: Option<Arc<ScratchLease>>,
+    pub(super) owner: Option<Arc<ScratchLease>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -469,53 +472,36 @@ impl StatusHandle {
                     if let Some(TerminalIdentity::Committed{decision,..})=&identity.terminal {
                         if matches!(decision.decision,TxnDecision::Commit{commit_ts} if commit_ts<=cut) && identity.restore_origin.is_none() && decision.decided_at.index>applied.index{return Err(unknown());}
                     }
-                    let terminal = identity.terminal.filter(|terminal| match terminal {
-                        TerminalIdentity::Committed { decision, .. } => {
-                            identity.restore_origin.is_some() || decision.decided_at.index <= applied.index
+                    let identity = super::archive_images::project_identity(identity, applied)
+                        .ok_or_else(unknown)?;
+                    let disposition = identity_disposition(
+                        identity.reservation,
+                        identity.terminal,
+                        identity.rejection,
+                        cut,
+                    );
+                    let point_projection = if identity.restore_origin.is_none() {
+                        match &disposition {
+                            ArchivedIdentityDisposition::PreCutCommitted { decision, .. }
+                            | ArchivedIdentityDisposition::CurrentFailed {
+                                terminal: TerminalIdentity::Committed { decision, .. },
+                            } => read_for_transaction(
+                                view,
+                                &group,
+                                decision.txn,
+                                Some(current_applied),
+                            )?,
+                            _ => None,
                         }
-                        TerminalIdentity::Failed { recorded_at, .. }
-                        | TerminalIdentity::ReadExpired { recorded_at, .. } => {
-                            identity.restore_origin.is_some() || recorded_at.index <= applied.index
-                        }
-                    });
-                    let disposition = match terminal {
-                        Some(TerminalIdentity::Committed {
-                            decision, outcome, ..
-                        }) => match decision.decision {
-                            TxnDecision::Commit { commit_ts } if commit_ts <= cut => {
-                                ArchivedIdentityDisposition::PreCutCommitted { decision, outcome }
-                            }
-                            TxnDecision::Commit { .. } => {
-                                ArchivedIdentityDisposition::RestoreExcluded {
-                                    source_decision: decision,
-                                    restore_cut: cut,
-                                }
-                            }
-                            TxnDecision::Abort { .. } => ArchivedIdentityDisposition::CurrentFailed {
-                                terminal: TerminalIdentity::Committed { reservation: identity.reservation, decision, outcome },
-                            },
-                        },
-                        Some(terminal @ TerminalIdentity::Failed { .. }) => {
-                            ArchivedIdentityDisposition::CurrentFailed { terminal }
-                        }
-                        Some(terminal @ TerminalIdentity::ReadExpired { .. }) => {
-                            ArchivedIdentityDisposition::ExpiredRead { terminal }
-                        }
-                        None => match identity
-                            .rejection
-                            .filter(|r| identity.restore_origin.is_some() || r.recorded_at.index <= applied.index)
-                        {
-                            Some(rejection) => {
-                                ArchivedIdentityDisposition::CurrentRejected { rejection }
-                            }
-                            None => ArchivedIdentityDisposition::Reserved,
-                        },
+                    } else {
+                        None
                     };
                     let item = ArchivedIdentity {
                         origin: identity.restore_origin,
                         reservation: identity.reservation,
                         reserved_at: identity.reserved_at,
                         disposition,
+                        point_projection: point_projection.map(Box::new),
                         owner: None,
                     };
                     let bytes = serialized_length(&item)?;
@@ -578,6 +564,43 @@ impl StatusHandle {
             .await
     }
 }
+pub(super) fn identity_disposition(
+    reservation: IdentityReservation,
+    terminal: Option<TerminalIdentity>,
+    rejection: Option<RejectedIdentity>,
+    cut: CommitTs,
+) -> ArchivedIdentityDisposition {
+    match terminal {
+        Some(TerminalIdentity::Committed {
+            decision, outcome, ..
+        }) => match decision.decision {
+            TxnDecision::Commit { commit_ts } if commit_ts <= cut => {
+                ArchivedIdentityDisposition::PreCutCommitted { decision, outcome }
+            }
+            TxnDecision::Commit { .. } => ArchivedIdentityDisposition::RestoreExcluded {
+                source_decision: decision,
+                restore_cut: cut,
+            },
+            TxnDecision::Abort { .. } => ArchivedIdentityDisposition::CurrentFailed {
+                terminal: TerminalIdentity::Committed {
+                    reservation,
+                    decision,
+                    outcome,
+                },
+            },
+        },
+        Some(terminal @ TerminalIdentity::Failed { .. }) => {
+            ArchivedIdentityDisposition::CurrentFailed { terminal }
+        }
+        Some(terminal @ TerminalIdentity::ReadExpired { .. }) => {
+            ArchivedIdentityDisposition::ExpiredRead { terminal }
+        }
+        None => rejection.map_or(ArchivedIdentityDisposition::Reserved, |rejection| {
+            ArchivedIdentityDisposition::CurrentRejected { rejection }
+        }),
+    }
+}
+
 fn serialized_length(value: &impl Serialize) -> Result<usize, ProtocolError> {
     struct Count(usize);
     impl std::io::Write for Count {

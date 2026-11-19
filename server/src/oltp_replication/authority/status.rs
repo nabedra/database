@@ -21,9 +21,13 @@ pub(crate) use identity::{
 };
 pub(crate) use identity::{
     IdentityLookup, IdentityReservation, ManifestDraft, ManifestInventoryPage, RejectedIdentity,
-    RequestKind, RetirementCertificate, ScopedAdmission, SealedAdmissionRejection, StatusCommand, StatusFault,
+    RequestKind, RetirementCertificate, ScopedAdmission, ScopedTerminalReceipt, SealedAdmissionRejection, StatusCommand, StatusFault,
     StatusHandle, StatusMachine, StatusReply, TerminalIdentity, TransactionInspection,
     VerifiedAdmissionRejection, VerifiedTerminalRetirement,
+};
+pub(crate) use identity::transaction::timestamp_point::{
+    LocatedTimestampManifest, TimestampDecisionLocator, TimestampPointBinding, TimestampPointHome,
+    TimestampPointManifest, projection::TimestampPointProjection,
 };
 pub(crate) use outcome::MutationOutcome;
 pub(crate) use routing::{PartitionedStatus, StatusTopology};
@@ -234,7 +238,6 @@ impl VerifiedSettlement {
         Self::from_strong_settled_read(statement)
     }
 
-    #[cfg(test)]
     pub(crate) fn statement(&self) -> &SettlementStatement {
         self.0.statement()
     }

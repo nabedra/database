@@ -29,6 +29,7 @@ impl LocalServices {
         native: SharedResourceConfig,
         execution: &ExecutionConfig,
     ) -> Result<Self, ProtocolError> {
+        let scoped_oltp = config.scoped_oltp && config.required_voters == 3;
         let enrollments = config.control_enrollments.to_vec();
         let operator_pins = config
             .operator_pins
@@ -72,6 +73,7 @@ impl LocalServices {
         )
         .await?;
         let local = WorkerIdentity::from(&worker.enrollment);
+        let scoped_operator = operator_pins.contains(&local.certificate_sha256);
         let placements = worker.placements.clone();
         let status_topology = placements.status_topology()?;
         let seed = placements.control.voters[0].worker_id;
@@ -141,8 +143,9 @@ impl LocalServices {
             let registration = manager
                 .registry()
                 .reserve(placements.control.identity.clone())?;
+            let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
             let hosted_control = HostedControlEndpoint::new(
-                ControlEndpoint::new(control.clone(), shared.clone())?,
+                control_endpoint.clone(),
                 raw_control.clone(),
                 shared.clone(),
                 pins.clone(),
@@ -396,6 +399,16 @@ impl LocalServices {
                     crate::oltp_replication::authority::control::ServiceAction::Owner,
                 )?);
             }
+            if scoped_oltp {
+                control_endpoint.install_scoped_queue_fence_readers(
+                    status_topology.clone(),
+                    status.clone(),
+                    timestamps.clone(),
+                    placements.catalog.identity.clone(),
+                    manager.client(),
+                    rpc.clone(),
+                )?;
+            }
             let services = status.iter().cloned()
                 .map(|client| -> Arc<dyn StatusService> { client })
                 .collect();
@@ -472,13 +485,14 @@ impl LocalServices {
                 "nabedra-db: registered {} queue join begun",
                 local.worker_id
             );
-            let replica = if bootstrap {
+            let (legacy_limits, scoped_limits) = queue_limits_for_formats(execution, scoped_oltp);
+            let mut replica = if bootstrap {
                 WorkerReplica::new_empty_bootstrap(
                     shared.clone(),
                     scope.clone(),
                     local,
                     ticket,
-                    queue_limits(execution),
+                    legacy_limits,
                 )
             } else {
                 WorkerReplica::new_joining(
@@ -487,11 +501,14 @@ impl LocalServices {
                     local,
                     startup_read(deadline, &error_trace, "queue authority", || control.current(&scope)).await?,
                     members.clone(),
-                    queue_limits(execution),
+                    legacy_limits,
                     ticket,
                 )
             }
             .map_err(QueueError::protocol)?;
+            if let Some(limits) = scoped_limits {
+                replica.install_scoped_queues(limits).map_err(QueueError::protocol)?;
+            }
             let replica = Arc::new(Mutex::new(replica));
             shared.bind_read_replica(&replica)?;
             let issuer = super::super::admission_tickets::AdmissionTickets::new(
@@ -510,12 +527,25 @@ impl LocalServices {
             )?;
             endpoint.install_admission_tickets(issuer.clone())?;
             endpoint.install_retirement_reader(routed_status.clone())?;
-            endpoint.install_scoped_payload_readers(
-                placements.control.identity.clone(),
-                rpc.clone(),
-                catalog.clone(),
-                timestamps.clone(),
-            )?;
+            if scoped_oltp {
+                endpoint.install_scoped_payload_readers(
+                    placements.control.identity.clone(), rpc.clone(), catalog.clone(), timestamps.clone(),
+                )?;
+                endpoint.install_scoped_queue_peer(peer.clone())?;
+            }
+            let scoped = scoped_limits.map(|limits| super::super::scoped_worker::ScopedWorkerServices {
+                local,
+                control: rpc.clone(),
+                timestamps: timestamps.clone(),
+                status: routed_status.clone(),
+                catalog: catalog.clone(),
+                resolver: resolver.clone(),
+                replica: replica.clone(),
+                endpoint: endpoint.clone(),
+                peer: peer.clone(),
+                operator: scoped_operator,
+                max_result_bytes: limits.max_retained_result_bytes_per_worker,
+            });
             registration.bind(Purpose::QueueControl, endpoint.clone())?;
             registration.bind(Purpose::QueueData, endpoint)?;
             members.push(local);
@@ -632,7 +662,7 @@ impl LocalServices {
             }
             Ok((
                 control, operator, timestamps, status, routed_status, catalog, resolver, replica, queue, rpc,
-                issuer, membership, split, placement,
+                issuer, membership, split, placement, scoped,
             ))
         }).await.unwrap_or_else(|_| {
             let mut error=last_error.lock().ok().and_then(|error|error.clone()).unwrap_or_else(unavailable);
@@ -655,6 +685,7 @@ impl LocalServices {
                 membership,
                 split,
                 placement,
+                scoped,
             )) => {
                 let refresh = tokio::spawn(
                     directory
@@ -686,6 +717,7 @@ impl LocalServices {
                     placement: Some(placement),
                     replica,
                     queue,
+                    scoped,
                     manager,
                     directory,
                     refresh: Mutex::new(Some(refresh)),

@@ -63,6 +63,7 @@ impl NativeBackupManifest {
         Ok(())
     }
 }
+mod point_history;
 mod restore;
 mod restore_graph;
 mod split_baseline;
@@ -407,9 +408,12 @@ impl WorkerRuntime {
         let mut validator = HistoryReader::new(&mut file)?;
         let split_graph = restore_graph::RestoreGraph::new(shared.clone())?;
         let mut split_transcript = restore_graph::SplitTranscript::default();
+        let mut point_transcript = point_history::PointTranscript::default();
         while let Some(frame) = validator.next(&shared)? {
             split_transcript.observe(&split_graph, &frame, scope.cut)?;
+            point_transcript.observe(frame.payload()?, &shared)?;
         }
+        point_transcript.finish()?;
         split_graph.verify_split_inventory(false)?;
         let verified = validator.verified()?;
         if retain_history {
@@ -801,6 +805,15 @@ impl WorkerRuntime {
                         identity: identity.clone(),
                     })
                     .await?;
+                if identity.point_projection.is_some() {
+                    let _owner = self
+                        .services
+                        .shared
+                        .reserve_scratch(ByteClass::Data, 32 << 10)?;
+                    let image = point_history::verify_identity(closure.statement(), identity)?
+                        .ok_or_else(unknown)?;
+                    export.frame(HistoryFrame::Metadata(image)).await?;
+                }
             }
             if page.exhausted {
                 break;

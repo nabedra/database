@@ -1,6 +1,6 @@
 //! One HTTP admission/receipt surface for standalone and hosted worker runtimes.
 //! Authentication, wire validation and response ownership remain in http.rs.
-use super::LocalRuntime;
+use super::{LocalRuntime, application::PointRequest};
 use crate::{
     executor::Executor,
     oltp_replication::multiplex::EndpointFuture,
@@ -40,6 +40,7 @@ pub(crate) trait HttpRuntime: Send + Sync + 'static {
         self: Arc<Self>,
         body: Vec<u8>,
         parsing_charge: MemoryCharge,
+        point: Option<PointRequest>,
     ) -> EndpointFuture<'static, RequestRecord>;
     fn receipt(&self, run: Uuid, id: Uuid) -> EndpointFuture<'_, OwnedReceipt>;
     fn wait<'a>(&'a self, record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse>;
@@ -84,6 +85,7 @@ impl HttpRuntime for LocalRuntime {
         self: Arc<Self>,
         body: Vec<u8>,
         parsing_charge: MemoryCharge,
+        _point: Option<PointRequest>,
     ) -> EndpointFuture<'static, RequestRecord> {
         Box::pin(async move {
             let submitted = LocalRuntime::submit(&self, body).await;

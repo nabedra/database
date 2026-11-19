@@ -11,7 +11,7 @@ use crate::{
         recovery_unknown,
     },
     oltp_replication::{
-        authority::status::SealedStatusDecision,
+        authority::status::{SealedStatusDecision, TimestampDecisionLocator},
         owned::{OwnedCommand, OwnedPayload},
         types::{
             AppliedPosition, Authority, CommitTs, Digest, GroupIdentity, GroupKind, ManifestRef,
@@ -35,10 +35,12 @@ pub(crate) mod lineage;
 pub(crate) mod point;
 pub(crate) mod restore;
 pub(crate) mod scan;
+pub(crate) mod scoped_queue;
 pub(crate) mod split_closure;
 pub(crate) mod split_usage;
+pub(crate) mod timestamp_resolution;
 pub(crate) use handle::{
-    ParticipantEpochs, ParticipantFuture, ParticipantHandle, RemoteParticipant,
+    ParticipantEpochs, ParticipantFuture, ParticipantHandle, PointEvidenceRead, RemoteParticipant,
     ScheduledReadFuture, VerifiedParticipantResolution, VerifiedParticipantSeal,
 };
 const CONFIG: &[u8] = b"mvcc/config/v1";
@@ -76,6 +78,11 @@ struct Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ParticipantCommand {
+    Scoped {
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+        command: OwnedCommand<ParticipantCommand>,
+    },
+    FenceScopedQueue(scoped_queue::QueueFence),
     Fence {
         transition_id: Uuid,
         expected: Option<Authority>,
@@ -120,6 +127,22 @@ pub(crate) enum ParticipantCommand {
         manifest: ManifestRef,
         result_digest: Digest,
     },
+    PrepareTimestampPoint {
+        locator: Box<TimestampDecisionLocator>,
+        page: OwnedCommand<ParticipantCommand>,
+    },
+    SealTimestampPoint {
+        authority: Authority,
+        locator: Box<TimestampDecisionLocator>,
+    },
+    RejectTimestampPoint {
+        locator: Box<TimestampDecisionLocator>,
+        page: OwnedCommand<ParticipantCommand>,
+    },
+    ResolveTimestampPoint {
+        authority: Authority,
+        proof: Box<timestamp_resolution::SealedTimestampPointDecision>,
+    },
     /// Resolve is paged. The immutable status proof authorizes every page; a
     /// partially resolved transaction remains discoverable through its heads.
     Resolve {
@@ -131,6 +154,7 @@ pub(crate) enum ParticipantCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ParticipantReply {
+    ScopedQueueFenced(scoped_queue::QueueFenceReceipt),
     Fenced(crate::oltp_replication::types::GroupFenceReceipt),
     Lifecycle(lifecycle::LifecycleReply),
     SplitSourceFrozen(lineage::SplitSourceStatement),
@@ -151,6 +175,11 @@ pub(crate) enum ParticipantReply {
         source_images: u64,
         root: Digest,
         complete: bool,
+    },
+    TimestampPointRejected(AppliedPosition),
+    TimestampPointResolved {
+        evidence: ResolutionEvidence,
+        writes: u64,
     },
     Rejected(Fault),
 }
@@ -173,6 +202,10 @@ struct Txn {
     /// coverage for effects whose preparation did not persist an audit.
     #[serde(default)]
     archive_audit_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_queue: Option<scoped_queue::QueueBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    point_home: Option<Digest>,
     request: RequestBinding,
     manifest: ManifestRef,
     plan: ParticipantPlan,
@@ -461,12 +494,48 @@ fn apply(
     let Some(config) = config else {
         return reject(tx, Fault::NotInitialized);
     };
+    if let ParticipantCommand::FenceScopedQueue(fence) = command {
+        return scoped_queue::apply_fence(tx, group, &config, position, *fence);
+    }
+    let (scope, command) = match command {
+        ParticipantCommand::Scoped { scope, command } => {
+            let command = command.payload()?;
+            if let Err(fault) = scoped_queue::check(tx, group, &config, *scope, command)? {
+                return reject(tx, fault);
+            }
+            (Some(*scope), command)
+        }
+        _ => (None, command),
+    };
+    let queue_binding = scope.map(scoped_queue::QueueBinding::from_scope);
+    let (point, rejecting, command) = match command {
+        ParticipantCommand::PrepareTimestampPoint { locator, page }
+        | ParticipantCommand::RejectTimestampPoint { locator, page } => {
+            let page = page.payload()?;
+            let Some(scope) = scope else {
+                return reject(tx, Fault::InvalidBinding);
+            };
+            if !timestamp_resolution::matches_page_binding(locator, page)?
+                || !timestamp_resolution::matches_scope(locator, scope)
+            {
+                return reject(tx, Fault::InvalidBinding);
+            }
+            (
+                Some(locator.as_ref()),
+                matches!(command, ParticipantCommand::RejectTimestampPoint { .. }),
+                page,
+            )
+        }
+        _ => (None, false, command),
+    };
     if let ParticipantCommand::Lifecycle(command) = command {
-        return lifecycle::apply(tx, group, &config, position, command);
+        return lifecycle::apply(tx, group, &config, position, command, queue_binding);
     }
     let authority = match command {
         ParticipantCommand::PreparePage { authority, .. }
         | ParticipantCommand::Seal { authority, .. }
+        | ParticipantCommand::SealTimestampPoint { authority, .. }
+        | ParticipantCommand::ResolveTimestampPoint { authority, .. }
         | ParticipantCommand::Resolve { authority, .. }
         | ParticipantCommand::SplitFreeze { authority, .. }
         | ParticipantCommand::SplitFinishSource { authority, .. }
@@ -525,22 +594,48 @@ fn apply(
             if !lifecycle::validate_guards(&config, group, *txn, request, plan, writes, guards)? {
                 return reject(tx, Fault::InvalidBinding);
             }
-            if tx.pinned(&txn_key(b'b', *txn))?.is_some() {
+            let root = page_root(*previous_root, *page_index, writes)?;
+            if let Some(locator) = point {
+                if root != plan.write_root
+                    || !timestamp_resolution::eligible_config(&config, locator)
+                    || !locator.binding.accepts_authority(authority)
+                    || !owns(group, &config.span, &writes[0].key)
+                {
+                    return reject(tx, Fault::InvalidBinding);
+                }
+                if rejecting {
+                    if !page_fits(txn, manifest, writes)? {
+                        return reject(tx, Fault::ResourceLimit);
+                    }
+                    return timestamp_resolution::apply_rejection(
+                        tx, locator, authority, position, &writes[0],
+                    );
+                }
+            }
+            if timestamp_resolution::completion_exists(tx, *txn)?
+                || tx.pinned(&txn_key(b'b', *txn))?.is_some()
+                || timestamp_resolution::rejection_exists(tx, *txn)?
+            {
                 return reject(tx, Fault::RolledBack);
             }
+            let point_home = point.map(TimestampDecisionLocator::digest).transpose()?;
             let key = txn_key(b't', *txn);
             let old = load::<Txn>(tx, &key)?;
             let mut state = match old {
                 Some(state)
                     if state.request == *request
                         && state.manifest == *manifest
-                        && state.plan == *plan =>
+                        && state.plan == *plan
+                        && state.scoped_queue == queue_binding
+                        && state.point_home == point_home =>
                 {
                     state
                 }
                 Some(_) => return reject(tx, Fault::InvalidBinding),
                 None => Txn {
                     archive_audit_version: Some(1),
+                    scoped_queue: queue_binding,
+                    point_home,
                     request: *request,
                     manifest: *manifest,
                     plan: plan.clone(),
@@ -552,7 +647,6 @@ fn apply(
                     resolved: 0,
                 },
             };
-            let root = page_root(*previous_root, *page_index, writes)?;
             if *page_index < state.next_page {
                 return if tx
                     .pinned(&ordinal_key(b'p', *txn, *page_index))?
@@ -683,47 +777,26 @@ fn apply(
                 },
             )
         }
-        ParticipantCommand::Seal {
-            txn,
-            manifest,
-            result_digest,
-            ..
-        } => {
-            if tx.pinned(&txn_key(b'b', *txn))?.is_some() {
-                return reject(tx, Fault::RolledBack);
-            }
-            let key = txn_key(b't', *txn);
-            let Some(mut state) = load::<Txn>(tx, &key)? else {
-                return reject(tx, Fault::Incomplete);
+        ParticipantCommand::Seal { txn, manifest, result_digest, .. } => {
+            seal(tx, *txn, *manifest, *result_digest, authority, position, scope, None)
+        }
+        ParticipantCommand::SealTimestampPoint { locator, .. } => {
+            let Some(scope) = scope else {
+                return reject(tx, Fault::InvalidBinding);
             };
-            if state.manifest != *manifest {
+            if !timestamp_resolution::matches_scope(locator, scope)
+                || !locator.binding.accepts_authority(authority)
+                || !timestamp_resolution::eligible_config(&config, locator)
+            {
                 return reject(tx, Fault::InvalidBinding);
             }
-            if let Some(sealed) = state.sealed {
-                return if sealed.result_digest == *result_digest {
-                    commit(tx, &ParticipantReply::Sealed(sealed))
-                } else {
-                    reject(tx, Fault::InvalidBinding)
-                };
-            }
-            if state.decision.is_some()
-                || state.next_page != state.plan.page_count
-                || state.writes != state.plan.write_count
-                || state.root != state.plan.write_root
-            {
-                return reject(tx, Fault::Incomplete);
-            }
-            let sealed = PreparedParticipant {
-                txn: *txn,
-                manifest: *manifest,
-                participant: state.plan.clone(),
-                authority,
-                sealed_at: position,
-                result_digest: *result_digest,
-            };
-            state.sealed = Some(sealed.clone());
-            tx.put_serialized(&key, &state)?;
-            commit(tx, &ParticipantReply::Sealed(sealed))
+            seal(
+                tx, locator.binding.txn, locator.manifest, locator.binding.result_digest,
+                authority, position, Some(scope), Some(locator.digest()?),
+            )
+        }
+        ParticipantCommand::ResolveTimestampPoint { proof, .. } => {
+            timestamp_resolution::apply_resolution(tx, group, &config, position, scope, proof)
         }
         ParticipantCommand::Resolve {
             proof, max_items, ..
@@ -734,6 +807,11 @@ fn apply(
             let statement = proof.statement();
             // Validation binds the sealed status DTO even on an early ABORT.
             let txn = statement.txn;
+            if timestamp_resolution::completion_exists(tx, txn)?
+                || timestamp_resolution::rejection_exists(tx, txn)?
+            {
+                return reject(tx, Fault::InvalidBinding);
+            }
             let key = txn_key(b't', txn);
             let witness_key = txn_key(RESOLUTION_WITNESS, txn);
             let known_digest = tx
@@ -784,6 +862,16 @@ fn apply(
                     },
                 );
             };
+            if state.point_home.is_some() {
+                return reject(tx, Fault::InvalidBinding);
+            }
+            // Cold recovery still uses the exact Status decision for a
+            // transaction whose queue and in-memory request are gone.
+            if (state.request.run_id == authority.run_id && state.scoped_queue != queue_binding)
+                || scope.is_some_and(|scope| state.plan.read_ts != scope.read_ts)
+            {
+                return reject(tx, Fault::InvalidBinding);
+            }
             proof.validate_for(txn, &state.manifest, &state.request)?;
             if known_digest.is_some()
                 && (state.decision.is_none() || state.resolved == 0 || state.resolved > state.writes)
@@ -806,68 +894,7 @@ fn apply(
                 .resolved
                 .saturating_add(*max_items as u64)
                 .min(state.writes);
-            for ordinal in state.resolved..until {
-                let logical = tx
-                    .pinned(&ordinal_key(b'w', txn, ordinal))?
-                    .ok_or_else(recovery_unknown)?;
-                let length = logical.len();
-                tx.with_scratch_buffer(length + 9, |tx, buffer| {
-                    buffer[1..1 + length].copy_from_slice(&logical);
-                    let end = length + 1;
-                    buffer[0] = HEAD;
-                    let head = load::<Head>(tx, &buffer[..end])?.ok_or_else(recovery_unknown)?;
-                    if head.intent != Some(txn) {
-                        return Err(recovery_unknown());
-                    }
-                    buffer[0] = INTENT;
-                    let encoded = tx.pinned(&buffer[..end])?.ok_or_else(recovery_unknown)?;
-                    if encoded.len() > super::MAX_FIXED_COMMAND_BYTES {
-                        return Err(recovery_unknown());
-                    }
-                    // Borrow row JSON from the pinned intent; only fixed
-                    // metadata is decoded, never the application row tree.
-                    let intent: Intent<'_> =
-                        serde_json::from_slice(&encoded).map_err(|_| recovery_unknown())?;
-                    if intent.txn != txn || intent.manifest != state.manifest {
-                        return Err(recovery_unknown());
-                    }
-                    let mut version = head.version;
-                    if let TxnDecision::Commit { commit_ts } = statement.decision {
-                        if !matches!(intent.change, IntentChange::Keep) {
-                            buffer[0] = VALUE;
-                            buffer[end..].copy_from_slice(&(!commit_ts.get()).to_be_bytes());
-                            #[derive(Serialize)]
-                            struct Version<'a> {
-                                value: Option<&'a RawValue>,
-                            }
-                            let value = match intent.change {
-                                IntentChange::Put => {
-                                    Some(intent.value.ok_or_else(recovery_unknown)?)
-                                }
-                                IntentChange::Delete => None,
-                                _ => unreachable!(),
-                            };
-                            tx.put_serialized(buffer, &Version { value })?;
-                            version = Some(commit_ts);
-                        }
-                    }
-                    buffer[0] = INTENT;
-                    tx.delete(&buffer[..end])?;
-                    buffer[0] = HEAD;
-                    if version.is_none() {
-                        tx.delete(&buffer[..end])?
-                    } else {
-                        tx.put_serialized(
-                            &buffer[..end],
-                            &Head {
-                                version,
-                                intent: None,
-                            },
-                        )?;
-                    }
-                    Ok(())
-                })?;
-            }
+            resolve_writes(tx, &state, txn, until, statement.decision)?;
             if until == state.writes && tx.pinned(&txn_key(b'd', txn))?.is_none() {
                 tx.put_serialized(
                     &txn_key(b'd', txn),
@@ -901,13 +928,145 @@ fn apply(
                 },
             )
         }
-        ParticipantCommand::Fence { .. } | ParticipantCommand::Lifecycle(_) => unreachable!(),
+        ParticipantCommand::Fence { .. }
+        | ParticipantCommand::FenceScopedQueue(_)
+        | ParticipantCommand::Scoped { .. }
+        | ParticipantCommand::PrepareTimestampPoint { .. }
+        | ParticipantCommand::RejectTimestampPoint { .. }
+        | ParticipantCommand::Lifecycle(_) => unreachable!(),
     }
 }
 
 /// The page producer uses this same deterministic bound before proposing. The
 /// state machine repeats it before candidate growth, returning a stable page
 /// rejection instead of making a committed entry depend on replica memory.
+fn seal(
+    tx: &mut GroupTransaction<'_>,
+    txn: TxnId,
+    manifest: ManifestRef,
+    result_digest: Digest,
+    authority: Authority,
+    position: AppliedPosition,
+    scope: Option<crate::oltp_replication::authority::control::ScopedCatalogRead>,
+    point_home: Option<Digest>,
+) -> Result<Transition, ProtocolError> {
+    if tx.pinned(&txn_key(b'b', txn))?.is_some()
+        || timestamp_resolution::rejection_exists(tx, txn)?
+    {
+        return reject(tx, Fault::RolledBack);
+    }
+    let key = txn_key(b't', txn);
+    let Some(mut state) = load::<Txn>(tx, &key)? else {
+        return reject(tx, Fault::Incomplete);
+    };
+    if state.manifest != manifest
+        || state.point_home != point_home
+        || state.scoped_queue != scope.map(scoped_queue::QueueBinding::from_scope)
+        || scope.is_some_and(|scope| {
+            state.request != scope.request || state.plan.read_ts != scope.read_ts
+        })
+    {
+        return reject(tx, Fault::InvalidBinding);
+    }
+    if let Some(sealed) = state.sealed {
+        return if sealed.result_digest == result_digest {
+            commit(tx, &ParticipantReply::Sealed(sealed))
+        } else {
+            reject(tx, Fault::InvalidBinding)
+        };
+    }
+    if state.decision.is_some()
+        || state.next_page != state.plan.page_count
+        || state.writes != state.plan.write_count
+        || state.root != state.plan.write_root
+    {
+        return reject(tx, Fault::Incomplete);
+    }
+    let sealed = PreparedParticipant {
+        txn,
+        manifest,
+        participant: state.plan.clone(),
+        authority,
+        sealed_at: position,
+        result_digest,
+    };
+    state.sealed = Some(sealed.clone());
+    tx.put_serialized(&key, &state)?;
+    commit(tx, &ParticipantReply::Sealed(sealed))
+}
+
+fn resolve_writes(
+    tx: &mut GroupTransaction<'_>,
+    state: &Txn,
+    txn: TxnId,
+    until: u64,
+    decision: TxnDecision,
+) -> Result<(), ProtocolError> {
+    for ordinal in state.resolved..until {
+        let logical = tx
+            .pinned(&ordinal_key(b'w', txn, ordinal))?
+            .ok_or_else(recovery_unknown)?;
+        let length = logical.len();
+        tx.with_scratch_buffer(length + 9, |tx, buffer| {
+            buffer[1..1 + length].copy_from_slice(&logical);
+            let end = length + 1;
+            buffer[0] = HEAD;
+            let head = load::<Head>(tx, &buffer[..end])?.ok_or_else(recovery_unknown)?;
+            if head.intent != Some(txn) {
+                return Err(recovery_unknown());
+            }
+            buffer[0] = INTENT;
+            let encoded = tx.pinned(&buffer[..end])?.ok_or_else(recovery_unknown)?;
+            if encoded.len() > super::MAX_FIXED_COMMAND_BYTES {
+                return Err(recovery_unknown());
+            }
+            // Borrow row JSON from the pinned intent; only fixed
+            // metadata is decoded, never the application row tree.
+            let intent: Intent<'_> =
+                serde_json::from_slice(&encoded).map_err(|_| recovery_unknown())?;
+            if intent.txn != txn || intent.manifest != state.manifest {
+                return Err(recovery_unknown());
+            }
+            let mut version = head.version;
+            if let TxnDecision::Commit { commit_ts } = decision {
+                if !matches!(intent.change, IntentChange::Keep) {
+                    buffer[0] = VALUE;
+                    buffer[end..].copy_from_slice(&(!commit_ts.get()).to_be_bytes());
+                    #[derive(Serialize)]
+                    struct Version<'a> {
+                        value: Option<&'a RawValue>,
+                    }
+                    let value = match intent.change {
+                        IntentChange::Put => {
+                            Some(intent.value.ok_or_else(recovery_unknown)?)
+                        }
+                        IntentChange::Delete => None,
+                        _ => unreachable!(),
+                    };
+                    tx.put_serialized(buffer, &Version { value })?;
+                    version = Some(commit_ts);
+                }
+            }
+            buffer[0] = INTENT;
+            tx.delete(&buffer[..end])?;
+            buffer[0] = HEAD;
+            if version.is_none() {
+                tx.delete(&buffer[..end])?
+            } else {
+                tx.put_serialized(
+                    &buffer[..end],
+                    &Head {
+                        version,
+                        intent: None,
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn page_fits(
     txn: &TxnId,
     manifest: &ManifestRef,
@@ -1007,6 +1166,8 @@ pub(crate) fn encoded_length(value: &impl Serialize, limit: usize) -> Result<usi
 impl std::fmt::Display for ParticipantCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Scoped { .. } => "participant-scoped",
+            Self::FenceScopedQueue(_) => "participant-scoped-queue-fence",
             Self::Fence { .. } => "participant-fence",
             Self::Lifecycle(_) => "catalog-lifecycle",
             Self::SplitFreeze { .. } => "participant-split-freeze",
@@ -1015,6 +1176,10 @@ impl std::fmt::Display for ParticipantCommand {
             Self::SplitImportPage { .. } => "participant-split-image-page",
             Self::PreparePage { .. } => "participant-prepare-page",
             Self::Seal { .. } => "participant-seal",
+            Self::PrepareTimestampPoint { .. } => "participant-prepare-timestamp-point",
+            Self::SealTimestampPoint { .. } => "participant-seal-timestamp-point",
+            Self::RejectTimestampPoint { .. } => "participant-reject-timestamp-point",
+            Self::ResolveTimestampPoint { .. } => "participant-resolve-timestamp-point",
             Self::Resolve { .. } => "participant-resolve",
         })
     }
@@ -1289,6 +1454,18 @@ fn encode_key(key: &MvccKey, out: &mut [u8]) {
     }
 }
 
+impl ParticipantCommand {
+    pub(crate) fn uses_prepare_lane(&self) -> bool {
+        matches!(
+            self,
+            Self::PreparePage { .. }
+                | Self::PrepareTimestampPoint { .. }
+                | Self::RejectTimestampPoint { .. }
+                | Self::SplitImportPage { .. }
+        )
+    }
+}
+
 impl OwnedPayload for ParticipantCommand {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         let mut bytes = 0usize;
@@ -1297,6 +1474,18 @@ impl OwnedPayload for ParticipantCommand {
             Ok(())
         };
         match self {
+            Self::Scoped { command, .. } => {
+                add(command.uncharged_heap_bytes()?)?;
+            }
+            Self::PrepareTimestampPoint { locator, page }
+            | Self::RejectTimestampPoint { locator, page } => {
+                add(timestamp_resolution::locator_heap_bytes(locator))?;
+                add(page.uncharged_heap_bytes()?)?;
+            }
+            Self::SealTimestampPoint { locator, .. } => {
+                add(timestamp_resolution::locator_heap_bytes(locator))?;
+            }
+            Self::ResolveTimestampPoint { proof, .. } => add(proof.heap_bytes())?,
             Self::SplitFreeze { children, .. } => {
                 add(std::mem::size_of_val(children.as_ref()))?;
                 for child in children.iter() {
@@ -1339,6 +1528,14 @@ impl OwnedPayload for ParticipantCommand {
         &self,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<(), ProtocolError> {
+        match self {
+            Self::Scoped { command, .. }
+            | Self::PrepareTimestampPoint { page: command, .. }
+            | Self::RejectTimestampPoint { page: command, .. } => {
+                return command.attach_from_codec(owner);
+            }
+            _ => {}
+        }
         if let Self::SplitImportPage { page, .. } = self {
             page.attach_fields(owner.clone())?;
         }
@@ -1351,6 +1548,9 @@ impl OwnedPayload for ParticipantCommand {
     }
     fn fields_attached(&self) -> bool {
         match self {
+            Self::Scoped { command, .. }
+            | Self::PrepareTimestampPoint { page: command, .. }
+            | Self::RejectTimestampPoint { page: command, .. } => command.is_attached(),
             Self::SplitImportPage { page, .. } => page.fields_attached(),
             Self::PreparePage { writes, .. } => writes.iter().all(PreparedWrite::fields_attached),
             _ => true,

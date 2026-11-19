@@ -378,7 +378,8 @@ impl CatalogHandle {
         key: &Key,
         next: Option<Uuid>,
     ) -> Result<RouteRead, ProtocolError> {
-        self.read_route_pages(snapshot, table_id, key, next, None).await
+        self.read_route_pages(snapshot, table_id, key, next, None)
+            .await
     }
     async fn read_route_pages(
         &self,
@@ -390,12 +391,13 @@ impl CatalogHandle {
     ) -> Result<RouteRead, ProtocolError> {
         while let Some(page_id) = next {
             let read = match scope {
-                Some(scope) => self
-                    .read_scoped::<RoutingPage>(
+                Some(scope) => {
+                    self.read_scoped::<RoutingPage>(
                         scope,
                         MvccKey::CatalogRoutingPage { table_id, page_id },
                     )
-                    .await?,
+                    .await?
+                }
                 None => self.routing_page(snapshot, table_id, page_id).await?,
             };
             match read {
@@ -608,6 +610,7 @@ pub(crate) struct PointCatalog {
     pub(super) table: OwnedRecord<TableRecord>,
     pub(super) table_version: Option<CommitTs>,
     pub(super) first_page: Option<Uuid>,
+    pub(super) selected: Option<(OwnedRecord<RoutingPage>, usize)>,
 }
 
 impl CatalogCapture {
@@ -651,7 +654,110 @@ pub(crate) enum CaptureRead {
     Captured(CatalogCapture),
     Blocked(IntentRef),
 }
+pub(crate) enum ScopedCapture {
+    Captured(CatalogCapture),
+    ScopeSuperseded,
+}
 impl CatalogHandle {
+    pub(crate) async fn scoped_admission_route(
+        &self,
+        placement: &ScopedQueuePlacement,
+        authority: Authority,
+        request: RequestBinding,
+        key: &Key,
+    ) -> Result<RouteRead, ProtocolError> {
+        let GroupKind::Data { table_id, .. } = placement.group.kind else {
+            return Err(invalid());
+        };
+        let read_ts = ReadTs::new(u64::MAX).map_err(|_| invalid())?;
+        let scope = ScopedCatalogRead {
+            queue_group_id: placement.group.group_id,
+            data_generation: placement.data_generation,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request,
+            table_id,
+            read_ts,
+        };
+        let catalog = Self::new(Arc::new(self.participant.with_scoped_execution(scope)?))?;
+        let current = catalog.snapshot(read_ts, authority)?;
+        catalog.route(&current, table_id, key).await
+    }
+
+    pub(crate) async fn capture_scoped_lineage(
+        &self,
+        placement: &crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        reservation: crate::oltp_replication::authority::status::IdentityReservation,
+        identity: &crate::oltp_replication::types::PinIdentity,
+        storage_pin: crate::oltp_replication::types::StoragePin,
+        key: &crate::protocol::Key,
+        authority: Authority,
+    ) -> Result<ScopedCapture, ProtocolError> {
+        use crate::oltp_replication::{
+            authority::control::ScopedCatalogRead,
+            types::{Digest, RequestBinding},
+        };
+        let GroupKind::Data { table_id, .. } = placement.group.kind else {
+            return Err(invalid());
+        };
+        let request = RequestBinding {
+            run_id: identity.run_id,
+            request_id: identity.request_id,
+            digest: identity.digest,
+            accepted_context: Digest::from_bytes([0; 32]),
+        };
+        if !reservation.binds(request)
+            || reservation.reservation_id != identity.nonce
+            || request.run_id != placement.view.run_id
+            || !reservation.scoped.is_some_and(|policy| {
+                policy.queue_group_id == placement.group.group_id
+                    && policy.queue_generation == placement.queue_generation
+            })
+        {
+            return Err(invalid());
+        }
+        let scope = ScopedCatalogRead {
+            queue_group_id: placement.group.group_id,
+            data_generation: placement.data_generation,
+            queue_generation: placement.queue_generation,
+            queue_view: placement.view,
+            request,
+            table_id,
+            read_ts: storage_pin.read_ts,
+        };
+        let catalog = Self::new(Arc::new(self.participant.with_scoped_execution(scope)?))?;
+        let pin = catalog.snapshot(storage_pin.read_ts, authority)?;
+        let operation = crate::protocol::Operation::Get(crate::protocol::KeyPayload {
+            table_id,
+            key: key.clone(),
+        });
+        let unavailable = || {
+            ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "scoped catalog lineage or data route is unavailable",
+                crate::protocol::Outcome::Unknown,
+            )
+        };
+        let CaptureRead::Captured(mut capture) = catalog.capture_lineage(&pin, &operation).await?
+        else {
+            return Err(unavailable());
+        };
+        let Some(point) = capture.point.as_mut() else {
+            return Ok(ScopedCapture::ScopeSuperseded);
+        };
+        match catalog
+            .route_pages(&pin, table_id, key, point.first_page)
+            .await?
+        {
+            RouteRead::Route { page, index } if page.shards[index].group == placement.group => {
+                point.selected = Some((page, index));
+                Ok(ScopedCapture::Captured(capture))
+            }
+            RouteRead::Route { .. } | RouteRead::Missing => Ok(ScopedCapture::ScopeSuperseded),
+            RouteRead::Blocked(_) => Err(unavailable()),
+        }
+    }
+
     pub(crate) async fn capture_lineage(
         &self,
         pin: &PinnedCatalog,
@@ -739,6 +845,7 @@ impl CatalogHandle {
                                 table,
                                 table_version: capture.table_version,
                                 first_page: root.first_page,
+                                selected: None,
                             });
                         }
                     }

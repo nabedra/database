@@ -5,12 +5,13 @@ use crate::{
             CanonicalJson,
             store::ParticipantHandle,
         },
-        pool::{ChargedBytes, WorkerSharedResources},
+        pool::{ChargedBytes, ScratchLease, WorkerSharedResources},
     },
     oltp_replication::{
         authority::{
             consensus::{Applied, ConsensusFuture},
-            timestamp::{VerifiedArchiveClosure, VerifiedPinRelease},
+            control::ScopedQueuePlacement,
+            timestamp::{ScopedAdmissionClosure, VerifiedArchiveClosure, VerifiedPinRelease},
         },
         types::*,
     },
@@ -202,6 +203,67 @@ impl StatusService for PartitionedStatus {
     fn identity(&self) -> &GroupIdentity {
         &self.topology.groups()[0]
     }
+    fn with_scoped_execution(
+        &self,
+        scope: crate::oltp_replication::authority::control::ScopedCatalogRead,
+    ) -> Result<Arc<dyn StatusService>, ProtocolError> {
+        self.request(scope.request.request_id)
+            .with_scoped_execution(scope)
+    }
+    fn fence_scoped_queue<'a>(
+        &'a self,
+        transfer: &'a crate::oltp_replication::authority::control::ScopedQueueTransition,
+    ) -> ConsensusFuture<'a, ()> {
+        Box::pin(async move {
+            for service in &self.services {
+                service.fence_scoped_queue(transfer).await?;
+            }
+            Ok(())
+        })
+    }
+    fn scoped_receipt<'a>(
+        &'a self,
+        placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        request: RequestBinding,
+        txn: TxnId,
+        manifest: ManifestRef,
+    ) -> ConsensusFuture<'a, (VerifiedStatusDecision, VerifiedSettlement)> {
+        self.request(request.request_id)
+            .scoped_receipt(placement, request, txn, manifest)
+    }
+    fn retired_scoped_receipt<'a>(
+        &'a self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        self.request(request_id).retired_scoped_receipt(run, request_id, digest)
+    }
+    fn prior_scoped_receipt<'a>(
+        &'a self,
+        run: Uuid,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        self.request(request_id).prior_scoped_receipt(run, request_id, digest)
+    }
+    fn scoped_terminal_receipt<'a>(
+        &'a self,
+        placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Option<Digest>,
+    ) -> ConsensusFuture<'a, Option<ScopedTerminalReceipt>> {
+        self.request(request_id).scoped_terminal_receipt(placement, request_id, digest)
+    }
+    fn lookup_identity_for_scoped<'a>(
+        &'a self,
+        placement: &'a crate::oltp_replication::authority::control::ScopedQueuePlacement,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, Option<IdentityLookup>> {
+        self.request(request_id)
+            .lookup_identity_for_scoped(placement, request_id, digest)
+    }
     fn resources(&self) -> &Arc<WorkerSharedResources> {
         self.services[0].resources()
     }
@@ -275,6 +337,16 @@ impl StatusService for PartitionedStatus {
         self.request(cap.reservation().request_id)
             .reject_unaccepted(cap)
     }
+    fn reject_scoped_route_moved<'a>(
+        &'a self,
+        placement: &'a ScopedQueuePlacement,
+        authority: Authority,
+        reservation: IdentityReservation,
+        closure: &'a ScopedAdmissionClosure,
+    ) -> ConsensusFuture<'a, RejectedIdentity> {
+        self.request(reservation.request_id)
+            .reject_scoped_route_moved(placement, authority, reservation, closure)
+    }
     fn rejected_identity<'a>(
         &'a self,
         expected: &'a RejectedIdentity,
@@ -295,6 +367,35 @@ impl StatusService for PartitionedStatus {
         digest: Digest,
     ) -> ConsensusFuture<'a, Option<VerifiedTerminalRetirement>> {
         self.request(request_id).retirement(request_id, digest)
+    }
+    fn install_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        point: TimestampPointManifest,
+    ) -> ConsensusFuture<'a, ManifestRef> {
+        self.request(point.binding.txn.request_id).install_timestamp_point(authority, point)
+    }
+    fn timestamp_point_home<'a>(
+        &'a self,
+        authority: Authority,
+        request_id: Uuid,
+        digest: Digest,
+    ) -> ConsensusFuture<'a, TimestampPointHome> {
+        self.request(request_id).timestamp_point_home(authority, request_id, digest)
+    }
+    fn timestamp_point_projection<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, Option<(TimestampPointProjection, Arc<ScratchLease>)>> {
+        self.request(locator.binding.txn.request_id).timestamp_point_projection(authority, locator)
+    }
+    fn project_timestamp_point<'a>(
+        &'a self,
+        authority: Authority,
+        locator: &'a TimestampDecisionLocator,
+    ) -> ConsensusFuture<'a, (TimestampPointProjection, Arc<ScratchLease>)> {
+        self.request(locator.binding.txn.request_id).project_timestamp_point(authority, locator)
     }
     fn try_install_point_manifest<'a>(
         &'a self,

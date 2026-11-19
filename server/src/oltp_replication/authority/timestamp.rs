@@ -20,10 +20,21 @@ pub(crate) mod archive_lifecycle;
 pub(crate) mod cold;
 mod handle;
 mod index_metadata;
+pub(crate) mod point_decision;
+mod scoped_admission;
+mod scoped_retirement;
 mod service;
 pub(crate) mod split;
 pub(crate) use handle::TimestampHandle;
 pub(crate) use index_metadata::IndexMetadataPin;
+pub(crate) use point_decision::{
+    PointDecision, TimestampDecisionLocator, TimestampPointBinding, TimestampPointManifest,
+};
+pub(crate) use scoped_admission::{ScopedAdmissionClosure, ScopedAdmissionFailure};
+pub(crate) use scoped_retirement::{
+    ScopedCopyProof, ScopedPinRelease, ScopedRetirementMarker, ScopedTerminalStatement,
+    ScopedTerminalWitness, ScopedTerminalWitnessReply, ScopedTimestampEpoch,
+};
 pub(crate) use service::TimestampService;
 
 /// Per-Status-group archive closure. Only the TSO leader's allocation/decision
@@ -104,11 +115,24 @@ pub(crate) enum TimestampCommand {
         pin: StoragePin,
         request: RequestBinding,
     },
+    ScopedSnapshot(scoped_admission::Command),
     AllocateCommit {
         permit: SealedCommitPermit,
     },
+    DecidePoint(Box<point_decision::PointCommand>),
     Release {
         proof: SealedTerminalProof,
+    },
+    FenceScopedQueue {
+        transition_id: uuid::Uuid,
+        previous: ScopedTimestampEpoch,
+        next: ScopedTimestampEpoch,
+    },
+    StageScopedCopies {
+        copies: scoped_retirement::ScopedTerminalCopies,
+    },
+    ReleaseScoped {
+        marker: ScopedRetirementMarker,
     },
     CancelUnaccepted {
         proof: super::status::SealedAdmissionRejection,
@@ -183,8 +207,13 @@ impl fmt::Display for TimestampCommand {
             Self::FenceReady { .. } => "timestamp.ready_fence",
             Self::BeginSnapshot { .. } => "timestamp.begin_snapshot",
             Self::BindSnapshotContext { .. } => "timestamp.bind_snapshot_context",
+            Self::ScopedSnapshot(command) => command.name(),
             Self::AllocateCommit { .. } => "timestamp.allocate_commit",
+            Self::DecidePoint(_) => "timestamp.decide_point",
             Self::Release { .. } => "timestamp.release_pin",
+            Self::FenceScopedQueue { .. } => "timestamp.fence_scoped_queue",
+            Self::StageScopedCopies { .. } => "timestamp.stage_scoped_copies",
+            Self::ReleaseScoped { .. } => "timestamp.release_scoped_pin",
             Self::CancelUnaccepted { .. } => "timestamp.cancel_unaccepted",
             Self::ReleaseColdApplication { .. } => "timestamp.release_cold_application",
             Self::BeginMaintenance { .. } => "timestamp.begin_maintenance",
@@ -207,10 +236,14 @@ impl OwnedPayload for TimestampCommand {
         Ok(match self {
             Self::SealArchive { proof } => proof.heap_bytes(),
             Self::SplitMetadata { command } => command.heap_bytes()?,
+            Self::DecidePoint(command) => command.heap_bytes(),
+            Self::ScopedSnapshot(command) => command.heap_bytes(),
             Self::ReleaseMaintenance { closure, .. } => closure
                 .restored_observation
                 .as_ref()
-                .map_or(0, |observation| observation.target.database.capacity_bytes()),
+                .map_or(0, |observation| {
+                    observation.target.database.capacity_bytes()
+                }),
             Self::CancelUnaccepted { proof } => {
                 proof.status_group().database.capacity_bytes()
                     + proof.rejection().failure.heap_bytes()
@@ -236,6 +269,7 @@ pub(crate) enum Fault {
     PinExpired,
     UnknownPin,
     TimestampExhausted,
+    DecisionUnavailable,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -246,10 +280,22 @@ pub(crate) enum TimestampReply {
         receipt: GroupFenceReceipt,
     },
     Snapshot(StoragePin),
+    ScopedSnapshot {
+        pin: StoragePin,
+        origin: crate::oltp_runtime::replica::OriginalAuthorization,
+    },
     ContextBound(StoragePin),
     Commit(CommitStamp),
+    PointDecided(Box<PointDecision>),
     ReadyFenced(ReadyFenceReceipt),
     Released,
+    ScopedQueueFenced {
+        transition_id: uuid::Uuid,
+        epoch: ScopedTimestampEpoch,
+        applied_at: AppliedPosition,
+    },
+    ScopedCopies(ScopedCopyProof),
+    ScopedPinReleased(ScopedPinRelease),
     Archive(archive::ArchiveClosureStatement),
     Retention {
         authority: Authority,
@@ -258,6 +304,7 @@ pub(crate) enum TimestampReply {
         applied_at: AppliedPosition,
     },
     Rejected(Fault),
+    ScopedAdmissionClosed(ScopedAdmissionClosure),
 }
 /// A durable receipt for Control's pending -> TSO-fenced -> published phases.
 /// Re-proposing the same transition returns its original applied position.
@@ -288,10 +335,14 @@ enum PinState {
         proof: SealedTerminalProof,
         applied_at: AppliedPosition,
     },
+    ScopedReleased { release: ScopedPinRelease },
     Cancelled,
     ColdReleased,
     MetadataReleased {
         decision: Digest,
+        applied_at: AppliedPosition,
+    },
+    ScopeSuperseded {
         applied_at: AppliedPosition,
     },
 }
@@ -321,6 +372,8 @@ struct PinRecord {
     state: PinState,
     #[serde(default)]
     purpose: PinPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_copy_proof: Option<ScopedCopyProof>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -433,10 +486,24 @@ fn apply(
 ) -> Result<Transition, ProtocolError> {
     let state: Option<State> = load(tx, STATE)?;
     match command {
+        TimestampCommand::FenceScopedQueue { transition_id, previous, next } => {
+            scoped_retirement::fence(tx, state, *transition_id, *previous, *next, digest, position)
+        }
+        TimestampCommand::ScopedSnapshot(command) => {
+            scoped_admission::apply(tx, scope, state, command, position)
+        }
+        TimestampCommand::StageScopedCopies { copies } => {
+            scoped_retirement::stage(tx, state, copies.clone(), position)
+        }
+        TimestampCommand::ReleaseScoped { marker } => {
+            scoped_retirement::release(tx, state, marker.clone(), position)
+        }
         TimestampCommand::ArchiveControl { command } => {
             archive_lifecycle::apply(tx, state, command)
         }
-        TimestampCommand::SplitMetadata { command } => split::apply(tx, state, scope, command, position),
+        TimestampCommand::SplitMetadata { command } => {
+            split::apply(tx, state, scope, command, position)
+        }
         TimestampCommand::SealArchive { proof } => archive::apply_closure(tx, scope, state, proof),
         TimestampCommand::Fence {
             transition_id,
@@ -546,107 +613,15 @@ fn apply(
             identity,
             reservation,
             pin_id,
-        } => {
-            let Some(mut state) = state else {
-                return reject(tx, Fault::NotInitialized);
-            };
-            if state.ready.view != *view {
-                return reject(tx, Fault::StaleReadyView);
-            }
-            if state.ready.ready_count == 0
-                || pin_id.is_nil()
-                || identity.nonce.is_nil()
-                || reservation.request_id.is_nil()
-                || reservation.reservation_id.is_nil()
-                || identity.nonce != reservation.reservation_id
-                || identity.run_id != state.authority.run_id
-                || identity.run_id != reservation.original_run
-                || identity.request_id != reservation.request_id
-                || identity.digest != reservation.digest
-            {
-                return reject(tx, Fault::InvalidBinding);
-            }
-            let key = pin_key(identity.nonce);
-            if tx.get(&rejected_key(identity.nonce))?.is_some() {
-                return reject(tx, Fault::PinExpired);
-            }
-            if let Some(existing) = load::<PinRecord>(tx, &key)? {
-                if existing.identity != *identity
-                    || existing.reservation != *reservation
-                    || existing.purpose != PinPurpose::Application
-                {
-                    return reject(tx, Fault::InvalidBinding);
-                }
-                return match existing.state {
-                    PinState::Active => commit(tx, &TimestampReply::Snapshot(existing.pin)),
-                    PinState::Released { .. }
-                    | PinState::Cancelled
-                    | PinState::ColdReleased
-                    | PinState::MetadataReleased { .. } => reject(tx, Fault::PinExpired),
-                };
-            }
-            let Some(next) = state.high_watermark.checked_add(1) else {
-                return reject(tx, Fault::TimestampExhausted);
-            };
-            let read_ts = Timestamp::new(next).map_err(|_| unknown())?;
-            let pin = StoragePin {
-                pin_id: *pin_id,
-                read_ts,
-                allocator_epoch: state.allocator_epoch,
-            };
-            let record = PinRecord {
-                identity: identity.clone(),
-                reservation: *reservation,
-                request: None,
-                pin,
-                state: PinState::Active,
-                purpose: PinPurpose::Application,
-            };
-            put(tx, &key, &record)?;
-            tx.put(&active_key(pin), identity.nonce.as_bytes())?;
-            state.high_watermark = next;
-            put(tx, STATE, &state)?;
-            commit(tx, &TimestampReply::Snapshot(pin))
-        }
+        } => scoped_admission::begin(tx, state, *view, identity, reservation, *pin_id, None),
         TimestampCommand::BindSnapshotContext {
             view,
             identity,
             pin,
             request,
-        } => {
-            let Some(state) = state else {
-                return reject(tx, Fault::NotInitialized);
-            };
-            if state.ready.view != *view {
-                return reject(tx, Fault::StaleReadyView);
-            }
-            if request.run_id != state.authority.run_id
-                || request.run_id != identity.run_id
-                || request.request_id != identity.request_id
-                || request.digest != identity.digest
-            {
-                return reject(tx, Fault::InvalidBinding);
-            }
-            let key = pin_key(identity.nonce);
-            let Some(mut record) = load::<PinRecord>(tx, &key)? else {
-                return reject(tx, Fault::UnknownPin);
-            };
-            if record.identity != *identity || record.pin != *pin {
-                return reject(tx, Fault::InvalidBinding);
-            }
-            if !matches!(record.state, PinState::Active) {
-                return reject(tx, Fault::PinExpired);
-            }
-            if let Some(existing) = record.request {
-                return if existing == *request {
-                    commit(tx, &TimestampReply::ContextBound(*pin))
-                } else {
-                    reject(tx, Fault::InvalidBinding)
-                };
-            }
-            record.request = Some(*request);
-            put(tx, &key, &record)?;
-            commit(tx, &TimestampReply::ContextBound(*pin))
+        } => scoped_admission::bind(tx, state, *view, identity, *pin, *request, None),
+        TimestampCommand::DecidePoint(command) => {
+            point_decision::apply(tx, scope, state, command, position)
         }
         TimestampCommand::AllocateCommit { permit } => {
             let Some(mut state) = state else {
@@ -658,6 +633,9 @@ fn apply(
             let statement = permit.statement();
             if state.authority != statement.authority {
                 return reject(tx, Fault::StaleAuthority);
+            }
+            if point_decision::record_exists(statement.txn.request_id, |key| tx.get(key))? {
+                return reject(tx, Fault::DecisionUnavailable);
             }
             let key = commit_key(statement.manifest.status_group_id, statement.txn);
             if let Some(existing) = load::<CommitAllocation>(tx, &key)? {
@@ -687,6 +665,12 @@ fn apply(
             if pin.pin.read_ts != statement.read_ts
                 || pin.request != Some(statement.request)
                 || pin.reservation.kind != super::status::RequestKind::Mutation
+                || pin.reservation.scoped.is_some_and(|binding| {
+                    binding.status_group_id != statement.manifest.status_group_id
+                        || pin.purpose != PinPurpose::Application
+                        || !pin.reservation.binds(statement.request)
+                        || !matches!(pin.state, PinState::Active)
+                })
             {
                 return reject(tx, Fault::InvalidBinding);
             }
@@ -728,7 +712,8 @@ fn apply(
             let Some(mut pin) = load::<PinRecord>(tx, &key)? else {
                 return reject(tx, Fault::UnknownPin);
             };
-            if pin.identity != statement.pin_identity
+            if pin.reservation.scoped.is_some()
+                || pin.identity != statement.pin_identity
                 || pin.request != Some(statement.request)
                 || pin.pin != statement.storage_pin
                 || pin.purpose != PinPurpose::Application
@@ -744,9 +729,10 @@ fn apply(
                 } => {
                     if *terminal_version > statement.terminal_version
                         || *response_hash != statement.response_hash
-                        || stored.statement.terminal_digest.is_some_and(|digest| {
-                            statement.terminal_digest != Some(digest)
-                        })
+                        || stored
+                            .statement
+                            .terminal_digest
+                            .is_some_and(|digest| statement.terminal_digest != Some(digest))
                         || ((*terminal_version == statement.terminal_version)
                             != (stored.statement.ready == statement.ready))
                     {
@@ -759,7 +745,11 @@ fn apply(
                 PinState::Active => {
                     tx.delete(&active_key(pin.pin))?;
                 }
-                PinState::Cancelled | PinState::ColdReleased | PinState::MetadataReleased { .. } => {
+                PinState::ScopedReleased { .. }
+                | PinState::ScopeSuperseded { .. }
+                | PinState::Cancelled
+                | PinState::ColdReleased
+                | PinState::MetadataReleased { .. } => {
                     return reject(tx, Fault::PinExpired);
                 }
             }
@@ -1228,6 +1218,7 @@ fn begin_metadata(
             pin,
             state: PinState::Active,
             purpose,
+            scoped_copy_proof: None,
         },
     )?;
     tx.put(&active_key(pin), identity.nonce.as_bytes())?;
