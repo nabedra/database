@@ -36,3 +36,31 @@ cargo test --locked --manifest-path server/Cargo.toml --no-default-features \
 ```
 
 The fixture image ID is `sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc`. The `6d9a401` executable for the copy cuts has SHA-256 `efe76cc7c7e2b4c7473d9cd74133204d5f5781ee88d77acb339aa5ed86ee9ab7`.
+
+## Paired serial point-update comparison
+
+All three engines ran sequentially on the same x86-64 host under a 4 CPU and 8 GB Docker ceiling with RF3. Nabedra used 4 CPUs and 7.9 GB including its TLS gateway and driver. ScyllaDB used 3.65 CPUs and 7.35 GB including its direct CQL driver, with plain QUORUM updates, durable writes and batch commit-log sync. Swap was disabled and no container was OOM-killed. Nabedra's response also waits for its exact receipt and terminal copies.
+
+The matching schedule used one client, 128 initial rows, seed `20261118` and a 10-second client timeout. Each three-second window offered one update. There was one warm-up window and five measured windows per engine. The row oracle checked the initial data and each of the six windows. All three runs exited zero and passed the oracle. The matching schedule SHA-256 was `55f04f292d8de68e9a41a3ae5aa29a9c4e75dace476da64d6499a414cb397627`.
+
+| Engine | Successful writes | p50 latency (ms) | Largest latency (ms) | Median successful ops/s | Finished inside the offer window | Rejects / timeouts / unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prior Nabedra `e76250e` | 5/5 | 1,883.15 | 2,756.33 | 0.248 | 1/5 | 0 / 0 / 0 |
+| Scoped Nabedra `6d9a401` | 5/5 | 6,570.34 | 7,173.30 | 0.150 | 0/5 | 0 / 0 / 0 |
+| ScyllaDB 6.2.3 | 5/5 | 8.55 | 40.13 | 0.333 | 5/5 | 0 / 0 / 0 |
+
+Latency runs from scheduled arrival to completion. Successful throughput uses each window's elapsed time including its drain. The scoped median was 3.49 times the prior Nabedra median and outside the plan's proposed ScyllaDB equivalence band. Five samples per engine give a serial smoke comparison. High-percentile equivalence, saturation and concurrent load remain unmeasured. The binaries measured precede the final takeover-only fixes in this PR.
+
+```sh
+common=(--seconds 3 --warmup-seconds 3 --rates 0.34 --repetitions 5 \
+  --clients 1 --rows 128 --seed 20261118 --timeout 10)
+python3.11 -B scripts/benchmark_oltp_nabedra.py --image "$FIXTURE_IMAGE" \
+  --binary "$PRIOR_NABEDRA_DB" --output "$PRIOR_OUTPUT" \
+  --worker-cpus 1,1,1 --tls-key-type rsa "${common[@]}"
+python3.11 -B scripts/benchmark_oltp_nabedra.py --image "$FIXTURE_IMAGE" \
+  --binary "$SCOPED_NABEDRA_DB" --output "$CANDIDATE_OUTPUT" \
+  --worker-cpus 1,1,1 --tls-key-type rsa --scoped-oltp "${common[@]}"
+bash scripts/benchmark_scylla_oltp.sh "$SCYLLA_OUTPUT" "${common[@]}"
+```
+
+The prior binary SHA-256 is `551f6bd10c9150795d9ed157a07302e367939c7571a30f72dce18fd52ed95c40` and the scoped binary SHA-256 is `479439ce4435226070cf34e9b45ec285289f5de19ef0d5c1d44663f38472710d`. The ScyllaDB image is pinned to `sha256:a9d904089abe9a4f8b5b893ebb5b5bf8b5a1bd0dc6658921cf05f89d3712289c`. The integration checkout retains exact commands, individual samples, row oracle results and container limits under `.nabedra/workflows/oltp-production-overhaul/paired-short-6d9a401`. This run covers the serial subset of B01/B02.
