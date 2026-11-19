@@ -1,5 +1,7 @@
 This ledger records execution for [the OLTP contract](oltp-contract.md) and [implementation plan](../../plans/oltp-engine.md). The implementation is experimental. A local assertion is not evidence of distributed or provider behavior.
 
+The scoped queue rollout has a separate record of its registered RF3 copy, retry, cold-start and comparison runs. [Scoped OLTP queue evidence](evidence/oltp/scoped-queues/README.md)
+
 ## Common runtime integration
 
 The actual `serve` entry point now uses WorkerRuntime with typed Control, timestamp, Status, Catalog and Data Raft groups, guarded MVCC and fixed Prepare/Decide/Resolve transactions. The unchanged [public ORM program](../../server/tests/oltp_orm_contract.py) passed all thirteen operations, exact result types, atomic conflicts, submit/receipt/replay, authentication/database scope, stale handles and 1/100/1,000-row variations against the local RF1 topology. The server exited through SIGTERM and its child was reaped. This is the new runtime, not fixture authority or the legacy Operation-Raft adapter.
