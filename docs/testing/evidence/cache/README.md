@@ -51,14 +51,13 @@ small sample and single-host network establish runner interoperability.
   contract, clock bounds, stale authority and replication gaps, bounded
   promotion and snapshot allocation, and readiness based on locally
   installed leases. All five feature dependency-graph checks passed.
-- The default OLAP and OLAP-only Rust test matrices passed in Docker.
-  The OLTP-only unit suite reported 245 passes, 13 ignores and two failures
-  in unchanged tests. C07/M02 exhausted the fixture's configured memory
-  before reaching its authority-read assertion. C02 expected rejection
-  when the unchanged CLI accepts the configured thread count. Both OLTP
-  resolved package and feature graphs matched the approved-plan baseline.
-  All seven OLTP integration suites ran separately and returned 31 passes
-  and two ignores.
+- The default OLAP and OLAP-only Rust matrices passed in Docker. Each OLTP
+  variant, with and without backup-S3, reported 245 unit passes, 13 ignores
+  and two failures in unchanged fixtures. C07/M02 exhausted its configured
+  memory before reaching the authority-read assertion. C02 expected rejection
+  where the CLI accepts the configured thread count. All seven integration
+  suites ran for each variant and returned 31 passes and two ignores per
+  variant. Both resolved OLTP dependency and feature graphs match `8f5f6ae`.
 - The Python regression suite ran 190 tests with one skip. TypeScript passed
   41 checks with three live skips. Both rebuilt packages are version 0.2.0,
   and installed tests exercised TLS and authentication closure on an opening
@@ -68,3 +67,12 @@ small sample and single-host network establish runner interoperability.
   lost-response recovery. The 12-worker template passed static lint. No AWS
   actions ran. AZ-loss performance, actual surviving resource headroom and
   repeated provider growth and drain remain unqualified.
+
+## Release builds
+
+Docker produced and checksummed Linux amd64 and arm64 release archives.
+Both binaries require glibc 2.34 or compatible. The amd64 binary passed the
+standalone and clustered process tests. The arm64 binary passed the standalone
+TLS and RESP smoke under QEMU in Docker. BuildKit accepted the cache Dockerfile.
+The runtime stage, loaded with the compiled amd64 binary, returned RESP2 PONG
+as the unprivileged service user. [Release archive build command](../../../../scripts/cache-release/build-linux.sh)
