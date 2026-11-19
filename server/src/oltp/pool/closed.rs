@@ -49,9 +49,21 @@ impl OltpPool {
                         error: storage_error_message(),
                     });
                 }
-                let inner = match Arc::try_unwrap(self.inner) {
-                    Ok(inner) => inner,
-                    Err(inner) => return Ok(PoolCloseOutcome::StillOwned(OltpPool { inner })),
+                // Stats briefly hold pool references under this lock; holding it
+                // here makes the last-owner check exact.
+                let registry = self.inner.shared.clone();
+                let inner = {
+                    let _pools = registry
+                        .storage
+                        .pools
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    match Arc::try_unwrap(self.inner) {
+                        Ok(inner) => inner,
+                        Err(inner) => {
+                            return Ok(PoolCloseOutcome::StillOwned(OltpPool { inner }));
+                        }
+                    }
                 };
                 let registered = match &inner._mount {
                     Some(mount) => match mount.reobserve_for_close(close_id) {
@@ -69,7 +81,7 @@ impl OltpPool {
                     },
                     None => None,
                 };
-                if inner.recovery.load(Ordering::Acquire) {
+                if inner.recovery.load(Ordering::Acquire) || inner.store.requires_recovery() {
                     return Ok(PoolCloseOutcome::Failed {
                         pool: OltpPool {
                             inner: Arc::new(inner),
@@ -77,7 +89,7 @@ impl OltpPool {
                         error: recovery_unknown(),
                     });
                 }
-                if inner.db.flush_wal(true).is_err() {
+                if inner.store.sync().and_then(wait_commit).is_err() {
                     inner.recovery.store(true, Ordering::Release);
                     return Ok(PoolCloseOutcome::Failed {
                         pool: OltpPool {
@@ -101,7 +113,7 @@ impl OltpPool {
                     identity: inner.identity.clone(),
                     registered,
                 };
-                // PoolInner drops DB first and the verified mount last. Every
+                // PoolInner closes the store first and drops the verified mount last. Every
                 // exported snapshot/transfer owns a pool guard and prevented the
                 // unique unwrap above while it could still use this filesystem.
                 drop(inner);
@@ -198,16 +210,16 @@ impl OltpPool {
                     return Err(blocked());
                 }
                 let id = group.group_id;
-                let db = pool.inner.db.snapshot();
+                let db = pool.snapshot();
                 if db
-                    .get_pinned(group_key(id, b't', &[]))
+                    .get(&group_key(id, b't', &[]))
                     .map_err(storage_error)?
                     .is_some()
                 {
                     return Err(blocked());
                 }
                 let active = db
-                    .get_pinned(group_key(id, b'a', &[]))
+                    .get(&group_key(id, b'a', &[]))
                     .map_err(storage_error)?
                     .ok_or_else(recovery_unknown)?;
                 if active.len() != 8 {
@@ -215,7 +227,8 @@ impl OltpPool {
                 }
 
                 let prefix = group_key(id, b's', active.as_ref());
-                let mut iter = db.raw_iterator();
+                let scope = group_scope(id);
+                let mut iter = RawIter::bounded(&db, &scope, &prefix_end(&scope), true);
                 let mut intent = prefix.clone();
                 intent.push(crate::oltp::mvcc::store::INTENT);
                 iter.seek(&intent);
@@ -233,12 +246,12 @@ impl OltpPool {
                     }
                     let mut resolution = key.to_vec();
                     resolution[transactions.len() - 1] = b'd';
-                    if db.get_pinned(resolution).map_err(storage_error)?.is_none() {
+                    if db.get(&resolution).map_err(storage_error)?.is_none() {
                         return Err(blocked());
                     }
                     iter.next();
                 }
-                iter.status().map_err(storage_error)?;
+                iter.status()?;
 
                 let incoming = pool
                     .inner
@@ -261,12 +274,12 @@ impl OltpPool {
                     .key()
                     .filter(|key| key.starts_with(&retired_prefix))
                     .ok_or_else(blocked)?;
-                let bytes = iter.value().ok_or_else(recovery_unknown)?;
+                let bytes = iter.value()?;
                 if bytes.len() > 4096 || key.len() != retired_prefix.len() + 16 {
                     return Err(recovery_unknown());
                 }
                 let proof: ReplicaRetiredStamp =
-                    serde_json::from_slice(bytes).map_err(|_| recovery_unknown())?;
+                    serde_json::from_slice(&bytes).map_err(|_| recovery_unknown())?;
                 if proof.group != group
                     || proof.generation.as_bytes() != &key[retired_prefix.len()..]
                     || proof.replica.pool_id != pool.identity().pool_id
@@ -281,7 +294,7 @@ impl OltpPool {
                 {
                     return Err(blocked());
                 }
-                iter.status().map_err(storage_error)?;
+                iter.status()?;
                 Ok(proof)
             })
             .await

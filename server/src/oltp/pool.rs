@@ -9,6 +9,7 @@ mod placement;
 mod resources;
 pub(crate) mod restore;
 mod snapshot;
+mod storage;
 pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
 #[cfg(test)]
 mod tests;
@@ -19,16 +20,14 @@ pub use resources::{
 use resources::{ByteReservation, capacity};
 pub(crate) use resources::{GroupCapacityLease, RAFT_REPLICA_BYTES};
 
-use super::{failure, recovery_unknown, storage_error, sync_options};
+use super::{failure, recovery_unknown};
 use crate::{
     oltp_replication::types::{Digest, GroupIdentity},
     protocol::{ErrorCode, ProtocolError},
     scheduling::MemoryCharge,
 };
-use rocksdb::{
-    BlockBasedOptions, DB, DBCompressionType, DBPinnableSlice, DBRawIterator, DBRecoveryMode,
-    Options, Snapshot, WriteBatch, WriteOptions,
-};
+use bytes::Bytes;
+use nabedra_kv::{Durability, Snapshot, Store, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -40,6 +39,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use storage::{
+    GROUP_SCOPE_BYTES, RawIter, commit_error, group_scope, prefix_end, storage_error,
+    unsupported_format, wait_commit,
+};
+pub use storage::StorageStats;
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
@@ -48,8 +52,8 @@ const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const BATCH_OVERHEAD: usize = 32;
-#[cfg(test)]
-pub(crate) const TEST_UNSYNCED_WAL_IN_MEMORY: &str = "NABEDRA_TEST_UNSYNCED_WAL_IN_MEMORY";
+/// Pool format 2: a `nabedra-kv` store in `kv/`. Format 1 (RocksDB) is refused (Q1).
+pub const POOL_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +67,7 @@ pub struct PoolIdentity {
 impl PoolIdentity {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.engine != "oltp"
-            || self.pool_format_version != 1
+            || self.pool_format_version != POOL_FORMAT_VERSION
             || self.cluster_id.is_nil()
             || self.worker_id.is_nil()
             || self.pool_id.is_nil()
@@ -78,13 +82,14 @@ impl PoolIdentity {
 }
 
 struct PoolInner {
-    db: DB,
+    /// Declared first so the store closes before the slot, charges and mount drop.
+    store: Store,
     identity: PoolIdentity,
     path: std::path::PathBuf,
     shared: Arc<WorkerSharedResources>,
     recovery: Arc<AtomicBool>,
     groups: Arc<tokio::sync::Mutex<BTreeMap<Uuid, Weak<GroupInner>>>>,
-    durability: WalDurability,
+    synced_requests: AtomicU64,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
     _mount: Option<VerifiedPoolMount>,
@@ -100,35 +105,28 @@ struct GroupInner {
     generation: Arc<tokio::sync::RwLock<()>>,
     log_order: Arc<tokio::sync::Mutex<()>>,
     log_metadata_order: Arc<tokio::sync::Mutex<()>>,
-    /// Set only by the Raft host after it proves this group's log lives in
-    /// the same physical pool, and therefore the same RocksDB WAL.
+    /// Set only by the Raft host after it proves this group's log lives in the
+    /// same physical pool, and therefore the same journal. Cleared when the host
+    /// stops (RV-T2 Q5).
     deferred_apply: AtomicBool,
-    /// Last unsynced application write: (applied index, WAL ticket).
+    /// Last unsynced application write: (applied index, journal sequence).
     deferred_tail: std::sync::Mutex<Option<(u64, u64)>>,
     synced_writes: AtomicU64,
     deferred_writes: AtomicU64,
     _handle_slot: GroupCapacityLease,
 }
-/// Orders unsynced writes against later synced writes of the same WAL. A write
-/// takes its ticket only after RocksDB returned, so a synced write that starts
-/// after the ticket was issued also persists that write. RocksDB loses only a
-/// WAL suffix, so every write ordered before a completed sync survives it.
-#[derive(Default)]
-struct WalDurability {
-    issued: AtomicU64,
-    durable: AtomicU64,
-    deferred: AtomicU64,
-    in_flight: AtomicU64,
-    synced_writes: AtomicU64,
-}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PoolWriteStats {
-    /// Synced WAL writes and explicit WAL syncs: one fsync each.
+    /// Real journal fsyncs of this pool (RV-T2 Q1). Group commit lets one fsync
+    /// cover synced writes of every group and lane on the pool.
     pub synced_writes: u64,
+    /// Synced write and sync requests that completed (each needed an fsync to cover it).
+    pub synced_requests: u64,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct GroupWriteStats {
-    /// Synced writes issued by this replica's log and state transactions.
+    /// Synced write requests issued by this replica's log and state transactions.
+    /// Group commit may cover several with one journal fsync.
     pub synced_writes: u64,
     /// Unsynced application writes made durable by a later synced write.
     pub deferred_writes: u64,
@@ -149,6 +147,19 @@ enum WriteSync {
     Synced,
     Unsynced,
     ApplyHint,
+}
+/// What a group mutation left for its caller to await after the executor.
+enum Submitted {
+    /// A replayed applied entry: its stored reply, nothing written.
+    Done(ChargedBytes),
+    /// The transaction wrote nothing.
+    Empty { response: ChargedBytes, sync: bool },
+    /// Queued in the journal; the caller awaits the commit.
+    Pending {
+        response: ChargedBytes,
+        commit: nabedra_kv::Commit,
+        deferred: bool,
+    },
 }
 #[derive(Clone, Copy)]
 enum ReplyLane {
@@ -181,11 +192,33 @@ impl OltpPool {
     ) -> Result<Self, ProtocolError> {
         Self::open_path(path.as_ref(), identity, shared, None)
     }
+    /// Test-only: a development pool whose store runs on `fs` (for example a
+    /// `FaultFs`, to inject I/O errors or to drop the unsynced journal tail).
+    /// Journal segments are 1 MiB so an in-memory filesystem stays small.
+    #[cfg(test)]
+    pub(crate) fn open_development_on(
+        path: impl AsRef<Path>,
+        identity: PoolIdentity,
+        shared: Arc<WorkerSharedResources>,
+        fs: Arc<dyn nabedra_kv::fs::Fs>,
+    ) -> Result<Self, ProtocolError> {
+        Self::open_path_on(path.as_ref(), identity, shared, None, fs, Some(1 << 20))
+    }
     fn open_path(
         path: &Path,
         identity: PoolIdentity,
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
+    ) -> Result<Self, ProtocolError> {
+        Self::open_path_on(path, identity, shared, mount, nabedra_kv::fs::real(), None)
+    }
+    fn open_path_on(
+        path: &Path,
+        identity: PoolIdentity,
+        shared: Arc<WorkerSharedResources>,
+        mount: Option<VerifiedPoolMount>,
+        fs: Arc<dyn nabedra_kv::fs::Fs>,
+        segment_bytes: Option<u64>,
     ) -> Result<Self, ProtocolError> {
         identity.validate()?;
         super::native::validate_thread_defaults(shared.thread_budget())?;
@@ -197,31 +230,65 @@ impl OltpPool {
             .map_err(|_| capacity())?;
         let overhead = shared.pool_overhead()?;
         open_pool_manifest(path, &identity)?;
-        let mut options = Options::default();
-        options.create_if_missing(true);
-        options.set_compression_type(DBCompressionType::None);
-        options.set_wal_recovery_mode(DBRecoveryMode::AbsoluteConsistency);
-        // Test-only power-loss model: unsynced WAL records stay in process
-        // memory until a synced write, so aborting the process drops exactly
-        // the unsynced WAL suffix that an OS crash could lose.
-        #[cfg(test)]
-        if std::env::var_os(TEST_UNSYNCED_WAL_IN_MEMORY).is_some() {
-            options.set_manual_wal_flush(true);
+        let mut options =
+            storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
+        if let Some(bytes) = segment_bytes {
+            options.journal.segment_bytes = bytes;
         }
-        options.set_write_buffer_size(shared.config.write_buffer_bytes / 2);
-        options.set_max_write_buffer_number(2);
-        options.set_write_buffer_manager(&shared.write_buffers);
-        options.set_env(&shared.env);
-        super::configure_native_jobs(&mut options, shared.config.background_threads);
-        options.set_max_open_files(128);
-        options.set_max_total_wal_size(shared.config.write_buffer_bytes as u64);
-        let mut blocks = BlockBasedOptions::default();
-        blocks.set_block_cache(&shared.cache);
-        blocks.set_cache_index_and_filter_blocks(true);
-        blocks.set_bloom_filter(10.0, false);
-        options.set_block_based_table_factory(&blocks);
-        let db = DB::open(&options, path).map_err(storage_error)?;
-        match db.get_pinned(POOL_KEY).map_err(storage_error)? {
+        let opened =
+            Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
+        let store = opened.store;
+        // R6 at pool level: a damaged open that quarantines more than 8 groups, or
+        // more than 10% of the pool's groups (always allowing one), is more likely
+        // systemic than local, so the pool is refused instead (plan section 3).
+        let damaged = opened.quarantined.len();
+        if damaged > 0 {
+            let groups = damaged + count_healthy_groups(&store)?;
+            if damaged > 8 || (damaged > 1 && damaged * 10 > groups) {
+                tracing::error!(
+                    path = %path.display(),
+                    damaged,
+                    groups,
+                    "refusing OLTP pool: too many damaged groups"
+                );
+                return Err(failure(
+                    ErrorCode::StorageUnavailable,
+                    "OLTP pool refused: damage spans too many groups",
+                ));
+            }
+            for damage in &opened.quarantined {
+                tracing::warn!(
+                    path = %path.display(),
+                    group = ?group_of_scope(&damage.scope),
+                    reason = ?damage.reason,
+                    file = ?damage.file,
+                    first_bad_seq = ?damage.first_bad_seq,
+                    "OLTP group quarantined at open; it will not start"
+                );
+            }
+        }
+        if opened.recovery.tail_truncations > 0 {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = opened.recovery.tail_bytes,
+                "OLTP pool recovered a torn journal tail"
+            );
+        }
+        let recovery = Arc::new(AtomicBool::new(false));
+        {
+            let path = path.to_owned();
+            store.on_damage(Box::new(move |damage| {
+                tracing::error!(
+                    path = %path.display(),
+                    group = ?group_of_scope(&damage.scope),
+                    reason = ?damage.reason,
+                    file = ?damage.file,
+                    "OLTP storage damage found at run time; group quarantined"
+                );
+            }));
+        }
+        let snapshot = store.snapshot();
+        match snapshot.get(POOL_KEY).map_err(storage_error)? {
             Some(value)
                 if serde_json::from_slice::<PoolIdentity>(&value).ok().as_ref()
                     == Some(&identity) => {}
@@ -232,36 +299,39 @@ impl OltpPool {
                 ));
             }
             None => {
-                let mut iter = db.raw_iterator();
-                iter.seek_to_first();
+                let mut iter = RawIter::new(&snapshot, &[], true);
+                iter.seek(&[]);
                 if iter.valid() {
                     return Err(failure(
                         ErrorCode::StorageUnavailable,
                         "unidentified nonempty physical pool",
                     ));
                 }
-                iter.status().map_err(storage_error)?;
+                iter.status()?;
                 let bytes = shared.encode(&identity, MAX_IDENTITY_BYTES as usize)?;
-                let mut batch = WriteBatch::default();
+                let mut batch = WriteBatch::new();
                 batch.put(POOL_KEY, bytes.as_slice());
-                db.write_opt(batch, &sync_options())
-                    .map_err(|_| recovery_unknown())?;
+                let commit = store
+                    .submit(batch, Durability::Sync, Box::new(()))
+                    .map_err(|error| commit_error(error).1)?;
+                wait_commit(commit).map_err(|error| commit_error(error).1)?;
             }
         }
-        Ok(Self {
-            inner: Arc::new(PoolInner {
-                db,
-                identity,
-                path: path.to_owned(),
-                shared,
-                recovery: Arc::new(AtomicBool::new(false)),
-                groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
-                durability: WalDurability::default(),
-                _pool_slot: pool_slot,
-                _overhead: overhead,
-                _mount: mount,
-            }),
-        })
+        drop(snapshot);
+        let inner = Arc::new(PoolInner {
+            store,
+            identity,
+            path: path.to_owned(),
+            shared,
+            recovery,
+            groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            synced_requests: AtomicU64::new(0),
+            _pool_slot: pool_slot,
+            _overhead: overhead,
+            _mount: mount,
+        });
+        inner.shared.storage.register(&inner);
+        Ok(Self { inner })
     }
 
     pub fn open_registered(
@@ -300,8 +370,10 @@ impl OltpPool {
         }
         Ok(observed)
     }
+    /// True once a write's outcome is unknown: this handle or the store latched.
+    /// Every alias of the pool shares the latch (O29, NS09).
     pub fn requires_recovery(&self) -> bool {
-        self.inner.recovery.load(Ordering::Acquire)
+        self.inner.recovery.load(Ordering::Acquire) || self.inner.store.requires_recovery()
     }
     fn healthy(&self) -> Result<(), ProtocolError> {
         if self.requires_recovery() {
@@ -310,66 +382,93 @@ impl OltpPool {
             Ok(())
         }
     }
-    fn durable_write(&self, batch: WriteBatch) -> Result<(), ProtocolError> {
-        self.healthy()?;
-        let covered = self.inner.durability.issued.load(Ordering::SeqCst);
+    fn latch(&self) {
+        self.inner.recovery.store(true, Ordering::Release);
+    }
+    /// A consistent read view of the whole pool.
+    fn snapshot(&self) -> Snapshot {
+        self.inner.store.snapshot()
+    }
+    /// The newest value of `key`.
+    fn get_latest(&self, key: &[u8]) -> Result<Option<Bytes>, ProtocolError> {
+        self.snapshot().get(key).map_err(storage_error)
+    }
+    /// Groups quarantined by damage, at open or at run time. They never start.
+    pub fn quarantined_groups(&self) -> Vec<Uuid> {
         self.inner
-            .db
-            .write_opt(batch, &sync_options())
-            .map_err(|_| {
-                self.inner.recovery.store(true, Ordering::Release);
-                recovery_unknown()
-            })?;
-        self.synced(covered);
+            .store
+            .quarantined()
+            .iter()
+            .filter_map(|damage| group_of_scope(&damage.scope))
+            .collect()
+    }
+    fn group_quarantined(&self, id: Uuid) -> bool {
+        let scope = group_scope(id);
+        self.inner
+            .store
+            .quarantined()
+            .iter()
+            .any(|damage| damage.scope.as_ref() == scope)
+    }
+    /// Queues `batch`, confined to `scope`. Never blocks on I/O.
+    fn submit(
+        &self,
+        scope: &[u8],
+        mut batch: WriteBatch,
+        durability: Durability,
+        on_done: Box<dyn std::any::Any + Send>,
+    ) -> Result<nabedra_kv::Commit, ProtocolError> {
+        self.healthy()?;
+        batch.set_scope(scope);
+        self.inner
+            .store
+            .submit(batch, durability, on_done)
+            .map_err(|error| self.failed(error))
+    }
+    /// The protocol error for a failed write; ambiguous failures latch the pool.
+    fn failed(&self, error: nabedra_kv::Error) -> ProtocolError {
+        if let nabedra_kv::Error::InvalidArgument(_) = error {
+            // Refused before the journal: nothing was written.
+            return failure(ErrorCode::StorageUnavailable, "invalid storage batch");
+        }
+        let (ambiguous, error) = commit_error(error);
+        if ambiguous {
+            self.latch();
+        }
+        error
+    }
+    /// A synced write from a synchronous pool path (executor threads, and pool
+    /// open). Ordinary group transactions use the asynchronous commit instead.
+    fn durable_write(&self, scope: &[u8], batch: WriteBatch) -> Result<(), ProtocolError> {
+        let commit = self.submit(scope, batch, Durability::Sync, Box::new(()))?;
+        wait_commit(commit).map_err(|error| self.failed(error))?;
+        self.inner.synced_requests.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
-    /// An unsynced WAL write. Only Raft application state and the commit hint
-    /// use it, because the synced log in the same WAL replays what it covers.
-    /// Returns the ticket that a later synced write must cover.
-    fn deferred_write(&self, batch: WriteBatch) -> Result<u64, ProtocolError> {
+    /// Makes every write submitted before the call durable (`flush_wal(true)`).
+    pub(crate) async fn sync_wal(&self) -> Result<(), ProtocolError> {
         self.healthy()?;
-        let durability = &self.inner.durability;
-        durability.in_flight.fetch_add(1, Ordering::SeqCst);
-        let written = self.inner.db.write_opt(batch, &deferred_options());
-        let ticket = durability.issued.fetch_add(1, Ordering::SeqCst) + 1;
-        durability.deferred.fetch_max(ticket, Ordering::SeqCst);
-        durability.in_flight.fetch_sub(1, Ordering::SeqCst);
-        written.map_err(|_| {
-            self.inner.recovery.store(true, Ordering::Release);
-            recovery_unknown()
-        })?;
-        Ok(ticket)
-    }
-    /// Synchronously persists every WAL write that completed before the call.
-    pub(crate) fn sync_wal(&self) -> Result<(), ProtocolError> {
-        self.healthy()?;
-        let covered = self.inner.durability.issued.load(Ordering::SeqCst);
-        self.inner.db.flush_wal(true).map_err(|_| {
-            self.inner.recovery.store(true, Ordering::Release);
-            recovery_unknown()
-        })?;
-        self.synced(covered);
+        let commit = self
+            .inner
+            .store
+            .sync()
+            .map_err(|error| self.failed(error))?;
+        commit.done().await.map_err(|error| self.failed(error))?;
+        self.inner.synced_requests.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
-    fn synced(&self, covered: u64) {
-        let durability = &self.inner.durability;
-        durability.synced_writes.fetch_add(1, Ordering::Relaxed);
-        durability.durable.fetch_max(covered, Ordering::SeqCst);
-    }
-    /// True while an unsynced write may still be lost by a crash.
+    /// True while a visible write may still be lost by a crash.
     pub(crate) fn has_unsynced_writes(&self) -> bool {
-        let durability = &self.inner.durability;
-        durability.in_flight.load(Ordering::SeqCst) != 0
-            || durability.deferred.load(Ordering::SeqCst)
-                > durability.durable.load(Ordering::SeqCst)
+        self.inner.store.visible_seq() > self.inner.store.durable_seq()
     }
-    fn ticket_durable(&self, ticket: u64) -> bool {
-        self.inner.durability.durable.load(Ordering::SeqCst) >= ticket
+    fn seq_durable(&self, seq: u64) -> bool {
+        self.inner.store.durable_seq() >= seq
     }
     /// Fsync count of this physical pool, for `/v1/runtime/stats`.
     pub fn write_stats(&self) -> PoolWriteStats {
         PoolWriteStats {
-            synced_writes: self.inner.durability.synced_writes.load(Ordering::Relaxed),
+            synced_writes: self.inner.store.stats().journal_syncs,
+            synced_requests: self.inner.synced_requests.load(Ordering::Relaxed),
         }
     }
     pub async fn group(&self, identity: GroupIdentity) -> Result<GroupStore, ProtocolError> {
@@ -417,9 +516,17 @@ impl OltpPool {
                     }
                     return Ok(GroupStore { inner: group });
                 }
+                if pool.group_quarantined(identity.group_id) {
+                    // Section 3 rule 1: a damaged group never starts under its
+                    // old identity. NS14 replaces and releases it.
+                    return Err(failure(
+                        ErrorCode::StorageUnavailable,
+                        "OLTP group is quarantined after storage damage",
+                    ));
+                }
                 let slot = pool.inner.shared.reserve_group_handle()?;
                 let key = identity_key(identity.group_id);
-                match pool.inner.db.get_pinned(&key).map_err(storage_error)? {
+                match pool.get_latest(&key)? {
                     Some(bytes)
                         if serde_json::from_slice::<GroupIdentity>(&bytes)
                             .ok()
@@ -436,16 +543,19 @@ impl OltpPool {
                             .inner
                             .shared
                             .encode(&identity, MAX_IDENTITY_BYTES as usize)?;
-                        let mut batch = WriteBatch::default();
+                        let mut batch = WriteBatch::new();
                         batch.put(&key, value.as_slice());
-                        batch.put(group_key(identity.group_id, b'a', &[]), 0u64.to_be_bytes());
+                        batch.put(
+                            &group_key(identity.group_id, b'a', &[]),
+                            &0u64.to_be_bytes(),
+                        );
                         if let Some(binding) = learner {
                             batch.put(
-                                placement::learner_key(identity.group_id),
+                                &placement::learner_key(identity.group_id),
                                 binding.as_bytes(),
                             );
                         }
-                        pool.durable_write(batch)?;
+                        pool.durable_write(&group_scope(identity.group_id), batch)?;
                     }
                     None => {
                         return Err(failure(
@@ -513,11 +623,11 @@ impl OltpPool {
             .execute(0, 0, move || {
                 let _vector = _vector;
                 pool.healthy()?;
-                let snapshot = pool.inner.db.snapshot();
-                let mut iter = snapshot.raw_iterator();
+                let snapshot = pool.snapshot();
                 let start = after
-                    .map(|id| super::codec::end(&group_key(id, 0, &[])[..17]))
+                    .map(|id| prefix_end(&group_scope(id)))
                     .unwrap_or_else(|| vec![0x40]);
+                let mut iter = RawIter::bounded(&snapshot, &start, &[0x41], true);
                 iter.seek(&start);
                 let mut items = Vec::new();
                 items.try_reserve_exact(max_items).map_err(|_| capacity())?;
@@ -536,7 +646,7 @@ impl OltpPool {
                     }
                     let id = Uuid::from_slice(&key[1..17]).map_err(|_| recovery_unknown())?;
                     let encoded = snapshot
-                        .get_pinned(identity_key(id))
+                        .get(&identity_key(id))
                         .map_err(storage_error)?
                         .ok_or_else(recovery_unknown)?;
                     let decode =
@@ -547,9 +657,10 @@ impl OltpPool {
                     items.push(identity);
                     decoded_charges.push(decode);
                     last = Some(id);
-                    iter.seek(super::codec::end(&key[..17]));
+                    let next = prefix_end(&key[..GROUP_SCOPE_BYTES]);
+                    iter.seek(&next);
                 }
-                iter.status().map_err(storage_error)?;
+                iter.status()?;
                 let exhausted =
                     !iter.valid() || iter.key().is_none_or(|key| key.first() != Some(&0x40));
                 #[derive(Serialize)]
@@ -716,7 +827,7 @@ impl GroupStore {
     /// Lets Raft application writes skip their own fsync. The caller is the
     /// Raft host and passes the store that holds this group's synced log; the
     /// switch is refused unless both are the same group in the same physical
-    /// pool, so the log and the state share one RocksDB WAL.
+    /// pool, so the log and the state share one journal and one sync domain.
     pub(crate) fn defer_apply_sync(&self, log: &GroupStore) -> bool {
         if !Arc::ptr_eq(&self.pool().inner, &log.pool().inner) || self.identity() != log.identity()
         {
@@ -725,10 +836,16 @@ impl GroupStore {
         self.inner.deferred_apply.store(true, Ordering::Release);
         true
     }
+    /// The Raft host stopped: later application writes are synced again, since no
+    /// running log replays them (RV-T2 Q5).
+    pub(crate) fn stop_deferred_applies(&self) {
+        self.inner.deferred_apply.store(false, Ordering::Release);
+    }
     pub fn applies_deferred(&self) -> bool {
         self.inner.deferred_apply.load(Ordering::Acquire)
     }
-    /// Fsync and unsynced-write counts of this replica, for `/v1/runtime/stats`.
+    /// Synced-request and unsynced-write counts of this replica, for
+    /// `/v1/runtime/stats`. Real fsyncs are counted per pool.
     pub fn write_stats(&self) -> GroupWriteStats {
         GroupWriteStats {
             synced_writes: self.inner.synced_writes.load(Ordering::Relaxed),
@@ -743,12 +860,13 @@ impl GroupStore {
             .deferred_tail
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        tail.filter(|(_, ticket)| !self.pool().ticket_durable(*ticket))
+        tail.filter(|(_, seq)| !self.pool().seq_durable(*seq))
             .map(|(index, _)| index)
     }
-    /// Log purge calls this first. It refuses a purge past the applied index
-    /// and syncs the WAL when an earlier application write is not yet durable,
-    /// so the log is never purged past state that a crash could lose.
+    /// Log purge calls this first: it refuses a purge past the applied index.
+    /// No sync is needed (RV-T2 Q2): the applied write is visible, so it precedes
+    /// the purge record in the journal, and the purge record is itself synced.
+    /// A durable purge therefore implies durable applied state up to its index.
     pub(crate) async fn ensure_applied_durable(&self, index: u64) -> Result<(), ProtocolError> {
         if !self.applies_deferred() {
             return Ok(());
@@ -766,19 +884,14 @@ impl GroupStore {
                 "log purge passes the applied state",
             ));
         }
-        if self.pool().has_unsynced_writes() {
-            let pool = self.pool().clone();
-            self.resources()
-                .execute(ExecutionClass::Control, index, 0, move || pool.sync_wal())
-                .await?;
-        }
         Ok(())
     }
-    /// Snapshot export calls this under the group's application order, so the
-    /// exported applied index is durable before any snapshot names it.
-    pub(super) fn sync_deferred_applies(&self) -> Result<(), ProtocolError> {
+    /// Snapshot export calls this while it holds the group's application order,
+    /// before it takes a compute permit, so the exported applied index is durable
+    /// before any snapshot names it.
+    pub(super) async fn sync_deferred_applies(&self) -> Result<(), ProtocolError> {
         if self.applies_deferred() && self.pool().has_unsynced_writes() {
-            self.pool().sync_wal()?;
+            self.pool().sync_wal().await?;
         }
         Ok(())
     }
@@ -830,14 +943,17 @@ impl GroupStore {
         };
         let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output)?;
-        prepared
+        // The executor builds the batch and submits it; it never waits for storage.
+        // The journal thread drops the order guard, the generation guard and the
+        // batch charge after the write is visible (and durable, for synced writes),
+        // so a cancelled caller cannot release ordering early (plan section 5).
+        let submitted = prepared
             .execute(0, 0, move || {
-                let _owner = owner;
-                let _generation_owner = generation_owner;
+                let guards = (owner, generation_owner);
                 group.pool().healthy()?;
                 let write_started = std::cell::Cell::new(false);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let snapshot = group.pool().inner.db.snapshot();
+                    let snapshot = group.pool().snapshot();
                     let prefix = group.prefix(&snapshot, log)?;
                     let mut transaction =
                         GroupTransaction::new(&snapshot, prefix, budget, reservations);
@@ -856,7 +972,8 @@ impl GroupStore {
                             }
                             return group
                                 .read_meta_bytes(&snapshot, b'r', &mut transaction.read.output)?
-                                .ok_or_else(recovery_unknown);
+                                .ok_or_else(recovery_unknown)
+                                .map(Submitted::Done);
                         }
                         if existing.position.index.checked_add(1) != Some(meta.position.index) {
                             return Err(failure(
@@ -900,7 +1017,6 @@ impl GroupStore {
                             )?;
                         }
                     }
-                    write_started.set(true);
                     let deferred_index = match sync {
                         WriteSync::Synced => None,
                         WriteSync::Unsynced => Some(None),
@@ -909,37 +1025,86 @@ impl GroupStore {
                             .filter(|_| group.applies_deferred())
                             .map(|meta| Some(meta.position.index)),
                     };
-                    match deferred_index {
-                        None => {
-                            group.pool().durable_write(transaction.batch)?;
-                            group.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Some(index) => {
-                            let ticket = group.pool().deferred_write(transaction.batch)?;
-                            group.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
-                            if let Some(index) = index {
-                                *group
-                                    .inner
-                                    .deferred_tail
-                                    .lock()
-                                    .unwrap_or_else(|poison| poison.into_inner()) =
-                                    Some((index, ticket));
-                            }
-                        }
+                    let GroupTransaction {
+                        batch,
+                        _batch_charge: batch_charge,
+                        ..
+                    } = transaction;
+                    if batch.is_empty() {
+                        // Nothing to order. A synced empty write still means
+                        // "every earlier write is durable", as it did on RocksDB.
+                        return Ok(Submitted::Empty {
+                            response,
+                            sync: deferred_index.is_none(),
+                        });
                     }
-                    Ok(response)
+                    write_started.set(true);
+                    let durability = if deferred_index.is_some() {
+                        Durability::NoSync
+                    } else {
+                        Durability::Sync
+                    };
+                    let commit = group.pool().submit(
+                        &group_scope(group.identity().group_id),
+                        batch,
+                        durability,
+                        Box::new((guards, batch_charge)),
+                    )?;
+                    if let Some(Some(index)) = deferred_index {
+                        *group
+                            .inner
+                            .deferred_tail
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner()) =
+                            Some((index, commit.seq()));
+                    }
+                    Ok(Submitted::Pending {
+                        response,
+                        commit,
+                        deferred: deferred_index.is_some(),
+                    })
                 }));
                 match result {
                     Ok(result) => result,
                     Err(_) => {
                         if write_started.get() {
-                            group.pool().inner.recovery.store(true, Ordering::Release);
+                            group.pool().latch();
                         }
                         Err(recovery_unknown())
                     }
                 }
             })
-            .await
+            .await?;
+        match submitted {
+            Submitted::Done(response) => Ok(response),
+            Submitted::Empty { response, sync } => {
+                if sync {
+                    self.pool().sync_wal().await?;
+                    self.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+            Submitted::Pending {
+                response,
+                commit,
+                deferred,
+            } => {
+                commit
+                    .done()
+                    .await
+                    .map_err(|error| self.pool().failed(error))?;
+                if deferred {
+                    self.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
+                    self.pool()
+                        .inner
+                        .synced_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(response)
+            }
+        }
     }
     pub async fn read(
         &self,
@@ -1076,7 +1241,7 @@ impl GroupStore {
         prepared
             .execute(0, 0, move || {
                 group.pool().healthy()?;
-                let snapshot = group.pool().inner.db.snapshot();
+                let snapshot = group.pool().snapshot();
                 let prefix = group.prefix(&snapshot, log)?;
                 let mut read = GroupRead {
                     snapshot: &snapshot,
@@ -1213,7 +1378,7 @@ impl GroupStore {
     }
     fn read_applied(
         &self,
-        snapshot: &Snapshot<'_>,
+        snapshot: &Snapshot,
         scratch: &mut ByteReservation,
     ) -> Result<Option<AppliedState>, ProtocolError> {
         let Some(bytes) = self.read_meta_bytes(snapshot, b'p', scratch)? else {
@@ -1249,22 +1414,22 @@ impl GroupStore {
     }
     fn read_meta_bytes(
         &self,
-        snapshot: &Snapshot<'_>,
+        snapshot: &Snapshot,
         tag: u8,
         reservation: &mut ByteReservation,
     ) -> Result<Option<ChargedBytes>, ProtocolError> {
         snapshot
-            .get_pinned(group_key(self.identity().group_id, tag, &[]))
+            .get(&group_key(self.identity().group_id, tag, &[]))
             .map_err(|_| recovery_unknown())?
             .map(|value| reservation.copy(&value))
             .transpose()
     }
-    fn prefix(&self, snapshot: &Snapshot<'_>, log: bool) -> Result<Vec<u8>, ProtocolError> {
+    fn prefix(&self, snapshot: &Snapshot, log: bool) -> Result<Vec<u8>, ProtocolError> {
         if log {
             return Ok(group_key(self.identity().group_id, b'l', &[]));
         }
         let bytes = snapshot
-            .get_pinned(group_key(self.identity().group_id, b'a', &[]))
+            .get(&group_key(self.identity().group_id, b'a', &[]))
             .map_err(storage_error)?
             .ok_or_else(recovery_unknown)?;
         let generation: u64 =
@@ -1286,24 +1451,26 @@ impl GroupStore {
 }
 
 pub struct GroupRead<'a> {
-    snapshot: &'a Snapshot<'a>,
+    snapshot: &'a Snapshot,
     prefix: Vec<u8>,
     scratch: ByteReservation,
     output: ByteReservation,
     key_buffer: KeyBuffer,
 }
-/// One record pinned by the native iterator at a bounded seek. The record
-/// cannot outlive the one consistent group snapshot used by its callback.
+/// One record found by a bounded seek in the group's snapshot. Its value was
+/// read (and checked) when the record was found.
 pub struct ScopedRecord<'a> {
-    iterator: DBRawIterator<'a>,
+    iterator: nabedra_kv::Iter,
+    value: Bytes,
     scope_length: usize,
+    _snapshot: std::marker::PhantomData<&'a Snapshot>,
 }
 impl ScopedRecord<'_> {
     pub fn key(&self) -> &[u8] {
-        &self.iterator.key().expect("validated scoped record")[self.scope_length..]
+        &self.iterator.key()[self.scope_length..]
     }
     pub fn value(&self) -> &[u8] {
-        self.iterator.value().expect("validated scoped record")
+        &self.value
     }
 }
 #[derive(Default)]
@@ -1332,12 +1499,13 @@ impl<'a> GroupRead<'a> {
         let value = self.pinned(key)?;
         read(value.as_ref().map(|value| value.as_ref()))
     }
-    /// A pinned value cannot outlive this native snapshot. Keeping it borrowed
-    /// avoids copying a large private row merely to encode its fixed resolution.
-    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<DBPinnableSlice<'a>>, ProtocolError> {
+    /// A value shared with the store's memtable or block cache. Reading it copies
+    /// nothing, which avoids copying a large private row merely to encode its
+    /// fixed resolution.
+    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<Bytes>, ProtocolError> {
         let snapshot = self.snapshot;
         let key = self.key(key)?;
-        snapshot.get_pinned(key).map_err(storage_error)
+        snapshot.get(key).map_err(storage_error)
     }
     /// Seek directly to the first logical record at or after `start` within
     /// `prefix`. Versioned point reads need not scan newer versions or copy an
@@ -1355,17 +1523,22 @@ impl<'a> GroupRead<'a> {
         }
         let snapshot = self.snapshot;
         let scope_length = self.prefix.len();
-        let mut iterator = snapshot.raw_iterator();
-        iterator.seek(self.key(start)?);
-        iterator.status().map_err(storage_error)?;
+        let upper = prefix_end(&[self.prefix.as_slice(), prefix].concat());
+        let start = self.key(start)?;
+        let mut iterator = RawIter::bounded(snapshot, start, &upper, true);
+        iterator.seek(start);
+        iterator.status()?;
         if iterator.key().is_none_or(|key| {
             !key.starts_with(&self.prefix) || !key[scope_length..].starts_with(prefix)
         }) {
             return Ok(None);
         }
+        let value = iterator.value()?;
         Ok(Some(ScopedRecord {
-            iterator,
+            iterator: iterator.into_inner(),
+            value,
             scope_length,
+            _snapshot: std::marker::PhantomData,
         }))
     }
     /// Snapshot-only. Candidate writes are deliberately not consulted.
@@ -1453,7 +1626,8 @@ impl<'a> GroupRead<'a> {
                 "scan cursor outside prefix",
             ));
         }
-        let mut iterator = native.raw_iterator();
+        let upper = prefix_end(lower.as_slice());
+        let mut iterator = RawIter::bounded(native, start, &upper, true);
         iterator.seek(start);
         if after.is_some() && iterator.key() == Some(start) {
             iterator.next();
@@ -1468,15 +1642,13 @@ impl<'a> GroupRead<'a> {
             if !key.starts_with(lower.as_slice()) {
                 break;
             }
-            let stop = visit(
-                &key[scope_length..],
-                iterator.value().ok_or_else(recovery_unknown)?,
-            )?;
+            let value = iterator.value()?;
+            let stop = visit(&key[scope_length..], &value)?;
             progress.visited += 1;
             if stop || progress.visited == max_items {
                 let cursor = self.scratch.copy(&key[scope_length..])?;
                 iterator.next();
-                iterator.status().map_err(storage_error)?;
+                iterator.status()?;
                 progress.exhausted = !iterator.valid()
                     || iterator
                         .key()
@@ -1488,7 +1660,7 @@ impl<'a> GroupRead<'a> {
             }
             iterator.next();
         }
-        iterator.status().map_err(storage_error)?;
+        iterator.status()?;
         progress.exhausted = true;
         Ok(progress)
     }
@@ -1502,7 +1674,7 @@ pub struct GroupTransaction<'a> {
 }
 impl<'a> GroupTransaction<'a> {
     fn new(
-        snapshot: &'a Snapshot<'a>,
+        snapshot: &'a Snapshot,
         prefix: Vec<u8>,
         budget: TransactionBudget,
         (scratch, batch, output): (ByteReservation, ByteReservation, ByteReservation),
@@ -1611,12 +1783,12 @@ impl<'a> GroupTransaction<'a> {
         self.batch.delete_range(start.as_slice(), end.as_slice());
         Ok(())
     }
-    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<DBPinnableSlice<'a>>, ProtocolError> {
+    pub fn pinned(&mut self, key: &[u8]) -> Result<Option<Bytes>, ProtocolError> {
         self.read.pinned(key)
     }
     fn put_meta(&mut self, key: impl AsRef<[u8]>, value: &[u8]) -> Result<(), ProtocolError> {
         self.preflight(key.as_ref().len(), value.len())?;
-        self.batch.put(key, value);
+        self.batch.put(key.as_ref(), value);
         Ok(())
     }
     fn preflight(&mut self, key: usize, value: usize) -> Result<(), ProtocolError> {
@@ -1632,12 +1804,6 @@ impl<'a> GroupTransaction<'a> {
     }
 }
 
-fn deferred_options() -> WriteOptions {
-    let mut options = WriteOptions::default();
-    options.set_sync(false);
-    options.disable_wal(false);
-    options
-}
 fn group_key(id: Uuid, tag: u8, suffix: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(18 + suffix.len());
     key.push(0x40);
@@ -1672,9 +1838,21 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         file.take(MAX_IDENTITY_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| storage_error_message())?;
-        if bytes.len() as u64 > MAX_IDENTITY_BYTES
-            || serde_json::from_slice::<PoolIdentity>(&bytes).ok().as_ref() != Some(identity)
+        if bytes.len() as u64 > MAX_IDENTITY_BYTES {
+            return Err(storage_error_message());
+        }
+        let stored = serde_json::from_slice::<PoolIdentity>(&bytes).ok();
+        if let Some(stored) = &stored
+            && stored.pool_format_version != POOL_FORMAT_VERSION
         {
+            // Q1 clean break: a RocksDB (format 1) pool is refused by name.
+            return Err(unsupported_format(&format!(
+                "{}: pool_format_version {}",
+                manifest.display(),
+                stored.pool_format_version
+            )));
+        }
+        if stored.as_ref() != Some(identity) {
             return Err(storage_error_message());
         }
         return Ok(());
@@ -1684,6 +1862,9 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         .next()
         .is_some()
     {
+        if let Some(found) = storage::legacy_store_marker(path) {
+            return Err(unsupported_format(&found));
+        }
         return Err(storage_error_message());
     }
     let mut file = OpenOptions::new()
@@ -1705,4 +1886,57 @@ fn storage_error_message() -> ProtocolError {
         ErrorCode::StorageUnavailable,
         "typed physical pool unavailable or identity mismatch",
     )
+}
+/// The group a quarantined scope names (`0x40 ‖ id`).
+fn group_of_scope(scope: &[u8]) -> Option<Uuid> {
+    (scope.len() == GROUP_SCOPE_BYTES && scope[0] == 0x40)
+        .then(|| Uuid::from_slice(&scope[1..]).ok())
+        .flatten()
+}
+/// Groups with a readable identity record, skipping quarantined scopes (R6).
+fn count_healthy_groups(store: &Store) -> Result<usize, ProtocolError> {
+    let snapshot = store.snapshot();
+    let mut quarantined: Vec<Vec<u8>> = store
+        .quarantined()
+        .into_iter()
+        .map(|damage| damage.scope.to_vec())
+        .collect();
+    quarantined.sort();
+    // Each range between quarantined scopes is read with bounds that exclude
+    // them, so the iterator never lands on a quarantined key.
+    let mut ranges = Vec::new();
+    let mut lower = vec![0x40];
+    for scope in quarantined {
+        if scope.as_slice() > lower.as_slice() {
+            ranges.push((lower, scope.clone()));
+        }
+        lower = prefix_end(&scope);
+    }
+    ranges.push((lower, vec![0x41]));
+    let mut groups = 0;
+    for (lower, upper) in ranges {
+        let mut iter = RawIter::bounded(&snapshot, &lower, &upper, false);
+        iter.seek(&lower);
+        while let Some(key) = iter.key() {
+            if key.len() < GROUP_SCOPE_BYTES {
+                return Err(recovery_unknown());
+            }
+            if key.len() == GROUP_SCOPE_BYTES + 1 && key[GROUP_SCOPE_BYTES] == b'i' {
+                groups += 1;
+            }
+            // Identity keys sort after `a` (active generation) and before every
+            // other per-group tag, so seeking to the identity then past the group
+            // counts each group once.
+            let scope = key[..GROUP_SCOPE_BYTES].to_vec();
+            let mut identity = scope.clone();
+            identity.push(b'i');
+            if key < identity.as_slice() {
+                iter.seek(&identity);
+            } else {
+                iter.seek(&prefix_end(&scope));
+            }
+        }
+        iter.status()?;
+    }
+    Ok(groups)
 }

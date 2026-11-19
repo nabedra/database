@@ -1,0 +1,279 @@
+//! Glue between the pool and `nabedra-kv`: worker-shared engine resources, store
+//! options, key scopes, error mapping and a raw iterator with the shape the pool's
+//! readers use. It replaces the RocksDB helpers the pool used to import from the
+//! legacy `oltp` module (plan section 5).
+use super::{PoolInner, failure, recovery_unknown};
+use crate::protocol::{ErrorCode, ProtocolError};
+use bytes::Bytes;
+use nabedra_kv::{
+    Background, BlockCache, Commit, MemtableBudget, Options, Seq, StoreStats,
+    fs::Fs,
+};
+use serde::Serialize;
+use std::{
+    future::Future,
+    ops::Bound,
+    path::Path,
+    pin::pin,
+    sync::{Arc, Mutex, Weak},
+    task::{Context, Poll, Wake, Waker},
+    thread::Thread,
+};
+use uuid::Uuid;
+
+/// Directory of the pool's `nabedra-kv` store, under the pool directory.
+pub(super) const STORE_DIR: &str = "kv";
+/// Length of a pool group's scope: `0x40 ‖ group id`.
+pub(super) const GROUP_SCOPE_BYTES: usize = 17;
+
+/// Engine resources one worker shares across all of its pools, each charged once
+/// (`cache_bytes`, `write_buffer_bytes`, `background_threads`).
+pub(super) struct NativeStorage {
+    pub(super) cache: Arc<BlockCache>,
+    pub(super) memtables: Arc<MemtableBudget>,
+    pub(super) background: Arc<Background>,
+    /// Open pools, for `/v1/runtime/stats`. Pruned lazily. A pool close takes this
+    /// lock around its last-owner check so stats never keep a closing store alive.
+    pub(super) pools: Mutex<Vec<Weak<PoolInner>>>,
+}
+impl NativeStorage {
+    pub(super) fn new(cache_bytes: usize, write_buffer_bytes: usize, background: usize) -> Self {
+        Self {
+            cache: Arc::new(BlockCache::new(cache_bytes)),
+            memtables: Arc::new(MemtableBudget::new(write_buffer_bytes)),
+            background: Background::new(background),
+            pools: Mutex::new(Vec::new()),
+        }
+    }
+    pub(super) fn register(&self, pool: &Arc<PoolInner>) {
+        let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(Arc::downgrade(pool));
+    }
+    pub(super) fn stats(&self) -> StorageStats {
+        let pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
+        let mut total = StorageStats::default();
+        for pool in pools.iter().filter_map(Weak::upgrade) {
+            total.add(&pool.store.stats(), pool.store.quarantined().len());
+        }
+        total
+    }
+}
+
+/// Store counters summed over a worker's open pools (`/v1/runtime/stats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StorageStats {
+    pub pools: u32,
+    /// Real journal fsyncs (`fdatasync`, or `F_FULLFSYNC` on macOS).
+    pub journal_syncs: u64,
+    pub file_syncs: u64,
+    pub commits: u64,
+    pub synced_commits: u64,
+    pub group_commits: u64,
+    pub user_bytes: u64,
+    pub journal_bytes: u64,
+    pub flush_bytes: u64,
+    pub compaction_bytes: u64,
+    pub relocated_bytes: u64,
+    pub stall_ms: u64,
+    pub memtable_bytes: u64,
+    pub l0_runs: u32,
+    pub recovery_ms: u64,
+    pub corruption_detected: u64,
+    pub tail_truncations: u64,
+    pub quarantined_groups: u32,
+}
+impl StorageStats {
+    fn add(&mut self, stats: &StoreStats, quarantined: usize) {
+        self.pools += 1;
+        self.journal_syncs += stats.journal_syncs;
+        self.file_syncs += stats.file_syncs;
+        self.commits += stats.commits;
+        self.synced_commits += stats.synced_commits;
+        self.group_commits += stats.group_commits;
+        self.user_bytes += stats.user_bytes;
+        self.journal_bytes += stats.journal_bytes;
+        self.flush_bytes += stats.flush_bytes;
+        self.compaction_bytes += stats.compaction_bytes;
+        self.relocated_bytes += stats.relocated_bytes;
+        self.stall_ms += stats.stall_ms;
+        self.memtable_bytes += stats.memtable_bytes;
+        self.l0_runs += stats.l0_runs;
+        self.recovery_ms = self.recovery_ms.max(stats.recovery_ms);
+        self.corruption_detected += stats.corruption_detected;
+        self.tail_truncations += stats.tail_truncations;
+        self.quarantined_groups += quarantined as u32;
+    }
+}
+
+/// A key's scope: its group (`0x40 ‖ id`) or store-wide (the pool identity key).
+pub(super) fn scope_of(key: &[u8]) -> usize {
+    if key.len() >= GROUP_SCOPE_BYTES && key[0] == 0x40 {
+        GROUP_SCOPE_BYTES
+    } else {
+        0
+    }
+}
+pub(super) fn group_scope(id: Uuid) -> [u8; GROUP_SCOPE_BYTES] {
+    let mut scope = [0u8; GROUP_SCOPE_BYTES];
+    scope[0] = 0x40;
+    scope[1..].copy_from_slice(id.as_bytes());
+    scope
+}
+/// The first key after every key that starts with `prefix`.
+pub(super) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    nabedra_kv::batch::prefix_successor(prefix).expect("pool prefixes have a finite successor")
+}
+
+/// Store options around the worker-shared resources. The memtable size and replay
+/// window follow RocksDB's former per-pool `write_buffer_size = wb / 2` and
+/// `max_total_wal_size = wb`.
+pub(super) fn store_options(
+    storage: &NativeStorage,
+    fs: Arc<dyn Fs>,
+    write_buffer_bytes: usize,
+) -> Options {
+    let mut options = Options::new(
+        fs,
+        storage.cache.clone(),
+        storage.memtables.clone(),
+        storage.background.clone(),
+    );
+    options.scope_of = scope_of;
+    options.memtable_bytes = (write_buffer_bytes / 2).max(1 << 20);
+    options.max_replay_bytes = (write_buffer_bytes as u64).max(4 << 20);
+    options
+}
+
+/// Maps an engine error onto the pool's protocol errors.
+pub(super) fn storage_error(error: nabedra_kv::Error) -> ProtocolError {
+    match error {
+        nabedra_kv::Error::UnsupportedFormat { found } => unsupported_format(&found),
+        nabedra_kv::Error::NoSpace => no_space(),
+        _ => failure(
+            ErrorCode::StorageUnavailable,
+            "OLTP storage unavailable or corrupt",
+        ),
+    }
+}
+pub(super) fn unsupported_format(found: &str) -> ProtocolError {
+    failure(
+        ErrorCode::StorageUnavailable,
+        &format!("unsupported store format: {found}"),
+    )
+}
+pub(super) fn no_space() -> ProtocolError {
+    failure(
+        ErrorCode::StorageUnavailable,
+        "OLTP storage device is full; the write was not applied",
+    )
+}
+/// The outcome of a failed commit: `NoSpace` wrote nothing; anything else is
+/// ambiguous and latches the pool (O29).
+pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
+    match error {
+        nabedra_kv::Error::NoSpace => (false, no_space()),
+        _ => (true, recovery_unknown()),
+    }
+}
+
+/// Waits for a commit on any thread, including one that drives an async runtime,
+/// where `Commit::wait` would panic. Only the synchronous pool paths that already
+/// blocked on RocksDB use it: open, close, snapshot install and export, group
+/// creation and retirement stamps, all of which run on an executor thread except
+/// open. `GroupStore::mutate` never blocks; it awaits `Commit::done` instead.
+pub(super) fn wait_commit(commit: Commit) -> nabedra_kv::Result<Seq> {
+    struct Unpark(Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(commit.done());
+    loop {
+        if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
+            return result;
+        }
+        std::thread::park();
+    }
+}
+
+/// A raw cursor with the shape of RocksDB's `DBRawIterator`, over a `nabedra-kv`
+/// iterator. `key()` is `None` when the cursor is not on a record; damage and
+/// quarantine surface through `status()`.
+pub(super) struct RawIter(nabedra_kv::Iter);
+impl RawIter {
+    pub(super) fn new(snapshot: &nabedra_kv::Snapshot, lower: &[u8], fill_cache: bool) -> Self {
+        Self(snapshot.iter(Bound::Included(lower), Bound::Unbounded, fill_cache))
+    }
+    /// A cursor over `[lower, upper)`.
+    pub(super) fn bounded(
+        snapshot: &nabedra_kv::Snapshot,
+        lower: &[u8],
+        upper: &[u8],
+        fill_cache: bool,
+    ) -> Self {
+        Self(snapshot.iter(
+            Bound::Included(lower),
+            Bound::Excluded(upper),
+            fill_cache,
+        ))
+    }
+    pub(super) fn seek(&mut self, target: &[u8]) {
+        self.0.seek(target);
+    }
+    pub(super) fn next(&mut self) {
+        if self.0.valid() {
+            self.0.next();
+        }
+    }
+    pub(super) fn valid(&self) -> bool {
+        self.0.valid()
+    }
+    pub(super) fn key(&self) -> Option<&[u8]> {
+        self.0.valid().then(|| self.0.key())
+    }
+    pub(super) fn value(&self) -> Result<Bytes, ProtocolError> {
+        if !self.0.valid() {
+            return Err(recovery_unknown());
+        }
+        self.0.value().map_err(storage_error)
+    }
+    pub(super) fn status(&self) -> Result<(), ProtocolError> {
+        self.0.status().map_err(storage_error)
+    }
+    pub(super) fn into_inner(self) -> nabedra_kv::Iter {
+        self.0
+    }
+}
+
+/// R4 (Q1, NS22): files a RocksDB store or the legacy engine leaves in its
+/// directory. A pool directory without a format-2 manifest that holds any of them
+/// is refused as an unsupported store format, before anything is touched.
+pub(super) fn legacy_store_marker(path: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let legacy = matches!(
+            name.as_ref(),
+            "CURRENT" | "IDENTITY" | "LOCK" | "LOG" | "NABEDRA_OLTP.json" | "rocksdb"
+        ) || name.starts_with("MANIFEST-")
+            || name.starts_with("OPTIONS-")
+            || name.ends_with(".sst")
+            || name.ends_with(".log");
+        if legacy {
+            return Some(format!(
+                "{}: RocksDB or legacy OLTP files ({name})",
+                path.display()
+            ));
+        }
+    }
+    None
+}
+

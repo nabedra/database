@@ -125,7 +125,7 @@ impl LocalWorker {
             &ownership.path.join("pool"),
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: topology.cluster_id,
                 worker_id: topology.worker_id,
                 pool_id: topology.pool_id,

@@ -27,7 +27,7 @@ path = "src/main.rs"
 [features]
 default = ["olap", "s3"]
 olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
-oltp = ["dep:rocksdb", "dep:openraft", "dep:tokio-rustls"]
+oltp = ["dep:rocksdb", "dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls"]
 cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
@@ -57,6 +57,7 @@ openraft = { version = "=0.10.0", optional = true, default-features = false, fea
 tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["tls12", "aws_lc_rs"] }
 rocksdb = { version = "=0.25.0", optional = true, default-features = false, features = ["bindgen-runtime"] }
 bytes = "=1.12.1"
+nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }
