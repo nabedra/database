@@ -1182,7 +1182,7 @@ impl Endpoint for TimestampEndpoint {
                 return reply(self.handle.resources(), &session, self.node, result).await;
             }
             let result = async {
-                let (request, owner) = decode(self.handle.resources(), sections).await?;
+                let (request, owner) = decode::<Request>(self.handle.resources(), sections).await?;
                 if request.method() != head.method {
                     return Err(invalid());
                 }
@@ -1191,13 +1191,23 @@ impl Endpoint for TimestampEndpoint {
                 let result = match request {
                     Request::CommitTimestampPoint { locator, reconcile } => {
                         Box::pin(self.decide_point(
-                            &session, &head, &locator, point_decision::PointOperation::Commit, reconcile,
-                        )).await
+                            &session,
+                            &head,
+                            &locator,
+                            point_decision::PointOperation::Commit,
+                            reconcile,
+                        ))
+                        .await
                     }
                     Request::AbortTimestampPoint { locator, reconcile } => {
                         Box::pin(self.decide_point(
-                            &session, &head, &locator, point_decision::PointOperation::Abort, reconcile,
-                        )).await
+                            &session,
+                            &head,
+                            &locator,
+                            point_decision::PointOperation::Abort,
+                            reconcile,
+                        ))
+                        .await
                     }
                     request => Box::pin(self.dispatch(&session, &head, request)).await,
                 };
