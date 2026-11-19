@@ -319,11 +319,14 @@ class Cluster:
         self.key_spec = {'rsa': 'rsa:2048', 'ed25519': 'ed25519'}[args.tls_key_type]
         image, = json.loads(command('docker', 'image', 'inspect', args.image))
         self.image = image['Id']
+        self.scoped_oltp = getattr(args, 'scoped_oltp', False)
         self.metadata = {'engine': 'nabedra', 'cluster_id': self.cluster_id, 'run_id': self.run_id,
-                         'replication_factor': 3, 'queue_replication': 'all_ready_workers',
+                         'replication_factor': 3,
+                         'queue_replication': 'scoped_rf3' if self.scoped_oltp else 'all_ready_workers',
                          'consistency': 'Nabedra production OLTP', 'protocol': 'synchronous HTTPS /v1/operations',
                          'image': self.image, 'image_os': image['Os'], 'image_architecture': image['Architecture'],
-                         'contract_references': ['O24', 'Q01', 'B02'], 'rpc_trace': args.rpc_trace,
+                         'contract_references': ['O24', 'Q01', 'B02'] + (['O30'] if self.scoped_oltp else []),
+                         'rpc_trace': args.rpc_trace,
                          'tls_key_type': args.tls_key_type}
         if args.binary:
             with args.binary.open('rb') as binary:
@@ -457,6 +460,8 @@ class Cluster:
                                    identity=dict(engine='oltp', pool_format_version=1, cluster_id=self.cluster_id,
                                                  worker_id=worker['worker_id'], pool_id=pool[name]),
                                    mount_path='/data', provider_volume_id='docker-volume:' + volume, filesystem_uuid=''))
+            if self.scoped_oltp:
+                node['scoped_oltp'] = True
             write_json(self.directory / f'{name}.json', dict(version=1, bind='0.0.0.0:8000',
                        auth_file='/tmp/config/auth.json', node=node, resources=resources(WORKER_MEMORY), execution=EXECUTION))
             script = '''set -eu
@@ -486,13 +491,16 @@ exec "$2" worker --bootstrap "/tmp/config/$1.json"
             admin('api.enroll', {'expected': None, 'next': api_enrollment})
         finally:
             control.close()
-        write_json(self.directory / 'api.json', dict(version=1, engine='oltp', bind='0.0.0.0:8000', database=DATABASE,
+        api_config = dict(version=1, engine='oltp', bind='0.0.0.0:8000', database=DATABASE,
                    auth_file='/tmp/config/auth.json', tls=dict(cert_file='/tmp/config/api.pem', key_file='/tmp/config/api.key'),
                    topology=dict(mode='remote', cluster_id=self.cluster_id, control_group_id=connection['control_group_id'],
                                  control_peers=connection['control_peers'], enrollment=api_enrollment,
                                  worker_tls=dict(cert_file='/tmp/config/api.pem', key_file='/tmp/config/api.key',
                                                  ca_file='/tmp/config/ca.pem')),
-                   worker=dict(resources=resources(API_MEMORY), execution=EXECUTION, queue_size=128)))
+                   worker=dict(resources=resources(API_MEMORY), execution=EXECUTION, queue_size=128))
+        if self.scoped_oltp:
+            api_config['topology']['scoped_oltp'] = True
+        write_json(self.directory / 'api.json', api_config)
         script = '''set -eu
 umask 077
 mkdir /tmp/config
@@ -514,6 +522,27 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         print('Waiting for the remote OLTP API', flush=True)
         self.metadata['ready'].update(self.worker_ready({'api': self.host_url('api', 'https')},
                                      ca=ssl.create_default_context(cafile=str(self.directory / 'ca.pem')), deadline_seconds=40))
+        if self.scoped_oltp:
+            control = Http(worker_urls['w1'], self.auth['admin_token'], 15)
+            try:
+                deadline = time.monotonic() + 30
+                while True:
+                    capability = admin('queue.scoped.status', {})
+                    if capability['activation'] is not None:
+                        active = capability
+                        break
+                    try:
+                        active = admin('queue.scoped.admission', {'expected': capability, 'enabled': True})
+                        break
+                    except RuntimeError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.25)
+                if active['version'] != 2 or active['run_id'] != self.run_id or active['activation'] is None:
+                    raise RuntimeError(f'Control did not activate scoped OLTP: {active}')
+                self.metadata['scoped_activation'] = active
+            finally:
+                control.close()
         worker = f'{self.prefix}-w1'
         version = self.docker('exec', worker, self.binary, '--version')
         if 'oltp' not in version.split():
@@ -659,6 +688,7 @@ def main():
     parser.add_argument('--status-seed-worker', choices=WORKERS,
                         help='select the first voter that initializes the fresh RF3 Status group (default: w3)')
     parser.add_argument('--rpc-trace', action='store_true', help='capture bounded native RPC logs for a diagnostic run')
+    parser.add_argument('--scoped-oltp', action='store_true', help='activate the RF3 scoped point path')
     parser.add_argument('--tls-key-type', choices=('rsa', 'ed25519'), default='rsa',
                         help='key type for fixture certificates, including the CA (default: rsa)')
     parser.add_argument('--driver', action='store_true', help=argparse.SUPPRESS)

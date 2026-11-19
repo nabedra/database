@@ -13,6 +13,9 @@ use crate::oltp_replication::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use crate::oltp_replication::authority::status::identity::transaction::timestamp_point::{
     TimestampDecisionLocator, TimestampPointBinding, TimestampPointManifest,
 };

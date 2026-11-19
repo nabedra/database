@@ -203,6 +203,11 @@ impl ScopedCopyQuorum {
     pub(crate) fn stamp(self) -> ScopedCopyStamp {
         self.stamp
     }
+
+    #[cfg(test)]
+    pub(crate) fn holders(self) -> [WorkerIdentity; 2] {
+        self.holders
+    }
 }
 
 pub(crate) fn placement_digest(current: &ScopedQueuePlacement) -> Result<Digest, QueueError> {

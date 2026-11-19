@@ -382,6 +382,31 @@ impl QueueEndpoint {
         self.with_scoped_store(|store| store.reserve_admission(body_bytes))
     }
 
+    #[cfg(test)]
+    async fn observe_scoped_copy(
+        stage: &str,
+        placement: &ScopedQueuePlacement,
+        quorum: ScopedCopyQuorum,
+    ) {
+        #[derive(Serialize)]
+        struct Copy<'a> {
+            placement: &'a ScopedQueuePlacement,
+            stamp: ScopedCopyStamp,
+            holders: [WorkerIdentity; 2],
+        }
+        let stamp = quorum.stamp();
+        super::super::recovery_tests::transaction_checkpoint(
+            stage,
+            stamp.binding().request_id,
+            &Copy {
+                placement,
+                stamp,
+                holders: quorum.holders(),
+            },
+        )
+        .await;
+    }
+
     async fn require_scoped_owner(
         &self,
         expected: &ScopedQueuePlacement,
@@ -444,6 +469,8 @@ impl QueueEndpoint {
             };
             let installation = ScopedCopyQuorum::confirm(current, stamp, local, remote)
                 .map_err(QueueError::protocol)?;
+            #[cfg(test)]
+            Self::observe_scoped_copy("scoped-payload-quorum", current, installation).await;
             self.require_scoped_owner(current).await?;
             let marker = self.with_scoped_store(|store| {
                 store.install_marker(current, self.local, installation, stamp.binding())
@@ -474,6 +501,8 @@ impl QueueEndpoint {
                 return Err(unavailable());
             }
             self.with_scoped_store(|store| store.confirm_copies(current, accepted))?;
+            #[cfg(test)]
+            Self::observe_scoped_copy("scoped-marker-quorum", current, accepted).await;
             Ok(accepted)
         })
         .await
@@ -654,6 +683,8 @@ impl QueueEndpoint {
                 return Err(unavailable());
             }
             self.with_scoped_store(|store| store.confirm_copies(current, quorum))?;
+            #[cfg(test)]
+            Self::observe_scoped_copy("scoped-terminal-quorum", current, quorum).await;
             Ok(quorum)
         })
         .await
@@ -1073,6 +1104,8 @@ impl QueueEndpoint {
         record: &RecordHeader,
         sections: &ChargedSections,
     ) -> Result<ChargedReply, ProtocolError> {
+        #[cfg(test)]
+        super::super::recovery_tests::pause("before-scoped-payload-copy", record.request_id).await;
         let revision = self.with_scoped_store(|store| Ok(store.write_revision(scope[0])))?;
         let placement = self
             .scoped_payload_placement(session, scope, record)
@@ -1189,6 +1222,9 @@ impl QueueEndpoint {
         let ack = if witness && current.owner == session.local() {
             self.with_scoped_store(|store| store.copy_witness(&current, stamp.marker()))?
         } else if !witness && current.owner == session.remote() {
+            #[cfg(test)]
+            super::super::recovery_tests::pause("before-scoped-marker-copy", request.request_id)
+                .await;
             let local = self.with_scoped_store(|store| store.copy_witness(&current, stamp))?;
             let owner = self
                 .scoped_peer
@@ -1276,6 +1312,9 @@ impl QueueEndpoint {
         record: ScopedTransferRecord,
         sections: &ChargedSections,
     ) -> Result<ChargedReply, ProtocolError> {
+        #[cfg(test)]
+        super::super::recovery_tests::pause("before-scoped-terminal-copy", record.request_id())
+            .await;
         let revision = self.with_scoped_store(|store| Ok(store.write_revision(scope[0])))?;
         let view = record.payload_header().ready.view;
         let current = self
@@ -1322,6 +1361,8 @@ impl QueueEndpoint {
         version: RecordVersion,
         sections: &ChargedSections,
     ) -> Result<ChargedReply, ProtocolError> {
+        #[cfg(test)]
+        super::super::recovery_tests::pause("before-scoped-terminal-copy", header.request_id).await;
         let current = self
             .scoped_terminal_placement(session, scope, header)
             .await?;

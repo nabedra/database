@@ -135,6 +135,9 @@ impl TransactionCoordinator {
             }
             _ => return Err(unknown()),
         }
+        #[cfg(test)]
+        super::super::recovery_tests::pause("after-scoped-timestamp-decision", txn.request_id)
+            .await;
         self.finish_timestamp_point(authority, scope, &locator, data)
             .await
             .map(Some)

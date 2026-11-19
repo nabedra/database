@@ -734,6 +734,13 @@ impl ScopedWorker {
         if record.acceptance.is_none() {
             return Err(unavailable());
         }
+        #[cfg(test)]
+        super::recovery_tests::transaction_checkpoint(
+            "scoped-dispatch",
+            id,
+            &record.stamp.binding(),
+        )
+        .await;
         let (mut frame, terminal) = record
             .frames(self.resources())
             .map_err(QueueError::protocol)?;
@@ -789,6 +796,13 @@ impl ScopedWorker {
         } else {
             let (encoded, decision) = match recovered {
                 Some(decision) => {
+                    #[cfg(test)]
+                    super::recovery_tests::transaction_checkpoint(
+                        "scoped-decision",
+                        id,
+                        decision.statement(),
+                    )
+                    .await;
                     let outcome = decision.outcome().ok_or_else(unavailable)?;
                     (
                         encode_outcome(id, outcome.result()),
@@ -824,6 +838,13 @@ impl ScopedWorker {
                                 crate::oltp_replication::authority::timestamp::ScopedTimestampEpoch::from_placement(&placement)?,
                             )
                             .await?;
+                        #[cfg(test)]
+                        super::recovery_tests::transaction_checkpoint(
+                            "scoped-decision",
+                            id,
+                            decision.statement(),
+                        )
+                        .await;
                         let outcome = decision.outcome().ok_or_else(unavailable)?;
                         (
                             encode_outcome(id, outcome.result()),
