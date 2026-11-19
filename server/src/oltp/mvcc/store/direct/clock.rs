@@ -73,6 +73,7 @@ pub(crate) struct LeaderToken {
     term: u64,
     generation: u64,
 }
+#[allow(dead_code)] // The leader executor (T5) reads the term.
 impl LeaderToken {
     pub(crate) fn term(&self) -> u64 {
         self.term
