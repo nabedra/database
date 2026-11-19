@@ -11,6 +11,7 @@ const MAX_ROUTE_BYTES: usize = 4096;
 const MAX_CACHED_RANGES: usize = 64;
 const MAX_CACHED_RECEIPTS: usize = 128;
 const ROUTE_DEADLINE: Duration = Duration::from_secs(30);
+const RECEIPT_HINT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -328,6 +329,7 @@ impl ApplicationClient {
         };
         let mut target = routes.receipt(run, id);
         for attempt in 0..2 {
+            let cached = target.is_some();
             let current = match target.take() {
                 Some(current) => current,
                 None => {
@@ -351,10 +353,17 @@ impl ApplicationClient {
                     current
                 }
             };
-            match self
-                .call_to(current.target.owner, scoped(current), None)
-                .await
-            {
+            let observe = self.call_to(current.target.owner, scoped(current), None);
+            let reply = if cached {
+                // Invalidate a silent owner before the HTTP receipt deadline
+                // cancels observation and leaves the same stale hint cached.
+                tokio::time::timeout(RECEIPT_HINT_TIMEOUT, observe)
+                    .await
+                    .unwrap_or_else(|_| Err(unavailable()))
+            } else {
+                observe.await
+            };
+            match reply {
                 Err(error) if error.code == ErrorCode::StorageUnavailable && attempt == 0 => {
                     routes.forget(current.target);
                 }
