@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { test } from "node:test"
 import * as orm from "nabedra"
+import { Cache } from "nabedra/cache"
 import * as events from "nabedra/events"
 import * as deployment from "nabedra/deployment"
 import * as aws from "nabedra/aws"
@@ -10,7 +11,7 @@ import * as gateway from "nabedra/gateway"
 import * as cli from "nabedra/cli"
 import * as sink from "nabedra/events/sink"
 
-const root = ["AuthenticationError", "AwsCredentials", "BatchStream", "Cluster", "ConflictError", "DB", "Database",
+const root = ["AuthenticationError", "AwsCredentials", "BatchStream", "Cache", "Cluster", "ConflictError", "DB", "Database",
   "Expr", "Gateway", "GatewayContext", "HTTPResponse", "KubernetesProvider", "LimitExceededError",
   "NabedraError", "NotFoundError", "OverloadedError", "ProtocolError", "ProviderError", "Query",
   "RequestReceipt", "S3", "StorageError", "StreamAbandonedError", "StreamExpiredError", "StreamSnapshot",
@@ -36,6 +37,8 @@ test("package has the Python ORM and Events exports with camelCase public member
   assert.deepEqual(Object.keys(cli).sort(), ["main"])
   assert.deepEqual(Object.keys(sink).sort(), ["main"])
   assert.equal(orm.DB, orm.Database)
+  assert.equal(orm.Cache, Cache)
+  assert.deepEqual(classMembers(Cache.prototype), ["close", "delete", "expire", "get", "increment", "persist", "set", "ttlMs"])
   assert.equal(new orm.Database("http://localhost", "test", { mode: "olap" }).mode, "olap")
   assert.deepEqual(classMembers(orm.Database.prototype),
     ["createTable", "mode", "receipt", "submit", "table", "tables"])

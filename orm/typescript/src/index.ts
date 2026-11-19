@@ -1,4 +1,5 @@
 export { Database, DB, RequestReceipt, type DatabaseOptions } from "./client.js"
+export { Cache, type CacheOptions, type CacheSetCondition, type CacheSetOptions } from "./cache.js"
 export { Cluster, type ClusterOptions, type ClusterPolicy, type ClusterStatus, type ClusterNode,
   type ClusterIntent, type WorkerResources, type ScaleOptions, type AutoscaleOptions } from "./cluster.js"
 export { Expr, col } from "./expr.js"

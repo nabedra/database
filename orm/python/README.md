@@ -67,3 +67,24 @@ the [repository installer](https://github.com/zPy52/nabedra-database/blob/main/s
 - [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
 - [Application gateway setup](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
 - [Contribution guide](https://github.com/zPy52/nabedra-database/blob/main/CONTRIBUTION.md)
+
+## Cache
+
+Use a synchronous context manager with a Nabedra Cache endpoint. The client
+opens a connection pool and releases it when the context exits.
+
+```python
+from nabedra.cache import Cache
+
+with Cache.connect("rediss://cache.example.com:6379", username=user,
+                   password=secret, namespace="catalog", ca_file="/path/to/ca.pem") as cache:
+    cache.set("sku:42", b"in stock", ttl_ms=30_000, when="absent")
+    value = cache.get("sku:42")
+```
+
+`Cache` is also exported from `nabedra`. Call `delete`, `expire`, `persist`,
+`ttl_ms` and `increment` on the same handle. `get` returns exact bytes or
+`None`. Use `cluster=True` with bootstrap endpoints and `allowed_nodes` or
+`allowed_node_suffix` when node names differ from the seeds. The
+[shared contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+describes deadlines, routing and errors.
