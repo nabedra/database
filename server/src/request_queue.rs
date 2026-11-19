@@ -377,6 +377,7 @@ impl RequestQueue {
     }
     /// Roll back only an exact proposal that has never been accepted. Accepted
     /// records retain their logical identity through every execution outcome.
+    #[cfg(feature = "olap")]
     pub(crate) fn discard_unaccepted(
         &mut self,
         id: impl Into<RequestKey>,
