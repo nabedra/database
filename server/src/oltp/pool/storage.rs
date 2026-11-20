@@ -1,7 +1,7 @@
 //! Glue between the pool and `nabedra-kv`: worker-shared engine resources, store
 //! options, key scopes, error mapping and a raw iterator with the shape the pool's
-//! readers use. It replaces the RocksDB helpers the pool used to import from the
-//! legacy `oltp` module (plan section 5).
+//! readers use. It replaces the storage helpers the pool used to import from the
+//! deleted standalone `oltp` engine (plan section 5).
 use super::{PoolInner, failure, recovery_unknown};
 use crate::protocol::{ErrorCode, ProtocolError};
 use bytes::Bytes;
@@ -171,8 +171,8 @@ pub(super) fn prefix_end(prefix: &[u8]) -> Vec<u8> {
 }
 
 /// Store options around the worker-shared resources. The memtable size and replay
-/// window follow RocksDB's former per-pool `write_buffer_size = wb / 2` and
-/// `max_total_wal_size = wb`.
+/// window keep the previous engine's per-pool settings: half of `wb` per memtable
+/// and a replay window of `wb`.
 pub(super) fn store_options(
     storage: &NativeStorage,
     fs: Arc<dyn Fs>,
@@ -223,10 +223,9 @@ pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
 }
 
 /// Waits for a commit on any thread, including one that drives an async runtime,
-/// where `Commit::wait` would panic. Only the synchronous pool paths that already
-/// blocked on RocksDB use it: open, close, snapshot install and export, group
-/// creation and retirement stamps, all of which run on an executor thread except
-/// open. `GroupStore::mutate` never blocks; it awaits `Commit::done` instead.
+/// where `Commit::wait` would panic. Only the synchronous pool paths use it: open,
+/// close, snapshot install and export, group creation and retirement stamps, all
+/// of which run on an executor thread except open. `GroupStore::mutate` never blocks; it awaits `Commit::done` instead.
 ///
 /// The future is polled outside tokio's cooperative budget (RV-NS6 F1). On a
 /// runtime worker whose task has spent its budget, a budgeted poll returns
@@ -254,8 +253,8 @@ pub(super) fn wait_commit(commit: Commit) -> nabedra_kv::Result<Seq> {
     }
 }
 
-/// A raw cursor with the shape of RocksDB's `DBRawIterator`, over a `nabedra-kv`
-/// iterator. `key()` is `None` when the cursor is not on a record; damage and
+/// A raw cursor (seek, next, key, value, status) over a `nabedra-kv` iterator,
+/// with the shape the pool's readers already use. `key()` is `None` when the cursor is not on a record; damage and
 /// quarantine surface through `status()`.
 pub(super) struct RawIter(nabedra_kv::Iter);
 impl RawIter {

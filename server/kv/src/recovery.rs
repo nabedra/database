@@ -36,7 +36,7 @@ fn unsupported(dir: &Path, what: String) -> Error {
 /// R4 checks, the lock, creation of a new store, and the manifest state.
 ///
 /// A directory without `FORMAT` must be empty apart from the leftovers of an interrupted
-/// creation (`LOCK`, `FORMAT.tmp`); anything else (a RocksDB store, for instance) is
+/// creation (`LOCK`, `FORMAT.tmp`); anything else (another engine's store, for instance) is
 /// refused before anything in it is touched.
 pub(crate) fn prepare(fs: &dyn Fs, dir: &Path, _scope_of: fn(&[u8]) -> usize) -> Result<Prepared> {
     if !fs.exists(dir)? {

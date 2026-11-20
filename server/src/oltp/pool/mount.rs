@@ -1,5 +1,5 @@
 //! A registered pool opens only on its expected mounted block device. The
-//! directory descriptor and exclusive ownership lock live as long as RocksDB.
+//! directory descriptor and exclusive ownership lock live as long as the store.
 //! The caller obtains expectations from authenticated operator inventory.
 use super::{PoolIdentity, ProtocolError};
 use crate::{
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&path).unwrap().count(),
             0,
-            "a missing mount must not receive identity or RocksDB files"
+            "a missing mount must not receive identity or store files"
         );
         let mut root = expected;
         root.mount_path = PathBuf::from("/");

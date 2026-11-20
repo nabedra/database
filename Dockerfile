@@ -2,21 +2,23 @@ ARG NABEDRA_ENGINE=olap
 FROM rust:1.94.1-bookworm AS build
 ARG NABEDRA_ENGINE=olap
 ARG NABEDRA_S3=auto
-# RocksDB's Rust binding uses libclang and a C++ compiler.
-RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev && rm -rf /var/lib/apt/lists/*
+# Optional Cargo job limit for memory-constrained builders; unset uses every CPU.
+ARG BUILD_JOBS=
+# Storage is the in-tree nabedra-kv engine (Rust only). The only C code is TLS
+# (ring, aws-lc-sys), which builds with the base image's gcc through `cc`.
 WORKDIR /src
 COPY server/ ./server/
 RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
     if [ "$NABEDRA_S3" = auto ]; then if [ "$NABEDRA_ENGINE" = olap ]; then NABEDRA_S3=true; else NABEDRA_S3=false; fi; fi && \
     case "$NABEDRA_ENGINE:$NABEDRA_S3" in oltp:true) selected_features=oltp-backup-s3 ;; olap:true) selected_features=olap,s3 ;; *:false) selected_features="$NABEDRA_ENGINE" ;; *) exit 2 ;; esac && \
-    cargo build --manifest-path server/Cargo.toml --locked --release --bin nabedra-db --no-default-features --features "$selected_features" && \
+    cargo build --manifest-path server/Cargo.toml --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --bin nabedra-db --no-default-features --features "$selected_features" && \
     ./server/target/release/nabedra-db --version | grep -w "$NABEDRA_ENGINE"
 
 FROM python:3.11-slim-bookworm AS runtime
 ARG NABEDRA_ENGINE=olap
 ARG NABEDRA_S3=auto
 LABEL io.nabedra.engine=$NABEDRA_ENGINE io.nabedra.s3=$NABEDRA_S3
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libstdc++6 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY orm/python/ /opt/nabedra/orm/python/
 RUN python -m pip install --no-cache-dir /opt/nabedra/orm/python && useradd --create-home nabedra
 COPY --from=build /src/server/target/release/nabedra-db /usr/local/bin/nabedra-db

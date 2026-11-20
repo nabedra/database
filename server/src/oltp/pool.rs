@@ -56,7 +56,8 @@ const POOL_KEY: &[u8] = b"\0typed-pool-v1";
 const MAX_KEY_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + 256;
 const MAX_IDENTITY_BYTES: u64 = 4096;
 const BATCH_OVERHEAD: usize = 32;
-/// Pool format 2: a `nabedra-kv` store in `kv/`. Format 1 (RocksDB) is refused (Q1).
+/// Pool format 2: a `nabedra-kv` store in `kv/`. Format 1 (the previous engine) is
+/// refused (Q1).
 pub const POOL_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1153,7 +1154,7 @@ impl GroupStore {
                     } = transaction;
                     if batch.is_empty() {
                         // Nothing to order. A synced empty write still means
-                        // "every earlier write is durable", as it did on RocksDB.
+                        // "every earlier write is durable".
                         return Ok(Submitted::Empty {
                             response,
                             sync: deferred_index.is_none(),
@@ -2010,7 +2011,7 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         if let Some(stored) = &stored
             && stored.pool_format_version != POOL_FORMAT_VERSION
         {
-            // Q1 clean break: a RocksDB (format 1) pool is refused by name.
+            // Q1 clean break: a format 1 pool (previous engine) is refused by name.
             return Err(unsupported_format(&format!(
                 "{}: pool_format_version {}",
                 manifest.display(),
@@ -2057,7 +2058,7 @@ fn storage_error_message() -> ProtocolError {
 /// closes it while holding a multi-threaded runtime worker: the worker's other
 /// tasks move to another thread first (KVfix1 note 8). A current-thread runtime
 /// has no other worker; the close needs nothing from the runtime, so it only
-/// blocks that thread briefly, as dropping the RocksDB handle did.
+/// blocks that thread briefly.
 struct OwnedStore(Option<Store>);
 impl std::ops::Deref for OwnedStore {
     type Target = Store;
