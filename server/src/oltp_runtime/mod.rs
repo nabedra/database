@@ -1,13 +1,13 @@
-//! Standalone OLTP server and experimental worker-memory queue components.
-//! The installed server uses RF1; distributed production composition and
-//! provisioning are not enabled by the CLI.
+//! OLTP server runtimes. Every entry point opens typed pools through
+//! `WorkerRuntime`; distributed production composition and provisioning are
+//! not enabled by the CLI.
 mod admission;
 mod admission_tickets;
-mod authority_fence;
 #[cfg(unix)]
 pub mod api_process;
 pub(crate) mod application;
 pub mod archive_cli;
+mod authority_fence;
 pub(crate) mod bootstrap;
 pub mod coordinator;
 #[cfg(unix)]
@@ -18,12 +18,13 @@ mod direct_benchmark;
 pub(crate) mod direct;
 mod http;
 mod http_runtime;
+#[cfg(test)]
+mod ns28_tests;
 mod operator;
-mod queue;
-#[cfg(unix)]
-pub mod registered_process;
 #[cfg(test)]
 pub(crate) mod recovery_tests;
+#[cfg(unix)]
+pub mod registered_process;
 #[cfg(unix)]
 mod remote_api;
 pub mod replica;
@@ -34,7 +35,6 @@ pub(crate) mod worker_runtime;
 
 use crate::{
     config::{ExecutionConfig, WorkerResources},
-    oltp::OltpEngine,
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -43,9 +43,6 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     path::PathBuf,
 };
-
-pub use http::router;
-pub use queue::LocalRuntime;
 
 /// Bound for decoded request structures, independent of logical table size.
 pub(crate) const MAX_DECODED_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -91,18 +88,6 @@ pub struct ServeOptions {
     pub tls_cert: Option<PathBuf>,
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
-}
-
-pub(crate) fn require_standalone(engine: &OltpEngine) -> Result<(), ProtocolError> {
-    let manifest = engine.manifest();
-    if manifest.topology != "standalone-rf1" || manifest.group_id.is_some() {
-        return Err(ProtocolError::new(
-            ErrorCode::UnsupportedOperation,
-            "standalone runtime cannot execute a replicated store",
-            Outcome::NotApplied,
-        ));
-    }
-    Ok(())
 }
 
 fn invalid(message: &'static str) -> ProtocolError {

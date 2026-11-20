@@ -1,4 +1,4 @@
-use super::{LocalRuntime, http_runtime::HttpRuntime, invalid, valid_database};
+use super::{http_runtime::HttpRuntime, invalid, valid_database};
 use crate::{
     protocol::{self, ErrorCode, Outcome, ProtocolError},
     response::{self, EncodedResponse},
@@ -22,15 +22,6 @@ struct ApiState {
     admin: Option<String>,
 }
 
-pub fn router(
-    runtime: Arc<LocalRuntime>,
-    token: String,
-    database: String,
-) -> Result<Router, ProtocolError> {
-    super::require_standalone(&runtime.engine)?;
-    runtime.engine.bind_database(&database)?;
-    router_for(runtime, token, database)
-}
 pub(crate) fn router_for(
     runtime: Arc<dyn HttpRuntime>,
     token: String,
@@ -238,9 +229,8 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
             Err(error) => return Ok((state, scan_request_id(&bytes), Err(error))),
         };
         let id = Some(parsed.request_id);
-        let point = super::application::PointRequest::from_operation(
-            parsed.request_id, &parsed.operation,
-        );
+        let point =
+            super::application::PointRequest::from_operation(parsed.request_id, &parsed.operation);
         drop(parsed);
         let record = state.runtime.clone().submit(bytes, staging, point).await;
         Ok((state, id, record))

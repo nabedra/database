@@ -24,7 +24,7 @@ use crate::{
             consensus::{Applied, Consensus},
             status::VerifiedStatusDecision,
         },
-        entry::{LogId, Payload, Vote},
+        entry::{Payload, Vote},
         hosted::{log_id, position},
         manager::{HostedGroupManager, ManagedData},
         multiplex::{EndpointRegistry, TransportConfig, WorkerTransport},
@@ -488,23 +488,30 @@ async fn offline(base: &Path, root: &Path, topology: &Topology, node: u64, mode:
     let shared = shared(node);
     if mode == "corrupt" {
         let corruption = root.join("corrupt");
-        let mut options = rocksdb::Options::default();
-        options.set_wal_recovery_mode(rocksdb::DBRecoveryMode::AbsoluteConsistency);
-        let error = rocksdb::DB::open_for_read_only(&options, &corruption, false)
-            .err()
-            .expect("native open accepted corrupt voter WAL");
-        assert_eq!(error.kind(), rocksdb::ErrorKind::Corruption);
-        assert!(error.to_string().contains("checksum mismatch"), "{error}");
-        let refused = OltpPool::open_development(corruption, topology.identity(node), shared)
-            .err()
-            .expect("OLTP open accepted corrupt voter WAL");
-        assert_eq!(refused.code, ErrorCode::StorageUnavailable);
-        assert_eq!(refused.message, "OLTP storage unavailable or corrupt");
+        let probe = (corruption.clone(), root.join("corrupt-probe"));
+        let native = tokio::task::spawn_blocking(move || probe_native_store(&probe.0, &probe.1))
+            .await
+            .unwrap();
+        // The pool either refuses the store (R1, or R6 when too many groups are
+        // damaged) or opens with the damaged group quarantined and never started (G1).
+        let pool = match OltpPool::open_development(corruption, topology.identity(node), shared) {
+            Err(refused) => {
+                assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+                json!({"refused": refused})
+            }
+            Ok(opened) => {
+                let quarantined = opened.quarantined_groups();
+                assert!(
+                    !quarantined.is_empty(),
+                    "OLTP open accepted corrupt voter WAL"
+                );
+                json!({"quarantined_groups": quarantined})
+            }
+        };
         write(
             root,
             "corrupt-result.json",
-            &json!({"native_error": error.to_string(),
-            "pool_error": refused}),
+            &json!({"native": native, "pool": pool}),
         );
         return;
     }
@@ -515,6 +522,56 @@ async fn offline(base: &Path, root: &Path, topology: &Topology, node: u64, mode:
     verify_log(&mut log, &pending).await;
     let observation = verify(topology, &pending, &mut log, mode == "recovered").await;
     write(root, &format!("{mode}-result.json"), &observation);
+}
+
+/// Opens a copy of the voter's `nabedra-kv` store (`<pool>/kv`, plan section 2 "Files"),
+/// so recovery cannot repair the copy that the pool assertion opens next. The store must
+/// detect the flipped journal byte: either refuse to open (R1, `Corruption`) or open with
+/// the damaged scope quarantined (G1). Opening clean, for example by truncating the damage
+/// as a torn tail (L2), fails the fixture.
+fn probe_native_store(pool: &Path, probe: &Path) -> Value {
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(probe);
+    copy_tree(&pool.join("kv"), probe);
+    let options = nabedra_kv::Options::new(
+        nabedra_kv::fs::real(),
+        Arc::new(nabedra_kv::BlockCache::new(1 << 20)),
+        Arc::new(nabedra_kv::MemtableBudget::new(8 << 20)),
+        nabedra_kv::Background::new(1),
+    );
+    let outcome = match nabedra_kv::Store::open(probe, options) {
+        Err(error @ nabedra_kv::Error::Corruption { .. }) => {
+            json!({"refused": error.to_string()})
+        }
+        Err(error) => panic!("native open failed without reporting corruption: {error}"),
+        Ok(opened) => {
+            let damaged: Vec<_> = opened
+                .quarantined
+                .iter()
+                .filter(|damage| damage.reason == nabedra_kv::DamageReason::JournalRecord)
+                .map(|damage| format!("{damage:?}"))
+                .collect();
+            assert!(
+                !damaged.is_empty(),
+                "native open accepted corrupt voter journal: {:?}",
+                opened.recovery
+            );
+            json!({"quarantined": damaged})
+        }
+    };
+    fs::remove_dir_all(probe).unwrap();
+    outcome
 }
 
 fn check_replication(data: &ManagedData, pending: &Pending) -> Value {
