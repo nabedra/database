@@ -924,7 +924,7 @@ pub struct PreparedNative {
     lease: NativeLease,
 }
 impl PreparedNative {
-    pub(super) fn buffers(
+    pub(super) async fn buffers(
         &self,
         budget: super::TransactionBudget,
         output: ByteReservation,
@@ -942,8 +942,12 @@ impl PreparedNative {
             ExecutionClass::Control => &owner.apply_control,
         };
         // Reply capacity was acquired without a physical or CPU permit. Every
-        // active native slot now owns this bounded working maximum already.
-        let mut all = apply.reserve(working)?;
+        // active native slot owns this bounded working maximum, but a finished
+        // write hands its batch charge to the journal, which drops it only once
+        // the write is visible, after this slot was released. Wait for it: a
+        // failed reservation here would fail a committed Raft apply, which is
+        // fatal to the replica (T7b, D07).
+        let mut all = apply.reserve_wait(working).await?;
         let scratch = all.split(budget.scratch_bytes)?;
         let batch = all.split(budget.batch_bytes)?;
         Ok((scratch, batch, output))
@@ -1493,6 +1497,57 @@ fn capacity_context(context: String) -> ProtocolError {
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    /// T7b (D07, T5 concern 4, T6 concern 1): a write's batch charge
+    /// outlives its native slot (the journal drops it once the write is
+    /// visible). The next apply on that slot, for another group, used to fail
+    /// at once with "byte arena insufficient bytes", which openraft treats as
+    /// a fatal apply error: the replica's Raft core stopped and its group lost
+    /// a voter. It now waits for the charge and then proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn o06_d07_t7b_an_apply_waits_for_the_previous_writes_batch_charge() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let budget = super::super::TransactionBudget {
+            scratch_bytes: (32 << 20) + (128 << 10),
+            batch_bytes: (32 << 20) + (128 << 10),
+            output_bytes: 0,
+        };
+        let first = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let (scratch, batch, _) = first.buffers(budget, output).await.unwrap();
+        // The write is submitted: its slot and scratch go, its batch charge
+        // stays with the journal.
+        drop(scratch);
+        drop(first);
+        let second = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(second.buffers(budget, output));
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiting.as_mut().poll(cx).is_pending(),
+                "waits for the in-flight batch instead of failing"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // The journal makes the write visible and drops the charge.
+        drop(batch);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("granted once the batch charge drops");
+        assert!(granted.is_ok());
+    }
 
     #[test]
     fn o05_c02_m02_registered_group_capacity_precharges_and_recovers_each_lease() {

@@ -679,13 +679,15 @@ impl OltpPool {
             .reply_budget(ExecutionClass::Control, budget.output_bytes)
             .await?;
         let prepared = self.resources().prepare(ExecutionClass::Control).await?;
-        let (mut scratch, _batch, output) = prepared.buffers(
-            TransactionBudget {
-                batch_bytes: 0,
-                ..budget
-            },
-            output,
-        )?;
+        let (mut scratch, _batch, output) = prepared
+            .buffers(
+                TransactionBudget {
+                    batch_bytes: 0,
+                    ..budget
+                },
+                output,
+            )
+            .await?;
         let _vector = scratch.split(
             max_items
                 .checked_mul(
@@ -1056,7 +1058,7 @@ impl GroupStore {
             }
         };
         let prepared = self.resources().prepare(execution_class).await?;
-        let reservations = prepared.buffers(budget, output)?;
+        let reservations = prepared.buffers(budget, output).await?;
         let runtime = tokio::runtime::Handle::try_current().ok();
         // The executor builds the batch and submits it, or hands it to a paced
         // task; it never waits for storage. Either way the write is dispatched
@@ -1389,7 +1391,7 @@ impl GroupStore {
             }
         };
         let prepared = self.resources().prepare(execution_class).await?;
-        let (scratch, _batch, output) = prepared.buffers(budget, output)?;
+        let (scratch, _batch, output) = prepared.buffers(budget, output).await?;
         let group = self.clone();
         prepared
             .execute(0, 0, move || {
