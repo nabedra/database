@@ -659,7 +659,7 @@ impl Store {
         self.inner.journal().submit(batch, durability, on_done)
     }
 
-    /// Write pacing while L0 is at its slowdown trigger (RocksDB's delayed write rate):
+    /// Write pacing while L0 is at its slowdown trigger (a delayed write rate):
     /// charges `bytes` to the store's pacing budget and returns how long the caller
     /// should wait before submitting them. Zero when writes are not slowed. Only the
     /// writers that call this wait; the journal thread never sleeps for pacing, so other

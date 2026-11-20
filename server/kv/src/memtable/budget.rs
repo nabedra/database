@@ -1,5 +1,5 @@
-//! A worker-shared memtable byte budget, the replacement for RocksDB's
-//! `WriteBufferManager`.
+//! A worker-shared memtable byte budget, the replacement for the previous engine's
+//! write buffer manager.
 //!
 //! Every memtable charges its approximate memory here and releases it when dropped.
 //! Writers never fail for memory: the journal thread asks [`MemtableBudget::should_flush`]
@@ -21,8 +21,8 @@ pub struct MemtableBudget {
 }
 
 impl MemtableBudget {
-    /// A budget of `limit` bytes that asks for a flush at 7/8 of it, as RocksDB's
-    /// write buffer manager does for mutable memtables.
+    /// A budget of `limit` bytes that asks for a flush at 7/8 of it, as a write
+    /// buffer manager does for mutable memtables.
     pub fn new(limit: usize) -> MemtableBudget {
         MemtableBudget::with_flush_threshold(limit, limit - limit / 8)
     }

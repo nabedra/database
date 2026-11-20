@@ -27,7 +27,7 @@ use crate::types::{Kind, MAX_SEQ, Seq, parse_internal_key, user_key};
 /// Levels L0 to L6.
 pub const NUM_LEVELS: usize = 7;
 
-/// Leveled compaction knobs (plan Decisions: today's RocksDB settings).
+/// Leveled compaction knobs (plan Decisions: the previous engine's settings).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LevelOptions {
     /// L0 runs that trigger an L0 compaction.
@@ -159,7 +159,7 @@ pub(crate) struct RunFile {
     pub hi: Bytes,
     pub hi_exclusive: bool,
     /// An L0 run is kept open for its whole life at L0 (index, filter and tombstones
-    /// resident), like RocksDB's `pin_l0_filter_and_index_blocks_in_cache`.
+    /// resident), as if its filter and index blocks were pinned in the cache.
     pinned: OnceLock<Arc<Run>>,
     handle: Arc<RunHandle>,
 }

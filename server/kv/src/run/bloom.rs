@@ -7,7 +7,7 @@
 //! One 64-bit hash per key: its low half picks a 64-byte line (`fastrange`), its high
 //! half drives the probes inside that line (multiply by the golden ratio, take the top
 //! 9 bits), so a lookup touches one CPU cache line however large the filter is. This is
-//! the layout of RocksDB's `FastLocalBloom`. At 10 bits per key and 6 probes the false
+//! the cache-local blocked bloom layout common to LSM engines. At 10 bits per key and 6 probes the false
 //! positive rate is about 1%.
 
 use crate::cache::fmix64;
