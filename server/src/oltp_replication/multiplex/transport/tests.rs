@@ -866,3 +866,61 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
         cap
     );
 }
+
+/// NS11 finding 8: local lane-full refusals are counted per class for
+/// `/v1/runtime/stats`; a waiting Authority probe that later succeeds is not.
+#[tokio::test]
+async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("refusals-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 1);
+    let local = WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(local.clone());
+    let config = TransportConfig::default();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport =
+        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
+    let client = transport.client();
+    let empty = serde_json::json!({
+        "outgoing_lane_full": {"total": 0, "by_class": {}},
+        "handler_lane_full": {"total": 0, "by_class": {}},
+    });
+    assert_eq!(client.lane_refusals(), empty);
+    let class = TrafficClass::ApiObservation;
+    let target = Uuid::new_v4();
+    let held: Vec<_> = (0..config.handler_slots[class as usize])
+        .map(|_| client.try_outgoing(target, class).unwrap())
+        .collect();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.try_outgoing(target, class),
+            Err(RequestError::OutgoingLaneFull)
+        ));
+    }
+    // A probe that waits for its slot is not a refusal.
+    assert!(client.try_outgoing_slot(target, class).is_err());
+    let refusals = client.lane_refusals();
+    assert_eq!(refusals["outgoing_lane_full"]["total"], 2);
+    assert_eq!(
+        refusals["outgoing_lane_full"]["by_class"]["ApiObservation"],
+        2
+    );
+    assert_eq!(refusals["handler_lane_full"]["total"], 0);
+    drop(held);
+    assert!(client.try_outgoing(target, class).is_ok());
+    assert_eq!(client.lane_refusals()["outgoing_lane_full"]["total"], 2);
+}

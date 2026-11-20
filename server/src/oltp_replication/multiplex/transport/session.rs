@@ -1452,7 +1452,10 @@ async fn run_stream(
         let handler = common.handlers[class as usize]
             .clone()
             .try_acquire_owned()
-            .map_err(|_| overloaded("worker handler lane full"))?;
+            .map_err(|_| {
+                common.refusals.handler(class);
+                overloaded("worker handler lane full")
+            })?;
         trace.phase = RaftTransportPhase::ReadSections;
         if plan.section_lengths != lengths {
             return Err(malformed("worker section length differs from preflight"));

@@ -1890,6 +1890,8 @@ impl HttpRuntime for WorkerRuntime {
                         "history_settling":switch.history_settling(),
                     })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                    // Local lane refusals (NS11 finding 8).
+                    "transport":self.services.manager.client().lane_refusals(),
                     // RV-APPLY: transient retries and stopped cores.
                     "raft":self.services.manager.raft_health(),
                 }))

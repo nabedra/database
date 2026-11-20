@@ -481,9 +481,30 @@ impl HttpRuntime for RemoteRuntime {
     fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
         Box::pin(async move {
             let body = self.client.stats().await?;
+            let _scratch = self.shared.reserve_scratch(
+                ByteClass::Progress,
+                crate::oltp::mvcc::json_decode_budget(body.as_ref())?,
+            )?;
+            let mut stats: serde_json::Value =
+                serde_json::from_slice(body.as_ref()).map_err(|_| unavailable())?;
+            let worker = stats.as_object_mut().ok_or_else(unavailable)?;
+            // The owner worker reports its own gateway and transport. The
+            // gateway that served this endpoint's requests is the API's (NS11
+            // finding 8): report it and the API's lane refusals in their
+            // place, and keep the worker's under `owner`.
+            let owner = serde_json::json!({
+                "direct_gateway": worker.remove("direct_gateway"),
+                "transport": worker.remove("transport"),
+            });
+            worker.insert(
+                "direct_gateway".into(),
+                serde_json::to_value(self.gateway.stats()).map_err(|_| unavailable())?,
+            );
+            worker.insert("transport".into(), self.client.lane_refusals());
+            worker.insert("owner".into(), owner);
             Ok(EncodedResponse {
                 status: 200,
-                body: body.as_ref().to_vec(),
+                body: serde_json::to_vec(&stats).map_err(|_| unavailable())?,
             })
         })
     }

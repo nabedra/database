@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -562,6 +562,8 @@ struct Common {
     sessions: PeerSessions,
     session_slots: [Arc<Semaphore>; CLASSES],
     pending_sessions: Arc<Semaphore>,
+    /// Local lane refusals, reported in `/v1/runtime/stats` (NS11 finding 8).
+    refusals: LaneRefusals,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
     /// Tests close a whole class with `hold_outgoing_for_test`.
@@ -573,6 +575,39 @@ struct Common {
     /// Replies a receiver skipped because the caller cancelled the stream.
     #[cfg(test)]
     cancelled_replies: std::sync::atomic::AtomicU64,
+}
+/// Requests this worker refused locally because a lane was full: `outgoing`
+/// before sending (caller slots), `handler` on receipt (handler slots).
+#[derive(Default)]
+struct LaneRefusals {
+    outgoing: [AtomicU64; CLASSES],
+    handler: [AtomicU64; CLASSES],
+}
+impl LaneRefusals {
+    fn outgoing(&self, class: TrafficClass) {
+        self.outgoing[class as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    fn handler(&self, class: TrafficClass) {
+        self.handler[class as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> serde_json::Value {
+        let side = |counters: &[AtomicU64; CLASSES]| {
+            let mut total = 0;
+            let mut by_class = serde_json::Map::new();
+            for class in TrafficClass::ALL {
+                let count = counters[class as usize].load(Ordering::Relaxed);
+                if count != 0 {
+                    total += count;
+                    by_class.insert(format!("{class:?}"), count.into());
+                }
+            }
+            serde_json::json!({"total": total, "by_class": by_class})
+        };
+        serde_json::json!({
+            "outgoing_lane_full": side(&self.outgoing),
+            "handler_lane_full": side(&self.handler),
+        })
+    }
 }
 pub struct WorkerTransport {
     common: Arc<Common>,
@@ -751,6 +786,7 @@ impl WorkerTransport {
                     Arc::new(Semaphore::new(config.session_slots[i]))
                 }),
                 pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
+                refusals: LaneRefusals::default(),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
                 #[cfg(test)]
@@ -910,7 +946,10 @@ impl WorkerTransport {
             let handler = self.common.handlers[class as usize]
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| overloaded("worker handler lane full"))?;
+                .map_err(|_| {
+                    self.common.refusals.handler(class);
+                    overloaded("worker handler lane full")
+                })?;
             trace.phase = RaftTransportPhase::ReadSections;
             let sections = read_sections(&mut stream, &self.common, class, plan).await?;
             drop(preflight);
@@ -1070,9 +1109,18 @@ impl WorkerClient {
         let deadline = Instant::now()
             .checked_add(self.common.config.deadline)
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
-        let _slots = self.authority_slots(target, deadline).await?;
+        let refused = |error: RequestError| {
+            if matches!(error, RequestError::OutgoingLaneFull) {
+                self.common.refusals.outgoing(class);
+            }
+            error
+        };
+        let _slots = self
+            .authority_slots(target, deadline)
+            .await
+            .map_err(refused)?;
         if Instant::now() >= deadline {
-            return Err(RequestError::OutgoingLaneFull);
+            return Err(refused(RequestError::OutgoingLaneFull));
         }
         timeout_at(
             deadline,
@@ -1100,10 +1148,12 @@ impl WorkerClient {
         // Keep an existing slot available to ordinary Authority traffic.
         // A one-slot lane has no capacity to reserve and keeps immediate admission.
         if self.common.config.handler_slots[index] == 1 {
-            return self.try_outgoing(target, class).map(|slot| (None, slot));
+            return self
+                .try_outgoing_slot(target, class)
+                .map(|slot| (None, slot));
         }
         if let Ok(role) = roles.try_acquire()
-            && let Ok(slot) = self.try_outgoing(target, class)
+            && let Ok(slot) = self.try_outgoing_slot(target, class)
         {
             return Ok((Some(role), slot));
         }
@@ -1323,6 +1373,10 @@ impl WorkerClient {
             .supports(&peer, class, feature)
             .then(|| WorkerIdentity::from(&peer))
     }
+    /// Local lane refusals since start, for `/v1/runtime/stats`.
+    pub(crate) fn lane_refusals(&self) -> serde_json::Value {
+        self.common.refusals.snapshot()
+    }
     /// The largest request payload this caller sends on `class`.
     pub(crate) fn payload_limit(&self, class: TrafficClass) -> usize {
         self.common.config.payload_bytes[class as usize]
@@ -1331,6 +1385,16 @@ impl WorkerClient {
     /// One caller slot on the lane to `target` for `class`, or a local
     /// `OutgoingLaneFull` refusal before anything is written.
     fn try_outgoing(
+        &self,
+        target: Uuid,
+        class: TrafficClass,
+    ) -> Result<OutgoingSlot, RequestError> {
+        self.try_outgoing_slot(target, class).inspect_err(|_| {
+            self.common.refusals.outgoing(class);
+        })
+    }
+    /// `try_outgoing` for a caller that waits instead when the lane is full.
+    fn try_outgoing_slot(
         &self,
         target: Uuid,
         class: TrafficClass,

@@ -594,6 +594,10 @@ impl ApplicationClient {
             body: reply.sections[1].clone(),
         })
     }
+    /// This process's local lane refusals.
+    pub(crate) fn lane_refusals(&self) -> serde_json::Value {
+        self.transport.lane_refusals()
+    }
     pub(crate) async fn stats(&self) -> Result<ChargedBytes, ProtocolError> {
         let reply = self.call(Method::Stats, None).await?;
         reply.sections[0].as_ref().cloned().ok_or_else(invalid)

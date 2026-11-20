@@ -322,6 +322,27 @@ def leader_of(cluster, request):
     return leaders[0]
 
 
+def api_gateway_stats(cluster, token, ca):
+    """NS11 finding 8: an API's /v1/runtime/stats reports the API's own gateway and lane
+    refusals (they read 0 before: the endpoint relayed the owner worker's), the worker's under
+    `owner`."""
+    observed = {}
+    for name, routed in (('api1', True), ('api2', False)):
+        status, stats = call(cluster.api_urls[name], '/v1/runtime/stats', token=token, ca=ca)
+        assert status == 200, (name, status, stats)
+        gateway, transport = stats.get('direct_gateway'), stats.get('transport')
+        assert gateway is not None and transport is not None, (name, sorted(stats))
+        assert set(stats.get('owner') or {}) == {'direct_gateway', 'transport'}, (name, stats.get('owner'))
+        for side in ('outgoing_lane_full', 'handler_lane_full'):
+            assert isinstance(transport[side]['total'], int), (name, transport)
+        if routed:
+            assert gateway['direct_done'] > 0 and gateway['requests'] >= gateway['direct_done'], (name, gateway)
+        else:
+            assert gateway['direct_done'] == 0, (name, gateway)
+        observed[name] = dict(direct_gateway=gateway, transport=transport)
+    return observed
+
+
 def insert_body(table_id, key, value, request_id=None, operation_name='table.insert'):
     return operation(operation_name, {'table_id': table_id, 'row': {'id': key, 'value': value}}, request_id)
 
@@ -344,6 +365,7 @@ def suite_cluster(args, output, rf1_reference):
         gateways = {'api1': (api_on, True), 'api2': (api_off, False),
                     owner: (cluster.urls[owner], cluster.direct[owner])}
         reference, sections = d01_programs('rf3', gateways, token, ca, cluster.all_stats, create)
+        api_stats = api_gateway_stats(cluster, token, ca)
         # Direct point operations through a non-owner worker gateway need no owner.
         db_owner = Database(url=api_on, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
         probe = db_owner.create_table('d01_non_owner', {'id': int, 'value': int}, key='id')
@@ -362,7 +384,7 @@ def suite_cluster(args, output, rf1_reference):
             non_owner[name] = dict(direct_oltp=cluster.direct[name], insert=inserted[0], get=got[0],
                                    queued_table_list=listed[0], queued_error=(listed[1].get('error') or {}).get('code'))
         report('D01-RF3', topology='3 registered workers + 2 API gateways, mTLS', capability=capability, queue_owner=owner,
-               non_owner_worker_gateways=non_owner,
+               non_owner_worker_gateways=non_owner, api_stats=api_stats,
                gateways={name: dict(url=url, direct_oltp=routed) for name, (url, routed) in gateways.items()},
                orms=['python', 'typescript'], steps=len(reference), direct_sections=sections)
         if rf1_reference is not None:
