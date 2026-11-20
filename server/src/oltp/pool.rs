@@ -229,6 +229,12 @@ impl OltpPool {
             tune(options);
         })
     }
+    /// Test-only: the pool's store, for engine stats and blocking maintenance
+    /// (`flush`, `compact`, `gc_journal`; call those off the async runtime).
+    #[cfg(test)]
+    pub(crate) fn kv_store(&self) -> &Store {
+        &self.inner.store
+    }
     fn open_path(
         path: &Path,
         identity: PoolIdentity,
@@ -1852,6 +1858,19 @@ impl<'a> GroupTransaction<'a> {
         self.preflight(self.read.prefix.len() + key.len(), value.len())?;
         let key = self.read.key(key)?;
         self.batch.put(key, value);
+        Ok(())
+    }
+    /// Like [`Self::put`], but `value` is stored once, in the journal record, and the
+    /// LSM holds only a 32-byte locator (plan section 2, "Journal values"). For large
+    /// values deleted soon after they are written: Raft log entries. Reads resolve the
+    /// locator transparently.
+    pub fn put_journal(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
+        if key.len() > MAX_KEY_BYTES {
+            return Err(capacity());
+        }
+        self.preflight(self.read.prefix.len() + key.len(), value.len())?;
+        let key = self.read.key(key)?;
+        self.batch.put_journal(key, value);
         Ok(())
     }
     pub fn delete(&mut self, key: &[u8]) -> Result<(), ProtocolError> {
