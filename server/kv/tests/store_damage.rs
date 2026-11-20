@@ -198,6 +198,93 @@ fn ns07_g1_group_record_damage_quarantines_only_that_group() {
     );
 }
 
+/// NS07 / R6 (RV-NS6 F2): `Opened::quarantined_now` names only the scopes this open
+/// quarantined. Damage persisted by an earlier open stays in `quarantined` but is not
+/// counted again, so two isolated damages found at different opens never add up.
+#[test]
+fn ns07_r6_quarantined_now_names_only_this_opens_damage() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2);
+    let store = open(&dir, options(&fs, &bg));
+    let sync = Durability::Sync;
+    write_kv(
+        &store,
+        &group_prefix(1),
+        &group_key(1, 1),
+        &val("g1-a"),
+        false,
+        sync,
+    );
+    write_kv(
+        &store,
+        &group_prefix(3),
+        &group_key(3, 1),
+        &val("g3-a"),
+        false,
+        sync,
+    );
+    let image = fs.kill();
+    drop(store);
+    let (seg, off) = find_one(&image, &dir.join("journal"), b"<<g1-a>>");
+    image.flip_bit(&seg, off + 20, 3).unwrap();
+
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    let scopes = |list: &[Damage]| {
+        let mut scopes: Vec<Vec<u8>> = list.iter().map(|d| d.scope.to_vec()).collect();
+        scopes.sort();
+        scopes
+    };
+    assert_eq!(scopes(&opened.quarantined), vec![group_prefix(1)]);
+    assert_eq!(scopes(&opened.quarantined_now), vec![group_prefix(1)]);
+    let s = opened.store;
+    write_kv(
+        &s,
+        &group_prefix(2),
+        &group_key(2, 1),
+        &val("g2-a"),
+        false,
+        sync,
+    );
+    write_kv(
+        &s,
+        &group_prefix(3),
+        &group_key(3, 2),
+        &val("g3-b"),
+        false,
+        sync,
+    );
+    s.close().unwrap();
+    let image = image.kill();
+    let (seg, off) = find_one(&image, &dir.join("journal"), b"<<g2-a>>");
+    image.flip_bit(&seg, off + 20, 3).unwrap();
+
+    // The second open finds g01's record damaged again and g02's for the first time.
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    assert_eq!(
+        scopes(&opened.quarantined),
+        vec![group_prefix(1), group_prefix(2)]
+    );
+    assert_eq!(scopes(&opened.quarantined_now), vec![group_prefix(2)]);
+    assert_eq!(
+        opened
+            .store
+            .snapshot()
+            .get(&group_key(3, 2))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        val("g3-b")
+    );
+    opened.store.close().unwrap();
+    let opened = Store::open(&dir, options(&image.kill(), &bg)).unwrap();
+    assert_eq!(opened.quarantined.len(), 2);
+    assert!(
+        opened.quarantined_now.is_empty(),
+        "{:?}",
+        opened.quarantined_now
+    );
+}
+
 /// NS07 R1: damage to a durable store-wide record refuses the store, and stays refused.
 #[test]
 fn ns07_r1_store_wide_record_damage_refuses() {
@@ -304,6 +391,12 @@ fn ns07_g2_run_block_damage_quarantines_on_read() {
     assert_eq!(
         opened.quarantined[0].scope.as_ref(),
         group_prefix(1).as_slice()
+    );
+    // RV-NS6 F2: persisted at run time, so not quarantined by this open.
+    assert!(
+        opened.quarantined_now.is_empty(),
+        "{:?}",
+        opened.quarantined_now
     );
 }
 
