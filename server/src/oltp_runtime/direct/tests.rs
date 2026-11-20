@@ -507,16 +507,11 @@ impl Cluster {
             other => panic!("unexpected read {other:?}"),
         }
     }
-    /// Waits until every running voter applied at least the leader's index.
+    /// Waits until every running voter applied the leader's whole log. The
+    /// leader's log index covers every entry a returned proposal wrote; its
+    /// applied metric can lag the apply that answered the proposal.
     async fn converge(&self, leader: usize) {
-        let target = self.voters[leader]
-            .consensus
-            .raft
-            .metrics()
-            .borrow_watched()
-            .last_applied
-            .map(|id| id.index)
-            .unwrap_or(0);
+        let target = self.last_index(leader);
         for voter in self.voters.iter().filter(|v| v.running) {
             watchdog(|| async {
                 let applied = voter
@@ -1319,9 +1314,11 @@ async fn d03_expiry_deletes_old_dedup_records_on_every_replica() {
     );
     let deleted = cluster.voters[leader].executor.expire_served().await;
     assert_eq!(deleted, 3);
-    cluster.converge(leader).await;
+    assert_eq!(cluster.keys_with(leader, b'D').await, 1, "leader");
+    // Followers apply the same entries; wait for replication, not metrics.
     for voter in 0..3 {
-        assert_eq!(cluster.keys_with(voter, b'D').await, 1, "voter {voter}");
+        let cluster = &cluster;
+        watchdog(|| async { (cluster.keys_with(voter, b'D').await == 1).then_some(()) }).await;
     }
     assert_eq!(cluster.voters[leader].executor.stats().expired_records, 3);
     cluster.shutdown().await;
