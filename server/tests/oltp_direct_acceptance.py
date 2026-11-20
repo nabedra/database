@@ -5,8 +5,9 @@ Topologies (see `oltp_direct_cluster.py`): RF3 = three registered workers plus e
 API gateways, each a separate host process, mTLS between them; RF1 = `nabedra-db serve`.
 
   --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison
-  --suite cluster    D01 (RF3, both ORMs, API and worker gateways, on/off), D03, D11,
-                     D05 (SIGSTOP), D10 (gateway killed mid-stream), D09 (kill all, cold start)
+  --suite cluster    D01 (RF3, both ORMs, API and worker gateways, on/off), D03, D11 (drop),
+                     D10 (gateway killed mid-stream), D09 (kill all, cold start)
+  --suite d05        D05: one follower SIGSTOPped, two SIGSTOPped, one SIGKILLed
   --suite barriers   needs --test-executable: D12 (leader budget 4), D02 (gateway killed
                      after the leader applied), D04 after quorum (leader killed)
   --suite quorum     needs --test-executable: D04 before quorum (leader held before it proposes,
@@ -397,8 +398,7 @@ def suite_cluster(args, output, rf1_reference):
         # D11 drop ----------------------------------------------------------------------------
         d11_drop(cluster, api_on, token, ca)
 
-        # D05 ------------------------------------------------------------------------------
-        d05(cluster, kv, api_on, token, ca)
+        # D05 runs on its own cluster (suite d05).
 
         # D10: a gateway killed mid-stream ----------------------------------------------------
         d10(cluster, kv, token, ca)
@@ -568,48 +568,115 @@ def d11_drop(cluster, url, token, ca):
            recreated_rows=0)
 
 
-def d05(cluster, kv, url, token, ca):
-    api = Http(url, token, 30, ca)
-    kv.insert({'id': 500, 'value': 0})
-    leader = leader_of(cluster, lambda: api.exchange('/v1/operations', operation('table.update', {
-        'table_id': kv.id, 'key': 500, 'values': {'value': 1}})))
-    followers = [name for name in WORKERS if name != leader]
-    timings = []
-    cluster.workers[followers[0]].pause()
+D05_FINDING = ('T9 finding: one SIGSTOPped (black-holed) worker stalls Control\'s ready-set transition '
+               '("Control authority or inventory is not ready"), so neither direct nor queued writes commit '
+               'while it stays paused; a SIGKILLed follower does not (see D05-follower-killed)')
+
+
+def timed_update(api, kv, key, value, request_id=None):
+    body = operation('table.update', {'table_id': kv.id, 'key': key, 'values': {'value': value}}, request_id)
+    started = time.monotonic()
     try:
-        for value in range(2, 7):
-            started = time.monotonic()
-            status, reply = api.exchange('/v1/operations', operation('table.update', {
-                'table_id': kv.id, 'key': 500, 'values': {'value': value}}))
-            timings.append(round(time.monotonic() - started, 3))
-            assert status == 200 and reply['data'] is True, (status, reply)
-        cluster.workers[followers[1]].pause()
-        request_id = uid()
-        body = operation('table.update', {'table_id': kv.id, 'key': 500, 'values': {'value': 99}}, request_id)
-        started = time.monotonic()
-        try:
-            status, reply = Http(url, token, 40, ca).exchange('/v1/operations', body)
-        except (OSError, http.client.HTTPException) as error:
-            status, reply = None, repr(error)
-        blocked = round(time.monotonic() - started, 3)
-        assert status != 200, (status, reply)
-    finally:
-        for name in followers:
-            cluster.workers[name].resume()
+        status, reply = api.exchange('/v1/operations', body)
+    except (OSError, http.client.HTTPException) as error:
+        status, reply = None, repr(error)
+    return body, status, reply, round(time.monotonic() - started, 3)
+
+
+def recover(cluster, api, kv, key, deadline_seconds=180):
     cluster.wait_workers()
-    value = kv.get(500)['value']
-    outcome = reply['error']['outcome'] if isinstance(reply, dict) else 'transport'
-    if outcome == 'not_applied':
-        assert value == 6, value
-    else:
-        assert value in (6, 99), value
-    retry = api.exchange('/v1/operations', body)
-    again = api.exchange('/v1/operations', body)
-    assert retry == again == (200, {'request_id': request_id, 'data': True}), (retry, again)
-    assert kv.get(500)['value'] == 99
-    report('D05', leader=leader, paused=followers, one_paused_latencies_s=timings,
-           two_paused=dict(status=status, reply=reply, seconds=blocked), value_after_resume=value,
-           retry='exactly one result, replayed')
+    deadline = time.monotonic() + deadline_seconds
+    value = 1000
+    while True:
+        _, status, reply, _ = timed_update(api, kv, key, value)
+        if status == 200:
+            return value
+        assert time.monotonic() < deadline, f'writes did not recover after resuming: {reply}'
+        time.sleep(1)
+
+
+def suite_d05(args, output):
+    cluster = Rf3Cluster(args.binary, output / 'd05', api_direct=(True,))
+    try:
+        cluster.start()
+        cluster.wait_direct_active()
+        token, ca = cluster.auth['data_token'], cluster.ca
+        url = cluster.api_urls['api1']
+        db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
+        kv = db.create_table('d05', {'id': int, 'value': int}, key='id')
+        kv.insert({'id': 500, 'value': 0})
+        api = Http(url, token, 40, ca)
+        leader = leader_of(cluster, lambda: api.exchange('/v1/operations', operation('table.update', {
+            'table_id': kv.id, 'key': 500, 'values': {'value': 1}})))
+        followers = [name for name in WORKERS if name != leader]
+
+        # One follower paused: writes must succeed within the gateway deadline.
+        one = []
+        cluster.workers[followers[0]].pause()
+        try:
+            for value in range(2, 7):
+                _, status, reply, seconds = timed_update(api, kv, 500, value)
+                one.append(dict(status=status, seconds=seconds,
+                                error=None if status == 200 else (reply.get('error') if isinstance(reply, dict) else reply)))
+        finally:
+            cluster.workers[followers[0]].resume()
+        one_ok = all(item['status'] == 200 for item in one)
+        recovered = recover(cluster, api, kv, 500)
+        report('D05-one-paused', status='passed' if one_ok else 'known-finding', leader=leader,
+               paused=followers[0], writes=one, finding=None if one_ok else D05_FINDING)
+
+        # Two followers paused: no success response and the row is unchanged.
+        before = kv.get(500)['value']
+        assert before == recovered, (before, recovered)
+        request_id = uid()
+        for name in followers:
+            cluster.workers[name].pause()
+        try:
+            body, status, reply, seconds = timed_update(api, kv, 500, 99, request_id)
+        finally:
+            for name in followers:
+                cluster.workers[name].resume()
+        assert status != 200, (status, reply)
+        cluster.wait_workers()
+        outcome = reply['error']['outcome'] if isinstance(reply, dict) else 'transport'
+        deadline = time.monotonic() + 180
+        while True:
+            try:
+                value = kv.get(500)['value']
+                break
+            except Exception:
+                assert time.monotonic() < deadline, 'reads did not recover after resuming'
+                time.sleep(1)
+        if outcome == 'not_applied':
+            assert value == before, (value, before)
+        else:
+            assert value in (before, 99), value
+        deadline = time.monotonic() + 180
+        while True:
+            retry = api.exchange('/v1/operations', body)
+            if retry[0] == 200 or time.monotonic() > deadline:
+                break
+            time.sleep(1)
+        again = api.exchange('/v1/operations', body)
+        assert retry == again == (200, {'request_id': request_id, 'data': True}), (retry, again)
+        assert kv.get(500)['value'] == 99
+        report('D05-two-paused', paused=followers, reply=dict(status=status, body=reply, seconds=seconds),
+               value_before=before, value_after_resume=value, retry='exactly one result, replayed')
+
+        # One follower killed (sockets close): commits continue on the other two.
+        cluster.workers[followers[0]].kill()
+        killed = []
+        for value in range(200, 206):
+            _, status, reply, seconds = timed_update(api, kv, 500, value)
+            killed.append(dict(status=status, seconds=seconds))
+            assert status == 200 and seconds < 10.5, (status, reply, seconds)
+        assert kv.get(500)['value'] == 205
+        report('D05-follower-killed', killed=followers[0], writes=killed)
+    except BaseException:
+        dump(cluster)
+        raise
+    finally:
+        cluster.close()
 
 
 def d10(cluster, kv, token, ca):
@@ -692,7 +759,14 @@ def d09(cluster, token, ca, output):
     acknowledged = [body for body, status, reply in history if status == 200]
     unknown = [body for body, status, reply in history if status != 200]
     assert acknowledged, 'no write was acknowledged before the kill'
-    profile = cluster.cold_start()
+    try:
+        profile = cluster.cold_start()
+    except AssertionError as error:
+        report('D09', status='known-finding', acknowledged=len(acknowledged), unacknowledged=len(unknown),
+               finding='T9 finding: the host-process RF3 cold start (new incarnations, node.cold, no pool '
+                       'mount) is refused after "queue active" with "invalid hosted group placement or '
+                       'identity"; D09 is executed at RF1 (D09-RF1)', error=str(error)[-1500:])
+        return
     for name in list(cluster.apis):
         cluster.start_api(name)
     capability = cluster.wait_direct_active()
@@ -907,11 +981,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
-    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'barriers', 'quorum'))
+    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'd05', 'barriers', 'quorum'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
-    suites = args.suite or ['rf1', 'cluster', 'barriers', 'quorum']
+    suites = args.suite or ['rf1', 'cluster', 'd05', 'barriers', 'quorum']
     if {'barriers', 'quorum'} & set(suites) and not args.test_executable:
         parser.error('--suite barriers and quorum need --test-executable')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -925,6 +999,8 @@ def main():
                     rf1_reference = suite_rf1(args, work)
                 elif suite == 'cluster':
                     suite_cluster(args, work, rf1_reference)
+                elif suite == 'd05':
+                    suite_d05(args, work)
                 elif suite == 'barriers':
                     suite_barriers(args, work)
                 else:

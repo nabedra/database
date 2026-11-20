@@ -539,19 +539,20 @@ jobs:
           set -o pipefail
           python server/tests/oltp_direct_acceptance.py --binary "$NABEDRA_BIN" --test-executable "$NABEDRA_TEST_EXE" \
             --output artifacts/direct 2>&1 | tee artifacts/direct.log
-      - name: ORM suites, direct_oltp on
+      - name: ORM suites, direct_oltp on and off
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           set -o pipefail
-          (cd orm/typescript && NABEDRA_TEST_SERVER_BINARY="$NABEDRA_BIN" npm test) 2>&1 | tee artifacts/orm-typescript-on.log
-          (cd orm/python && PYTHONPATH=src python -m unittest discover -s tests) 2>&1 | tee artifacts/orm-python-unit.log
-          python server/tests/oltp_process.py --binary "$NABEDRA_BIN" 2>&1 | tee artifacts/orm-python-process-on.log
-      - name: ORM suites, direct_oltp off
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          set -o pipefail
-          (cd orm/typescript && NABEDRA_TEST_SERVER_BINARY="$GITHUB_WORKSPACE/server/tests/direct_off_server.sh" npm test) 2>&1 | tee artifacts/orm-typescript-off.log
-          python server/tests/oltp_process.py --binary "$GITHUB_WORKSPACE/server/tests/direct_off_server.sh" 2>&1 | tee artifacts/orm-python-process-off.log
+          python -m pip install --quiet "httpx>=0.27,<1"
+          status=0
+          (cd orm/python && PYTHONPATH=src python -m unittest discover -s tests) 2>&1 | tee artifacts/orm-python-unit.log || status=1
+          off="$GITHUB_WORKSPACE/server/tests/direct_off_server.sh"
+          for mode in on off; do
+            binary="$NABEDRA_BIN"; [ "$mode" = off ] && binary="$off"
+            (cd orm/typescript && NABEDRA_TEST_SERVER_BINARY="$binary" npm test) 2>&1 | tee "artifacts/orm-typescript-$mode.log" || status=1
+            python server/tests/oltp_process.py --binary "$binary" 2>&1 | tee "artifacts/orm-python-process-$mode.log" || status=1
+          done
+          exit $status
       - name: OLTP library suite, direct_oltp off
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
