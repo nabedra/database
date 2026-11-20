@@ -225,6 +225,7 @@ async fn give_up<C, M>(
     crate::oltp_replication::hosted::transient::RaftHealthStats::bump(&stats.given_up);
     tracing::error!(group=%identity.group_id, node,
         "giving up a replica whose Raft core keeps stopping; it stops routing and is reported for replacement");
+    let pool = running.state.store().pool().clone();
     let Some(route) = retire(routes, identity, node, running).await else {
         return;
     };
@@ -232,6 +233,6 @@ async fn give_up<C, M>(
         .upgrade()
         .and_then(|sink| sink.lock().ok().and_then(|sink| sink.clone()));
     if let Some(sink) = sink {
-        sink.gave_up(identity.clone(), route.member);
+        sink.gave_up(identity.clone(), route.member, pool);
     }
 }

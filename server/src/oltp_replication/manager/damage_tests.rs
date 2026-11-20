@@ -746,6 +746,108 @@ async fn o06_d07_rv_apply_fatal_core_is_detected_and_recovered() {
     .unwrap();
 }
 
+/// Records the replicas the supervisor gave up, with the pool it passed.
+#[derive(Default)]
+struct GaveUpSink(std::sync::Mutex<Vec<(GroupIdentity, ReplicaMember, OltpPool)>>);
+impl DamageSink for GaveUpSink {
+    fn damaged(&self, _: GroupIdentity, _: ReplicaMember, _: OltpPool) {}
+    fn gave_up(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool) {
+        self.0.lock().unwrap().push((group, replica, pool));
+    }
+}
+
+/// RV-FINAL M4, RV-APPLY F4, O06, O17, NS14b (RF3, real workers): a
+/// follower's core keeps stopping (a test hook fails every apply), so the
+/// supervisor gives it up. The report carries the replica's open pool (it
+/// used to carry none, so nothing was ever released). The group is not
+/// quarantined; once the change replacing the replica commits, the release
+/// deletes its bytes, counts it and the given-up identity never reopens.
+/// Before the fix the release answered `AlreadyReleased` and kept them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_o17_rv_final_m4_given_up_replica_bytes_are_released_after_replacement() {
+    timeout(Duration::from_secs(180), async {
+        let mut cluster = Cluster::new(4, 3).await;
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        let follower = (0..3).find(|index| *index != leader).unwrap();
+        cluster.fence(leader, 1).await;
+        let sink = Arc::new(GaveUpSink::default());
+        let manager = cluster.workers[follower].manager.clone().unwrap();
+        manager.install_damage_sink(sink.clone());
+        let pool = cluster.workers[follower].pool.clone().unwrap();
+        cluster
+            .host(follower)
+            .retry()
+            .fail_applies
+            .store(u32::MAX, std::sync::atomic::Ordering::Release);
+        cluster.fence(leader, 2).await;
+        // Restart backoffs of 1 + 2 + 4 s, then the give-up.
+        timeout(Duration::from_secs(60), async {
+            while sink.0.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the supervisor gives the replica up");
+        let health = manager.raft_health();
+        assert_eq!(health.given_up, 1, "{health:?}");
+        {
+            let reported = sink.0.lock().unwrap();
+            let (group, replica, reported_pool) = &reported[0];
+            assert_eq!(group, &cluster.group);
+            assert_eq!(replica, &cluster.member(follower));
+            assert_eq!(reported_pool.identity(), pool.identity());
+        }
+        sink.0.lock().unwrap().clear();
+        assert!(manager.hosted_replicas(cluster.group.group_id).is_empty());
+        assert!(!pool.is_group_quarantined(cluster.group.group_id));
+        cluster.workers[follower].host = None;
+
+        // Control's replacement (NS14b): the leader replaces the identity.
+        let fresh = cluster.member(3);
+        let replaced = timeout(
+            Duration::from_secs(60),
+            cluster
+                .host(leader)
+                .replace_damaged_voter(&cluster.member(follower), fresh.clone()),
+        )
+        .await
+        .expect("replacement finished")
+        .unwrap();
+        assert_eq!(replaced.proof.removed, cluster.member(follower));
+
+        let before = pool.damage_releases();
+        let outcome = timeout(Duration::from_secs(30), async {
+            loop {
+                match pool.release_damaged_group(replaced.removed.clone()).await {
+                    // The retired host's last handles are still dropping.
+                    Err(error) if error.code == crate::protocol::ErrorCode::Conflict => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        })
+        .await
+        .expect("the given-up group's handles close");
+        assert_eq!(outcome, ReleaseOutcome::Released);
+        assert_eq!(pool.damage_releases(), before + 1);
+        // Its bytes are gone: the given-up identity never reopens.
+        assert!(pool.retained_group(cluster.group.clone()).await.is_err());
+        // Idempotent.
+        assert_eq!(
+            pool.release_damaged_group(replaced.removed.clone())
+                .await
+                .unwrap(),
+            ReleaseOutcome::AlreadyReleased
+        );
+        drop(pool);
+        drop(manager);
+        cluster.shutdown().await;
+    })
+    .await
+    .expect("M4 watchdog");
+}
+
 /// RV-APPLY F4, O29, NS09 (RF3, real workers): EIO on a follower's journal sync
 /// latches its pool and stops its core. The supervisor classifies it as
 /// recovery-required: the replica stops routing and its host shuts down, with
