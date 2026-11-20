@@ -1129,3 +1129,5 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
 /// T1b: real typed Raft voters over mTLS worker transports.
 #[path = "replicated_tests.rs"]
 mod replicated;
+
+mod kv_crash;
