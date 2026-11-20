@@ -707,6 +707,7 @@ impl LocalServices {
                     scope,
                     local,
                     replication_factor,
+                    direct_timestamps: None,
                     cold_history: Some(
                         super::super::worker_runtime::cold_history::Sources::Registered {
                             timestamps: timestamps.clone(),

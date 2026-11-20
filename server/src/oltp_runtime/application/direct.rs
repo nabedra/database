@@ -727,11 +727,24 @@ impl DirectGateway {
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {
-                    if error.outcome == Outcome::Unknown {
+                    if error.code == ErrorCode::OutcomeUnknown {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
                         return Err(error);
+                    }
+                    if error.outcome == Outcome::Unknown {
+                        // Not settled yet (a proposal failed in an election):
+                        // resend the same id and body; the dedup record
+                        // decides.
+                        *uncertain = true;
+                        GatewayStats::bump(&self.stats.resends);
+                        range.leader_hint.store(0, Ordering::Relaxed);
+                        rotation += 1;
+                        if !pause(deadline, &mut delay).await {
+                            return Err(deadline_error(true));
+                        }
+                        continue;
                     }
                     if error.code == ErrorCode::NotFound && !refreshed_unknown_table {
                         // `UnknownTable`: the table may have been recreated.

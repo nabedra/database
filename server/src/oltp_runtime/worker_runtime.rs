@@ -314,7 +314,7 @@ impl WorkerRuntime {
                 transport: runtime.services.manager.client(),
                 catalog: runtime.services.catalog.participant().identity().clone(),
                 timestamps: runtime.services.timestamps.identity().clone(),
-                local_timestamps: None,
+                local_timestamps: runtime.services.direct_timestamps.clone(),
             });
             direct.start();
             runtime.direct.set(direct).map_err(|_| unknown())?;
