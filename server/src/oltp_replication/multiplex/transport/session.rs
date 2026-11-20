@@ -1278,6 +1278,14 @@ pub(super) async fn serve(
         reader.abort();
         let _ = reader.await;
     }
+    // No request is read any more. Give the slots back before the writer
+    // closes the socket: a peer that sees the close and reconnects must find
+    // them free, not wait for this task to be scheduled again (D10/C07,
+    // CIfix1). A lane slot is kept while a stream still owes its reply.
+    lock(&state.pending).take();
+    if lock(&state.active).is_empty() {
+        lock(&state.lane).take();
+    }
     let _ = writer.await;
 }
 
