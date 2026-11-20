@@ -27,7 +27,7 @@ use crate::batch::{BatchOp, MAX_SCOPE_LEN, WriteBatch};
 use crate::error::{Damage, DamageReason, Error, Result};
 use crate::gc;
 use crate::journal::format::{RECORD_HEADER_LEN, RECORDS_START};
-use crate::journal::{Durability, Journal, RecordKind, VALUE_RECYCLED};
+use crate::journal::{Commit, Durability, Journal, RecordKind, VALUE_RECYCLED};
 use crate::source::InternalIterator;
 use crate::types::{Kind, Locator, Seq, parse_internal_key};
 use crate::version::SuperVersion;
@@ -56,6 +56,52 @@ pub(crate) struct GcState {
     /// were looked at. They are looked at again once the journal has written another
     /// quarter of its budget.
     pub dense: BTreeMap<u64, u64>,
+    /// Relocation commits not known to have succeeded, with the segments they clear. A
+    /// relocation the journal refused (`NoSpace` voids its sequences, which still become
+    /// visible) moved nothing, so its segments must not retire.
+    pub relocating: Vec<Relocation>,
+}
+
+pub(crate) struct Relocation {
+    commits: Vec<Commit>,
+    targets: Vec<u64>,
+}
+
+impl GcState {
+    /// Settles finished relocation commits: a failed one un-clears its segments (the next
+    /// pass scans them again). Returns the segments whose relocations are still running,
+    /// which must not retire yet.
+    pub fn settle_relocations(&mut self) -> Vec<u64> {
+        let mut running = Vec::new();
+        let mut failed = Vec::new();
+        self.relocating.retain_mut(|r| {
+            let mut pending = false;
+            let mut ok = true;
+            r.commits.retain_mut(|c| match c.try_result() {
+                None => {
+                    pending = true;
+                    true
+                }
+                Some(Ok(_)) => false,
+                Some(Err(_)) => {
+                    ok = false;
+                    false
+                }
+            });
+            if !ok {
+                failed.extend_from_slice(&r.targets);
+                return false;
+            }
+            if pending {
+                running.extend_from_slice(&r.targets);
+            }
+            pending
+        });
+        for segment in failed {
+            self.cleared.remove(&segment);
+        }
+        running
+    }
 }
 
 impl Inner {
@@ -88,7 +134,7 @@ impl Inner {
                 offset: 0,
                 what: "journal relocation record without its locators",
             })?;
-            if key == k2 && holds(self, &sv, key, first_seq - 1, old) {
+            if key == k2 && holds(self, &sv, key, first_seq - 1, old)? {
                 accepted.push((seq + 1, key, new));
                 relocated += u64::from(new.len);
             }
@@ -217,11 +263,19 @@ impl Inner {
             .filter(|(_, loc)| targets.contains(&loc.segment))
             .collect();
 
-        let last = self.relocate(&journal, live)?;
-        let relocated = last.unwrap_or(scan_seq).max(scan_seq);
+        let commits = self.relocate(&journal, live)?;
+        let relocated = commits
+            .iter()
+            .map(Commit::seq)
+            .max()
+            .unwrap_or(scan_seq)
+            .max(scan_seq);
         let mut gc = lock(&self.gc);
-        for s in targets {
+        for &s in &targets {
             gc.cleared.insert(s, relocated);
+        }
+        if !commits.is_empty() {
+            gc.relocating.push(Relocation { commits, targets });
         }
         Ok(Some(GC_WAIT))
     }
@@ -273,10 +327,16 @@ impl Inner {
         found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.offset.cmp(&b.1.offset)));
         found.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         // Keep what the key still holds at `seq`; a key in a quarantined scope is dead
-        // (its reads fail until `release_scope` deletes it).
-        found.retain(|(key, loc)| {
-            self.quarantine.check(key).is_ok() && holds(self, sv, key, seq, &loc.encode())
-        });
+        // (its reads fail until `release_scope` deletes it). A key that cannot be read
+        // (EIO, a damaged block not yet quarantined) fails the pass, which is retried:
+        // KVfix3, NS10 seed 510 lost a value whose liveness check met an injected EIO.
+        let mut held = Vec::with_capacity(found.len());
+        for (key, loc) in found {
+            if self.quarantine.check(&key).is_ok() && holds(self, sv, &key, seq, &loc.encode())? {
+                held.push((key, loc));
+            }
+        }
+        let mut found = held;
         found.sort_by(|a, b| {
             self.scope_bytes(&a.0)
                 .cmp(&self.scope_bytes(&b.0))
@@ -286,9 +346,10 @@ impl Inner {
         Ok(found)
     }
 
-    /// Submits `Relocate` records (one scope each, bounded size) for `live`. Returns the
-    /// last relocation's sequence, or `None` when there was nothing to move.
-    fn relocate(&self, journal: &Journal, live: Vec<(Bytes, Locator)>) -> Result<Option<Seq>> {
+    /// Submits `Relocate` records (one scope each, bounded size) for `live`. Returns their
+    /// commits, not awaited (the journal thread may need this thread, see `journal_gc`):
+    /// [`GcState::settle_relocations`] checks them before anything retires.
+    fn relocate(&self, journal: &Journal, live: Vec<(Bytes, Locator)>) -> Result<Vec<Commit>> {
         // The payload one record can hold: a segment's record area less a record header
         // and the longest scope. Batches are cut before an entry that would not fit, not
         // after the size passed a target (KVfix3: 12 KiB segments have a 4 KiB record
@@ -296,7 +357,7 @@ impl Inner {
         let capacity = (self.segment_bytes.saturating_sub(RECORDS_START) as usize)
             .saturating_sub(RECORD_HEADER_LEN + MAX_SCOPE_LEN);
         let limit = RELOCATE_BATCH_BYTES.min(capacity / 2);
-        let mut last = None;
+        let mut commits = Vec::new();
         let mut batch = WriteBatch::new();
         let mut scope = Bytes::new();
         let mut submit = |batch: &mut WriteBatch| -> Result<()> {
@@ -310,9 +371,7 @@ impl Inner {
                 Durability::NoSync,
                 Box::new(()),
             )?;
-            last = Some(commit.seq());
-            // Not awaited: the journal thread may need this thread (see `journal_gc`).
-            drop(commit);
+            commits.push(commit);
             Ok(())
         };
         for (key, loc) in live {
@@ -356,14 +415,16 @@ impl Inner {
             batch.put_journal(&key, &value);
         }
         submit(&mut batch)?;
-        Ok(last)
+        Ok(commits)
     }
 }
 
-/// True when the newest version of `key` at `seq` is a journal value at `old`.
-fn holds(inner: &Inner, sv: &SuperVersion, key: &[u8], seq: Seq, old: &[u8]) -> bool {
-    matches!(
-        read::newest(inner, sv, key, seq, false),
-        Ok(Some((Kind::JournalPut, ref stored))) if stored.as_ref() == old
-    )
+/// True when the newest version of `key` at `seq` is a journal value at `old`. A read
+/// error is returned, never taken for "no longer held": a live value judged dead is not
+/// relocated, and its segment is then recycled under its locator.
+fn holds(inner: &Inner, sv: &SuperVersion, key: &[u8], seq: Seq, old: &[u8]) -> Result<bool> {
+    Ok(matches!(
+        read::newest(inner, sv, key, seq, false)?,
+        Some((Kind::JournalPut, ref stored)) if stored.as_ref() == old
+    ))
 }

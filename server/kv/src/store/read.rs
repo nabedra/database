@@ -80,8 +80,8 @@ fn run_tombstones(file: &RunFile, run: &Run) -> Arc<FragmentedRangeTombstones> {
 
 /// The newest point version of `key` visible at `seq` in `sv`: `(kind, stored value)`,
 /// with range tombstones of every source applied. Run damage is reported (G2) when
-/// `report` is set; journal GC's relocation check passes false and treats any error as
-/// "the key no longer holds the old locator".
+/// `report` is set; journal GC's relocation check passes false and fails its pass on any
+/// error (an unreadable key is never taken for one that no longer holds its locator).
 pub(super) fn newest(
     inner: &Inner,
     sv: &SuperVersion,

@@ -34,6 +34,7 @@ mod snapshots;
 mod tests;
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
@@ -1434,14 +1435,22 @@ impl Inner {
         let min_referenced = self.tracker.min_referenced_segment();
         let segments = journal.segments();
         let oldest_snapshot = self.snapshots.oldest();
-        let gc = lock(&self.gc);
+        let mut gc = lock(&self.gc);
+        // A segment counts as cleared only once its relocations succeeded.
+        let running = gc.settle_relocations();
+        let cleared: BTreeMap<u64, Seq> = gc
+            .cleared
+            .iter()
+            .filter(|(s, _)| !running.contains(s))
+            .map(|(&s, &seq)| (s, seq))
+            .collect();
         let state = gc::RetireState {
             flushed_seq,
             durable_seq,
             visible_seq,
             min_referenced,
             oldest_snapshot,
-            cleared: Some(&gc.cleared),
+            cleared: Some(&cleared),
         };
         gc::retirable(&segments, &state)
             .into_iter()

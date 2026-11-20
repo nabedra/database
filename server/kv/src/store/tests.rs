@@ -341,3 +341,91 @@ fn ns03_compaction_deletes_its_unpinned_inputs_before_it_returns() {
     );
     store.close().unwrap();
 }
+
+/// NS13, NS11 (KVfix3): a relocation the journal refuses moves nothing, so its segments
+/// do not retire. GC marked segments cleared when it submitted their relocation records,
+/// without awaiting them; a `NoSpace` roll voids a record's sequences, which still become
+/// visible, so the segments retired with their live values unmoved (NS10 long campaign,
+/// seed 510: "journal locator names a recycled segment"). The background thread is
+/// occupied so this thread runs every flush and GC pass.
+#[test]
+fn ns13_gc_retires_nothing_for_a_relocation_the_journal_refused() {
+    use crate::fs::{Fault, FaultError, FsOp};
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let bg = Background::new(1).unwrap();
+    let _release = Release(Blocker::occupy(&bg));
+    let mut o = small(Arc::new(fs.clone()), &bg, 64);
+    o.journal.segment_bytes = 32 << 10;
+    o.journal.max_group_bytes = 16 << 10;
+    o.max_journal_bytes = 3 * (32 << 10);
+    o.memtable_bytes = 1 << 20;
+    let store = Store::open(Path::new("/db/kv"), o).unwrap().store;
+    let put = |group: u32, idx: u32, len: usize, d: Durability| {
+        let mut b = WriteBatch::new();
+        let prefix = format!("g{group:02}/");
+        b.set_scope(prefix.as_bytes());
+        let mut value = format!("<{group}:{idx}>").into_bytes();
+        value.resize(len, b'a');
+        b.put_journal(format!("{prefix}e{idx:06}").as_bytes(), &value);
+        store.submit(b, d, Box::new(())).unwrap().wait()
+    };
+    // g00's live values sit in the oldest segment; g01 fills the journal past its budget
+    // and deletes what it wrote.
+    for idx in 0..6 {
+        put(0, idx, 1500, Durability::Sync).unwrap();
+    }
+    for idx in 0..300 {
+        put(1, idx, 900, Durability::NoSync).unwrap();
+    }
+    let mut b = WriteBatch::new();
+    b.set_scope(b"g01/");
+    b.delete_range(b"g01/", b"g010");
+    store
+        .submit(b, Durability::Sync, Box::new(()))
+        .unwrap()
+        .wait()
+        .unwrap();
+    store.flush().unwrap();
+    // No segment can be prepared any more: small writes fill the active segment until
+    // one needs a roll and is refused.
+    fs.inject(
+        Fault::on(FsOp::Preallocate)
+            .error(FaultError::Enospc)
+            .repeat(),
+    );
+    let mut refused = false;
+    for idx in 0..5000 {
+        match put(2, idx, 300, Durability::NoSync) {
+            Ok(_) => {}
+            Err(crate::Error::NoSpace) => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(refused, "the journal never ran out of segments");
+    // GC relocates g00's values into the full journal and is refused; then later
+    // writes are refused too, and their voided sequences become visible.
+    for _ in 0..3 {
+        let _ = store.inner.journal_gc();
+        let _ = put(2, 9999, 300, Durability::NoSync);
+    }
+    for _ in 0..3 {
+        let _ = store.inner.journal_gc();
+    }
+    assert!(!store.requires_recovery());
+    let snap = store.snapshot();
+    for idx in 0..6 {
+        let key = format!("g00/e{idx:06}");
+        let value = snap.get(key.as_bytes());
+        assert!(
+            matches!(&value, Ok(Some(v)) if v.starts_with(format!("<0:{idx}>").as_bytes())),
+            "{key}: {value:?}"
+        );
+    }
+    drop(snap);
+    fs.clear_faults();
+    store.close().unwrap();
+}
