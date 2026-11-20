@@ -8,8 +8,8 @@ use crate::oltp_replication::{
         status::PartitionedStatus,
     },
     manager::{
-        DataGroupClient, DataGroupFactory, DataGroupSpec, RegisteredConfig, RegisteredWorker,
-        ReplicaPlacement,
+        DamageReplacementEndpoint, DamageScheduler, DataGroupClient, DataGroupFactory,
+        DataGroupSpec, FactoryDamageHost, RegisteredConfig, RegisteredWorker, ReplicaPlacement,
         shard_split::{SplitClient, SplitEndpoint},
     },
     service_rpc::{
@@ -162,6 +162,15 @@ impl LocalServices {
                 placements.control.identity.clone(),
                 routes,
             )?;
+            groups.damage.connect(&rpc);
+            // NS14b: GroupDamaged and the replacement commands are proposed only
+            // once every Control member decodes them (`data.direct.v1` active).
+            control.install_group_damage_gate(
+                crate::oltp_replication::authority::control::DirectCapabilityDamageGate::watch(
+                    rpc.clone(),
+                    std::time::Duration::from_secs(5),
+                ),
+            );
             let native_timestamps = TimestampHandle::new(
                 TimestampMachine::new(raw_timestamps.state.store().clone())?,
                 raw_timestamps.clone(),
@@ -467,6 +476,11 @@ impl LocalServices {
                 .restart_mount
                 .take()
                 .map(|mount| (mount.generation, mount.key));
+            let damage_endpoint = DamageReplacementEndpoint::new(
+                FactoryDamageHost::new(factory.clone(), pools.clone()),
+                placements.control.identity.clone(),
+            );
+            registration.bind(Purpose::GroupDamage, damage_endpoint.clone())?;
             let placement = ReplicaPlacement::new(factory, pools.clone(), restart_mount);
             registration.bind(Purpose::ReplicaPlacement, placement.clone())?;
             #[cfg(test)]
@@ -474,6 +488,16 @@ impl LocalServices {
                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
             }
             let operator = Arc::new(worker.operator);
+            // NS14b: Control replaces damaged Data replicas on its own, from the
+            // process whose Control replica leads.
+            DamageScheduler::new(
+                control.clone(),
+                raw_control.clone(),
+                operator.clone(),
+                damage_endpoint,
+                std::time::Duration::from_secs(2),
+            )
+            .spawn(stop.subscribe());
             let resolver = Arc::new(RegisteredParticipants {
                 shared: shared.clone(),
                 manager: manager.clone(),
