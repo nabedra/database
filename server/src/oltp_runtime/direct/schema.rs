@@ -13,8 +13,8 @@ use crate::{
     oltp::mvcc::{
         MvccKey,
         catalog::{CatalogHandle, CatalogRead},
-        store::direct::DirectSchema as GroupSchema,
         index::{IndexDefinition, IndexPage, IndexRecord, IndexRoot},
+        store::direct::DirectSchema as GroupSchema,
         store::direct::MAX_DIRECT_INDEX_CHANGES,
     },
     oltp_replication::{
@@ -83,6 +83,9 @@ pub(crate) struct StaticSchema {
     exclusive: Mutex<std::collections::HashSet<Uuid>>,
     /// The next this many lifecycle reads fail as an unreachable Catalog.
     failing_reads: Mutex<u32>,
+    /// Test hook: table reads never answer (a stalled Catalog leader).
+    #[cfg(test)]
+    stalled_table_reads: std::sync::atomic::AtomicBool,
 }
 impl StaticSchema {
     /// Models a Catalog that cannot answer the next `count` lifecycle reads.
@@ -98,6 +101,12 @@ impl StaticSchema {
         } else {
             exclusive.remove(&table_id);
         }
+    }
+    /// Models a Catalog leader that stops answering table reads.
+    #[cfg(test)]
+    pub(crate) fn stall_table_reads(&self, stalled: bool) {
+        self.stalled_table_reads
+            .store(stalled, std::sync::atomic::Ordering::Release);
     }
     pub(crate) fn insert(&self, table: DirectTable) {
         self.tables
@@ -146,6 +155,13 @@ impl DirectSchema for StaticSchema {
         group: Option<GroupSchema>,
         _: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup> {
+        #[cfg(test)]
+        if self
+            .stalled_table_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(std::future::pending());
+        }
         let found = self
             .tables
             .lock()
@@ -289,7 +305,10 @@ impl CatalogSchema {
             lifecycle_id: table.lifecycle_id,
             indexes,
         });
-        self.remember((table_id, schema_epoch, group.map(|group| group.epoch)), table.clone());
+        self.remember(
+            (table_id, schema_epoch, group.map(|group| group.epoch)),
+            table.clone(),
+        );
         Ok(SchemaLookup::Table(table))
     }
 }

@@ -1793,6 +1793,51 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
     cluster.shutdown().await;
 }
 
+/// RV-FINAL L3, C07, F03: a Catalog leader that stops answering table
+/// reads holds neither a direct mutation nor a forward past the request
+/// deadline. Both answer `not_applied` (nothing was proposed) instead of
+/// waiting until the gateway's own deadline cuts the call as uncertain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let v = &cluster.voters[leader];
+    let proposed = v.executor.stats().entries_proposed;
+    cluster.schema.stall_table_reads(true);
+    for forward in [false, true] {
+        let id = Uuid::new_v4();
+        let body = cluster.body(
+            id,
+            "table.upsert",
+            serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+        );
+        let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            if forward {
+                v.executor.forward(&v.handle, request).await
+            } else {
+                v.executor.execute(&v.handle, request).await
+            }
+        })
+        .await
+        .expect("a stalled Catalog read outlived the request deadline");
+        assert_eq!(
+            code(&response),
+            Some((ErrorCode::StorageUnavailable, Outcome::NotApplied)),
+            "forward={forward}: {response:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    cluster.schema.stall_table_reads(false);
+    assert_eq!(
+        v.executor.stats().entries_proposed,
+        proposed,
+        "nothing was proposed"
+    );
+    cluster.shutdown().await;
+}
+
 /// Rule 2 wiring for `table.get` (plan section 6): a get of a key with a
 /// pending commit waits for it, and a get never waits on other keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

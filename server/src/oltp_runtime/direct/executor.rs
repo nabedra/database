@@ -463,18 +463,19 @@ impl DirectExecutor {
         request: &DirectRequest,
         epochs: &ParticipantEpochs,
         operation: &Operation,
+        deadline: Instant,
     ) -> Result<Arc<DirectTable>, DirectResponse> {
-        let table = match self
-            .schema
-            .table(
+        let lookup = catalog_read(
+            deadline,
+            self.schema.table(
                 request.table_id,
                 request.schema_epoch,
                 epochs.direct_schema,
                 epochs.authority,
-            )
-            .await
-            .map_err(failed)?
-        {
+            ),
+        )
+        .await?;
+        let table = match lookup {
             SchemaLookup::Table(table) => table,
             SchemaLookup::Blocked => {
                 return Err(DirectResponse::Fallback {
@@ -553,7 +554,8 @@ impl DirectExecutor {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
             let epochs = self.epochs(handle, clock, request, deadline).await?;
-            self.table(request, &epochs, &parsed.operation).await?;
+            self.table(request, &epochs, &parsed.operation, deadline)
+                .await?;
             loop {
                 if by(deadline, handle.direct_barrier()).await.is_err() {
                     if !self.pause(deadline, RetryCause::Leadership).await {
@@ -697,7 +699,9 @@ impl DirectExecutor {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
             let epochs = self.epochs(handle, clock, request, deadline).await?;
-            let table = self.table(request, &epochs, &parsed.operation).await?;
+            let table = self
+                .table(request, &epochs, &parsed.operation, deadline)
+                .await?;
             let keys = self.row_keys(&table, &parsed.operation)?;
             let encoded: Vec<Vec<u8>> = keys
                 .iter()
@@ -1155,17 +1159,17 @@ impl DirectExecutor {
                     deadline,
                 )
                 .await?;
-            let table = match self
-                .schema
-                .table(
+            let lookup = catalog_read(
+                deadline,
+                self.schema.table(
                     request.table_id,
                     request.schema_epoch,
                     None,
                     epochs.authority,
-                )
-                .await
-                .map_err(failed)?
-            {
+                ),
+            )
+            .await?;
+            let table = match lookup {
                 SchemaLookup::Table(table) => table,
                 // The anchor key still follows from the stored key column
                 // only through the descriptor, so a forward needs one.
@@ -1484,6 +1488,18 @@ async fn by<T>(
 /// have committed (then the dedup record decides on the next attempt).
 fn full_device_refusal(error: &ProtocolError, uncertain: bool) -> bool {
     !uncertain && error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(error)
+}
+/// RV-FINAL L3: a Catalog read bounded by the request deadline. Nothing was
+/// proposed yet, so running out of time is `not_applied`, never a call the
+/// gateway's own deadline cuts as uncertain.
+async fn catalog_read<T>(
+    deadline: Instant,
+    read: impl std::future::Future<Output = Result<T, ProtocolError>>,
+) -> Result<T, DirectResponse> {
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(read) => read.map_err(failed),
+        Err(_) => Err(failed(unavailable_not_applied())),
+    }
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)
