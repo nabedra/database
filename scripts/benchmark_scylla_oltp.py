@@ -76,6 +76,7 @@ class Scylla:
             self.session, insert, ((key, 0) for key in range(rows)), concurrency=32,
         )
         self.point_update = self.session.prepare(f"UPDATE {DATABASE} SET value = ? WHERE id = ?")
+        self.point_get = self.session.prepare(f"SELECT value FROM {DATABASE} WHERE id = ?")
 
     def update(self, key, value, _request_id):
         try:
@@ -86,6 +87,16 @@ class Scylla:
             # A client or replica timeout can occur after the write has taken effect.
             return {"status": "unresolved", "error": f"{type(error).__name__}: {error}"}
         return {"status": "succeeded"}
+
+    def get(self, key, _request_id):
+        try:
+            row = self.session.execute(self.point_get, (key,)).one()
+        except Unavailable as error:
+            return {"status": "rejected", "error": f"{type(error).__name__}: {error}"}
+        except (DriverException, NoHostAvailable) as error:
+            # A read changes nothing; the outcome only lacks a value.
+            return {"status": "unresolved", "error": f"{type(error).__name__}: {error}"}
+        return {"status": "succeeded", "read_value": None if row is None else row.value}
 
     def read(self, _keys):
         values = {}
@@ -166,7 +177,7 @@ def main():
             "consistency": "QUORUM",
             "commitlog_sync_by_node": node_modes,
             "durable_writes": True,
-            "measurement": "persistent native CQL, prepared UPDATE, no application retries",
+            "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
         }
         result = run_workload(args, adapter, args.output, metadata)
         return 0 if result["correctness_verified"] else 1

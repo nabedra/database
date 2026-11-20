@@ -1,4 +1,4 @@
-"""Shared, seeded open-loop workload for replicated OLTP point updates."""
+"""Shared, seeded open-loop workload for replicated OLTP point updates and point gets."""
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -11,11 +11,13 @@ import platform
 import random
 import statistics
 import time
+from time import time_ns as wall_ns
 from uuid import uuid4
 
 
 STATUSES = {'succeeded', 'rejected', 'failed', 'unresolved', 'client_capacity'}
 TABLE = 'benchmark_points'
+OPERATIONS = ('update', 'get', 'mix')
 
 
 def parse_rates(value):
@@ -46,6 +48,14 @@ def add_workload_args(parser):
     parser.add_argument('--seed', type=int, default=20261118)
     parser.add_argument('--timeout', type=float, default=10,
                         help='client socket or operation timeout in seconds')
+    parser.add_argument('--operation', choices=OPERATIONS, default='update',
+                        help='point updates (default), point gets, or a read/write mix')
+    parser.add_argument('--read-fraction', type=float, default=0.95,
+                        help='share of gets in --operation mix (default 0.95)')
+    parser.add_argument('--stop-p99-ms', type=float,
+                        help='stop the sweep after a rate whose median successful p99 exceeds this')
+    parser.add_argument('--stop-on-rejection', action='store_true',
+                        help='stop the sweep after a rate with any explicit rejection')
 
 
 def _offered_updates(rate, seconds):
@@ -68,6 +78,8 @@ def validate_args(args):
               for seconds in (args.seconds, args.warmup_seconds)]
     if min(counts) < 1 or max(counts) > args.rows:
         raise ValueError('each phase must offer between 1 and --rows unique updates')
+    if not 0 <= getattr(args, 'read_fraction', 0.95) <= 1:
+        raise ValueError('--read-fraction must be within [0, 1]')
 
 
 def distribution(values):
@@ -81,10 +93,13 @@ def distribution(values):
 
 def observe(adapter, work):
     dispatched = time.monotonic_ns()
-    result = adapter.update(work['key'], work['value'], work['request_id'])
+    if work.get('op', 'update') == 'get':
+        result = adapter.get(work['key'], work['request_id'])
+    else:
+        result = adapter.update(work['key'], work['value'], work['request_id'])
     settled = time.monotonic_ns()
     if result['status'] not in STATUSES - {'client_capacity'}:
-        raise ValueError(f"invalid update status {result['status']!r}")
+        raise ValueError(f"invalid {work.get('op', 'update')} status {result['status']!r}")
     return work | result | {'dispatched_ns': dispatched, 'settled_ns': settled,
                             'service_time_ns': settled - dispatched}
 
@@ -95,8 +110,15 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
     # Ordered uniform times are Poisson arrivals conditioned on the phase count.
     offsets = sorted(round(rng.random() * seconds * 1e9) for _ in range(count))
     keys = rng.sample(range(args.rows), count)
-    work = [{'key': key, 'value': first_value + index, 'request_id': str(uuid4())}
-            for index, key in enumerate(keys)]
+    operation_kind = getattr(args, 'operation', 'update')
+    read_fraction = getattr(args, 'read_fraction', 0.95)
+    # Keys stay distinct within a phase, so a get never races an update of its key
+    # and must return the previous snapshot's value (or a still-unresolved one).
+    ops = ['get' if operation_kind == 'get' or (operation_kind == 'mix' and rng.random() < read_fraction)
+           else 'update' for _ in range(count)]
+    work = [{'key': key, 'value': first_value + index, 'request_id': str(uuid4()), 'op': op}
+            for index, (key, op) in enumerate(zip(keys, ops, strict=True))]
+    start_wall = wall_ns()
     start = time.monotonic_ns()
     pending, samples = set(), []
     for operation, offset in zip(work, offsets, strict=True):
@@ -124,8 +146,20 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
     elapsed = (drain_end - start) / 1e9
     status_counts = Counter(sample['status'] for sample in samples)
     timely_success = sum(sample['settled_ns'] <= end for sample in successful)
+    by_operation = {}
+    for op in sorted({sample.get('op', 'update') for sample in samples}):
+        mine = [sample for sample in samples if sample.get('op', 'update') == op]
+        op_counts = Counter(sample['status'] for sample in mine)
+        by_operation[op] = {
+            'offered': len(mine), 'statuses': {s: op_counts[s] for s in sorted(STATUSES)},
+            'succeeded_rps': op_counts['succeeded'] / elapsed,
+            'success_latency_ms': distribution((sample['settled_ns'] - sample['scheduled_ns']) / 1e6
+                                               for sample in mine if sample['status'] == 'succeeded'),
+        }
     return {
         'phase_seed': phase_seed, 'start_ns': start, 'offer_end_ns': end, 'drain_end_ns': drain_end,
+        'start_unix_ns': start_wall, 'drain_end_unix_ns': start_wall + (drain_end - start),
+        'by_operation': by_operation,
         'offered': count, 'offered_rps': count / seconds, 'statuses': {s: status_counts[s] for s in sorted(STATUSES)},
         'admitted_or_completed': sum(sample.get('accepted', sample['status'] == 'succeeded') for sample in samples),
         'submitted': count - status_counts['client_capacity'],
@@ -145,7 +179,14 @@ def verify(adapter, before, samples, pending_values):
     required = dict(before)
     uncertain = {}
     carried = sum(len(values) for values in pending_values.values())
+    read_mismatches = []
     for sample in samples:
+        if sample.get('op', 'update') == 'get':
+            if sample['status'] == 'succeeded':
+                key, seen = sample['key'], sample.get('read_value')
+                if seen != before.get(key) and seen not in pending_values.get(key, ()):
+                    read_mismatches.append({'key': key, 'expected': before.get(key), 'actual': seen})
+            continue
         resolution = sample.get('reconciliation', {}).get('resolution')
         key, value = sample['key'], sample['value']
         if sample['status'] == 'succeeded' or resolution == 'succeeded':
@@ -176,8 +217,9 @@ def verify(adapter, before, samples, pending_values):
         elif key not in required or key not in actual or value != required[key]:
             differences.append({'key': key, 'expected': required.get(key), 'actual': value})
     digest = hashlib.sha256(json.dumps(sorted(actual.items()), separators=(',', ':')).encode()).hexdigest()
-    return {'rows': len(actual), 'sha256': digest, 'mismatches': len(differences),
-            'first_mismatches': differences[:10], 'unresolved_keys': len(uncertain),
+    return {'rows': len(actual), 'sha256': digest, 'mismatches': len(differences) + len(read_mismatches),
+            'first_mismatches': differences[:10], 'read_mismatches': len(read_mismatches),
+            'first_read_mismatches': read_mismatches[:10], 'unresolved_keys': len(uncertain),
             'unresolved_keys_with_new_value': sum(actual.get(key) == value for key, value in uncertain.items()),
             'unobserved_unresolved_values_before_phase': carried,
             'unobserved_unresolved_values_after_snapshot': pending,
@@ -200,9 +242,14 @@ def run_workload(args, adapter, output, metadata):
     results = {'metadata': metadata, 'started_utc': datetime.now(timezone.utc).isoformat(),
                'driver': {'platform': platform.platform(), 'python': platform.python_version(),
                           'clock': 'monotonic_ns'},
-               'settings': {field: getattr(args, field) for field in ('rates', 'seconds', 'warmup_seconds',
-                            'repetitions', 'clients', 'rows', 'seed', 'timeout')},
-               'workload': 'existing bigint primary-key updates to a bigint value',
+               'settings': {field: getattr(args, field, None) for field in ('rates', 'seconds', 'warmup_seconds',
+                            'repetitions', 'clients', 'rows', 'seed', 'timeout', 'operation', 'read_fraction',
+                            'stop_p99_ms', 'stop_on_rejection')},
+               'workload': {
+                   'update': 'existing bigint primary-key updates to a bigint value',
+                   'get': 'point gets of existing bigint primary keys',
+                   'mix': 'point gets and updates of existing bigint primary keys (--read-fraction gets)',
+               }[getattr(args, 'operation', None) or 'update'],
                'phases': [], 'correctness_verified': False}
 
     def save():
@@ -222,6 +269,8 @@ def run_workload(args, adapter, output, metadata):
             raise RuntimeError(f'seed verification failed: {initial}')
         with ThreadPoolExecutor(max_workers=args.clients) as executor:
             for rate in args.rates:
+                if results.get('stopped_after_rate') is not None:
+                    break
                 for rep in range(args.repetitions + 1):
                     label = f'{rate}-' + (f'rep{rep}' if rep else 'warmup')
                     phase_seed = random.Random(f'{args.seed}/{rate}/{rep}').getrandbits(64)
@@ -251,6 +300,18 @@ def run_workload(args, adapter, output, metadata):
                     save()
                     if phase['snapshot']['mismatches']:
                         raise RuntimeError(f'{label} snapshot verification failed: {phase["snapshot"]}')
+                stop_p99 = getattr(args, 'stop_p99_ms', None)
+                if stop_p99 is None and not getattr(args, 'stop_on_rejection', False):
+                    continue
+                measured = [phase for phase in results['phases'] if phase['rate'] == rate and phase['repetition'] > 0]
+                p99s = [phase['success_latency_ms']['p99'] for phase in measured]
+                median_p99 = statistics.median(p99 if p99 is not None else math.inf for p99 in p99s)
+                rejected = sum(phase['statuses']['rejected'] for phase in measured)
+                if (stop_p99 is not None and median_p99 > stop_p99) or \
+                        (getattr(args, 'stop_on_rejection', False) and rejected):
+                    results['stopped_after_rate'] = rate
+                    results['stop_reason'] = {'median_p99_ms': None if math.isinf(median_p99) else median_p99,
+                                              'rejected': rejected}
         results['correctness_verified'] = all(
             not phase['unresolved_after_reconciliation'] and not phase['protocol_failures']
             for phase in results['phases']
@@ -259,6 +320,7 @@ def run_workload(args, adapter, output, metadata):
             str(rate): statistics.median(phase['succeeded_rps'] for phase in results['phases']
                                         if phase['rate'] == rate and phase['repetition'] > 0)
             for rate in args.rates
+            if any(phase['rate'] == rate and phase['repetition'] > 0 for phase in results['phases'])
         }
         return results
     except Exception as error:

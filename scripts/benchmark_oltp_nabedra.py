@@ -2,6 +2,7 @@
 """Run the shared point-update workload against the production RF3 OLTP topology."""
 
 import argparse
+import base64
 from decimal import Decimal
 import hashlib
 import http.client
@@ -12,14 +13,16 @@ from pathlib import Path
 import re
 import secrets
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tempfile
 import threading
+import random
 import time
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-from benchmark_oltp_workload import TABLE, add_workload_args, run_workload, validate_args
+from benchmark_oltp_workload import TABLE, add_workload_args, distribution, measure, run_workload, validate_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,10 @@ WORKER_MEMORY = 2_150_000_000
 API_CPU, API_MEMORY = '0.35', 550_000_000
 DRIVER_CPU, DRIVER_MEMORY = '0.65', 900_000_000
 WORKERS = ('w1', 'w2', 'w3')
+SOAK_TABLE = 'benchmark_soak'
+# fsync-family calls counted in the separate strace run (NS11 G4).
+STRACE_CALLS = 'fsync,fdatasync,sync_file_range,syncfs'
+CGROUP_FILES = ('io.stat', 'memory.current', 'memory.peak', 'memory.events', 'cpu.stat')
 DEFAULT_WORKER_CPUS = (NANO_CPUS,) * len(WORKERS)
 STATUS_LEADER_HINT = re.compile(
     r'^(\S+)\s+WARN\s+nabedra_database_server::oltp_replication::hosted: '
@@ -183,24 +190,37 @@ class Nabedra:
         return placement
 
     def update(self, key, value, request_id):
+        return self.point('table.update', {'table_id': self.table_id, 'key': key, 'values': {'value': value}},
+                          request_id, lambda data: data is True, lambda _data: {})
+
+    def get(self, key, request_id):
+        def valid(row):
+            return row is None or (isinstance(row, dict) and set(row) == {'id', 'value'} and row['id'] == key
+                                   and type(row['value']) is int)
+        return self.point('table.get', {'table_id': self.table_id, 'key': key}, request_id, valid,
+                          lambda row: {'read_value': None if row is None else row['value']})
+
+    def point(self, operation, payload, request_id, expected, extract):
         client = self.client()
         try:
             status, response = client.exchange('/v1/operations', {
-                'request_id': request_id, 'operation': 'table.update',
-                'payload': {'table_id': self.table_id, 'key': key, 'values': {'value': value}},
+                'request_id': request_id, 'operation': operation, 'payload': payload,
             })
         except (OSError, http.client.HTTPException) as error:
             return client.sizes | {'status': 'unresolved', 'transport_error': type(error).__name__, 'message': str(error)}
         except ValueError as error:
             return client.sizes | {'status': 'unresolved', 'protocol_error': str(error)}
-        details = client.sizes | {'http_status': status, 'response': response}
+        details = client.sizes | {'http_status': status}
+        if status != 200:
+            details['response'] = response
         if status == 200:
             try:
                 data = require_data(status, response, request_id)
             except RuntimeError:
-                return details | {'status': 'unresolved', 'protocol_error': 'invalid success envelope'}
-            if data is True:
-                return details | {'status': 'succeeded', 'accepted': True}
+                return details | {'status': 'unresolved', 'protocol_error': 'invalid success envelope',
+                                  'response': response}
+            if expected(data):
+                return details | {'status': 'succeeded', 'accepted': True} | extract(data)
             return details | {'status': 'failed', 'accepted': True, 'unexpected_result': data}
         if isinstance(response, dict) and set(response) == {'request_id', 'error'} \
                 and response['request_id'] in (None, request_id) and isinstance(response['error'], dict):
@@ -263,6 +283,14 @@ class Nabedra:
         if network.is_file():
             driver['network'] = network.read_text()
         stats = {'driver_cgroup': driver}
+        client = Http('https://api:8000', self.token, min(self.timeout, 3), self.ca)
+        try:
+            status, reply = client.exchange('/v1/runtime/stats')
+            stats['api'] = reply if status == 200 else {'status': status, 'response': reply}
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            stats['api'] = {'error': f'{type(error).__name__}: {error}'}
+        finally:
+            client.close()
         for worker in WORKERS:
             client = Http(f'http://{worker}:8000', self.token, min(self.timeout, 3))
             try:
@@ -275,6 +303,12 @@ class Nabedra:
         return stats
 
     def summarize_stage(self, before, after):
+        summary = self.summarize_queue_stage(before, after)
+        summary['direct'] = summarize_direct(before, after)
+        return summary
+
+    def summarize_queue_stage(self, before, after):
+        # b29a178 reports queue-owner stage stats; the direct path has none.
         for name in WORKERS:
             old = (before or {}).get(name, {}).get('accept_to_dispatch')
             new = (after or {}).get(name, {}).get('accept_to_dispatch')
@@ -306,6 +340,182 @@ class Nabedra:
             client.close()
 
 
+def counter_delta(old, new):
+    """Counter differences of two snapshots of the same shape (numbers and maps of numbers)."""
+    if isinstance(new, bool) or new is None:
+        return None
+    if isinstance(new, (int, float)):
+        return new - old if isinstance(old, (int, float)) and not isinstance(old, bool) else new
+    if isinstance(new, dict):
+        out = {}
+        for key, value in new.items():
+            delta = counter_delta((old or {}).get(key) if isinstance(old, dict) else None, value)
+            if delta not in (None, {}, 0):
+                out[key] = delta
+        return out
+    return None
+
+
+def summarize_direct(before, after):
+    """The `direct` section (plan "Benchmark"): per-worker leader counters and gateway counters over a phase."""
+    out = {}
+    for name in (*WORKERS, 'api'):
+        old, new = (before or {}).get(name) or {}, (after or {}).get(name) or {}
+        section = {}
+        for key in ('direct', 'direct_gateway'):
+            if isinstance(new.get(key), dict):
+                delta = counter_delta(old.get(key), new[key])
+                # in_flight and max_in_flight are gauges.
+                for gauge in ('in_flight', 'max_in_flight'):
+                    if gauge in new[key]:
+                        delta[gauge] = new[key][gauge]
+                section[key] = delta
+        if isinstance(new.get('direct_capability'), dict):
+            section['direct_capability'] = new['direct_capability']
+        if section:
+            out[name] = section
+    return out or None
+
+
+def soak_seed(adapter, args, output):
+    """Rows with incompressible payloads until each replica holds well over 4x cache + write buffer."""
+    create = {'name': SOAK_TABLE, 'schema': {'id': 'int64', 'value': 'int64', 'payload': 'utf8'},
+              'key': 'id', 'format': 'parquet'}
+    descriptor = adapter.operation('table.create', create)
+    adapter.table_id = descriptor['id']
+    batch_rows = max(1, (256 * 1024) // args.soak_payload_bytes)
+    batches = [range(start, min(start + batch_rows, args.soak_rows)) for start in range(0, args.soak_rows, batch_rows)]
+    payload_raw = (args.soak_payload_bytes * 3) // 4
+
+    def payload(key):
+        return base64.b64encode(random.Random(f'{args.seed}/{key}').randbytes(payload_raw)).decode()[:args.soak_payload_bytes]
+
+    stats = {'batches': len(batches), 'rows_per_batch': batch_rows, 'rejected_retries': 0, 'errors': []}
+    lock = threading.Lock()
+    queue = list(reversed(batches))
+
+    def worker():
+        while True:
+            with lock:
+                if not queue:
+                    return
+                keys = queue.pop()
+            rows = [{'id': key, 'value': 0, 'payload': payload(key)} for key in keys]
+            for attempt in range(200):
+                result = adapter.point('table.insert_many', {'table_id': adapter.table_id, 'rows': rows}, uid(),
+                                       lambda count: count == len(rows), lambda _count: {})
+                if result['status'] == 'succeeded':
+                    break
+                if result['status'] == 'rejected':
+                    with lock:
+                        stats['rejected_retries'] += 1
+                    time.sleep(min(2, 0.05 * (attempt + 1)))
+                    continue
+                # A failed or unresolved insert_many: retrying could double-insert, so stop.
+                raise RuntimeError(f'soak seed batch {keys.start}: {result}')
+            else:
+                raise RuntimeError(f'soak seed batch {keys.start} rejected 200 times')
+    started = time.monotonic()
+    errors = []
+
+    def guarded():
+        try:
+            worker()
+        except Exception as error:  # noqa: BLE001 - reported below
+            errors.append(f'{type(error).__name__}: {error}')
+    threads = [threading.Thread(target=guarded) for _ in range(args.soak_seed_clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise RuntimeError(f'soak seeding failed: {errors[:3]}')
+    stats.update(seconds=time.monotonic() - started, rows=args.soak_rows, payload_bytes=args.soak_payload_bytes,
+                 logical_bytes=args.soak_rows * (args.soak_payload_bytes + 16))
+    return descriptor, stats
+
+
+def run_soak(args, adapter, output, metadata):
+    """NS11 storage soak: seed, then --soak-seconds of updates at --soak-rate in phases of distinct keys."""
+    results = {'metadata': metadata, 'workload': 'storage soak: updates of rows with incompressible payloads',
+               'settings': {field: getattr(args, field) for field in ('soak_rows', 'soak_payload_bytes', 'soak_seconds',
+                            'soak_phase_seconds', 'soak_rate', 'soak_seed_clients', 'clients', 'seed', 'timeout')},
+               'phases': [], 'correctness_verified': False}
+
+    def save():
+        (output / 'results.tmp').write_text(json.dumps(results, indent=2) + '\n')
+        (output / 'results.tmp').replace(output / 'results.json')
+    output.mkdir(parents=True, exist_ok=True)
+    latest, uncertain = {}, {}
+    try:
+        descriptor, seed_stats = soak_seed(adapter, args, output)
+        results['seed_details'] = {'descriptor': descriptor, 'seed': seed_stats}
+        results['seed_end_unix_ns'] = time.time_ns()
+        save()
+        args.rows = args.soak_rows
+        phases = max(1, round(args.soak_seconds / args.soak_phase_seconds))
+        next_value = 1
+        with ThreadPoolExecutor(max_workers=args.clients) as executor:
+            for index in range(phases):
+                before_stats = adapter.stage_stats()
+                phase, samples = measure(executor, args, adapter, args.soak_rate, args.soak_phase_seconds,
+                                         random.Random(f'{args.seed}/soak/{index}').getrandbits(64), next_value)
+                next_value += len(samples)
+                phase.update(label=f'soak-{index}', rate=args.soak_rate, repetition=index + 1)
+                phase['stage_stats_before'] = before_stats
+                phase['stage_stats_after'] = adapter.stage_stats()
+                phase['stage_summary'] = adapter.summarize_stage(before_stats, phase['stage_stats_after'])
+                unresolved = [sample for sample in samples if sample['status'] == 'unresolved']
+                if unresolved:
+                    adapter.reconcile(unresolved)
+                for sample in samples:
+                    resolution = sample.get('reconciliation', {}).get('resolution')
+                    if sample['status'] == 'succeeded' or resolution == 'succeeded':
+                        latest[sample['key']] = sample['value']
+                        uncertain.pop(sample['key'], None)
+                    elif sample['status'] == 'unresolved' and resolution is None:
+                        uncertain.setdefault(sample['key'], set()).add(sample['value'])
+                phase['unresolved_after_reconciliation'] = sum(
+                    sample['status'] == 'unresolved' and sample.get('reconciliation', {}).get('resolution') is None
+                    for sample in samples)
+                with (output / f'soak-{index}.jsonl').open('w') as stream:
+                    for sample in samples:
+                        stream.write(json.dumps(sample, separators=(',', ':')) + '\n')
+                results['phases'].append(phase)
+                save()
+        # Verify a seeded sample of the written keys with point gets.
+        check = sorted(random.Random(args.seed).sample(sorted(latest), min(2000, len(latest))))
+        mismatches, uncertain_seen = [], 0
+        for key in check:
+            result = adapter.get(key, uid())
+            if result['status'] != 'succeeded':
+                mismatches.append({'key': key, 'get': result['status']})
+                continue
+            if result['read_value'] == latest[key]:
+                continue
+            if result['read_value'] in uncertain.get(key, ()):
+                uncertain_seen += 1
+                continue
+            mismatches.append({'key': key, 'expected': latest[key], 'actual': result['read_value']})
+        results['verification'] = {'keys_checked': len(check), 'mismatches': len(mismatches),
+                                   'first_mismatches': mismatches[:10], 'later_unresolved_values_seen': uncertain_seen,
+                                   'keys_with_unresolved_values': len(uncertain)}
+        results['correctness_verified'] = not mismatches and all(
+            not phase['unresolved_after_reconciliation'] for phase in results['phases'])
+        latencies = [phase['success_latency_ms'] for phase in results['phases']]
+        results['summary'] = {'offered': sum(phase['offered'] for phase in results['phases']),
+                              'succeeded': sum(phase['statuses']['succeeded'] for phase in results['phases']),
+                              'rejected': sum(phase['statuses']['rejected'] for phase in results['phases']),
+                              'phase_p99_ms': [latency['p99'] for latency in latencies]}
+        return results
+    except Exception as error:
+        results['error'] = f'{type(error).__name__}: {error}'
+        raise
+    finally:
+        save()
+        adapter.close()
+
+
 class Cluster:
     def __init__(self, args, directory):
         self.args, self.directory = args, directory
@@ -316,6 +526,11 @@ class Cluster:
         self.auth = {role + '_token': secrets.token_urlsafe(32) for role in ('admin', 'data', 'enrollment')}
         self.network_created = False
         self.binary = '/fixture-nabedra-db' if args.binary else '/usr/local/bin/nabedra-db'
+        self.execution = dict(EXECUTION)
+        if args.direct_oltp is not None:
+            # Omitted by default: b29a178 refuses the unknown field.
+            self.execution['direct_oltp'] = args.direct_oltp == 'on'
+        self.samples, self.sampling = [], threading.Event()
         self.key_spec = {'rsa': 'rsa:2048', 'ed25519': 'ed25519'}[args.tls_key_type]
         image, = json.loads(command('docker', 'image', 'inspect', args.image))
         self.image = image['Id']
@@ -327,7 +542,9 @@ class Cluster:
                          'image': self.image, 'image_os': image['Os'], 'image_architecture': image['Architecture'],
                          'contract_references': ['O24', 'Q01', 'B02'] + (['O30'] if self.scoped_oltp else []),
                          'rpc_trace': args.rpc_trace,
-                         'tls_key_type': args.tls_key_type}
+                         'tls_key_type': args.tls_key_type, 'direct_oltp': args.direct_oltp,
+                         'strace': STRACE_CALLS if args.strace else None,
+                         'orm_source': str(args.orm_source), 'pool_format_version': args.pool_format_version}
         if args.binary:
             with args.binary.open('rb') as binary:
                 self.metadata['binary_sha256'] = hashlib.file_digest(binary, 'sha256').hexdigest()
@@ -355,7 +572,8 @@ class Cluster:
         name = f'{self.prefix}-{alias}'
         self.containers.append(name)
         mounts = ['--mount', f'type=bind,source={self.directory},target=/fixture,readonly',
-                  '--mount', f'type=bind,source={ROOT},target=/source,readonly']
+                  '--mount', f'type=bind,source={ROOT},target=/source,readonly',
+                  '--mount', f'type=bind,source={self.args.orm_source},target=/orm,readonly']
         if self.args.binary:
             mounts += ['--mount', f'type=bind,source={self.args.binary},target={self.binary},readonly']
         log_options = ['--log-opt', 'max-size=4m']
@@ -365,7 +583,7 @@ class Cluster:
         self.docker('run', '-d', '--pull=never', '--name', name, '--network', self.prefix, '--network-alias', alias,
                     '--cpus', cpu, '--memory', str(memory), '--memory-swap', str(memory), '--pids-limit', '96',
                     *log_options, '--user', '0:0', '-e', 'PYTHONDONTWRITEBYTECODE=1',
-                    '-e', 'PYTHONPATH=/source/orm/python/src', *mounts, *options, '--entrypoint', entry,
+                    '-e', 'PYTHONPATH=/orm', *mounts, *options, '--entrypoint', entry,
                     self.image, *arguments)
         return name
 
@@ -457,19 +675,24 @@ class Cluster:
                         bootstrap_id=self.bootstrap_id, initial_run=self.run_id, required_voters=len(WORKERS),
                         placements=placements, control_enrollments=enrollments, operator_pins=operator_pins,
                         mount=dict(profile={'docker': {'volume_marker': marker}}, worker=identity, generation=1,
-                                   identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
+                                   identity=dict(engine='oltp', pool_format_version=self.args.pool_format_version,
+                                                 cluster_id=self.cluster_id,
                                                  worker_id=worker['worker_id'], pool_id=pool[name]),
                                    mount_path='/data', provider_volume_id='docker-volume:' + volume, filesystem_uuid=''))
             if self.scoped_oltp:
                 node['scoped_oltp'] = True
             write_json(self.directory / f'{name}.json', dict(version=1, bind='0.0.0.0:8000',
-                       auth_file='/tmp/config/auth.json', node=node, resources=resources(WORKER_MEMORY), execution=EXECUTION))
+                       auth_file='/tmp/config/auth.json', node=node, resources=resources(WORKER_MEMORY),
+                       execution=self.execution))
+            # `mkdir -p`: a SIGKILLed worker restarts in the same container (recovery run).
+            launch = (f'exec strace -f --seccomp-bpf -qq -ttt -e trace={STRACE_CALLS} -o /tmp/strace.log '
+                      if self.args.strace else 'exec ')
             script = '''set -eu
 umask 077
-mkdir /tmp/config
+mkdir -p /tmp/config
 cp /fixture/auth.json /fixture/ca.pem "/fixture/$1.json" "/fixture/$1.pem" "/fixture/$1.key" /tmp/config/
 cp "/fixture/$1-volume.json" /data/.nabedra-docker-volume.json
-exec "$2" worker --bootstrap "/tmp/config/$1.json"
+''' + launch + '''"$2" worker --bootstrap "/tmp/config/$1.json"
 '''
             cpu = format(Decimal(self.worker_nano_cpus[name]).scaleb(-9).normalize(), 'f')
             self.launch(name, cpu, WORKER_MEMORY, 'sh', ['-c', script, 'worker', name, self.binary],
@@ -498,6 +721,8 @@ exec "$2" worker --bootstrap "/tmp/config/$1.json"
                                  worker_tls=dict(cert_file='/tmp/config/api.pem', key_file='/tmp/config/api.key',
                                                  ca_file='/tmp/config/ca.pem')),
                    worker=dict(resources=resources(API_MEMORY), execution=EXECUTION, queue_size=128))
+        if self.args.direct_oltp is not None:
+            api_config['topology']['direct_oltp'] = self.args.direct_oltp == 'on'
         if self.scoped_oltp:
             api_config['topology']['scoped_oltp'] = True
         write_json(self.directory / 'api.json', api_config)
@@ -543,6 +768,8 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                 self.metadata['scoped_activation'] = active
             finally:
                 control.close()
+        if self.args.direct_oltp is not None:
+            self.metadata['direct_capability'] = self.wait_direct_capability(worker_urls)
         worker = f'{self.prefix}-w1'
         version = self.docker('exec', worker, self.binary, '--version')
         if 'oltp' not in version.split():
@@ -550,6 +777,107 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         if 'binary_sha256' not in self.metadata:
             self.metadata['binary_sha256'] = self.docker('exec', worker, 'sha256sum', self.binary).split()[0]
         self.metadata.update(server_version=version, placements=placements, execution=EXECUTION)
+
+    def wait_direct_capability(self, urls, deadline_seconds=120):
+        """`data.direct.v1` activates on its own once every member supports it (plan "Rollout")."""
+        deadline = time.monotonic() + deadline_seconds
+        started = time.monotonic()
+        while True:
+            capability = {}
+            for name, url in urls.items():
+                client = Http(url, self.auth['data_token'], 3)
+                try:
+                    status, reply = client.exchange('/v1/runtime/stats')
+                    capability[name] = reply.get('direct_capability') if status == 200 else {'status': status}
+                except (OSError, http.client.HTTPException, ValueError) as error:
+                    capability[name] = {'error': str(error)}
+                finally:
+                    client.close()
+            if all((value or {}).get('active') for value in capability.values()):
+                return {'workers': capability, 'seconds_after_api_ready': time.monotonic() - started}
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f'data.direct.v1 did not activate: {capability}')
+            time.sleep(0.5)
+
+    def cgroup_sample(self, name):
+        files = ' '.join(f'/sys/fs/cgroup/{file}' for file in CGROUP_FILES)
+        raw = self.docker('exec', f'{self.prefix}-{name}', 'sh', '-c',
+                          f'date +%s%N; for f in {files}; do echo "@$f"; cat "$f" 2>/dev/null; done', timeout=20)
+        lines = raw.splitlines()
+        sample, current = {'worker': name, 'unix_ns': int(lines[0]), 'files': {}}, None
+        for line in lines[1:]:
+            if line.startswith('@/sys/fs/cgroup/'):
+                current = line.rsplit('/', 1)[1]
+                sample['files'][current] = ''
+            elif current:
+                sample['files'][current] += line + '\n'
+        return sample
+
+    def sample_cgroups(self, interval):
+        # Worker cgroup counters on the Docker VM's wall clock, which the driver's phases also record.
+        while not self.sampling.wait(interval):
+            for name in WORKERS:
+                try:
+                    self.samples.append(self.cgroup_sample(name))
+                except (RuntimeError, ValueError, IndexError, subprocess.SubprocessError) as error:
+                    self.samples.append({'worker': name, 'error': str(error)})
+
+    def recover(self, name):
+        """SIGKILL one worker, restart it in place, time process start to serving (NS11 G6)."""
+        container = f'{self.prefix}-{name}'
+        record = {'worker': name, 'before_kill': self.cgroup_sample(name)}
+        self.docker('kill', '--signal', 'KILL', container)
+        self.docker('wait', container, timeout=60)
+        record['killed_state'] = json.loads(self.docker('inspect', '--format', '{{json .State}}', container))
+        start = time.monotonic()
+        self.docker('start', container)
+        started = json.loads(self.docker('inspect', '--format', '{{json .State}}', container))
+        record['restarted_state'] = started
+        url = self.host_url(name)
+        client = Http(url, self.auth['data_token'], 2)
+        ready = None
+        try:
+            while time.monotonic() - start < 300:
+                try:
+                    status, reply = client.exchange('/health/ready')
+                    if status == 200 and reply.get('ready_workers') == len(WORKERS) and reply.get('run_id') == self.run_id:
+                        ready = time.monotonic() - start
+                        record['ready_reply'] = reply
+                        break
+                except (OSError, http.client.HTTPException, ValueError):
+                    client.close()
+                    client = Http(url, self.auth['data_token'], 2)
+                time.sleep(0.05)
+        finally:
+            client.close()
+        record['ready_seconds'] = ready
+        # The process start, from the container's own clock, to the readiness reply.
+        record['process_started_at'] = started.get('StartedAt')
+        if ready is not None and self.args.direct_oltp == 'on':
+            capability_start = time.monotonic()
+            try:
+                record['direct_capability_after_restart'] = self.wait_direct_capability({name: url}, 120)
+                record['direct_active_seconds'] = ready + time.monotonic() - capability_start
+            except RuntimeError as error:
+                record['direct_capability_error'] = str(error)
+        # A write and a read through the API after the restart: the cluster serves.
+        ca = ssl.create_default_context(cafile=str(self.directory / 'ca.pem'))
+        api = Http(self.host_url('api', 'https'), self.auth['data_token'], 30, ca)
+        try:
+            probe_start = time.monotonic()
+            results = json.loads((self.args.output / 'results.json').read_text())
+            table_id = results['seed_details']['descriptor']['id']
+            request_id = uid()
+            status, reply = api.exchange('/v1/operations', dict(request_id=request_id, operation='table.get',
+                                         payload={'table_id': table_id, 'key': 0}))
+            record['probe'] = {'operation': 'table.get', 'status': status, 'seconds': time.monotonic() - probe_start,
+                               'ok': status == 200 and reply.get('request_id') == request_id}
+        except (OSError, http.client.HTTPException, ValueError, KeyError) as error:
+            record['probe'] = {'error': str(error)}
+        finally:
+            api.close()
+        record['after_restart'] = self.cgroup_sample(name)
+        return record
 
     def run(self):
         args = self.args
@@ -572,14 +900,46 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                                                 for worker, quota in self.worker_nano_cpus.items()}
         write_json(self.directory / 'metadata.json', self.metadata)
         settings = ['--rates', ','.join(map(str, args.rates))]
-        for field in ('seconds', 'warmup_seconds', 'repetitions', 'clients', 'rows', 'seed', 'timeout'):
+        for field in ('seconds', 'warmup_seconds', 'repetitions', 'clients', 'rows', 'seed', 'timeout',
+                      'operation', 'read_fraction', 'soak_rows', 'soak_payload_bytes', 'soak_seconds',
+                      'soak_phase_seconds', 'soak_rate', 'soak_seed_clients'):
             settings += ['--' + field.replace('_', '-'), str(getattr(args, field))]
-        driver = self.launch('driver', DRIVER_CPU, DRIVER_MEMORY, 'python3',
-            ['/source/scripts/benchmark_oltp_nabedra.py', '--driver', '--output', '/results', *settings])
-        print(f'Running the OLTP workload in {driver}', flush=True)
-        state = int(self.docker('wait', driver, timeout=len(args.rates) * (args.warmup_seconds
-                    + args.repetitions * args.seconds + (args.repetitions + 1) * (args.timeout + 30)) + 120))
-        self.docker('cp', f'{driver}:/results/.', str(args.output), timeout=120)
+        if args.stop_p99_ms is not None:
+            settings += ['--stop-p99-ms', str(args.stop_p99_ms)]
+        if args.stop_on_rejection:
+            settings.append('--stop-on-rejection')
+        if args.soak:
+            settings.append('--soak')
+        sampler = threading.Thread(target=self.sample_cgroups, args=(args.cgroup_interval,), daemon=True)
+        sampler.start()
+        try:
+            driver = self.launch('driver', DRIVER_CPU, DRIVER_MEMORY, 'python3',
+                ['/source/scripts/benchmark_oltp_nabedra.py', '--driver', '--output', '/results', *settings])
+            print(f'Running the OLTP workload in {driver}', flush=True)
+            budget = len(args.rates) * (args.warmup_seconds + args.repetitions * args.seconds
+                                        + (args.repetitions + 1) * (args.timeout + 30)) + 120
+            if args.soak:
+                budget = 7200 + 2 * args.soak_seconds
+            state = int(self.docker('wait', driver, timeout=budget))
+            self.docker('cp', f'{driver}:/results/.', str(args.output), timeout=120)
+        finally:
+            self.sampling.set()
+            sampler.join(timeout=60)
+            with (args.output / 'cgroup-samples.jsonl').open('w') as stream:
+                for sample in self.samples:
+                    stream.write(json.dumps(sample, separators=(',', ':')) + '\n')
+        if args.kill_worker:
+            try:
+                recovery = self.recover(args.kill_worker)
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                recovery = {'error': str(error)}
+            write_json(args.output / 'recovery.json', recovery)
+        for name in WORKERS:
+            try:
+                usage = self.docker('exec', f'{self.prefix}-{name}', 'du', '-sb', '/data', timeout=60)
+                self.metadata.setdefault('data_bytes', {})[name] = int(usage.split()[0])
+            except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                self.metadata.setdefault('data_bytes', {})[name] = str(error)
         return state
 
     def record_status_leader_hints(self):
@@ -621,6 +981,9 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                         '/sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events '
                         '/proc/net/dev /proc/net/snmp /proc/net/netstat; do '
                         'if [ -f "$f" ]; then echo "$f"; cat "$f"; fi; done')
+                if self.args.strace and name.rsplit('-', 1)[-1] in WORKERS:
+                    subprocess.run(['docker', 'cp', f'{name}:/tmp/strace.log',
+                                    str(self.args.output / f'{name}.strace.log')], timeout=120, check=False)
                 log_path = self.args.output / f'{name}.log'
                 if self.args.rpc_trace and not name.endswith('-driver'):
                     with log_path.open('w+b') as log:
@@ -691,11 +1054,32 @@ def main():
     parser.add_argument('--scoped-oltp', action='store_true', help='activate the RF3 scoped point path')
     parser.add_argument('--tls-key-type', choices=('rsa', 'ed25519'), default='rsa',
                         help='key type for fixture certificates, including the CA (default: rsa)')
+    parser.add_argument('--direct-oltp', choices=('on', 'off'),
+                        help='set direct_oltp on every worker and the API (omit for b29a178, which predates it)')
+    parser.add_argument('--orm-source', type=Path, default=ROOT / 'orm' / 'python' / 'src',
+                        help='Python ORM source tree for the API CLI (use the baseline revision\'s tree for b29a178)')
+    parser.add_argument('--pool-format-version', type=int, choices=(1, 2), default=2,
+                        help='mount identity pool format: 2 for nabedra-kv pools, 1 for b29a178 (RocksDB)')
+    parser.add_argument('--strace', action='store_true',
+                        help=f'run each worker under strace -f -e trace={STRACE_CALLS} (fsync counts; distorts latency)')
+    parser.add_argument('--kill-worker', choices=WORKERS, help='after the workload, SIGKILL this worker and time its restart')
+    parser.add_argument('--cgroup-interval', type=float, default=5, help='seconds between worker cgroup samples')
+    parser.add_argument('--soak', action='store_true', help='run the storage soak instead of the rate sweep')
+    parser.add_argument('--soak-rows', type=int, default=80_000)
+    parser.add_argument('--soak-payload-bytes', type=int, default=2048)
+    parser.add_argument('--soak-seconds', type=float, default=600)
+    parser.add_argument('--soak-phase-seconds', type=float, default=60)
+    parser.add_argument('--soak-rate', type=float, default=50)
+    parser.add_argument('--soak-seed-clients', type=int, default=4)
     parser.add_argument('--driver', action='store_true', help=argparse.SUPPRESS)
     add_workload_args(parser)
     args = parser.parse_args()
     try:
-        validate_args(args)
+        if args.soak:
+            if args.soak_rate * args.soak_phase_seconds > args.soak_rows or args.soak_rate <= 0:
+                raise ValueError('each soak phase must offer between 1 and --soak-rows distinct updates')
+        else:
+            validate_args(args)
     except ValueError as error:
         parser.error(str(error))
     if args.driver:
@@ -708,12 +1092,16 @@ def main():
             metadata['trace_clock'] = {'unix_ns': unix_ns, 'monotonic_ns': (before + after) // 2,
                                        'sample_interval_ns': after - before}
         adapter = Nabedra(Path('/fixture/ca.pem'), auth, args.timeout, metadata)
+        if args.soak:
+            results = run_soak(args, adapter, args.output, metadata)
+            return int(not results['correctness_verified'])
         results = run_workload(args, adapter, args.output, metadata)
         return int(not results['correctness_verified'])
     if not args.image:
         parser.error('--image is required')
     if args.binary:
         args.binary = args.binary.resolve(strict=True)
+    args.orm_source = args.orm_source.resolve(strict=True)
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
