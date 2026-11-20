@@ -34,9 +34,22 @@ impl TopologySource for WorkerTopology {
                 .control
                 .current(&runtime.services.scope)
                 .await?;
-            runtime
-                .direct_table_fill(current.ready.view.authority(), table_id)
-                .await
+            // The `DirectLeader` Catalog reader: a worker that is not the
+            // queue owner cannot read through the owner's role (T6 concern
+            // 3). Before activation (no reader yet) the owner path stays.
+            match runtime
+                .direct_switch()
+                .and_then(|switch| switch.direct_catalog())
+            {
+                Some(catalog) => {
+                    direct::catalog_fill(&catalog, current.ready.view.authority(), table_id).await
+                }
+                None => {
+                    runtime
+                        .direct_table_fill(current.ready.view.authority(), table_id)
+                        .await
+                }
+            }
         })
     }
     fn placement<'a>(

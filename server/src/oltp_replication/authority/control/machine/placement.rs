@@ -15,11 +15,11 @@ pub(in crate::oltp_replication::authority::control) fn move_key(id: Uuid) -> Vec
     key(b"ct/replica-move/", id)
 }
 
-fn claim_key(group_id: Uuid) -> Vec<u8> {
+pub(super) fn claim_key(group_id: Uuid) -> Vec<u8> {
     key(b"ct/group-replacement/", group_id)
 }
 
-fn occupied(group_id: Uuid, node_id: u64) -> Vec<u8> {
+pub(super) fn occupied(group_id: Uuid, node_id: u64) -> Vec<u8> {
     member_key_nested(b"ct/permanent-replica/", group_id, node_id)
 }
 

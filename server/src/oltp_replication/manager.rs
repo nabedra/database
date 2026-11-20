@@ -32,12 +32,15 @@ use std::{
 mod data_factory;
 mod lifecycle;
 pub(crate) use lifecycle::{
-    AppliedPlacementMembership, DamageSink, ReplicatedLearner, settle_damage,
+    AppliedPlacementMembership, DamageSink, ReplicatedLearner, ReportingDamageSink,
+    SettlingReplicas, spawn_settlement,
 };
 #[allow(unused_imports)]
-pub(crate) use lifecycle::{DamageControl, DamagedReplacement};
+pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
 #[cfg(test)]
 mod damage_tests;
+#[cfg(test)]
+mod damage_scheduler_tests;
 mod retirement;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
@@ -45,6 +48,9 @@ pub(crate) use data_factory::placement::{
     PlacementCatalog, RemotePlacementTarget, ReplicaPlacement,
 };
 pub(crate) use data_factory::split as shard_split;
+pub(crate) use data_factory::damage_replacement::{
+    DamageHost, DamageReplacementEndpoint, DamageScheduler, FactoryDamageHost,
+};
 pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
 pub(crate) use local::{
     GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredSystemGroups,

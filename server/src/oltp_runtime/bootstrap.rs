@@ -61,9 +61,10 @@ pub(crate) struct LocalServices {
     pub control: Arc<ControlHandle>,
     pub operator: Arc<LocalOperatorPermit>,
     pub timestamps: Arc<dyn TimestampService>,
-    /// This process's own Timestamp replica for `AllocateDirect`, when the
-    /// Timestamp service is not reachable over the service lane (a single
-    /// worker). `None` for registered workers.
+    /// This process's own Timestamp replica for `AllocateDirect`, tried in
+    /// process before the service lane: a single worker (whose Timestamp
+    /// service is not on the service lane) and every registered worker
+    /// (each hosts a Timestamp replica; only the leader answers).
     pub direct_timestamps:
         Option<Arc<dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource>>,
     pub status: Arc<dyn StatusService>,

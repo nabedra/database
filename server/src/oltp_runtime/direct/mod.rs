@@ -49,3 +49,26 @@ impl DirectGate for super::worker_runtime::WorkerRuntime {
         self.direct_commits_active()
     }
 }
+
+/// Test-only tracing for the direct-path suites: with
+/// `NABEDRA_DIRECT_TRACE=<targets>` (for example
+/// `nabedra_database_server::oltp_replication::hosted=warn,openraft=info`)
+/// the process logs those targets to stderr. Without it, nothing changes.
+#[cfg(test)]
+pub(crate) fn trace_for_test() {
+    use tracing_subscriber::prelude::*;
+    let Some(targets) = std::env::var("NABEDRA_DIRECT_TRACE").ok() else {
+        return;
+    };
+    let Ok(targets) = targets.parse::<tracing_subscriber::filter::Targets>() else {
+        return;
+    };
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::io::stderr)
+                .with_filter(targets),
+        )
+        .try_init();
+}

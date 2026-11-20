@@ -66,8 +66,12 @@ pub(crate) trait DirectSchema: Send + Sync {
         authority: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup>;
     /// The table record's current lifecycle id, which a first activation of
-    /// a Data group binds (T7). `None` when the table is missing or a DDL
-    /// holds an intent on it.
+    /// a Data group binds (T7). `None` when the table is missing, a DDL
+    /// holds an intent on it, or a DDL holds or awaits the table's exclusive
+    /// lifecycle guard (T7b: a DDL that saw `data.direct.v1` inactive does
+    /// not fence, so its pre-DDL lifecycle must not be bound). The guard is
+    /// read before the table record, linearizably: a DDL that takes the
+    /// guard after that read already sees the capability active and fences.
     fn lifecycle(&self, table_id: Uuid, authority: Authority) -> ConsensusFuture<'_, Option<Uuid>>;
 }
 
@@ -75,8 +79,26 @@ pub(crate) trait DirectSchema: Send + Sync {
 #[derive(Default)]
 pub(crate) struct StaticSchema {
     tables: Mutex<HashMap<Uuid, Arc<DirectTable>>>,
+    /// Tables whose exclusive lifecycle guard a modelled DDL holds.
+    exclusive: Mutex<std::collections::HashSet<Uuid>>,
+    /// The next this many lifecycle reads fail as an unreachable Catalog.
+    failing_reads: Mutex<u32>,
 }
 impl StaticSchema {
+    /// Models a Catalog that cannot answer the next `count` lifecycle reads.
+    pub(crate) fn fail_lifecycle_reads(&self, count: u32) {
+        *self.failing_reads.lock().unwrap_or_else(|p| p.into_inner()) = count;
+    }
+    /// Models a DDL taking (`true`) or releasing the table's exclusive
+    /// lifecycle guard.
+    pub(crate) fn hold_exclusive(&self, table_id: Uuid, held: bool) {
+        let mut exclusive = self.exclusive.lock().unwrap_or_else(|p| p.into_inner());
+        if held {
+            exclusive.insert(table_id);
+        } else {
+            exclusive.remove(&table_id);
+        }
+    }
     pub(crate) fn insert(&self, table: DirectTable) {
         self.tables
             .lock()
@@ -86,6 +108,29 @@ impl StaticSchema {
 }
 impl DirectSchema for StaticSchema {
     fn lifecycle(&self, table_id: Uuid, _: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
+        let failing = {
+            let mut left = self.failing_reads.lock().unwrap_or_else(|p| p.into_inner());
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            failing
+        };
+        if failing {
+            return Box::pin(async {
+                Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "modelled Catalog unavailable",
+                    Outcome::Unknown,
+                ))
+            });
+        }
+        if self
+            .exclusive
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&table_id)
+        {
+            return Box::pin(async { Ok(None) });
+        }
         let found = self
             .tables
             .lock()
@@ -265,6 +310,16 @@ impl DirectSchema for CatalogSchema {
     }
     fn lifecycle(&self, table_id: Uuid, authority: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
         Box::pin(async move {
+            // The guard first: see the trait.
+            if self
+                .catalog
+                .participant()
+                .lifecycle_exclusive(table_id)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
             let latest = ReadTs::new(u64::MAX).map_err(|_| invalid())?;
             let pin = self.catalog.snapshot(latest, authority)?;
             Ok(match self.catalog.describe(&pin, table_id).await? {

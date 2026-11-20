@@ -860,7 +860,9 @@ impl WorkerTransport {
             trace.phase = RaftTransportPhase::Handle;
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
-            let _handler = handler;
+            // Free the lane before the reply can reach the peer, as on a
+            // session: its next request must not find this call's slot held.
+            drop(handler);
             trace.phase = RaftTransportPhase::SendReply;
             write_reply(&mut stream, hello.nonce, 0, &reply).await
         }
@@ -1322,7 +1324,7 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
             Ok(TrafficClass::ServiceMutation)
         }
         Purpose::GroupLifecycle if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
-        Purpose::ReplicaPlacement if group.kind == GroupKind::Control => {
+        Purpose::ReplicaPlacement | Purpose::GroupDamage if group.kind == GroupKind::Control => {
             Ok(TrafficClass::Settlement)
         }
         Purpose::ShardSplit if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
@@ -1521,6 +1523,7 @@ impl Hello {
             15 => Purpose::ShardSplitImage,
             16 => Purpose::ReplicaPlacement,
             17 => Purpose::RaftProgress,
+            18 => Purpose::GroupDamage,
             _ => return Err(malformed("unknown worker RPC purpose")),
         };
         let member = |start| WorkerIdentity {

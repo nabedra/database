@@ -191,6 +191,7 @@ fn span(start: Option<i64>, end: Option<i64>) -> KeySpan {
 
 impl Cluster {
     async fn new() -> Self {
+        crate::oltp_runtime::direct::trace_for_test();
         let dir = Dir(std::env::temp_dir().join(format!("t6-gateway-{}", Uuid::new_v4())));
         std::fs::create_dir_all(&dir.0).unwrap();
         let certificates = tls::certificates(&dir.0, 3);

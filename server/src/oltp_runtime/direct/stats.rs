@@ -28,6 +28,29 @@ pub(crate) enum RetryCause {
 }
 const RETRY_CAUSES: usize = 5;
 
+/// Why a proposal (a `DirectCommit`, a forward marker, a group activation or
+/// an expiry page) produced no reply. Tells a slow election from a stuck
+/// leader (T7b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProposalFailure {
+    /// The request deadline expired while the proposal was in flight.
+    Deadline,
+    /// Raft refused or lost the proposal and this node no longer serves the
+    /// term it proposed in (an election moved leadership).
+    Leadership,
+    /// Raft refused or lost the proposal while this node still served the
+    /// same term: quorum, log or apply trouble on a stable leader.
+    Stalled,
+    /// The group's first activation (`DirectSchema::Activate`) failed.
+    Activation,
+}
+const PROPOSAL_FAILURES: [(&str, ProposalFailure); 4] = [
+    ("deadline", ProposalFailure::Deadline),
+    ("leadership", ProposalFailure::Leadership),
+    ("stalled", ProposalFailure::Stalled),
+    ("activation", ProposalFailure::Activation),
+];
+
 #[derive(Default)]
 pub(crate) struct DirectStats {
     requests: AtomicU64,
@@ -44,6 +67,7 @@ pub(crate) struct DirectStats {
     read_only: AtomicU64,
     fallbacks: [AtomicU64; FallbackReason::ALL.len()],
     retries: [AtomicU64; RETRY_CAUSES],
+    proposal_failures: [AtomicU64; PROPOSAL_FAILURES.len()],
     latch_waits: AtomicU64,
     latch_wait_micros: AtomicU64,
     overloaded: AtomicU64,
@@ -110,6 +134,9 @@ impl DirectStats {
     pub(crate) fn retry(&self, cause: RetryCause) {
         bump(&self.retries[cause as usize]);
     }
+    pub(crate) fn proposal_failed(&self, reason: ProposalFailure) {
+        bump(&self.proposal_failures[reason as usize]);
+    }
     pub(crate) fn latch_wait(&self, waited: Duration) {
         bump(&self.latch_waits);
         self.latch_wait_micros
@@ -174,6 +201,10 @@ impl DirectStats {
             .iter()
             .map(|(name, cause)| (*name, load(&self.retries[*cause as usize])))
             .collect();
+        let proposal_failures = PROPOSAL_FAILURES
+            .iter()
+            .map(|(name, reason)| (*name, load(&self.proposal_failures[*reason as usize])))
+            .collect();
         DirectStatsSnapshot {
             requests: load(&self.requests),
             gets: load(&self.gets),
@@ -188,6 +219,7 @@ impl DirectStats {
             batch_sizes,
             fallbacks,
             retries,
+            proposal_failures,
             latch_waits: load(&self.latch_waits),
             latch_wait_micros: load(&self.latch_wait_micros),
             overloaded_429: load(&self.overloaded),
@@ -225,6 +257,8 @@ pub(crate) struct DirectStatsSnapshot {
     pub batch_sizes: BTreeMap<String, u64>,
     pub fallbacks: BTreeMap<&'static str, u64>,
     pub retries: BTreeMap<&'static str, u64>,
+    /// Proposals that produced no reply, by `ProposalFailure`.
+    pub proposal_failures: BTreeMap<&'static str, u64>,
     pub latch_waits: u64,
     pub latch_wait_micros: u64,
     pub overloaded_429: u64,

@@ -205,6 +205,7 @@ fn descriptor(table: Uuid) -> TableDescriptor {
 
 impl Cluster {
     async fn new(options: Options) -> Self {
+        crate::oltp_runtime::direct::trace_for_test();
         let dir = Dir::new();
         let certificates = tls::certificates(&dir.0, 3);
         let cluster_id = Uuid::new_v4();
@@ -349,6 +350,9 @@ impl Cluster {
             let dyn_consensus: Arc<dyn Consensus<ParticipantCommand, ParticipantReply>> =
                 consensus.clone();
             let handle = Arc::new(ParticipantHandle::new(machine, dyn_consensus));
+            // What `ParticipantEndpoint::new` does for every served Data
+            // replica: the expiry task visits it (T7b).
+            crate::oltp_replication::service_rpc::direct::register_replica(&handle);
             let executor = DirectExecutor::new(
                 shared.clone(),
                 options.config,
@@ -1403,6 +1407,15 @@ async fn d05_one_stopped_follower_keeps_writes_and_two_stop_every_success() {
         // A proposal that may still commit is reported as unknown.
         assert!(matches!(outcome, Outcome::Unknown | Outcome::NotApplied));
     }
+    // T7b: a lost quorum shows as proposals that never answered, not as a
+    // leadership change.
+    let stats = cluster.voters[leader].executor.stats();
+    if stats.entries_proposed > 5 {
+        assert!(
+            stats.proposal_failures["deadline"] + stats.proposal_failures["stalled"] >= 1,
+            "{stats:?}"
+        );
+    }
     assert_eq!(
         cluster.latest(leader, cluster.row_key(1)).await,
         before,
@@ -1601,9 +1614,17 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
     .await;
     let leader = cluster.leader().await;
     let handle = cluster.voters[leader].handle.clone();
-    assert_eq!(handle.direct_schema().await.unwrap(), None, "not active yet");
-    let row = |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
-    assert_eq!(cluster.op(leader, "table.insert", row(1)).await, done("null"));
+    assert_eq!(
+        handle.direct_schema().await.unwrap(),
+        None,
+        "not active yet"
+    );
+    let row =
+        |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
+    assert_eq!(
+        cluster.op(leader, "table.insert", row(1)).await,
+        done("null")
+    );
     assert_eq!(
         handle.direct_schema().await.unwrap(),
         Some(GroupSchema {
@@ -1641,7 +1662,10 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
         lifecycle_id: published,
         indexes: Vec::new(),
     });
-    assert_eq!(cluster.op(leader, "table.insert", row(2)).await, done("null"));
+    assert_eq!(
+        cluster.op(leader, "table.insert", row(2)).await,
+        done("null")
+    );
     assert!(cluster.latest(leader, cluster.row_key(2)).await.0.is_some());
     // A drop fence: no direct write applies to the table again.
     handle
@@ -1655,5 +1679,234 @@ async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_publishe
         "{dropped:?}"
     );
     assert_eq!(cluster.latest(leader, cluster.row_key(3)).await.0, None);
+    cluster.shutdown().await;
+}
+
+/// T7b item 2 (T7 concern 1): a DDL that read `data.direct.v1` as inactive
+/// skips its fence. While it holds the table's exclusive lifecycle guard,
+/// no first request may bind the pre-DDL lifecycle to the group: a mutation
+/// falls back with nothing proposed, a forward waits. Once the DDL publishes
+/// its descriptor (here: a new index) and releases the guard, the group is
+/// activated at the new lifecycle and the leader writes with the new
+/// descriptor, index entry included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o12_d11_t7b_activation_waits_for_a_ddl_that_read_the_capability_inactive() {
+    let cluster = Cluster::new(Options {
+        activate: false,
+        ..Options::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    let v = &cluster.voters[leader];
+    // The pre-DDL table: no index.
+    cluster.schema.insert(DirectTable {
+        descriptor: descriptor(cluster.table),
+        schema_epoch: 1,
+        lifecycle_id: cluster.table,
+        indexes: Vec::new(),
+    });
+    // The DDL holds the guard; its probe saw the capability inactive, so it
+    // committed no fence.
+    cluster.schema.hold_exclusive(cluster.table, true);
+    let row =
+        |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
+    let before = cluster.last_index(leader);
+    let blocked = cluster.op(leader, "table.insert", row(1)).await;
+    assert_eq!(
+        blocked,
+        DirectResponse::Fallback {
+            reason: FallbackReason::Schema
+        }
+    );
+    assert_eq!(
+        v.handle.direct_schema().await.unwrap(),
+        None,
+        "not activated"
+    );
+    assert_eq!(cluster.last_index(leader), before, "nothing proposed");
+    // A forward waits for the guard: its marker needs an active group.
+    let id = Uuid::new_v4();
+    let body = cluster.body(id, "table.insert", row(2));
+    let forward = {
+        let executor = v.executor.clone();
+        let handle = v.handle.clone();
+        let request = cluster.request(leader, &body, id);
+        tokio::spawn(async move { executor.forward(&handle, request).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!forward.is_finished(), "the forward waits for the DDL");
+    assert_eq!(v.handle.direct_schema().await.unwrap(), None);
+    // The DDL publishes a new lifecycle with an index, then releases.
+    let published = Uuid::new_v4();
+    cluster.schema.insert(DirectTable {
+        descriptor: descriptor(cluster.table),
+        schema_epoch: 1,
+        lifecycle_id: published,
+        indexes: vec![IndexDefinition {
+            index_id: cluster.index,
+            table_id: cluster.table,
+            name: Text::try_from("by_value").unwrap(),
+            columns: Page::new(vec![Text::try_from("value").unwrap()]).unwrap(),
+            covering: Page::new(Vec::new()).unwrap(),
+        }],
+    });
+    cluster.schema.hold_exclusive(cluster.table, false);
+    assert_eq!(
+        forward.await.unwrap(),
+        DirectResponse::Fallback {
+            reason: FallbackReason::Forwarded
+        },
+        "the marker lands once the group is active"
+    );
+    assert_eq!(
+        v.handle.direct_schema().await.unwrap(),
+        Some(crate::oltp::mvcc::store::direct::DirectSchema {
+            epoch: 1,
+            lifecycle: Some(published)
+        }),
+        "bound to the published lifecycle, never the pre-DDL one"
+    );
+    assert_eq!(
+        cluster.op(leader, "table.insert", row(3)).await,
+        done("null")
+    );
+    assert!(
+        cluster
+            .latest(leader, cluster.index_key(3, 3))
+            .await
+            .0
+            .is_some(),
+        "the leader wrote with the published descriptor"
+    );
+    cluster.shutdown().await;
+}
+
+/// T7b item 6 (T6 concern 5): a group activation that fails transiently
+/// (an unreachable Catalog) is retried inside the executor within the
+/// deadline; the request commits instead of answering
+/// `storage_unavailable` with an unknown outcome. Activation that cannot
+/// finish before the deadline answers `not_applied`: the request itself was
+/// never proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d04_t7b_activation_failures_are_retried_inside_the_executor() {
+    let cluster = Cluster::new(Options {
+        activate: false,
+        ..Options::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    cluster.schema.fail_lifecycle_reads(5);
+    let row =
+        |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
+    assert_eq!(
+        cluster.op(leader, "table.insert", row(1)).await,
+        done("null")
+    );
+    let stats = cluster.voters[leader].executor.stats();
+    assert!(stats.retries["unavailable"] >= 5, "{stats:?}");
+    assert_eq!(stats.outcome_unknown, 0, "{stats:?}");
+    cluster.shutdown().await;
+    // A fresh group: both followers stop before a never-activated request;
+    // activation cannot reach quorum before the deadline.
+    let mut cluster = Cluster::new(Options {
+        activate: false,
+        ..Options::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    for follower in (0..3).filter(|v| *v != leader).collect::<Vec<_>>() {
+        cluster.stop(follower).await;
+    }
+    let id = Uuid::new_v4();
+    let body = cluster.body(id, "table.insert", row(2));
+    let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(1500));
+    let started = std::time::Instant::now();
+    let answer = cluster.voters[leader]
+        .executor
+        .execute(&cluster.voters[leader].handle, request)
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "bounded by the deadline"
+    );
+    assert_eq!(
+        code(&answer),
+        Some((ErrorCode::StorageUnavailable, Outcome::NotApplied)),
+        "{answer:?}"
+    );
+    let stats = cluster.voters[leader].executor.stats();
+    assert!(stats.proposal_failures["activation"] >= 1, "{stats:?}");
+    assert_eq!(stats.entries_proposed, 0, "the request was never proposed");
+    cluster.shutdown().await;
+}
+
+/// T7b item 7 (T5 concern 3): after a leader change, the new leader's
+/// expiry pass deletes old dedup records on a range it leads although it
+/// never served a direct request there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
+    let cluster = Cluster::new(Options {
+        electors: vec![1, 2, 3],
+        config: DirectConfig {
+            dedup_retention_ms: 1,
+            ..DirectConfig::default()
+        },
+        ..Options::default()
+    })
+    .await;
+    let old = cluster.leader().await;
+    for id in 0..3 {
+        assert_eq!(
+            cluster
+                .op(
+                    old,
+                    "table.upsert",
+                    serde_json::json!({"row": {"id": id, "value": id, "tag": "e", "score": 0.0}}),
+                )
+                .await,
+            done("null")
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        cluster
+            .op(
+                old,
+                "table.upsert",
+                serde_json::json!({"row": {"id": 10, "value": 1, "tag": "e", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    cluster.converge(old).await;
+    // Leadership moves to a node whose executor never served this range.
+    let next = (old + 1) % 3;
+    let new = watchdog(|| async {
+        let _ = cluster.voters[next]
+            .consensus
+            .raft
+            .trigger()
+            .elect(false)
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let leader = cluster.leader().await;
+        (leader != old).then_some(leader)
+    })
+    .await;
+    cluster.serving(new).await;
+    let executor = &cluster.voters[new].executor;
+    assert_eq!(executor.stats().requests, 0, "never served a request");
+    let deleted = watchdog(|| async {
+        let deleted = executor.expire_served().await;
+        (deleted > 0).then_some(deleted)
+    })
+    .await;
+    assert_eq!(deleted, 3);
+    for voter in 0..3 {
+        let cluster = &cluster;
+        watchdog(|| async { (cluster.keys_with(voter, b'D').await == 1).then_some(()) }).await;
+    }
+    // The old leader, now a follower, proposes nothing.
+    assert_eq!(cluster.voters[old].executor.expire_served().await, 0);
     cluster.shutdown().await;
 }
