@@ -16,6 +16,7 @@ use crate::{
                 ParticipantReply, compare_keys,
                 direct::{
                     ClockRejection, DEFAULT_DIRECT_DEDUP_RETENTION_MS, DedupLookup, DirectCommit,
+                    DirectSchema as GroupSchema, DirectSchemaChange,
                     DirectExpire, DirectForward, DirectReply, DirectWrite, IndexChange,
                     LeaderToken, MAX_DIRECT_EXPIRE_ITEMS, MAX_DIRECT_INDEX_CHANGES,
                     MAX_DIRECT_RESULT_BYTES, MAX_DIRECT_WRITES, RangeClock, expiry_cutoff,
@@ -324,6 +325,51 @@ impl DirectExecutor {
         {
             return Err(stale_route(Some(&epochs)));
         }
+        let epochs = self.activated(handle, request.table_id, epochs).await?;
+        match epochs.direct_schema {
+            // The table's drop fenced this group: no direct commit applies.
+            Some(GroupSchema {
+                lifecycle: None, ..
+            }) => Err(failed(ProtocolError::new(
+                ErrorCode::NotFound,
+                "table or shard not found",
+                Outcome::NotApplied,
+            ))),
+            _ => Ok(epochs),
+        }
+    }
+
+    /// `data.direct.v1` reached Control (the gate is open) but not yet this
+    /// group: activate it, bound to the table's current Catalog lifecycle,
+    /// then re-read the group's epochs. A DDL fence that applied first wins;
+    /// activation never undoes it.
+    async fn activated(
+        &self,
+        handle: &ParticipantHandle,
+        table_id: Uuid,
+        epochs: ParticipantEpochs,
+    ) -> Result<ParticipantEpochs, DirectResponse> {
+        if epochs.direct_schema.is_some() {
+            return Ok(epochs);
+        }
+        let Some(lifecycle) = self
+            .schema
+            .lifecycle(table_id, epochs.authority)
+            .await
+            .map_err(failed)?
+        else {
+            return Err(DirectResponse::Fallback {
+                reason: FallbackReason::Schema,
+            });
+        };
+        handle
+            .change_direct_schema(DirectSchemaChange::Activate { lifecycle })
+            .await
+            .map_err(failed)?;
+        let epochs = handle.direct_epochs().await.map_err(failed)?;
+        if epochs.direct_schema.is_none() {
+            return Err(failed(unavailable_not_applied()));
+        }
         Ok(epochs)
     }
 
@@ -335,7 +381,12 @@ impl DirectExecutor {
     ) -> Result<Arc<DirectTable>, DirectResponse> {
         let table = match self
             .schema
-            .table(request.table_id, request.schema_epoch, epochs.authority)
+            .table(
+                request.table_id,
+                request.schema_epoch,
+                epochs.direct_schema,
+                epochs.authority,
+            )
             .await
             .map_err(failed)?
         {
@@ -646,7 +697,10 @@ impl DirectExecutor {
         let commit = DirectCommit {
             authority: epochs.authority,
             table_id: request.table_id,
-            schema_epoch: epochs.schema_epoch,
+            // The group's direct epoch (T7 DDL fence), not the route's.
+            schema_epoch: epochs
+                .direct_schema
+                .map_or(epochs.schema_epoch, |schema| schema.epoch),
             routing_epoch: epochs.routing_epoch,
             request_id: request.request_id,
             digest: request.digest,
@@ -913,9 +967,11 @@ impl DirectExecutor {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
             let epochs = handle.direct_epochs().await.map_err(failed)?;
+            // A forward marker is gated like Direct: activate the group.
+            let epochs = self.activated(handle, request.table_id, epochs).await?;
             let table = match self
                 .schema
-                .table(request.table_id, request.schema_epoch, epochs.authority)
+                .table(request.table_id, request.schema_epoch, None, epochs.authority)
                 .await
                 .map_err(failed)?
             {
@@ -1060,6 +1116,10 @@ impl DirectExecutor {
         // Bounded: one interval deletes at most this many pages.
         for _ in 0..64 {
             let epochs = handle.direct_epochs().await?;
+            // Nothing to expire on a group direct commits never reached.
+            if epochs.direct_schema.is_none() {
+                return Ok(deleted);
+            }
             let command = OwnedCommand::new_owned(
                 ParticipantCommand::DirectExpire(DirectExpire {
                     authority: epochs.authority,
@@ -1158,6 +1218,10 @@ fn fault_response(fault: Fault, epochs: &ParticipantEpochs) -> DirectResponse {
         },
         Fault::ResourceLimit => DirectResponse::Fallback {
             reason: FallbackReason::ResourceLimit,
+        },
+        // The store-side `data.direct.v1` gate (T7): nothing was written.
+        Fault::DirectInactive => DirectResponse::Fallback {
+            reason: FallbackReason::Inactive,
         },
         _ => failed(ProtocolError::new(
             ErrorCode::InternalError,

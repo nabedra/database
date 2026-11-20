@@ -51,6 +51,11 @@ pub(super) fn begin(
     let Some(removed) = plan.removed() else {
         return fault(Fault::Invalid);
     };
+    // The added replica is a learner first: once `data.direct.v1` is active
+    // its worker must decode direct entries.
+    if !super::direct::admits_worker_id(tx, request.target.worker_id)? {
+        return fault(Fault::DirectCapabilityRequired);
+    }
     let mut next = plan.old.clone();
     for member in &mut next {
         if member == removed {

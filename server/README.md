@@ -127,6 +127,30 @@ eligible. Other operations and preexisting all-ready identities retain their
 original execution paths. The [OLTP contract](../docs/testing/oltp-contract.md)
 specifies the acceptance, recovery, and receipt boundaries.
 
+### Direct point operations (`data.direct.v1`)
+
+Every worker and gateway advertises the `data.direct.v1` Control capability
+at startup. Control activates it once every enrolled worker and API ingress has
+advertised its current identity. Activation is durable and never reverts.
+
+- Upgrade all Control voters first. An older Control replica cannot decode the
+  advertisement, as with the scoped-queue capability.
+- Before activation, no node proposes a direct-family Data entry, and a Data
+  group rejects any that arrives.
+- After activation, a worker that has not advertised (an older build, or a
+  re-enrolled process that has not advertised yet) cannot join the ready set
+  or become a voter or learner of a group. Control returns
+  `DirectCapabilityRequired`.
+- Downgrade is unsupported once the capability is active. Data groups then
+  hold direct entries, dedup records and forward markers, and the activated
+  group configuration cannot be read by an older build.
+- `execution.direct_oltp` (workers) and `topology.direct_oltp` (remote
+  gateways) default to `true`. Setting `false` keeps the capability but routes
+  eligible operations through the queue. Each request ID is still settled at
+  its anchor range before it is queued.
+- While the capability is active, incremental backups are refused. Take full
+  backups instead.
+
 Docker uses the same choices. The OLAP image retains its existing Python CLI
 entrypoint; the OLTP image invokes `nabedra-db` directly:
 

@@ -630,6 +630,12 @@ impl LocalServices {
             let catalog =
                 CatalogHandle::new(resolver.participant(catalog_participant.identity()).await?)?;
             timestamps.install_release_reader(control_client.clone(), peer.clone())?;
+            // T3's ReserveWindow predicate (T7): data.direct.v1 is active.
+            timestamps.install_direct_gate(
+                super::worker_runtime::direct_capability::ControlReserveWindowGate::new(
+                    control_client.clone(),
+                ),
+            );
             let queue = QueueCoordinator::new(replica.clone(), control.clone(), peer);
             shared.bind_read_queue(&queue)?;
             Ok((
@@ -1078,6 +1084,8 @@ fn accepted(reply: ControlReply) -> Result<(), ProtocolError> {
         Fault::Stale | Fault::Conflict | Fault::Incomplete => ErrorCode::Conflict,
         Fault::NotFound => ErrorCode::NotFound,
         Fault::NotInitialized | Fault::Busy | Fault::NotReady => ErrorCode::StorageUnavailable,
+        // `data.direct.v1` is active and this worker did not advertise it.
+        Fault::DirectCapabilityRequired => ErrorCode::UnsupportedOperation,
     };
     Err(ProtocolError::new(
         code,

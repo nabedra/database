@@ -221,6 +221,8 @@ impl Cluster {
             descriptor: descriptor(table),
             schema_epoch: 1,
             indexes: Vec::new(),
+            // The executor activates each group on its first request (T7).
+            lifecycle_id: table,
         });
         let timestamps = Arc::new(Counter(AtomicU64::new(1_000)));
         let mut nodes = Vec::new();

@@ -36,7 +36,7 @@ fn manifest_path(fs: &FaultFs, dir: &Path) -> std::path::PathBuf {
 #[test]
 fn ns03_trivial_move_then_compaction_keeps_files_old_snapshots_read() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     o.levels.l0_compaction_trigger = 1;
     o.memtable_bytes = 1 << 20;
@@ -84,7 +84,7 @@ fn ns03_trivial_move_then_compaction_keeps_files_old_snapshots_read() {
 #[test]
 fn ns11_failed_manifest_sync_never_deletes_the_runs_it_names() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     o.memtable_bytes = 1 << 20;
     o.max_replay_bytes = 1 << 30;
@@ -138,7 +138,7 @@ fn ns11_failed_manifest_sync_never_deletes_the_runs_it_names() {
 #[test]
 fn ns11_failed_current_dir_sync_never_leaves_current_dangling() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     o.memtable_bytes = 1 << 20;
     o.max_replay_bytes = 1 << 30;
@@ -209,7 +209,7 @@ fn finishes_within(timeout: Duration, f: impl FnOnce() + Send + 'static) -> bool
 #[test]
 fn ns10_snapshot_pinned_memtable_does_not_stall_writes() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     let budget = Arc::new(MemtableBudget::new(64 << 10));
     o.memtables = budget.clone();
@@ -246,7 +246,7 @@ fn ns10_snapshot_pinned_memtable_does_not_stall_writes() {
 /// store with nothing of its own to flush stalls until one of them writes again.
 #[test]
 fn ns10_idle_stores_holding_the_budget_are_flushed_for_another_store() {
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let budget = Arc::new(MemtableBudget::new(64 << 10));
     let mut stores = Vec::new();
     for s in 0..10 {
@@ -285,7 +285,7 @@ fn ns10_idle_stores_holding_the_budget_are_flushed_for_another_store() {
 #[test]
 fn ns09_persistent_run_write_eio_latches_and_memory_stays_bounded() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     let budget = Arc::new(MemtableBudget::new(64 << 10));
     o.memtables = budget.clone();

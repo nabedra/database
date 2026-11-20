@@ -1,10 +1,7 @@
-//! Disk key format 1. Prefixes delimit namespaces and table generations.
+//! Order-preserving primary-key encoding used by MVCC keys, plus prefix bounds.
 //! UTF-8 escaping preserves byte order; signed integers flip their sign bit.
 use crate::protocol::{Key, Scalar};
 use uuid::Uuid;
-
-pub(crate) const MANIFEST: &[u8] = b"\x00m";
-pub(crate) const ACTIVE: &[u8] = b"\x00g";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Namespace(pub u64);
@@ -20,29 +17,10 @@ impl Namespace {
         out
     }
 
-    pub(crate) fn descriptor(self, id: Uuid) -> Vec<u8> {
-        let mut out = self.category(b't');
-        out.extend_from_slice(id.as_bytes());
-        out
-    }
-
-    pub(crate) fn name(self, name: &str) -> Vec<u8> {
-        let mut out = self.category(b'n');
-        out.extend_from_slice(name.as_bytes());
-        out
-    }
-
-    pub(crate) fn decision(self, id: Uuid) -> Vec<u8> {
-        let mut out = self.category(b'd');
-        out.extend_from_slice(id.as_bytes());
-        out
-    }
-
     pub(crate) fn rows(self, id: Uuid) -> Vec<u8> {
         let mut out = self.category(b'r');
         out.extend_from_slice(id.as_bytes());
-        // Generation zero belongs to the standalone store. A distributed engine
-        // requires a new manifest format and cannot silently reuse these keys.
+        // Generation zero is part of the encoding MVCC keys were written with.
         out.extend_from_slice(&0_u64.to_be_bytes());
         out
     }

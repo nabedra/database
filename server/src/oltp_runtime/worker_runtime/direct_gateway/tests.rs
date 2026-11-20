@@ -1,14 +1,9 @@
 //! T6 evidence on one worker (RF1), end to end: HTTP with a declared body
 //! length, the gateway's Catalog fill and Control placement read, the
 //! `DirectGateway` role checked by Control at the leader, `Method::Direct`
-//! over the worker's own mTLS session, the T5 executor with the Catalog
-//! schema. Modelled: direct commit timestamps (see the test body).
+//! over the worker's own mTLS session, and the executor T7 installs on
+//! activation (remote Catalog schema, in-process `AllocateDirect`).
 use super::*;
-use crate::oltp_replication::{
-    authority::{control::ServiceAction, timestamp::DirectTimestampClient},
-    service_rpc::TimestampClient,
-};
-use crate::oltp_runtime::direct::{CatalogSchema, DirectConfig, DirectExecutor};
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -17,26 +12,6 @@ use axum::{
 use serde_json::{Value, json};
 use std::time::Duration;
 use tower::ServiceExt;
-
-/// Direct commit timestamps for this single-worker fixture.
-struct Counter(std::sync::atomic::AtomicU64);
-impl crate::oltp_replication::authority::timestamp::DirectTimestampSource for Counter {
-    fn allocate_direct(
-        &self,
-        count: u64,
-    ) -> crate::oltp_replication::authority::consensus::ConsensusFuture<
-        '_,
-        crate::oltp_replication::authority::timestamp::DirectTimestampRange,
-    > {
-        let first = self.0.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async move {
-            crate::oltp_replication::authority::timestamp::DirectTimestampRange::new(
-                CommitTs::new(first).unwrap(),
-                CommitTs::new(first + count - 1).unwrap(),
-            )
-        })
-    }
-}
 
 const TOKEN: &str = "t6-direct-gateway-data";
 const DATABASE: &str = "t6_direct";
@@ -145,129 +120,152 @@ fn normalized(status: u16, mut envelope: Value, base: i64) -> Value {
     json!({"status": status, "envelope": envelope})
 }
 
+async fn open(path: &std::path::Path, direct_oltp: bool) -> Arc<WorkerRuntime> {
+    WorkerRuntime::open(
+        path,
+        DATABASE,
+        TOKEN,
+        ExecutionConfig {
+            max_pending_requests: 32,
+            max_queue_bytes_per_replica: 8 << 20,
+            max_retained_result_bytes_per_worker: 8 << 20,
+            direct_oltp,
+            ..Default::default()
+        },
+        WorkerResources {
+            max_threads: 2,
+            memory_limit_bytes: 2 << 30,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// Waits until this single worker activated `data.direct.v1` (T7: a lone
+/// worker activates it on startup) and its executor is installed.
+async fn activated(runtime: &WorkerRuntime) {
+    let switch = runtime.direct_switch().unwrap().clone();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(switch.refresh().await.unwrap_or(false)
+        && crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
+            .is_some())
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no activation");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn create(app: &Router) -> Value {
+    let (status, created) = call(
+        app,
+        body(
+            Uuid::new_v4(),
+            "table.create",
+            json!({
+                "name": "items", "key": "id", "format": "parquet",
+                "schema": {"id": "int64", "value": "int64", "tag": "utf8"},
+            }),
+        ),
+        true,
+    )
+    .await;
+    assert_eq!(status, 200, "{created}");
+    created["data"]["id"].clone()
+}
+
 /// D01/O03/O02 on one worker: every eligible operation's results, errors
 /// and types over the direct path equal the queued path's for the same
-/// program; the topology is read once; with the capability off nothing
-/// goes direct (O01).
+/// program; the topology is read once per table. The baseline worker runs
+/// with `direct_oltp: false`: its mutations are settled at the anchor and
+/// executed queued, nothing runs directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
-    tokio::time::timeout(Duration::from_secs(180), async {
-        let directory = TestDirectory(
-            std::env::temp_dir().join(format!("nabedra-t6-gateway-{}", Uuid::new_v4())),
+    tokio::time::timeout(Duration::from_secs(240), async {
+        // The queued path (`direct_oltp: false`), with forward markers.
+        let baseline_dir = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-t6-queued-{}", Uuid::new_v4())),
         );
-        let runtime = WorkerRuntime::open(
-            &directory.0,
-            DATABASE,
-            TOKEN,
-            ExecutionConfig {
-                max_pending_requests: 32,
-                max_queue_bytes_per_replica: 8 << 20,
-                max_retained_result_bytes_per_worker: 8 << 20,
-                ..Default::default()
-            },
-            WorkerResources {
-                max_threads: 2,
-                memory_limit_bytes: 2 << 30,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let app = runtime.application(TOKEN.into()).unwrap();
-        let (status, created) = call(
-            &app,
-            body(
-                Uuid::new_v4(),
-                "table.create",
-                json!({
-                    "name": "items", "key": "id", "format": "parquet",
-                    "schema": {"id": "int64", "value": "int64", "tag": "utf8"},
-                }),
-            ),
-            true,
-        )
-        .await;
-        assert_eq!(status, 200, "{created}");
-        let table = created["data"]["id"].clone();
-        let gateway = runtime.direct_gateway_handle().unwrap().clone();
-
-        // The queued path (capability off), with and without a length.
+        let baseline = open(&baseline_dir.0, false).await;
+        activated(&baseline).await;
+        let app = baseline.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
         let mut queued = Vec::new();
         for (operation, payload) in program(&table, 0) {
-            let (status, envelope) = call(&app, body(Uuid::new_v4(), operation, payload), true).await;
+            let (status, envelope) =
+                call(&app, body(Uuid::new_v4(), operation, payload), true).await;
             queued.push((operation, normalized(status, envelope, 0)));
         }
-        assert_eq!(gateway.stats(), Default::default(), "O01: nothing routed while off");
+        let gateway = baseline.direct_gateway_handle().unwrap().stats();
+        eprintln!("d01 rf1 queued gateway: {gateway:?}");
+        assert_eq!(gateway.direct_done, 0, "{gateway:?}");
+        assert!(gateway.forwards >= 8, "every eligible mutation settled first: {gateway:?}");
+        baseline.drain().await.unwrap();
 
-        // Activate: install the executor and turn the capability flag on.
-        // The remote `AllocateDirect` cannot reach a single worker's own
-        // Timestamp group ("worker does not host target replica node"); the
-        // in-process source is T7's wiring, so a counter far above every
-        // queued timestamp stands in for it here.
-        let remote = TimestampClient::new(
-            runtime.services.timestamps.identity().clone(),
-            runtime.services.shared.clone(),
-            runtime.services.manager.client(),
-            runtime.services.control_client.clone(),
-            ServiceAction::Owner,
-        )
-        .unwrap();
-        assert_eq!(
-            remote.allocate_direct(1).await.unwrap_err().code,
-            ErrorCode::ValidationError,
-            "the RF1 gap this test models; wire the local source (T7) and drop the counter"
+        // The direct path (`direct_oltp: true`).
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-t6-direct-{}", Uuid::new_v4())),
         );
-        let timestamps = Arc::new(Counter(std::sync::atomic::AtomicU64::new(1 << 60)));
-        let executor = DirectExecutor::new(
-            runtime.services.shared.clone(),
-            DirectConfig::default(),
-            runtime.clone(),
-            Arc::new(CatalogSchema::new(runtime.services.catalog.clone())),
-            DirectTimestampClient::new(None, timestamps),
-        );
-        executor.install();
-        runtime.set_direct_commits_active(true);
-
-        let base = 1_000;
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let gateway = runtime.direct_gateway_handle().unwrap().clone();
+        let leader = || {
+            crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
+                .unwrap()
+                .stats()
+        };
         let mut latencies = Vec::new();
-        for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
+        for (index, (operation, payload)) in program(&table, 0).into_iter().enumerate() {
             let started = std::time::Instant::now();
-            let (status, envelope) = call(&app, body(Uuid::new_v4(), operation, payload), true).await;
+            let (status, envelope) =
+                call(&app, body(Uuid::new_v4(), operation, payload), true).await;
             latencies.push(started.elapsed());
-            if normalized(status, envelope.clone(), base) != queued[index].1 {
-                eprintln!("d01 rf1 mismatch at {index}: leader {:?}", executor.stats());
+            if normalized(status, envelope.clone(), 0) != queued[index].1 {
+                eprintln!("d01 rf1 mismatch at {index}: leader {}", leader());
             }
             assert_eq!(
-                normalized(status, envelope, base),
+                normalized(status, envelope, 0),
                 queued[index].1,
                 "step {index} {operation}"
             );
         }
         let stats = gateway.stats();
         eprintln!("d01 rf1 gateway: {stats:?}");
-        eprintln!("d01 rf1 leader: {:?}", executor.stats());
+        eprintln!("d01 rf1 leader: {}", leader());
         // One fill for the one range; nothing per request after that.
-        assert_eq!((stats.catalog_reads, stats.placement_reads), (1, 1), "{stats:?}");
+        assert_eq!(
+            (stats.catalog_reads, stats.placement_reads),
+            (1, 1),
+            "{stats:?}"
+        );
         // Gets and mutations that reached the leader answered directly; the
-        // utf8 key and the typed failures stayed exact.
+        // utf8 key went queued, typed failures came back exact.
         assert!(stats.direct_done >= 12, "{stats:?}");
-        let leader = executor.stats();
-        assert_eq!(leader.entries_applied, 6, "{leader:?}");
+        assert_eq!(stats.forwards, 0, "{stats:?}");
+        assert_eq!(leader()["entries_applied"], json!(6));
 
-        // A second program without a declared length takes the queued path
-        // and still answers the same (the full parsing charge applies).
+        // Without a declared length the request takes the queued path and
+        // still answers the same (the full parsing charge applies).
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
-            let (status, envelope) = call(&app, body(Uuid::new_v4(), operation, payload), false).await;
-            assert_eq!(normalized(status, envelope, base), queued[index].1, "step {index}");
+            let (status, envelope) =
+                call(&app, body(Uuid::new_v4(), operation, payload), false).await;
+            assert_eq!(
+                normalized(status, envelope, base),
+                queued[index].1,
+                "step {index}"
+            );
         }
         assert_eq!(gateway.stats().requests, stats.requests);
 
-        // The runtime stats show both sides.
+        // The runtime stats show the gateway, the executor and the switch.
         let reply = runtime.stats().await.unwrap();
         let stats: Value = serde_json::from_slice(&reply.body).unwrap();
         assert!(stats["direct_gateway"]["direct_done"].as_u64().unwrap() >= 12);
-        assert!(stats["direct"].is_object());
+        assert!(stats["direct"].is_object(), "{stats}");
+        assert_eq!(stats["direct_capability"]["active"], json!(true));
         let total: Duration = latencies.iter().sum();
         eprintln!(
             "d01 rf1 latency (HTTP -> gateway -> mTLS -> leader -> fsync): mean {:.2} ms over {} ops, max {:.2} ms",
@@ -275,8 +273,6 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             latencies.len(),
             latencies.iter().max().unwrap().as_secs_f64() * 1e3
         );
-        runtime.set_direct_commits_active(false);
-        drop(executor);
         runtime.drain().await.unwrap();
     })
     .await

@@ -34,27 +34,64 @@ pub(super) struct NativeStorage {
     /// Open pools, for `/v1/runtime/stats`. Pruned lazily. A pool close takes this
     /// lock around its last-owner check so stats never keep a closing store alive.
     pub(super) pools: Mutex<Vec<Weak<PoolInner>>>,
+    /// Test hook: runs inside `stats()` once it holds its pool handles.
+    #[cfg(test)]
+    pub(super) stats_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl NativeStorage {
-    pub(super) fn new(cache_bytes: usize, write_buffer_bytes: usize, background: usize) -> Self {
-        Self {
+    pub(super) fn new(
+        cache_bytes: usize,
+        write_buffer_bytes: usize,
+        background: usize,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
             cache: Arc::new(BlockCache::new(cache_bytes)),
             memtables: Arc::new(MemtableBudget::new(write_buffer_bytes)),
-            background: Background::new(background),
+            // F9: the OS refusing a thread fails the worker's setup, never panics.
+            background: Background::new(background).map_err(|error| {
+                tracing::error!(%error, "could not start the OLTP storage background threads");
+                failure(
+                    ErrorCode::StorageUnavailable,
+                    "could not start the OLTP storage background threads",
+                )
+            })?,
             pools: Mutex::new(Vec::new()),
-        }
+            #[cfg(test)]
+            stats_probe: Mutex::new(None),
+        })
     }
     pub(super) fn register(&self, pool: &Arc<PoolInner>) {
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
         pools.retain(|pool| pool.strong_count() > 0);
         pools.push(Arc::downgrade(pool));
     }
+    /// Sums the open pools' store counters. Every handle `stats()` takes is also
+    /// released under the registry lock, so `close_with_native`'s last-owner check
+    /// under that lock stays exact. When the other owners dropped meanwhile and
+    /// `stats()` holds the last handle, the store closes only after the lock is
+    /// released: a close waits for flushes and compactions and joins the journal
+    /// threads, and must not block `register` or other stats calls (RV-NS6 F11).
     pub(super) fn stats(&self) -> StorageStats {
-        let pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
         let mut total = StorageStats::default();
-        for pool in pools.iter().filter_map(Weak::upgrade) {
-            total.add(&pool.store.stats(), pool.store.quarantined().len());
+        let mut last_owned = Vec::new();
+        {
+            let pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
+            let open: Vec<Arc<PoolInner>> = pools.iter().filter_map(Weak::upgrade).collect();
+            #[cfg(test)]
+            if let Some(probe) = self
+                .stats_probe
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                probe();
+            }
+            for pool in open {
+                total.add(&pool.store.stats(), pool.store.quarantined().len());
+                last_owned.extend(Arc::into_inner(pool));
+            }
         }
+        drop(last_owned);
         total
     }
 }
@@ -185,50 +222,17 @@ pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
     }
 }
 
-/// A write's guards and charges, handed to the journal as `on_done`.
-struct Retained {
-    payload: Option<Box<dyn std::any::Any + Send>>,
-    released: Option<tokio::sync::oneshot::Sender<()>>,
-}
-impl Drop for Retained {
-    fn drop(&mut self) {
-        drop(self.payload.take());
-        if let Some(released) = self.released.take() {
-            let _ = released.send(());
-        }
-    }
-}
-/// Resolves once a [`retain`]ed payload has dropped.
-pub(super) struct Released(tokio::sync::oneshot::Receiver<()>);
-impl Released {
-    pub(super) async fn wait(self) {
-        // An error means the sender dropped, which also happens only after the
-        // payload dropped.
-        let _ = self.0.await;
-    }
-}
-/// Wraps `payload` as a commit's `on_done`. The journal thread wakes the
-/// committer before it drops `on_done`; awaiting the returned [`Released`]
-/// after `Commit::done` restores RocksDB's order, in which a write's guards and
-/// charges were released before the write returned.
-pub(super) fn retain(
-    payload: impl std::any::Any + Send,
-) -> (Box<dyn std::any::Any + Send>, Released) {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    (
-        Box::new(Retained {
-            payload: Some(Box::new(payload)),
-            released: Some(tx),
-        }),
-        Released(rx),
-    )
-}
-
 /// Waits for a commit on any thread, including one that drives an async runtime,
 /// where `Commit::wait` would panic. Only the synchronous pool paths that already
 /// blocked on RocksDB use it: open, close, snapshot install and export, group
 /// creation and retirement stamps, all of which run on an executor thread except
 /// open. `GroupStore::mutate` never blocks; it awaits `Commit::done` instead.
+///
+/// The future is polled outside tokio's cooperative budget (RV-NS6 F1). On a
+/// runtime worker whose task has spent its budget, a budgeted poll returns
+/// `Pending` and defers its waker to the scheduler until the task yields. This
+/// loop never yields, so that waker would never fire and the thread would park
+/// forever.
 pub(super) fn wait_commit(commit: Commit) -> nabedra_kv::Result<Seq> {
     struct Unpark(Thread);
     impl Wake for Unpark {
@@ -241,7 +245,7 @@ pub(super) fn wait_commit(commit: Commit) -> nabedra_kv::Result<Seq> {
     }
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
     let mut context = Context::from_waker(&waker);
-    let mut future = pin!(commit.done());
+    let mut future = pin!(tokio::task::coop::unconstrained(commit.done()));
     loop {
         if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
             return result;

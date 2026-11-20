@@ -90,7 +90,7 @@ fn puts(store: &Arc<Store>, writers: u64, per_writer: u64, durability: Durabilit
 #[ignore = "bench; run in release"]
 fn ns5_bench_store_reads_writes_flush_compaction() {
     let tmp = TempDir::new("bench");
-    let bg = Background::new(4);
+    let bg = Background::new(4).unwrap();
     let store = Arc::new(Store::open(tmp.path(), options(&bg)).unwrap().store);
 
     // Load: 64 groups × 4096 rows of 100 B, unsynced batches of 16.

@@ -270,12 +270,13 @@ pub(crate) fn installed(
 
 /// Who may send `Method::Direct`: an enrolled API ingress of this database
 /// (checked against the Control group, where its enrollment lives) or the
-/// current queue owner, or a ready worker acting as gateway (T6).
+/// current queue owner, or an advertised worker acting as gateway with
+/// `DirectLeader` once `data.direct.v1` is active (T6).
 pub(super) fn allowed(header: &super::Header) -> bool {
     use crate::oltp_replication::authority::control::ServiceAction;
     matches!(
         header.action,
-        ServiceAction::ApiIngress | ServiceAction::Owner | ServiceAction::DirectGateway
+        ServiceAction::ApiIngress | ServiceAction::Owner | ServiceAction::DirectLeader
     )
 }
 
@@ -358,7 +359,8 @@ pub(crate) struct DirectLink {
 }
 impl DirectLink {
     /// `action` is the caller's role: `ApiIngress` for an enrolled API,
-    /// `DirectGateway` for a ready worker.
+    /// `DirectLeader` (T7's role, granted once `data.direct.v1` is active)
+    /// for a worker.
     pub(crate) fn new(
         group: GroupIdentity,
         shared: Arc<crate::oltp::pool::WorkerSharedResources>,

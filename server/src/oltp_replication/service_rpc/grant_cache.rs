@@ -51,7 +51,7 @@ impl GrantKey {
             None => matches!(
                 action,
                 ServiceAction::Owner
-                    | ServiceAction::DirectGateway
+                    | ServiceAction::DirectLeader
                     | ServiceAction::StatusProof { .. }
                     | ServiceAction::TimestampProof { .. }
                     | ServiceAction::ParticipantProof { .. }

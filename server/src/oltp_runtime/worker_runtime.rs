@@ -4,6 +4,7 @@ mod admission_cleanup;
 pub(crate) mod archive;
 mod automatic_split;
 pub(super) mod cold_history;
+pub(crate) mod direct_capability;
 mod deployment;
 mod direct_gateway;
 mod index_admin;
@@ -87,10 +88,9 @@ pub(crate) struct WorkerRuntime {
     /// Status decision, so incremental backups would miss them.
     direct_commits_active: AtomicBool,
     /// The direct-path gateway of this worker's HTTP API (T6).
-    direct_gateway: std::sync::OnceLock<(
-        Arc<super::application::direct::DirectGateway>,
-        Arc<direct_gateway::WorkerSwitch>,
-    )>,
+    direct_gateway: std::sync::OnceLock<Arc<super::application::direct::DirectGateway>>,
+    /// This worker's `data.direct.v1` view and `direct_oltp` switch (T7).
+    direct: std::sync::OnceLock<Arc<direct_capability::DirectSwitch>>,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -230,6 +230,7 @@ impl WorkerRuntime {
             accepting: AtomicBool::new(true),
             direct_commits_active: AtomicBool::new(false),
             direct_gateway: std::sync::OnceLock::new(),
+            direct: std::sync::OnceLock::new(),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),
@@ -291,6 +292,32 @@ impl WorkerRuntime {
                 .advertise_scoped_queue(operation)
                 .await?;
             scoped.start_maintenance()?;
+        }
+        {
+            let direct = direct_capability::DirectSwitch::new(
+                runtime.services.control_client.clone(),
+                runtime.services.local,
+                execution.direct_oltp,
+            );
+            runtime.planner.set_direct_probe(direct.clone())?;
+            // T4fix F2: direct commits have no Status decision, so incremental
+            // backups are refused from activation on.
+            let weak = Arc::downgrade(&runtime);
+            direct.on_active(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.set_direct_commits_active(true);
+                }
+            });
+            // T5's executor serves `Method::Direct` once active (T7).
+            direct.serve_direct_when_active(direct_capability::DirectLeaderServices {
+                shared: runtime.services.shared.clone(),
+                transport: runtime.services.manager.client(),
+                catalog: runtime.services.catalog.participant().identity().clone(),
+                timestamps: runtime.services.timestamps.identity().clone(),
+                local_timestamps: None,
+            });
+            direct.start();
+            runtime.direct.set(direct).map_err(|_| unknown())?;
         }
         if runtime.services.cold_history.is_some() {
             *runtime.cold_cleanup.lock().map_err(|_| unknown())? =
@@ -926,6 +953,9 @@ impl WorkerRuntime {
         self.index_builds.drain().await;
         self.supervision.drain().await;
         self.admission_cleanup.join().await?;
+        if let Some(direct) = self.direct.get() {
+            direct.stop().await;
+        }
         let retirement = self.retirement.lock().map_err(|_| unknown())?.take();
         if let Some(retirement) = retirement {
             retirement.await.map_err(|_| unknown())?;
@@ -1807,9 +1837,16 @@ impl HttpRuntime for WorkerRuntime {
                     "storage":self.services.shared.storage_stats(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
                     "native_thread_budget":self.services.shared.thread_budget(),
-                    // `null` until T7 installs the direct executor.
-                    "direct":crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                        .map(|service| service.stats()),
+                    // `null` until `data.direct.v1` activates the executor.
+                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                            .map(|service| service.stats())
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                    })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                 }))
                 .map_err(|_| unknown())?,

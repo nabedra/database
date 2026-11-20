@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod data_worker;
+mod direct;
 mod growth;
 mod placement;
 mod pool_drain;
@@ -520,6 +521,20 @@ impl ControlHandle {
             operation_id,
             machine::hash(target.worker_id.as_bytes()),
         )?;
+        // Every caller joins its own process, which runs this build and so
+        // decodes every direct entry: advertise `data.direct.v1` first, or an
+        // active capability refuses the join. Control answers `Unauthorized`
+        // (and records nothing) when the identity is not enrolled yet.
+        if target == permit.local {
+            self.submit(ControlCommand::DirectCapability {
+                operation_id: Uuid::new_v4(),
+                actor: target,
+                action: super::DirectCapabilityOperation::Advertise {
+                    version: super::DIRECT_VERSION,
+                },
+            })
+            .await?;
+        }
         self.submit(ControlCommand::BeginJoin {
             operation_id,
             expected,
@@ -1402,6 +1417,22 @@ impl ControlHandle {
                     ServiceAction::ApiIngress | ServiceAction::ScopedQueueIngress { .. } => {
                         return Err(unauthorized());
                     }
+                    ServiceAction::DirectLeader => {
+                        let advertised = load::<WorkerIdentity>(
+                            view,
+                            &machine::direct::reader_key(remote),
+                        )?;
+                        if view.get(machine::direct::activation_key())?.is_none()
+                            || advertised != Some(remote)
+                            || !matches!(
+                                target.kind,
+                                GroupKind::Catalog | GroupKind::Timestamps | GroupKind::Data { .. }
+                            )
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
+                    }
                     ServiceAction::Owner => {
                         if state.owner != Some(remote) {
                             return Err(unauthorized());
@@ -1535,19 +1566,6 @@ impl ControlHandle {
                             return Err(unauthorized());
                         }
                         Some((control.group_id, 3))
-                    }
-                    ServiceAction::DirectGateway => {
-                        let member: Option<WorkerIdentity> = load(
-                            view,
-                            &machine::ready_key(state.ready_generation, remote.worker_id),
-                        )?;
-                        if !matches!(target.kind, GroupKind::Data { .. })
-                            || state.invalid_ready != 0
-                            || member != Some(remote)
-                        {
-                            return Err(unauthorized());
-                        }
-                        None
                     }
                     ServiceAction::QueueRetirement => {
                         let member: Option<WorkerIdentity> = load(

@@ -172,6 +172,13 @@ impl ApiEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlCommand {
+    /// `data.direct.v1` adverts and activation. New in this build: see
+    /// `control::direct` for the upgrade order.
+    DirectCapability {
+        operation_id: Uuid,
+        actor: WorkerIdentity,
+        action: super::DirectCapabilityOperation,
+    },
     ScopedQueue {
         operation_id: Uuid,
         actor: WorkerIdentity,
@@ -406,7 +413,8 @@ pub(crate) enum ControlCommand {
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::ScopedQueue { operation_id, .. }
+            Self::DirectCapability { operation_id, .. }
+            | Self::ScopedQueue { operation_id, .. }
             | Self::EnsureScopedQueue { operation_id, .. }
             | Self::PoolDrain { operation_id, .. }
             | Self::BeginWorkerDrain { operation_id, .. }
@@ -533,10 +541,14 @@ pub(crate) enum Fault {
     NotFound,
     Incomplete,
     NotReady,
+    /// `data.direct.v1` is active and the worker did not advertise it, so it
+    /// cannot become a voter or learner. Emitted only after activation.
+    DirectCapabilityRequired,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
+    DirectCapability(super::DirectCapability),
     ScopedQueueUpdated,
     ScopedQueueTransfer(Box<super::ScopedQueueTransition>),
     ScopedQueue(Box<super::ScopedQueuePlacement>),
@@ -657,16 +669,18 @@ pub(crate) enum ServiceAction {
     },
     QueueRetirement,
     ApiIngress,
-    /// A ready worker acting as the direct-path gateway (plan section 3):
-    /// it may send `Method::Direct`/`DirectForward` to a Data group of its
-    /// database. Sent only while `data.direct.v1` is active, so an older
-    /// Control replica never has to decode it.
-    DirectGateway,
     StatusProof { source_group: Uuid },
     TimestampProof { source_group: Uuid },
     ParticipantProof { source_group: Uuid },
     ControlFence { transition_id: Uuid },
     Operator,
+    /// A Data range leader executing direct commits (T7): Catalog reads for
+    /// its table schema and `AllocateDirect` on the Timestamp group. A worker
+    /// acting as gateway (T6) also uses it for `Method::Direct` and
+    /// `DirectForward` on Data groups. Granted only while `data.direct.v1`
+    /// is active, to a worker that advertised it, so no older peer receives
+    /// this tag.
+    DirectLeader,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

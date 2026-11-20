@@ -63,7 +63,10 @@ fn read_ids(snap: &nabedra_kv::Snapshot, keys: &[Vec<u8>]) -> Vec<Option<u64>> {
 fn ns02_no_reader_sees_part_of_a_batch_through_flush_and_compaction() {
     let done = watchdog(Duration::from_secs(240));
     let (fs, dir) = fault_fs();
-    let store = Arc::new(open(&dir, small_options(Arc::new(fs), Background::new(3))));
+    let store = Arc::new(open(
+        &dir,
+        small_options(Arc::new(fs), Background::new(3).unwrap()),
+    ));
     let keys = Arc::new(batch_keys());
     let next_id = Arc::new(AtomicU64::new(1));
     let completed_seq = Arc::new(AtomicU64::new(0));
@@ -352,7 +355,10 @@ fn ns17_random_sleeps_and_cancelled_callers() {
     });
     // The budget, not the memtable size, freezes memtables, so writers stall.
     let budget = Arc::new(MemtableBudget::new(48 << 10));
-    let mut options = small_options(Arc::new(SleepyHandle(sleepy.clone())), Background::new(2));
+    let mut options = small_options(
+        Arc::new(SleepyHandle(sleepy.clone())),
+        Background::new(2).unwrap(),
+    );
     options.memtables = budget.clone();
     options.memtable_bytes = 1 << 20;
     options.max_replay_bytes = 1 << 20;

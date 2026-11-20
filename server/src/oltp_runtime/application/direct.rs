@@ -49,7 +49,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -84,28 +84,41 @@ pub(crate) enum DirectMode {
     Direct,
 }
 
-/// The capability and the operator switch (T7 owns both; see
-/// [`GatewaySwitch`]).
-pub(crate) trait DirectSwitch: Send + Sync {
+/// Where the gateway reads `data.direct.v1` and `direct_oltp` from: T7's
+/// `DirectSwitch` in production.
+pub(crate) trait DirectRouting: Send + Sync {
     fn mode(&self) -> DirectMode;
 }
-
-/// The two flags T7 sets: `active` when `data.direct.v1` is active,
-/// `direct_oltp` from the operator setting (on by default).
-pub(crate) struct GatewaySwitch {
-    active: AtomicBool,
-    direct_oltp: AtomicBool,
+impl crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch {
+    /// The gateway's mode: `requires_forward()` is the capability,
+    /// `routes_direct()` adds `direct_oltp`.
+    pub(crate) fn mode(&self) -> DirectMode {
+        mode(self.requires_forward(), self.routes_direct())
+    }
 }
+impl DirectRouting for crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch {
+    fn mode(&self) -> DirectMode {
+        crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch::mode(self)
+    }
+}
+
+/// Two flags, for tests: `active` is the capability, `direct_oltp` the
+/// operator setting (on by default).
+#[cfg(test)]
+pub(crate) struct GatewaySwitch {
+    active: std::sync::atomic::AtomicBool,
+    direct_oltp: std::sync::atomic::AtomicBool,
+}
+#[cfg(test)]
 impl Default for GatewaySwitch {
     fn default() -> Self {
         Self {
-            active: AtomicBool::new(false),
-            direct_oltp: AtomicBool::new(true),
+            active: std::sync::atomic::AtomicBool::new(false),
+            direct_oltp: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
-// T7 sets both on activation and from the operator setting.
-#[allow(dead_code)]
+#[cfg(test)]
 impl GatewaySwitch {
     pub(crate) fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Release);
@@ -114,16 +127,19 @@ impl GatewaySwitch {
         self.direct_oltp.store(enabled, Ordering::Release);
     }
 }
-impl DirectSwitch for GatewaySwitch {
+#[cfg(test)]
+impl DirectRouting for GatewaySwitch {
     fn mode(&self) -> DirectMode {
         mode(
             self.active.load(Ordering::Acquire),
-            self.direct_oltp.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire) && self.direct_oltp.load(Ordering::Acquire),
         )
     }
 }
-pub(crate) fn mode(active: bool, direct_oltp: bool) -> DirectMode {
-    match (active, direct_oltp) {
+/// `forward`: the capability is active (every queued eligible request is
+/// settled at its anchor first); `direct`: eligible operations go direct.
+pub(crate) fn mode(forward: bool, direct: bool) -> DirectMode {
+    match (forward, direct) {
         (false, _) => DirectMode::Off,
         (true, false) => DirectMode::ForwardOnly,
         (true, true) => DirectMode::Direct,
@@ -409,7 +425,7 @@ enum Terminal {
 pub(crate) struct DirectGateway {
     shared: Arc<WorkerSharedResources>,
     database: Text<128>,
-    switch: Arc<dyn DirectSwitch>,
+    switch: Arc<dyn DirectRouting>,
     source: Arc<dyn TopologySource>,
     transport: Arc<dyn DirectTransport>,
     cache: TopologyCache,
@@ -422,7 +438,7 @@ impl DirectGateway {
     pub(crate) fn new(
         shared: Arc<WorkerSharedResources>,
         database: Text<128>,
-        switch: Arc<dyn DirectSwitch>,
+        switch: Arc<dyn DirectRouting>,
         source: Arc<dyn TopologySource>,
         transport: Arc<dyn DirectTransport>,
     ) -> Arc<Self> {

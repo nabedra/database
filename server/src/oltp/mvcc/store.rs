@@ -78,6 +78,11 @@ struct Config {
     /// The split holding the replicated direct-commit barrier, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     direct_pause: Option<Uuid>,
+    /// Set once `data.direct.v1` reached this group; see
+    /// `direct::DirectSchema`. A replica of an older version cannot read a
+    /// config that carries it, which is why downgrade is unsupported then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_schema: Option<direct::DirectSchema>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -168,6 +173,9 @@ pub(crate) enum ParticipantCommand {
     /// The source's publication timestamp for a complete split child.
     /// Gated like `Direct`.
     ChildPublished(direct::ChildPublished),
+    /// Activates direct commits on a Data group, or fences them before a
+    /// DDL publishes (plan section 7). Gated like `Direct`.
+    DirectSchema(direct::DirectSchemaFence),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -212,6 +220,7 @@ pub(crate) enum ParticipantReply {
     ChildPublished {
         published_at: CommitTs,
     },
+    DirectSchema(direct::DirectSchema),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -236,6 +245,10 @@ pub(crate) enum Fault {
     /// applied: take the direct barrier and allocate a newer cut. Emitted
     /// only once direct commits exist.
     DirectCommitAboveCut,
+    /// A direct-family command reached a group that `data.direct.v1` has not
+    /// activated (the store-side gate). Emitted only to proposers that
+    /// already speak the direct commands.
+    DirectInactive,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -572,6 +585,8 @@ fn apply(
             split_child: config.as_ref().and_then(|c| c.split_child),
             // A fence keeps the split barrier: the split outlives the run.
             direct_pause: config.as_ref().and_then(|c| c.direct_pause),
+            // A run fence keeps direct activation and the DDL schema fence.
+            direct_schema: config.as_ref().and_then(|c| c.direct_schema),
         };
         if encoded_length(&next_config, METADATA_BYTES).is_err() {
             return reject(tx, Fault::ResourceLimit);
@@ -603,6 +618,9 @@ fn apply(
         }
         ParticipantCommand::ChildPublished(published) => {
             return direct::child_published(tx, group, config, published);
+        }
+        ParticipantCommand::DirectSchema(fence) => {
+            return direct::schema(tx, group, config, fence);
         }
         _ => {}
     }
@@ -1059,7 +1077,8 @@ fn apply(
         | ParticipantCommand::DirectExpire(_)
         | ParticipantCommand::DirectForward(_)
         | ParticipantCommand::DirectPause(_)
-        | ParticipantCommand::ChildPublished(_) => unreachable!(),
+        | ParticipantCommand::ChildPublished(_)
+        | ParticipantCommand::DirectSchema(_) => unreachable!(),
     }
 }
 
@@ -1312,6 +1331,7 @@ impl std::fmt::Display for ParticipantCommand {
             Self::DirectForward(_) => "participant-direct-forward",
             Self::DirectPause(_) => "participant-direct-pause",
             Self::ChildPublished(_) => "participant-child-published",
+            Self::DirectSchema(_) => "participant-direct-schema",
         })
     }
 }
@@ -1640,6 +1660,7 @@ impl ParticipantCommand {
                 | Self::DirectForward(_)
                 | Self::DirectPause(_)
                 | Self::ChildPublished(_)
+                | Self::DirectSchema(_)
         )
     }
     pub(crate) fn uses_prepare_lane(&self) -> bool {

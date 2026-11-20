@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 pub(super) mod data_worker;
+pub(super) mod direct;
 pub(super) mod replacement;
 pub(super) mod restart;
 pub(super) mod placement;
@@ -232,6 +233,7 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        DirectCapability { actor, action, .. } => direct::apply(tx, state, position, *actor, action),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }
@@ -607,6 +609,9 @@ fn apply_initialized(
             for member in replicas.iter() {
                 if pool_drain::blocks_pool(tx, member.pool_id)? || worker_drain::blocks_worker(tx, member.worker_id)? {
                     return fault(Fault::Busy);
+                }
+                if !direct::admits_worker_id(tx, member.worker_id)? {
+                    return fault(Fault::DirectCapabilityRequired);
                 }
                 if member.validate().is_err()
                     || build.last_node.is_some_and(|old| member.node_id <= old)
@@ -1058,6 +1063,9 @@ fn begin_ready(
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
     }
+    if change == ReadyChange::Join && !direct::admits(tx, target)? {
+        return fault(Fault::DirectCapabilityRequired);
+    }
     if change == ReadyChange::Join && worker_drain::blocks_worker(tx, target.worker_id)?
         && !replacement::can_join(tx, target)?
     {
@@ -1425,6 +1433,11 @@ fn register_initial_data(
         || proof.replica_root != group_root(count, chain)
     {
         return fault(Fault::Invalid);
+    }
+    for member in replicas {
+        if !direct::admits_worker_id(tx, member.worker_id)? {
+            return fault(Fault::DirectCapabilityRequired);
+        }
     }
     let reply = ControlReply::GroupRegistered {
         group_id: proof.group.group_id,
