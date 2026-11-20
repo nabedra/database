@@ -1,3 +1,7 @@
-target/
-deploy/
-tests/
+# Build context: `server`. Send only what the Events build reads.
+*
+!kv/Cargo.toml
+!kv/src/
+!events/Cargo.toml
+!events/Cargo.lock
+!events/src/

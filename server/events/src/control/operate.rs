@@ -175,6 +175,8 @@ async fn broker_status(
         "groups": groups.len(),
         "leaders": leaders,
         "disk_available_bytes": control.disk_available.load(Ordering::Relaxed),
+        // Groups with damaged storage stay stopped until an operator re-adds them.
+        "quarantined_groups": control.broker.quarantined_groups(),
         "publish": control.publish_metrics.report(),
         "poll": control.poll_metrics.report(),
     })))
