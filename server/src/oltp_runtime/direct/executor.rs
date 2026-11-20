@@ -6,6 +6,7 @@ use super::{
     schema::{DirectSchema, DirectTable, SchemaLookup},
     stats::{DirectStats, DirectStatsSnapshot, ProposalFailure, RetryCause},
 };
+use crate::oltp_runtime::stage_timing::{perf_stage, timed};
 use crate::{
     oltp::{
         mvcc::{
@@ -172,7 +173,10 @@ impl DirectExecutor {
         let started = std::time::Instant::now();
         self.stats.request();
         let mut get = false;
-        let response = match self.admit(handle, &request) {
+        let admit = std::time::Instant::now();
+        let admission = self.admit(handle, &request);
+        perf_stage!("leader.admit").since(admit);
+        let response = match admission {
             Err(response) => response,
             Ok((admitted, parsed)) => {
                 let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
@@ -190,8 +194,10 @@ impl DirectExecutor {
         };
         if get {
             self.stats.get_time(started.elapsed());
+            perf_stage!("leader.get.total").since(started);
         } else {
             self.stats.mutation_time(started.elapsed());
+            perf_stage!("leader.mutation.total").since(started);
         }
         self.count(&response);
         response
@@ -552,18 +558,40 @@ impl DirectExecutor {
         };
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, clock, request, deadline).await?;
-            self.table(request, &epochs, &parsed.operation, deadline)
-                .await?;
+            timed(
+                perf_stage!("leader.get.token"),
+                self.token(handle, clock, deadline),
+            )
+            .await?;
+            let epochs = timed(
+                perf_stage!("leader.get.epochs"),
+                self.epochs(handle, clock, request, deadline),
+            )
+            .await?;
+            timed(
+                perf_stage!("leader.get.table"),
+                self.table(request, &epochs, &parsed.operation, deadline),
+            )
+            .await?;
             loop {
-                if by(deadline, handle.direct_barrier()).await.is_err() {
+                if timed(
+                    perf_stage!("leader.get.barrier"),
+                    by(deadline, handle.direct_barrier()),
+                )
+                .await
+                .is_err()
+                {
                     if !self.pause(deadline, RetryCause::Leadership).await {
                         return Err(not_leader_or(handle, false));
                     }
                     continue;
                 }
-                match by(deadline, handle.direct_latest(key.clone())).await {
+                match timed(
+                    perf_stage!("leader.get.latest"),
+                    by(deadline, handle.direct_latest(key.clone())),
+                )
+                .await
+                {
                     Err(error) if error.code == ErrorCode::StorageUnavailable => {
                         if !self.pause(deadline, RetryCause::Unavailable).await {
                             return Err(failed(error));
@@ -697,27 +725,39 @@ impl DirectExecutor {
     ) -> DirectResponse {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, clock, request, deadline).await?;
-            let table = self
-                .table(request, &epochs, &parsed.operation, deadline)
-                .await?;
+            timed(
+                perf_stage!("leader.mutation.token"),
+                self.token(handle, clock, deadline),
+            )
+            .await?;
+            let epochs = timed(
+                perf_stage!("leader.mutation.epochs"),
+                self.epochs(handle, clock, request, deadline),
+            )
+            .await?;
+            let table = timed(
+                perf_stage!("leader.mutation.table"),
+                self.table(request, &epochs, &parsed.operation, deadline),
+            )
+            .await?;
             let keys = self.row_keys(&table, &parsed.operation)?;
             let encoded: Vec<Vec<u8>> = keys
                 .iter()
                 .map(|key| serde_json::to_vec(key).map_err(|_| failed(corrupt())))
                 .collect::<Result<_, _>>()?;
-            let latched = self
-                .latches
-                .lock(encoded.iter().map(Vec::as_slice), deadline)
-                .await
-                .map_err(|_| {
-                    failed(ProtocolError::new(
-                        ErrorCode::StorageUnavailable,
-                        "deadline expired waiting for a key latch",
-                        Outcome::NotApplied,
-                    ))
-                })?;
+            let latched = timed(
+                perf_stage!("leader.mutation.latch"),
+                self.latches
+                    .lock(encoded.iter().map(Vec::as_slice), deadline),
+            )
+            .await
+            .map_err(|_| {
+                failed(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "deadline expired waiting for a key latch",
+                    Outcome::NotApplied,
+                ))
+            })?;
             if let Some(waited) = latched.waited {
                 self.stats.latch_wait(waited);
             }
@@ -767,9 +807,23 @@ impl DirectExecutor {
         uncertain: &mut bool,
     ) -> Result<Attempt<DirectResponse>, DirectResponse> {
         // T4fix F4: the token is taken before the timestamp is fetched.
-        let token = self.token(handle, clock, deadline).await?;
-        let epochs = self.epochs(handle, clock, request, deadline).await?;
-        if by(deadline, handle.direct_barrier()).await.is_err() {
+        let token = timed(
+            perf_stage!("leader.attempt.token"),
+            self.token(handle, clock, deadline),
+        )
+        .await?;
+        let epochs = timed(
+            perf_stage!("leader.attempt.epochs"),
+            self.epochs(handle, clock, request, deadline),
+        )
+        .await?;
+        if timed(
+            perf_stage!("leader.attempt.barrier"),
+            by(deadline, handle.direct_barrier()),
+        )
+        .await
+        .is_err()
+        {
             if Instant::now() + RETRY_PAUSE >= deadline {
                 return Err(not_leader_or(handle, *uncertain));
             }
@@ -785,15 +839,24 @@ impl DirectExecutor {
         // A cancelled earlier attempt of this request may still be pending
         // on these keys (its latch is gone but its entry is not applied):
         // wait for it, so the dedup lookup below sees its record.
+        let waited = std::time::Instant::now();
         for key in keys {
             if by(deadline, clock.wait_latest(key)).await.is_err() {
                 return Ok(Attempt::Retry(RetryCause::Unavailable));
             }
         }
+        perf_stage!("leader.attempt.wait_latest").since(waited);
         // The dedup record decides before any fallback (T4fix concern 1).
-        match by(
-            deadline,
-            handle.direct_dedup_after_barrier(request.table_id, anchor.clone(), request.request_id),
+        match timed(
+            perf_stage!("leader.attempt.dedup"),
+            by(
+                deadline,
+                handle.direct_dedup_after_barrier(
+                    request.table_id,
+                    anchor.clone(),
+                    request.request_id,
+                ),
+            ),
         )
         .await
         {
@@ -814,6 +877,7 @@ impl DirectExecutor {
             }
             Ok(None) => {}
         }
+        let read = std::time::Instant::now();
         let mut current = Vec::with_capacity(keys.len());
         for key in keys {
             match self.latest(handle, key.clone(), &epochs, deadline).await? {
@@ -828,9 +892,12 @@ impl DirectExecutor {
                 None => return Ok(Attempt::Retry(RetryCause::Unavailable)),
             }
         }
-        let Some(computed) = self
-            .compute(handle, table, operation, keys, current, &epochs, deadline)
-            .await?
+        perf_stage!("leader.attempt.latest").since(read);
+        let Some(computed) = timed(
+            perf_stage!("leader.attempt.compute"),
+            self.compute(handle, table, operation, keys, current, &epochs, deadline),
+        )
+        .await?
         else {
             return Ok(Attempt::Retry(RetryCause::Unavailable));
         };
@@ -849,10 +916,16 @@ impl DirectExecutor {
                 DirectData::from_json(result.as_str()).map_err(failed)?,
             )));
         }
-        let commit_ts = match by(deadline, self.timestamps.commit_ts()).await {
+        let commit_ts = match timed(
+            perf_stage!("leader.attempt.timestamp"),
+            by(deadline, self.timestamps.commit_ts()),
+        )
+        .await
+        {
             Ok(ts) => ts,
             Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
         };
+        let build = std::time::Instant::now();
         let commit = DirectCommit {
             authority: epochs.authority,
             table_id: request.table_id,
@@ -896,12 +969,18 @@ impl DirectExecutor {
                 return Err(failed(error));
             }
         };
+        perf_stage!("leader.attempt.build_command").since(build);
         self.stats.proposed(rows, index_changes);
         // T9 process barrier (D04 before quorum): timestamp registered, entry not
         // yet proposed.
         #[cfg(test)]
         crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id).await;
-        let applied = match by(deadline, handle.propose(command)).await {
+        let applied = match timed(
+            perf_stage!("leader.attempt.propose"),
+            by(deadline, handle.propose(command)),
+        )
+        .await
+        {
             Ok(applied) => applied,
             Err(error) => {
                 // T4: settle on any proposal error.

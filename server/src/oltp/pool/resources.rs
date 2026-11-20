@@ -809,9 +809,23 @@ impl WorkerSharedResources {
         task_bytes: u64,
         work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
     ) -> Result<T, ProtocolError> {
+        use crate::oltp_runtime::stage_timing::perf_stage;
+        let started = std::time::Instant::now();
         let prepared = self.prepare(class).await?;
         let grant = prepared.reserve_compute(request, task_bytes).await?;
-        prepared.run_with_guard(grant, work).await?.0
+        let admitted = std::time::Instant::now();
+        let result = prepared.run_with_guard(grant, work).await;
+        match class {
+            ExecutionClass::Query => {
+                perf_stage!("native.query.admit").record(admitted - started);
+                perf_stage!("native.query.run").since(admitted);
+            }
+            ExecutionClass::Control => {
+                perf_stage!("native.control.admit").record(admitted - started);
+                perf_stage!("native.control.run").since(admitted);
+            }
+        }
+        result?.0
     }
 }
 

@@ -798,6 +798,7 @@ impl Client {
             return Err(unsupported_service_route().into());
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
+        let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
         let reply = self
             .transport
             .request_classified(

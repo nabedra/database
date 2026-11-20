@@ -363,10 +363,28 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             leader_commit: rpc.leader_commit,
             entries,
         };
-        let reply: AppendEntriesResponse<C> = self
-            .rpc(header, payload, option.soft_ttl(), target)
-            .await
-            .map_err(|_| unreachable())?;
+        let names = if header.payload_bytes == 0 {
+            [
+                "raft.data.net.heartbeat",
+                "raft.ts.net.heartbeat",
+                "raft.meta.net.heartbeat",
+            ]
+        } else {
+            [
+                "raft.data.net.append",
+                "raft.ts.net.append",
+                "raft.meta.net.append",
+            ]
+        };
+        let reply: AppendEntriesResponse<C> = crate::oltp_runtime::stage_timing::timed(
+            crate::oltp_runtime::stage_timing::by_kind(
+                &self.factory.resident.identity().kind,
+                names,
+            ),
+            self.rpc(header, payload, option.soft_ttl(), target),
+        )
+        .await
+        .map_err(|_| unreachable())?;
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
             || (header.payload_bytes == 0
                 && matches!(reply, AppendEntriesResponse::PartialSuccess(_)))
@@ -724,7 +742,28 @@ where
                         entries,
                         leader_commit: head.leader_commit,
                     };
-                    let reply = self.raft.append_entries(rpc).await.map_err(|_| {
+                    let names = if rpc.entries.is_empty() {
+                        [
+                            "raft.data.net.heartbeat_handle",
+                            "raft.ts.net.heartbeat_handle",
+                            "raft.meta.net.heartbeat_handle",
+                        ]
+                    } else {
+                        [
+                            "raft.data.net.append_handle",
+                            "raft.ts.net.append_handle",
+                            "raft.meta.net.append_handle",
+                        ]
+                    };
+                    let reply = crate::oltp_runtime::stage_timing::timed(
+                        crate::oltp_runtime::stage_timing::by_kind(
+                            &self.resident.identity().kind,
+                            names,
+                        ),
+                        self.raft.append_entries(rpc),
+                    )
+                    .await
+                    .map_err(|_| {
                         observe("raft_handled", "raft_unavailable");
                         unavailable()
                     })?;

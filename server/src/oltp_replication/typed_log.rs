@@ -584,6 +584,15 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     /// raises it to the applied index on startup. The next synced write of
     /// this pool's WAL persists it.
     async fn save_committed(&mut self, id: Option<LogId>) -> io::Result<()> {
+        let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            &self.store.identity().kind,
+            [
+                "raft.data.save_committed",
+                "raft.ts.save_committed",
+                "raft.meta.save_committed",
+            ],
+        )
+        .timer();
         self.retry
             .retry(RaftWrite::Committed, || {
                 self.store
@@ -689,10 +698,15 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
         tokio::spawn(async move {
+            use crate::oltp_runtime::stage_timing::by_kind;
+            let kind = store.identity().kind.clone();
+            let started = std::time::Instant::now();
             let _retained_entries=batch.clone();
             let _writer = writer;
             let _pending = pending;
             let _order = writes.lock_owned().await;
+            by_kind(&kind, ["raft.data.append_order_wait", "raft.ts.append_order_wait", "raft.meta.append_order_wait"]).since(started);
+            let ordered = std::time::Instant::now();
             let result: io::Result<()> = async {
                 let class = match store.identity().kind {
                     GroupKind::Control | GroupKind::Timestamps | GroupKind::Status { .. } => {
@@ -729,6 +743,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     })
                     .await
                     .map_err(disk)?;
+                let written = std::time::Instant::now();
+                by_kind(&kind, ["raft.data.append_encode", "raft.ts.append_encode", "raft.meta.append_encode"]).since(ordered);
                 // One synced WriteBatch per bounded chunk, in log order. A
                 // crash between chunks leaves a consecutive durable prefix.
                 for chunk in append_chunks(&sizes) {
@@ -770,9 +786,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                         .await
                         .map_err(disk)?;
                 }
+                by_kind(&kind, ["raft.data.append_write", "raft.ts.append_write", "raft.meta.append_write"]).since(written);
                 Ok(())
             }
             .await;
+            by_kind(&kind, ["raft.data.append", "raft.ts.append", "raft.meta.append"]).since(started);
             if let Err(error) = &result {
                 tracing::error!(group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
             }

@@ -481,10 +481,18 @@ impl HttpRuntime for RemoteRuntime {
     fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
         Box::pin(async move {
             let body = self.client.stats().await?;
-            Ok(EncodedResponse {
-                status: 200,
-                body: body.as_ref().to_vec(),
-            })
+            // PERF1: this process's own stage timings next to the worker's.
+            let body = match serde_json::from_slice::<serde_json::Value>(body.as_ref()) {
+                Ok(serde_json::Value::Object(mut stats)) => {
+                    stats.insert(
+                        "api_stage_timing".to_owned(),
+                        super::stage_timing::snapshot(),
+                    );
+                    serde_json::to_vec(&stats).map_err(|_| unavailable())?
+                }
+                _ => body.as_ref().to_vec(),
+            };
+            Ok(EncodedResponse { status: 200, body })
         })
     }
 }

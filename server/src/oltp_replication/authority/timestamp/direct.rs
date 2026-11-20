@@ -381,14 +381,21 @@ impl TimestampHandle {
                 Outcome::NotApplied,
             ));
         }
+        let _total = crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.total").timer();
         // The plan asks for ReadPolicy::LeaseRead. The Consensus contract only
         // exposes the stricter ReadIndex barrier today.
-        let barrier = self.consensus.ensure_linearizable().await?;
+        let barrier = crate::oltp_runtime::stage_timing::timed(
+            crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.barrier"),
+            self.consensus.ensure_linearizable(),
+        )
+        .await?;
         let leader = leader_of(barrier.applied);
         let direct = &self.machine.direct;
         if let Some(range) = direct.take(leader, count) {
             return Ok(range);
         }
+        let _refill_timer =
+            crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.refill").timer();
         let _refill = direct.refill.lock().await;
         if let Some(range) = direct.take(leader, count) {
             return Ok(range);

@@ -1892,6 +1892,8 @@ impl HttpRuntime for WorkerRuntime {
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                     // RV-APPLY: transient retries and stopped cores.
                     "raft":self.services.manager.raft_health(),
+                    // PERF1: per-stage latency histograms of this process.
+                    "stage_timing":super::stage_timing::snapshot(),
                 }))
                 .map_err(|_| unknown())?,
             })
