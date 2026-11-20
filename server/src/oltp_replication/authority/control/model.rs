@@ -657,6 +657,11 @@ pub(crate) enum ServiceAction {
     },
     QueueRetirement,
     ApiIngress,
+    /// A ready worker acting as the direct-path gateway (plan section 3):
+    /// it may send `Method::Direct`/`DirectForward` to a Data group of its
+    /// database. Sent only while `data.direct.v1` is active, so an older
+    /// Control replica never has to decode it.
+    DirectGateway,
     StatusProof { source_group: Uuid },
     TimestampProof { source_group: Uuid },
     ParticipantProof { source_group: Uuid },

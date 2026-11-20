@@ -270,12 +270,12 @@ pub(crate) fn installed(
 
 /// Who may send `Method::Direct`: an enrolled API ingress of this database
 /// (checked against the Control group, where its enrollment lives) or the
-/// current queue owner. Further gateway roles are T6's.
+/// current queue owner, or a ready worker acting as gateway (T6).
 pub(super) fn allowed(header: &super::Header) -> bool {
     use crate::oltp_replication::authority::control::ServiceAction;
     matches!(
         header.action,
-        ServiceAction::ApiIngress | ServiceAction::Owner
+        ServiceAction::ApiIngress | ServiceAction::Owner | ServiceAction::DirectGateway
     )
 }
 
@@ -327,6 +327,115 @@ pub(super) async fn serve(
         &response,
         crate::protocol::MAX_BODY_BYTES,
     )
+}
+
+/// Why a gateway's send produced no `DirectResponse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirectSendError {
+    /// Refused before the receiver could execute anything: the local lane
+    /// was full, the request could not be encoded, or the receiver refused
+    /// it typed with `not_applied` (authorization, a full lane, overload).
+    NotApplied(ProtocolError),
+    /// The request may have reached the leader and executed: the session
+    /// failed after the request was written, or the receiver failed with an
+    /// unknown outcome. The gateway resends the same id and body.
+    Uncertain(ProtocolError),
+}
+impl DirectSendError {
+    pub(crate) fn error(&self) -> &ProtocolError {
+        match self {
+            Self::NotApplied(error) | Self::Uncertain(error) => error,
+        }
+    }
+}
+
+/// The gateway side of `Method::Direct` for one Data group (plan section 3):
+/// sends a request to one voter over the worker's persistent session on the
+/// ingress lane and returns the leader's answer. It does not retry; the
+/// gateway decides that from the answer.
+pub(crate) struct DirectLink {
+    client: super::Client,
+}
+impl DirectLink {
+    /// `action` is the caller's role: `ApiIngress` for an enrolled API,
+    /// `DirectGateway` for a ready worker.
+    pub(crate) fn new(
+        group: GroupIdentity,
+        shared: Arc<crate::oltp::pool::WorkerSharedResources>,
+        transport: super::WorkerClient,
+        control: Arc<crate::oltp_replication::authority::control::ControlClient>,
+        action: crate::oltp_replication::authority::control::ServiceAction,
+    ) -> Result<Self, ProtocolError> {
+        if !matches!(group.kind, GroupKind::Data { .. }) {
+            return Err(invalid_request());
+        }
+        Ok(Self {
+            client: super::Client::new(group, shared, transport, control, action)?,
+        })
+    }
+    pub(crate) fn group(&self) -> &GroupIdentity {
+        &self.client.group
+    }
+    /// Sends `request` to replica `node` on `worker`. `forward` sends
+    /// `Method::DirectForward` instead of `Method::Direct`.
+    pub(crate) async fn send(
+        &self,
+        node: u64,
+        worker: Uuid,
+        request: &DirectRequest,
+        forward: bool,
+    ) -> Result<DirectResponse, DirectSendError> {
+        use super::{CallError, Method, RequestError, RequestTarget};
+        if request.group != self.client.group.group_id
+            || request.database != self.client.group.database
+        {
+            return Err(DirectSendError::NotApplied(invalid_request()));
+        }
+        let header = request.header();
+        let method = if forward {
+            Method::DirectForward(header)
+        } else {
+            Method::Direct(header)
+        };
+        let by_outcome = |error: ProtocolError| {
+            if error.outcome == Outcome::NotApplied {
+                DirectSendError::NotApplied(error)
+            } else {
+                DirectSendError::Uncertain(error)
+            }
+        };
+        let payload = Some(request.body.clone());
+        match self
+            .client
+            .call_member_at(
+                self.client.action,
+                method,
+                &payload,
+                node,
+                RequestTarget::WorkerId(worker),
+                None,
+            )
+            .await
+        {
+            Ok(Ok(response)) => response
+                .reply
+                .decode_section::<DirectResponse>(0)
+                .map(|decoded| (*decoded).clone())
+                // A reply that does not decode came after execution.
+                .map_err(DirectSendError::Uncertain),
+            Ok(Err(error)) => Err(by_outcome(error)),
+            Err(CallError::Local(error)) => Err(DirectSendError::NotApplied(error)),
+            Err(CallError::Transport(RequestError::OutgoingLaneFull)) => Err(
+                DirectSendError::NotApplied(RequestError::OutgoingLaneFull.into()),
+            ),
+            Err(CallError::Transport(
+                RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
+            )) => Err(by_outcome(error)),
+            Err(CallError::Transport(RequestError::Unreachable)) => {
+                Err(DirectSendError::Uncertain(RequestError::Unreachable.into()))
+            }
+        }
+    }
 }
 
 fn invalid_request() -> ProtocolError {

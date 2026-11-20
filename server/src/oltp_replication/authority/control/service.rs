@@ -1536,6 +1536,19 @@ impl ControlHandle {
                         }
                         Some((control.group_id, 3))
                     }
+                    ServiceAction::DirectGateway => {
+                        let member: Option<WorkerIdentity> = load(
+                            view,
+                            &machine::ready_key(state.ready_generation, remote.worker_id),
+                        )?;
+                        if !matches!(target.kind, GroupKind::Data { .. })
+                            || state.invalid_ready != 0
+                            || member != Some(remote)
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
+                    }
                     ServiceAction::QueueRetirement => {
                         let member: Option<WorkerIdentity> = load(
                             view,
