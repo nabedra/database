@@ -461,7 +461,7 @@ impl LocalServices {
             }
             registration.bind(Purpose::GroupLifecycle, factory.clone())?;
             let split = SplitClient::new(data.clone(), rpc.clone(), placements.timestamps.identity.clone());
-            let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps, native_catalog.clone(), status_topology.clone())?;
+            let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps.clone(), native_catalog.clone(), status_topology.clone())?;
             registration.bind(Purpose::ShardSplit, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitProof, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitImage, split_endpoint)?;
@@ -695,7 +695,7 @@ impl LocalServices {
             }
             Ok((
                 control, operator, timestamps, status, routed_status, catalog, resolver, replica, queue, rpc,
-                issuer, membership, split, placement, scoped,
+                issuer, membership, split, placement, scoped, native_timestamps,
             ))
         }).await.unwrap_or_else(|_| {
             let mut error=last_error.lock().ok().and_then(|error|error.clone()).unwrap_or_else(unavailable);
@@ -719,6 +719,7 @@ impl LocalServices {
                 split,
                 placement,
                 scoped,
+                native_timestamps,
             )) => {
                 let refresh = tokio::spawn(
                     directory
@@ -731,7 +732,13 @@ impl LocalServices {
                     scope,
                     local,
                     replication_factor,
-                    direct_timestamps: None,
+                    // Every registered worker hosts a Timestamp replica:
+                    // `AllocateDirect` tries it in process first (it only
+                    // answers on the leader), then the service lane.
+                    direct_timestamps: Some(native_timestamps
+                        as Arc<
+                            dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+                        >),
                     cold_history: Some(
                         super::super::worker_runtime::cold_history::Sources::Registered {
                             timestamps: timestamps.clone(),

@@ -1193,6 +1193,41 @@ fn m02_f03_retained_wire_and_decode_owners_prevent_worker_budget_reset() {
     replacement.bind_worker(worker).unwrap();
 }
 
+/// C02, O05, NS04 (CIfix1): a finished native job has released its lease, and
+/// with it the executor's hold on the worker resources, by the time its caller
+/// sees the result. Otherwise a caller that drops its last owner and reopens
+/// the worker's pool right away can find the old owner still alive and be
+/// refused with "worker storage capacity unavailable" (seen on Linux CI in
+/// `ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log`). The future is
+/// spun with a no-op waker so the caller observes the result as soon as the
+/// executor thread publishes it, not after a thread wake-up.
+#[test]
+fn c02_o05_ns04_native_job_releases_its_worker_owner_before_its_result() {
+    let resources = shared(SharedResourceConfig::default());
+    let worker = Uuid::new_v4();
+    resources.bind_worker(worker).unwrap();
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    for round in 0..2000 {
+        let mut job = std::pin::pin!(resources.execute(ExecutionClass::Control, 0, 0, || Ok(())));
+        loop {
+            if let std::task::Poll::Ready(result) = job.as_mut().poll(&mut context) {
+                result.unwrap();
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        assert_eq!(
+            Arc::strong_count(&resources),
+            1,
+            "round {round}: the executor still owns the worker resources"
+        );
+    }
+    drop(resources);
+    shared(SharedResourceConfig::default())
+        .bind_worker(worker)
+        .unwrap();
+}
+
 #[tokio::test]
 async fn f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic() {
     struct PanicOnDrop;

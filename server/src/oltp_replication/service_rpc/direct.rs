@@ -268,6 +268,40 @@ pub(crate) fn installed(
         .and_then(|(_, s)| s.upgrade())
 }
 
+type Replicas = Mutex<Vec<(usize, Weak<crate::oltp::mvcc::store::ParticipantHandle>)>>;
+fn replicas() -> &'static Replicas {
+    static REPLICAS: OnceLock<Replicas> = OnceLock::new();
+    REPLICAS.get_or_init(Default::default)
+}
+
+/// Records a local Data replica this worker serves on the service lane, so
+/// the executor's expiry task visits every range this worker leads, not
+/// only the ranges that received a direct request since it started (T5
+/// concern 3). Held weakly: a replica leaves when its endpoint is dropped.
+pub(crate) fn register_replica(handle: &Arc<crate::oltp::mvcc::store::ParticipantHandle>) {
+    if !matches!(handle.identity().kind, GroupKind::Data { .. }) || handle.direct_clock().is_err() {
+        return;
+    }
+    let key = resources_key(handle.resources());
+    let mut entries = replicas().lock().unwrap_or_else(|p| p.into_inner());
+    entries.retain(|(_, replica)| replica.strong_count() > 0);
+    entries.push((key, Arc::downgrade(handle)));
+}
+
+/// The live local Data replicas registered for this worker.
+pub(crate) fn registered_replicas(
+    resources: &Arc<crate::oltp::pool::WorkerSharedResources>,
+) -> Vec<Arc<crate::oltp::mvcc::store::ParticipantHandle>> {
+    let key = resources_key(resources);
+    replicas()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| *k == key)
+        .filter_map(|(_, replica)| replica.upgrade())
+        .collect()
+}
+
 /// Who may send `Method::Direct`: an enrolled API ingress of this database
 /// (checked against the Control group, where its enrollment lives) or the
 /// current queue owner, or an advertised worker acting as gateway with
@@ -294,7 +328,9 @@ pub(super) async fn authorize(
         database: session.group().database.clone(),
     };
     let target = control.control_group().clone();
-    let key = super::GrantKey::new(session.remote(), header.action, &target, None);
+    // Cached like the stable roles (T6 concern 4): one Control read per
+    // API process per `GRANT_TTL`, not per request.
+    let key = super::GrantKey::direct_ingress(session.remote(), &target);
     control
         .service_grants()
         .role(key, control.applied_revision(), || async {

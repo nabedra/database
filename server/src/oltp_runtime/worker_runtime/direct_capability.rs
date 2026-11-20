@@ -52,6 +52,10 @@ pub(crate) struct DirectSwitch {
             JoinHandle<()>,
         )>,
     >,
+    /// The Catalog under the `DirectLeader` role, once active: the
+    /// executor's schema reads and a worker gateway's topology fills use it,
+    /// so neither needs the queue owner's role (T6 concern 3).
+    catalog: Mutex<Option<crate::oltp::mvcc::catalog::CatalogHandle>>,
 }
 
 impl DirectSwitch {
@@ -69,6 +73,7 @@ impl DirectSwitch {
             stop: watch::channel(false).0,
             watcher: Mutex::new(None),
             executor: Mutex::new(None),
+            catalog: Mutex::new(None),
         })
     }
 
@@ -334,6 +339,7 @@ impl DirectSwitch {
             services.local_timestamps.clone(),
             remote,
         );
+        *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) = Some(catalog.clone());
         let executor = crate::oltp_runtime::direct::DirectExecutor::new(
             services.shared.clone(),
             crate::oltp_runtime::direct::DirectConfig::default(),
@@ -345,6 +351,14 @@ impl DirectSwitch {
         let expiry = executor.spawn_expiry();
         *self.executor.lock().unwrap_or_else(|e| e.into_inner()) = Some((executor, expiry));
         Ok(())
+    }
+
+    /// The Catalog under the `DirectLeader` role, once active.
+    pub(crate) fn direct_catalog(&self) -> Option<crate::oltp::mvcc::catalog::CatalogHandle> {
+        self.catalog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The installed executor's `direct` stats, once active.

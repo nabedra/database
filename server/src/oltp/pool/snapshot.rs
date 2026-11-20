@@ -147,14 +147,16 @@ impl GroupStore {
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
         let prepared = self.resources().prepare(ExecutionClass::Control).await?;
-        let (mut scratch, _batch, _unused) = prepared.buffers(
-            TransactionBudget {
-                output_bytes: 0,
-                batch_bytes: 0,
-                ..budget
-            },
-            unused,
-        )?;
+        let (mut scratch, _batch, _unused) = prepared
+            .buffers(
+                TransactionBudget {
+                    output_bytes: 0,
+                    batch_bytes: 0,
+                    ..budget
+                },
+                unused,
+            )
+            .await?;
         let identity = self.identity().clone();
         let group = self.clone();
         prepared
@@ -263,13 +265,15 @@ impl GroupStore {
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
         let prepared = self.resources().prepare(self.execution_class()).await?;
-        let (mut scratch, _batch, _output) = prepared.buffers(
-            TransactionBudget {
-                output_bytes: 0,
-                ..budget
-            },
-            output,
-        )?;
+        let (mut scratch, _batch, _output) = prepared
+            .buffers(
+                TransactionBudget {
+                    output_bytes: 0,
+                    ..budget
+                },
+                output,
+            )
+            .await?;
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;
@@ -340,13 +344,15 @@ impl GroupStore {
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
         let prepared = self.resources().prepare(self.execution_class()).await?;
-        let reservations = prepared.buffers(
-            TransactionBudget {
-                output_bytes: 0,
-                ..budget
-            },
-            output,
-        )?;
+        let reservations = prepared
+            .buffers(
+                TransactionBudget {
+                    output_bytes: 0,
+                    ..budget
+                },
+                output,
+            )
+            .await?;
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;
@@ -479,13 +485,15 @@ impl GroupStore {
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
         let prepared = self.resources().prepare(self.execution_class()).await?;
-        let reservations = prepared.buffers(
-            TransactionBudget {
-                output_bytes: 0,
-                ..budget
-            },
-            output,
-        )?;
+        let reservations = prepared
+            .buffers(
+                TransactionBudget {
+                    output_bytes: 0,
+                    ..budget
+                },
+                output,
+            )
+            .await?;
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;

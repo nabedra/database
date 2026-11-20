@@ -4,7 +4,7 @@ use super::{
     admission::{Admitted, DirectAdmission},
     latches::{DEFAULT_STRIPES, KeyLatches},
     schema::{DirectSchema, DirectTable, SchemaLookup},
-    stats::{DirectStats, DirectStatsSnapshot, RetryCause},
+    stats::{DirectStats, DirectStatsSnapshot, ProposalFailure, RetryCause},
 };
 use crate::{
     oltp::{
@@ -16,10 +16,10 @@ use crate::{
                 ParticipantReply, compare_keys,
                 direct::{
                     ClockRejection, DEFAULT_DIRECT_DEDUP_RETENTION_MS, DedupLookup, DirectCommit,
-                    DirectSchema as GroupSchema, DirectSchemaChange,
-                    DirectExpire, DirectForward, DirectReply, DirectWrite, IndexChange,
-                    LeaderToken, MAX_DIRECT_EXPIRE_ITEMS, MAX_DIRECT_INDEX_CHANGES,
-                    MAX_DIRECT_RESULT_BYTES, MAX_DIRECT_WRITES, RangeClock, expiry_cutoff,
+                    DirectExpire, DirectForward, DirectReply, DirectSchema as GroupSchema,
+                    DirectSchemaChange, DirectWrite, IndexChange, LeaderToken,
+                    MAX_DIRECT_EXPIRE_ITEMS, MAX_DIRECT_INDEX_CHANGES, MAX_DIRECT_RESULT_BYTES,
+                    MAX_DIRECT_WRITES, RangeClock, expiry_cutoff,
                 },
             },
         },
@@ -107,6 +107,17 @@ type RowChange = (MvccKey, Option<CommitTs>, Option<Row>, Option<Row>);
 struct Computed {
     writes: Vec<DirectWrite>,
     result: serde_json::Value,
+}
+
+/// What `activated` does while the table has no lifecycle to bind (a DDL
+/// holds it, or it is missing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Activation {
+    /// Answer `Fallback{Schema}` at once: the gateway settles the request
+    /// at its anchor and the queued path waits for the DDL.
+    FallBack,
+    /// Wait within the deadline: a forward marker needs an active group.
+    Wait,
 }
 
 enum Attempt<T> {
@@ -317,7 +328,9 @@ impl DirectExecutor {
     async fn epochs(
         &self,
         handle: &ParticipantHandle,
+        clock: &RangeClock,
         request: &DirectRequest,
+        deadline: Instant,
     ) -> Result<ParticipantEpochs, DirectResponse> {
         let epochs = handle.direct_epochs().await.map_err(failed)?;
         if epochs.schema_epoch != request.schema_epoch
@@ -325,7 +338,16 @@ impl DirectExecutor {
         {
             return Err(stale_route(Some(&epochs)));
         }
-        let epochs = self.activated(handle, request.table_id, epochs).await?;
+        let epochs = self
+            .activated(
+                handle,
+                clock,
+                request.table_id,
+                epochs,
+                Activation::FallBack,
+                deadline,
+            )
+            .await?;
         match epochs.direct_schema {
             // The table's drop fenced this group: no direct commit applies.
             Some(GroupSchema {
@@ -343,34 +365,92 @@ impl DirectExecutor {
     /// group: activate it, bound to the table's current Catalog lifecycle,
     /// then re-read the group's epochs. A DDL fence that applied first wins;
     /// activation never undoes it.
+    ///
+    /// The lifecycle is read only while no DDL holds or awaits the table's
+    /// exclusive lifecycle guard (T7b): a DDL that read the capability as
+    /// inactive did not fence, so binding its pre-DDL lifecycle would let
+    /// this leader commit with a descriptor the DDL is about to replace.
+    /// While a DDL holds it, a mutation falls back (the queued path waits on
+    /// the guard) and a forward waits within its deadline, because its
+    /// marker needs an active group. Transient Catalog and proposal failures
+    /// are retried within the deadline (T6 concern 5).
     async fn activated(
         &self,
         handle: &ParticipantHandle,
+        clock: &RangeClock,
         table_id: Uuid,
-        epochs: ParticipantEpochs,
+        mut epochs: ParticipantEpochs,
+        on_ddl: Activation,
+        deadline: Instant,
     ) -> Result<ParticipantEpochs, DirectResponse> {
-        if epochs.direct_schema.is_some() {
-            return Ok(epochs);
+        loop {
+            if epochs.direct_schema.is_some() {
+                return Ok(epochs);
+            }
+            match self
+                .activate_once(handle, table_id, epochs.authority, deadline)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) if on_ddl == Activation::FallBack => {
+                    return Err(DirectResponse::Fallback {
+                        reason: FallbackReason::Schema,
+                    });
+                }
+                Ok(false) => {
+                    if !self.pause(deadline, RetryCause::Unavailable).await {
+                        return Err(DirectResponse::Fallback {
+                            reason: FallbackReason::Schema,
+                        });
+                    }
+                }
+                Err(error) if error.code == ErrorCode::StorageUnavailable => {
+                    if !self.pause(deadline, RetryCause::Unavailable).await {
+                        return Err(failed(unavailable_not_applied()));
+                    }
+                    // A lost leadership redirects instead of retrying here.
+                    self.token(handle, clock, deadline).await?;
+                }
+                Err(error) => return Err(failed(error)),
+            }
+            epochs = by(deadline, handle.direct_epochs()).await.map_err(failed)?;
         }
-        let Some(lifecycle) = self
-            .schema
-            .lifecycle(table_id, epochs.authority)
-            .await
-            .map_err(failed)?
+    }
+
+    /// One activation attempt. `false` when the table is missing or a DDL
+    /// holds it (no lifecycle to bind now).
+    async fn activate_once(
+        &self,
+        handle: &ParticipantHandle,
+        table_id: Uuid,
+        authority: crate::oltp_replication::types::Authority,
+        deadline: Instant,
+    ) -> Result<bool, ProtocolError> {
+        let Some(lifecycle) = by(deadline, self.schema.lifecycle(table_id, authority)).await?
         else {
-            return Err(DirectResponse::Fallback {
-                reason: FallbackReason::Schema,
-            });
+            return Ok(false);
         };
-        handle
-            .change_direct_schema(DirectSchemaChange::Activate { lifecycle })
-            .await
-            .map_err(failed)?;
-        let epochs = handle.direct_epochs().await.map_err(failed)?;
-        if epochs.direct_schema.is_none() {
-            return Err(failed(unavailable_not_applied()));
+        if let Err(error) = by(
+            deadline,
+            handle.change_direct_schema(DirectSchemaChange::Activate { lifecycle }),
+        )
+        .await
+        {
+            self.stats.proposal_failed(ProposalFailure::Activation);
+            tracing::debug!(group = %handle.identity().group_id, code = ?error.code,
+                message = %error.message, "direct group activation failed");
+            // Activation writes no request: a retry is always safe.
+            return Err(ProtocolError::new(
+                if error.code == ErrorCode::ValidationError {
+                    error.code
+                } else {
+                    ErrorCode::StorageUnavailable
+                },
+                error.message,
+                Outcome::NotApplied,
+            ));
         }
-        Ok(epochs)
+        Ok(true)
     }
 
     async fn table(
@@ -421,6 +501,35 @@ impl DirectExecutor {
         true
     }
 
+    /// Counts a proposal that produced no reply, by why (T7b): the
+    /// deadline, a leadership change since `token`, or a stable leader whose
+    /// proposal still failed.
+    fn proposal_failed(
+        &self,
+        handle: &ParticipantHandle,
+        clock: &RangeClock,
+        token: Option<LeaderToken>,
+        deadline: Instant,
+        error: &ProtocolError,
+    ) {
+        let reason = if Instant::now() >= deadline {
+            ProposalFailure::Deadline
+        } else if token.is_none() || clock.leader_token() != token {
+            ProposalFailure::Leadership
+        } else {
+            ProposalFailure::Stalled
+        };
+        self.stats.proposal_failed(reason);
+        tracing::debug!(
+            group = %handle.identity().group_id,
+            ?reason,
+            leadership = ?handle.direct_leadership(),
+            code = ?error.code,
+            message = %error.message,
+            "direct proposal produced no reply"
+        );
+    }
+
     async fn get(
         &self,
         handle: &Arc<ParticipantHandle>,
@@ -438,7 +547,7 @@ impl DirectExecutor {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, request).await?;
+            let epochs = self.epochs(handle, clock, request, deadline).await?;
             self.table(request, &epochs, &parsed.operation).await?;
             loop {
                 if by(deadline, handle.direct_barrier()).await.is_err() {
@@ -548,7 +657,7 @@ impl DirectExecutor {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, request).await?;
+            let epochs = self.epochs(handle, clock, request, deadline).await?;
             let table = self.table(request, &epochs, &parsed.operation).await?;
             let keys = self.row_keys(&table, &parsed.operation)?;
             let encoded: Vec<Vec<u8>> = keys
@@ -616,7 +725,7 @@ impl DirectExecutor {
     ) -> Result<Attempt<DirectResponse>, DirectResponse> {
         // T4fix F4: the token is taken before the timestamp is fetched.
         let token = self.token(handle, clock, deadline).await?;
-        let epochs = self.epochs(handle, request).await?;
+        let epochs = self.epochs(handle, clock, request, deadline).await?;
         if by(deadline, handle.direct_barrier()).await.is_err() {
             if Instant::now() + RETRY_PAUSE >= deadline {
                 return Err(not_leader_or(handle, *uncertain));
@@ -740,11 +849,12 @@ impl DirectExecutor {
         self.stats.proposed(rows, index_changes);
         let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
-            Err(_) => {
+            Err(error) => {
                 // The entry may still commit; the dedup record decides on
                 // the next attempt (T4: settle on any proposal error).
                 clock.settle(commit_ts);
                 *uncertain = true;
+                self.proposal_failed(handle, clock, Some(token), deadline, &error);
                 return Ok(Attempt::Retry(RetryCause::Leadership));
             }
         };
@@ -965,13 +1075,27 @@ impl DirectExecutor {
     ) -> ForwardResponse {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            self.token(handle, clock, deadline).await?;
+            let token = Some(self.token(handle, clock, deadline).await?);
             let epochs = handle.direct_epochs().await.map_err(failed)?;
             // A forward marker is gated like Direct: activate the group.
-            let epochs = self.activated(handle, request.table_id, epochs).await?;
+            let epochs = self
+                .activated(
+                    handle,
+                    clock,
+                    request.table_id,
+                    epochs,
+                    Activation::Wait,
+                    deadline,
+                )
+                .await?;
             let table = match self
                 .schema
-                .table(request.table_id, request.schema_epoch, None, epochs.authority)
+                .table(
+                    request.table_id,
+                    request.schema_epoch,
+                    None,
+                    epochs.authority,
+                )
                 .await
                 .map_err(failed)?
             {
@@ -1051,8 +1175,9 @@ impl DirectExecutor {
                 .map_err(failed)?;
                 let applied = match by(deadline, handle.propose(command)).await {
                     Ok(applied) => applied,
-                    Err(_) => {
+                    Err(error) => {
                         uncertain = true;
+                        self.proposal_failed(handle, clock, token, deadline, &error);
                         if !self.pause(deadline, RetryCause::Leadership).await {
                             return Err(deadline_expired(uncertain));
                         }
@@ -1151,12 +1276,26 @@ impl DirectExecutor {
         Ok(deleted)
     }
 
-    /// One expiry pass over every range this worker served as leader.
+    /// One expiry pass over every range this worker leads: the ranges it
+    /// served direct requests on, and every local Data replica registered on
+    /// its service lane (T5 concern 3), so a new leader also expires records
+    /// on ranges that receive no direct request. `expire` proposes nothing
+    /// where this node does not serve as leader.
     pub(crate) async fn expire_served(&self) -> u64 {
         let handles: Vec<Arc<ParticipantHandle>> = {
             let mut served = self.served.lock().unwrap_or_else(|p| p.into_inner());
             served.retain(|_, handle| handle.strong_count() > 0);
-            served.values().filter_map(Weak::upgrade).collect()
+            let mut handles: HashMap<Uuid, Arc<ParticipantHandle>> = served
+                .iter()
+                .filter_map(|(group, handle)| Some((*group, handle.upgrade()?)))
+                .collect();
+            drop(served);
+            for handle in
+                crate::oltp_replication::service_rpc::direct::registered_replicas(&self.resources)
+            {
+                handles.entry(handle.identity().group_id).or_insert(handle);
+            }
+            handles.into_values().collect()
         };
         let mut deleted = 0;
         for handle in handles {

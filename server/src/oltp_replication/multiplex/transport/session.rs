@@ -225,6 +225,11 @@ struct Outbound {
     head: Vec<u8>,
     parts: Vec<Part>,
     ack: Option<oneshot::Sender<WriteOutcome>>,
+    /// A reply's handler lane slot. The writer releases it when it starts
+    /// writing the frame, so the slot is free before the peer can read the
+    /// reply and send its next request (a sequential caller is never refused
+    /// by its own previous call).
+    release: Option<OwnedSemaphorePermit>,
 }
 impl Outbound {
     fn control(stream_id: u64, flags: u8) -> Self {
@@ -238,6 +243,7 @@ impl Outbound {
             .to_vec(),
             parts: Vec::new(),
             ack: None,
+            release: None,
         }
     }
     fn cancel(stream_id: u64) -> Self {
@@ -289,7 +295,7 @@ async fn write_frames(
             _ = stopped(&mut stop) => break true,
             frame = queue.recv() => frame,
         };
-        let Some(frame) = frame else {
+        let Some(mut frame) = frame else {
             break true;
         };
         if let Some(hold) = hold.as_mut() {
@@ -305,6 +311,7 @@ async fn write_frames(
                 break true;
             }
         }
+        drop(frame.release.take());
         let written = tokio::select! {
             biased;
             written = timeout(deadline, write_frame(&mut stream, &frame)) => {
@@ -582,6 +589,7 @@ impl ClientSession {
             head,
             parts,
             ack: Some(ack),
+            release: None,
         };
         match timeout_at(deadline, self.outgoing.send(frame)).await {
             Ok(Ok(())) => guard.queued = true,
@@ -1270,6 +1278,14 @@ pub(super) async fn serve(
         reader.abort();
         let _ = reader.await;
     }
+    // No request is read any more. Give the slots back before the writer
+    // closes the socket: a peer that sees the close and reconnects must find
+    // them free, not wait for this task to be scheduled again (D10/C07,
+    // CIfix1). A lane slot is kept while a stream still owes its reply.
+    lock(&state.pending).take();
+    if lock(&state.active).is_empty() {
+        lock(&state.lane).take();
+    }
     let _ = writer.await;
 }
 
@@ -1394,6 +1410,7 @@ fn reply_frame(stream_id: u64, nonce: Uuid, status: u8, reply: ChargedReply) -> 
         head,
         parts,
         ack: None,
+        release: None,
     }
 }
 
@@ -1457,7 +1474,7 @@ async fn run_stream(
         Ok((reply, handler))
     })
     .await;
-    let (frame, handler) = match handled {
+    let (frame, mut handler) = match handled {
         Ok(Ok((reply, handler))) => (Some(reply_frame(stream_id, nonce, 0, reply)), Some(handler)),
         Ok(Err(error)) => {
             if matches!(purpose, Purpose::Raft | Purpose::RaftProgress) {
@@ -1481,8 +1498,12 @@ async fn run_stream(
         let mut frame = frame.unwrap_or_else(|| Outbound::cancel(stream_id));
         let (ack, written) = oneshot::channel();
         frame.ack = Some(ack);
+        // The handler lane stays held while the reply waits for the socket.
+        // The writer frees it as it starts writing the reply, before the peer
+        // can see it: freed after the write, the slot could still be held
+        // when the peer's next request arrives (D10/O05, CIfix1).
+        frame.release = handler.take();
         if outgoing.send(frame).await.is_ok() {
-            // The handler lane stays held until the reply reaches the socket.
             let _ = written.await;
         }
     }
@@ -1708,6 +1729,7 @@ mod tests {
                 Part::Length([0; 8]),
             ],
             ack: None,
+            release: None,
         };
         let mut out = Vec::new();
         write_frame(&mut out, &frame).await.unwrap();
@@ -1716,5 +1738,64 @@ mod tests {
         expected.extend_from_slice(&7u64.to_be_bytes());
         expected.extend_from_slice(&[0; 8]);
         assert_eq!(out, expected);
+    }
+
+    /// D10/O05 (CIfix1): a reply's handler lane slot is free before any byte
+    /// of the reply reaches the socket, so a peer that answers a reply with
+    /// its next request always finds the slot free. Released after the write,
+    /// a sequential caller on a loaded host was refused with "worker handler
+    /// lane full" (`d10_o05_one_session_per_lane_carries_many_calls`, Linux CI).
+    #[tokio::test]
+    async fn d10_o05_reply_frees_its_handler_slot_before_its_bytes_are_written() {
+        struct Probe {
+            lane: Arc<Semaphore>,
+            free: Arc<Mutex<Vec<usize>>>,
+        }
+        impl AsyncWrite for Probe {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
+                self.free
+                    .lock()
+                    .unwrap()
+                    .push(self.lane.available_permits());
+                std::task::Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let lane = Arc::new(Semaphore::new(1));
+        let free = Arc::new(Mutex::new(Vec::new()));
+        let (queue, frames) = mpsc::channel(4);
+        let (ack, written) = oneshot::channel();
+        let mut frame = Outbound::cancel(7);
+        frame.ack = Some(ack);
+        frame.release = Some(lane.clone().try_acquire_owned().unwrap());
+        queue.send(frame).await.unwrap();
+        drop(queue);
+        let probe = Probe {
+            lane: lane.clone(),
+            free: free.clone(),
+        };
+        assert!(write_frames(probe, frames, None, None, Duration::from_secs(5)).await);
+        assert_eq!(written.await.unwrap(), WriteOutcome::Written);
+        let free = free.lock().unwrap().clone();
+        assert!(!free.is_empty());
+        assert!(
+            free.iter().all(|&n| n == 1),
+            "the handler slot was held while its reply was written: {free:?}"
+        );
     }
 }
