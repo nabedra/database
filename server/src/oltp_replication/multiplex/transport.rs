@@ -1302,7 +1302,12 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
         Purpose::QueueControl if group.kind == GroupKind::Control => Ok(TrafficClass::QueueControl),
         Purpose::QueueData if group.kind == GroupKind::Control => Ok(TrafficClass::QueueData),
         Purpose::Storage if !small => Ok(TrafficClass::Storage),
-        Purpose::ApiIngress if group.kind == GroupKind::Control => Ok(TrafficClass::ApiIngress),
+        // Data groups: `Method::Direct` from a gateway to the range leader.
+        Purpose::ApiIngress
+            if matches!(group.kind, GroupKind::Control | GroupKind::Data { .. }) =>
+        {
+            Ok(TrafficClass::ApiIngress)
+        }
         Purpose::ApiObservation if group.kind == GroupKind::Control => {
             Ok(TrafficClass::ApiObservation)
         }

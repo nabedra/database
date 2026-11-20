@@ -15,6 +15,8 @@
 //! Mixed versions: an older receiver rejects the unknown method or the
 //! ingress purpose on a Data group before executing anything. Gateways send
 //! these methods only once `data.direct.v1` is active (T7).
+// T6 (gateway) and T7 (activation) construct and call this; until then only tests do.
+#![cfg_attr(not(test), allow(dead_code))]
 use crate::{
     oltp::pool::ChargedBytes,
     oltp_replication::types::{Digest, GroupIdentity, GroupKind, Text},
@@ -260,6 +262,67 @@ pub(crate) fn installed(
         .iter()
         .find(|(k, _)| *k == key)
         .and_then(|(_, s)| s.upgrade())
+}
+
+/// Who may send `Method::Direct`: an enrolled API ingress of this database
+/// (checked against the Control group, where its enrollment lives) or the
+/// current queue owner. Further gateway roles are T6's.
+pub(super) fn allowed(header: &super::Header) -> bool {
+    use crate::oltp_replication::authority::control::ServiceAction;
+    matches!(
+        header.action,
+        ServiceAction::ApiIngress | ServiceAction::Owner
+    )
+}
+
+pub(super) async fn authorize(
+    control: &crate::oltp_replication::authority::control::ControlClient,
+    session: &super::AuthenticatedSession,
+    header: &super::Header,
+) -> Result<(), ProtocolError> {
+    use crate::oltp_replication::authority::control::ServiceAction;
+    if header.action != ServiceAction::ApiIngress {
+        return super::authorize(control, session, header).await;
+    }
+    let scope = crate::oltp_runtime::replica::QueueScope {
+        cluster_id: session.group().cluster_id,
+        database: session.group().database.clone(),
+    };
+    let target = control.control_group().clone();
+    let key = super::GrantKey::new(session.remote(), header.action, &target, None);
+    control
+        .service_grants()
+        .role(key, control.applied_revision(), || async {
+            control
+                .service_role(&scope, session.remote(), header.action, target.clone())
+                .await
+                .map(Some)
+        })
+        .await
+}
+
+/// Serves `Method::Direct` / `Method::DirectForward` on a local replica.
+pub(super) async fn serve(
+    handle: &Arc<crate::oltp::mvcc::store::ParticipantHandle>,
+    session: &super::AuthenticatedSession,
+    header: DirectHeader,
+    forward: bool,
+    sections: &super::ChargedSections,
+) -> Result<ChargedBytes, ProtocolError> {
+    let body = sections.section(0).ok_or_else(invalid_request)?.clone();
+    let request = DirectRequest::received(session.group(), header, body)?;
+    let response = match installed(handle.resources()) {
+        None => DirectResponse::Fallback {
+            reason: FallbackReason::Inactive,
+        },
+        Some(service) if forward => service.forward(handle, request).await?,
+        Some(service) => service.execute(handle, request).await?,
+    };
+    handle.resources().encode_in(
+        crate::oltp::pool::ByteClass::Data,
+        &response,
+        crate::protocol::MAX_BODY_BYTES,
+    )
 }
 
 fn invalid_request() -> ProtocolError {
