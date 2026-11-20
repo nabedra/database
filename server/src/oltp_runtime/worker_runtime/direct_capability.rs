@@ -340,9 +340,20 @@ impl DirectSwitch {
             remote,
         );
         *self.catalog.lock().unwrap_or_else(|e| e.into_inner()) = Some(catalog.clone());
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut config = crate::oltp_runtime::direct::DirectConfig::default();
+        // T9 D12: a registered test child can shrink the leader's in-flight budget
+        // so a process-level load deterministically exceeds it.
+        #[cfg(test)]
+        if let Some(limit) = std::env::var("NABEDRA_OLTP_TEST_DIRECT_MAX_IN_FLIGHT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            config.max_in_flight = limit;
+        }
         let executor = crate::oltp_runtime::direct::DirectExecutor::new(
             services.shared.clone(),
-            crate::oltp_runtime::direct::DirectConfig::default(),
+            config,
             self.clone(),
             Arc::new(crate::oltp_runtime::direct::CatalogSchema::new(catalog)),
             timestamps,

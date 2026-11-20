@@ -48,11 +48,8 @@ pub(crate) struct RemoteConfig {
     pub scoped_oltp: bool,
     /// `topology.direct_oltp`: route eligible point operations directly once
     /// `data.direct.v1` is active (default `true`).
-    #[serde(default = "direct_oltp_default")]
+    #[serde(default = "crate::config::direct_oltp_default")]
     pub direct_oltp: bool,
-}
-fn direct_oltp_default() -> bool {
-    true
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
