@@ -105,6 +105,14 @@ pub(crate) trait RemoteParticipant: Send + Sync {
         &self,
         binding: super::lifecycle::LifecycleBinding,
     ) -> ParticipantFuture<'_, Option<super::lifecycle::VerifiedLifecycleGuard>>;
+    /// The table's exclusive lifecycle guard (T7b). Only the service client
+    /// implements it.
+    fn lifecycle_exclusive(
+        &self,
+        _table_id: Uuid,
+    ) -> ParticipantFuture<'_, Option<super::lifecycle::LifecycleBinding>> {
+        Box::pin(async { Err(invalid()) })
+    }
     fn scoped_lifecycle_guard(
         &self,
         _txn: TxnId,

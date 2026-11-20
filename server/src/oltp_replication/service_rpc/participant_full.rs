@@ -54,6 +54,9 @@ impl ParticipantEndpoint {
         transport: WorkerClient,
         status_topology: Option<StatusTopology>,
     ) -> Result<Arc<Self>, ProtocolError> {
+        // Every served local Data replica is visible to the direct expiry
+        // task, which proposes only where this node leads (T7b).
+        super::direct::register_replica(&handle);
         Ok(Arc::new(Self {
             proof: ParticipantProofEndpoint::new(handle, node, control)?,
             transport,
@@ -115,6 +118,15 @@ impl ParticipantEndpoint {
             | Method::ParticipantScanOpen { .. }
             | Method::ParticipantScanRun { .. }
             | Method::ParticipantHolder { .. } => head.action == ServiceAction::Owner,
+            // A direct range leader checks for a DDL before it activates a
+            // Data group (T7b).
+            Method::ParticipantExclusive { .. } => {
+                self.proof.handle.identity().kind == GroupKind::Catalog
+                    && matches!(
+                        head.action,
+                        ServiceAction::Owner | ServiceAction::DirectLeader
+                    )
+            }
             Method::ParticipantResolveTimestampPoint => {
                 matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
                     && matches!(head.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
@@ -908,6 +920,16 @@ impl Endpoint for ParticipantEndpoint {
                     }
                     Method::ParticipantHolder { table_id } => {
                         let value = self.proof.handle.lifecycle_holder(table_id).await?;
+                        let shared = self.proof.shared.clone();
+                        self.proof
+                            .shared
+                            .execute(ExecutionClass::Control, self.proof.node, 0, move || {
+                                shared.encode_in(ByteClass::Progress, &value, 128 << 10)
+                            })
+                            .await
+                    }
+                    Method::ParticipantExclusive { table_id } => {
+                        let value = self.proof.handle.lifecycle_exclusive(table_id).await?;
                         let shared = self.proof.shared.clone();
                         self.proof
                             .shared
@@ -1786,6 +1808,16 @@ impl RemoteParticipant for ParticipantClient {
     ) -> ParticipantFuture<'_, Option<LifecycleBinding>> {
         Box::pin(async move {
             self.decoded(Method::ParticipantHolder { table_id }, None)
+                .await
+                .map(|(value, _)| value)
+        })
+    }
+    fn lifecycle_exclusive(
+        &self,
+        table_id: uuid::Uuid,
+    ) -> ParticipantFuture<'_, Option<LifecycleBinding>> {
+        Box::pin(async move {
+            self.decoded(Method::ParticipantExclusive { table_id }, None)
                 .await
                 .map(|(value, _)| value)
         })
