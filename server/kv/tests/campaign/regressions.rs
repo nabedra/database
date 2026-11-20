@@ -31,8 +31,9 @@ pub const FIXED: &[Case] = &[
         note: "injected run read EIO during the dump after a clean reopen",
     },
     // KVfix3, CI 34ce7f4 (Linux debug, `ns05_ns10_power_loss_faults_and_recoveries_sampled`):
-    // the same harness gap; whether the n-th run read lands in the dump depends on
-    // background timing.
+    // an armed crash froze the machine during the dump after a clean reopen (background
+    // work after the open reached the armed operation), and the harness failed the run
+    // instead of cutting. Whether the crash lands in the dump depends on timing.
     Case {
         seed: 6,
         steps: 400,
@@ -43,7 +44,7 @@ pub const FIXED: &[Case] = &[
             320, 321, 322, 323, 324, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361,
             362, 363, 364, 365, 366, 367,
         ],
-        note: "injected run read EIO during the dump after a clean reopen (timing)",
+        note: "armed crash during the dump after a clean reopen (timing)",
     },
 ];
 

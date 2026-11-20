@@ -640,19 +640,30 @@ impl<'a> Exec<'a> {
         self.faulted && matches!(e, Error::Io(_)) && !self.fs.is_crashed()
     }
 
-    /// The whole state of `snap`, both ways. An injected read error is retried once:
-    /// EIO faults fire once, so the second dump reads every block, and its result must
-    /// still be exact. Any other failure, or a second `Io`, is the caller's.
-    fn dump_retrying(&self, snap: &Snapshot) -> Result<Model, String> {
+    /// The whole state of `snap`, both ways, for the checks around a clean reopen.
+    /// - An injected read error is retried once: EIO faults fire once, so the second
+    ///   dump reads every block, and its result must still be exact.
+    /// - An armed crash may freeze the machine while the dump runs (background flushes
+    ///   and compactions after the open count as mutating operations); every read then
+    ///   fails, and the armed cut happens, as in [`Exec::on_error`].
+    ///
+    /// Anything else fails the run, labelled `what`.
+    fn dump_checked(&self, snap: &Snapshot, what: &str) -> Result<Model, Flow> {
         let mut retried = false;
         loop {
             match oracle::dump(snap) {
                 Ok(m) => return Ok(m),
+                Err(DumpFailure::Scan(..)) if self.fs.is_crashed() && self.armed.is_some() => {
+                    let kind = self.armed.expect("checked");
+                    return Err(Flow::Cut(kind, "armed crash during a reopen check"));
+                }
                 Err(DumpFailure::Scan(_, e)) if !retried && self.injected_read_error(&e) => {
                     retried = true;
                 }
-                Err(DumpFailure::Scan(what, e)) => return Err(format!("{what} scan: {e}")),
-                Err(DumpFailure::Differ(m)) => return Err(m),
+                Err(DumpFailure::Scan(dir, e)) => {
+                    return Err(Flow::Fail(format!("{what}: {dir} scan: {e}")));
+                }
+                Err(DumpFailure::Differ(m)) => return Err(Flow::Fail(format!("{what}: {m}"))),
             }
         }
     }
@@ -679,7 +690,7 @@ impl<'a> Exec<'a> {
     fn reopen(&mut self) -> Flow {
         self.report.reopens += 1;
         for (snap, m) in &self.held {
-            match self.dump_retrying(snap) {
+            match self.dump_checked(snap, "held snapshot before reopen") {
                 Ok(d) if &d == m => {}
                 Ok(d) => {
                     return Flow::Fail(format!(
@@ -687,7 +698,7 @@ impl<'a> Exec<'a> {
                         oracle::first_difference(&d, m)
                     ));
                 }
-                Err(e) => return Flow::Fail(format!("held snapshot before reopen: {e}")),
+                Err(flow) => return flow,
             }
         }
         self.held.clear();
@@ -711,13 +722,13 @@ impl<'a> Exec<'a> {
                     return Flow::Fail(format!("reopen quarantined {:?}", opened.quarantined));
                 }
                 self.store = Some(Arc::new(opened.store));
-                match self.dump_retrying(&self.store().snapshot()) {
+                match self.dump_checked(&self.store().snapshot(), "after clean reopen") {
                     Ok(d) if d == self.model => Flow::Continue,
                     Ok(d) => Flow::Fail(format!(
                         "after clean reopen: {}",
                         oracle::first_difference(&d, &self.model)
                     )),
-                    Err(e) => Flow::Fail(format!("after clean reopen: {e}")),
+                    Err(flow) => flow,
                 }
             }
             Err(e) => {
