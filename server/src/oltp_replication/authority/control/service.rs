@@ -521,6 +521,20 @@ impl ControlHandle {
             operation_id,
             machine::hash(target.worker_id.as_bytes()),
         )?;
+        // Every caller joins its own process, which runs this build and so
+        // decodes every direct entry: advertise `data.direct.v1` first, or an
+        // active capability refuses the join. Control answers `Unauthorized`
+        // (and records nothing) when the identity is not enrolled yet.
+        if target == permit.local {
+            self.submit(ControlCommand::DirectCapability {
+                operation_id: Uuid::new_v4(),
+                actor: target,
+                action: super::DirectCapabilityOperation::Advertise {
+                    version: super::DIRECT_VERSION,
+                },
+            })
+            .await?;
+        }
         self.submit(ControlCommand::BeginJoin {
             operation_id,
             expected,
@@ -1402,6 +1416,19 @@ impl ControlHandle {
                 let source = match action {
                     ServiceAction::ApiIngress | ServiceAction::ScopedQueueIngress { .. } => {
                         return Err(unauthorized());
+                    }
+                    ServiceAction::DirectLeader => {
+                        let advertised = load::<WorkerIdentity>(
+                            view,
+                            &machine::direct::reader_key(remote),
+                        )?;
+                        if view.get(machine::direct::activation_key())?.is_none()
+                            || advertised != Some(remote)
+                            || !matches!(target.kind, GroupKind::Catalog | GroupKind::Timestamps)
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
                     }
                     ServiceAction::Owner => {
                         if state.owner != Some(remote) {

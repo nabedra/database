@@ -567,6 +567,10 @@ pub(crate) struct ParticipantEpochs {
     pub catalog_group_id: Uuid,
     pub schema_epoch: u64,
     pub routing_epoch: u64,
+    /// The group's `data.direct.v1` state (T7), read from the same config.
+    /// Absent until activation, so the encoding is unchanged before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_schema: Option<super::direct::DirectSchema>,
 }
 impl ParticipantHandle {
     pub(crate) async fn activation(&self) -> Result<Option<ParticipantEpochs>, ProtocolError> {

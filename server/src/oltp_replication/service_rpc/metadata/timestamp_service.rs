@@ -417,7 +417,11 @@ impl TimestampEndpoint {
                             if source_group == route.source_group
                     )
             }
-            Method::TimestampCall { .. } => head.action == ServiceAction::Owner,
+            // `AllocateDirect` (operation 41) also for a direct range leader.
+            Method::TimestampCall { operation, .. } => {
+                head.action == ServiceAction::Owner
+                    || head.action == ServiceAction::DirectLeader && operation == 41
+            }
             _ => false,
         };
         if !permitted {

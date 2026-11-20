@@ -82,6 +82,10 @@ impl ParticipantEndpoint {
         let allowed = match head.method {
             Method::ParticipantRead { read_ts } => match head.action {
                 ServiceAction::Owner => true,
+                // A direct range leader reads its table schema (T7).
+                ServiceAction::DirectLeader => {
+                    self.proof.handle.identity().kind == GroupKind::Catalog
+                }
                 ServiceAction::ScopedCatalogRead(scope) => {
                     self.proof.handle.identity().kind == GroupKind::Catalog
                         && scope.read_ts == read_ts
@@ -101,7 +105,9 @@ impl ParticipantEndpoint {
                 matches!(
                     head.action,
                     ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
-                )
+                ) || matches!(head.method, Method::ParticipantActivation)
+                    && head.action == ServiceAction::DirectLeader
+                    && self.proof.handle.identity().kind == GroupKind::Catalog
             }
             Method::ParticipantImages
             | Method::ParticipantArchiveEffects { .. }

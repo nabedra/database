@@ -165,6 +165,16 @@ impl WorkerRuntime {
     pub(crate) fn direct_switch(&self) -> Option<&Arc<super::direct_capability::DirectSwitch>> {
         self.direct.get()
     }
+    /// Incremental backups exist only while `data.direct.v1` is inactive (a
+    /// cluster with an older member). A single test worker activates it on
+    /// startup, so tests of incremental export stop the watcher first.
+    #[cfg(test)]
+    pub(crate) async fn without_direct_for_test(&self) {
+        if let Some(direct) = self.direct.get() {
+            direct.stop().await;
+        }
+        self.set_direct_commits_active(false);
+    }
     pub(crate) fn direct_commits_active(&self) -> bool {
         self.direct_commits_active
             .load(std::sync::atomic::Ordering::Acquire)

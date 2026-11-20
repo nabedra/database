@@ -1,16 +1,19 @@
 //! Table descriptors and writable indexes for the leader (plan section 6
 //! step 4: "validate the row against the cached table descriptor").
 //!
-//! A cache entry is keyed by `(table_id, schema_epoch)`. Every DirectCommit
-//! carries its schema epoch and apply refuses a stale one, so an entry can be
-//! reused for as long as the group's epoch is unchanged. This relies on the
-//! DDL fence of plan section 7 (T7): every change of the writable index set
-//! or the descriptor commits a new `schema_epoch` to the table's Data groups
-//! before the Catalog publishes it.
+//! A cache entry is keyed by the table, the route's schema epoch and the
+//! group's direct schema epoch (T7). Every DirectCommit carries the direct
+//! epoch and apply refuses a stale one. The DDL fence of plan section 7
+//! commits a new direct epoch, bound to the table lifecycle id the Catalog is
+//! about to publish, to every Data group of the table before the Catalog
+//! publishes a new descriptor or writable index set. A load accepts only the
+//! table record whose `lifecycle_id` the group's direct schema names, so an
+//! entry stays valid for as long as the group's direct epoch is unchanged.
 use crate::{
     oltp::mvcc::{
         MvccKey,
         catalog::{CatalogHandle, CatalogRead},
+        store::direct::DirectSchema as GroupSchema,
         index::{IndexDefinition, IndexPage, IndexRecord, IndexRoot},
         store::direct::MAX_DIRECT_INDEX_CHANGES,
     },
@@ -31,6 +34,8 @@ use uuid::Uuid;
 pub(crate) struct DirectTable {
     pub descriptor: TableDescriptor,
     pub schema_epoch: u64,
+    /// The Catalog table record's lifecycle id this entry was read from.
+    pub lifecycle_id: Uuid,
     /// Every writable (building or ready) index at `schema_epoch`.
     pub indexes: Vec<IndexDefinition>,
 }
@@ -48,12 +53,22 @@ pub(crate) enum SchemaLookup {
 }
 
 pub(crate) trait DirectSchema: Send + Sync {
+    /// The table at the route's `schema_epoch`. With `group`, only the
+    /// descriptor whose lifecycle the group's direct schema admits; a
+    /// different one means a DDL is between its fence and its publication
+    /// (`Blocked`). Without it (forward markers, which need only the key
+    /// column), any current descriptor.
     fn table(
         &self,
         table_id: Uuid,
         schema_epoch: u64,
+        group: Option<GroupSchema>,
         authority: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup>;
+    /// The table record's current lifecycle id, which a first activation of
+    /// a Data group binds (T7). `None` when the table is missing or a DDL
+    /// holds an intent on it.
+    fn lifecycle(&self, table_id: Uuid, authority: Authority) -> ConsensusFuture<'_, Option<Uuid>>;
 }
 
 /// Fixed tables, for tests and single-process composition.
@@ -70,10 +85,20 @@ impl StaticSchema {
     }
 }
 impl DirectSchema for StaticSchema {
+    fn lifecycle(&self, table_id: Uuid, _: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
+        let found = self
+            .tables
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&table_id)
+            .map(|table| table.lifecycle_id);
+        Box::pin(async move { Ok(found) })
+    }
     fn table(
         &self,
         table_id: Uuid,
         schema_epoch: u64,
+        group: Option<GroupSchema>,
         _: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup> {
         let found = self
@@ -88,6 +113,9 @@ impl DirectSchema for StaticSchema {
                 Some(table) if table.schema_epoch != schema_epoch => SchemaLookup::StaleEpoch {
                     current: table.schema_epoch,
                 },
+                Some(table) if group.is_some_and(|group| !group.admits(table.lifecycle_id)) => {
+                    SchemaLookup::Blocked
+                }
                 Some(table) => SchemaLookup::Table(table),
             })
         })
@@ -103,8 +131,8 @@ pub(crate) struct CatalogSchema {
 const CACHE_ENTRIES: usize = 256;
 #[derive(Default)]
 struct Cache {
-    entries: HashMap<(Uuid, u64), Arc<DirectTable>>,
-    order: VecDeque<(Uuid, u64)>,
+    entries: HashMap<CacheKey, Arc<DirectTable>>,
+    order: VecDeque<CacheKey>,
 }
 impl CatalogSchema {
     pub(crate) fn new(catalog: CatalogHandle) -> Self {
@@ -113,7 +141,7 @@ impl CatalogSchema {
             cache: Mutex::default(),
         }
     }
-    fn cached(&self, key: (Uuid, u64)) -> Option<Arc<DirectTable>> {
+    fn cached(&self, key: CacheKey) -> Option<Arc<DirectTable>> {
         self.cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -121,8 +149,7 @@ impl CatalogSchema {
             .get(&key)
             .cloned()
     }
-    fn remember(&self, table: Arc<DirectTable>) {
-        let key = (table.descriptor.id, table.schema_epoch);
+    fn remember(&self, key: CacheKey, table: Arc<DirectTable>) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if cache.entries.insert(key, table).is_none() {
             cache.order.push_back(key);
@@ -137,6 +164,7 @@ impl CatalogSchema {
         &self,
         table_id: Uuid,
         schema_epoch: u64,
+        group: Option<GroupSchema>,
         authority: Authority,
     ) -> Result<SchemaLookup, ProtocolError> {
         let latest = ReadTs::new(u64::MAX).map_err(|_| invalid())?;
@@ -153,6 +181,11 @@ impl CatalogSchema {
             return Ok(SchemaLookup::StaleEpoch {
                 current: table.schema_epoch,
             });
+        }
+        if group.is_some_and(|group| !group.admits(table.lifecycle_id)) {
+            // Fenced but not yet published (or a publication that failed
+            // after its fence): the queued path waits on the DDL's guard.
+            return Ok(SchemaLookup::Blocked);
         }
         let mut indexes = Vec::new();
         let root = match self
@@ -208,9 +241,10 @@ impl CatalogSchema {
         let table = Arc::new(DirectTable {
             descriptor: table.descriptor.clone(),
             schema_epoch: table.schema_epoch,
+            lifecycle_id: table.lifecycle_id,
             indexes,
         });
-        self.remember(table.clone());
+        self.remember((table_id, schema_epoch, group.map(|group| group.epoch)), table.clone());
         Ok(SchemaLookup::Table(table))
     }
 }
@@ -219,16 +253,32 @@ impl DirectSchema for CatalogSchema {
         &self,
         table_id: Uuid,
         schema_epoch: u64,
+        group: Option<GroupSchema>,
         authority: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup> {
         Box::pin(async move {
-            if let Some(table) = self.cached((table_id, schema_epoch)) {
+            if let Some(table) = self.cached((table_id, schema_epoch, group.map(|g| g.epoch))) {
                 return Ok(SchemaLookup::Table(table));
             }
-            self.load(table_id, schema_epoch, authority).await
+            self.load(table_id, schema_epoch, group, authority).await
+        })
+    }
+    fn lifecycle(&self, table_id: Uuid, authority: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
+        Box::pin(async move {
+            let latest = ReadTs::new(u64::MAX).map_err(|_| invalid())?;
+            let pin = self.catalog.snapshot(latest, authority)?;
+            Ok(match self.catalog.describe(&pin, table_id).await? {
+                CatalogRead::Value {
+                    record: Some(record),
+                    ..
+                } => Some(record.lifecycle_id),
+                _ => None,
+            })
         })
     }
 }
+/// (table, route schema epoch, group direct epoch when checked).
+type CacheKey = (Uuid, u64, Option<u64>);
 
 fn invalid() -> ProtocolError {
     ProtocolError::new(

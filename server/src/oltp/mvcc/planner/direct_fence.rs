@@ -46,6 +46,7 @@ impl NativePlanner {
     /// table routes to at `pin`. Call it while holding the table's exclusive
     /// lifecycle guard and before the Catalog publication commits. Returns
     /// the number of groups fenced (0 while `data.direct.v1` is inactive).
+    #[allow(clippy::result_large_err)] // `PlanError`, like the rest of the planner.
     pub(crate) async fn fence_direct_writers(
         &self,
         pin: &PinnedCatalog,

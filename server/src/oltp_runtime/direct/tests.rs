@@ -169,11 +169,16 @@ struct Options {
     electors: Vec<u64>,
     config: DirectConfig,
     span: crate::oltp::mvcc::store::KeySpan,
+    /// Activate `data.direct.v1` on the group before the test (T7), so
+    /// entry counts see only the requests' own entries. Off, the first
+    /// direct request activates it.
+    activate: bool,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             electors: vec![1],
+            activate: true,
             config: DirectConfig::default(),
             span: crate::oltp::mvcc::store::KeySpan {
                 start: None,
@@ -255,6 +260,8 @@ impl Cluster {
         schema.insert(DirectTable {
             descriptor: descriptor(table),
             schema_epoch: 1,
+            // A created table's first lifecycle id is its table id.
+            lifecycle_id: table,
             indexes: vec![IndexDefinition {
                 index_id: index,
                 table_id: table,
@@ -398,6 +405,22 @@ impl Cluster {
         .await;
         let leader = cluster.leader().await;
         cluster.serving(leader).await;
+        if options.activate {
+            let lifecycle = cluster.table;
+            watchdog(|| async {
+                let leader = cluster.leader().await;
+                cluster.voters[leader]
+                    .handle
+                    .change_direct_schema(
+                        crate::oltp::mvcc::store::direct::DirectSchemaChange::Activate {
+                            lifecycle,
+                        },
+                    )
+                    .await
+                    .ok()
+            })
+            .await;
+        }
         cluster
     }
 
@@ -1561,4 +1584,76 @@ fn o02_received_request_takes_its_group_and_database_from_the_session() {
         ..header
     };
     assert!(DirectRequest::received(&group, no_deadline, body).is_err());
+}
+
+/// T7, O12 / D11 on three voters: the leader activates the group on its
+/// first direct request; a DDL fence (index publication) then sends every
+/// request to the queued path until the leader's Catalog serves the
+/// published descriptor, and the next direct commits carry the new epoch.
+/// A drop fence stops direct writes on the table for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o12_d11_ddl_fences_stop_direct_writers_until_the_descriptor_is_published() {
+    use crate::oltp::mvcc::store::direct::{DirectSchema as GroupSchema, DirectSchemaChange};
+    let cluster = Cluster::new(Options {
+        activate: false,
+        ..Options::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    let handle = cluster.voters[leader].handle.clone();
+    assert_eq!(handle.direct_schema().await.unwrap(), None, "not active yet");
+    let row = |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
+    assert_eq!(cluster.op(leader, "table.insert", row(1)).await, done("null"));
+    assert_eq!(
+        handle.direct_schema().await.unwrap(),
+        Some(GroupSchema {
+            epoch: 1,
+            lifecycle: Some(cluster.table)
+        }),
+        "the first request activated the group at the table's lifecycle"
+    );
+    // The DDL coordinator fences before the Catalog publishes `published`.
+    let published = Uuid::new_v4();
+    assert_eq!(
+        handle
+            .change_direct_schema(DirectSchemaChange::Fence {
+                lifecycle: Some(published)
+            })
+            .await
+            .unwrap(),
+        GroupSchema {
+            epoch: 2,
+            lifecycle: Some(published)
+        }
+    );
+    let before = cluster.last_index(leader);
+    let blocked = cluster.op(leader, "table.insert", row(2)).await;
+    assert!(
+        matches!(blocked, DirectResponse::Fallback { .. }),
+        "an unpublished descriptor goes queued: {blocked:?}"
+    );
+    assert_eq!(cluster.last_index(leader), before, "nothing proposed");
+    assert_eq!(cluster.latest(leader, cluster.row_key(2)).await.0, None);
+    // The Catalog publishes: the leader's schema now has that lifecycle.
+    cluster.schema.insert(DirectTable {
+        descriptor: descriptor(cluster.table),
+        schema_epoch: 1,
+        lifecycle_id: published,
+        indexes: Vec::new(),
+    });
+    assert_eq!(cluster.op(leader, "table.insert", row(2)).await, done("null"));
+    assert!(cluster.latest(leader, cluster.row_key(2)).await.0.is_some());
+    // A drop fence: no direct write applies to the table again.
+    handle
+        .change_direct_schema(DirectSchemaChange::Fence { lifecycle: None })
+        .await
+        .unwrap();
+    let dropped = cluster.op(leader, "table.insert", row(3)).await;
+    assert_eq!(
+        code(&dropped),
+        Some((ErrorCode::NotFound, Outcome::NotApplied)),
+        "{dropped:?}"
+    );
+    assert_eq!(cluster.latest(leader, cluster.row_key(3)).await.0, None);
+    cluster.shutdown().await;
 }

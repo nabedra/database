@@ -303,6 +303,14 @@ impl WorkerRuntime {
                     runtime.set_direct_commits_active(true);
                 }
             });
+            // T5's executor serves `Method::Direct` once active (T7).
+            direct.serve_direct_when_active(direct_capability::DirectLeaderServices {
+                shared: runtime.services.shared.clone(),
+                transport: runtime.services.manager.client(),
+                catalog: runtime.services.catalog.participant().identity().clone(),
+                timestamps: runtime.services.timestamps.identity().clone(),
+                local_timestamps: None,
+            });
             direct.start();
             runtime.direct.set(direct).map_err(|_| unknown())?;
         }

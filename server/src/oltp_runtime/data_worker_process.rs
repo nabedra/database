@@ -405,6 +405,17 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 "data-worker-queue-join",
                 &(node.intent.claim_id, current.ready),
             )?;
+            // Once `data.direct.v1` is active, Control admits only joiners
+            // that advertised it. This build decodes every direct entry; an
+            // older Control (which rejects the request) has nothing active.
+            let _ = control
+                .change_direct_capability(
+                    Uuid::new_v4(),
+                    crate::oltp_replication::authority::control::DirectCapabilityOperation::Advertise {
+                        version: crate::oltp_replication::authority::control::DIRECT_VERSION,
+                    },
+                )
+                .await;
             match startup_read(
                 deadline,
                 &last_error,
@@ -490,6 +501,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         }
         endpoint.release_join_mount()?;
         let manager = HostedGroupManager::new(shared.clone(), client.clone(), registry.clone());
+        let (direct_catalog, direct_timestamps) = (catalog.identity.clone(), timestamps.clone());
         let scoped = if let Some(limits) = scoped_limits {
             let resolver = ScopedParticipants::new(shared.clone(), client.clone(), control.clone());
             let catalog_handle = CatalogHandle::new(resolver.participant(&catalog.identity).await?)?;
@@ -561,6 +573,16 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             control.clone(),
             local,
             config.execution.direct_oltp,
+        );
+        // This worker leads Data ranges: serve `Method::Direct` once active.
+        direct.serve_direct_when_active(
+            super::worker_runtime::direct_capability::DirectLeaderServices {
+                shared: shared.clone(),
+                transport: client.clone(),
+                catalog: direct_catalog,
+                timestamps: direct_timestamps,
+                local_timestamps: None,
+            },
         );
         direct.start();
         Ok(Arc::new(Joined {
