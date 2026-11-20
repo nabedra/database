@@ -428,16 +428,24 @@ class Rf3Cluster:
                 else:
                     process.kill()
 
-    def cold_start(self):
-        """Restart every worker as a fresh incarnation after a complete stop (R04/D09)."""
+    def kill_workers(self):
+        """SIGKILL every worker; API gateways keep running (G6)."""
+        for process in self.workers.values():
+            if process.alive():
+                process.kill()
+
+    def cold_start(self, keep_certificates=False):
+        """Restart every worker as a fresh incarnation after a complete stop (R04/D09). With
+        `keep_certificates` each worker keeps its key and certificate, as a restarted container
+        does; otherwise each gets a new one."""
         assert not any(process.alive() for process in self.workers.values())
         profile = dict(previous_run=self.run_id, next_run=uid(), transition_id=uid())
         nexts = {}
         for name in WORKERS:
             previous = self.config[name]['node']['enrollment']
             port = int(previous['endpoint'].rsplit(':', 1)[1])
-            fresh = self.certificate(name, port) | dict(worker_id=previous['worker_id'],
-                                                        enrollment_revision=previous['enrollment_revision'] + 1)
+            fresh = (dict(previous, incarnation=uid()) if keep_certificates else self.certificate(name, port)) | dict(
+                worker_id=previous['worker_id'], enrollment_revision=previous['enrollment_revision'] + 1)
             nexts[name] = fresh
         peers = sorted(nexts.values(), key=lambda record: record['worker_id'])
         pins = sorted(record['certificate_sha256'] for record in peers)

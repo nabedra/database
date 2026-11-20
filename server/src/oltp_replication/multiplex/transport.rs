@@ -108,6 +108,32 @@ pub trait PeerDirectory: Send + Sync + 'static {
     fn applied_revision(&self) -> Option<u64> {
         None
     }
+    /// Whether `peer` is an enrolled API gateway (not a worker).
+    fn is_api(&self, _peer: WorkerIdentity) -> bool {
+        false
+    }
+}
+
+/// Whether this worker is the hello's audience. Every audience names this
+/// incarnation exactly, except one: an enrolled API gateway that has not yet
+/// learned this worker's newer incarnation may still reach Control authority
+/// here. After every worker cold-starts onto a new run with its certificate,
+/// the gateway can learn the new enrollments only from Control (G6). TLS has
+/// proved the pinned certificate and the sender's API enrollment; Control's
+/// reads and commands do not depend on the incarnation the sender assumed.
+fn audience(
+    directory: &dyn PeerDirectory,
+    hello: &Hello,
+    group: &GroupIdentity,
+    local: &WorkerIdentity,
+) -> bool {
+    hello.to == *local
+        || (hello.to.worker_id == local.worker_id
+            && hello.to.certificate_sha256 == local.certificate_sha256
+            && hello.to.enrollment_revision < local.enrollment_revision
+            && hello.purpose == Purpose::Authority
+            && group.kind == GroupKind::Control
+            && directory.is_api(hello.from))
 }
 
 #[derive(Clone, Debug)]
@@ -899,7 +925,7 @@ impl WorkerTransport {
         let group = lease.identity();
         if hello.cluster_id != group.cluster_id
             || hello.group_digest != identity_digest(group)?
-            || hello.to != self.common.local
+            || !audience(&*self.common.directory, &hello, group, &self.common.local)
         {
             return Err(malformed("foreign worker/group audience"));
         }

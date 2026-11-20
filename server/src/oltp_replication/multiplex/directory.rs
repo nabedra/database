@@ -275,6 +275,14 @@ impl PeerDirectory for AppliedPeerDirectory {
     fn applied_revision(&self) -> Option<u64> {
         Some(self.revision())
     }
+    fn is_api(&self, peer: WorkerIdentity) -> bool {
+        self.entries.read().is_ok_and(|entries| {
+            entries.get(&peer.worker_id).is_some_and(|entry| {
+                matches!(entry.role, Role::Api(_))
+                    && WorkerIdentity::from(&entry.enrollment) == peer
+            })
+        })
+    }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
         if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
             .as_ref().filter(|candidate| candidate.enrollment.worker_id == worker)

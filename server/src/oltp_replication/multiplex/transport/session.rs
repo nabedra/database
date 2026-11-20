@@ -1552,7 +1552,7 @@ impl WorkerTransport {
             let group = lease.identity();
             if hello.cluster_id != group.cluster_id
                 || hello.group_digest != identity_digest(group)?
-                || hello.to != common.local
+                || !super::audience(&*common.directory, &hello, group, &common.local)
             {
                 return Err(malformed("foreign worker/group audience"));
             }
