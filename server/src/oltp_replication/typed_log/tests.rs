@@ -423,6 +423,40 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
     .expect("typed journal sync watchdog");
 }
 
+/// C07/O05: a bounded entry stream ends at its exclusive end without another
+/// native read. OpenRaft applies `since..end` through this stream and answers
+/// each proposer inside the apply. A trailing read for index `end` needed a
+/// Query slot after the last reply was already visible, so a caller that took
+/// the worker's only Query slot on that reply stalled the leader's applied
+/// index, and every linearizable read waiting for it, until it let go (CIfix2:
+/// the C07 progress test hung on Linux CI).
+#[tokio::test]
+async fn c07_o05_bounded_entry_stream_ends_without_reading_past_its_end() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut f = Fixture::new().await;
+        for index in 0..3 {
+            f.log
+                .append([blank(index)], IOFlushed::noop())
+                .await
+                .unwrap();
+        }
+        let shared = f.log.group().resources().clone();
+        let mut stream = Box::pin(f.log.entries_stream(0..3).await);
+        for index in 0..3 {
+            assert_eq!(stream.next().await.unwrap().unwrap().index(), index);
+        }
+        let query = shared.prepare(ExecutionClass::Query).await.unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        drop(query);
+        assert!(
+            matches!(end, Ok(None)),
+            "the stream needed a Query slot after its last entry"
+        );
+    })
+    .await
+    .expect("bounded entry stream watchdog");
+}
+
 /// O05/O11: range truncation and metadata are one native batch, while an
 /// arbitrarily long retained log is consumed through a one-entry stream.
 #[tokio::test]
