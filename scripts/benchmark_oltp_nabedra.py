@@ -37,7 +37,7 @@ WORKERS = ('w1', 'w2', 'w3')
 SOAK_TABLE = 'benchmark_soak'
 # fsync-family calls counted in the separate strace run (NS11 G4).
 STRACE_CALLS = 'fsync,fdatasync,sync_file_range,syncfs'
-CGROUP_FILES = ('io.stat', 'memory.current', 'memory.peak', 'memory.events', 'cpu.stat')
+CGROUP_FILES = ('io.stat', 'memory.current', 'memory.peak', 'memory.events', 'memory.stat', 'cpu.stat')
 DEFAULT_WORKER_CPUS = (NANO_CPUS,) * len(WORKERS)
 STATUS_LEADER_HINT = re.compile(
     r'^(\S+)\s+WARN\s+nabedra_database_server::oltp_replication::hosted: '
@@ -531,6 +531,7 @@ class Cluster:
             # Omitted by default: b29a178 refuses the unknown field.
             self.execution['direct_oltp'] = args.direct_oltp == 'on'
         self.samples, self.sampling = [], threading.Event()
+        self.worker_configs = {}
         self.key_spec = {'rsa': 'rsa:2048', 'ed25519': 'ed25519'}[args.tls_key_type]
         image, = json.loads(command('docker', 'image', 'inspect', args.image))
         self.image = image['Id']
@@ -681,11 +682,12 @@ class Cluster:
                                    mount_path='/data', provider_volume_id='docker-volume:' + volume, filesystem_uuid=''))
             if self.scoped_oltp:
                 node['scoped_oltp'] = True
-            write_json(self.directory / f'{name}.json', dict(version=1, bind='0.0.0.0:8000',
+            self.worker_configs[name] = dict(version=1, bind='0.0.0.0:8000',
                        auth_file='/tmp/config/auth.json', node=node, resources=resources(WORKER_MEMORY),
-                       execution=self.execution))
+                       execution=self.execution)
+            write_json(self.directory / f'{name}.json', self.worker_configs[name])
             # `mkdir -p`: a SIGKILLed worker restarts in the same container (recovery run).
-            launch = (f'exec strace -f --seccomp-bpf -qq -ttt -e trace={STRACE_CALLS} -o /tmp/strace.log '
+            launch = (f'exec strace -f --seccomp-bpf -qq -ttt -T -e trace={STRACE_CALLS} -o /tmp/strace.log '
                       if self.args.strace else 'exec ')
             script = '''set -eu
 umask 077
@@ -879,6 +881,103 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         record['after_restart'] = self.cgroup_sample(name)
         return record
 
+    def ready_on_run(self, name, run_id, start, deadline_seconds=300):
+        """Seconds from `start` until `name` answers ready for `run_id` with every worker ready."""
+        while time.monotonic() - start < deadline_seconds:
+            try:
+                client = Http(self.host_url(name), self.auth['data_token'], 2)
+            except RuntimeError:
+                time.sleep(0.05)
+                continue
+            try:
+                status, reply = client.exchange('/health/ready')
+                if status == 200 and reply.get('run_id') == run_id and reply.get('ready_workers') == len(WORKERS):
+                    return time.monotonic() - start, reply
+            except (OSError, http.client.HTTPException, ValueError):
+                pass
+            finally:
+                client.close()
+            time.sleep(0.05)
+        return None, None
+
+    def cold_restart(self):
+        """G6 substitute: SIGKILL every worker, restart all with the cold-start profile (R04, D09).
+
+        A registered worker that crashed cannot rejoin its run in place (both b29a178 and the
+        candidate refuse a plain restart); the supported recovery after an unplanned stop of the
+        whole worker set is the cold start onto a new run. Timed from the first process start
+        until every worker serves the new run, then until a point get through the API succeeds."""
+        record = {'mode': 'cold restart of all workers after SIGKILL', 'previous_run': self.run_id}
+        record['before_kill'] = {name: self.cgroup_sample(name) for name in WORKERS}
+        for name in WORKERS:
+            self.docker('kill', '--signal', 'KILL', f'{self.prefix}-{name}')
+        for name in WORKERS:
+            self.docker('wait', f'{self.prefix}-{name}', timeout=60)
+        profile = dict(previous_run=self.run_id, next_run=uid(), transition_id=uid())
+        nexts = {}
+        for name in WORKERS:
+            previous = self.worker_configs[name]['node']['enrollment']
+            nexts[name] = self.certificate(name) | dict(worker_id=previous['worker_id'],
+                                                        enrollment_revision=previous['enrollment_revision'] + 1)
+        peers = sorted(nexts.values(), key=lambda item: item['worker_id'])
+        pins = sorted(item['certificate_sha256'] for item in peers)
+        for name in WORKERS:
+            node = self.worker_configs[name]['node']
+            node.update(cold=profile, enrollment=nexts[name], control_enrollments=peers, operator_pins=pins)
+            node['mount']['worker'] = {field: nexts[name][field] for field in
+                                       ('worker_id', 'incarnation', 'enrollment_revision', 'certificate_sha256')}
+            node['mount']['generation'] += 1
+            write_json(self.directory / f'{name}.json', self.worker_configs[name])
+        record['profile'] = profile
+        start = time.monotonic()
+        for name in WORKERS:
+            self.docker('start', f'{self.prefix}-{name}')
+        record['start_command_seconds'] = time.monotonic() - start
+        record['started_at'] = {name: json.loads(self.docker('inspect', '--format', '{{json .State}}',
+                                                            f'{self.prefix}-{name}'))['StartedAt'] for name in WORKERS}
+        ready = {}
+        for name in WORKERS:
+            seconds, reply = self.ready_on_run(name, profile['next_run'], start)
+            ready[name] = {'seconds': seconds, 'reply': reply}
+        record['ready'] = ready
+        times = [item['seconds'] for item in ready.values()]
+        record['all_ready_seconds'] = None if None in times else max(times)
+        self.run_id = profile['next_run']
+        if self.args.direct_oltp == 'on' and record['all_ready_seconds'] is not None:
+            try:
+                urls = {name: self.host_url(name) for name in WORKERS}
+                record['direct_capability'] = self.wait_direct_capability(urls, 120)
+                record['direct_active_seconds'] = time.monotonic() - start
+            except RuntimeError as error:
+                record['direct_capability_error'] = str(error)
+        # Serving: the first point get through the API (it reconnects on its own or not at all).
+        ca = ssl.create_default_context(cafile=str(self.directory / 'ca.pem'))
+        probe = {'attempts': 0}
+        try:
+            results = json.loads((self.args.output / 'results.json').read_text())
+            table_id = results['seed_details']['descriptor']['id']
+            while time.monotonic() - start < 180:
+                probe['attempts'] += 1
+                api = Http(self.host_url('api', 'https'), self.auth['data_token'], 10, ca)
+                try:
+                    request_id = uid()
+                    status, reply = api.exchange('/v1/operations', dict(request_id=request_id,
+                                                 operation='table.get', payload={'table_id': table_id, 'key': 0}))
+                    probe['last'] = {'status': status, 'reply': reply}
+                    if status == 200 and reply.get('request_id') == request_id:
+                        probe['served_seconds'] = time.monotonic() - start
+                        break
+                except (OSError, http.client.HTTPException, ValueError) as error:
+                    probe['last'] = {'error': f'{type(error).__name__}: {error}'}
+                finally:
+                    api.close()
+                time.sleep(0.25)
+        except (OSError, KeyError, ValueError) as error:
+            probe['error'] = str(error)
+        record['api_probe'] = probe
+        record['after_restart'] = {name: self.cgroup_sample(name) for name in WORKERS}
+        return record
+
     def run(self):
         args = self.args
         sources = (Path(__file__), Path(__file__).with_name('benchmark_oltp_workload.py'))
@@ -934,6 +1033,12 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             except (RuntimeError, subprocess.SubprocessError, OSError) as error:
                 recovery = {'error': str(error)}
             write_json(args.output / 'recovery.json', recovery)
+        if args.cold_restart:
+            try:
+                recovery = self.cold_restart()
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                recovery = {'error': str(error)}
+            write_json(args.output / 'cold-restart.json', recovery)
         for name in WORKERS:
             try:
                 usage = self.docker('exec', f'{self.prefix}-{name}', 'du', '-sb', '/data', timeout=60)
@@ -978,7 +1083,7 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                     runtime[name]['cgroup_final'] = self.docker('exec', name, 'sh', '-c',
                         'for f in /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/io.stat '
                         '/sys/fs/cgroup/memory.current '
-                        '/sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events '
+                        '/sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.stat '
                         '/proc/net/dev /proc/net/snmp /proc/net/netstat; do '
                         'if [ -f "$f" ]; then echo "$f"; cat "$f"; fi; done')
                 if self.args.strace and name.rsplit('-', 1)[-1] in WORKERS:
@@ -1063,6 +1168,8 @@ def main():
     parser.add_argument('--strace', action='store_true',
                         help=f'run each worker under strace -f -e trace={STRACE_CALLS} (fsync counts; distorts latency)')
     parser.add_argument('--kill-worker', choices=WORKERS, help='after the workload, SIGKILL this worker and time its restart')
+    parser.add_argument('--cold-restart', action='store_true',
+                        help='after the workload, SIGKILL every worker and time the cold start onto a new run')
     parser.add_argument('--cgroup-interval', type=float, default=5, help='seconds between worker cgroup samples')
     parser.add_argument('--soak', action='store_true', help='run the storage soak instead of the rate sweep')
     parser.add_argument('--soak-rows', type=int, default=80_000)
