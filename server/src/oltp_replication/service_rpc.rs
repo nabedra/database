@@ -177,6 +177,12 @@ enum Method {
     /// Settle a request id at its anchor before the queued path (addendum
     /// 2026-11-19). The body is the first payload section.
     DirectForward(direct::DirectHeader),
+    /// The table's exclusive lifecycle guard on the Catalog, read by a
+    /// direct range leader before it activates a Data group (T7b). Sent
+    /// only while `data.direct.v1` is active, when every peer decodes it.
+    ParticipantExclusive {
+        table_id: uuid::Uuid,
+    },
 }
 impl Method {
     fn purpose(self) -> Purpose {

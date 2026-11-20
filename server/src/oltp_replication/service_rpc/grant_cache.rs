@@ -68,6 +68,23 @@ impl GrantKey {
     }
 }
 
+impl GrantKey {
+    /// An API process's `ApiIngress` role for `Method::Direct` and
+    /// `Method::DirectForward` at a range leader (T7b). The check compares
+    /// no owner or authority (the leader checks its fence in the Data log),
+    /// so it is cached under the same rules as the stable roles: dropped
+    /// after [`GRANT_TTL`], on an enrollment revision change, or when a
+    /// fresh read sees another ready view or owner. Other `ApiIngress`
+    /// checks stay uncached.
+    pub(crate) fn direct_ingress(remote: WorkerIdentity, target: &GroupIdentity) -> Option<Self> {
+        let encoded = serde_json::to_vec(&(remote, ServiceAction::ApiIngress, target)).ok()?;
+        let mut hash = Sha256::new();
+        hash.update(b"nabedra/oltp/direct-ingress-grant/v1\0");
+        hash.update(&encoded);
+        Some(Self(hash.finalize().into()))
+    }
+}
+
 /// The parts of a fresh grant that invalidate every cached role when they move.
 type Observed = (ReadyMembership, Option<WorkerIdentity>);
 fn observed(grant: &ServiceAuthorization) -> Observed {
@@ -430,5 +447,59 @@ mod tests {
             cache.insert(key(caller, &target), Some(1), Instant::now(), None);
             assert!(cache.len() <= MAX_GRANTS);
         }
+    }
+
+    /// T7b (T6 concern 4): an API process's `ApiIngress` role for
+    /// `Method::Direct` is cached under the stable-role rules: one Control
+    /// read per caller incarnation per `GRANT_TTL`, dropped on a revision
+    /// change or a moved ready view or owner, so a revoked API passes for at
+    /// most five seconds. Its key differs from every other role's, and the
+    /// general `ApiIngress` key stays uncached.
+    #[tokio::test(start_paused = true)]
+    async fn d10_o14_t7b_direct_ingress_role_is_cached_with_a_five_second_bound() {
+        let cache = GrantCache::default();
+        let api = worker();
+        let control = group();
+        let key = GrantKey::direct_ingress(api, &control);
+        assert!(key.is_some());
+        assert_eq!(
+            GrantKey::new(api, ServiceAction::ApiIngress, &control, None),
+            None
+        );
+        assert_ne!(
+            key,
+            GrantKey::new(api, ServiceAction::Owner, &control, None)
+        );
+        assert_ne!(key, GrantKey::direct_ingress(worker(), &control));
+        let reads = AtomicUsize::new(0);
+        let owner = worker();
+        let read = || async {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(grant(owner, 1)))
+        };
+        for _ in 0..100 {
+            cache.role(key, Some(7), read).await.unwrap();
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            1,
+            "one Control read per window"
+        );
+        // Revocation: at most five seconds later the role is read again.
+        tokio::time::advance(GRANT_TTL).await;
+        assert!(!cache.allowed(key.unwrap(), Some(7)));
+        let revoked = || async {
+            Err(crate::protocol::ProtocolError::new(
+                crate::protocol::ErrorCode::Unauthorized,
+                "api enrollment revoked",
+                crate::protocol::Outcome::NotApplied,
+            ))
+        };
+        assert!(cache.role(key, Some(7), revoked).await.is_err());
+        assert!(!cache.allowed(key.unwrap(), Some(7)));
+        // An enrollment revision change drops the cached role at once.
+        cache.role(key, Some(7), read).await.unwrap();
+        assert!(cache.allowed(key.unwrap(), Some(7)));
+        assert!(!cache.allowed(key.unwrap(), Some(8)));
     }
 }
