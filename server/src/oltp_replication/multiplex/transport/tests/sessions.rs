@@ -1369,3 +1369,74 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
     let _ = timeout(WAIT, healthy_worker).await;
     fixture.stop().await;
 }
+
+/// G1: a local failure after the request reached the peer (here the caller's
+/// own reply decode budget is over its class limit, checked on the reply) is
+/// not `not_applied`: the peer has already handled the request. A refusal
+/// before anything was written stays `not_applied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g1_local_failure_after_send_has_unknown_outcome() {
+    for release in [Release::Current, Release::OneShotOnly] {
+        let (fixture, _) = Fixture::start(
+            release,
+            Release::Current,
+            TransportConfig::default(),
+            TransportConfig::default(),
+            false,
+        )
+        .await;
+        let class = traffic(&fixture.group, Purpose::Storage).unwrap();
+        let shared = &fixture.caller_transport.common.shared;
+        let header = shared
+            .encode_in(class.byte_class(), &"after-send", 1024)
+            .unwrap();
+        let over_budget = TransportConfig::default().decode_bytes[class as usize] + 1;
+        let refused = timeout(
+            WAIT,
+            fixture.client.request_classified(
+                &fixture.group,
+                WorkerIdentity::from(&fixture.target),
+                Purpose::Storage,
+                header,
+                [None, None, None],
+                over_budget,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
+        match refused {
+            Err(RequestError::Protocol(error)) => {
+                assert_eq!(error.outcome, Outcome::Unknown, "{error:?}");
+                assert_ne!(
+                    ProtocolError::from(RequestError::Protocol(error)).outcome,
+                    Outcome::NotApplied
+                );
+            }
+            Err(other) => panic!("expected a local protocol failure, got {other:?}"),
+            Ok(_) => panic!("the over-budget reply was accepted"),
+        }
+        // Before sending, a full lane is still a definitive refusal.
+        let _held = fixture.client.hold_outgoing_for_test(class);
+        let header = shared.encode_in(class.byte_class(), &"held", 1024).unwrap();
+        let full = fixture
+            .client
+            .request_classified(
+                &fixture.group,
+                WorkerIdentity::from(&fixture.target),
+                Purpose::Storage,
+                header,
+                [None, None, None],
+                0,
+            )
+            .await;
+        let Err(full) = full else {
+            panic!("a held lane accepted the call");
+        };
+        assert!(matches!(full, RequestError::OutgoingLaneFull));
+        assert_eq!(ProtocolError::from(full).outcome, Outcome::NotApplied);
+        assert_eq!(fixture.endpoint.handled.load(Ordering::Acquire), 1);
+        drop(_held);
+        fixture.stop().await;
+    }
+}

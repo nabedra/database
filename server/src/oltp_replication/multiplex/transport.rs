@@ -1209,8 +1209,14 @@ impl WorkerClient {
                 probe_resolving.take(),
                 &mut trace.phase,
             )
-            .await?;
-        let reply = self.finish(raw, nonce, class, response_decode_bytes)?;
+            .await
+            .map_err(|error| match trace.phase {
+                RaftTransportPhase::ReceiveReply => sent_request_failed(error),
+                _ => error,
+            })?;
+        let reply = self
+            .finish(raw, nonce, class, response_decode_bytes)
+            .map_err(sent_request_failed)?;
         trace.phase = RaftTransportPhase::Complete;
         match reply {
             Err(error) => Err(RequestError::PeerRejected {
@@ -1774,6 +1780,18 @@ fn tune_socket(socket: &TcpStream) {
 }
 fn overloaded(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Overloaded, message, Outcome::NotApplied)
+}
+/// A local failure after the request reached the peer's socket (reading,
+/// charging or checking its reply) says nothing about whether the peer
+/// executed it (G1). The peer's own typed refusal is still definitive.
+fn sent_request_failed(error: RequestError) -> RequestError {
+    match error {
+        RequestError::Protocol(mut error) => {
+            error.outcome = Outcome::Unknown;
+            RequestError::Protocol(error)
+        }
+        error => error,
+    }
 }
 fn unavailable() -> ProtocolError {
     ProtocolError::new(
