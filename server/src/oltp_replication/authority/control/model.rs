@@ -402,6 +402,20 @@ pub(crate) enum ControlCommand {
         operation_id: Uuid,
         transition_id: Uuid,
     },
+    /// NS14 rule 2: a worker cannot serve this replica (storage damage or a
+    /// refused pool). Proposed only behind `GroupDamageGate`.
+    GroupDamaged {
+        operation_id: Uuid,
+        worker: WorkerIdentity,
+        report: Box<super::GroupDamageReport>,
+    },
+    /// NS14 rule 3: the membership change that removed the damaged replica
+    /// committed. Proposed only behind `GroupDamageGate`.
+    GroupDamageReplaced {
+        operation_id: Uuid,
+        authorization: AuthorizationStamp,
+        proof: Box<super::GroupDamageReplacement>,
+    },
 }
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
@@ -445,7 +459,9 @@ impl ControlCommand {
             | Self::BeginColdFence { operation_id, .. }
             | Self::ExcludedPage { operation_id, .. }
             | Self::GroupFenced { operation_id, .. }
-            | Self::PublishFence { operation_id, .. } => *operation_id,
+            | Self::PublishFence { operation_id, .. }
+            | Self::GroupDamaged { operation_id, .. }
+            | Self::GroupDamageReplaced { operation_id, .. } => *operation_id,
         }
     }
 }
@@ -511,6 +527,12 @@ impl OwnedPayload for ControlCommand {
             Self::ExcludedPage { workers, .. } => workers.len() * size_of::<ExclusionStamp>(),
             Self::GroupFenced { receipt, .. } => receipt.group.database.len(),
             Self::SealGroup { proof, .. } => proof.group.database.len(),
+            Self::GroupDamaged { report, .. } => {
+                size_of::<super::GroupDamageReport>() + report.group.database.capacity_bytes()
+            }
+            Self::GroupDamageReplaced { proof, .. } => {
+                size_of::<super::GroupDamageReplacement>() + proof.group.database.capacity_bytes()
+            }
             _ => 0,
         })
     }
@@ -552,6 +574,8 @@ pub(crate) enum ControlReply {
         remaining: u64,
     },
     ReplicaMove(Box<super::placement::ReplicaMove>),
+    /// NS14: one replica's damage record.
+    GroupDamage(Box<super::GroupDamageRecord>),
     Growth(crate::oltp_deployment::controller::GrowthRecord),
     Initialized {
         ready: ReadyMembership,

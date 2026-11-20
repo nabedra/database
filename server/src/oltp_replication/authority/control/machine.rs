@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 pub(super) mod data_worker;
+pub(super) mod group_damage;
 pub(super) mod replacement;
 pub(super) mod restart;
 pub(super) mod placement;
@@ -276,6 +277,10 @@ fn apply_initialized(
             placement::cancel(tx, state, *transition_id, *worker, authorization),
         PublishReplicaMove { proof, authorization, .. } =>
             placement::publish(tx, scope, state, proof, authorization),
+        GroupDamaged { worker, report, .. } =>
+            group_damage::report(tx, scope, position, *worker, report),
+        GroupDamageReplaced { authorization, proof, .. } =>
+            group_damage::replaced(tx, scope, state, authorization, proof),
         ReplicaRetired {
             authorization,
             proof,

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod data_worker;
+mod group_damage;
 mod growth;
 mod placement;
 mod pool_drain;
@@ -260,6 +261,8 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
+    /// NS14 mixed-version gate for the group damage commands.
+    group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
 impl ControlHandle {
     pub(crate) fn new(
@@ -271,6 +274,7 @@ impl ControlHandle {
             machine,
             consensus,
             policy,
+            group_damage_gate: std::sync::RwLock::new(None),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {

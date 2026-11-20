@@ -3,6 +3,7 @@
 mod data_worker;
 mod endpoint;
 mod forwarding;
+mod group_damage;
 mod growth;
 mod machine;
 mod model;
@@ -16,6 +17,11 @@ mod worker_drain;
 pub(crate) use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, ReplicaRoutes};
 pub(crate) use data_worker::{DataWorkerGrowthProof, DataWorkerIntent};
 pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
+pub(crate) use group_damage::{
+    GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport,
+};
+#[allow(unused_imports)]
+pub(crate) use group_damage::{GroupDamageGate, GroupDamagePhase};
 pub(crate) use machine::ControlMachine;
 pub(crate) use machine::{group_root, group_seed, group_step};
 pub(crate) use model::*;
