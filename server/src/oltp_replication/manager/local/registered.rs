@@ -186,6 +186,8 @@ pub(crate) struct RegisteredWorker {
 /// by one deterministic bootstrap voter. Starting them grants neither queue
 /// readiness nor authority to execute application work.
 pub(crate) struct RegisteredSystemGroups {
+    /// Reports run-time damage of any hosted replica once connected to Control.
+    pub damage: Arc<crate::oltp_replication::manager::ReportingDamageSink>,
     pub control: Option<ManagedControl>,
     pub timestamps: Option<ManagedTimestamps>,
     pub status: Vec<ManagedStatus>,
@@ -243,6 +245,10 @@ impl RegisteredWorker {
         config: openraft::Config,
     ) -> Result<RegisteredSystemGroups, ProtocolError> {
         let worker = self.enrollment.worker_id;
+        // NS14b: the reporter exists before any system group starts, so a
+        // run-time stop of one is reported once Control is reachable.
+        let damage = crate::oltp_replication::manager::ReportingDamageSink::new(Default::default());
+        self.manager.install_damage_sink(damage.clone());
         let control = if let Some(local) = self.placements.control.local(worker) {
             let group = &self.placements.control;
             let running = self
@@ -305,6 +311,7 @@ impl RegisteredWorker {
             None
         };
         Ok(RegisteredSystemGroups {
+            damage,
             control,
             timestamps,
             status,

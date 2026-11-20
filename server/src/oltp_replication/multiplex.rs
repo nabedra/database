@@ -46,6 +46,8 @@ pub enum Purpose {
     ShardSplitImage = 15,
     ReplicaPlacement = 16,
     RaftProgress = 17,
+    /// NS14b: Control's damage-replacement scheduler to a worker (Control scope).
+    GroupDamage = 18,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {

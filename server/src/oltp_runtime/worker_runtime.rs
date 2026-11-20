@@ -1835,6 +1835,8 @@ impl HttpRuntime for WorkerRuntime {
                     "accept_to_dispatch":accept_to_dispatch,
                     "block_cache":self.services.shared.block_cache_usage(),
                     "storage":self.services.shared.storage_stats(),
+                    // Rule 6: secondary pools refused at open, with the error class.
+                    "refused_pools":self.services.pools.refused_report(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
                     "native_thread_budget":self.services.shared.thread_budget(),
                     // `null` until `data.direct.v1` activates the executor.
