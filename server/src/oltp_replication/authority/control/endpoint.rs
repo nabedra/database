@@ -656,6 +656,11 @@ pub(crate) struct ControlClient {
     service_grants: crate::oltp_replication::service_rpc::GrantCache,
 }
 impl ControlClient {
+    /// The Control group this client reads (API ingress enrollments live
+    /// there; `Method::Direct` authorizes them against it).
+    pub(crate) fn control_group(&self) -> &GroupIdentity {
+        &self.group
+    }
     /// Receiver-side service-role grants for callers of this worker.
     pub(crate) fn service_grants(&self) -> &crate::oltp_replication::service_rpc::GrantCache {
         &self.service_grants

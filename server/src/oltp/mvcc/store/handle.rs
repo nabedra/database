@@ -26,7 +26,9 @@ pub(crate) type ScheduledReadFuture<'a> = std::pin::Pin<
             + 'a,
     >,
 >;
+mod direct;
 mod timestamp_point;
+pub(crate) use direct::LatestRead;
 pub(crate) use timestamp_point::PointEvidenceRead;
 
 pub(crate) trait RemoteParticipant: Send + Sync {

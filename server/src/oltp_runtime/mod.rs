@@ -14,6 +14,8 @@ pub mod coordinator;
 pub mod data_worker_process;
 #[cfg(test)]
 mod direct_benchmark;
+// T5 call site for the lead (NS8 owns this file): the leader executor.
+pub(crate) mod direct;
 mod http;
 mod http_runtime;
 mod operator;
