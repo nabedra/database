@@ -24,7 +24,7 @@ use crate::{
             consensus::{Applied, Consensus},
             status::VerifiedStatusDecision,
         },
-        entry::{LogId, Payload, Vote},
+        entry::{Payload, Vote},
         hosted::{log_id, position},
         manager::{HostedGroupManager, ManagedData},
         multiplex::{EndpointRegistry, TransportConfig, WorkerTransport},

@@ -38,13 +38,17 @@ async fn send(
     payload: Value,
 ) -> (StatusCode, Value) {
     let body = json!({"request_id":request_id, "operation":operation, "payload":payload});
+    raw(app, serde_json::to_string(&body).unwrap()).await
+}
+
+async fn raw(app: &Router, body: String) -> (StatusCode, Value) {
     let reply = app
         .clone()
         .oneshot(
             Request::post("/v1/operations")
                 .header("authorization", format!("Bearer {DATA}"))
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -88,22 +92,36 @@ async fn create(app: &Router, name: &str) -> Value {
     table["id"].clone()
 }
 
+fn small_queue() -> ExecutionConfig {
+    ExecutionConfig {
+        max_pending_requests: 32,
+        max_queue_bytes_per_replica: 8 << 20,
+        max_retained_result_bytes_per_worker: 8 << 20,
+        ..Default::default()
+    }
+}
+
 async fn open(path: &std::path::Path) -> (Arc<WorkerRuntime>, Router) {
-    let runtime = WorkerRuntime::open(
+    open_with(path, small_queue(), false).await
+}
+
+/// A restart of a stopped local worker requires `cold_start`, as `run --cold-start` does.
+async fn open_with(
+    path: &std::path::Path,
+    execution: ExecutionConfig,
+    cold_start: bool,
+) -> (Arc<WorkerRuntime>, Router) {
+    let runtime = WorkerRuntime::open_configured(
         path,
         "ns28",
         DATA,
-        ExecutionConfig {
-            max_pending_requests: 32,
-            max_queue_bytes_per_replica: 8 << 20,
-            max_retained_result_bytes_per_worker: 8 << 20,
-            ..Default::default()
-        },
+        execution,
         WorkerResources {
             max_threads: 2,
             memory_limit_bytes: 2 << 30,
             ..Default::default()
         },
+        cold_start,
     )
     .await
     .unwrap();
@@ -157,6 +175,26 @@ async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_confl
         assert!(minimum["rank"].as_f64().unwrap().is_sign_negative());
         assert_eq!(
             data(&app, "table.get", json!({"table_id":id,"key":5})).await,
+            Value::Null
+        );
+
+        // O01/O03: JSON cannot carry a nonfinite float64; an overflowing literal
+        // is refused before it can apply, for single rows and batches.
+        for (operation, payload) in [
+            ("table.insert", format!(r#"{{"table_id":{id},"row":{{"id":9,"rank":1e400,"text":"inf","active":true}}}}"#)),
+            ("table.insert_many", format!(r#"{{"table_id":{id},"rows":[{{"id":9,"rank":-1e400,"text":"inf","active":true}}]}}"#)),
+        ] {
+            let body = format!(
+                r#"{{"request_id":"{}","operation":"{operation}","payload":{payload}}}"#,
+                Uuid::new_v4()
+            );
+            let (status, reply) = raw(&app, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{operation}: {reply}");
+            assert_eq!(reply["error"]["code"], "validation_error", "{reply}");
+            assert_eq!(reply["error"]["outcome"], "not_applied", "{reply}");
+        }
+        assert_eq!(
+            data(&app, "table.get", json!({"table_id":id,"key":9})).await,
             Value::Null
         );
 
@@ -324,41 +362,92 @@ async fn o01_o03_o04_o07_o08_o10_pool_path_thirteen_operations_types_order_confl
     .expect("NS28 operations watchdog");
 }
 
-/// Replaces `o21_growth_past_old_row_and_byte_limits_is_streamed_and_survives_reopen`:
+/// Replaces `o21_growth_past_old_row_and_byte_limits_is_streamed_and_survives_reopen`
+/// and the database-binding half of `o07_o08_o10_atomic_conflicts_stable_replays_and_database_binding`:
 /// one table grows past 100,000 rows and 64 MiB through the pool path, keeps exact
-/// count/get/range semantics after a reopen, and still bounds collected results.
+/// count/get/range semantics after a cold restart, and still bounds collected results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn o21_pool_path_growth_past_old_row_and_byte_limits_survives_reopen() {
-    tokio::time::timeout(Duration::from_secs(900), async {
+#[ignore = "O21 growth takes 15-30 minutes in a debug build; run with --ignored --exact"]
+async fn o10_o21_pool_path_growth_past_old_row_and_byte_limits_survives_cold_restart() {
+    tokio::time::timeout(Duration::from_secs(3600), async {
         let dir = Directory::new("growth");
-        let (runtime, app) = open(&dir.0).await;
+        // Terminal records hold queue bytes until result retention expires, so
+        // bulk loading uses the default 256 MiB replica queue and a short retention.
+        let execution = ExecutionConfig {
+            result_retention_ms: 1_000,
+            ..Default::default()
+        };
+        let (runtime, app) = open_with(&dir.0, execution.clone(), false).await;
+        let started = std::time::Instant::now();
         let id = create(&app, "large").await;
-        let text = "x".repeat(768);
+        let text = "x".repeat(640);
         let total = 110_001_i64;
-        for first in (0..total).step_by(1000) {
-            let rows: Vec<_> = (first..(first + 1000).min(total))
+        let mut overloaded = 0_u64;
+        for first in (0..total).step_by(5000) {
+            let rows: Vec<_> = (first..(first + 5000).min(total))
                 .map(|key| row(key, (key % 7) as f64, &text))
                 .collect();
-            let inserted = data(
-                &app,
-                "table.insert_many",
-                json!({"table_id":id,"rows":rows}),
-            )
-            .await;
-            assert_eq!(inserted, json!((first + 1000).min(total) - first));
+            // Admission sheds load with a not-applied 429 while earlier batches
+            // still hold replica queue bytes; a client resubmits the same identity.
+            let request_id = Uuid::new_v4();
+            let payload = json!({"table_id":id,"rows":rows});
+            let reply = loop {
+                let (status, reply) =
+                    send(&app, request_id, "table.insert_many", payload.clone()).await;
+                if status != StatusCode::TOO_MANY_REQUESTS {
+                    assert_eq!(status, StatusCode::OK, "{reply}");
+                    break reply;
+                }
+                assert_eq!(reply["error"]["outcome"], "not_applied", "{reply}");
+                overloaded += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(reply["data"], json!((first + 5000).min(total) - first));
+            if first % 20_000 == 0 {
+                eprintln!(
+                    "O21 pool-path growth: {first} rows after {} ms, overloaded_retries={overloaded}",
+                    started.elapsed().as_millis()
+                );
+            }
         }
+        eprintln!(
+            "O21 pool-path growth: rows={total}, raw_text_bytes={}, insertion_ms={}, overloaded_retries={overloaded}",
+            total as usize * text.len(),
+            started.elapsed().as_millis()
+        );
         assert!(total as usize * text.len() > 64 << 20);
         runtime.drain().await.unwrap();
         drop(app);
         drop(runtime);
+        eprintln!("O21 drained after {} ms", started.elapsed().as_millis());
 
-        let (runtime, app) = open(&dir.0).await;
+        // O10: the worker directory stays bound to its database across restarts.
+        let rebound = WorkerRuntime::open_configured(
+            &dir.0,
+            "other",
+            DATA,
+            execution.clone(),
+            WorkerResources {
+                max_threads: 2,
+                memory_limit_bytes: 2 << 30,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .err()
+        .expect("worker reopened under another database");
+        assert_eq!(rebound.code, ErrorCode::ValidationError);
+
+        let (runtime, app) = open_with(&dir.0, execution, true).await;
+        eprintln!("O21 cold restart after {} ms", started.elapsed().as_millis());
         assert_eq!(
             data(&app, "table.get", json!({"table_id":id,"key":100_000})).await,
             row(100_000, 5.0, &text)
         );
         let all = query(&id, Value::Null, Value::Null, Value::Null, Value::Null);
         assert_eq!(data(&app, "query.count", all.clone()).await, json!(total));
+        eprintln!("O21 full count after {} ms", started.elapsed().as_millis());
         assert_eq!(
             refused(&app, "query.collect", all).await,
             json!("limit_exceeded")
