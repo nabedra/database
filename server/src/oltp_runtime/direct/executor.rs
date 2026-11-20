@@ -900,12 +900,24 @@ impl DirectExecutor {
         let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
             Err(error) => {
-                // The entry may still commit; the dedup record decides on
-                // the next attempt (T4: settle on any proposal error).
+                // T4: settle on any proposal error.
                 clock.settle(commit_ts);
-                *uncertain = true;
+                // RV-FINAL M1: a refusal before Raft (a full device, a
+                // refused reservation) commits nothing. A full device
+                // answers at once, as the queued path does (U01).
+                if full_device_refusal(&error, *uncertain) {
+                    return Err(failed(error));
+                }
+                // Otherwise the entry may still commit; the dedup record
+                // decides on the next attempt.
+                let cause = if error.outcome == Outcome::NotApplied {
+                    RetryCause::Unavailable
+                } else {
+                    *uncertain = true;
+                    RetryCause::Leadership
+                };
                 self.proposal_failed(handle, clock, Some(token), deadline, &error);
-                return Ok(Attempt::Retry(RetryCause::Leadership));
+                return Ok(Attempt::Retry(cause));
             }
         };
         let fault = match applied.reply {
@@ -1231,9 +1243,18 @@ impl DirectExecutor {
                 let applied = match by(deadline, handle.propose(command)).await {
                     Ok(applied) => applied,
                     Err(error) => {
-                        uncertain = true;
+                        // RV-FINAL M1, as for a direct commit.
+                        if full_device_refusal(&error, uncertain) {
+                            return Err(failed(error));
+                        }
+                        let cause = if error.outcome == Outcome::NotApplied {
+                            RetryCause::Unavailable
+                        } else {
+                            uncertain = true;
+                            RetryCause::Leadership
+                        };
                         self.proposal_failed(handle, clock, token, deadline, &error);
-                        if !self.pause(deadline, RetryCause::Leadership).await {
+                        if !self.pause(deadline, cause).await {
                             return Err(deadline_expired(uncertain));
                         }
                         continue;
@@ -1457,6 +1478,12 @@ async fn by<T>(
                 Outcome::Unknown,
             ))
         })
+}
+/// RV-FINAL M1: a proposal refused with a full device before Raft saw it
+/// is the request's answer, unless an earlier proposal of the request may
+/// have committed (then the dedup record decides on the next attempt).
+fn full_device_refusal(error: &ProtocolError, uncertain: bool) -> bool {
+    !uncertain && error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(error)
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)

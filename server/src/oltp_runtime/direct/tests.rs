@@ -1729,6 +1729,70 @@ async fn d07_o16_rv_final_h1_restarted_core_serves_direct_commits_again() {
     cluster.shutdown().await;
 }
 
+/// RV-FINAL M1, U01, F01/F03: a leader whose device is full refuses the
+/// proposal before Raft sees it. The direct update answers that refusal at
+/// once (`storage_unavailable`, `not_applied`, the no-space message), as the
+/// queued path does, after one proposal and one timestamp fetch; before the
+/// fix it looped until its deadline and answered `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    let v = &cluster.voters[leader];
+    let before = v.executor.stats();
+    let refused = v.consensus.health().snapshot().proposals_refused_no_space;
+    v.consensus.retry().mark_no_space();
+    let started = std::time::Instant::now();
+    let response = cluster
+        .op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 1, "values": {"value": 2}}),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let DirectResponse::Failed(error) = &response else {
+        panic!("{response:?}");
+    };
+    assert_eq!(
+        (error.code, error.outcome),
+        (ErrorCode::StorageUnavailable, Outcome::NotApplied),
+        "{error:?}"
+    );
+    assert!(crate::oltp::pool::is_no_space(error), "{error:?}");
+    // The request deadline is 10 s; the refusal comes back without waiting.
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    let after = v.executor.stats();
+    assert_eq!(
+        after.entries_proposed - before.entries_proposed,
+        1,
+        "{after:?}"
+    );
+    assert_eq!(after.outcome_unknown, before.outcome_unknown, "{after:?}");
+    assert_eq!(
+        v.consensus.health().snapshot().proposals_refused_no_space - refused,
+        1
+    );
+    // Nothing applied: the row keeps its value (a get proposes nothing).
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done(r#"{"id":1,"score":0.0,"tag":"a","value":1}"#)
+    );
+    cluster.shutdown().await;
+}
+
 /// Rule 2 wiring for `table.get` (plan section 6): a get of a key with a
 /// pending commit waits for it, and a get never waits on other keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
