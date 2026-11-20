@@ -2305,7 +2305,13 @@ async fn o16_d06_a_split_barrier_lets_the_freeze_succeed_under_steady_direct_loa
     tokio::time::sleep(Duration::from_millis(100)).await;
     // Without the barrier, a cut allocated before more commits apply fails.
     let early = split_bindings(&f, Uuid::new_v4(), source.load(AtomicOrdering::SeqCst));
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // At most one commit per writer took its timestamp before the cut was read,
+    // so once four more entries apply at least one of them is above the cut.
+    // Wait for that instead of sleeping, which fails on a loaded host.
+    let start = log.lock().await.0;
+    while log.lock().await.0 < start + 4 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
         submit(ParticipantCommand::SplitFreeze {
             authority: f.authority,
