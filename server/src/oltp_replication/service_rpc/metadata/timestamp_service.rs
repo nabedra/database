@@ -1341,9 +1341,13 @@ impl TimestampClient {
         // These reads also arrive from Status or participant proof clients.
         // A point decision write can repeat only in reconciliation mode.
         // Fences return the receipt stored for the same transition and command.
+        // AllocateDirect repeats safely (values above every completed
+        // allocation), so a stalled leader gets a per-replica deadline and
+        // the call moves on to the new leader (D05/LIVE1).
         if matches!(
             request,
-            Request::ScopedReadPin { .. }
+            Request::AllocateDirect { .. }
+                | Request::ScopedReadPin { .. }
                 | Request::ScopedCopyProof { .. }
                 | Request::VerifyTimestampPointPin(_)
                 | Request::CommitTimestampPoint { reconcile: true, .. }
@@ -1365,7 +1369,6 @@ impl TimestampClient {
                 | Request::Allocate { .. }
                 | Request::Allocation { .. }
                 | Request::Released { .. }
-                | Request::AllocateDirect { .. }
         );
         self.client.named(request.method(), request, converge).await
     }

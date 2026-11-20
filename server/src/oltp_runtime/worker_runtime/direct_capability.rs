@@ -10,6 +10,12 @@
 //!   keeps the capability but routes eligible operations queued.
 //! - `routes_direct()`: both, so the gateway may send eligible operations to
 //!   the range leader (T6) and the leader may propose `Direct` (T5).
+//! - `history_settling()` (T7c): Control activated with queued history (a
+//!   queue owner reserved an eligible mutation without a forward marker
+//!   before activation), and one dedup retention since the activation has
+//!   not passed. Such a request id may still be retried, and only the
+//!   queued path knows it, so leaders execute no new mutation directly and
+//!   gateways settle eligible mutations at their anchor and go queued.
 use crate::{
     oltp::mvcc::planner::{ResolveFuture, direct_fence::DirectActivationProbe},
     oltp_replication::{
@@ -23,7 +29,7 @@ use crate::{
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -37,11 +43,25 @@ const REEVALUATE_EVERY: u32 = 12;
 
 type OnActive = Box<dyn Fn() + Send + Sync>;
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 pub(crate) struct DirectSwitch {
     control: Arc<ControlClient>,
     local: WorkerIdentity,
     direct_oltp: bool,
     active: AtomicBool,
+    /// End (Unix ms) of the queued-history window, 0 without one (T7c).
+    history_until: AtomicU64,
+    /// Control recorded this owner's pre-activation queued history (T7c).
+    history_noted: AtomicBool,
+    /// `WorkerRuntime::without_direct_for_test`: the owner neither notes
+    /// history nor settles (T7c), as if the capability never activated.
+    #[cfg(test)]
+    disabled_for_test: AtomicBool,
     on_active: Mutex<Vec<OnActive>>,
     stop: watch::Sender<bool>,
     watcher: Mutex<Option<JoinHandle<()>>>,
@@ -69,6 +89,10 @@ impl DirectSwitch {
             local,
             direct_oltp,
             active: AtomicBool::new(false),
+            history_until: AtomicU64::new(0),
+            history_noted: AtomicBool::new(false),
+            #[cfg(test)]
+            disabled_for_test: AtomicBool::new(false),
             on_active: Mutex::new(Vec::new()),
             stop: watch::channel(false).0,
             watcher: Mutex::new(None),
@@ -111,9 +135,60 @@ impl DirectSwitch {
         }
     }
 
+    /// T7c: within the queued-history window (see the module doc).
+    pub(crate) fn history_settling(&self) -> bool {
+        let until = self.history_until.load(Ordering::Acquire);
+        until != 0 && now_ms() < until
+    }
+
+    /// T7c, called by a queue owner before it reserves an eligible mutation
+    /// while this switch has not observed activation: either Control is (or
+    /// now becomes) active, and the owner settles the request at its anchor
+    /// first, or Control durably records pre-activation queued history
+    /// before the reservation, so every later activation opens the window.
+    /// Returns whether the capability is active. One Control write per
+    /// process; after that the recorded history covers every reservation.
+    pub(crate) async fn note_queued_history(&self) -> Result<bool, ProtocolError> {
+        #[cfg(test)]
+        if self.disabled_for_test.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if self.is_direct_active() {
+            return Ok(true);
+        }
+        if self.history_noted.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let capability = self
+            .change(DirectCapabilityOperation::QueuedHistory)
+            .await?;
+        if capability.version != DIRECT_VERSION {
+            return Err(ProtocolError::new(
+                crate::protocol::ErrorCode::StorageUnavailable,
+                "invalid Control direct capability",
+                crate::protocol::Outcome::NotApplied,
+            ));
+        }
+        if self.observe(capability) {
+            return Ok(true);
+        }
+        self.history_noted.store(true, Ordering::Release);
+        Ok(false)
+    }
+
     fn observe(&self, capability: DirectCapability) -> bool {
-        if capability.version != DIRECT_VERSION || !capability.active() {
+        if capability.version != DIRECT_VERSION {
             return false;
+        }
+        let Some(activation) = capability.activation else {
+            return false;
+        };
+        // Set before `active`, so no reader sees the capability active
+        // without its window.
+        if let Some(until) = activation
+            .history_until(crate::oltp::mvcc::store::direct::DEFAULT_DIRECT_DEDUP_RETENTION_MS)
+        {
+            self.history_until.store(until.max(1), Ordering::Release);
         }
         if !self.active.swap(true, Ordering::AcqRel) {
             let hooks =
@@ -156,6 +231,16 @@ impl DirectSwitch {
         let task = tokio::spawn(async move {
             let mut advertised = false;
             let mut polls = 0u32;
+            // T7c process tests hold activation, then release it: ask for
+            // re-evaluation on every poll there.
+            #[cfg(test)]
+            let reevaluate_every = if std::env::var_os("NABEDRA_OLTP_TEST_DIRECT_HOLD").is_some() {
+                1
+            } else {
+                REEVALUATE_EVERY
+            };
+            #[cfg(not(test))]
+            let reevaluate_every = REEVALUATE_EVERY;
             loop {
                 let Some(switch) = switch.upgrade() else {
                     return;
@@ -166,7 +251,7 @@ impl DirectSwitch {
                             version: DIRECT_VERSION,
                         })
                         .await
-                } else if polls % REEVALUATE_EVERY == REEVALUATE_EVERY - 1 {
+                } else if polls % reevaluate_every == reevaluate_every - 1 {
                     switch.change(DirectCapabilityOperation::Activate).await
                 } else {
                     switch.control.direct_capability().await
@@ -186,6 +271,11 @@ impl DirectSwitch {
             }
         });
         *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_for_test(&self) {
+        self.disabled_for_test.store(true, Ordering::Release);
     }
 
     /// Stops the watcher and waits for it.
@@ -268,6 +358,9 @@ impl crate::oltp_replication::authority::timestamp::DirectTimestampGate
 impl crate::oltp_runtime::direct::DirectGate for DirectSwitch {
     fn direct_active(&self) -> bool {
         self.is_direct_active()
+    }
+    fn history_settling(&self) -> bool {
+        DirectSwitch::history_settling(self)
     }
 }
 

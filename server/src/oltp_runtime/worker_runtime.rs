@@ -973,6 +973,44 @@ impl WorkerRuntime {
         let authorization = self.authorization.clone();
         self.submit_original(body, authorization, None).await
     }
+    /// T7c: the exactly-once rule across the `data.direct.v1` activation
+    /// boundary, enforced where the queued path reserves a request id.
+    ///
+    /// While the capability is active an eligible mutation is settled at
+    /// its anchor (`DirectForward`) before Status reserves it, whatever the
+    /// sending gateway did: a gateway that has not yet observed activation
+    /// routes queued without a marker. A replayed direct result means the
+    /// id already committed directly, so it must not be queued.
+    ///
+    /// Before this switch observes activation, Control is asked first
+    /// (`QueuedHistory`): it either is or becomes active (settle as above),
+    /// or durably records pre-activation queued history before this
+    /// reservation. Any later activation then opens the queued-history
+    /// window, in which no leader executes an unknown id directly (see
+    /// `DirectSwitch::history_settling`), so a request reserved here
+    /// without a marker can only be answered by the queued path: its
+    /// original result, a conflict, or 404 abandoned after a cold start.
+    /// The scoped queue's admission calls this too.
+    pub(super) async fn settle_before_reserve(&self, body: &[u8]) -> Result<(), ProtocolError> {
+        if !super::application::direct::eligible(body) {
+            return Ok(());
+        }
+        let (Some(switch), Some(gateway)) = (self.direct_switch(), self.direct_gateway_handle())
+        else {
+            return Ok(());
+        };
+        if !switch.note_queued_history().await? {
+            return Ok(());
+        }
+        match gateway.route(body, true).await? {
+            super::application::direct::Routed::Queued => Ok(()),
+            super::application::direct::Routed::Done(_) => Err(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "request id already committed on the direct path; retry it to read the result",
+                Outcome::Unknown,
+            )),
+        }
+    }
     async fn submit_original(
         self: Arc<Self>,
         body: Vec<u8>,
@@ -1004,6 +1042,7 @@ impl WorkerRuntime {
         // Acquire the UUID gate before Reserve, so a retry observes a rejection
         // that landed while the previous admission held that gate.
         let actor = self.actors.try_admit()?;
+        self.settle_before_reserve(prepared.body()).await?;
         let reserved = match self.admission.reserve(prepared, expected).await? {
             ReservationResult::Reserved(reserved) => reserved,
             ReservationResult::Abandoned(_) => return Err(QueueError::Abandoned.protocol()),
@@ -1848,6 +1887,7 @@ impl HttpRuntime for WorkerRuntime {
                     },
                     "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
                         "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                        "history_settling":switch.history_settling(),
                     })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                     // RV-APPLY: transient retries and stopped cores.

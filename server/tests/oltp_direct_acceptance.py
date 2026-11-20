@@ -6,8 +6,9 @@ API gateways, each a separate host process, mTLS between them; RF1 = `nabedra-db
 
   --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison
   --suite cluster    D01 (RF3, both ORMs, API and worker gateways, on/off), D03, D11 (drop),
-                     D10 (gateway killed mid-stream), D09 (kill all, cold start)
-  --suite d05        D05: one follower SIGSTOPped, two SIGSTOPped, one SIGKILLed
+                     D10 (gateway killed mid-stream)
+  --suite d05        D05: one follower SIGSTOPped (and its rejoin), two SIGSTOPped, one SIGKILLed
+  --suite d09        D09 at RF3: kill everything under load, cold start (Linux + sudo pool mounts)
   --suite barriers   needs --test-executable: D12 (leader budget 4), D02 (gateway killed
                      after the leader applied), D04 after quorum (leader killed)
   --suite quorum     needs --test-executable: D04 before quorum (leader held before it proposes,
@@ -403,8 +404,7 @@ def suite_cluster(args, output, rf1_reference):
         # D10: a gateway killed mid-stream ----------------------------------------------------
         d10(cluster, kv, token, ca)
 
-        # D09 ------------------------------------------------------------------------------
-        d09(cluster, token, ca, output)
+        # D09 runs on its own cluster with pool mounts (suite d09).
     except BaseException:
         dump(cluster)
         raise
@@ -568,11 +568,6 @@ def d11_drop(cluster, url, token, ca):
            recreated_rows=0)
 
 
-D05_FINDING = ('T9 finding: one SIGSTOPped (black-holed) worker stalls Control\'s ready-set transition '
-               '("Control authority or inventory is not ready"), so neither direct nor queued writes commit '
-               'while it stays paused; a SIGKILLed follower does not (see D05-follower-killed)')
-
-
 def timed_update(api, kv, key, value, request_id=None):
     body = operation('table.update', {'table_id': kv.id, 'key': key, 'values': {'value': value}}, request_id)
     started = time.monotonic()
@@ -581,6 +576,23 @@ def timed_update(api, kv, key, value, request_id=None):
     except (OSError, http.client.HTTPException) as error:
         status, reply = None, repr(error)
     return body, status, reply, round(time.monotonic() - started, 3)
+
+
+class cluster_view:
+    """The named workers of a cluster, for `ready_counts`."""
+    def __init__(self, cluster, names):
+        self.cluster, self.names = cluster, list(names)
+
+    def live(self):
+        return [name for name in self.cluster.live() if name in self.names]
+
+    @property
+    def urls(self):
+        return self.cluster.urls
+
+    @property
+    def auth(self):
+        return self.cluster.auth
 
 
 def ready_counts(cluster):
@@ -606,8 +618,21 @@ def recover(cluster, api, kv, key, deadline_seconds=180):
         time.sleep(1)
 
 
+def ready_everywhere(cluster, expected, deadline_seconds):
+    """Wait until every named worker reports `expected` ready workers; return the last counts."""
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        counts = ready_counts(cluster)
+        if all(count == expected for count in counts.values()):
+            return counts
+        if time.monotonic() > deadline:
+            return counts
+        time.sleep(1)
+
+
 def suite_d05(args, output):
-    cluster = Rf3Cluster(args.binary, output / 'd05', api_direct=(True,))
+    # api2 has direct_oltp off: its writes take the queued path.
+    cluster = Rf3Cluster(args.binary, output / 'd05', api_direct=(True, False))
     try:
         cluster.start()
         cluster.wait_direct_active()
@@ -617,25 +642,54 @@ def suite_d05(args, output):
         kv = db.create_table('d05', {'id': int, 'value': int}, key='id')
         kv.insert({'id': 500, 'value': 0})
         api = Http(url, token, 40, ca)
+        queued = Http(cluster.api_urls['api2'], token, 40, ca)
         leader = leader_of(cluster, lambda: api.exchange('/v1/operations', operation('table.update', {
             'table_id': kv.id, 'key': 500, 'values': {'value': 1}})))
         followers = [name for name in WORKERS if name != leader]
+        paused = followers[0]
+        survivors = [name for name in WORKERS if name != paused]
 
-        # One follower paused: writes must succeed within the gateway deadline.
+        # One follower paused (TCP alive, nothing answers). Direct writes commit on
+        # the leader and the other follower within the gateway deadline; queued
+        # writes commit once the owner has removed the paused holder (LIVE1).
         one = []
-        cluster.workers[followers[0]].pause()
+        queued_write = None
+        cluster.workers[paused].pause()
+        paused_at = time.monotonic()
         try:
             for value in range(2, 7):
                 _, status, reply, seconds = timed_update(api, kv, 500, value)
                 one.append(dict(status=status, seconds=seconds,
                                 error=None if status == 200 else (reply.get('error') if isinstance(reply, dict) else reply)))
+            body = insert_body(kv.id, 600, 600)
+            deadline = time.monotonic() + 120
+            attempts = 0
+            while True:
+                attempts += 1
+                started = time.monotonic()
+                try:
+                    status, reply = queued.exchange('/v1/operations', body)
+                except (OSError, http.client.HTTPException) as error:
+                    status, reply = None, repr(error)
+                if status == 200 or time.monotonic() > deadline:
+                    break
+                time.sleep(1)
+            queued_write = dict(status=status, attempts=attempts, last_seconds=round(time.monotonic() - started, 3),
+                                since_pause=round(time.monotonic() - paused_at, 3),
+                                error=None if status == 200 else reply)
+            # Hold the pause until the owner has removed the paused worker, so the
+            # resume below exercises the rejoin.
+            removed = ready_everywhere(cluster_view(cluster, survivors), 2, 90)
+            paused_for = round(time.monotonic() - paused_at, 3)
         finally:
-            cluster.workers[followers[0]].resume()
-        one_ok = all(item['status'] == 200 for item in one)
-        time.sleep(5)
-        report('D05-one-paused', status='passed' if one_ok else 'known-finding', leader=leader,
-               paused=followers[0], writes=one, finding=None if one_ok else D05_FINDING,
-               ready_workers_5s_after_resume=ready_counts(cluster))
+            cluster.workers[paused].resume()
+        rejoined = ready_everywhere(cluster, 3, 120)
+        report('D05-one-paused', leader=leader, paused=paused, writes=one, queued_write=queued_write,
+               paused_seconds=paused_for, ready_while_paused=removed, ready_after_resume=rejoined)
+        assert all(item['status'] == 200 and item['seconds'] < 10.5 for item in one), one
+        assert queued_write['status'] == 200, queued_write
+        assert kv.get(600) == {'id': 600, 'value': 600}
+        assert all(count == 3 for count in rejoined.values()), rejoined
         recovered = recover(cluster, api, kv, 500)
 
         # Two followers paused: no success response and the row is unchanged.
@@ -771,14 +825,7 @@ def d09(cluster, token, ca, output):
     acknowledged = [body for body, status, reply in history if status == 200]
     unknown = [body for body, status, reply in history if status != 200]
     assert acknowledged, 'no write was acknowledged before the kill'
-    try:
-        profile = cluster.cold_start()
-    except AssertionError as error:
-        report('D09', status='known-finding', acknowledged=len(acknowledged), unacknowledged=len(unknown),
-               finding='T9 finding: the host-process RF3 cold start (new incarnations, node.cold, no pool '
-                       'mount) is refused after "queue active" with "invalid hosted group placement or '
-                       'identity"; D09 is executed at RF1 (D09-RF1)', error=str(error)[-1500:])
-        return
+    profile = cluster.cold_start()
     for name in list(cluster.apis):
         cluster.start_api(name)
     capability = cluster.wait_direct_active()
@@ -797,6 +844,26 @@ def d09(cluster, token, ca, output):
     report('D09', acknowledged=len(acknowledged), unacknowledged=len(unknown),
            unacknowledged_present_after_cold_start=present, cold_profile=profile, capability=capability,
            replayed=direct(after, 'replayed') - direct(before, 'replayed'), missing_acknowledged=0)
+
+
+def suite_d09(args, output):
+    """D09 at RF3: kill every worker and gateway under load, cold start, every
+    acknowledged write present and every acknowledged ID replays. Cold start
+    requires each pool on a Docker-profile mount (`cold::validate`); on a host
+    this needs `sudo -n mount` (Linux CI). LIVE1: T9's fixture had no mount."""
+    if not Rf3Cluster.mounts_available():
+        report('D09', status='not-run', reason='pool mounts need Linux and passwordless sudo (CI)')
+        return
+    cluster = Rf3Cluster(args.binary, output / 'd09', api_direct=(True, True), mounts=True)
+    try:
+        cluster.start()
+        cluster.wait_direct_active()
+        d09(cluster, cluster.auth['data_token'], cluster.ca, output)
+    except BaseException:
+        dump(cluster)
+        raise
+    finally:
+        cluster.close()
 
 
 # Test-child clusters -----------------------------------------------------------------------
@@ -993,11 +1060,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
-    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'd05', 'barriers', 'quorum'))
+    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
-    suites = args.suite or ['rf1', 'cluster', 'd05', 'barriers', 'quorum']
+    suites = args.suite or ['rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum']
     if {'barriers', 'quorum'} & set(suites) and not args.test_executable:
         parser.error('--suite barriers and quorum need --test-executable')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -1013,6 +1080,8 @@ def main():
                     suite_cluster(args, work, rf1_reference)
                 elif suite == 'd05':
                     suite_d05(args, work)
+                elif suite == 'd09':
+                    suite_d09(args, work)
                 elif suite == 'barriers':
                     suite_barriers(args, work)
                 else:

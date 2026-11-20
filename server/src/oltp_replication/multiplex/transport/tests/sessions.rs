@@ -512,10 +512,11 @@ async fn d10_c07_o05_exhausted_lane_overloads_while_raft_progress_advances() {
 
         // The held stream owns one caller slot. Take the rest of the lane:
         // the next Data consensus call is refused locally, before any write.
-        let rest = fixture.client.common.outgoing[data]
-            .clone()
-            .try_acquire_many_owned(caller_config.handler_slots[data] as u32 - 1)
-            .unwrap();
+        let rest = fixture.client.take_outgoing_for_test(
+            fixture.target.worker_id,
+            TrafficClass::DataConsensus,
+            caller_config.handler_slots[data] as u32 - 1,
+        );
         assert!(matches!(
             fixture
                 .call(&fixture.data_group, Purpose::Raft, "caller-full")
@@ -1263,5 +1264,104 @@ async fn d10_queued_callers_share_a_bounded_failed_connect() {
     })
     .await
     .unwrap();
+    fixture.stop().await;
+}
+
+/// D05/LIVE1: a peer that stops answering (SIGSTOP, a black-holed route) keeps
+/// its stalled streams until their deadlines. They fill only that peer's lane:
+/// the same class to another peer still sends. With one class-wide pool, the
+/// stalled streams took every slot, and Raft votes and heartbeats to the
+/// healthy peers were refused locally until the paused peer resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
+    let caller_config = TransportConfig {
+        deadline: Duration::from_secs(10),
+        ping_timeout: Duration::from_secs(8),
+        ping_idle: Duration::from_secs(60),
+        ..TransportConfig::default()
+    };
+    let slots = caller_config.handler_slots[TrafficClass::DataConsensus as usize];
+    let (fixture, relay) = Fixture::start(
+        Release::Current,
+        Release::Current,
+        caller_config,
+        TransportConfig::default(),
+        true,
+    )
+    .await;
+    let relay = relay.unwrap();
+    // The second worker also serves the Data group, at a real address.
+    let healthy = fixture.other.transport.common.local;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut enrollment = fixture.peers.resolve(healthy.worker_id).unwrap();
+    enrollment.endpoint = Text::new(listener.local_addr().unwrap().to_string()).unwrap();
+    fixture.peers.install(enrollment.clone());
+    let gate = Arc::new(Gate::default());
+    fixture
+        .other
+        .transport
+        .registry
+        .reserve(fixture.data_group.clone())
+        .unwrap()
+        .bind(Purpose::Raft, gate.clone())
+        .unwrap();
+    let server = Arc::new(WorkerTransport {
+        common: fixture.other.transport.common.clone(),
+        registry: fixture.other.transport.registry.clone(),
+    });
+    let (stop_healthy, shutdown) = oneshot::channel::<()>();
+    let healthy_worker = tokio::spawn(server.run(listener, async {
+        let _ = shutdown.await;
+    }));
+    let caller = fixture.caller();
+    let to_healthy =
+        |text: &str| caller.call(&enrollment, &fixture.data_group, Purpose::Raft, text, None);
+    timeout(WAIT, async {
+        echoed(
+            fixture
+                .call(&fixture.data_group, Purpose::Raft, "warm")
+                .await,
+            "warm",
+        );
+        echoed(to_healthy("warm-healthy").await, "warm-healthy");
+        relay.black_hole();
+        let stalled = (0..slots)
+            .map(|index| {
+                let call = fixture.call(
+                    &fixture.data_group,
+                    Purpose::Raft,
+                    &format!("stalled-{index}"),
+                );
+                tokio::spawn(call)
+            })
+            .collect::<Vec<_>>();
+        // The black-holed peer's lane is full: refused locally, before any write.
+        let lane = fixture.client.common.outgoing.lane(
+            fixture.target.worker_id,
+            TrafficClass::DataConsensus,
+            &fixture.client.common.config,
+        );
+        eventually(|| lane.available_permits() == 0, "stalled calls hold the lane").await;
+        assert!(matches!(
+            fixture
+                .call(&fixture.data_group, Purpose::Raft, "excess")
+                .await,
+            Err(RequestError::OutgoingLaneFull)
+        ));
+        assert!(stalled.iter().all(|call| !call.is_finished()));
+        // The same class to the healthy peer still sends, many times over.
+        for index in 0..(4 * slots) {
+            let text = format!("healthy-{index}");
+            echoed(to_healthy(&text).await, &text);
+        }
+        assert_eq!(gate.handled.load(Ordering::Acquire), 1 + 4 * slots);
+        for call in stalled {
+            call.abort();
+        }
+    })
+    .await
+    .unwrap();
+    stop_healthy.send(()).unwrap();
+    let _ = timeout(WAIT, healthy_worker).await;
     fixture.stop().await;
 }

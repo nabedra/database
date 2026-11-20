@@ -479,8 +479,10 @@ jobs:
           python-version: "3.11"
       - name: Acceptance (no AWS, no comparative benchmarks)
         run: |
-          python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
-            --category recovery --category growth --output artifacts/oltp-acceptance
+          # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
+          rc=0; python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
+            --category recovery --category growth --output artifacts/oltp-acceptance || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 2 ]
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -566,7 +568,9 @@ jobs:
           for mode in on off; do
             NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
               --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
-              --category recovery --category growth --output "artifacts/acceptance-$mode" > "artifacts/acceptance-$mode.log" 2>&1 || status=1
+              --category recovery --category growth --output "artifacts/acceptance-$mode" > "artifacts/acceptance-$mode.log" 2>&1 || rc=$?
+            # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
+            if [ "${rc:-0}" != 0 ] && [ "$rc" != 2 ]; then status=1; fi; rc=0
             tail -40 "artifacts/acceptance-$mode.log"
           done
           exit $status

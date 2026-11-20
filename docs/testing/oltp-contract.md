@@ -149,6 +149,25 @@ D05 "row unchanged" applies to a `not_applied` answer. When the gateway answers
 retry of the same ID and body then returns the one result, and the row holds either the
 old or the new value, never both and never twice.
 
+The activation boundary is part of O15 and D03. A queued eligible request, a get
+included, reserved before `data.direct.v1` activated has no forward marker. Two cases
+are required. In the first, the request is in flight at activation and is retried with
+the same ID after it: it runs once and returns the original result, and the same ID with
+another body is a conflict. In the second, a cold start abandons the request before
+activation and it is retried after: the answer is `404` abandoned, and the retry never
+runs. Run both with `direct_oltp` on and off: `server/tests/oltp_runtime_acceptance.py
+--scenario activation-boundary`, which `failure-boundaries` (O15) also runs.
+
+A paused follower is TCP-alive but answers nothing, unlike a killed one. D05 regressions
+(LIVE1) also require these:
+- Raft progress and the Timestamp leader change continue with one follower paused. The
+  paused peer fills only its own outgoing lanes.
+- Queued writes commit once the owner has removed the paused holder.
+- After resuming, the worker joins the ready set again without a restart.
+
+D09 at RF3 needs each pool on a Docker-profile mount, because a cold start refuses a pool
+without one. Host processes get tmpfs mounts through `sudo -n` (Linux CI).
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |

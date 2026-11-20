@@ -745,7 +745,7 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
 
     timeout(Duration::from_secs(5), async {
         let held = client
-            .authority_slots(Instant::now() + config.deadline)
+            .authority_slots(target.worker_id, Instant::now() + config.deadline)
             .await
             .unwrap();
         let mut pending = Box::pin(dependency(b"role"));
@@ -770,7 +770,14 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
         assert_eq!(reply.remote_identity(), WorkerIdentity::from(&target));
         assert_eq!(echo.0.load(Ordering::Relaxed), 2);
         assert_eq!(caller.common.authority_waiters.available_permits(), 1);
-        assert_eq!(caller.common.outgoing[authority].available_permits(), 2);
+        assert_eq!(
+            caller
+                .common
+                .outgoing
+                .lane(target.worker_id, TrafficClass::Authority, &caller.common.config)
+                .available_permits(),
+            2
+        );
         drop((ordinary, reply));
         assert_eq!(used_bytes(), baseline);
     })
