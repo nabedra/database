@@ -316,9 +316,7 @@ impl Database {
             let retired = self.get(&[RETIRED, group.group.as_bytes()].concat())?;
             if retired.is_some() && self.get(&Self::hosted_key(&group.group))?.is_none() {
                 tracing::info!(group = %group.group, "releasing a retired damaged group");
-                self.store()
-                    .release_scope(&group_root(&group.group))
-                    .and_then(nabedra_kv::Commit::wait)?;
+                self.store().release_scope(&group_root(&group.group))?;
             }
         }
         Ok(())
@@ -586,10 +584,7 @@ impl GroupStore {
         if quarantined {
             // The damaged bytes are kept until the retirement is durable (section 3,
             // rule 4); `Database::open` finishes a release a crash interrupted.
-            self.db
-                .store()
-                .release_scope(&self.root)
-                .and_then(nabedra_kv::Commit::wait)?;
+            self.db.store().release_scope(&self.root)?;
         }
         let dir = self.snapshot_dir();
         if dir.exists() {
