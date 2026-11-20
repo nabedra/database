@@ -1424,7 +1424,10 @@ impl ControlHandle {
                         )?;
                         if view.get(machine::direct::activation_key())?.is_none()
                             || advertised != Some(remote)
-                            || !matches!(target.kind, GroupKind::Catalog | GroupKind::Timestamps)
+                            || !matches!(
+                                target.kind,
+                                GroupKind::Catalog | GroupKind::Timestamps | GroupKind::Data { .. }
+                            )
                         {
                             return Err(unauthorized());
                         }

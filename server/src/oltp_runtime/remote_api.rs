@@ -75,6 +75,7 @@ pub(crate) struct RemoteRuntime {
     shared: Arc<WorkerSharedResources>,
     control: Arc<ControlClient>,
     client: Arc<ApplicationClient>,
+    gateway: Arc<super::application::direct::DirectGateway>,
     scope: QueueScope,
     ingress: Executor,
     accepting: AtomicBool,
@@ -236,10 +237,26 @@ impl RemoteRuntime {
             config.direct_oltp,
         );
         direct.start();
+        let gateway = super::application::direct::DirectGateway::new(
+            shared.clone(),
+            scope.database.clone(),
+            direct.clone(),
+            Arc::new(super::application::direct::ApiTopology {
+                client: client.clone(),
+                control: control.clone(),
+            }),
+            Arc::new(super::application::direct::WireTransport::new(
+                shared.clone(),
+                transport.client(),
+                control.clone(),
+                crate::oltp_replication::authority::control::ServiceAction::ApiIngress,
+            )),
+        );
         Ok(Arc::new(Self {
             shared,
             control,
             client,
+            gateway,
             scope,
             ingress: Executor::new(2, 16)?,
             accepting: AtomicBool::new(true),
@@ -340,6 +357,9 @@ impl Drop for RemoteRuntime {
 impl HttpRuntime for RemoteRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
+    }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        Some(self.gateway.clone())
     }
     fn scheduler(&self) -> ResourceScheduler {
         self.shared.scheduler()

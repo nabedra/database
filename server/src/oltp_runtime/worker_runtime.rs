@@ -6,6 +6,7 @@ mod automatic_split;
 pub(super) mod cold_history;
 pub(crate) mod direct_capability;
 mod deployment;
+mod direct_gateway;
 mod index_admin;
 mod index_backend;
 mod migration;
@@ -86,6 +87,8 @@ pub(crate) struct WorkerRuntime {
     /// Set while `data.direct.v1` is active (T7). Direct commits have no
     /// Status decision, so incremental backups would miss them.
     direct_commits_active: AtomicBool,
+    /// The direct-path gateway of this worker's HTTP API (T6).
+    direct_gateway: std::sync::OnceLock<Arc<super::application::direct::DirectGateway>>,
     /// This worker's `data.direct.v1` view and `direct_oltp` switch (T7).
     direct: std::sync::OnceLock<Arc<direct_capability::DirectSwitch>>,
     authorization: OriginalAuthorization,
@@ -226,6 +229,7 @@ impl WorkerRuntime {
             admission_cleanup,
             accepting: AtomicBool::new(true),
             direct_commits_active: AtomicBool::new(false),
+            direct_gateway: std::sync::OnceLock::new(),
             direct: std::sync::OnceLock::new(),
             authorization,
             _actor_memory: actor_memory,
@@ -233,6 +237,7 @@ impl WorkerRuntime {
             cold_cleanup: Mutex::new(None),
             automatic_split: Mutex::new(automatic_split::Observation::default()),
         });
+        runtime.install_direct_gateway();
         let weak = Arc::downgrade(&runtime);
         if let Some(issuer) = &runtime.services.admission_issuer {
             for client in &runtime.services.remote_status {
@@ -309,7 +314,7 @@ impl WorkerRuntime {
                 transport: runtime.services.manager.client(),
                 catalog: runtime.services.catalog.participant().identity().clone(),
                 timestamps: runtime.services.timestamps.identity().clone(),
-                local_timestamps: None,
+                local_timestamps: runtime.services.direct_timestamps.clone(),
             });
             direct.start();
             runtime.direct.set(direct).map_err(|_| unknown())?;
@@ -1723,6 +1728,9 @@ impl HttpRuntime for WorkerRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
     }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        self.direct_gateway_handle().cloned()
+    }
     fn scheduler(&self) -> ResourceScheduler {
         self.services.shared.scheduler()
     }
@@ -1829,9 +1837,17 @@ impl HttpRuntime for WorkerRuntime {
                     "storage":self.services.shared.storage_stats(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
                     "native_thread_budget":self.services.shared.thread_budget(),
-                    // `null` until T7 installs the direct executor.
-                    "direct":crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                        .map(|service| service.stats())
+                    // `null` until `data.direct.v1` activates the executor.
+                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                            .map(|service| service.stats())
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                    })),
+                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                 }))
                 .map_err(|_| unknown())?,
             })

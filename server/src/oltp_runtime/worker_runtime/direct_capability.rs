@@ -348,7 +348,6 @@ impl DirectSwitch {
     }
 
     /// The installed executor's `direct` stats, once active.
-    #[allow(dead_code)] // Read by `/v1/runtime/stats` (NS8-owned handler).
     pub(crate) fn direct_stats(&self) -> Option<crate::oltp_runtime::direct::DirectStatsSnapshot> {
         self.executor
             .lock()

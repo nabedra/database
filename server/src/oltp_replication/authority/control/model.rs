@@ -675,9 +675,11 @@ pub(crate) enum ServiceAction {
     ControlFence { transition_id: Uuid },
     Operator,
     /// A Data range leader executing direct commits (T7): Catalog reads for
-    /// its table schema and `AllocateDirect` on the Timestamp group. Granted
-    /// only while `data.direct.v1` is active, to a worker that advertised it,
-    /// so no older peer receives this tag.
+    /// its table schema and `AllocateDirect` on the Timestamp group. A worker
+    /// acting as gateway (T6) also uses it for `Method::Direct` and
+    /// `DirectForward` on Data groups. Granted only while `data.direct.v1`
+    /// is active, to a worker that advertised it, so no older peer receives
+    /// this tag.
     DirectLeader,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
