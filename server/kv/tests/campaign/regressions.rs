@@ -46,6 +46,17 @@ pub const FIXED: &[Case] = &[
         ],
         note: "armed crash during the dump after a clean reopen (timing)",
     },
+    // KVfix3, CI 55f6d85 (Linux debug, run 44726640722): an `EioRename` fault still armed
+    // at a clean reopen failed the open's `CURRENT` switch; the harness failed the run
+    // instead of recovering from the crash image.
+    Case {
+        seed: 11,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[224, 246],
+        note: "clean reopen failed under an injected rename EIO",
+    },
 ];
 
 /// Unfixed findings (each has an ignored test naming it in `main.rs`).
