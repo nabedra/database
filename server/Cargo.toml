@@ -86,6 +86,16 @@ tokio = { version = "=1.54.1", features = ["test-util"] }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body = "=1.1.0"
 
+# Local edit loop (plans/fast-builds.md, BLD2). Line tables keep file:line in
+# backtraces with smaller objects and faster links than full debug info.
+# CI overrides debug info to 0 through CARGO_PROFILE_DEV_DEBUG.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies are not stepped through in a debugger.
+[profile.dev.package."*"]
+debug = false
+
 [[test]]
 name = "api"
 required-features = ["olap"]

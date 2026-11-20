@@ -36,3 +36,13 @@ tower = { version = "=0.5.3", features = ["util", "limit", "load-shed", "timeout
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
 uuid = { version = "=1.29.2", features = ["serde", "v4"] }
+
+# Local edit loop (plans/fast-builds.md, BLD2). Line tables keep file:line in
+# backtraces with smaller objects and faster links than full debug info.
+# CI overrides debug info to 0 through CARGO_PROFILE_DEV_DEBUG.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies are not stepped through in a debugger.
+[profile.dev.package."*"]
+debug = false
