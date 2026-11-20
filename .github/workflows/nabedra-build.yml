@@ -132,24 +132,6 @@ jobs:
         run: |
           set -o pipefail
           cargo test --locked --no-fail-fast --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
-      # Temporary (T7b): D07 repeated alone; remove before integration.
-      - name: D07 x10 (T7b)
-        if: always()
-        working-directory: server
-        run: |
-          pass=0
-          for i in $(seq 1 10); do
-            cargo test --locked --no-default-features --features oltp --lib -- \
-              application::direct::tests::d07 --test-threads 1 > ../d07-run.log 2>&1 || true
-            cat ../d07-run.log >> ../oltp-d07.log
-            if grep -q "test result: ok. 1 passed" ../d07-run.log; then
-              pass=$((pass+1)); echo "d07 run $i: ok"
-            else
-              echo "d07 run $i: FAILED"
-            fi
-          done
-          echo "d07 passed $pass/10"
-          test "$pass" -eq 10
       - name: Integration tests
         working-directory: server
         run: |
