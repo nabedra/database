@@ -774,7 +774,11 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
             caller
                 .common
                 .outgoing
-                .lane(target.worker_id, TrafficClass::Authority, &caller.common.config)
+                .lane(
+                    target.worker_id,
+                    TrafficClass::Authority,
+                    &caller.common.config
+                )
                 .available_permits(),
             2
         );
@@ -785,4 +789,80 @@ async fn o14_o23_c07_r03_authority_dependency_waits_for_progress() {
     .unwrap();
     stop.send(()).unwrap();
     worker.await.unwrap().unwrap();
+}
+
+/// RV-FINAL L1, C07, M02, LIVE1 (5 peers): caller slots of one class are
+/// capped across peer lanes at `OUTGOING_CLASS_LANES` lanes' worth. A paused
+/// peer fills only its own lane, so the others keep sending (LIVE1); four
+/// full lanes reach the class cap, and a fifth peer's empty lane is refused
+/// locally instead of adding a lane of in-flight calls per peer. Other
+/// classes (Control consensus) are not affected.
+#[tokio::test]
+async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 1);
+    let local = WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(local.clone());
+    let config = TransportConfig::default();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport =
+        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
+    let client = transport.client();
+    let class = TrafficClass::DataConsensus;
+    let lane = config.handler_slots[class as usize];
+    let cap = lane * OUTGOING_CLASS_LANES;
+    let targets: Vec<Uuid> = (0..=OUTGOING_CLASS_LANES).map(|_| Uuid::new_v4()).collect();
+    let mut held = Vec::new();
+    // A paused peer holds only its own lane.
+    for _ in 0..lane {
+        held.push(client.try_outgoing(targets[0], class).unwrap());
+    }
+    assert!(matches!(
+        client.try_outgoing(targets[0], class),
+        Err(RequestError::OutgoingLaneFull)
+    ));
+    // The other peers still send, up to the class cap.
+    for target in &targets[1..OUTGOING_CLASS_LANES] {
+        for _ in 0..lane {
+            held.push(client.try_outgoing(*target, class).unwrap());
+        }
+    }
+    assert_eq!(held.len(), cap);
+    assert_eq!(
+        transport.common.outgoing_class[class as usize].available_permits(),
+        0
+    );
+    // A fifth peer's lane is empty, but the class is at its cap.
+    let fifth = targets[OUTGOING_CLASS_LANES];
+    assert!(matches!(
+        client.try_outgoing(fifth, class),
+        Err(RequestError::OutgoingLaneFull)
+    ));
+    // Control traffic is never starved by Data consensus.
+    let control = client
+        .try_outgoing(fifth, TrafficClass::ControlConsensus)
+        .unwrap();
+    // A finished call on any lane admits the fifth peer.
+    held.pop();
+    let admitted = client.try_outgoing(fifth, class).unwrap();
+    drop((control, admitted, held));
+    assert_eq!(
+        transport.common.outgoing_class[class as usize].available_permits(),
+        cap
+    );
 }

@@ -552,6 +552,8 @@ struct Common {
     /// one class-wide pool, its stalled requests took every slot, and Raft
     /// votes and heartbeats to the healthy peers were refused locally (LIVE1).
     outgoing: OutgoingLanes,
+    /// Caller slots per class across every peer lane (RV-FINAL L1).
+    outgoing_class: [Arc<Semaphore>; CLASSES],
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
@@ -731,6 +733,11 @@ impl WorkerTransport {
                     Arc::new(Semaphore::new(config.handler_slots[i]))
                 }),
                 outgoing: OutgoingLanes::default(),
+                outgoing_class: std::array::from_fn(|i| {
+                    Arc::new(Semaphore::new(outgoing_class_slots(
+                        config.handler_slots[i],
+                    )))
+                }),
                 authority_roles: Semaphore::new(
                     config.handler_slots[TrafficClass::Authority as usize] - 1,
                 ),
@@ -1104,6 +1111,7 @@ impl WorkerClient {
             .common
             .outgoing
             .lane(target, class, &self.common.config);
+        let class_slots = self.common.outgoing_class[index].clone();
         let _waiter = self
             .common
             .authority_waiters
@@ -1117,10 +1125,12 @@ impl WorkerClient {
                 .acquire_owned()
                 .await?;
             let slot = outgoing.acquire_owned().await?;
+            let class_slot = class_slots.acquire_owned().await?;
             Ok::<_, tokio::sync::AcquireError>((
                 Some(role),
                 OutgoingSlot {
                     _slot: slot,
+                    _class: class_slot,
                     #[cfg(test)]
                     _held: held,
                 },
@@ -1335,8 +1345,13 @@ impl WorkerClient {
             .lane(target, class, &self.common.config)
             .try_acquire_owned()
             .map_err(|_| full())?;
+        let class_slot = self.common.outgoing_class[class as usize]
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full())?;
         Ok(OutgoingSlot {
             _slot: slot,
+            _class: class_slot,
             #[cfg(test)]
             _held: held,
         })
@@ -1377,9 +1392,21 @@ impl WorkerClient {
 #[cfg(test)]
 const TEST_HOLD_PERMITS: u32 = 1 << 20;
 
-/// A caller slot on one peer lane. Dropping it frees the slot.
+/// Peer lanes' worth of caller slots one class may use in total. A paused
+/// peer holds at most its own lane (one handler capacity), so the others keep
+/// the rest (LIVE1), while the total in flight per class stays bounded by a
+/// constant instead of growing with the number of peers (RV-FINAL L1, M02).
+pub(crate) const OUTGOING_CLASS_LANES: usize = 4;
+fn outgoing_class_slots(handler_slots: usize) -> usize {
+    handler_slots
+        .saturating_mul(OUTGOING_CLASS_LANES)
+        .min(Semaphore::MAX_PERMITS)
+}
+
+/// A caller slot on one peer lane and in its class. Dropping it frees both.
 struct OutgoingSlot {
     _slot: OwnedSemaphorePermit,
+    _class: OwnedSemaphorePermit,
     #[cfg(test)]
     _held: OwnedSemaphorePermit,
 }
