@@ -186,6 +186,7 @@ jobs:
       - name: Use restored target
         run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
       - name: Build tests
+        id: build
         working-directory: server
         run: cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings
       - uses: actions/upload-artifact@v4
@@ -214,6 +215,7 @@ jobs:
           set -o pipefail
           cargo test --locked --no-fail-fast --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
       - name: Integration tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
         run: |
           set -o pipefail
@@ -305,6 +307,7 @@ jobs:
       - name: Use restored target
         run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
       - name: Build release tests
+        id: build
         working-directory: server
         run: |
           cargo test --locked --release -p nabedra-kv --test campaign --test store_model --test store_crash --test store_gc --no-run
@@ -330,11 +333,13 @@ jobs:
           set -o pipefail
           cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
       - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
         run: |
           set -o pipefail
           cargo test --locked --no-fail-fast --release -p nabedra-kv --test store_model --test store_crash --test store_gc -- --ignored --nocapture 2>&1 | tee ../store-long.log
       - name: SIGKILL and cold start (NS16, D09, R04, O11)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
         run: |
           set -o pipefail
