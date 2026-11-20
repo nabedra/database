@@ -308,16 +308,10 @@ impl OltpPool {
         // section 3). Groups this pool already accepted are not counted again
         // (RV-NS6 F2); a refused open accepts nothing, so it refuses again.
         let accepted = if opened.quarantined.is_empty() {
-            damage::admit(path, &store, &[], &[], 0)?
+            damage::admit(path, &store, &[], 0)?
         } else {
             let healthy = count_healthy_groups(&store)?;
-            damage::admit(
-                path,
-                &store,
-                &opened.quarantined,
-                &opened.quarantined_now,
-                healthy,
-            )?
+            damage::admit(path, &store, &opened.quarantined, healthy)?
         };
         if opened.recovery.tail_truncations > 0 {
             tracing::warn!(

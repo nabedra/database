@@ -158,29 +158,25 @@ impl DamageState {
 }
 
 /// R6 at open (plan section 3), sticky. Returns the accepted set to persist,
-/// when it changes. `quarantined_now` is kv's list for this open; it decides
-/// only for pools written before the accepted record existed.
+/// when it changes. A pool without the record has accepted nothing, so a pool
+/// that never had damage writes nothing at open.
 pub(super) fn admit(
     path: &Path,
     store: &Store,
     quarantined: &[Damage],
-    quarantined_now: &[Damage],
     healthy_groups: usize,
 ) -> Result<Option<BTreeSet<Uuid>>, ProtocolError> {
     let current: BTreeSet<Uuid> = quarantined
         .iter()
         .filter_map(|damage| group_of_scope(&damage.scope))
         .collect();
-    let accepted = read_accepted(store)?;
+    let accepted = read_accepted(store)?.unwrap_or_default();
     let override_file = path.join(ACCEPT_DAMAGE_FILE);
     let operator_accepts = override_file.exists();
-    let new: BTreeSet<Uuid> = match &accepted {
-        _ if operator_accepts => BTreeSet::new(),
-        Some(accepted) => current.difference(accepted).copied().collect(),
-        None => quarantined_now
-            .iter()
-            .filter_map(|damage| group_of_scope(&damage.scope))
-            .collect(),
+    let new: BTreeSet<Uuid> = if operator_accepts {
+        BTreeSet::new()
+    } else {
+        current.difference(&accepted).copied().collect()
     };
     let groups = current.len() + healthy_groups;
     if new.len() > R6_MAX_GROUPS || (new.len() > 1 && new.len() * 10 > groups) {
@@ -210,7 +206,7 @@ pub(super) fn admit(
             "OLTP group quarantined; it will not start until Control replaces it"
         );
     }
-    Ok((accepted.as_ref() != Some(&current)).then_some(current))
+    Ok((accepted != current || operator_accepts).then_some(current))
 }
 
 /// Persists the accepted set at open, then removes the operator's override.
@@ -277,7 +273,7 @@ impl OltpPool {
             .iter()
             .filter_map(|damage| group_of_scope(&damage.scope))
             .collect();
-        if read_accepted(&self.inner.store)?.as_ref() == Some(&current) {
+        if read_accepted(&self.inner.store)?.unwrap_or_default() == current {
             return Ok(());
         }
         self.healthy()?;
