@@ -58,6 +58,10 @@ pub(crate) struct DirectSwitch {
     history_until: AtomicU64,
     /// Control recorded this owner's pre-activation queued history (T7c).
     history_noted: AtomicBool,
+    /// `WorkerRuntime::without_direct_for_test`: the owner neither notes
+    /// history nor settles (T7c), as if the capability never activated.
+    #[cfg(test)]
+    disabled_for_test: AtomicBool,
     on_active: Mutex<Vec<OnActive>>,
     stop: watch::Sender<bool>,
     watcher: Mutex<Option<JoinHandle<()>>>,
@@ -87,6 +91,8 @@ impl DirectSwitch {
             active: AtomicBool::new(false),
             history_until: AtomicU64::new(0),
             history_noted: AtomicBool::new(false),
+            #[cfg(test)]
+            disabled_for_test: AtomicBool::new(false),
             on_active: Mutex::new(Vec::new()),
             stop: watch::channel(false).0,
             watcher: Mutex::new(None),
@@ -143,6 +149,10 @@ impl DirectSwitch {
     /// Returns whether the capability is active. One Control write per
     /// process; after that the recorded history covers every reservation.
     pub(crate) async fn note_queued_history(&self) -> Result<bool, ProtocolError> {
+        #[cfg(test)]
+        if self.disabled_for_test.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         if self.is_direct_active() {
             return Ok(true);
         }
@@ -261,6 +271,11 @@ impl DirectSwitch {
             }
         });
         *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn disable_for_test(&self) {
+        self.disabled_for_test.store(true, Ordering::Release);
     }
 
     /// Stops the watcher and waits for it.
