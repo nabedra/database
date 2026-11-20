@@ -462,7 +462,7 @@ pub(super) fn recover(
                 pad_at: Some(pos),
             }
         };
-        if !scan.max_durable.is_some_and(|d| d >= seq_p) {
+        if scan.max_durable.is_none_or(|d| d < seq_p) {
             if matches!(non_valid, NonValid::EndMarker) && scan.first_valid.is_none() {
                 // L1.
                 break fence;

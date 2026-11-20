@@ -31,6 +31,11 @@ concurrency:
 permissions:
   contents: read
 
+# An explicit `bash` runs steps with `-eo pipefail`, so a failing `cargo test | tee` fails the step.
+defaults:
+  run:
+    shell: bash
+
 env:
   RUST_TOOLCHAIN: "1.94.1"
   CARGO_TERM_COLOR: never
@@ -65,7 +70,7 @@ jobs:
         run: cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings
       - name: Test
         working-directory: server
-        run: cargo test --locked -p nabedra-kv 2>&1 | tee ../kv-test.log
+        run: cargo test --locked --no-fail-fast -p nabedra-kv 2>&1 | tee ../kv-test.log
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -126,7 +131,7 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
+          cargo test --locked --no-fail-fast --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
       # Temporary (T7b): D07 repeated alone; remove before integration.
       - name: D07 x10 (T7b)
         if: always()
@@ -149,7 +154,7 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --no-default-features --features oltp \
+          cargo test --locked --no-fail-fast --no-default-features --features oltp \
             --test oltp_multiplex --test oltp_worker_queue --test worker_pool --test executor --test protocol \
             2>&1 | tee ../oltp-integration.log
       - if: always()
@@ -181,7 +186,7 @@ jobs:
         working-directory: server/events
         run: |
           set -o pipefail
-          cargo test --locked 2>&1 | tee ../../events-test.log
+          cargo test --locked --no-fail-fast 2>&1 | tee ../../events-test.log
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -209,12 +214,12 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
       - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --release -p nabedra-kv --test store_model --test store_crash --test store_gc -- --ignored --nocapture 2>&1 | tee ../store-long.log
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test store_model --test store_crash --test store_gc -- --ignored --nocapture 2>&1 | tee ../store-long.log
       - name: SIGKILL and cold start (NS16, D09, R04, O11)
         working-directory: server
         run: |
