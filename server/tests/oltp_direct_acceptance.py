@@ -806,6 +806,9 @@ def suite_barriers(args, output):
                 lost = repr(error)
         retry = call(cluster.api_urls['api2'], '/v1/operations', body, token=token, ca=ca)
         again = call(cluster.urls[[name for name in WORKERS if name != leader][0]], '/v1/operations', body, token=token)
+        # api1 is gone: read through the other gateway from now on.
+        table = Database(url=cluster.api_urls['api2'], token=token, database=DATABASE, ca_file=str(ca),
+                         timeout=30).table('d_barrier')
         after = cluster.all_stats()
         assert retry == again == (200, {'request_id': request_id, 'data': None}), (retry, again)
         assert table.get(2000) == {'id': 2000, 'value': 7}
