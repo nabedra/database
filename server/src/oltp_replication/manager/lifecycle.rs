@@ -485,12 +485,113 @@ pub(crate) async fn settle_damage(
     }
 }
 
+/// Replicas whose damage report is being settled, so each settles once.
+pub(crate) type SettlingReplicas = Arc<Mutex<BTreeSet<(uuid::Uuid, u64)>>>;
+
+/// Reports and settles one damaged replica in the background, once per
+/// replica at a time.
+pub(crate) fn spawn_settlement(
+    control: Arc<ControlClient>,
+    settling: SettlingReplicas,
+    report: GroupDamageReport,
+    pool: Option<OltpPool>,
+) {
+    let key = (report.group.group_id, report.replica.node_id);
+    if !settling
+        .lock()
+        .is_ok_and(|mut settling| settling.insert(key))
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let outcome = settle_damage(control, report, pool, Duration::from_secs(1)).await;
+        tracing::warn!(group = %key.0, node = key.1, ?outcome, "group damage settled");
+        if let Ok(mut settling) = settling.lock() {
+            settling.remove(&key);
+        }
+    });
+}
+
+/// NS14b: the run-time damage reporter. It is installed before the system
+/// groups start, so a run-time stop of a Timestamps, Status or Catalog
+/// replica is reported too (rule 2); reports wait in memory until the worker
+/// has a Control client (`connect`). Control replicas are never reported:
+/// Control's own membership flows replace them.
+pub(crate) struct ReportingDamageSink {
+    control: Mutex<Option<std::sync::Weak<ControlClient>>>,
+    waiting: Mutex<Vec<(GroupDamageReport, OltpPool)>>,
+    settling: SettlingReplicas,
+}
+impl ReportingDamageSink {
+    const MAX_WAITING: usize = 1024;
+
+    pub(crate) fn new(settling: SettlingReplicas) -> Arc<Self> {
+        Arc::new(Self {
+            control: Mutex::new(None),
+            waiting: Mutex::new(Vec::new()),
+            settling,
+        })
+    }
+    /// Sends every waiting report, and every later one, through `control`.
+    pub(crate) fn connect(&self, control: &Arc<ControlClient>) {
+        if let Ok(mut slot) = self.control.lock() {
+            *slot = Some(Arc::downgrade(control));
+        }
+        let waiting = self
+            .waiting
+            .lock()
+            .map(|mut waiting| std::mem::take(&mut *waiting))
+            .unwrap_or_default();
+        for (report, pool) in waiting {
+            spawn_settlement(control.clone(), self.settling.clone(), report, Some(pool));
+        }
+    }
+}
+impl DamageSink for ReportingDamageSink {
+    fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool) {
+        if group.kind == GroupKind::Control {
+            tracing::error!(group = %group.group_id, node = replica.node_id,
+                "a Control replica stopped after storage damage; replace it through Control membership");
+            return;
+        }
+        let Some(damage) = pool.group_damage(group.group_id) else {
+            return;
+        };
+        let report = GroupDamageReport {
+            group,
+            replica,
+            reason: damage.cause.into(),
+            first_bad_seq: damage.first_bad_seq,
+            refusal: None,
+        };
+        let control = self
+            .control
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade));
+        match control {
+            Some(control) => spawn_settlement(control, self.settling.clone(), report, Some(pool)),
+            None => {
+                if let Ok(mut waiting) = self.waiting.lock()
+                    && waiting.len() < Self::MAX_WAITING
+                {
+                    waiting.push((report, pool));
+                }
+            }
+        }
+    }
+}
+
 impl HostedGroupManager {
     /// Installs where run-time damage is reported (rule 2).
     pub(crate) fn install_damage_sink(&self, sink: Arc<dyn DamageSink>) {
         if let Ok(mut slot) = self.damage_sink.lock() {
             *slot = Some(sink);
         }
+    }
+    /// A sink is installed already (the registered worker's early reporter).
+    pub(crate) fn has_damage_sink(&self) -> bool {
+        self.damage_sink.lock().is_ok_and(|slot| slot.is_some())
     }
 
     /// Section 3 rule 1 at run time: when kv quarantines this replica's group,
@@ -565,9 +666,10 @@ impl HostedGroupManager {
 }
 
 /// Rule 3 evidence after the leader replaced a damaged voter.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DamagedReplacement {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) membership: GroupMembershipObservation,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) removed: DamagedReplicaRemoved,
     pub(crate) proof: GroupDamageReplacement,
 }
@@ -587,8 +689,6 @@ where
     /// voters. Rule 5: without a quorum that excludes the damaged replica the
     /// quorum read or the change fails, and nothing is recorded or deleted.
     /// Idempotent after the change committed.
-    // NS14: the Control-side scheduler that calls this is not wired yet (report).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn replace_damaged_voter(
         &self,
         damaged: &ReplicaMember,

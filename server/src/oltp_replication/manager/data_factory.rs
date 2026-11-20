@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 pub(crate) mod split;
 pub(crate) mod placement;
+pub(crate) mod damage_replacement;
 mod restart;
 
 const HEADER: usize = 4096;
@@ -85,7 +86,7 @@ pub(crate) struct DataGroupFactory {
     starts: tokio::sync::Mutex<()>,
     wired: Mutex<std::collections::BTreeSet<(Uuid, u64)>>,
     /// Replicas whose damage report is already being settled (NS14).
-    damaged: Arc<Mutex<std::collections::BTreeSet<(Uuid, u64)>>>,
+    damaged: super::SettlingReplicas,
     _owner: Arc<ScratchLease>,
 }
 impl DataGroupFactory {
@@ -118,11 +119,14 @@ impl DataGroupFactory {
                 + voters.capacity() * std::mem::size_of::<ReplicaMember>()
                 + 4096,
         )?);
-        let damaged = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
-        manager.install_damage_sink(Arc::new(FactoryDamageSink {
-            control: Arc::downgrade(&rpc),
-            damaged: damaged.clone(),
-        }));
+        let damaged: super::SettlingReplicas = Arc::new(Mutex::new(Default::default()));
+        // A registered worker installed its reporter before its system groups
+        // started (NS14b); other workers report through this factory's client.
+        if !manager.has_damage_sink() {
+            let sink = super::ReportingDamageSink::new(damaged.clone());
+            sink.connect(&rpc);
+            manager.install_damage_sink(sink);
+        }
         Ok(Arc::new(Self {
             manager,
             pool,
@@ -142,7 +146,7 @@ impl DataGroupFactory {
     /// NS14 rules 2 and 4: report a replica this worker cannot serve and
     /// release its bytes once Control records its replacement.
     fn settle_damage(&self, report: GroupDamageReport, pool: Option<OltpPool>) {
-        spawn_settlement(self.rpc.clone(), self.damaged.clone(), report, pool);
+        super::spawn_settlement(self.rpc.clone(), self.damaged.clone(), report, pool);
     }
     fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
         crate::protocol::json_input(bytes, HEADER).map_err(|_| invalid())?;
@@ -239,6 +243,7 @@ impl DataGroupFactory {
                                 replica: self.local.clone(),
                                 reason: damage.cause.into(),
                                 first_bad_seq: damage.first_bad_seq,
+                                refusal: None,
                             },
                             Some(self.pool.clone()),
                         );
@@ -722,52 +727,4 @@ fn unauthorized() -> ProtocolError {
         "Data group creation requires the current fenced scheduler owner",
         Outcome::NotApplied,
     )
-}
-
-/// Reports replicas stopped by run-time damage (NS14 rule 2).
-struct FactoryDamageSink {
-    control: std::sync::Weak<ControlClient>,
-    damaged: Arc<Mutex<std::collections::BTreeSet<(Uuid, u64)>>>,
-}
-impl super::DamageSink for FactoryDamageSink {
-    fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool) {
-        let Some(control) = self.control.upgrade() else {
-            return;
-        };
-        let Some(damage) = pool.group_damage(group.group_id) else {
-            return;
-        };
-        let report = GroupDamageReport {
-            group,
-            replica,
-            reason: damage.cause.into(),
-            first_bad_seq: damage.first_bad_seq,
-        };
-        spawn_settlement(control, self.damaged.clone(), report, Some(pool));
-    }
-}
-
-fn spawn_settlement(
-    control: Arc<ControlClient>,
-    damaged: Arc<Mutex<std::collections::BTreeSet<(Uuid, u64)>>>,
-    report: GroupDamageReport,
-    pool: Option<OltpPool>,
-) {
-    let key = (report.group.group_id, report.replica.node_id);
-    if !damaged.lock().is_ok_and(|mut damaged| damaged.insert(key)) {
-        return;
-    }
-    tokio::spawn(async move {
-        let outcome = super::settle_damage(
-            control,
-            report,
-            pool,
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-        tracing::warn!(group = %key.0, node = key.1, ?outcome, "group damage settled");
-        if let Ok(mut damaged) = damaged.lock() {
-            damaged.remove(&key);
-        }
-    });
 }

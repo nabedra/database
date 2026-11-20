@@ -20,7 +20,8 @@ pub(crate) use data_worker::{DataWorkerGrowthProof, DataWorkerIntent};
 pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
 pub(crate) use direct::{DIRECT_VERSION, DirectActivation, DirectCapability, DirectCapabilityOperation};
 pub(crate) use group_damage::{
-    GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport,
+    GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,
+    GroupDamageReport, PoolRefusal, DirectCapabilityDamageGate,
 };
 #[allow(unused_imports)]
 pub(crate) use group_damage::{GroupDamageGate, GroupDamagePhase};

@@ -1,0 +1,7 @@
+# One compiler for local builds, CI (.github/workflows/nabedra-build.yml) and the
+# Docker build images (rust:1.94.1-bookworm). Scripts run Cargo from the repository
+# root with --manifest-path, so this file sits at the root.
+[toolchain]
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

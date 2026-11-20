@@ -133,6 +133,35 @@ impl WorkerPools {
         self.refused.lock().ok()?.get(&id).cloned()
     }
 
+    /// Every open pool of this worker, primary first.
+    pub(crate) fn pool_ids(&self) -> Result<Vec<Uuid>, ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| unavailable("worker pool inventory unavailable"))?;
+        let mut ids = vec![self.primary];
+        ids.extend(entries.keys().copied().filter(|id| *id != self.primary));
+        Ok(ids)
+    }
+    /// Rule 6 in `/v1/runtime/stats`: every refused secondary pool, with the
+    /// error class and message that refused it.
+    pub(crate) fn refused_report(&self) -> Vec<serde_json::Value> {
+        let Ok(refused) = self.refused.lock() else {
+            return Vec::new();
+        };
+        refused
+            .iter()
+            .map(|(id, error)| {
+                serde_json::json!({
+                    "pool_id": id,
+                    "class": crate::oltp_replication::authority::control::PoolRefusal::classify(error),
+                    "code": error.code,
+                    "message": error.message,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn get(&self, id: Uuid) -> Result<Option<OltpPool>, ProtocolError> {
         Ok(self.entry(id)?.map(|entry| entry.pool))
     }

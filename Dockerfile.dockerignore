@@ -1,0 +1,15 @@
+# Build context: the repository root. Send only what the root Dockerfile reads, so
+# docs, plans, scripts and Events changes neither upload nor invalidate anything.
+# Other builds from the root context (scripts/cache-benchmark) use .dockerignore.
+*
+!server/Cargo.toml
+!server/Cargo.lock
+!server/kv/Cargo.toml
+!server/kv/src/
+!server/src/
+!orm/python/pyproject.toml
+!orm/python/README.md
+!orm/python/LICENSE
+!orm/python/src/
+**/__pycache__
+**/*.egg-info

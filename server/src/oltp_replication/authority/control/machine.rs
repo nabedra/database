@@ -222,6 +222,8 @@ fn apply_initialized(
                 | PublishReplicaMove { .. }
                 | ArmReplicaMove { .. }
                 | CancelReplicaMove { .. }
+                | GroupDamageReplacementBegin { .. }
+                | GroupDamageReplaced { .. }
         )
     {
         return fault(Fault::Busy);
@@ -281,6 +283,8 @@ fn apply_initialized(
             placement::publish(tx, scope, state, proof, authorization),
         GroupDamaged { worker, report, .. } =>
             group_damage::report(tx, scope, position, *worker, report),
+        GroupDamageReplacementBegin { authorization, plan, .. } =>
+            group_damage::begin(tx, scope, state, position, authorization, plan),
         GroupDamageReplaced { authorization, proof, .. } =>
             group_damage::replaced(tx, scope, state, authorization, proof),
         ReplicaRetired {

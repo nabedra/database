@@ -1,7 +1,8 @@
 //! NS14: `GroupDamaged` and `GroupDamageReplaced` through the Control handle.
 //! See `control/group_damage.rs`.
 use super::super::group_damage::{
-    GroupDamageGate, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport, record_key,
+    GroupDamageGate, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,
+    GroupDamageReport, RECORD_PREFIX, record_key,
 };
 use super::*;
 
@@ -23,9 +24,17 @@ impl ControlHandle {
             ))
         }
     }
+    /// The gate allows the NS14 commands now.
+    pub(crate) fn group_damage_enabled(&self) -> bool {
+        self.group_damage_gate().is_ok()
+    }
+    /// The worker's certificate is an operator pin of this Control.
+    pub(crate) fn is_operator(&self, worker: &WorkerIdentity) -> bool {
+        self.policy
+            .certificate_pins
+            .contains(&worker.certificate_sha256)
+    }
     /// Installs the predicate that allows the NS14 commands.
-    // NS14: the Control-side scheduler that calls this is not wired yet (report).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_group_damage_gate(&self, gate: Arc<dyn GroupDamageGate>) {
         *self
             .group_damage_gate
@@ -58,9 +67,30 @@ impl ControlHandle {
         damage_reply(applied.reply)
     }
 
-    /// Rule 3, after the leader's `replace_voter` committed. A local operator
-    /// call: the driver runs in a process that hosts Control.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// NS14b: claims the record's group for `plan` (a local operator call by
+    /// the scheduler beside the Control leader). Idempotent for the same plan.
+    pub(crate) async fn begin_group_damage_replacement_local(
+        &self,
+        permit: &LocalOperatorPermit,
+        operation_id: Uuid,
+        plan: GroupDamageReplacementPlan,
+    ) -> Result<GroupDamageRecord, ProtocolError> {
+        self.group_damage_gate()?;
+        let evidence = crate::oltp_replication::owned::serialized_digest(&plan)?;
+        let authorization = self.local_operator(permit, operation_id, evidence)?;
+        let applied = self
+            .submit(ControlCommand::GroupDamageReplacementBegin {
+                operation_id,
+                authorization,
+                plan: Box::new(plan),
+            })
+            .await?;
+        damage_reply(applied.reply)
+    }
+
+    /// Rule 3, after the leader's `replace_voter` committed: records it and
+    /// publishes the plan's placement. A local operator call: the scheduler
+    /// runs in a process that hosts Control.
     pub(crate) async fn group_damage_replaced_local(
         &self,
         permit: &LocalOperatorPermit,
@@ -99,6 +129,50 @@ impl ControlHandle {
     }
 }
 
+impl ControlHandle {
+    /// A page of damage records ordered by group and node, after `after`, after
+    /// a quorum read. `done` is true when no record follows.
+    pub(crate) async fn group_damage_page(
+        &self,
+        after: Option<(Uuid, u64)>,
+        limit: usize,
+    ) -> Result<(Vec<GroupDamageRecord>, bool), ProtocolError> {
+        let limit = limit.clamp(1, 64);
+        let bytes = self
+            .read(move |view| {
+                let after = after.map(|(group, node)| record_key(group, node));
+                let mut records = Vec::new();
+                let progress =
+                    view.scan_page(RECORD_PREFIX, after.as_deref(), limit, |_, raw| {
+                        records.push(machine::decode::<GroupDamageRecord>(raw)?);
+                        Ok(())
+                    })?;
+                view.encode(&(records, progress.exhausted))
+            })
+            .await?;
+        machine::decode(bytes.as_ref())
+    }
+
+    /// Every damage record of one group, after a quorum read.
+    pub(crate) async fn group_damage_of_group(
+        &self,
+        group_id: Uuid,
+    ) -> Result<Vec<GroupDamageRecord>, ProtocolError> {
+        let bytes = self
+            .read(move |view| {
+                let prefix = machine::key(RECORD_PREFIX, group_id);
+                let mut records = Vec::new();
+                view.scan_page(&prefix, None, 64, |_, raw| {
+                    records.push(machine::decode::<GroupDamageRecord>(raw)?);
+                    Ok(())
+                })?;
+                view.encode(&records)
+            })
+            .await?;
+        machine::decode(bytes.as_ref())
+    }
+}
+
 fn damage_reply(reply: ControlReply) -> Result<GroupDamageRecord, ProtocolError> {
     match reply {
         ControlReply::GroupDamage(record) => Ok(*record),
@@ -111,6 +185,21 @@ fn damage_reply(reply: ControlReply) -> Result<GroupDamageRecord, ProtocolError>
         ControlReply::Rejected(Fault::Conflict) => Err(ProtocolError::new(
             ErrorCode::Conflict,
             "damage record already names another replacement",
+            Outcome::NotApplied,
+        )),
+        ControlReply::Rejected(Fault::Busy) => Err(ProtocolError::new(
+            ErrorCode::Overloaded,
+            "the group or a pool already has a replacement running",
+            Outcome::NotApplied,
+        )),
+        ControlReply::Rejected(Fault::Stale | Fault::NotReady) => Err(ProtocolError::new(
+            ErrorCode::Conflict,
+            "the group's placement changed or the replacement has no plan",
+            Outcome::NotApplied,
+        )),
+        ControlReply::Rejected(Fault::DirectCapabilityRequired) => Err(ProtocolError::new(
+            ErrorCode::UnsupportedOperation,
+            "the replacement worker has not advertised data.direct.v1",
             Outcome::NotApplied,
         )),
         ControlReply::Rejected(_) => Err(invalid()),
