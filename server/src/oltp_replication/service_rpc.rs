@@ -794,7 +794,10 @@ impl Client {
                 64 << 10,
             )
             .await
-            .map_err(CallError::Transport)?;
+            .map_err(|error| {
+                tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
+                CallError::Transport(error)
+            })?;
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport completed");
         if reply.remote_identity().worker_id != worker.worker_id()
             || reply.group() != &self.group
