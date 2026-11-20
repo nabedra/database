@@ -195,7 +195,8 @@ class Nabedra:
 
     def get(self, key, request_id):
         def valid(row):
-            return row is None or (isinstance(row, dict) and set(row) == {'id', 'value'} and row['id'] == key
+            # The soak table's rows also carry `payload`.
+            return row is None or (isinstance(row, dict) and set(row) - {'payload'} == {'id', 'value'} and row['id'] == key
                                    and type(row['value']) is int)
         return self.point('table.get', {'table_id': self.table_id, 'key': key}, request_id, valid,
                           lambda row: {'read_value': None if row is None else row['value']})
