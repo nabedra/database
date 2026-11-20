@@ -23,6 +23,14 @@ Agent use of AWS is limited to authorized S3 work. Keep those tests small.
   and test concurrency to fit the runner, and cache dependencies by toolchain,
   target, and lockfile. Keep caches within GitHub's free allowance and use
   standard runners. Upload compact logs, test evidence, and requested binaries.
+- The compiler is pinned in the repository-root `rust-toolchain.toml` (1.94.1,
+  the same as CI and the Docker build images); keep the workflow's
+  `RUST_TOOLCHAIN` equal to it. Caches are saved only from the integration
+  branch (and `main` once the workflow is there), right after each job's build
+  step and without the workspace crates' outputs. Task branches restore and
+  never save, so their dependency builds start cold until the workflow is on
+  `main`. Cargo `--timings` reports for the OLTP test build and both images are
+  uploaded as run artifacts.
 - Push an authorized checkpoint and launch the relevant workflow for that
   revision. If the workflow is new and only on the task branch, pilot it with a
   push trigger scoped to that branch. Manual dispatch becomes available once the
