@@ -227,6 +227,8 @@ pub(crate) trait DirectService: Send + Sync {
         handle: &'a Arc<crate::oltp::mvcc::store::ParticipantHandle>,
         request: DirectRequest,
     ) -> super::EndpointFuture<'a, ForwardResponse>;
+    /// The `direct` section of `/v1/runtime/stats`.
+    fn stats(&self) -> serde_json::Value;
 }
 
 type Registry = Mutex<Vec<(usize, Weak<dyn DirectService>)>>;

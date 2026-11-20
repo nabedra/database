@@ -36,6 +36,7 @@ use crate::{
     },
     protocol::{self, ErrorCode, Key, Operation, Outcome, ProtocolError, Row},
 };
+use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
@@ -51,6 +52,8 @@ pub(crate) const MAX_DIRECT_ENTRY_BYTES: usize = 1 << 20;
 /// Pause between attempts while this node waits for its first entry of a
 /// new term to apply (range clock rule 3) or storage to come back.
 const RETRY_PAUSE: Duration = Duration::from_millis(2);
+/// Bound on one `DirectExpire` proposal.
+const EXPIRE_PROPOSAL_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The capability check. No leader proposes a direct command while it is
 /// false; requests fall back with `Inactive`, and nothing is written.
@@ -385,13 +388,13 @@ impl DirectExecutor {
             let epochs = self.epochs(handle, request).await?;
             self.table(request, &epochs, &parsed.operation).await?;
             loop {
-                if let Err(error) = handle.direct_barrier().await {
+                if by(deadline, handle.direct_barrier()).await.is_err() {
                     if !self.pause(deadline, RetryCause::Leadership).await {
-                        return Err(not_leader_or(handle, error));
+                        return Err(not_leader_or(handle, false));
                     }
                     continue;
                 }
-                match handle.direct_latest(key.clone()).await {
+                match by(deadline, handle.direct_latest(key.clone())).await {
                     Err(error) if error.code == ErrorCode::StorageUnavailable => {
                         if !self.pause(deadline, RetryCause::Unavailable).await {
                             return Err(failed(error));
@@ -561,9 +564,9 @@ impl DirectExecutor {
         // T4fix F4: the token is taken before the timestamp is fetched.
         let token = self.token(handle, clock, deadline).await?;
         let epochs = self.epochs(handle, request).await?;
-        if let Err(error) = handle.direct_barrier().await {
+        if by(deadline, handle.direct_barrier()).await.is_err() {
             if Instant::now() + RETRY_PAUSE >= deadline {
-                return Err(not_leader_or(handle, error));
+                return Err(not_leader_or(handle, *uncertain));
             }
             return Ok(Attempt::Retry(RetryCause::Leadership));
         }
@@ -574,10 +577,20 @@ impl DirectExecutor {
         else {
             unreachable!("row keys only");
         };
+        // A cancelled earlier attempt of this request may still be pending
+        // on these keys (its latch is gone but its entry is not applied):
+        // wait for it, so the dedup lookup below sees its record.
+        for key in keys {
+            if by(deadline, clock.wait_latest(key)).await.is_err() {
+                return Ok(Attempt::Retry(RetryCause::Unavailable));
+            }
+        }
         // The dedup record decides before any fallback (T4fix concern 1).
-        match handle
-            .direct_dedup_after_barrier(request.table_id, anchor.clone(), request.request_id)
-            .await
+        match by(
+            deadline,
+            handle.direct_dedup_after_barrier(request.table_id, anchor.clone(), request.request_id),
+        )
+        .await
         {
             Err(error) if error.code == ErrorCode::StorageUnavailable => {
                 return Err(stale_route(Some(&epochs)));
@@ -591,13 +604,20 @@ impl DirectExecutor {
         }
         let mut current = Vec::with_capacity(keys.len());
         for key in keys {
-            match self.latest(handle, key.clone(), &epochs).await? {
-                Some(read) => current.push(read),
+            match self.latest(handle, key.clone(), &epochs, deadline).await? {
+                Some((version, value)) => {
+                    // Row keys hold rows; index entries are read separately.
+                    let row = value
+                        .map(|raw| serde_json::from_str::<Row>(raw.get()))
+                        .transpose()
+                        .map_err(|_| failed(corrupt()))?;
+                    current.push((version, row));
+                }
                 None => return Ok(Attempt::Retry(RetryCause::Unavailable)),
             }
         }
         let Some(computed) = self
-            .compute(handle, table, operation, keys, current, &epochs)
+            .compute(handle, table, operation, keys, current, &epochs, deadline)
             .await?
         else {
             return Ok(Attempt::Retry(RetryCause::Unavailable));
@@ -617,7 +637,7 @@ impl DirectExecutor {
                 DirectData::from_json(result.as_str()).map_err(failed)?,
             )));
         }
-        let commit_ts = match self.timestamps.commit_ts().await {
+        let commit_ts = match by(deadline, self.timestamps.commit_ts()).await {
             Ok(ts) => ts,
             Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
         };
@@ -662,7 +682,7 @@ impl DirectExecutor {
             }
         };
         self.stats.proposed(rows, index_changes);
-        let applied = match handle.propose(command).await {
+        let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
             Err(_) => {
                 // The entry may still commit; the dedup record decides on
@@ -734,15 +754,10 @@ impl DirectExecutor {
         handle: &ParticipantHandle,
         key: MvccKey,
         epochs: &ParticipantEpochs,
-    ) -> Result<Option<(Option<CommitTs>, Option<Row>)>, DirectResponse> {
-        match handle.direct_latest(key).await {
-            Ok(LatestRead::Value { version, value }) => {
-                let row = value
-                    .map(|raw| serde_json::from_str::<Row>(raw.get()))
-                    .transpose()
-                    .map_err(|_| failed(corrupt()))?;
-                Ok(Some((version, row)))
-            }
+        deadline: Instant,
+    ) -> Result<Option<(Option<CommitTs>, Option<Box<RawValue>>)>, DirectResponse> {
+        match by(deadline, handle.direct_latest(key)).await {
+            Ok(LatestRead::Value { version, value }) => Ok(Some((version, value))),
             Ok(LatestRead::Blocked) => Err(DirectResponse::Fallback {
                 reason: FallbackReason::Intent,
             }),
@@ -764,6 +779,7 @@ impl DirectExecutor {
         keys: &[MvccKey],
         current: Vec<(Option<CommitTs>, Option<Row>)>,
         epochs: &ParticipantEpochs,
+        deadline: Instant,
     ) -> Result<Option<Computed>, DirectResponse> {
         // (row key, head version, old row, new row)
         let mut changes: Vec<(MvccKey, Option<CommitTs>, Option<Row>, Option<Row>)> = Vec::new();
@@ -857,7 +873,8 @@ impl DirectExecutor {
                     .into_iter()
                     .chain(entries.put.map(|(key, cover)| (key, Some(cover))))
                 {
-                    let Some((expected, _)) = self.latest(handle, key.clone(), epochs).await?
+                    let Some((expected, _)) =
+                        self.latest(handle, key.clone(), epochs, deadline).await?
                     else {
                         return Ok(None);
                     };
@@ -933,19 +950,21 @@ impl DirectExecutor {
                     return Err(deadline_expired(uncertain));
                 }
                 let epochs = handle.direct_epochs().await.map_err(failed)?;
-                if handle.direct_barrier().await.is_err() {
+                if by(deadline, handle.direct_barrier()).await.is_err() {
                     if !self.pause(deadline, RetryCause::Leadership).await {
                         return Err(deadline_expired(uncertain));
                     }
                     continue;
                 }
-                match handle
-                    .direct_dedup_after_barrier(
+                match by(
+                    deadline,
+                    handle.direct_dedup_after_barrier(
                         request.table_id,
                         anchor.clone(),
                         request.request_id,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Err(error)
                         if matches!(
@@ -972,7 +991,7 @@ impl DirectExecutor {
                     ByteClass::Progress,
                 )
                 .map_err(failed)?;
-                let applied = match handle.propose(command).await {
+                let applied = match by(deadline, handle.propose(command)).await {
                     Ok(applied) => applied,
                     Err(_) => {
                         uncertain = true;
@@ -1049,7 +1068,8 @@ impl DirectExecutor {
                 &self.resources,
                 ByteClass::Progress,
             )?;
-            match handle.propose(command).await?.reply {
+            let bound = Instant::now() + EXPIRE_PROPOSAL_DEADLINE;
+            match by(bound, handle.propose(command)).await?.reply {
                 ParticipantReply::DirectExpired {
                     deleted: page,
                     complete,
@@ -1120,6 +1140,9 @@ impl DirectService for DirectExecutor {
     ) -> EndpointFuture<'a, ForwardResponse> {
         Box::pin(async move { Ok(DirectExecutor::forward(self, handle, request).await) })
     }
+    fn stats(&self) -> serde_json::Value {
+        serde_json::to_value(DirectExecutor::stats(self)).unwrap_or(serde_json::Value::Null)
+    }
 }
 
 fn fault_response(fault: Fault, epochs: &ParticipantEpochs) -> DirectResponse {
@@ -1148,13 +1171,32 @@ fn stale_route(epochs: Option<&ParticipantEpochs>) -> DirectResponse {
         routing_epoch: epochs.map(|e| e.routing_epoch),
     }
 }
-fn not_leader_or(handle: &ParticipantHandle, error: ProtocolError) -> DirectResponse {
+/// After a failed barrier: redirect when another node leads, else report
+/// the deadline.
+fn not_leader_or(handle: &ParticipantHandle, uncertain: bool) -> DirectResponse {
     let (leader, local) = handle.direct_leadership();
     if leader.is_some() && leader != local {
         DirectResponse::NotLeader { hint: leader }
     } else {
-        failed(error)
+        deadline_expired(uncertain)
     }
+}
+/// `future`, or an unknown-outcome `StorageUnavailable` at `deadline`.
+/// Dropping a proposal at the deadline leaves its outcome to the dedup
+/// record, as for any proposal error.
+async fn by<T>(
+    deadline: Instant,
+    future: impl std::future::Future<Output = Result<T, ProtocolError>>,
+) -> Result<T, ProtocolError> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "direct request deadline expired",
+                Outcome::Unknown,
+            ))
+        })
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)
