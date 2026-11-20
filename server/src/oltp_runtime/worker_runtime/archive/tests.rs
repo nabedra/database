@@ -1350,13 +1350,19 @@ async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_increment
     .await
     .unwrap();
     let switch = source.direct_switch().expect("every runtime has a switch").clone();
-    assert!(switch.direct_oltp(), "direct_oltp defaults to true");
+    // True in every release build; false only in T9's `NABEDRA_TEST_DIRECT_OLTP=off` run.
+    assert_eq!(
+        switch.direct_oltp(),
+        crate::config::direct_oltp_default(),
+        "direct_oltp follows its default"
+    );
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     while !switch.is_direct_active() {
         assert!(tokio::time::Instant::now() < deadline, "data.direct.v1 never activated");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(switch.routes_direct() && switch.requires_forward());
+    assert!(switch.requires_forward());
+    assert_eq!(switch.routes_direct(), switch.direct_oltp());
     assert!(source.direct_commits_active(), "activation set the backup gate");
     assert!(switch.refresh().await.unwrap(), "Control reports it active");
     let backup_id = Uuid::new_v4();

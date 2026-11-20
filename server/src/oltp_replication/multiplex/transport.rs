@@ -237,6 +237,8 @@ struct ReplicaResidency {
     _slot: GroupCapacityLease,
     metadata_used: std::sync::atomic::AtomicUsize,
     log_metadata_used: std::sync::atomic::AtomicUsize,
+    /// Woken whenever a metadata charge is released (RV-APPLY F3, F5).
+    metadata_released: tokio::sync::Notify,
     ownership: std::sync::OnceLock<Arc<dyn Send + Sync>>,
 }
 /// One live Raft instance, keyed by permanent node ID inside its group. A
@@ -269,6 +271,42 @@ impl ReplicaLease {
     }
     pub(crate) fn proposal_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.reserve_metadata_limit(bytes, true, (2 << 20) - (128 << 10))
+    }
+    /// [`Self::metadata`] that waits for room instead of failing. Every
+    /// holder releases on drop (snapshot objects, transfer descriptions), so
+    /// the wait ends. Used where a refusal would stop the Raft core (RV-APPLY
+    /// F3). A request larger than the whole budget fails at once.
+    pub(crate) async fn metadata_wait(
+        &self,
+        bytes: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        self.wait_metadata(bytes, false, RAFT_REPLICA_BYTES / 2)
+            .await
+    }
+    /// [`Self::log_metadata`] that waits for room (RV-APPLY F5: the leader's
+    /// own Blank and Membership entries in `append`).
+    pub(crate) async fn log_metadata_wait(
+        &self,
+        bytes: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        self.wait_metadata(bytes, true, 2 << 20).await
+    }
+    async fn wait_metadata(
+        &self,
+        bytes: usize,
+        log: bool,
+        limit: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        if bytes > limit {
+            return Err(malformed("replica metadata request exceeds its budget"));
+        }
+        loop {
+            let released = self.0.metadata_released.notified();
+            if let Ok(owner) = self.reserve_metadata_limit(bytes, log, limit) {
+                return Ok(owner);
+            }
+            released.await;
+        }
     }
     pub(crate) fn log_metadata_used(&self) -> usize {
         self.0
@@ -334,6 +372,7 @@ impl Drop for ReplicaMetadata {
             &self.owner.0.metadata_used
         })
         .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.owner.0.metadata_released.notify_waiters();
     }
 }
 #[derive(Clone)]
@@ -371,6 +410,7 @@ impl ResidentGroup {
             _slot: slot,
             metadata_used: std::sync::atomic::AtomicUsize::new(0),
             log_metadata_used: std::sync::atomic::AtomicUsize::new(0),
+            metadata_released: tokio::sync::Notify::new(),
             ownership: std::sync::OnceLock::new(),
         });
         replicas.insert(node_id, Arc::downgrade(&replica));

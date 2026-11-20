@@ -437,3 +437,18 @@ async fn exercise_release_and_snapshot() {
     drop(blocked);
     services.shutdown().await.unwrap();
 }
+
+/// T9 finding (D01 at RF3 on real processes): a range leader that is not the
+/// Timestamp leader allocates its commit timestamp remotely under `DirectLeader`.
+/// The receiver refused that role for operation 41, so no direct commit could land.
+#[test]
+fn d01_t9_allocate_direct_admits_the_direct_leader_role() {
+    assert!(allocate_direct_permitted(&ServiceAction::DirectLeader));
+    assert!(allocate_direct_permitted(&ServiceAction::Owner));
+    assert!(allocate_direct_permitted(
+        &ServiceAction::ParticipantProof {
+            source_group: Uuid::new_v4(),
+        }
+    ));
+    assert!(!allocate_direct_permitted(&ServiceAction::ApiIngress));
+}

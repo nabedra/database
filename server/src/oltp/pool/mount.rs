@@ -54,7 +54,7 @@ pub struct VerifiedPoolMount {
     #[cfg(target_os = "linux")]
     directory: File,
     #[cfg(target_os = "linux")]
-    _lock: File,
+    _lock: linux::VolumeLock,
 }
 /// Nonwriting physical verification, retained while the manager acquires its
 /// directory/process lock and obtains the previous-incarnation exclusion.
@@ -579,9 +579,27 @@ mod linux {
         Ok(VerifiedPoolMount {
             observation,
             directory,
-            _lock: lock,
+            _lock: VolumeLock(lock),
         })
     }
+    /// The volume lock of a verified mount. A child forked by any thread shares
+    /// the lock's open file description until it execs or exits, so dropping
+    /// only our descriptor could keep the volume locked after the mount is
+    /// gone and fail the close proof or the next open. Drop unlocks it first.
+    pub(super) struct VolumeLock(File);
+    impl Drop for VolumeLock {
+        fn drop(&mut self) {
+            // SAFETY: flock on a valid, owned descriptor.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+    impl std::ops::Deref for VolumeLock {
+        type Target = File;
+        fn deref(&self) -> &File {
+            &self.0
+        }
+    }
+
     fn lock_mount(base: &Path, create: bool) -> Result<File, ProtocolError> {
         let lock = OpenOptions::new()
             .read(true)
@@ -626,7 +644,7 @@ mod linux {
         }
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let lock = lock_mount(&base, false)?;
-        let mount = VerifiedPoolMount { observation, directory, _lock: lock };
+        let mount = VerifiedPoolMount { observation, directory, _lock: VolumeLock(lock) };
         revalidate(&mount.directory, &mount.observation)?;
         if read_data_worker_key(&mount)?.public_key() != permit.next.mount_public_key {
             return Err(invalid());

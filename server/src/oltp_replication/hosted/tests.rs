@@ -91,6 +91,7 @@ impl TypedMachine<CounterConfig> for Counter {
         command: OwnedCommand<Bump>,
     ) -> Result<ChargedBytes, ProtocolError> {
         let id = command.payload()?.id;
+        let big = command.payload()?.pad == BIG_REPLY;
         self.store
             .transaction(meta, BUDGET, move |tx| {
                 let marker = marker(id);
@@ -107,12 +108,26 @@ impl TypedMachine<CounterConfig> for Counter {
                 } + 1;
                 tx.put(&marker, b"1")?;
                 tx.put(b"count", &count.to_be_bytes())?;
+                if big {
+                    return Ok(Transition::Commit(tx.copy_output(&big_reply())?));
+                }
                 Ok(Transition::Commit(
                     tx.copy_output(count.to_string().as_bytes())?,
                 ))
             })
             .await
     }
+}
+/// A command whose durable reply fits the output budget but whose decode
+/// budget exceeds `MAX_REPLY_DECODE_BYTES` (RV-APPLY F6).
+const BIG_REPLY: &str = "test.big-reply";
+fn big_reply() -> Vec<u8> {
+    let mut reply = b"[0".to_vec();
+    for _ in 0..1800 {
+        reply.extend_from_slice(b",0");
+    }
+    reply.push(b']');
+    reply
 }
 fn marker(id: u64) -> Vec<u8> {
     let mut key = b"applied/".to_vec();
@@ -121,6 +136,7 @@ fn marker(id: u64) -> Vec<u8> {
 }
 
 /// A single voter never opens a peer connection.
+#[derive(Clone)]
 struct NoPeers;
 struct NoPeer;
 impl RaftNetworkFactory<CounterConfig> for NoPeers {
@@ -374,12 +390,18 @@ async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
         let pool = OltpPool::open_development_on(&path, layout.pool.clone(), shared.clone(), fs())
             .unwrap();
         let store = pool.retained_group(layout.group.clone()).await.unwrap();
-        let applied = store.applied_state(BUDGET).await.unwrap().unwrap();
+        // An application write survives only if a later synced write (a log
+        // append) covered it. When every append is synced before the first
+        // application write reaches the journal, as on a slow runner, no
+        // application survives and the group has no applied state at all.
+        let applied = store
+            .applied_state(BUDGET)
+            .await
+            .unwrap()
+            .map(|applied| applied.position.index);
         assert!(
-            applied.position.index < last_index,
-            "the unsynced application tail must be lost: applied {} last {}",
-            applied.position.index,
-            last_index
+            applied.is_none_or(|index| index < last_index),
+            "the unsynced application tail must be lost: applied {applied:?} last {last_index}"
         );
         let before = read_count(&store).await;
         assert!(before < commands);
@@ -1134,3 +1156,4 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
 mod replicated;
 
 mod kv_crash;
+mod transient;

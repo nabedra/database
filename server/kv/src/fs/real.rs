@@ -57,7 +57,20 @@ impl Fs for RealFs {
             .truncate(false)
             .open(path)?;
         lock_exclusive(&file)?;
-        Ok(FsLock::new(Box::new(file)))
+        Ok(FsLock::new(Box::new(RealLock(file))))
+    }
+}
+
+/// The store directory lock. A flock belongs to the open file description, and
+/// a child forked by any thread of this process shares that description until it
+/// execs or exits. Closing only our descriptor would leave the store locked for
+/// that long, so a reopen right after a close could fail with `WouldBlock`.
+/// Dropping the lock therefore unlocks the description explicitly first.
+struct RealLock(File);
+
+impl Drop for RealLock {
+    fn drop(&mut self) {
+        unlock(&self.0);
     }
 }
 
@@ -151,6 +164,18 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(unix)]
+fn unlock(file: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a valid, owned descriptor.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(not(unix))]
+fn unlock(file: &File) {
+    let _ = file.unlock();
 }
 
 #[cfg(not(unix))]

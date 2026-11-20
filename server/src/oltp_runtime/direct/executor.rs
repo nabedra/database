@@ -847,6 +847,10 @@ impl DirectExecutor {
             }
         };
         self.stats.proposed(rows, index_changes);
+        // T9 process barrier (D04 before quorum): timestamp registered, entry not
+        // yet proposed.
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id).await;
         let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
             Err(error) => {
@@ -861,6 +865,11 @@ impl DirectExecutor {
         let fault = match applied.reply {
             ParticipantReply::Direct(DirectReply::Applied { .. }) => {
                 self.stats.applied();
+                // T9 process barrier (D02, D04): the entry has reached quorum and
+                // applied here; the reply has not left the leader yet.
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::pause("direct-applied", request.request_id)
+                    .await;
                 return Ok(Attempt::Done(DirectResponse::Done(
                     DirectData::from_json(result.as_str()).map_err(failed)?,
                 )));

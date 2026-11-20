@@ -74,16 +74,7 @@ impl<D: CommandData> OwnedRaftEntry<D> {
         if self.ensure_charged().is_ok() {
             return Ok(self);
         }
-        if let Payload::Normal(command) = self.payload() {
-            command.ensure_charged()?
-        }
-        check_membership(self.payload())?;
-        // Include the bounded append vector cell and allocation framing before
-        // the vector grows. Payload clones share this same resident owner.
-        let bytes = self
-            .heap_bytes()?
-            .checked_add(size_of::<Self>() * 2 + 64)
-            .ok_or_else(|| invalid("entry metadata overflow"))?;
+        let bytes = self.resident_bytes()?;
         let owner = match self.payload() {
             Payload::Normal(command) => match command.raft_metadata() {
                 Some(owner) if owner.same_replica(resident) && owner.bytes() >= bytes => owner,
@@ -92,6 +83,41 @@ impl<D: CommandData> OwnedRaftEntry<D> {
             },
             _ => Arc::new(resident.log_metadata(bytes)?),
         };
+        if self.owner.set(EntryOwner::Resident(owner)).is_err() {
+            self.ensure_charged()?
+        }
+        self.ensure_charged()?;
+        Ok(self)
+    }
+    fn resident_bytes(&self) -> Result<usize, ProtocolError> {
+        if let Payload::Normal(command) = self.payload() {
+            command.ensure_charged()?
+        }
+        check_membership(self.payload())?;
+        // Include the bounded append vector cell and allocation framing before
+        // the vector grows. Payload clones share this same resident owner.
+        self.heap_bytes()?
+            .checked_add(size_of::<Self>() * 2 + 64)
+            .ok_or_else(|| invalid("entry metadata overflow"))
+    }
+    /// [`Self::charge_resident`] for the log append, where a refusal would
+    /// stop the Raft core: an entry without a proposal owner (the leader's own
+    /// Blank and Membership entries) waits for log metadata room instead of
+    /// failing (RV-APPLY F5).
+    pub(crate) async fn charge_resident_wait(
+        self,
+        resident: &super::multiplex::ReplicaLease,
+    ) -> Result<Self, ProtocolError> {
+        if self.ensure_charged().is_ok() {
+            return Ok(self);
+        }
+        if let Payload::Normal(command) = self.payload()
+            && command.raft_metadata().is_some()
+        {
+            return self.charge_resident(resident);
+        }
+        let bytes = self.resident_bytes()?;
+        let owner = Arc::new(resident.log_metadata_wait(bytes).await?);
         if self.owner.set(EntryOwner::Resident(owner)).is_err() {
             self.ensure_charged()?
         }

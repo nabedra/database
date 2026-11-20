@@ -691,3 +691,106 @@ async fn ns23_o06_run_time_damage_stops_the_running_host_and_reports_it() {
     .await
     .expect("NS23 run-time watchdog");
 }
+
+/// RV-APPLY F4, O06, D07 (RF3, real workers): a follower's core stops on a
+/// failed apply (a fail-once test hook). The supervisor counts the stop,
+/// restarts the core on the same log and state after its backoff, and the
+/// follower applies every committed fence; nothing is given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_d07_rv_apply_fatal_core_is_detected_and_recovered() {
+    timeout(Duration::from_secs(120), async {
+        let cluster = Cluster::new(3, 3).await;
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        let follower = (0..3).find(|index| *index != leader).unwrap();
+        cluster.fence(leader, 1).await;
+        let host = cluster.host(follower).clone();
+        let manager = cluster.workers[follower].manager.clone().unwrap();
+        host.retry()
+            .fail_applies
+            .store(1, std::sync::atomic::Ordering::Release);
+        cluster.fence(leader, 2).await;
+        timeout(Duration::from_secs(10), async {
+            while host.raft.restarts() != 1 || !host.raft.is_running() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the supervisor restarts the stopped core");
+        let health = manager.raft_health();
+        assert_eq!(
+            (
+                health.fatal,
+                health.fatal_transient,
+                health.restarts,
+                health.given_up
+            ),
+            (1, 1, 1, 0),
+            "{health:?}"
+        );
+        assert_eq!(
+            manager.hosted_replicas(cluster.group.group_id),
+            vec![follower as u64 + 1],
+            "the restarted replica stays routed"
+        );
+        let last = cluster.fence(leader, 3).await;
+        host.raft
+            .wait(Some(Duration::from_secs(20)))
+            .applied_index_at_least(Some(last.index), "the restarted follower catches up")
+            .await
+            .unwrap();
+        assert_eq!(cluster.applied_term(follower).await, 3);
+        assert!(host.raft.is_running());
+        cluster.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// RV-APPLY F4, O29, NS09 (RF3, real workers): EIO on a follower's journal sync
+/// latches its pool and stops its core. The supervisor classifies it as
+/// recovery-required: the replica stops routing and its host shuts down, with
+/// no restart loop; the other two voters keep committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o29_rv_apply_latched_pool_stops_routing_without_a_restart_loop() {
+    use nabedra_kv::fs::{Fault, FaultError, FsOp};
+    timeout(Duration::from_secs(120), async {
+        let cluster = Cluster::new(3, 3).await;
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        let follower = (0..3).find(|index| *index != leader).unwrap();
+        cluster.fence(leader, 1).await;
+        let manager = cluster.workers[follower].manager.clone().unwrap();
+        let pool = cluster.workers[follower].pool.clone().unwrap();
+        cluster.workers[follower].fault.inject(
+            Fault::on(FsOp::SyncData)
+                .path_prefix(cluster.pool_path(follower).join("kv").join("journal"))
+                .error(FaultError::Eio),
+        );
+        cluster.fence(leader, 2).await;
+        timeout(Duration::from_secs(10), async {
+            while !manager.hosted_replicas(cluster.group.group_id).is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the latched replica stops routing");
+        assert!(pool.requires_recovery());
+        // Longer than every restart backoff: nothing restarts it.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let health = manager.raft_health();
+        assert_eq!(
+            (
+                health.fatal,
+                health.fatal_recovery_required,
+                health.restarts,
+                health.given_up
+            ),
+            (1, 1, 0, 0),
+            "{health:?}"
+        );
+        assert!(!cluster.host(follower).raft.is_running());
+        cluster.fence(leader, 3).await;
+        cluster.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

@@ -1,5 +1,6 @@
 //! Group-local generation staging. Activation and applied state are one batch;
 //! unrelated groups and the generation-independent Raft log are never replaced.
+use super::storage::file_error;
 use super::*;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -385,7 +386,7 @@ impl GroupStore {
                         .write(true)
                         .create_new(true)
                         .open(&path)
-                        .map_err(|_| storage_error_message())?;
+                        .map_err(file_error)?;
                     let mut checksum = Sha256::new();
                     write_hashed(&mut file, &mut checksum, MAGIC)?;
                     write_hashed(
@@ -424,7 +425,7 @@ impl GroupStore {
                     file.write_all(&[255])
                         .and_then(|_| file.write_all(&checksum.finalize()))
                         .and_then(|_| file.sync_all())
-                        .map_err(|_| storage_error_message())?;
+                        .map_err(file_error)?;
                     sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
                     let name = path
                         .file_name()
@@ -543,7 +544,7 @@ impl GroupStore {
                 .write(true)
                 .create_new(true)
                 .open(&path)
-                .map_err(|_| storage_error_message())?;
+                .map_err(file_error)?;
             let copy_len = scratch.remaining().min(64 << 10);
             if copy_len == 0 {
                 return Err(capacity());
@@ -556,14 +557,14 @@ impl GroupStore {
                     .read_exact(&mut copy.as_mut_slice()[..chunk])
                     .map_err(|_| storage_error_message())?;
                 file.write_all(&copy.as_mut_slice()[..chunk])
-                    .map_err(|_| storage_error_message())?;
+                    .map_err(file_error)?;
                 remaining -= chunk as u64;
             }
             drop(copy);
             if file.metadata().map_err(|_| storage_error_message())?.len() != source.bytes {
                 return Err(storage_error_message());
             }
-            file.sync_all().map_err(|_| storage_error_message())?;
+            file.sync_all().map_err(file_error)?;
             sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| storage_error_message())?;
@@ -840,7 +841,7 @@ fn new_snapshot_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
     Ok(directory.join(format!("snap-{}.bin", Uuid::new_v4())))
 }
 fn write_hashed(file: &mut File, hash: &mut Sha256, bytes: &[u8]) -> Result<(), ProtocolError> {
-    file.write_all(bytes).map_err(|_| storage_error_message())?;
+    file.write_all(bytes).map_err(file_error)?;
     hash.update(bytes);
     Ok(())
 }

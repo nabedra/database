@@ -4,12 +4,12 @@ use super::*;
 use crate::oltp::pool::TransactionBudget;
 use crate::oltp_replication::{manager::RegisteredWorker, service_rpc::ParticipantEndpoint};
 #[derive(serde::Deserialize)]
-struct Page {
-    items: Vec<GroupIdentity>,
-    after: Option<Uuid>,
-    exhausted: bool,
+pub(super) struct Page {
+    pub(super) items: Vec<GroupIdentity>,
+    pub(super) after: Option<Uuid>,
+    pub(super) exhausted: bool,
 }
-async fn group_page(
+pub(super) async fn group_page(
     pool: &crate::oltp::pool::OltpPool,
     after: Option<Uuid>,
 ) -> Result<(Page, crate::oltp::pool::ScratchLease), ProtocolError> {

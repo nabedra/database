@@ -633,6 +633,12 @@ impl LocalServices {
                 .set(control_client.clone())
                 .map_err(|_| unavailable())?;
             resolver.bind_native(catalog_participant.clone()).await?;
+            // T9 finding: Data replicas start lazily, on the queued planner's first
+            // touch. After a restart (every RF1 restart is a cold start) the direct
+            // path's service lane found no replica and every point operation on an
+            // existing table timed out. Start and bind the retained ones now, as a
+            // registered worker does at restart.
+            resolver.bind_retained_data().await?;
             let catalog =
                 CatalogHandle::new(resolver.participant(catalog_participant.identity()).await?)?;
             timestamps.install_release_reader(control_client.clone(), peer.clone())?;
@@ -817,6 +823,36 @@ impl LocalParticipants {
             .map_err(|_| unavailable())?
             .insert(group.group_id, Arc::downgrade(&participant));
         Ok(participant)
+    }
+    /// Starts and binds every Data group in the pool that Control still records.
+    /// A group that cannot start is reported and skipped; it stays unreachable as
+    /// before, and the worker keeps serving the others.
+    async fn bind_retained_data(&self) -> Result<(), ProtocolError> {
+        let mut after = None;
+        loop {
+            let (page, _lease) = restore::group_page(&self.pool, after).await?;
+            for group in page
+                .items
+                .iter()
+                .filter(|group| matches!(group.kind, GroupKind::Data { .. }))
+            {
+                if self.control.group(group.group_id).await?.is_none() {
+                    continue;
+                }
+                let started = match self.native_participant(group).await {
+                    Ok(participant) => self.bind_native(participant).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = started {
+                    tracing::error!(group = %group.group_id, %error,
+                        "retained Data replica was not started at startup");
+                }
+            }
+            if page.exhausted {
+                return Ok(());
+            }
+            after = page.after;
+        }
     }
     async fn bind_native(&self, participant: Arc<ParticipantHandle>) -> Result<(), ProtocolError> {
         let Some(control) = self.rpc.get() else {
