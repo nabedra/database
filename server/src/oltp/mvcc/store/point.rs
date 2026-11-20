@@ -39,6 +39,7 @@ impl ParticipantMachine {
         {
             return Err(invalid());
         }
+        self.observe_snapshot(input.read_ts).await?;
         let owner = Arc::new(
             self.store
                 .resources()

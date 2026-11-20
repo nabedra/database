@@ -4,8 +4,8 @@ use super::*;
 use crate::{
     config::WorkerResources,
     oltp::pool::{
-        ByteClass, OltpPool, PoolIdentity, ScratchLease, SharedResourceConfig,
-        TEST_UNSYNCED_WAL_IN_MEMORY, TransactionBudget, WorkerSharedResources,
+        ByteClass, OltpPool, PoolIdentity, ScratchLease, SharedResourceConfig, TransactionBudget,
+        WorkerSharedResources,
     },
     oltp_replication::{
         entry::OwnedRaftEntry,
@@ -15,6 +15,7 @@ use crate::{
         types::{GroupIdentity, ReplicaMember, Text},
     },
 };
+use nabedra_kv::fs::{FaultFs, Fs};
 use openraft::{
     RaftLogReader,
     entry::RaftEntry,
@@ -27,11 +28,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
-const CRASH_DIR: &str = "NABEDRA_T2_CRASH_DIR";
 const COMMANDS: u64 = 200;
 const BUDGET: TransactionBudget = TransactionBudget {
     scratch_bytes: 64 << 10,
@@ -175,7 +175,7 @@ impl Layout {
     fn new() -> Self {
         let pool = PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: Uuid::new_v4(),
             worker_id: Uuid::new_v4(),
             pool_id: Uuid::new_v4(),
@@ -206,8 +206,23 @@ struct Node {
 }
 impl Node {
     async fn open(path: &Path, layout: &Layout) -> Self {
-        let shared = shared();
-        let pool = OltpPool::open_development(path, layout.pool.clone(), shared.clone()).unwrap();
+        Self::open_with(path, layout, shared(), None).await
+    }
+    /// `fs` runs the pool's store on a `FaultFs` (crash and power-loss models).
+    async fn open_with(
+        path: &Path,
+        layout: &Layout,
+        shared: Arc<WorkerSharedResources>,
+        fs: Option<FaultFs>,
+    ) -> Self {
+        let pool = match fs {
+            Some(fs) => {
+                let fs: Arc<dyn Fs> = Arc::new(fs);
+                OltpPool::open_development_on(path, layout.pool.clone(), shared.clone(), fs)
+            }
+            None => OltpPool::open_development(path, layout.pool.clone(), shared.clone()),
+        }
+        .unwrap();
         let store = pool.group(layout.group.clone()).await.unwrap();
         let registry = Arc::new(EndpointRegistry::new(shared));
         let (resident, lease) = registry.reserve_replica(layout.group.clone(), 1).unwrap();
@@ -323,101 +338,50 @@ impl Drop for Dir {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Acknowledged {
-    layout: Layout,
-    commands: u64,
-    last_index: u64,
-}
-
-/// Child half of D09/O11/O29. Every proposal returns after its entry is
-/// committed and applied; the process then aborts without flushing RocksDB.
-#[test]
-#[ignore = "child process of d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log"]
-fn d09_o11_unsynced_apply_crash_child() {
-    let Some(dir) = std::env::var_os(CRASH_DIR) else {
-        return;
-    };
-    assert!(std::env::var_os(TEST_UNSYNCED_WAL_IN_MEMORY).is_some());
-    let dir = PathBuf::from(dir);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let layout = Layout::new();
-        let node = Node::open(&dir.join("pool"), &layout).await;
-        node.lead(&layout, true).await;
-        let last_index = node.propose_all(0..COMMANDS).await;
-        assert_eq!(node.count().await, COMMANDS);
-        let ack = Acknowledged {
-            layout,
-            commands: COMMANDS,
-            last_index,
-        };
-        let temporary = dir.join("ack.new");
-        std::fs::write(&temporary, serde_json::to_vec(&ack).unwrap()).unwrap();
-        std::fs::rename(temporary, dir.join("ack")).unwrap();
-        // No destructor runs: RocksDB never writes its in-memory WAL buffer.
-        std::process::abort();
-    });
-}
-
 /// D09 (durability half), O11, O29: application and the commit hint are
-/// unsynced, and a crash drops them with the WAL tail. The synced log in the
-/// same WAL survives, replays every lost application, and nothing applies
-/// twice. Power loss is modelled by keeping unsynced WAL records in process
-/// memory (`manual_wal_flush`) and aborting the process; this is not an actual
-/// power-loss or fsync fault injection.
+/// unsynced, and a crash drops them with the journal tail. The synced log in
+/// the same journal survives, replays every lost application, and nothing
+/// applies twice. The store runs on `FaultFs`: after every proposal returned,
+/// the machine halts and only bytes a completed sync covered survive. This is
+/// the FaultFs crash model, not a physical power cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
     let dir = Dir::new();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "oltp_replication::hosted::tests::d09_o11_unsynced_apply_crash_child",
-            "--ignored",
-            "--nocapture",
-        ])
-        .env(CRASH_DIR, &dir.0)
-        .env(TEST_UNSYNCED_WAL_IN_MEMORY, "1")
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let ack: Acknowledged = loop {
-        if let Ok(bytes) = std::fs::read(dir.0.join("ack")) {
-            break serde_json::from_slice(&bytes).unwrap();
-        }
-        if let Some(status) = child.try_wait().unwrap() {
-            panic!("crash child exited before acknowledging: {status}");
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("crash child timed out");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-    let status = child.wait().unwrap();
-    assert!(!status.success(), "child must abort, not exit cleanly");
-
     let path = dir.0.join("pool");
-    let layout = ack.layout;
+    std::fs::create_dir_all(&path).unwrap();
+    let fault = FaultFs::new();
+    fault.create_dir_all_durable(&path);
+    let layout = Layout::new();
+    let shared = shared();
+    let commands = COMMANDS;
+    let last_index = {
+        let node = Node::open_with(&path, &layout, shared.clone(), Some(fault.clone())).await;
+        node.lead(&layout, true).await;
+        let last_index = node.propose_all(0..commands).await;
+        assert_eq!(node.count().await, commands);
+        // The machine stops here: nothing after this point reaches the disk.
+        fault.halt();
+        let _ = node.consensus.shutdown().await;
+        drop(node);
+        last_index
+    };
+    let fault = fault.crash();
+    let fs = || -> Arc<dyn Fs> { Arc::new(fault.clone()) };
     {
         // Inspect storage before Raft replays anything.
-        let pool = OltpPool::open_development(&path, layout.pool.clone(), shared()).unwrap();
+        let pool = OltpPool::open_development_on(&path, layout.pool.clone(), shared.clone(), fs())
+            .unwrap();
         let store = pool.retained_group(layout.group.clone()).await.unwrap();
         let applied = store.applied_state(BUDGET).await.unwrap().unwrap();
         assert!(
-            applied.position.index < ack.last_index,
+            applied.position.index < last_index,
             "the unsynced application tail must be lost: applied {} last {}",
             applied.position.index,
-            ack.last_index
+            last_index
         );
         let before = read_count(&store).await;
-        assert!(before < ack.commands);
-        assert_eq!(read_markers(&store, 0..ack.commands).await, before);
+        assert!(before < commands);
+        assert_eq!(read_markers(&store, 0..commands).await, before);
         let mut log = TypedLogStore::<CounterConfig>::new(store.clone(), 1)
             .await
             .unwrap();
@@ -427,32 +391,29 @@ async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
                 .unwrap()
                 .last_log_id
                 .map(|id| id.index),
-            Some(ack.last_index),
+            Some(last_index),
             "every acknowledged entry was in the synced log"
         );
         let committed = log.read_committed().await.unwrap().map(|id| id.index);
-        assert!(committed.is_none_or(|index| index <= ack.last_index));
+        assert!(committed.is_none_or(|index| index <= last_index));
         drop(log);
         drop(store);
         drop(pool);
     }
 
-    let node = Node::open(&path, &layout).await;
+    let node = Node::open_with(&path, &layout, shared.clone(), Some(fault.clone())).await;
     node.lead(&layout, false).await;
     node.consensus
         .raft
         .wait(Some(Duration::from_secs(20)))
-        .applied_index_at_least(Some(ack.last_index), "replay the lost applications")
+        .applied_index_at_least(Some(last_index), "replay the lost applications")
         .await
         .unwrap();
-    assert_eq!(node.count().await, ack.commands);
-    assert_eq!(
-        read_markers(&node.store, 0..ack.commands).await,
-        ack.commands
-    );
+    assert_eq!(node.count().await, commands);
+    assert_eq!(read_markers(&node.store, 0..commands).await, commands);
     // A new write still applies exactly once after the replay.
-    node.propose_all(ack.commands..ack.commands + 1).await;
-    assert_eq!(node.count().await, ack.commands + 1);
+    node.propose_all(commands..commands + 1).await;
+    assert_eq!(node.count().await, commands + 1);
     node.consensus.shutdown().await.unwrap();
 }
 
@@ -472,16 +433,20 @@ async fn o06_o11_group_commit_needs_fewer_fsyncs_than_entries() {
     assert_eq!(node.count().await, commands);
     let pool_after = node.pool.write_stats();
     let group_after = node.store.write_stats();
+    // Real journal fsyncs (RV-T2 Q1), not synced write requests.
     let fsyncs = pool_after.synced_writes - pool_before.synced_writes;
+    let requests = group_after.synced_writes - group_before.synced_writes;
     let deferred = group_after.deferred_writes - group_before.deferred_writes;
-    eprintln!("o06_o11 group commit: {commands} entries, {fsyncs} fsyncs, {deferred} unsynced");
+    eprintln!(
+        "o06_o11 group commit: {commands} entries, {fsyncs} fsyncs, {requests} synced requests, {deferred} unsynced"
+    );
     // Every application write is unsynced; commit hints add more.
     assert!(deferred >= commands, "{deferred} unsynced writes");
-    // Before T2 this was about three fsyncs per entry.
-    assert!(fsyncs < commands, "{fsyncs} fsyncs for {commands} entries");
-    assert_eq!(
-        group_after.synced_writes - group_before.synced_writes,
-        fsyncs
+    // Before T2 this was about three fsyncs per entry; batches of up to 64
+    // entries need a handful (RV-T2 Q3: a bound tied to the batch size).
+    assert!(
+        fsyncs <= commands.div_ceil(8) + 4,
+        "{fsyncs} fsyncs for {commands} entries"
     );
     node.consensus.shutdown().await.unwrap();
 }
@@ -536,19 +501,20 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
     assert!(log.purge(id(7)).await.is_err());
     assert_eq!(store.write_stats().unsynced_applied_index, Some(6));
     assert!(!pool.requires_recovery());
-    let before = pool.write_stats().synced_writes;
+    let before = pool.write_stats().synced_requests;
     log.purge(id(4)).await.unwrap();
-    // One WAL sync for the applied state, then the synced purge itself.
-    assert_eq!(pool.write_stats().synced_writes - before, 2);
+    // RV-T2 Q2: no separate sync for the applied state. The synced purge record
+    // follows the applied writes in the journal, so it makes them durable.
+    assert_eq!(pool.write_stats().synced_requests - before, 1);
     assert_eq!(store.write_stats().unsynced_applied_index, None);
+    assert!(!pool.has_unsynced_writes());
     assert_eq!(
         log.get_log_state().await.unwrap().last_purged_log_id,
         Some(id(4))
     );
-    // Purging again within durable state needs no extra sync.
-    let before = pool.write_stats().synced_writes;
+    let before = pool.write_stats().synced_requests;
     log.purge(id(5)).await.unwrap();
-    assert_eq!(pool.write_stats().synced_writes - before, 1);
+    assert_eq!(pool.write_stats().synced_requests - before, 1);
 
     apply(7).await.unwrap();
     assert_eq!(store.write_stats().unsynced_applied_index, Some(7));
@@ -655,3 +621,7 @@ async fn o06_o11_wide_append_writes_bounded_synced_batches() {
     }
     assert_eq!(next, 64);
 }
+
+/// T1b: real typed Raft voters over mTLS worker transports.
+#[path = "replicated_tests.rs"]
+mod replicated;

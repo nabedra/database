@@ -415,7 +415,7 @@ export class DockerGrowthAdapter implements StatefulGrowthAdapter {
     const runId = identity(requireRecord(requireRecord(beforePin.ready).view).run_id)
     const mount = {
       profile: { docker: { volume_marker: target.poolId } },
-      identity: { engine: "oltp", pool_format_version: 1, cluster_id: this.clusterId,
+      identity: { engine: "oltp", pool_format_version: 2, cluster_id: this.clusterId,
         worker_id: worker.worker_id, pool_id: target.poolId },
       worker, generation: target.poolGeneration, mount_path: "/data", provider_volume_id: target.resourceId, filesystem_uuid: "",
     }

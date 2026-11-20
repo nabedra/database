@@ -17,7 +17,9 @@ pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,
 };
-pub(crate) use transport::{ReplicaLease, ReplicaMetadata, RequestError, RequestTarget};
+pub(crate) use transport::{
+    PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
+};
 
 pub const MAX_SECTIONS: usize = 3;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;

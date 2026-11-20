@@ -70,13 +70,17 @@ impl VerifiedSplitSource {
 #[serde(deny_unknown_fields)]
 pub(super) struct SplitSourceState {
     pub(super) statement: SplitSourceStatement,
-    published_at: Option<CommitTs>,
+    pub(super) published_at: Option<CommitTs>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SplitChildVisibility {
     pub(super) read_ts: ReadTs,
     pub(super) complete: bool,
+    /// The source's publication timestamp, once the coordinator sent it
+    /// (`ChildPublished`). Direct commits stay above it (RV-T4 F8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) published_at: Option<CommitTs>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,14 +489,31 @@ pub(super) fn freeze_source(
     if tx.pinned(&source_receipt(left.split_id))?.is_some() {
         return reject(tx, Fault::AlreadyDecided);
     }
+    // Another split holds the direct barrier.
+    if config
+        .direct_pause
+        .is_some_and(|holder| holder != left.split_id)
+    {
+        return reject(tx, Fault::Conflict);
+    }
     if tx.first_from(&[INTENT], &[INTENT])?.is_some() {
         return reject(tx, Fault::Incomplete);
+    }
+    // Direct commits take no lifecycle guard. One applied above the cut
+    // would be missing from the child images, so this cut cannot freeze.
+    // The coordinator avoids this by taking the direct barrier
+    // (`DirectPause`) before it allocates the cut.
+    if super::direct::high(tx)?.is_some_and(|high| high > left.read_ts) {
+        return reject(tx, Fault::DirectCommitAboveCut);
     }
     let mut next = config.clone();
     next.split_source = Some(SplitSourceState {
         statement: statement.clone(),
         published_at: None,
     });
+    // The frozen source refuses direct commits by itself; an abort reopens
+    // the range, so the barrier is not kept.
+    next.direct_pause = None;
     if encoded_length(&next, METADATA_BYTES).is_err() {
         return reject(tx, Fault::ResourceLimit);
     }
@@ -527,6 +548,11 @@ pub(super) fn finish_source(
             && proof.txn.request_id == split_id && proof.request.request_id == split_id
             && settled.validate_for(proof.txn, &proof.request, &proof.manifest).is_ok()
         {
+            // An aborted split releases its direct barrier.
+            if config.direct_pause == Some(split_id) {
+                config.direct_pause = None;
+                tx.put_serialized(CONFIG, &config)?;
+            }
             tx.put_serialized(&key, &digest)?;
             return commit(tx, &ParticipantReply::SplitSourceFinished(decision));
         }
@@ -586,6 +612,12 @@ pub(super) fn stage_child(
     if config.split_child.is_some()
         || tx.first_from(&[HEAD], &[HEAD])?.is_some()
         || tx.first_from(b"t", b"t")?.is_some()
+        || tx
+            .first_from(&[super::direct::DEDUP], &[super::direct::DEDUP])?
+            .is_some()
+        || tx
+            .first_from(&[super::direct::EXPIRY], &[super::direct::EXPIRY])?
+            .is_some()
     {
         return reject(tx, Fault::Conflict);
     }
@@ -606,6 +638,7 @@ pub(super) fn stage_child(
     config.split_child = Some(SplitChildVisibility {
         read_ts: binding.read_ts,
         complete: false,
+        published_at: None,
     });
     if encoded_length(&config, METADATA_BYTES).is_err() {
         return reject(tx, Fault::ResourceLimit);
@@ -756,7 +789,7 @@ pub(super) fn apply(
     for image in page.images.iter() {
         if previous.is_some_and(|old| compare_keys(old, &image.key) != Ordering::Less)
             || image.commit_ts > page.binding.read_ts
-            || !owns(&page.binding.source, &page.binding.source_span, &image.key)
+            || !owns_image(&page.binding.source, &page.binding.source_span, &image.key)
         {
             return reject(tx, Fault::InvalidBinding);
         }
@@ -771,11 +804,17 @@ pub(super) fn apply(
             }
         }
         previous = Some(&image.key);
-        if !owns(group, &config.span, &image.key) {
+        if !owns_image(group, &config.span, &image.key) {
             continue;
         }
         if let Some(root) = state.image_root {
             state.image_root = Some(super::split_closure::fold_image(root, image)?);
+        }
+        if matches!(image.key, MvccKey::DirectDedup { .. }) {
+            // A retry routed to this child must replay the source's result.
+            super::direct::import_image(tx, image)?;
+            selected = selected.checked_add(1).ok_or_else(invalid)?;
+            continue;
         }
         tx.with_scratch_buffer(length + 9, |tx, key| {
             encode_key(&image.key, &mut key[1..length + 1]);
@@ -810,7 +849,7 @@ pub(super) fn apply(
         selected = selected.checked_add(1).ok_or_else(invalid)?;
     }
     if let Some(after) = after {
-        if !owns(&page.binding.source, &page.binding.source_span, after) {
+        if !owns_image(&page.binding.source, &page.binding.source_span, after) {
             return reject(tx, Fault::InvalidBinding);
         }
         let next = tx.with_scratch_buffer(key_length(after)?, |tx, buffer| {

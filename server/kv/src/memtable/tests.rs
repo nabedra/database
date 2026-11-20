@@ -301,7 +301,132 @@ fn ns01_memtable_point_reads_match_brute_force_over_many_range_tombstones() {
             }
         }
     }
-    assert!(mem.tombstone_count() > LINEAR_TOMBSTONES);
+    assert!(mem.tombstone_count() > 100);
     let fragmented: Vec<_> = mem.fragmented_tombstones().tombstones().collect();
     assert!(!fragmented.is_empty());
+    let rebuilt: Vec<_> = FragmentedRangeTombstones::new(&mem.range_tombstones(), MAX_SEQ)
+        .tombstones()
+        .collect();
+    assert_eq!(
+        fragmented, rebuilt,
+        "incremental and one-pass fragments differ"
+    );
+}
+
+/// RV-KV2 finding 7: a range delete must not make the next read re-fragment every
+/// tombstone of the memtable. An iterator's handle keeps the version it took, and point
+/// reads and new handles see each range delete as soon as it is inserted.
+#[test]
+fn ns01_memtable_range_deletes_update_the_fragmented_set_in_place() {
+    let mem = Memtable::new(MemtableOptions::default(), None);
+    let purge = |g: u32, upto: u32, seq: Seq| {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(
+            &group_key((g % 251) as u8, format!("{g:05}/log/{:08}", 0).as_bytes()),
+            &group_key((g % 251) as u8, format!("{g:05}/log/{upto:08}").as_bytes()),
+        );
+        mem.insert(&batch, seq, &[]).unwrap();
+    };
+    let mut seq = 1;
+    for g in 0..2_000u32 {
+        purge(g, 10, seq);
+        seq += 1;
+    }
+    let held = mem.fragmented_tombstones();
+    let held_tombstones: Vec<_> = held.tombstones().collect();
+    let key = |g: u32, i: u32| group_key((g % 251) as u8, format!("{g:05}/log/{i:08}").as_bytes());
+    for round in 0..300u32 {
+        let g = (round * 7) % 2_000;
+        purge(g, 20 + round, seq);
+        // The next point read sees the purge at its sequence and not below it.
+        assert_eq!(mem.max_covering_tombstone(&key(g, 15), seq), Some(seq));
+        assert_eq!(mem.max_covering_tombstone(&key(g, 15), seq - 1), None);
+        assert_eq!(mem.max_covering_tombstone(&key(g, 5), MAX_SEQ), Some(seq));
+        seq += 1;
+    }
+    assert_eq!(
+        held.tombstones().collect::<Vec<_>>(),
+        held_tombstones,
+        "a held handle changed under later range deletes"
+    );
+    let fragmented: Vec<_> = mem.fragmented_tombstones().tombstones().collect();
+    let rebuilt: Vec<_> = FragmentedRangeTombstones::new(&mem.range_tombstones(), MAX_SEQ)
+        .tombstones()
+        .collect();
+    assert_eq!(fragmented, rebuilt);
+}
+
+/// RV-KV2 finding 7, as a release bench: per-group purges (`delete_range`) interleaved
+/// with point reads on an active memtable holding 16, 1,000 and 10,000 tombstones.
+/// Before the fix a purge plus a read cost ~1.2 ms at 1,000 and ~11.7 ms at 10,000.
+#[test]
+#[ignore = "bench: cargo test --release -p nabedra-kv -- --ignored ns18_memtable_range_delete --nocapture"]
+fn ns18_memtable_range_delete_churn_bench() {
+    use std::time::Instant;
+    let mut worst = std::time::Duration::ZERO;
+    for &existing in &[16usize, 1_000, 10_000] {
+        let mem = Arc::new(Memtable::new(MemtableOptions::default(), None));
+        let mut seq = 1u64;
+        for g in 0..existing {
+            let mut b = WriteBatch::new();
+            b.delete_range(
+                format!("@g{g:06}/log/0").as_bytes(),
+                format!("@g{g:06}/log/1").as_bytes(),
+            );
+            mem.insert(&b, seq, &[]).unwrap();
+            seq += 1;
+        }
+        let rounds = 2_000u64;
+        let start = Instant::now();
+        for r in 0..rounds {
+            let mut b = WriteBatch::new();
+            let g = r as usize % existing;
+            b.delete_range(
+                format!("@g{g:06}/log/0").as_bytes(),
+                format!("@g{g:06}/log/1").as_bytes(),
+            );
+            mem.insert(&b, seq, &[]).unwrap();
+            seq += 1;
+            let _ = mem.get(b"@g000001/state", seq);
+        }
+        let per = start.elapsed() / rounds as u32;
+        // The same with an iterator's handle taken after every purge, so each purge
+        // copies the chunk handles it shares with that iterator.
+        let start = Instant::now();
+        for r in 0..rounds {
+            let mut b = WriteBatch::new();
+            let g = (r as usize * 7) % existing;
+            b.delete_range(
+                format!("@g{g:06}/log/0").as_bytes(),
+                format!("@g{g:06}/log/1").as_bytes(),
+            );
+            mem.insert(&b, seq, &[]).unwrap();
+            seq += 1;
+            let held = mem.fragmented_tombstones();
+            let _ = held.max_covering_seq(b"@g000001/log/0", seq);
+        }
+        let per_held = start.elapsed() / rounds as u32;
+        let start = Instant::now();
+        for r in 0..rounds {
+            let mut b = WriteBatch::new();
+            b.put(
+                format!("@g{:06}/log/0", r as usize % existing).as_bytes(),
+                b"v",
+            );
+            mem.insert(&b, seq, &[]).unwrap();
+            seq += 1;
+            let _ = mem.get(b"@g000001/state", seq);
+        }
+        let base = start.elapsed() / rounds as u32;
+        println!(
+            "{existing:>6} tombstones in the active memtable: purge + get = {per:?}; \
+             purge + iterator handle = {per_held:?}; put + get = {base:?}"
+        );
+        worst = worst.max(per).max(per_held);
+    }
+    // Generous for a loaded machine: the rebuild this replaces took ~11.7 ms at 10,000.
+    assert!(
+        worst < std::time::Duration::from_micros(500),
+        "purge + read is not in microseconds: {worst:?}"
+    );
 }

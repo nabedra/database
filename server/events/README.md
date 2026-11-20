@@ -15,7 +15,7 @@ From the repository root, build the standalone broker.
 
 ```sh
 docker build --build-arg BUILD_JOBS=2 \
-  -t nabedra-events:local -f server/events/deploy/Dockerfile server/events
+  -t nabedra-events:local -f server/events/deploy/Dockerfile server
 ```
 
 Generate a fixture with three brokers, one volume per broker, and an aggregate

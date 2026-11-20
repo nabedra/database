@@ -1,4 +1,4 @@
-//! Explicit execution-pool and housekeeping reservations. These are logical
+//! Explicit execution-pool and storage-thread reservations. These are logical
 //! stack/guard/metadata charges, not measurements of resident memory.
 use super::failure;
 use crate::protocol::{ErrorCode, ProtocolError};
@@ -16,54 +16,74 @@ unsafe extern "C" {
 #[cfg(all(unix, not(target_os = "macos")))]
 use libc::pthread_attr_getguardsize;
 
+/// Threads each open `nabedra-kv` store runs: the journal writer and its
+/// segment preparer.
+const JOURNAL_THREADS_PER_POOL: usize = 2;
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct NativeThreadBudget {
     pub query_threads: usize,
     pub control_threads: usize,
-    pub maintenance_high_threads: usize,
-    pub maintenance_low_threads: usize,
-    pub housekeeping_timer_threads: usize,
+    /// `kv-flush`: one per worker, shared by every pool.
+    pub flush_threads: usize,
+    /// `kv-compact`: `background_threads - 1` per worker.
+    pub compaction_threads: usize,
+    /// `kv-journal` and `kv-journal-prep` (segment preparation): two per open
+    /// pool, at most `2 * max_open_pools`.
+    pub journal_threads: usize,
     pub query_control_stack_bytes_per_thread: usize,
-    pub native_stack_bytes_per_thread: usize,
+    pub storage_stack_bytes_per_thread: usize,
     pub total_stack_reservation_bytes: usize,
 }
 impl NativeThreadBudget {
+    /// A budget for one store (the legacy engine, deleted by NS8).
     pub(super) fn new(
         query: usize,
         control: usize,
         background: i32,
     ) -> Result<Self, ProtocolError> {
+        Self::with_pools(query, control, background, 1)
+    }
+    pub(super) fn with_pools(
+        query: usize,
+        control: usize,
+        background: i32,
+        max_open_pools: usize,
+    ) -> Result<Self, ProtocolError> {
         if !(2..=128).contains(&background) {
             return Err(invalid());
         }
-        let (native_stack, rust_stack) = native_stack_reservation()?;
-        // Owned query/control threads explicitly request2MiB stacks. Reserve
-        //4MiB each to include guards and per-thread allocator metadata.
-
-        // RocksDB's process-shared periodic scheduler has one additional
-        // std::thread. It is separate from HIGH/LOW execution capacity.
+        let rust_stack = rust_stack_reservation()?;
+        // Every thread is a Rust thread: query and control request 2 MiB stacks,
+        // and `nabedra-kv` threads take Rust's 2 MiB default. Reserve 4 MiB each
+        // to include guards and per-thread allocator metadata.
+        let journal = max_open_pools
+            .checked_mul(JOURNAL_THREADS_PER_POOL)
+            .ok_or_else(invalid)?;
+        let storage = (background as usize)
+            .checked_add(journal)
+            .ok_or_else(invalid)?;
         let bytes = query
             .checked_add(control)
+            .and_then(|n| n.checked_add(storage))
             .and_then(|n| n.checked_mul(rust_stack))
-            .and_then(|n| n.checked_add((background as usize + 1).checked_mul(native_stack)?))
             .ok_or_else(invalid)?;
         Ok(Self {
             query_threads: query,
             control_threads: control,
-            maintenance_high_threads: 1,
-            maintenance_low_threads: background as usize - 1,
-            housekeeping_timer_threads: 1,
+            flush_threads: 1,
+            compaction_threads: background as usize - 1,
+            journal_threads: journal,
             query_control_stack_bytes_per_thread: rust_stack,
-            native_stack_bytes_per_thread: native_stack,
+            storage_stack_bytes_per_thread: rust_stack,
             total_stack_reservation_bytes: bytes,
         })
     }
 }
 
 pub(super) fn validate_thread_defaults(budget: NativeThreadBudget) -> Result<(), ProtocolError> {
-    let (native, rust) = native_stack_reservation()?;
-    if native > budget.native_stack_bytes_per_thread
-        || rust > budget.query_control_stack_bytes_per_thread
+    let rust = rust_stack_reservation()?;
+    if rust > budget.query_control_stack_bytes_per_thread
+        || rust > budget.storage_stack_bytes_per_thread
     {
         return Err(invalid());
     }
@@ -71,36 +91,28 @@ pub(super) fn validate_thread_defaults(budget: NativeThreadBudget) -> Result<(),
 }
 
 #[cfg(unix)]
-fn native_stack_reservation() -> Result<(usize, usize), ProtocolError> {
-    // C++ std::thread uses the process pthread defaults. Query them rather than
-    // assuming Rust's smaller explicitly configured worker stack applies.
+fn rust_stack_reservation() -> Result<usize, ProtocolError> {
+    // The guard size comes from the process pthread defaults, which Rust's
+    // spawned threads also use.
     let mut attributes = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
     if unsafe { libc::pthread_attr_init(attributes.as_mut_ptr()) } != 0 {
         return Err(invalid());
     }
     let mut attributes = unsafe { attributes.assume_init() };
-    let mut stack = 0usize;
     let mut guard = 0usize;
-    let stack_result = unsafe { libc::pthread_attr_getstacksize(&attributes, &mut stack) };
     let guard_result = unsafe { pthread_attr_getguardsize(&attributes, &mut guard) };
     let destroy_result = unsafe { libc::pthread_attr_destroy(&mut attributes) };
-    if stack_result != 0 || guard_result != 0 || destroy_result != 0 || stack == 0 {
+    if guard_result != 0 || destroy_result != 0 {
         return Err(invalid());
     }
-    let native = stack
-        .checked_add(guard)
-        .and_then(|n| n.checked_add(64 << 10))
-        .map(|n| n.max(8 << 20))
-        .ok_or_else(invalid)?;
-    let rust = (2usize << 20)
+    (2usize << 20)
         .checked_add(guard)
         .and_then(|n| n.checked_add(64 << 10))
         .map(|n| n.max(4 << 20))
-        .ok_or_else(invalid)?;
-    Ok((native, rust))
+        .ok_or_else(invalid)
 }
 #[cfg(not(unix))]
-fn native_stack_reservation() -> Result<(usize, usize), ProtocolError> {
+fn rust_stack_reservation() -> Result<usize, ProtocolError> {
     Err(failure(
         ErrorCode::UnsupportedOperation,
         "native stack accounting is unsupported on this platform",
@@ -117,17 +129,18 @@ fn invalid() -> ProtocolError {
 mod tests {
     use super::*;
     #[test]
-    fn o05_large_native_pool_reserves_each_default_pthread_stack_and_shared_timer() {
-        let report = NativeThreadBudget::new(1, 1, 128).unwrap();
-        assert_eq!(report.maintenance_high_threads, 1);
-        assert_eq!(report.maintenance_low_threads, 127);
-        assert_eq!(report.housekeeping_timer_threads, 1);
-        assert!(report.native_stack_bytes_per_thread >= 8 << 20);
+    fn o05_storage_threads_reserve_one_stack_each_per_worker_and_pool() {
+        let report = NativeThreadBudget::with_pools(1, 1, 128, 8).unwrap();
+        assert_eq!(report.flush_threads, 1);
+        assert_eq!(report.compaction_threads, 127);
+        assert_eq!(report.journal_threads, 16);
+        assert!(report.storage_stack_bytes_per_thread >= 4 << 20);
         assert_eq!(
             report.total_stack_reservation_bytes,
             2 * report.query_control_stack_bytes_per_thread
-                + 129 * report.native_stack_bytes_per_thread
+                + (128 + 16) * report.storage_stack_bytes_per_thread
         );
-        assert!(NativeThreadBudget::new(usize::MAX, 1, 128).is_err());
+        assert!(NativeThreadBudget::with_pools(usize::MAX, 1, 128, 8).is_err());
+        assert!(NativeThreadBudget::with_pools(1, 1, 1, 8).is_err());
     }
 }

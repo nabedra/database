@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
 
+# Events is its own workspace with its own lock file and target directory. The server
+# workspace lists "." as a member, which makes its `exclude = ["events"]` ineffective.
+[workspace]
+
 [dependencies]
 anyhow = "1"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
@@ -15,9 +19,9 @@ clap = { version = "=4.6.7", features = ["derive"] }
 fs2 = "0.4.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.12.1"
+nabedra-kv = { path = "../kv", version = "=0.1.0" }
 openraft = { version = "=0.9.25", default-features = false, features = ["generic-snapshot-data", "serde", "storage-v2"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["http2", "json", "rustls", "stream"] }
-rocksdb = { version = "=0.25.0", default-features = false, features = ["bindgen-runtime"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["raw_value", "arbitrary_precision"] }

@@ -165,7 +165,7 @@ impl Topology {
         let member = &self.members[&node];
         PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: self.group.cluster_id,
             worker_id: member.worker_id,
             pool_id: member.pool_id,

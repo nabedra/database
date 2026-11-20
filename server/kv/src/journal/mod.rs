@@ -193,6 +193,10 @@ pub struct RecoveryReport {
     pub tail_truncations: u64,
     pub tail_bytes: u64,
     pub recovery_ms: u64,
+    /// Sequences at or below `replay_after` that the journal no longer held at open (its
+    /// end was behind the caller's flushed state). Open voids them so numbers are never
+    /// reused; their state is already in runs.
+    pub voided_at_open: u64,
 }
 
 /// One live segment and the sequences its records take.
@@ -253,12 +257,13 @@ struct Waiter {
 }
 
 impl Waiter {
-    /// Completes the commit, then drops the payload (on the calling thread, which is the
-    /// journal thread for every queued item).
+    /// Drops the payload, then completes the commit, both on the calling thread (the
+    /// journal thread for every queued item). A caller that sees its commit complete can
+    /// rely on the payload's guards and charges being released already.
     fn complete(self, result: Result<Seq>) {
         let Waiter { tx, on_done } = self;
-        let _ = tx.send(result);
         drop(on_done);
+        let _ = tx.send(result);
     }
 }
 
@@ -434,6 +439,7 @@ impl Journal {
             prep_cancel: AtomicBool::new(false),
             value_cache: OnceLock::new(),
         });
+        report.voided_at_open = replay_after.saturating_sub(recovered.next_seq.saturating_sub(1));
         let writer = writer::Writer::finish_open(shared.clone(), recovered, replay_after)?;
         let next_seq = writer.next_seq();
         lock(&shared.queue).next_seq = next_seq;
@@ -459,7 +465,7 @@ impl Journal {
 
     /// Queues `batch` as one record. Never does I/O. Sequence numbers follow submission
     /// order; the batch takes `batch.count()` of them. `on_done` is dropped on the journal
-    /// thread after the commit completes (successfully or not).
+    /// thread once the outcome is known (success or failure), before the commit completes.
     pub fn submit(
         &self,
         batch: WriteBatch,

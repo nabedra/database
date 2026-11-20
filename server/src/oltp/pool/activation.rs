@@ -123,7 +123,7 @@ impl GroupStore {
                     }
                     let native_generation = view
                         .snapshot
-                        .get_pinned(group_key(group.identity().group_id, b'a', &[]))
+                        .get(&group_key(group.identity().group_id, b'a', &[]))
                         .map_err(storage_error)?
                         .ok_or_else(recovery_unknown)?;
                     let active_generation = u64::from_be_bytes(

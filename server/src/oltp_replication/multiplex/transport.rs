@@ -28,6 +28,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
+pub(crate) use session::PeerFeature;
 use session::{PeerSessions, RawReply, SESSION_ALPN};
 #[cfg(test)]
 mod tests;
@@ -117,6 +118,21 @@ pub struct TransportConfig {
     pub payload_bytes: [usize; CLASSES],
     pub decode_bytes: [usize; CLASSES],
     pub deadline: Duration,
+    /// Accepted sessions per traffic class. Each lane has its own pool, so
+    /// sessions on one class cannot take Control's or Raft progress's (C07).
+    pub session_slots: [usize; CLASSES],
+    /// TLS sessions accepted before their first verified request names a
+    /// lane. When none is free the listener offers only the one-shot ALPN.
+    pub pending_sessions: usize,
+    /// A caller pings an idle session after this long without receiving a
+    /// byte. A session that never names a lane is closed after this long.
+    pub ping_idle: Duration,
+    /// A caller with a stream waiting pings after this long without
+    /// receiving a byte, and closes the session when nothing arrives within
+    /// this long of the ping reaching the socket.
+    pub ping_timeout: Duration,
+    /// Bound on one TCP connect plus TLS handshake for a lane.
+    pub connect_timeout: Duration,
 }
 impl Default for TransportConfig {
     fn default() -> Self {
@@ -159,6 +175,11 @@ impl Default for TransportConfig {
                 RAFT_PROGRESS_DECODE_BYTES,
             ],
             deadline: Duration::from_secs(30),
+            session_slots: [256; CLASSES],
+            pending_sessions: 64,
+            ping_idle: Duration::from_secs(15),
+            ping_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -170,6 +191,8 @@ impl TransportConfig {
                 .preflight_slots
                 .iter()
                 .chain(&self.handler_slots)
+                .chain(&self.session_slots)
+                .chain([&self.pending_sessions])
                 .any(|&n| n == 0 || n > Semaphore::MAX_PERMITS)
             || self
                 .payload_bytes
@@ -178,6 +201,9 @@ impl TransportConfig {
                 .any(|(i, &n)| (n == 0) != (i == TrafficClass::RaftProgress as usize))
             || self.decode_bytes.contains(&0)
             || self.deadline.is_zero()
+            || self.ping_idle.is_zero()
+            || self.ping_timeout.is_zero()
+            || self.connect_timeout.is_zero()
         {
             return Err(malformed("invalid worker transport limits"));
         }
@@ -473,6 +499,9 @@ struct Common {
     directory: Arc<dyn PeerDirectory>,
     connector: TlsConnector,
     acceptor: TlsAcceptor,
+    /// Offers only the one-shot ALPN, for handshakes without a pending
+    /// session slot: the caller falls back instead of losing an agreed session.
+    one_shot_acceptor: TlsAcceptor,
     config: TransportConfig,
     handshakes: Arc<Semaphore>,
     preflight: [Arc<Semaphore>; CLASSES],
@@ -484,9 +513,16 @@ struct Common {
     /// False only for a test peer that speaks the one-shot protocol alone.
     sessions_enabled: bool,
     sessions: PeerSessions,
-    session_slots: Arc<Semaphore>,
+    session_slots: [Arc<Semaphore>; CLASSES],
+    pending_sessions: Arc<Semaphore>,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
+    /// Tests hold caller session writers before they dequeue a frame.
+    #[cfg(test)]
+    hold_writes: tokio::sync::watch::Sender<bool>,
+    /// Replies a receiver skipped because the caller cancelled the stream.
+    #[cfg(test)]
+    cancelled_replies: std::sync::atomic::AtomicU64,
 }
 pub struct WorkerTransport {
     common: Arc<Common>,
@@ -630,6 +666,7 @@ impl WorkerTransport {
         } else {
             tls.transports(&[ALPN])
         };
+        let (_, one_shot_acceptor) = tls.transports(&[ALPN]);
         Ok(Self {
             common: Arc::new(Common {
                 local: WorkerIdentity::from(local),
@@ -637,6 +674,7 @@ impl WorkerTransport {
                 directory,
                 connector,
                 acceptor,
+                one_shot_acceptor,
                 handshakes: Arc::new(Semaphore::new(config.handshake_slots)),
                 preflight: std::array::from_fn(|i| {
                     Arc::new(Semaphore::new(config.preflight_slots[i]))
@@ -656,9 +694,16 @@ impl WorkerTransport {
                 resolver: PeerResolver::default(),
                 sessions_enabled,
                 sessions: PeerSessions::default(),
-                session_slots: Arc::new(Semaphore::new(session::MAX_SERVER_SESSIONS)),
+                session_slots: std::array::from_fn(|i| {
+                    Arc::new(Semaphore::new(config.session_slots[i]))
+                }),
+                pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
+                #[cfg(test)]
+                hold_writes: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                cancelled_replies: std::sync::atomic::AtomicU64::new(0),
                 config,
             }),
             registry,
@@ -697,6 +742,9 @@ impl WorkerTransport {
     }
     /// The TLS handshake runs under the handshake slot. A session releases it
     /// once established; a one-shot exchange keeps it, as before sessions.
+    /// Sessions are offered only while a pending session slot is free, so a
+    /// full listener falls back to one-shot during the handshake and never
+    /// drops a session it agreed to.
     async fn accept(
         self: Arc<Self>,
         socket: TcpStream,
@@ -704,20 +752,32 @@ impl WorkerTransport {
         stopped: tokio::sync::watch::Receiver<bool>,
     ) {
         let deadline = Instant::now() + self.common.config.deadline;
-        let _ = socket.set_nodelay(true);
-        let Ok(Ok(stream)) = timeout_at(deadline, self.common.acceptor.accept(socket)).await else {
+        tune_socket(&socket);
+        let pending = if self.common.sessions_enabled {
+            self.common
+                .pending_sessions
+                .clone()
+                .try_acquire_owned()
+                .ok()
+        } else {
+            None
+        };
+        let acceptor = if pending.is_some() {
+            &self.common.acceptor
+        } else {
+            &self.common.one_shot_acceptor
+        };
+        let Ok(Ok(stream)) = timeout_at(deadline, acceptor.accept(socket)).await else {
             return;
         };
-        if self.common.sessions_enabled && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
+        if let Some(pending) = pending
+            && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
         {
             let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
                 return;
             };
-            let Ok(slot) = self.common.session_slots.clone().try_acquire_owned() else {
-                return;
-            };
             drop(handshake);
-            session::serve(self, stream, certificate, stopped, slot).await;
+            session::serve(self, stream, certificate, stopped, pending).await;
             return;
         }
         let _ = timeout_at(deadline, self.serve(stream, handshake)).await;
@@ -1162,9 +1222,39 @@ impl WorkerClient {
     pub(crate) fn live_sessions_for_test(&self) -> usize {
         self.common.sessions.live_for_test()
     }
+    #[cfg(test)]
+    pub(crate) fn waiting_streams_for_test(&self) -> usize {
+        self.common.sessions.waiting_for_test()
+    }
+    /// Close every caller session, as if each connection failed at once.
+    #[cfg(test)]
+    pub(crate) fn close_sessions_for_test(&self) {
+        self.common.sessions.close_all();
+    }
     /// The locally applied Control enrollment revision, if the directory has one.
     pub(crate) fn applied_revision(&self) -> Option<u64> {
         self.common.directory.applied_revision()
+    }
+    /// The peer's current incarnation when this caller's live session to it on
+    /// `class` negotiated a protocol with `feature`. `None` when there is no
+    /// such session yet, or the peer speaks only the one-shot protocol.
+    /// Send the feature's frames to the returned identity only, so a restarted
+    /// (possibly older) incarnation never receives them.
+    pub(crate) fn peer_supports(
+        &self,
+        worker: Uuid,
+        class: TrafficClass,
+        feature: PeerFeature,
+    ) -> Option<WorkerIdentity> {
+        let peer = self.common.directory.resolve(worker).ok()?;
+        self.common
+            .sessions
+            .supports(&peer, class, feature)
+            .then(|| WorkerIdentity::from(&peer))
+    }
+    /// The largest request payload this caller sends on `class`.
+    pub(crate) fn payload_limit(&self, class: TrafficClass) -> usize {
+        self.common.config.payload_bytes[class as usize]
     }
 
     #[cfg(test)]
@@ -1495,6 +1585,15 @@ fn peer_digest(
         .and_then(|certs| certs.first())
         .map(|certificate| Digest::from_bytes(Sha256::digest(certificate.as_ref()).into()))
         .ok_or_else(|| malformed("missing worker certificate"))
+}
+/// `TCP_NODELAY`, and TCP keepalive so the kernel also notices a dead peer
+/// on a connection that carries no traffic.
+fn tune_socket(socket: &TcpStream) {
+    let _ = socket.set_nodelay(true);
+    let keepalive = socket2::TcpKeepalive::new().with_time(Duration::from_secs(10));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let keepalive = keepalive.with_interval(Duration::from_secs(5));
+    let _ = socket2::SockRef::from(socket).set_tcp_keepalive(&keepalive);
 }
 fn overloaded(message: &'static str) -> ProtocolError {
     ProtocolError::new(ErrorCode::Overloaded, message, Outcome::NotApplied)

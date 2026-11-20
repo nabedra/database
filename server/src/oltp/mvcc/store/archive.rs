@@ -268,7 +268,7 @@ pub(super) fn decode_logical(bytes: &[u8]) -> Result<MvccKey, ProtocolError> {
     if bytes.is_empty() {
         return Err(recovery_unknown());
     }
-    if matches!(bytes[0], 1 | 2 | 10) {
+    if matches!(bytes[0], 1 | 2 | 10 | super::direct::DEDUP_TAG) {
         return super::scan::decode_key(bytes);
     }
     if bytes.len() < 33 {

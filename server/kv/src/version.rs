@@ -12,7 +12,7 @@
 //! live runs and memtables still point into, for journal retirement.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use bytes::Bytes;
@@ -20,6 +20,8 @@ use bytes::Bytes;
 use crate::iter::range_del::FragmentedRangeTombstones;
 use crate::manifest::RunDesc;
 use crate::memtable::Memtable;
+use crate::run::Run;
+use crate::source::RangeTombstone;
 use crate::types::{Kind, MAX_SEQ, Seq, parse_internal_key, user_key};
 
 /// Levels L0 to L6.
@@ -84,6 +86,9 @@ pub(crate) struct FileTracker {
     /// Runs marked obsolete whose last reference dropped: delete their files.
     obsolete: Mutex<Vec<u64>>,
     next_token: AtomicU64,
+    /// Resident range tombstones of live runs (their raw and fragmented copies), charged
+    /// to the pool overhead (plan section 5 "Memory").
+    tombstone_bytes: AtomicUsize,
 }
 
 impl FileTracker {
@@ -98,6 +103,11 @@ impl FileTracker {
         }
     }
 
+    /// Bytes of range tombstones that live runs keep resident.
+    pub fn tombstone_bytes(&self) -> usize {
+        self.tombstone_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn take_obsolete(&self) -> Vec<u64> {
         std::mem::take(&mut *lock(&self.obsolete))
     }
@@ -107,7 +117,40 @@ impl FileTracker {
     }
 }
 
-/// One live run of a version.
+/// One live run file: what every version object of that run shares. The file is deleted
+/// only when this drops after being marked obsolete, which is after the last version
+/// (current or pinned by a snapshot) that holds the run in any level is gone. A trivial
+/// move gives the run a new [`RunFile`] for its new level that shares this handle, so a
+/// snapshot that still holds the run at its old level keeps the file (RV-KV2 finding 1).
+pub(crate) struct RunHandle {
+    id: u64,
+    token: u64,
+    has_segment: bool,
+    tombstones: OnceLock<Arc<FragmentedRangeTombstones>>,
+    /// Bytes charged to `FileTracker::tombstone_bytes` for this run.
+    tombstone_charge: AtomicUsize,
+    obsolete: AtomicBool,
+    tracker: Arc<FileTracker>,
+}
+
+impl Drop for RunHandle {
+    fn drop(&mut self) {
+        let charge = *self.tombstone_charge.get_mut();
+        if charge > 0 {
+            self.tracker
+                .tombstone_bytes
+                .fetch_sub(charge, Ordering::Relaxed);
+        }
+        if self.has_segment {
+            lock(&self.tracker.run_segments).remove(&self.token);
+        }
+        if self.obsolete.load(Ordering::Acquire) {
+            lock(&self.tracker.obsolete).push(self.id);
+        }
+    }
+}
+
+/// One live run of a version, at one level.
 pub(crate) struct RunFile {
     pub desc: RunDesc,
     /// User-key range: `[lo, hi]`, or `[lo, hi)` when the largest key is a range
@@ -115,10 +158,10 @@ pub(crate) struct RunFile {
     pub lo: Bytes,
     pub hi: Bytes,
     pub hi_exclusive: bool,
-    token: u64,
-    tombstones: OnceLock<Arc<FragmentedRangeTombstones>>,
-    obsolete: AtomicBool,
-    tracker: Arc<FileTracker>,
+    /// An L0 run is kept open for its whole life at L0 (index, filter and tombstones
+    /// resident), like RocksDB's `pin_l0_filter_and_index_blocks_in_cache`.
+    pinned: OnceLock<Arc<Run>>,
+    handle: Arc<RunHandle>,
 }
 
 impl std::fmt::Debug for RunFile {
@@ -141,20 +184,38 @@ pub(crate) fn user_range(smallest: &[u8], largest: &[u8]) -> (Bytes, Bytes, bool
 
 impl RunFile {
     pub fn new(desc: RunDesc, tracker: Arc<FileTracker>) -> Arc<RunFile> {
-        let (lo, hi, hi_exclusive) = user_range(&desc.smallest, &desc.largest);
         let token = tracker.next_token();
         if let Some(segment) = desc.oldest_journal_segment {
             lock(&tracker.run_segments).insert(token, segment);
         }
+        let handle = Arc::new(RunHandle {
+            id: desc.id,
+            token,
+            has_segment: desc.oldest_journal_segment.is_some(),
+            tombstones: OnceLock::new(),
+            tombstone_charge: AtomicUsize::new(0),
+            obsolete: AtomicBool::new(false),
+            tracker,
+        });
+        Self::with_handle(desc, handle)
+    }
+
+    /// The same run file at another level (a trivial move): shares the file handle.
+    pub fn moved(&self, level: u8) -> Arc<RunFile> {
+        let mut desc = self.desc.clone();
+        desc.level = level;
+        Self::with_handle(desc, self.handle.clone())
+    }
+
+    fn with_handle(desc: RunDesc, handle: Arc<RunHandle>) -> Arc<RunFile> {
+        let (lo, hi, hi_exclusive) = user_range(&desc.smallest, &desc.largest);
         Arc::new(RunFile {
             desc,
             lo,
             hi,
             hi_exclusive,
-            token,
-            tombstones: OnceLock::new(),
-            obsolete: AtomicBool::new(false),
-            tracker,
+            pinned: OnceLock::new(),
+            handle,
         })
     }
 
@@ -170,9 +231,9 @@ impl RunFile {
         self.desc.file_size
     }
 
-    /// Marks the run for deletion once nothing references it.
+    /// Marks the run file for deletion once nothing references it at any level.
     pub fn mark_obsolete(&self) {
-        self.obsolete.store(true, Ordering::Release);
+        self.handle.obsolete.store(true, Ordering::Release);
     }
 
     pub fn contains(&self, key: &[u8]) -> bool {
@@ -198,24 +259,44 @@ impl RunFile {
         below_hi && above_lo
     }
 
-    /// The run's range tombstones, fragmented once.
-    pub fn tombstones(
-        &self,
-        load: impl FnOnce() -> Arc<FragmentedRangeTombstones>,
-    ) -> Arc<FragmentedRangeTombstones> {
-        self.tombstones.get_or_init(load).clone()
+    /// The run's range tombstones, fragmented once. The raw and fragmented copies are
+    /// charged to the tracker's `tombstone_bytes` while the run file lives.
+    pub fn tombstones(&self, run: &Run) -> Arc<FragmentedRangeTombstones> {
+        let h = &self.handle;
+        h.tombstones
+            .get_or_init(|| {
+                let raw = run.range_tombstones();
+                let charge = 2 * tombstone_charge(raw);
+                h.tombstone_charge.store(charge, Ordering::Relaxed);
+                h.tracker
+                    .tombstone_bytes
+                    .fetch_add(charge, Ordering::Relaxed);
+                Arc::new(FragmentedRangeTombstones::new(raw, MAX_SEQ))
+            })
+            .clone()
+    }
+
+    /// The fragmented range tombstones, if a reader loaded them already.
+    pub fn cached_tombstones(&self) -> Option<Arc<FragmentedRangeTombstones>> {
+        self.handle.tombstones.get().cloned()
+    }
+
+    /// Keeps `run` open for as long as this object lives (L0 runs).
+    pub fn pin(&self, run: Arc<Run>) {
+        let _ = self.pinned.set(run);
+    }
+
+    pub fn pinned(&self) -> Option<&Arc<Run>> {
+        self.pinned.get()
     }
 }
 
-impl Drop for RunFile {
-    fn drop(&mut self) {
-        if self.desc.oldest_journal_segment.is_some() {
-            lock(&self.tracker.run_segments).remove(&self.token);
-        }
-        if self.obsolete.load(Ordering::Acquire) {
-            lock(&self.tracker.obsolete).push(self.desc.id);
-        }
-    }
+/// Resident bytes of a set of range tombstones (keys plus per-entry overhead).
+pub(crate) fn tombstone_charge(tombstones: &[RangeTombstone]) -> usize {
+    tombstones
+        .iter()
+        .map(|t| t.start.len() + t.end.len() + 64)
+        .sum()
 }
 
 /// A memtable with the bookkeeping the store keeps for it.
@@ -228,6 +309,9 @@ pub(crate) struct MemEntry {
     pub journal_bytes: AtomicU64,
     oldest_segment: AtomicU64,
     tracker: Arc<FileTracker>,
+    /// Set once the memtable is flushed while readers still hold it: the budget group's
+    /// pinned-bytes counter and the bytes charged to it until this drops.
+    pinned: OnceLock<(Arc<AtomicUsize>, usize)>,
 }
 
 impl MemEntry {
@@ -239,6 +323,7 @@ impl MemEntry {
             journal_bytes: AtomicU64::new(0),
             oldest_segment: AtomicU64::new(u64::MAX),
             tracker,
+            pinned: OnceLock::new(),
         })
     }
 
@@ -253,10 +338,27 @@ impl MemEntry {
     pub fn last_seq(&self) -> Seq {
         self.last_seq.load(Ordering::Acquire)
     }
+
+    /// Lowest journal segment a locator in this memtable points into (`u64::MAX`: none).
+    pub fn oldest_segment(&self) -> u64 {
+        self.oldest_segment.load(Ordering::Acquire)
+    }
+
+    /// The memtable is flushed: from now on its budget charge counts as pinned (held only
+    /// by readers), not as memory a flush can free.
+    pub fn mark_flushed(&self, pinned: &Arc<AtomicUsize>) {
+        let bytes = self.mem.approximate_memory();
+        if self.pinned.set((pinned.clone(), bytes)).is_ok() {
+            pinned.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for MemEntry {
     fn drop(&mut self) {
+        if let Some((counter, bytes)) = self.pinned.get() {
+            counter.fetch_sub(*bytes, Ordering::Relaxed);
+        }
         if *self.oldest_segment.get_mut() != u64::MAX {
             lock(&self.tracker.mem_segments).remove(&self.id);
         }
@@ -397,6 +499,24 @@ mod tests {
         assert!(tracker.take_obsolete().is_empty());
         drop(pinned);
         assert_eq!(tracker.take_obsolete(), vec![3]);
+        assert_eq!(tracker.min_referenced_segment(), None);
+    }
+
+    #[test]
+    fn ns03_unit_a_moved_run_shares_its_file_with_the_old_level() {
+        let tracker = Arc::new(FileTracker::default());
+        let mut d = desc(4, 1, b"a", b"b", false);
+        d.oldest_journal_segment = Some(9);
+        let old = RunFile::new(d, tracker.clone());
+        let moved = old.moved(2);
+        assert_eq!(moved.level(), 2);
+        // A compaction consumes the moved run while a snapshot still holds the old one.
+        moved.mark_obsolete();
+        drop(moved);
+        assert!(tracker.take_obsolete().is_empty());
+        assert_eq!(tracker.min_referenced_segment(), Some(9));
+        drop(old);
+        assert_eq!(tracker.take_obsolete(), vec![4]);
         assert_eq!(tracker.min_referenced_segment(), None);
     }
 }

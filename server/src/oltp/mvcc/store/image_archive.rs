@@ -138,6 +138,7 @@ impl ParticipantMachine {
         {
             return Err(invalid());
         }
+        self.observe_snapshot(input.read_ts).await?;
         let owner = Arc::new(
             self.store
                 .resources()
@@ -179,13 +180,18 @@ impl ParticipantMachine {
                         ));
                     }
                     lineage::validate_read(&config, request.read_ts)?;
-                    let prefix = [HEAD];
+                    // Heads first, then direct-commit dedup records, which
+                    // sort after every head key (`MvccKey::DirectDedup`).
+                    let mut prefix = match &request.after {
+                        Some(MvccKey::DirectDedup { .. }) => [super::direct::DEDUP],
+                        _ => [HEAD],
+                    };
                     let mut cursor = match &request.after {
                         Some(after) => {
-                            if !owns(&group, &config.span, after) {
+                            if !owns_image(&group, &config.span, after) {
                                 return Err(invalid());
                             }
-                            let mut key = vec![HEAD; key_length(after)? + 2];
+                            let mut key = vec![prefix[0]; key_length(after)? + 2];
                             let end = key.len() - 1;
                             encode_key(after, &mut key[1..end]);
                             key[end] = 0;
@@ -200,22 +206,67 @@ impl ParticipantMachine {
                         + request.after.as_ref().map_or(0, MvccKey::heap_bytes);
                     let mut wire_used = 4096usize;
                     let mut next = request.after.clone();
-                    for _ in 0..request.max_items {
+                    let mut visited = 0;
+                    while visited < request.max_items {
                         let Some(head_row) = view.first_from(&prefix, &cursor)? else {
+                            if prefix[0] == HEAD {
+                                prefix = [super::direct::DEDUP];
+                                cursor.clear();
+                                cursor.push(super::direct::DEDUP);
+                                continue;
+                            }
                             break;
                         };
+                        visited += 1;
                         let logical = &head_row.key()[1..];
-                        if head_row.value().len() > METADATA_BYTES {
-                            return Err(recovery_unknown());
-                        }
-                        let head: Head = serde_json::from_slice(head_row.value())
-                            .map_err(|_| recovery_unknown())?;
                         let key = super::archive::decode_logical(logical)?;
-                        if !owns(&group, &config.span, &key) {
+                        if !owns_image(&group, &config.span, &key) {
                             return Err(recovery_unknown());
                         }
+                        let dedup = prefix[0] == super::direct::DEDUP;
+                        if dedup != matches!(key, MvccKey::DirectDedup { .. })
+                            || (!dedup && head_row.value().len() > METADATA_BYTES)
+                        {
+                            return Err(recovery_unknown());
+                        }
+                        let head: Head = if dedup {
+                            Head::default()
+                        } else {
+                            serde_json::from_slice(head_row.value())
+                                .map_err(|_| recovery_unknown())?
+                        };
                         let length = logical.len();
                         let outcome = view.with_scratch_buffer(length + 9, |view, buffer| {
+                            if dedup {
+                                let value = head_row.value();
+                                let cost =
+                                    encoded_length(&key, super::super::MAX_FIXED_COMMAND_BYTES)?
+                                        .checked_add(value.len())
+                                        .and_then(|n| n.checked_add(2048))
+                                        .ok_or_else(invalid)?;
+                                if wire_used
+                                    .checked_add(cost)
+                                    .is_none_or(|n| n > request.max_bytes)
+                                {
+                                    return Ok(None);
+                                }
+                                let Some(image) = super::direct::image_from_record(
+                                    key.clone(),
+                                    value,
+                                    request.read_ts,
+                                    owner.clone(),
+                                )?
+                                else {
+                                    return Ok(Some(Ok(None)));
+                                };
+                                wire_used += cost;
+                                used = used
+                                    .checked_add(key.heap_bytes())
+                                    .and_then(|n| n.checked_add(value.len()))
+                                    .and_then(|n| n.checked_add(IMAGE_METADATA_BYTES))
+                                    .ok_or_else(invalid)?;
+                                return Ok(Some(Ok(Some(image))));
+                            }
                             buffer[1..length + 1].copy_from_slice(logical);
                             let end = length + 1;
                             if let Some(txn) = head.intent {
@@ -348,7 +399,11 @@ impl ParticipantMachine {
                         used = retained;
                         next = Some(key);
                     }
-                    let exhausted = view.first_from(&prefix, &cursor)?.is_none();
+                    let exhausted = view.first_from(&prefix, &cursor)?.is_none()
+                        && (prefix[0] == super::direct::DEDUP
+                            || view
+                                .first_from(&[super::direct::DEDUP], &[super::direct::DEDUP])?
+                                .is_none());
                     if next.as_ref() == images.last().map(|image| &image.key) {
                         next = None;
                     }

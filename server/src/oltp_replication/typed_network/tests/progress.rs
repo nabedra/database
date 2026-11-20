@@ -163,7 +163,7 @@ async fn c07_m02_o05_o06_o11_o22_mtls_data_and_catalog_raft_progress_during_bulk
                 dir.0.join(format!("pool{node}")),
                 PoolIdentity {
                     engine: "oltp".into(),
-                    pool_format_version: 1,
+                    pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                     cluster_id: cluster,
                     worker_id: worker.worker_id,
                     pool_id: member.pool_id,
@@ -394,6 +394,7 @@ async fn assert_progress<C>(
         vote: baseline_vote,
         prev_log_id: Some(cut),
         leader_commit: Some(cut),
+        entries: None,
     };
     let slots = TransportConfig::default().handler_slots[TrafficClass::DataConsensus as usize];
     let mut background = Vec::new();

@@ -269,6 +269,7 @@ pub(super) fn recover(
         tail_truncations: 0,
         tail_bytes: 0,
         recovery_ms: 0,
+        voided_at_open: 0,
     };
     let live = inventory.live;
     if live.is_empty() {

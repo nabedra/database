@@ -585,6 +585,8 @@ pub(super) fn validate_guards(
     }
     for write in writes {
         let (table, exclusive) = match &write.key {
+            // Dedup records are written only by direct commits.
+            MvccKey::DirectDedup { .. } => return Ok(false),
             MvccKey::Row { table_id, .. } | MvccKey::IndexEntry { table_id, .. } => {
                 (*table_id, false)
             }
@@ -966,7 +968,7 @@ mod index_recovery_tests {
             &path,
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id,
                 worker_id: Uuid::new_v4(),
                 pool_id: Uuid::new_v4(),
@@ -1112,6 +1114,7 @@ mod index_recovery_tests {
             gc_floor: 0,
             split_source: None,
             split_child: None,
+            direct_pause: None,
         };
         let recover = |binding: LifecycleBinding, authority: Authority| {
             let catalog = catalog.clone();

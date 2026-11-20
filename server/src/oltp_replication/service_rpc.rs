@@ -1003,37 +1003,35 @@ fn scoped_admission_read(scope: super::authority::control::ScopedCatalogRead) ->
     // accepted context to hash. Only the queue owner gets this read privilege.
     scope.request.accepted_context == Digest::from_bytes([0; 32])
 }
-/// The caller's role, served from the receiver's grant cache while the
-/// locally applied Control revision is unchanged and the entry is under 5 s
-/// old. See `grant_cache` for the bound this places on revocation.
+/// The caller's full grant, always read fresh from Control: callers compare
+/// its owner and authority with the request's fences. The passed role check
+/// warms the receiver's cache for [`authorize`]. See `grant_cache`.
 async fn service_grant(
     control: &ControlClient,
     session: &AuthenticatedSession,
     header: &Header,
 ) -> Result<ServiceAuthorization, ProtocolError> {
     let key = GrantKey::new(session.remote(), header.action, session.group(), None);
-    let revision = control.applied_revision();
-    if let Some(Some(grant)) = key.and_then(|key| control.service_grants().get(key, revision)) {
-        return Ok(grant);
-    }
     let scope = crate::oltp_runtime::replica::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
-    let grant = control
-        .service_role(
-            &scope,
-            session.remote(),
-            header.action,
-            session.group().clone(),
-        )
-        .await?;
-    if let Some(key) = key {
-        control.service_grants().insert(key, revision, Some(grant));
-    }
-    Ok(grant)
+    control
+        .service_grants()
+        .grant(key, control.applied_revision(), || {
+            control.service_role(
+                &scope,
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+        })
+        .await
 }
 
+/// The caller's role only. A passed check is cached per caller incarnation
+/// and role while the locally applied Control revision is unchanged and the
+/// Control read started under 5 s ago.
 async fn authorize(
     control: &ControlClient,
     session: &AuthenticatedSession,
@@ -1043,6 +1041,7 @@ async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
+    let revision = control.applied_revision();
     if let Some(generation) = header.placement_generation {
         let key = GrantKey::new(
             session.remote(),
@@ -1050,25 +1049,37 @@ async fn authorize(
             session.group(),
             Some((header.to_node, generation)),
         );
-        let revision = control.applied_revision();
-        if key.is_some_and(|key| control.service_grants().get(key, revision).is_some()) {
-            return Ok(());
-        }
-        control
-            .service_role_at_replica(
-                &scope,
-                session.remote(),
-                session.group().clone(),
-                header.to_node,
-                generation,
-            )
-            .await?;
-        if let Some(key) = key {
-            control.service_grants().insert(key, revision, None);
-        }
-        return Ok(());
+        return control
+            .service_grants()
+            .role(key, revision, || async {
+                control
+                    .service_role_at_replica(
+                        &scope,
+                        session.remote(),
+                        session.group().clone(),
+                        header.to_node,
+                        generation,
+                    )
+                    .await
+                    .map(|_| None)
+            })
+            .await;
     }
-    service_grant(control, session, header).await.map(|_| ())
+    let key = GrantKey::new(session.remote(), header.action, session.group(), None);
+    control
+        .service_grants()
+        .role(key, revision, || async {
+            control
+                .service_role(
+                    &scope,
+                    session.remote(),
+                    header.action,
+                    session.group().clone(),
+                )
+                .await
+                .map(Some)
+        })
+        .await
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,

@@ -1108,6 +1108,275 @@ fn ns21_iterator_errors_surface_in_status_and_values() {
 // ---------------------------------------------------------------------------------------
 // Bench
 
+/// Counts every move of the inner iterator.
+struct Counting<I> {
+    inner: I,
+    steps: Arc<AtomicU64>,
+}
+
+impl<I: InternalIterator> InternalIterator for Counting<I> {
+    fn valid(&self) -> bool {
+        self.inner.valid()
+    }
+    fn seek_to_first(&mut self) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.seek_to_first();
+    }
+    fn seek_to_last(&mut self) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.seek_to_last();
+    }
+    fn seek(&mut self, target: &[u8]) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.seek(target);
+    }
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.seek_for_prev(target);
+    }
+    fn next(&mut self) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.next();
+    }
+    fn prev(&mut self) {
+        self.steps.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.prev();
+    }
+    fn key(&self) -> &[u8] {
+        self.inner.key()
+    }
+    fn value(&self) -> Bytes {
+        self.inner.value()
+    }
+    fn status(&self) -> crate::error::Result<()> {
+        self.inner.status()
+    }
+}
+
+/// One version: `(user key, seq, value or None for a delete)`.
+type Version = (Vec<u8>, Seq, Option<Vec<u8>>);
+
+/// The entries of one sorted source holding `versions`.
+fn sorted_entries(versions: &[Version]) -> Vec<(Vec<u8>, Bytes)> {
+    let mut entries: Vec<(Vec<u8>, Bytes)> = versions
+        .iter()
+        .map(|(key, seq, value)| match value {
+            Some(v) => (internal_key(key, *seq, Kind::Put), Bytes::from(v.clone())),
+            None => (internal_key(key, *seq, Kind::Delete), Bytes::new()),
+        })
+        .collect();
+    entries.sort_by(|a, b| compare_internal_keys(&a.0, &b.0));
+    entries
+}
+
+/// The live keys and values at `snapshot`, by brute force.
+fn visible_at(
+    versions: &[Version],
+    tombstones: &[RangeTombstone],
+    snapshot: Seq,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut newest: BTreeMap<Vec<u8>, (Seq, Option<Vec<u8>>)> = BTreeMap::new();
+    for (key, seq, value) in versions {
+        if *seq <= snapshot && newest.get(key).is_none_or(|(s, _)| s < seq) {
+            newest.insert(key.clone(), (*seq, value.clone()));
+        }
+    }
+    newest
+        .into_iter()
+        .filter_map(|(key, (seq, value))| {
+            let covered = tombstones.iter().any(|t| {
+                t.seq <= snapshot
+                    && t.seq > seq
+                    && t.start.as_ref() <= key.as_slice()
+                    && key.as_slice() < t.end.as_ref()
+            });
+            Some((key, value.filter(|_| !covered)?))
+        })
+        .collect()
+}
+
+fn counted_iter(
+    entries: &Arc<Vec<(Vec<u8>, Bytes)>>,
+    tombstones: &[RangeTombstone],
+    snapshot: Seq,
+) -> (DbIter<Counting<VecIter>>, Arc<AtomicU64>) {
+    let steps = Arc::new(AtomicU64::new(0));
+    let inner = Counting {
+        inner: VecIter::shared(entries.clone()),
+        steps: steps.clone(),
+    };
+    let mut agg = RangeDelAggregator::new(snapshot);
+    agg.add_tombstones(tombstones);
+    let it =
+        DbIter::new(inner, snapshot, Bound::Unbounded, Bound::Unbounded).with_range_tombstones(agg);
+    (it, steps)
+}
+
+/// NS3 concern 4: going backward, long runs of old versions of one key and of versions
+/// above the snapshot are crossed with a seek, not stepped through one by one.
+#[test]
+fn ns21_reverse_scans_reseek_over_long_version_chains() {
+    let v = |s: &str| Some(s.as_bytes().to_vec());
+    let mut versions = vec![(b"a".to_vec(), 1, v("a1"))];
+    // b: 1,000 visible versions.
+    versions.extend((2..=1001).map(|seq| (b"b".to_vec(), seq, v(&format!("b{seq}")))));
+    // c: 500 visible versions, the newest a delete.
+    versions.extend((1002..1501).map(|seq| (b"c".to_vec(), seq, v("c"))));
+    versions.push((b"c".to_vec(), 1501, None));
+    // d: one visible version and 1,000 above the snapshot.
+    versions.push((b"d".to_vec(), 1550, v("d1550")));
+    versions.extend((2000..3000).map(|seq| (b"d".to_vec(), seq, v("d-new"))));
+    // e: 1,000 versions, all above the snapshot.
+    versions.extend((3000..4000).map(|seq| (b"e".to_vec(), seq, v("e-new"))));
+    versions.push((b"f".to_vec(), 1600, v("f1600")));
+    let entries = Arc::new(sorted_entries(&versions));
+    let snapshot = 1600;
+    let want = visible_at(&versions, &[], snapshot);
+    assert_eq!(
+        want.iter().map(|(k, _)| k.as_slice()).collect::<Vec<_>>(),
+        vec![&b"a"[..], b"b", b"d", b"f"]
+    );
+
+    let (mut it, steps) = counted_iter(&entries, &[], snapshot);
+    let mut got = Vec::new();
+    it.seek_to_last();
+    while it.valid() {
+        got.push((it.key().to_vec(), it.value().unwrap().to_vec()));
+        it.prev();
+    }
+    it.status().unwrap();
+    got.reverse();
+    assert_eq!(got, want);
+    let reverse_steps = steps.load(AtomicOrdering::Relaxed);
+    assert!(
+        reverse_steps < 200,
+        "a reverse scan over {} entries took {reverse_steps} inner steps",
+        entries.len()
+    );
+
+    // seek_for_prev into a long chain, and direction switches around it.
+    let (mut it, steps) = counted_iter(&entries, &[], snapshot);
+    it.seek_for_prev(b"e");
+    assert_eq!(
+        (it.key(), &it.value().unwrap()[..]),
+        (&b"d"[..], &b"d1550"[..])
+    );
+    it.prev();
+    assert_eq!(
+        (it.key(), &it.value().unwrap()[..]),
+        (&b"b"[..], &b"b1001"[..])
+    );
+    it.next();
+    assert_eq!(it.key(), b"d");
+    it.prev();
+    assert_eq!(it.key(), b"b");
+    it.prev();
+    assert_eq!(it.key(), b"a");
+    it.prev();
+    assert!(!it.valid());
+    it.status().unwrap();
+    assert!(steps.load(AtomicOrdering::Relaxed) < 300);
+
+    // A range tombstone hiding the newest version of b, read through the seek path.
+    let tombstones = [RangeTombstone {
+        start: Bytes::from_static(b"b"),
+        end: Bytes::from_static(b"c"),
+        seq: 1200,
+    }];
+    let (mut it, _) = counted_iter(&entries, &tombstones, snapshot);
+    it.seek_to_last();
+    let mut got = Vec::new();
+    while it.valid() {
+        got.push(it.key().to_vec());
+        it.prev();
+    }
+    assert_eq!(got, keys(&[b"f", b"d", b"a"]));
+}
+
+/// Reverse and forward scans and walks agree with brute force over few keys with many
+/// versions each, deletes, range tombstones and snapshots, so both re-seek paths run
+/// often.
+#[test]
+fn ns21_reverse_reseeks_match_a_brute_force_model() {
+    let mut rng = Rng::new(0x0005_EE4B);
+    for round in 0..60 {
+        let key_count = 1 + rng.below(5);
+        let mut versions = Vec::new();
+        let mut tombstones = Vec::new();
+        let total = 50 + rng.below(400);
+        for seq in 1..=total {
+            let key = vec![b'k', rng.below(key_count) as u8];
+            match rng.below(20) {
+                0 => tombstones.push(RangeTombstone {
+                    start: Bytes::from(vec![b'k', rng.below(key_count) as u8]),
+                    end: Bytes::from(vec![b'k', rng.below(key_count + 1) as u8]),
+                    seq,
+                }),
+                1..=3 => versions.push((key, seq, None)),
+                _ => versions.push((key, seq, Some(seq.to_le_bytes().to_vec()))),
+            }
+        }
+        let entries = Arc::new(sorted_entries(&versions));
+        for _ in 0..8 {
+            let snapshot = rng.below(total + 2);
+            let want = visible_at(&versions, &tombstones, snapshot);
+            let ctx = format!("round {round} snapshot {snapshot}");
+            let (mut it, _) = counted_iter(&entries, &tombstones, snapshot);
+            let mut back = Vec::new();
+            it.seek_to_last();
+            while it.valid() {
+                back.push((it.key().to_vec(), it.value().unwrap().to_vec()));
+                it.prev();
+            }
+            it.status().unwrap();
+            back.reverse();
+            assert_eq!(back, want, "{ctx}: reverse scan");
+            let mut forward = Vec::new();
+            it.seek_to_first();
+            while it.valid() {
+                forward.push((it.key().to_vec(), it.value().unwrap().to_vec()));
+                it.next();
+            }
+            assert_eq!(forward, want, "{ctx}: forward scan");
+            // Random walks with direction switches.
+            for _ in 0..10 {
+                let target = vec![b'k', rng.below(key_count + 1) as u8];
+                let mut pos = if rng.chance(50) {
+                    it.seek(&target);
+                    want.partition_point(|(k, _)| *k < target) as i64
+                } else {
+                    it.seek_for_prev(&target);
+                    want.partition_point(|(k, _)| *k <= target) as i64 - 1
+                };
+                for _ in 0..8 {
+                    let expect = usize::try_from(pos).ok().and_then(|p| want.get(p));
+                    match expect {
+                        Some((k, v)) => {
+                            assert!(it.valid(), "{ctx}: walk ended early at {pos}");
+                            assert_eq!(
+                                (it.key(), &it.value().unwrap()[..]),
+                                (k.as_slice(), v.as_slice()),
+                                "{ctx}: walk at {pos}"
+                            );
+                        }
+                        None => {
+                            assert!(!it.valid(), "{ctx}: walk past the end at {pos}");
+                            break;
+                        }
+                    }
+                    if rng.chance(50) {
+                        it.next();
+                        pos += 1;
+                    } else {
+                        it.prev();
+                        pos -= 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "bench: cargo test --release -p nabedra-kv -- --ignored ns18_memtable --nocapture"]
 fn ns18_memtable_lookup_and_scan_bench() {

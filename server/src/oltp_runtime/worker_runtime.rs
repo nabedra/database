@@ -82,6 +82,9 @@ pub(crate) struct WorkerRuntime {
     changed: Notify,
     admission_cleanup: admission_cleanup::AdmissionCleanup,
     accepting: AtomicBool,
+    /// Set while `data.direct.v1` is active (T7). Direct commits have no
+    /// Status decision, so incremental backups would miss them.
+    direct_commits_active: AtomicBool,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -219,6 +222,7 @@ impl WorkerRuntime {
             changed: Notify::new(),
             admission_cleanup,
             accepting: AtomicBool::new(true),
+            direct_commits_active: AtomicBool::new(false),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),
@@ -1789,6 +1793,7 @@ impl HttpRuntime for WorkerRuntime {
                     "engine":"oltp", "queue":queue, "scheduler":scheduler,
                     "accept_to_dispatch":accept_to_dispatch,
                     "block_cache":self.services.shared.block_cache_usage(),
+                    "storage":self.services.shared.storage_stats(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
                     "native_thread_budget":self.services.shared.thread_budget()
                 }))
