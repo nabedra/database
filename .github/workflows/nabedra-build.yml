@@ -1,0 +1,280 @@
+# Heavy builds and verification for the remove-RocksDB track, on free standard runners.
+# See .agents/skills/nabedra-builds/SKILL.md. Pilot: push-triggered on the track's branches only.
+# Opt-in jobs: put [ci docker], [ci campaign] or [ci acceptance] in the pushed head commit message,
+# or use workflow_dispatch once this file is on the default branch.
+name: nabedra build
+
+on:
+  push:
+    branches:
+      - nabedra/remove-rocksdb
+      - "nabedra/rr-*"
+  workflow_dispatch:
+    inputs:
+      docker:
+        description: Build both images and run Events acceptance
+        type: boolean
+        default: false
+      campaign:
+        description: Release crash campaign (long modes) and kv_crash
+        type: boolean
+        default: false
+      acceptance:
+        description: Linux OLTP acceptance (no AWS, no benchmarks)
+        type: boolean
+        default: false
+
+concurrency:
+  group: nabedra-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.94.1"
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "4"
+  # Known failures on main (docs/testing/evidence/oltp/scoped-queues/README.md).
+  OLTP_BASELINE_SKIPS: >-
+    --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory
+    --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+
+jobs:
+  kv:
+    name: nabedra-kv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: kv-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: kv-${{ env.RUST_TOOLCHAIN }}-
+      - name: Clippy
+        working-directory: server
+        run: cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings
+      - name: Test
+        working-directory: server
+        run: cargo test --locked -p nabedra-kv 2>&1 | tee ../kv-test.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-test-log
+          path: kv-test.log
+          retention-days: 14
+
+  features:
+    name: feature builds (O02, NS26)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: features-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: features-${{ env.RUST_TOOLCHAIN }}-
+      - name: No RocksDB or C toolchain crates
+        run: python scripts/check_engine_features.py --dependencies-only
+      - name: Check every engine build
+        working-directory: server
+        run: |
+          set -eux
+          cargo check --locked --bin nabedra-db
+          cargo check --locked --bin nabedra-db --no-default-features --features oltp
+          cargo check --locked --bin nabedra-db --no-default-features --features oltp-backup-s3
+          cargo check --locked --bin nabedra-db --no-default-features --features cache
+
+  oltp:
+    name: OLTP library and integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/target
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Build tests
+        working-directory: server
+        run: cargo test --locked --no-default-features --features oltp --lib --tests --no-run
+      - name: Library suite
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
+      - name: Integration tests
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-default-features --features oltp \
+            --test oltp_multiplex --test oltp_worker_queue --test worker_pool --test executor --test protocol \
+            2>&1 | tee ../oltp-integration.log
+      - if: always()
+        run: df -h . && du -sh server/target || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-test-logs
+          path: oltp-*.log
+          retention-days: 14
+
+  events:
+    name: Events tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            server/events/target
+          key: events-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/events/Cargo.lock') }}
+          restore-keys: events-${{ env.RUST_TOOLCHAIN }}-
+      - name: Test
+        working-directory: server/events
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee ../../events-test.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: events-test-log
+          path: events-test.log
+          retention-days: 14
+
+  campaign:
+    name: crash campaign (release, long)
+    if: inputs.campaign || contains(github.event.head_commit.message, '[ci campaign]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: campaign-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock') }}
+          restore-keys: campaign-${{ env.RUST_TOOLCHAIN }}-
+      - name: kv campaign, long modes (NS01, NS04, NS05, NS07, NS09, NS11, NS17)
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
+      - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p nabedra-kv --test store_model --test store_crash --test store_gc -- --ignored --nocapture 2>&1 | tee ../store-long.log
+      - name: SIGKILL and cold start (NS16, D09, R04, O11)
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release --no-default-features --features oltp --test kv_crash -- --nocapture 2>&1 | tee ../kv-crash.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-logs
+          path: |
+            campaign.log
+            store-long.log
+            kv-crash.log
+          retention-days: 14
+
+  docker-oltp:
+    name: OLTP image
+    if: inputs.docker || contains(github.event.head_commit.message, '[ci docker]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          start=$(date +%s)
+          docker build --build-arg NABEDRA_ENGINE=oltp --build-arg BUILD_JOBS=4 -t nabedra-oltp:ci .
+          echo "build_seconds=$(( $(date +%s) - start ))"
+          docker image ls nabedra-oltp:ci
+      - name: Runtime libraries
+        run: docker run --rm --entrypoint ldd nabedra-oltp:ci /usr/local/bin/nabedra-db
+
+  docker-events:
+    name: Events image and acceptance
+    if: inputs.docker || contains(github.event.head_commit.message, '[ci docker]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build
+        run: |
+          start=$(date +%s)
+          docker build -f server/events/deploy/Dockerfile --build-arg BUILD_JOBS=4 -t nabedra-events:ci server
+          echo "build_seconds=$(( $(date +%s) - start ))"
+          docker image ls nabedra-events:ci
+      - name: Acceptance (NS27)
+        run: |
+          docker pull python:3.11-slim-bookworm
+          python server/events/tests/acceptance.py --image nabedra-events:ci --cpus 2 --memory-mib 1536 \
+            --fault-image python:3.11-slim-bookworm --output events-acceptance --logs events-acceptance/logs
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: events-acceptance
+          path: events-acceptance
+          retention-days: 14
+
+  acceptance:
+    name: Linux OLTP acceptance
+    if: inputs.acceptance || contains(github.event.head_commit.message, '[ci acceptance]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Acceptance (no AWS, no comparative benchmarks)
+        run: |
+          python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
+            --category recovery --category growth --output artifacts/oltp-acceptance
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-acceptance
+          path: artifacts/oltp-acceptance
+          retention-days: 14
