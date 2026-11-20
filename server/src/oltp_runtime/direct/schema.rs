@@ -82,13 +82,12 @@ pub(crate) struct StaticSchema {
     /// Tables whose exclusive lifecycle guard a modelled DDL holds.
     exclusive: Mutex<std::collections::HashSet<Uuid>>,
     /// The next this many lifecycle reads fail as an unreachable Catalog.
-    failing_reads: std::sync::atomic::AtomicU32,
+    failing_reads: Mutex<u32>,
 }
 impl StaticSchema {
     /// Models a Catalog that cannot answer the next `count` lifecycle reads.
     pub(crate) fn fail_lifecycle_reads(&self, count: u32) {
-        self.failing_reads
-            .store(count, std::sync::atomic::Ordering::SeqCst);
+        *self.failing_reads.lock().unwrap_or_else(|p| p.into_inner()) = count;
     }
     /// Models a DDL taking (`true`) or releasing the table's exclusive
     /// lifecycle guard.
@@ -109,15 +108,13 @@ impl StaticSchema {
 }
 impl DirectSchema for StaticSchema {
     fn lifecycle(&self, table_id: Uuid, _: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
-        if self
-            .failing_reads
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |left| left.checked_sub(1),
-            )
-            .is_ok()
-        {
+        let failing = {
+            let mut left = self.failing_reads.lock().unwrap_or_else(|p| p.into_inner());
+            let failing = *left > 0;
+            *left = left.saturating_sub(1);
+            failing
+        };
+        if failing {
             return Box::pin(async {
                 Err(ProtocolError::new(
                     ErrorCode::StorageUnavailable,

@@ -359,7 +359,7 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
             read_ts: ReadTs::new(u64::MAX - 1).unwrap(),
             authority,
         };
-        let guard = catalog
+        let _guard = catalog
             .participant()
             .acquire_lifecycle(binding.clone(), GuardMode::Exclusive)
             .await
@@ -427,7 +427,6 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
                 .unwrap(),
             Some(binding)
         );
-        drop(guard);
         runtime.drain().await.unwrap();
     })
     .await

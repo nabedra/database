@@ -1789,7 +1789,7 @@ async fn o12_d11_t7b_activation_waits_for_a_ddl_that_read_the_capability_inactiv
 /// never proposed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d04_t7b_activation_failures_are_retried_inside_the_executor() {
-    let mut cluster = Cluster::new(Options {
+    let cluster = Cluster::new(Options {
         activate: false,
         ..Options::default()
     })
