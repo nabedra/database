@@ -1043,11 +1043,37 @@ impl Inner {
             Some(journal) => journal.close(),
             None => Ok(()),
         };
+        self.release_memtables();
         lock(&self.lock_file).take();
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
         }
         result
+    }
+
+    /// Drops the store's memtables at close, so their budget charge is gone when `close`
+    /// or the last `Store` drop returns (NS17). `Inner` itself may outlive that: a
+    /// background thread holds the `Arc<Inner>` it upgraded until its job returns, which
+    /// is after `end_job` let `shutdown` go on. Once the journal is closed nothing applies
+    /// to a memtable or reads the current super-version again; snapshots and iterators
+    /// that outlive the store keep their own super-version, so their memtables stay
+    /// charged until they drop.
+    fn release_memtables(&self) {
+        let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
+        let empty = MemEntry::new(
+            Memtable::new(self.memtable_options, None),
+            self.tracker.clone(),
+            sv.mem.last_seq(),
+        );
+        let version = sv.version.clone();
+        self.publish_sv(
+            &mut sv,
+            SuperVersion {
+                mem: empty,
+                imm: Vec::new(),
+                version,
+            },
+        );
     }
 
     fn schedule_flush(&self) {

@@ -178,3 +178,49 @@ fn ns10_full_scan_respects_the_open_run_limit() {
         assert_eq!(it.key(), key.as_bytes());
     }
 }
+
+/// NS17 (KVfix3): `close` and drop free the memtable charges before they return. A
+/// background thread runs a job on an `Arc<Inner>` it upgraded from its queue entry and
+/// releases it only after `end_job`, so `shutdown` can return while that thread still
+/// holds the store; the last reference then drops on the background thread, later. The
+/// clone below stands in for that thread.
+#[test]
+fn ns17_close_frees_memtable_charges_while_a_background_thread_holds_the_store() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let bg = Background::new(2).unwrap();
+    let budget = Arc::new(MemtableBudget::new(8 << 20));
+    for close in [true, false] {
+        let mut options = small(Arc::new(fs.clone()), &bg, 16);
+        options.memtables = budget.clone();
+        // Large enough that nothing flushes on its own: an active and an immutable
+        // memtable.
+        options.memtable_bytes = 1 << 20;
+        let store = Store::open(Path::new("/db/kv"), options).unwrap().store;
+        for i in 0..64u32 {
+            let mut b = WriteBatch::new();
+            b.put(format!("k{i:04}").as_bytes(), &[b'v'; 100]);
+            store
+                .submit(b, Durability::NoSync, Box::new(()))
+                .unwrap()
+                .wait()
+                .unwrap();
+            if i == 31 {
+                store.inner.freeze_active();
+            }
+        }
+        assert!(budget.used() > 0);
+        let background_thread = store.inner.clone();
+        if close {
+            store.close().unwrap();
+        } else {
+            drop(store);
+        }
+        assert_eq!(
+            budget.used(),
+            0,
+            "charged after the store was closed (close: {close})"
+        );
+        drop(background_thread);
+    }
+}
