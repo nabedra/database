@@ -236,7 +236,12 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
-        DirectCapability { actor, action, .. } => direct::apply(tx, state, position, *actor, action),
+        DirectCapability {
+            actor,
+            action,
+            unix_ms,
+            ..
+        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }

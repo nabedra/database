@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -74,6 +75,10 @@ class RuntimeServer(AbstractContextManager):
             else:
                 for name in ('NABEDRA_OLTP_TEST_COLD',):
                     env.pop(name, None)
+            if getattr(self, 'hold_direct', None):
+                env['NABEDRA_OLTP_TEST_DIRECT_HOLD'] = self.hold_direct
+            else:
+                env.pop('NABEDRA_OLTP_TEST_DIRECT_HOLD', None)
             if getattr(self, 'barrier_stage', None):
                 env.update(NABEDRA_OLTP_TEST_STAGE=self.barrier_stage,
                     NABEDRA_OLTP_TEST_REQUEST=self.barrier_request,
@@ -623,11 +628,121 @@ def failure_boundaries(test_executable):
                 server.log.close()
 
 
+def wait_direct_active(server):
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        capability = server.stats()['direct_capability']
+        if capability['active']:
+            return capability
+        assert server.process.poll() is None, 'server died before data.direct.v1 activated'
+        time.sleep(.1)
+    raise TimeoutError('data.direct.v1 did not activate')
+
+
+def activation_boundary(test_executable):
+    """T7c (O15, D03): eligible mutations a queue owner reserved before
+    data.direct.v1 activated carry no forward marker. Control records that
+    queued history when the owner reserves them, and the activation opens a
+    window in which only the queued path answers new mutation ids, so:
+    - a request queued before activation and still in flight at activation,
+      retried with the same id after it, executes once and returns the
+      original result; the same id with another body conflicts;
+    - a request abandoned before activation by a cold start, retried after
+      activation, answers 404 abandoned and never executes.
+    Activation is held by a test-only file until the request is queued."""
+    for variation in ('in-flight', 'abandoned'):
+        with tempfile.TemporaryDirectory(prefix='nabedra-o15-boundary-' + variation + '-') as directory:
+            server = RuntimeServer(test_executable, directory)
+            server.test_executable = str(Path(test_executable).resolve())
+            hold = server.root / 'hold-direct'
+            hold.write_text('held')
+            server.hold_direct = str(hold)
+            server.barrier_stage = 'queued'
+            server.barrier_request = str(uuid.uuid4())
+            try:
+                server.start()
+                db = Database(url=server.url, token=server.token, database='test', timeout=20)
+                table = db.create_table('boundary', {'id': str, 'value': int}, key='id')
+                # Eligible, before activation: the owner records queued history.
+                table.insert({'id': 'seed', 'value': 1})
+                operation = dict(request_id=server.barrier_request, operation='table.insert',
+                    payload=dict(table_id=table.id, row={'id': 'target', 'value': 7}))
+                status, accepted = raw(server.url, '/v1/requests', operation, token=server.token)
+                assert status == 202 and accepted['run_id'] == server.run_id, accepted
+                deadline = time.monotonic() + 20
+                marker = server.root / 'reached'
+                while not marker.exists() and time.monotonic() < deadline:
+                    assert server.process.poll() is None, 'server died before the queued barrier'
+                    time.sleep(.01)
+                assert marker.read_text() == 'queued', 'queued barrier was not reached'
+                assert not server.stats()['direct_capability']['active'], 'activated before the request was queued'
+                old_run = server.run_id
+                hold.unlink()
+                if variation == 'abandoned':
+                    server.stop(abrupt=True)
+                    server.barrier_stage = None
+                    server.start(cold_start=True)
+                    assert server.run_id != old_run
+                capability = wait_direct_active(server)
+                assert capability['history_settling'], capability
+                db = Database(url=server.url, token=server.token, database='test', timeout=20)
+                table = db.table('boundary')
+                if variation == 'abandoned':
+                    status, retried = raw(server.url, '/v1/operations', operation, token=server.token)
+                    assert status == 404 and retried['error']['outcome'] == 'unknown', retried
+                    assert 'abandon' in retried['error']['message'], retried
+                    assert table.get('target') is None
+                    assert table.query().count() == 1
+                    table.insert({'id': 'target', 'value': 9})
+                    delayed = raw(server.url, '/v1/requests', operation, token=server.token)
+                    assert delayed[0] == 404, delayed
+                    status, again = raw(server.url, '/v1/operations', operation, token=server.token)
+                    assert status == 404 and 'abandon' in again['error']['message'], again
+                    assert table.get('target') == {'id': 'target', 'value': 9}
+                    assert table.query().count() == 2
+                else:
+                    # The original is still held in flight; its retry joins it.
+                    results = {}
+                    retry = threading.Thread(target=lambda: results.update(
+                        reply=raw(server.url, '/v1/operations', operation, token=server.token, timeout=60)))
+                    retry.start()
+                    time.sleep(1)
+                    (server.root / 'release').write_text('release')
+                    retry.join(90)
+                    assert not retry.is_alive(), 'retry did not finish'
+                    assert results['reply'] == (200, {'request_id': operation['request_id'], 'data': None}), results
+                    status, receipt = raw(server.url, '/v1/requests/' + old_run + '/' + operation['request_id'],
+                                          token=server.token)
+                    assert status == 200 and receipt['state'] == 'succeeded', receipt
+                    other = dict(operation, payload=dict(table_id=table.id, row={'id': 'other', 'value': 1}))
+                    status, conflict = raw(server.url, '/v1/operations', other, token=server.token)
+                    assert status == 409 and conflict['error']['code'] == 'conflict', conflict
+                    assert table.get('target') == {'id': 'target', 'value': 7}
+                    assert table.get('other') is None
+                    assert table.query().count() == 2
+                direct = server.stats().get('direct') or {}
+                # Nothing of this history ran directly.
+                assert direct.get('entries_proposed', 0) == 0, direct
+                print(json.dumps(dict(variation='activation-boundary-' + variation, status='passed',
+                    scope='actual-run-http-native-rf1', fallbacks=direct.get('fallbacks'),
+                    markers=direct.get('forward_markers_written'))), flush=True)
+            except BaseException:
+                server.log.flush()
+                with (server.root / 'server.log').open('rb') as diagnostics:
+                    diagnostics.seek(0, 2)
+                    diagnostics.seek(max(0, diagnostics.tell() - 8192))
+                    print(diagnostics.read().decode(errors='replace'), file=sys.stderr)
+                raise
+            finally:
+                server.stop()
+                server.log.close()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary')
     parser.add_argument('--test-executable')
-    parser.add_argument('--scenario', choices=('retirement-cold', 'cli', 'failure-boundaries', 'admission', 'snapshot-pressure', 'gateway'), required=True)
+    parser.add_argument('--scenario', choices=('retirement-cold', 'cli', 'failure-boundaries', 'activation-boundary', 'admission', 'snapshot-pressure', 'gateway'), required=True)
     args = parser.parse_args()
     if args.scenario == 'gateway':
         if not args.binary:
@@ -650,8 +765,13 @@ if __name__ == '__main__':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
         failure_boundaries(args.test_executable)
+        activation_boundary(args.test_executable)
         print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(dict(scenario='O15', status='not-run',
             reason='core RF1 queue/prepare/COMMIT histories passed; allocator/Status/shard fence-interruption and decision-order variations remain unexecuted')), flush=True)
+    elif args.scenario == 'activation-boundary':
+        if not args.test_executable:
+            parser.error('--test-executable is required for actual process barriers')
+        activation_boundary(args.test_executable)
     elif not args.binary:
         parser.error('--binary is required')
     elif args.scenario == 'cli':
