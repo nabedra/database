@@ -205,6 +205,7 @@ impl Database {
             store,
             quarantined,
             recovery,
+            ..
         } = Store::open(&kv_dir, options)
             .with_context(|| format!("open Events store {}", kv_dir.display()))?;
         if recovery.tail_truncations > 0 || recovery.manifest_torn_tail {
