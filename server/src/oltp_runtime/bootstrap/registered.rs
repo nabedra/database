@@ -176,6 +176,12 @@ impl LocalServices {
                 placements.control.identity.clone(),
             )?);
             native_timestamps.install_release_reader(rpc.clone(), peer.clone())?;
+            // T3's ReserveWindow predicate (T7): data.direct.v1 is active.
+            native_timestamps.install_direct_gate(
+                super::super::worker_runtime::direct_capability::ControlReserveWindowGate::new(
+                    rpc.clone(),
+                ),
+            );
             for (running, handle) in &status_groups {
                 let node = running.state.resident().node_id();
                 let endpoint = StatusEndpoint::new(

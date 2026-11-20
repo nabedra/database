@@ -195,6 +195,7 @@ async fn o19_native_committed_images_pitr_uuid_and_checked_refusals() {
     )
     .await
     .unwrap();
+    source.without_direct_for_test().await;
     let (_, created) = run(&source, request("table.create", json!({"name":"history","schema":{"id":"utf8","value":"int64"},"key":"id","format":"parquet"}))).await;
     let table = created.result.as_ref().unwrap()["id"]
         .as_str()
@@ -872,6 +873,7 @@ async fn o12_o19_native_index_closure_pitr_and_repeat_restore() {
     )
     .await
     .unwrap();
+    source.without_direct_for_test().await;
     let (_, table) = run(
         &source,
         request(
@@ -1270,6 +1272,7 @@ async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
     )
     .await
     .unwrap();
+    source.without_direct_for_test().await;
     assert!(!source.direct_commits_active(), "off by default");
     source.set_direct_commits_active(true);
     let backup_id = Uuid::new_v4();
@@ -1315,4 +1318,69 @@ async fn o19_incremental_backups_are_refused_while_direct_commits_are_active() {
         )
         .await
         .unwrap();
+}
+
+/// T7: a lone worker is every member, so its own advert activates
+/// `data.direct.v1` in Control; the activation hook turns on the T4fix F2
+/// gate, and incremental backups are refused from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_incremental_backups() {
+    let path = std::env::temp_dir().join(format!("nabedra-direct-activation-{}", Uuid::new_v4()));
+    std::fs::create_dir(&path).unwrap();
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(path.clone());
+    let source = WorkerRuntime::open(
+        &path.join("source"),
+        "test",
+        "direct-activation",
+        ExecutionConfig {
+            max_pending_requests: 8,
+            ..Default::default()
+        },
+        WorkerResources {
+            max_threads: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let switch = source.direct_switch().expect("every runtime has a switch").clone();
+    assert!(switch.direct_oltp(), "direct_oltp defaults to true");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !switch.is_direct_active() {
+        assert!(tokio::time::Instant::now() < deadline, "data.direct.v1 never activated");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(switch.routes_direct() && switch.requires_forward());
+    assert!(source.direct_commits_active(), "activation set the backup gate");
+    assert!(switch.refresh().await.unwrap(), "Control reports it active");
+    let backup_id = Uuid::new_v4();
+    let base = source
+        .backup_native(
+            &path.join("base"),
+            BackupOwnerRef {
+                backup_id,
+                attempt: 1,
+            },
+            None,
+        )
+        .await
+        .expect("a full backup runs while direct commits are active");
+    let refused = source
+        .backup_native(
+            &path.join("incremental"),
+            BackupOwnerRef {
+                backup_id,
+                attempt: 2,
+            },
+            Some(base),
+        )
+        .await
+        .expect_err("incremental backups are refused once active");
+    assert_eq!(refused.code, ErrorCode::UnsupportedOperation);
 }

@@ -63,6 +63,9 @@ impl NativePlanner {
             )
             .await?;
         let result = async {
+            // Plan section 7: the publication replaces the table lifecycle.
+            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+                .await?;
             let key = MvccKey::CatalogIndex {
                 table_id: maintenance.table_id,
                 index_id: maintenance.index_id,
@@ -428,6 +431,12 @@ impl NativePlanner {
             )
             .await?;
         let result = async {
+            // Plan section 7: a live table's lifecycle changes with the
+            // retirement; a dropped table was fenced by its drop.
+            if table.is_some() {
+                self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+                    .await?;
+            }
             let closed_key = MvccKey::CatalogIndexClosed {
                 table_id: maintenance.table_id,
                 closure_id: closure_id(&maintenance)?,

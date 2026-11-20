@@ -147,6 +147,20 @@ impl IndexService {
                 guards: vec![guard],
             }).await;
         }
+        // Plan section 7: direct writers stop at the Data log before the
+        // source pin, so every direct commit that omitted the new index is
+        // below the backfill cut.
+        if let Err(cause) = self
+            .backend
+            .planner()
+            .fence_direct_writers(&metadata.pin, definition.table_id, Some(metadata.txn.request_id))
+            .await
+        {
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
+        }
         let (pin, source) = match self
             .backend
             .source_pin(metadata.pin.authority, maintenance)
@@ -279,6 +293,18 @@ impl IndexService {
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         };
+        // Plan section 7, as in `declare`: fence before the new source pin.
+        if let Err(cause) = self
+            .backend
+            .planner()
+            .fence_direct_writers(&metadata.pin, next.table_id, Some(metadata.txn.request_id))
+            .await
+        {
+            return self.failed(metadata, PlanError::Guarded {
+                cause: Box::new(cause),
+                guards: vec![guard],
+            }).await;
+        }
         let (pin, source) = match self.backend.source_pin(metadata.pin.authority, next).await {
             Ok(source) => source,
             Err(error) => {

@@ -50,7 +50,7 @@ pub(super) fn supports(
     Ok(load::<WorkerIdentity>(tx, &reader_key(worker))? == Some(worker))
 }
 
-pub(super) fn is_api(
+pub(in crate::oltp_replication::authority::control) fn is_api(
     tx: &mut GroupTransaction<'_>,
     actor: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
