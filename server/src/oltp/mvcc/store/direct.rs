@@ -143,6 +143,52 @@ pub(crate) struct ChildPublished {
     pub authority: Authority,
     pub published_at: CommitTs,
 }
+/// The direct-commit schema state of one Data group (`data.direct.v1`,
+/// plan section 7). A group accepts direct-family commands only once it has
+/// one. `epoch` is what `DirectCommit::schema_epoch` must carry; `lifecycle`
+/// is the Catalog table lifecycle id (`TableRecord::lifecycle_id`) whose
+/// descriptor and index set direct commits must be computed from. `None`
+/// means the table was dropped: every direct commit answers `StaleEpoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectSchema {
+    pub epoch: u64,
+    pub lifecycle: Option<Uuid>,
+}
+impl DirectSchema {
+    /// Whether a descriptor read from the Catalog table record with
+    /// `lifecycle_id` may compute direct commits at `self.epoch`. A leader
+    /// whose cached descriptor fails this check refreshes it or falls back.
+    #[allow(dead_code)] // Read by the leader executor (T5).
+    pub(crate) fn admits(&self, lifecycle_id: Uuid) -> bool {
+        self.lifecycle == Some(lifecycle_id)
+    }
+}
+/// Activates direct commits on a group, or fences them before a DDL
+/// publishes. Proposed only after Control activated `data.direct.v1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectSchemaFence {
+    pub authority: Authority,
+    pub table_id: Uuid,
+    pub change: DirectSchemaChange,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DirectSchemaChange {
+    /// First activation, bound to the lifecycle the proposer read from the
+    /// Catalog while no exclusive lifecycle guard (DDL) was held or pending
+    /// on the table. A no-op when the group already has a direct schema, so
+    /// a DDL fence that applied first is never undone.
+    Activate { lifecycle: Uuid },
+    /// The DDL coordinator commits this before the Catalog publishes the
+    /// table's next lifecycle (`Some`, index publication) or its drop
+    /// (`None`). It bumps the epoch, so a `DirectCommit` computed from the
+    /// previous descriptor fails at apply. Repeating the same lifecycle is
+    /// a no-op.
+    Fence { lifecycle: Option<Uuid> },
+}
+
 /// The cutoff a leader proposes at `now_unix_ms` for `retention_ms`.
 /// `None` while nothing can be old enough yet.
 #[allow(dead_code)] // Called by the leader's expiry task (T5).
@@ -466,6 +512,10 @@ pub(super) fn apply(
     let Some(config) = config else {
         return rejected(tx, Fault::NotInitialized);
     };
+    // 0. `data.direct.v1` reached this group (the store-side gate).
+    let Some(schema) = config.direct_schema else {
+        return rejected(tx, Fault::DirectInactive);
+    };
     if let Some(fault) = well_formed(group, command)? {
         return rejected(tx, fault);
     }
@@ -482,8 +532,12 @@ pub(super) fn apply(
     if config.authority != command.authority {
         return rejected(tx, Fault::StaleAuthority);
     }
-    // 3. Both epochs.
-    if config.schema_epoch != command.schema_epoch || config.routing_epoch != command.routing_epoch
+    // 3. Both epochs. The schema epoch is the group's direct epoch, which
+    //    a DDL fence bumps before the Catalog publishes (plan section 7); a
+    //    dropped table takes no direct commit.
+    if schema.lifecycle.is_none()
+        || schema.epoch != command.schema_epoch
+        || config.routing_epoch != command.routing_epoch
     {
         return rejected(tx, Fault::StaleEpoch);
     }
@@ -632,6 +686,9 @@ pub(super) fn forward(
     let Some(config) = config else {
         return rejected(tx, Fault::NotInitialized);
     };
+    if config.direct_schema.is_none() {
+        return rejected(tx, Fault::DirectInactive);
+    }
     let anchor = MvccKey::Row {
         table_id: command.table_id,
         primary_key: command.anchor.clone(),
@@ -692,6 +749,9 @@ pub(super) fn pause(
     let Some(mut config) = config else {
         return reject(tx, Fault::NotInitialized);
     };
+    if config.direct_schema.is_none() {
+        return reject(tx, Fault::DirectInactive);
+    }
     if !matches!(group.kind, GroupKind::Data { .. }) || command.split_id.is_nil() {
         return reject(tx, Fault::InvalidBinding);
     }
@@ -839,6 +899,9 @@ pub(super) fn expire(
     let Some(config) = config else {
         return reject(tx, Fault::NotInitialized);
     };
+    if config.direct_schema.is_none() {
+        return reject(tx, Fault::DirectInactive);
+    }
     if !matches!(group.kind, GroupKind::Data { .. })
         || command.max_items == 0
         || command.max_items > MAX_DIRECT_EXPIRE_ITEMS
@@ -985,6 +1048,52 @@ pub(super) fn image_from_record(
         commit_ts,
         value: Some(CanonicalJson::from_stored_json(value, owner)?),
     }))
+}
+
+/// Activates direct commits on the group or fences them for a DDL (plan
+/// section 7). Not gated by the group's own state: it is the activation.
+/// Control gates it, like every direct-family command.
+pub(super) fn schema(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<Config>,
+    command: &DirectSchemaFence,
+) -> Result<Transition, ProtocolError> {
+    let Some(mut config) = config else {
+        return reject(tx, Fault::NotInitialized);
+    };
+    if !matches!(&group.kind, GroupKind::Data { table_id, .. } if *table_id == command.table_id)
+        || command.authority.validate().is_err()
+    {
+        return reject(tx, Fault::InvalidBinding);
+    }
+    if config.authority != command.authority {
+        return reject(tx, Fault::StaleAuthority);
+    }
+    let next = match (config.direct_schema, command.change) {
+        (Some(current), DirectSchemaChange::Activate { .. }) => current,
+        (None, DirectSchemaChange::Activate { lifecycle }) => DirectSchema {
+            epoch: config.schema_epoch,
+            lifecycle: Some(lifecycle),
+        },
+        (Some(current), DirectSchemaChange::Fence { lifecycle })
+            if current.lifecycle == lifecycle =>
+        {
+            current
+        }
+        (current, DirectSchemaChange::Fence { lifecycle }) => {
+            let base = current.map_or(config.schema_epoch, |current| current.epoch);
+            let Some(epoch) = base.checked_add(1) else {
+                return reject(tx, Fault::ResourceLimit);
+            };
+            DirectSchema { epoch, lifecycle }
+        }
+    };
+    if config.direct_schema != Some(next) {
+        config.direct_schema = Some(next);
+        tx.put_serialized(CONFIG, &config)?;
+    }
+    commit(tx, &ParticipantReply::DirectSchema(next))
 }
 
 /// The highest direct commit timestamp applied on this group.

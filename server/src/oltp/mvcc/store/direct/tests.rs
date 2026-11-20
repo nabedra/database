@@ -171,6 +171,15 @@ impl std::ops::DerefMut for OtherReplica {
 impl Fixture {
     /// Another worker's replica of this group, with the fence applied.
     async fn replica_of(&self) -> OtherReplica {
+        let mut other = self.replica_of_inactive().await;
+        assert!(matches!(
+            other.submit(self.activation()).await,
+            ParticipantReply::DirectSchema(_)
+        ));
+        other
+    }
+    /// Another worker's replica with only the first fence applied.
+    async fn replica_of_inactive(&self) -> OtherReplica {
         let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", Uuid::new_v4())));
         let mut identity = self.pool_identity.clone();
         identity.worker_id = Uuid::new_v4();
@@ -198,6 +207,16 @@ impl Fixture {
         Self::with(Uuid::new_v4(), full_span()).await
     }
     async fn with(table: Uuid, span: KeySpan) -> Self {
+        let mut f = Self::inactive(table, span).await;
+        let activation = f.activation();
+        assert!(matches!(
+            f.submit(activation).await,
+            ParticipantReply::DirectSchema(_)
+        ));
+        f
+    }
+    /// A fenced group that `data.direct.v1` has not reached yet.
+    async fn inactive(table: Uuid, span: KeySpan) -> Self {
         let shared = shared();
         let dir = Dir(std::env::temp_dir().join(format!("mvcc-direct-{}", Uuid::new_v4())));
         let pool_identity = PoolIdentity {
@@ -252,6 +271,18 @@ impl Fixture {
         let fence = f.first_fence.clone();
         assert!(matches!(f.submit(fence).await, ParticipantReply::Fenced(_)));
         f
+    }
+    /// `data.direct.v1` reaches the group: the store-side gate opens, bound
+    /// to the table's initial Catalog lifecycle (its id, as `table.create`
+    /// writes it).
+    fn activation(&self) -> ParticipantCommand {
+        ParticipantCommand::DirectSchema(DirectSchemaFence {
+            authority: self.authority,
+            table_id: self.table,
+            change: DirectSchemaChange::Activate {
+                lifecycle: self.table,
+            },
+        })
     }
     fn fence(&self, schema_epoch: u64, routing_epoch: u64, span: KeySpan) -> ParticipantCommand {
         ParticipantCommand::Fence {
@@ -856,11 +887,19 @@ async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         command_digest: digest(9),
         membership: None,
     };
-    let first = f.machine().apply(meta(1), entry()).await.unwrap();
+    let first = f
+        .machine()
+        .apply(meta(f.replica.index), entry())
+        .await
+        .unwrap();
     let state = f.dump().await;
     // Raft redelivers the same entry after a crash before the applied index
     // was observed: the stored reply returns and nothing is applied twice.
-    let again = f.machine().apply(meta(1), entry()).await.unwrap();
+    let again = f
+        .machine()
+        .apply(meta(f.replica.index), entry())
+        .await
+        .unwrap();
     assert_eq!(again.as_slice(), first.as_slice());
     assert_eq!(f.dump().await, state);
     drop((first, again));
@@ -876,6 +915,8 @@ async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         ..
     } = f;
     drop(first_fence);
+    // The fence and the activation precede the commit.
+    let next_index = replica.index + 1;
     let shared = replica.shared.clone();
     drop(replica);
     drop(pool);
@@ -883,7 +924,7 @@ async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
     let mut reopened = Replica {
         machine: ParticipantMachine::new(pool.group(group).await.unwrap()).unwrap(),
         shared,
-        index: 2,
+        index: next_index,
     };
     assert_eq!(reopened.dump().await, state, "the commit is durable");
     // The same request proposed again as a new entry replays.
@@ -995,6 +1036,10 @@ async fn d03_o16_dedup_records_follow_their_anchor_row_through_a_split() {
         assert!(matches!(
             child.submit(f.fence(1, 2, span.clone())).await,
             ParticipantReply::Fenced(_)
+        ));
+        assert!(matches!(
+            child.submit(f.activation()).await,
+            ParticipantReply::DirectSchema(_)
         ));
         targets.push(target);
         children.push(child);
@@ -1379,6 +1424,10 @@ async fn d03_o19_dedup_records_survive_backup_images_and_restore() {
     assert!(matches!(
         restored.submit(f.fence(1, 1, full_span())).await,
         ParticipantReply::Fenced(_)
+    ));
+    assert!(matches!(
+        restored.submit(f.activation()).await,
+        ParticipantReply::DirectSchema(_)
     ));
     let state = restored.dump().await;
     assert_eq!(count_tag(&state, DEDUP), 1);
@@ -2531,6 +2580,10 @@ async fn o16_a_split_child_with_a_stray_dedup_record_refuses_staging() {
         child.submit(f.fence(1, 2, left.target_span.clone())).await,
         ParticipantReply::Fenced(_)
     ));
+    assert!(matches!(
+        child.submit(f.activation()).await,
+        ParticipantReply::DirectSchema(_)
+    ));
     // The stray record: a forward marker for a key in the child's span.
     let mut stray = f.forward_of(1, Uuid::new_v4(), 1);
     stray.anchor = Key::Int64(1);
@@ -2591,3 +2644,5 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
     clock.lead(9);
     assert_eq!((clock.pending_len(), clock.pending_key_count()), (0, 0));
 }
+
+mod t7;

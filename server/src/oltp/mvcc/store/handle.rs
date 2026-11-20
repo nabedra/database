@@ -657,6 +657,73 @@ impl ParticipantHandle {
         })
         .await
     }
+    /// The group's direct-commit schema state (`data.direct.v1`, plan
+    /// section 7): `None` until direct commits were activated on it. Read
+    /// behind the linearizable barrier on the local replica; the leader
+    /// executor (T5) calls it on the range leader.
+    #[allow(dead_code)] // Called by the leader executor (T5).
+    pub(crate) async fn direct_schema(
+        &self,
+    ) -> Result<Option<super::direct::DirectSchema>, ProtocolError> {
+        if self.remote.is_some() {
+            return Err(invalid());
+        }
+        self.local_consensus().ensure_linearizable().await?;
+        let raw = self
+            .local_machine()
+            .store
+            .read_metadata(META, |view| {
+                let schema = view
+                    .pinned(CONFIG)?
+                    .map(|raw| {
+                        if raw.len() > METADATA_BYTES {
+                            return Err(recovery_unknown());
+                        }
+                        serde_json::from_slice::<Config>(&raw)
+                            .map(|config| config.direct_schema)
+                            .map_err(|_| recovery_unknown())
+                    })
+                    .transpose()?
+                    .flatten();
+                view.encode(&schema)
+            })
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
+    }
+    /// Activates direct commits on this Data group or fences them for a DDL,
+    /// under the group's current run authority. Only callers that observed
+    /// Control's `data.direct.v1` activation may call it: an older replica
+    /// cannot decode the command.
+    pub(crate) async fn change_direct_schema(
+        &self,
+        change: super::direct::DirectSchemaChange,
+    ) -> Result<super::direct::DirectSchema, ProtocolError> {
+        let GroupKind::Data { table_id, .. } = self.identity().kind else {
+            return Err(invalid());
+        };
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let authority = self.epochs().await?.authority;
+            let applied = self
+                .propose(OwnedCommand::new_owned(
+                    ParticipantCommand::DirectSchema(super::direct::DirectSchemaFence {
+                        authority,
+                        table_id,
+                        change,
+                    }),
+                    self.resources(),
+                    crate::oltp::pool::ByteClass::Progress,
+                )?)
+                .await?;
+            match applied.reply {
+                ParticipantReply::DirectSchema(schema) => return Ok(schema),
+                // A run fence moved between the epoch read and the apply.
+                ParticipantReply::Rejected(Fault::StaleAuthority) if tries < 3 => continue,
+                _ => return Err(invalid()),
+            }
+        }
+    }
     async fn fence_command(
         &self,
         command: ParticipantCommand,
