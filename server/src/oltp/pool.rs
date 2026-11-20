@@ -48,6 +48,7 @@ use storage::{
     GROUP_SCOPE_BYTES, RawIter, commit_error, group_scope, prefix_end, storage_error,
     unsupported_format, wait_commit,
 };
+pub(crate) use storage::{is_no_space, no_space};
 use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
