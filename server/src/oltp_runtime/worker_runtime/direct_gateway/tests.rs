@@ -247,7 +247,10 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         assert_eq!(leader()["entries_applied"], json!(6));
 
         // Without a declared length the request takes the queued path and
-        // still answers the same (the full parsing charge applies).
+        // still answers the same (the full parsing charge applies). The
+        // queue owner settles each eligible mutation at its anchor before it
+        // reserves it (T7c), so none can also run directly.
+        let markers = leader()["forward_markers_written"].as_u64().unwrap();
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
             let (status, envelope) =
@@ -258,7 +261,14 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
                 "step {index}"
             );
         }
-        assert_eq!(gateway.stats().requests, stats.requests);
+        let after = gateway.stats();
+        assert_eq!(after.direct_done, stats.direct_done, "{after:?}");
+        assert!(after.forwards >= 8, "{after:?}");
+        assert!(
+            leader()["forward_markers_written"].as_u64().unwrap() >= markers + 8,
+            "{}",
+            leader()
+        );
 
         // The runtime stats show the gateway, the executor and the switch.
         let reply = runtime.stats().await.unwrap();

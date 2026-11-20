@@ -178,6 +178,11 @@ pub(crate) enum ControlCommand {
         operation_id: Uuid,
         actor: WorkerIdentity,
         action: super::DirectCapabilityOperation,
+        /// The proposer's wall clock (Unix ms). An activation records it, so
+        /// every process measures the queued-history window (T7c) from the
+        /// same instant.
+        #[serde(default)]
+        unix_ms: u64,
     },
     ScopedQueue {
         operation_id: Uuid,

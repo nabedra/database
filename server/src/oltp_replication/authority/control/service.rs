@@ -536,6 +536,7 @@ impl ControlHandle {
                 action: super::DirectCapabilityOperation::Advertise {
                     version: super::DIRECT_VERSION,
                 },
+                unix_ms: super::direct::wall_ms(),
             })
             .await?;
         }

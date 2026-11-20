@@ -63,6 +63,11 @@ pub(super) struct PreparedSubmission {
     body: ChargedBytes,
     authorization: OriginalAuthorization,
 }
+impl PreparedSubmission {
+    pub(super) fn body(&self) -> &[u8] {
+        self.body.as_ref()
+    }
+}
 pub(crate) enum ReservationResult {
     Reserved(ReservedSubmission),
     Abandoned(IdentityReservation),

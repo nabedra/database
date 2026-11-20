@@ -290,6 +290,13 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
   `SplitInProgress`, which the gateway treats as `Fallback`, not as a stale route.
 - **Range clock.** A pending commit is bound to the leadership generation in which its timestamp was fetched, and a
   leadership change fails reads that were waiting on pending commits instead of releasing them.
+- **Activation boundary (T7c, 2026-11-20).** The queue owner applies the forward rule where it reserves the request
+  ID, gets included, whatever the sending gateway did. Before its switch observes activation, the owner first sends
+  Control `QueuedHistory`. Control then activates, and the owner settles the request, or it durably records that
+  unsettled queued history exists. An activation with that history opens a window of one dedup retention. Inside
+  it, a leader answers `Fallback{History}` for any ID with no record at its anchor, so the queued path answers
+  pre-activation IDs: the original result, a conflict, or `404` abandoned. A direct get also checks its key's
+  record.
 
 ## Out of scope
 

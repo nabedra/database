@@ -46,6 +46,7 @@ impl ControlHandle {
             operation_id,
             actor: session.remote(),
             action,
+            unix_ms: crate::oltp_replication::authority::control::direct::wall_ms(),
         };
         let applied = if let Some(leader) = leader {
             let owned = OwnedCommand::new_owned(command, self.resources(), ByteClass::Progress)?;

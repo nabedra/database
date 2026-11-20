@@ -119,10 +119,14 @@ impl DirectTimestampSource for Counter {
     }
 }
 
-struct Gate(AtomicBool);
+/// `.0`: `data.direct.v1` active; `.1`: the queued-history window (T7c).
+struct Gate(AtomicBool, AtomicBool);
 impl DirectGate for Gate {
     fn direct_active(&self) -> bool {
         self.0.load(Ordering::Acquire)
+    }
+    fn history_settling(&self) -> bool {
+        self.1.load(Ordering::Acquire)
     }
 }
 
@@ -255,7 +259,7 @@ impl Cluster {
                 .map(|worker| (worker.worker_id, worker.clone()))
                 .collect(),
         ));
-        let gate = Arc::new(Gate(AtomicBool::new(true)));
+        let gate = Arc::new(Gate(AtomicBool::new(true), AtomicBool::new(false)));
         let schema = Arc::new(StaticSchema::default());
         let index = Uuid::new_v4();
         schema.insert(DirectTable {
@@ -1293,6 +1297,162 @@ async fn d03_forward_markers_settle_request_ids_before_the_queued_path() {
         Some((ErrorCode::Conflict, Outcome::NotApplied))
     );
     assert_eq!(v.executor.stats().forward_markers_written, 1);
+    cluster.shutdown().await;
+}
+
+/// T7c, O15/D03: inside the queued-history window a leader executes no
+/// mutation whose anchor holds no dedup record: it may be the retry of a
+/// queued request reserved before activation without a marker, which only
+/// the queued path can answer. It answers `Fallback{History}` and writes
+/// nothing; gets answer the same. The gateway's forward still settles the
+/// id (a marker), and an id that already committed directly still replays
+/// its result. After the window the same leader executes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let v = &cluster.voters[leader];
+    // Committed directly before the window opens on this leader (a leader
+    // whose clock passed the window's end, then one whose clock did not).
+    let committed = Uuid::new_v4();
+    let upsert = cluster.body(
+        committed,
+        "table.upsert",
+        serde_json::json!({"row": {"id": 4, "value": 4, "tag": "b", "score": 0.0}}),
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &upsert, committed))
+            .await,
+        done("null")
+    );
+    let entries = v.executor.stats().entries_proposed;
+    cluster.gate.1.store(true, Ordering::Release);
+
+    let history = DirectResponse::Fallback {
+        reason: FallbackReason::History,
+    };
+    let id = Uuid::new_v4();
+    let insert = cluster.body(
+        id,
+        "table.insert",
+        serde_json::json!({"row": {"id": 3, "value": 3, "tag": "a", "score": 0.0}}),
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &insert, id))
+            .await,
+        history
+    );
+    let update = Uuid::new_v4();
+    let update_body = cluster.body(
+        update,
+        "table.update",
+        serde_json::json!({"key": 4, "values": {"value": 40}}),
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &update_body, update))
+            .await,
+        history,
+        "an existing row changes nothing either"
+    );
+    assert_eq!(
+        v.executor.stats().entries_proposed,
+        entries,
+        "nothing proposed"
+    );
+    assert_eq!(
+        cluster.latest(leader, cluster.row_key(3)).await,
+        (None, None)
+    );
+    // The direct commit still replays inside the window.
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &upsert, committed))
+            .await,
+        done("null")
+    );
+    // A get may be the retry of a queued read accepted before activation
+    // too: the same answer, nothing read.
+    let get = Uuid::new_v4();
+    let get_body = cluster.body(get, "table.get", serde_json::json!({"key": 4}));
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &get_body, get))
+            .await,
+        history
+    );
+    // The gateway settles the fallen-back id: a marker, then the queued path.
+    assert_eq!(
+        v.executor
+            .forward(&v.handle, cluster.request(leader, &insert, id))
+            .await,
+        DirectResponse::Fallback {
+            reason: FallbackReason::Forwarded
+        }
+    );
+    assert_eq!(v.executor.stats().forward_markers_written, 1);
+    let stats = serde_json::to_value(v.executor.stats()).unwrap();
+    assert_eq!(
+        stats["fallbacks"]["history"],
+        serde_json::json!(3),
+        "{stats}"
+    );
+
+    // After the window: the marker keeps `id` on the queued path; a new id
+    // executes directly again.
+    cluster.gate.1.store(false, Ordering::Release);
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &insert, id))
+            .await,
+        DirectResponse::Fallback {
+            reason: FallbackReason::Forwarded
+        }
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &update_body, update))
+            .await,
+        done("true")
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &get_body, get))
+            .await,
+        done(r#"{"id":4,"score":0.0,"tag":"b","value":40}"#)
+    );
+    // A queued read is settled like a mutation: its marker keeps a later
+    // direct get of the same id on the queued path.
+    let read = Uuid::new_v4();
+    let read_body = cluster.body(read, "table.get", serde_json::json!({"key": 4}));
+    let forwarded = DirectResponse::Fallback {
+        reason: FallbackReason::Forwarded,
+    };
+    assert_eq!(
+        v.executor
+            .forward(&v.handle, cluster.request(leader, &read_body, read))
+            .await,
+        forwarded
+    );
+    assert_eq!(
+        v.executor
+            .execute(&v.handle, cluster.request(leader, &read_body, read))
+            .await,
+        forwarded
+    );
+    // A get reusing a direct mutation's id on its key conflicts, as the
+    // queued path's identity would.
+    let reuse = cluster.body(committed, "table.get", serde_json::json!({"key": 4}));
+    assert_eq!(
+        code(
+            &v.executor
+                .execute(&v.handle, cluster.request(leader, &reuse, committed))
+                .await
+        ),
+        Some((ErrorCode::Conflict, Outcome::NotApplied))
+    );
     cluster.shutdown().await;
 }
 
