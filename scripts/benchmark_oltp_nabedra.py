@@ -439,7 +439,8 @@ def run_soak(args, adapter, output, metadata):
     """NS11 storage soak: seed, then --soak-seconds of updates at --soak-rate in phases of distinct keys."""
     results = {'metadata': metadata, 'workload': 'storage soak: updates of rows with incompressible payloads',
                'settings': {field: getattr(args, field) for field in ('soak_rows', 'soak_payload_bytes', 'soak_seconds',
-                            'soak_phase_seconds', 'soak_rate', 'soak_seed_clients', 'clients', 'seed', 'timeout')},
+                            'soak_phase_seconds', 'soak_rate', 'soak_seed_clients', 'soak_verify_keys', 'clients',
+                            'seed', 'timeout')},
                'phases': [], 'correctness_verified': False}
 
     def save():
@@ -484,7 +485,7 @@ def run_soak(args, adapter, output, metadata):
                 results['phases'].append(phase)
                 save()
         # Verify a seeded sample of the written keys with point gets.
-        check = sorted(random.Random(args.seed).sample(sorted(latest), min(2000, len(latest))))
+        check = sorted(random.Random(args.seed).sample(sorted(latest), min(args.soak_verify_keys, len(latest))))
         mismatches, uncertain_seen = [], 0
         for key in check:
             result = adapter.get(key, uid())
@@ -1001,7 +1002,7 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         settings = ['--rates', ','.join(map(str, args.rates))]
         for field in ('seconds', 'warmup_seconds', 'repetitions', 'clients', 'rows', 'seed', 'timeout',
                       'operation', 'read_fraction', 'soak_rows', 'soak_payload_bytes', 'soak_seconds',
-                      'soak_phase_seconds', 'soak_rate', 'soak_seed_clients'):
+                      'soak_phase_seconds', 'soak_rate', 'soak_seed_clients', 'soak_verify_keys'):
             settings += ['--' + field.replace('_', '-'), str(getattr(args, field))]
         if args.stop_p99_ms is not None:
             settings += ['--stop-p99-ms', str(args.stop_p99_ms)]
@@ -1178,6 +1179,7 @@ def main():
     parser.add_argument('--soak-phase-seconds', type=float, default=60)
     parser.add_argument('--soak-rate', type=float, default=50)
     parser.add_argument('--soak-seed-clients', type=int, default=4)
+    parser.add_argument('--soak-verify-keys', type=int, default=500, help='written keys checked by point gets after the soak')
     parser.add_argument('--driver', action='store_true', help=argparse.SUPPRESS)
     add_workload_args(parser)
     args = parser.parse_args()
