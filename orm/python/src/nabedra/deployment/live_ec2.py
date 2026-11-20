@@ -243,7 +243,7 @@ class Ec2GrowthAdapter:
         pool = template.pool
         return dict(profile='ebs', worker=worker, generation=1, mount_path=pool.mount_path,
                     provider_volume_id=volume_id, filesystem_uuid=pool.filesystem_uuid,
-                    identity=dict(engine='oltp', pool_format_version=1, cluster_id=self.cluster_id,
+                    identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
                                   worker_id=worker['worker_id'], pool_id=pool.pool_id))
 
     def _staged_ready(self, template, worker, record, volumes, inventory, deadline):
@@ -531,7 +531,7 @@ class Ec2GrowthAdapter:
                 return None
             return {'worker': target.worker, 'profile': 'ebs', 'generation': target.pool_generation,
                     'provider_volume_id': volume_id, 'filesystem_uuid': slot.filesystem_uuid,
-                    'mount_path': slot.mount_path, 'identity': {'engine': 'oltp', 'pool_format_version': 1,
+                    'mount_path': slot.mount_path, 'identity': {'engine': 'oltp', 'pool_format_version': 2,
                     'cluster_id': self.cluster_id, 'worker_id': target.worker['worker_id'], 'pool_id': target.pool_id}}
         if self.provider.local_host is not None and self.provider.local_host.instance_id == instance_id:
             inventory = controller._read('storage.growth.inventory', {}, deadline=deadline)

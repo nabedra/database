@@ -544,7 +544,7 @@ function spend(stateful: Records, pvcs: Records, policy: KubeRecord, reservedWor
 
 function mount(adapter: EksGrowthAdapter, template: EksWorkerTemplate, worker: JsonObject, volumeId: string, filesystem: string): JsonObject {
   return { profile: "ebs", worker, generation: 1, mount_path: template.mountPath, provider_volume_id: volumeId,
-    filesystem_uuid: filesystem, identity: { engine: "oltp", pool_format_version: 1, cluster_id: adapter.clusterId,
+    filesystem_uuid: filesystem, identity: { engine: "oltp", pool_format_version: 2, cluster_id: adapter.clusterId,
       worker_id: worker.worker_id, pool_id: template.poolId } }
 }
 

@@ -77,7 +77,7 @@ export function ebsMount(value: unknown, clusterId: string, worker?: unknown): J
   const pool = requireRecord(expected.identity)
   const mountedWorker = requireRecord(expected.worker)
   const path = expected.mount_path
-  if (expected.profile !== "ebs" || pool.cluster_id !== clusterId || pool.engine !== "oltp" || pool.pool_format_version !== 1
+  if (expected.profile !== "ebs" || pool.cluster_id !== clusterId || pool.engine !== "oltp" || pool.pool_format_version !== 2
     || pool.worker_id !== mountedWorker.worker_id || (worker !== undefined && !isDeepStrictEqual(worker, mountedWorker))
     || typeof expected.provider_volume_id !== "string" || !volumeId.test(expected.provider_volume_id)
     || typeof path !== "string" || !path.startsWith("/") || path.includes("\0")

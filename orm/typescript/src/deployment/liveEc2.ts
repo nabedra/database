@@ -257,7 +257,7 @@ function mountExpectation(adapter: Ec2GrowthAdapter, worker: JsonObject, volumeI
   generation: number | bigint = 1): JsonObject {
   return {
     profile: "ebs", worker, generation, mount_path: slot.mountPath, provider_volume_id: volumeId, filesystem_uuid: slot.filesystemUuid,
-    identity: { engine: "oltp", pool_format_version: 1, cluster_id: adapter.clusterId, worker_id: worker.worker_id, pool_id: slot.poolId },
+    identity: { engine: "oltp", pool_format_version: 2, cluster_id: adapter.clusterId, worker_id: worker.worker_id, pool_id: slot.poolId },
   }
 }
 

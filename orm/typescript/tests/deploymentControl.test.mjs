@@ -89,7 +89,7 @@ test("closed worker permit requires the retained EBS mount and same-run quorum",
   const expected = {
     profile: "ebs", worker, generation: 1, mount_path: "/storage/pool",
     provider_volume_id: "vol-a1234567", filesystem_uuid: randomUUID(),
-    identity: { cluster_id: clusterId, engine: "oltp", pool_format_version: 1, worker_id: worker.worker_id, pool_id: randomUUID() },
+    identity: { cluster_id: clusterId, engine: "oltp", pool_format_version: 2, worker_id: worker.worker_id, pool_id: randomUUID() },
   }
   const record = {
     id: drainId, growth_claim: randomUUID(), intent: { worker, run_id: runId, native_target: nativeTarget },

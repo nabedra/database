@@ -155,7 +155,7 @@ test("EC2 volume retries retain the same claim and remain pending until filesyst
 test("A02 EC2 stop needs closed Control evidence and detach waits for exact-host unmount", async t => {
   const expected = { profile: "ebs", worker, generation: 1, provider_volume_id: volumeId, mount_path: "/pool",
     filesystem_uuid: filesystemUuid, identity: { pool_id: poolId, worker_id: workerId, cluster_id: clusterId,
-      engine: "oltp", pool_format_version: 1 } }
+      engine: "oltp", pool_format_version: 2 } }
   const mount = { expected, mount_id: 1, root_inode: 2, device_major: 3, device_minor: 4 }
   const drain = { id: drainId, growth_claim: claimId,
     intent: { worker, run_id: runId, native_target: { kind: "ec2", instance_id: instanceId } },
