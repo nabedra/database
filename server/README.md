@@ -80,11 +80,12 @@ cargo build --locked --manifest-path server/Cargo.toml --no-default-features --f
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features oltp
 ```
 
-OLTP uses RocksDB on an attached filesystem and does not need an S3 bucket or
-AWS credentials. Native compilation needs a C++ compiler, CMake and libclang.
-On Debian, install `build-essential cmake clang libclang-dev`; on macOS, install
-the Xcode command line tools and make libclang available to bindgen. The lockfile
-pins RocksDB's Rust binding to 0.25.0 and its native library to 11.8.1.
+OLTP stores data on an attached filesystem with `nabedra-kv`, the in-tree storage
+engine in [`kv/`](kv) (design: [native storage engine plan](../plans/native-storage-engine.md)).
+It does not need an S3 bucket or AWS credentials. The build needs Rust and a C
+compiler for the TLS crates (`ring`, `aws-lc-sys`); no C++ compiler, CMake or
+libclang. OLTP data directories from releases before `nabedra-kv` are refused with an
+error that names the path; start those workers on empty volumes.
 `nabedra-db --version` identifies the compiled engine.
 
 The standalone topology uses one worker and one data directory. Registered

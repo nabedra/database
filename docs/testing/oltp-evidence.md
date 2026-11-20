@@ -2,6 +2,13 @@ This ledger records execution for [the OLTP contract](oltp-contract.md) and [imp
 
 The scoped queue rollout has a separate record of its registered RF3 copy, retry, cold-start and comparison runs. [Scoped OLTP queue evidence](evidence/oltp/scoped-queues/README.md)
 
+OLTP storage now runs on `nabedra-kv`, the in-tree engine specified in [the native storage engine plan](../../plans/native-storage-engine.md); its scenarios are the NS rows of [the OLTP contract](oltp-contract.md). Every checkpoint below was measured on the previous native engine and the removed standalone engine. Those observations stay as recorded; they are not evidence for `nabedra-kv`. Current dependency and engine checks:
+
+```sh
+python3.12 scripts/check_engine_features.py --dependencies-only
+cargo test --locked --manifest-path server/Cargo.toml -p nabedra-kv
+```
+
 ## Common runtime integration
 
 The actual `serve` entry point now uses WorkerRuntime with typed Control, timestamp, Status, Catalog and Data Raft groups, guarded MVCC and fixed Prepare/Decide/Resolve transactions. The unchanged [public ORM program](../../server/tests/oltp_orm_contract.py) passed all thirteen operations, exact result types, atomic conflicts, submit/receipt/replay, authentication/database scope, stale handles and 1/100/1,000-row variations against the local RF1 topology. The server exited through SIGTERM and its child was reaped. This is the new runtime, not fixture authority or the legacy Operation-Raft adapter.
@@ -14,7 +21,7 @@ After small integration refinements, the coordinated OLTP all-target compilation
 
 Worktree: `nabedra/oltp-engine-plan`, based on `0d02e105183e12626e18332bfd35a23ba3266530`. The quiet process run captured complete Cargo/Rust/ORM source SHA-256 `f7f96807c7555fb8fad2982dcb91482f0db5fb97a6b0a5191f3099bcf40349ff`, including untracked implementation files. It verified unchanged source and driver hashes throughout execution. Its recorded Git commit `964ac69` contains the original plan; the implementation was still uncommitted when measured. Later source changes require their own checks.
 
-The native dependency spike compiled `rocksdb 0.25.0` and `librocksdb-sys 0.19.0+11.8.1` on this Intel Mac with Rust 1.99.1 and Apple clang 21.0.0. This does not establish the declared minimum Rust version or Linux/Docker compatibility.
+The native dependency spike compiled the previous engine's pinned Rust binding and native library on this Intel Mac with Rust 1.99.1 and Apple clang 21.0.0. This does not establish the declared minimum Rust version or Linux/Docker compatibility.
 
 | Executed check | Observation | Scope |
 | --- | --- | --- |
@@ -52,7 +59,7 @@ export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 export CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
 ```
 
-Representative reproduction commands, with exact executed output retained in the linked artifacts:
+Representative reproduction commands, with exact executed output retained in the linked artifacts. The `oltp_storage` and `oltp_replication` targets were deleted with the standalone engine; the pool-path tests that replace them are listed in the NS28 row of the contract.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=orm/python/src python3.11 -m unittest discover -s orm/python/tests -v

@@ -1,12 +1,12 @@
-This is the serialization argument required by P0 of [the OLTP plan](../../plans/oltp-engine.md). It describes the target distributed protocol. The current standalone and single-group consensus implementations do not establish these assumptions for multiple shards. Read [the executed evidence](../testing/oltp-evidence.md) separately.
+This is the serialization argument required by P0 of [the OLTP plan](../../plans/oltp-engine.md). It describes the target distributed protocol. The current pool-based group stores do not establish these assumptions for multiple shards. Read [the executed evidence](../testing/oltp-evidence.md) separately.
 
 ## Supported operations
 
 Each existing call is one transaction. Read-only operations may scan predicates, order rows and apply a limit. A mutating call reads and writes a known bounded set of primary keys, including absence checks. Create/drop also require lifecycle guards. There are no predicate mutations, multi-call transactions or application read-modify-write transactions. Adding those operations invalidates this restricted argument unless their read and predicate dependencies receive additional validation.
 
-The standalone argument is recorded in [the local engine design](../../server/src/oltp/DESIGN.md). A single replicated group can order atomic operations directly and authorize reads with a fresh quorum barrier plus applied-position wait. That does not establish a common snapshot or atomic commit across independent groups.
+The standalone RF1 engine and its argument were removed; [OLTP storage](../../server/src/oltp/DESIGN.md) describes the group stores that replaced it. A single replicated group can order atomic operations directly and authorize reads with a fresh quorum barrier plus applied-position wait. That does not establish a common snapshot or atomic commit across independent groups.
 
-The current single-group dependency spike logs deterministic `Operation` commands. It is not the target cold-start implementation: replaying such a command still evaluates an application operation. The production command families must instead replay fixed prepared storage changes and authoritative decisions. Control, timestamp and status command types cannot contain application `Request`, `Operation` or `Row` payloads.
+The removed single-group dependency spike logged deterministic `Operation` commands. It was not the target cold-start implementation: replaying such a command still evaluates an application operation. The production command families must instead replay fixed prepared storage changes and authoritative decisions. Control, timestamp and status command types cannot contain application `Request`, `Operation` or `Row` payloads.
 
 The agreed group roles are current `Control` authority, monotonic `Timestamps`, partitioned `Status`, MVCC `Catalog`, and `Data` for one table/shard. Catalog and data use shared version/intent primitives. Enrollment identity and current status authority are not stale application snapshots; schema/name/drop records and published index definitions are.
 
@@ -23,7 +23,7 @@ The agreed group roles are current `Control` authority, monotonic `Timestamps`, 
 9. Timestamp assignment and snapshot retention cannot race garbage collection. `BeginSnapshot` allocates `s` and installs its storage-retention pin in one timestamp-group transition. GC uses the timestamp-ordered pin floor, unresolved transactions and backup/transfer floors, never a raw reserved allocator watermark. Pin release follows owned-work settlement. A cold-run fence can clear abandoned application pins after required recovery fences, but cannot clear an unfinished backup/transfer pin without its own completion or abort proof.
 10. Consensus participants follow the authenticated protocol; Raft does not tolerate Byzantine replicas. Service boundaries verify bounded pages of queue-copy acknowledgments against the authoritative ready-worker set before creating an opaque proof reference. An enrolled worker cannot submit an arbitrary raw release command. The reference binds the pin, authority, ready-set revision/root/count, terminal version and digest, and accepted context. Replicas apply the validated deterministic command and check its current authority and release revision in the same durable transition.
 
-These are proof obligations, not consequences of choosing RocksDB or a Raft library.
+These are proof obligations, not consequences of choosing a storage engine or a Raft library.
 
 ## Serialization order
 
@@ -45,7 +45,7 @@ An unfinished mutation may obtain `c <= s` before its decision is durable while 
 
 A participant timeout cannot authorize rollback. A surviving coordinator resolves the authoritative status record. Reapplying a known decision does not rerun application logic or create another logical mutation.
 
-Likewise, absence from a live storage view after a native write error cannot prove rollback. The pinned RocksDB write path can reach WAL persistence before updating the live memtable. A pool with uncertain write state must recover authoritative storage state before new execution or recomputation. Recovery-required state must be shared by every handle to that physical pool. O29 distinguishes a deterministic model of this interval from actual native fsync or power-loss fault injection.
+Likewise, absence from a live storage view after a native write error cannot prove rollback. A `nabedra-kv` commit reaches the journal before the live memtable, so an error after the journal write can leave durable state invisible until recovery. A pool with uncertain write state must recover authoritative storage state before new execution or recomputation. Recovery-required state must be shared by every handle to that physical pool. O29 distinguishes a deterministic model of this interval from actual native fsync or power-loss fault injection.
 
 Cold start requires authoritative shutdown evidence or explicit authorization. It fences metadata, timestamp, data and status authorities before admitting new mutations. Group fences need not become visible simultaneously, so bootstrap must finish the required fences and reconcile decisions before aborting old preparations. A COMMIT ordered before its group's new fence remains committed. A new old-owner decision ordered after that fence fails. Previously committed state may finish applying after the fence using its existing decision proof.
 
