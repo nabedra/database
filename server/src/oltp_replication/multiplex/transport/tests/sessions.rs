@@ -1341,7 +1341,11 @@ async fn d05_live1_black_holed_peer_fills_only_its_own_lane() {
             TrafficClass::DataConsensus,
             &fixture.client.common.config,
         );
-        eventually(|| lane.available_permits() == 0, "stalled calls hold the lane").await;
+        eventually(
+            || lane.available_permits() == 0,
+            "stalled calls hold the lane",
+        )
+        .await;
         assert!(matches!(
             fixture
                 .call(&fixture.data_group, Purpose::Raft, "excess")

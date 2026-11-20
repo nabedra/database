@@ -438,9 +438,9 @@ impl DamageControl for ControlClient {
 pub(crate) trait DamageSink: Send + Sync {
     fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool);
     /// RV-APPLY F4: the supervisor stopped this replica after its Raft core
-    /// kept failing. Nothing is released: the bytes stay until an operator
-    /// acts, but Control replaces the replica.
-    fn gave_up(&self, _group: GroupIdentity, _replica: ReplicaMember) {}
+    /// kept failing. Control replaces the replica; once that change commits
+    /// the replica's bytes on `pool` are released (RV-FINAL M4).
+    fn gave_up(&self, _group: GroupIdentity, _replica: ReplicaMember, _pool: OltpPool) {}
 }
 
 /// Rules 2 and 4 on the damaged worker. Reports the replica until Control
@@ -570,15 +570,20 @@ impl DamageSink for ReportingDamageSink {
         };
         self.send(report, Some(pool));
     }
-    /// Reported with the existing wire reason `pool_refused` (class `other`):
-    /// an older Control decodes it, and like a refused pool nothing is
-    /// released (`pool` is `None`). A dedicated reason needs a gated variant.
-    fn gave_up(&self, group: GroupIdentity, replica: ReplicaMember) {
+    /// Reported with the existing wire reason `pool_refused` (class `other`),
+    /// which every Control of this release decodes; a dedicated reason needs
+    /// a gated variant (RV-FINAL M4 follow-up). The log line names the real
+    /// cause. Unlike a refused pool, the pool is open, so the replica's
+    /// bytes are released once Control's replacement commits.
+    fn gave_up(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool) {
         if group.kind == GroupKind::Control {
             tracing::error!(group = %group.group_id, node = replica.node_id,
                 "a Control replica was given up; replace it through Control membership");
             return;
         }
+        tracing::error!(group = %group.group_id, node = replica.node_id,
+            "reporting a given-up replica (its Raft core kept stopping) as pool_refused/other; \
+             its bytes are released after the replacement commits");
         let report = GroupDamageReport {
             group,
             replica,
@@ -586,7 +591,7 @@ impl DamageSink for ReportingDamageSink {
             first_bad_seq: None,
             refusal: Some(crate::oltp_replication::authority::control::PoolRefusal::Other),
         };
-        self.send(report, None);
+        self.send(report, Some(pool));
     }
 }
 impl ReportingDamageSink {

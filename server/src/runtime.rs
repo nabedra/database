@@ -21,7 +21,7 @@ pub(crate) fn retained_tls(
     material
         .map(|material| {
             let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
+                rustls::crypto::ring::default_provider(),
             ))
             .with_safe_default_protocol_versions()
             .map_err(|_| crate::node::http::invalid())?

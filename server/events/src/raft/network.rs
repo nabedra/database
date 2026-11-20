@@ -79,6 +79,10 @@ impl PeerTransport {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {secret}"))
             .context("invalid peer authentication token")?;
         authorization.set_sensitive(true);
+        // reqwest is built without a provider of its own (`rustls-no-provider`): it
+        // reads the process default, so make sure that is `ring`. An error means a
+        // provider is already installed, which is then the one in use.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()

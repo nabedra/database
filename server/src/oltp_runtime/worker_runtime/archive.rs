@@ -161,7 +161,6 @@ impl WorkerRuntime {
     /// Whether direct commits are active, which refuses incremental backups.
     /// The `data.direct.v1` switch: `is_direct_active()`, `direct_oltp()`
     /// and `routes_direct()` for the leader executor (T5) and gateway (T6).
-    #[allow(dead_code)] // Read by T5 and T6.
     pub(crate) fn direct_switch(&self) -> Option<&Arc<super::direct_capability::DirectSwitch>> {
         self.direct.get()
     }
@@ -181,7 +180,6 @@ impl WorkerRuntime {
             .load(std::sync::atomic::Ordering::Acquire)
     }
     /// Set by the `data.direct.v1` activation (T7). Off by default.
-    #[allow(dead_code)] // Driven by the capability activation (T7).
     pub(crate) fn set_direct_commits_active(&self, active: bool) {
         self.direct_commits_active
             .store(active, std::sync::atomic::Ordering::Release);

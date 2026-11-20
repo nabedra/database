@@ -73,8 +73,8 @@ pub(crate) struct LeaderToken {
     term: u64,
     generation: u64,
 }
-#[allow(dead_code)] // The leader executor (T5) reads the term.
 impl LeaderToken {
+    #[cfg(test)]
     pub(crate) fn term(&self) -> u64 {
         self.term
     }
@@ -138,7 +138,6 @@ fn encoded(key: &MvccKey) -> Result<Vec<u8>, ProtocolError> {
     Ok(bytes)
 }
 
-#[allow(dead_code)] // The leader executor (T5) is the main caller.
 impl RangeClock {
     /// Every `ParticipantMachine` over one group store shares a clock, so the
     /// executor that registers commits and the readers see one state.
@@ -169,10 +168,12 @@ impl RangeClock {
     }
 
     /// The highest snapshot timestamp served on this range, if any.
+    #[cfg(test)]
     pub(crate) fn max_read_ts(&self) -> Option<ReadTs> {
         ReadTs::new(self.lock().max_read_ts).ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.lock().pending.len()
     }
@@ -186,6 +187,7 @@ impl RangeClock {
     /// Rule 1 as a pure check: true when `commit_ts` is at or below an
     /// already-served snapshot, so the caller must fetch a new timestamp.
     /// `register_pending` repeats this check atomically.
+    #[cfg(test)]
     pub(crate) fn needs_new_timestamp(&self, commit_ts: CommitTs) -> bool {
         commit_ts.get() <= self.lock().max_read_ts
     }
@@ -280,6 +282,7 @@ impl RangeClock {
     }
 
     /// True once this node leads and an entry of its term applied.
+    #[cfg(test)]
     pub(crate) fn serving(&self) -> bool {
         self.lock().serving()
     }

@@ -195,7 +195,7 @@ impl TlsConfig {
         let key = PrivateKeyDer::from_pem_slice(&key)
             .map_err(|_| invalid("invalid cache TLS private key"))?;
         let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|_| invalid("invalid cache TLS protocols"))?

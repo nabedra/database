@@ -250,6 +250,11 @@ impl HostRetry {
     pub(crate) fn take_export_fault(&self) -> bool {
         take(&self.fail_exports)
     }
+    /// Test hook: as if the last write found the device full.
+    #[cfg(test)]
+    pub(crate) fn mark_no_space(&self) {
+        self.no_space.store(true, Ordering::Release);
+    }
     /// True while this host's writes find the device full.
     pub(crate) fn out_of_space(&self) -> bool {
         self.no_space.load(Ordering::Acquire)

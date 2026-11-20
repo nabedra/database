@@ -5,8 +5,8 @@ ARG NABEDRA_ENGINE=olap
 ARG NABEDRA_S3=auto
 # Optional Cargo job limit for memory-constrained builders; unset uses every CPU.
 ARG BUILD_JOBS=
-# Storage is the in-tree nabedra-kv engine (Rust only). The only C code is TLS
-# (ring, aws-lc-sys), which builds with the base image's gcc through `cc`.
+# Storage is the in-tree nabedra-kv engine (Rust only). The only C code is `ring`,
+# the only TLS crypto provider, which builds with the base image's gcc through `cc`.
 WORKDIR /src/server
 RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
     if [ "$NABEDRA_S3" = auto ]; then if [ "$NABEDRA_ENGINE" = olap ]; then NABEDRA_S3=true; else NABEDRA_S3=false; fi; fi && \

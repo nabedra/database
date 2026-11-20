@@ -71,6 +71,7 @@ impl S3Repository {
             return Err(invalid());
         }
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(crate::aws_http::https_client())
             .region(Region::new(config.region));
         if let Some(credentials) = config.credentials {
             loader = loader.credentials_provider(credentials);

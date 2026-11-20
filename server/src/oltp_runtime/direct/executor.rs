@@ -463,25 +463,26 @@ impl DirectExecutor {
         request: &DirectRequest,
         epochs: &ParticipantEpochs,
         operation: &Operation,
+        deadline: Instant,
     ) -> Result<Arc<DirectTable>, DirectResponse> {
-        let table = match self
-            .schema
-            .table(
+        let lookup = catalog_read(
+            deadline,
+            self.schema.table(
                 request.table_id,
                 request.schema_epoch,
                 epochs.direct_schema,
                 epochs.authority,
-            )
-            .await
-            .map_err(failed)?
-        {
+            ),
+        )
+        .await?;
+        let table = match lookup {
             SchemaLookup::Table(table) => table,
             SchemaLookup::Blocked => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Schema,
                 });
             }
-            SchemaLookup::StaleEpoch { .. } => return Err(stale_route(Some(epochs))),
+            SchemaLookup::StaleEpoch => return Err(stale_route(Some(epochs))),
             SchemaLookup::Missing => {
                 return Err(failed(ProtocolError::new(
                     ErrorCode::NotFound,
@@ -553,7 +554,8 @@ impl DirectExecutor {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
             let epochs = self.epochs(handle, clock, request, deadline).await?;
-            self.table(request, &epochs, &parsed.operation).await?;
+            self.table(request, &epochs, &parsed.operation, deadline)
+                .await?;
             loop {
                 if by(deadline, handle.direct_barrier()).await.is_err() {
                     if !self.pause(deadline, RetryCause::Leadership).await {
@@ -697,7 +699,9 @@ impl DirectExecutor {
             let clock = handle.direct_clock().map_err(failed)?;
             self.token(handle, clock, deadline).await?;
             let epochs = self.epochs(handle, clock, request, deadline).await?;
-            let table = self.table(request, &epochs, &parsed.operation).await?;
+            let table = self
+                .table(request, &epochs, &parsed.operation, deadline)
+                .await?;
             let keys = self.row_keys(&table, &parsed.operation)?;
             let encoded: Vec<Vec<u8>> = keys
                 .iter()
@@ -900,12 +904,24 @@ impl DirectExecutor {
         let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
             Err(error) => {
-                // The entry may still commit; the dedup record decides on
-                // the next attempt (T4: settle on any proposal error).
+                // T4: settle on any proposal error.
                 clock.settle(commit_ts);
-                *uncertain = true;
+                // RV-FINAL M1: a refusal before Raft (a full device, a
+                // refused reservation) commits nothing. A full device
+                // answers at once, as the queued path does (U01).
+                if full_device_refusal(&error, *uncertain) {
+                    return Err(failed(error));
+                }
+                // Otherwise the entry may still commit; the dedup record
+                // decides on the next attempt.
+                let cause = if error.outcome == Outcome::NotApplied {
+                    RetryCause::Unavailable
+                } else {
+                    *uncertain = true;
+                    RetryCause::Leadership
+                };
                 self.proposal_failed(handle, clock, Some(token), deadline, &error);
-                return Ok(Attempt::Retry(RetryCause::Leadership));
+                return Ok(Attempt::Retry(cause));
             }
         };
         let fault = match applied.reply {
@@ -1143,21 +1159,21 @@ impl DirectExecutor {
                     deadline,
                 )
                 .await?;
-            let table = match self
-                .schema
-                .table(
+            let lookup = catalog_read(
+                deadline,
+                self.schema.table(
                     request.table_id,
                     request.schema_epoch,
                     None,
                     epochs.authority,
-                )
-                .await
-                .map_err(failed)?
-            {
+                ),
+            )
+            .await?;
+            let table = match lookup {
                 SchemaLookup::Table(table) => table,
                 // The anchor key still follows from the stored key column
                 // only through the descriptor, so a forward needs one.
-                SchemaLookup::StaleEpoch { .. } => return Err(stale_route(Some(&epochs))),
+                SchemaLookup::StaleEpoch => return Err(stale_route(Some(&epochs))),
                 SchemaLookup::Blocked | SchemaLookup::Missing => {
                     return Err(failed(ProtocolError::new(
                         ErrorCode::StorageUnavailable,
@@ -1231,9 +1247,18 @@ impl DirectExecutor {
                 let applied = match by(deadline, handle.propose(command)).await {
                     Ok(applied) => applied,
                     Err(error) => {
-                        uncertain = true;
+                        // RV-FINAL M1, as for a direct commit.
+                        if full_device_refusal(&error, uncertain) {
+                            return Err(failed(error));
+                        }
+                        let cause = if error.outcome == Outcome::NotApplied {
+                            RetryCause::Unavailable
+                        } else {
+                            uncertain = true;
+                            RetryCause::Leadership
+                        };
                         self.proposal_failed(handle, clock, token, deadline, &error);
-                        if !self.pause(deadline, RetryCause::Leadership).await {
+                        if !self.pause(deadline, cause).await {
                             return Err(deadline_expired(uncertain));
                         }
                         continue;
@@ -1457,6 +1482,24 @@ async fn by<T>(
                 Outcome::Unknown,
             ))
         })
+}
+/// RV-FINAL M1: a proposal refused with a full device before Raft saw it
+/// is the request's answer, unless an earlier proposal of the request may
+/// have committed (then the dedup record decides on the next attempt).
+fn full_device_refusal(error: &ProtocolError, uncertain: bool) -> bool {
+    !uncertain && error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(error)
+}
+/// RV-FINAL L3: a Catalog read bounded by the request deadline. Nothing was
+/// proposed yet, so running out of time is `not_applied`, never a call the
+/// gateway's own deadline cuts as uncertain.
+async fn catalog_read<T>(
+    deadline: Instant,
+    read: impl std::future::Future<Output = Result<T, ProtocolError>>,
+) -> Result<T, DirectResponse> {
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(read) => read.map_err(failed),
+        Err(_) => Err(failed(unavailable_not_applied())),
+    }
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)

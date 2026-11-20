@@ -166,6 +166,7 @@ struct Cluster {
     catalog: Uuid,
     authority: Authority,
     timestamps: Arc<Counter>,
+    schema: Arc<StaticSchema>,
     _dir: Dir,
 }
 
@@ -293,6 +294,7 @@ impl Cluster {
                 owner_term: 1,
             },
             timestamps,
+            schema,
             _dir: dir,
         }
     }
@@ -484,6 +486,7 @@ impl Cluster {
             routes: Mutex::new(routes),
             down: Mutex::default(),
             lose: AtomicUsize::new(0),
+            after_lose: Mutex::default(),
             sent: AtomicU64::new(0),
         })
     }
@@ -586,6 +589,8 @@ struct InProcess {
     routes: Mutex<Replicas>,
     down: Mutex<HashSet<u64>>,
     lose: AtomicUsize,
+    /// Runs once, when a reply is lost (before the gateway resends).
+    after_lose: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     sent: AtomicU64,
 }
 impl DirectTransport for InProcess {
@@ -632,7 +637,12 @@ impl DirectTransport for InProcess {
                     .lose
                     .compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
                 {
-                    Ok(_) => return Err(unreachable()),
+                    Ok(_) => {
+                        if let Some(hook) = self.after_lose.lock().unwrap().take() {
+                            hook();
+                        }
+                        return Err(unreachable());
+                    }
                     Err(now) => left = now,
                 }
             }
@@ -990,6 +1000,53 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
         (2, 2),
         "one fill per gateway, none per request"
     );
+    cluster.shutdown().await;
+}
+
+/// RV-FINAL L2, D02, Q05: an insert commits but its reply is lost. Before
+/// the resend reaches the leader, the table's descriptor changes so the body
+/// no longer validates; the leader checks that before its dedup lookup and
+/// answers a definite `validation_error`. The gateway does not report that
+/// failure for a write that committed: it settles the id at the anchor,
+/// whose dedup record replays the original result. Before the fix the client
+/// got `validation_error`/`not_applied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d02_q05_rv_final_l2_uncertain_resend_never_reports_a_definite_failure() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = cluster.transport();
+    let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
+    let id = Uuid::new_v4();
+    let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+    let schema = cluster.schema.clone();
+    let table = cluster.table;
+    *transport.after_lose.lock().unwrap() = Some(Box::new(move || {
+        let mut changed = descriptor(table);
+        changed.schema.insert("value".to_string(), ColumnType::Utf8);
+        schema.insert(DirectTable {
+            descriptor: changed,
+            schema_epoch: 1,
+            indexes: Vec::new(),
+            lifecycle_id: table,
+        });
+    }));
+    transport.lose.store(1, Ordering::SeqCst);
+    assert_eq!(
+        answer(&gateway, &insert, id).await,
+        Answer::Data(Value::Null)
+    );
+    assert!(
+        transport.after_lose.lock().unwrap().is_none(),
+        "a reply was lost"
+    );
+    let stats = gateway.stats();
+    assert_eq!(stats.resends, 1, "{stats:?}");
+    assert_eq!(stats.forward_replayed, 1, "{stats:?}");
+    // One committed version of the row.
+    let (version, row) = cluster.latest(group, 0, 7).await;
+    assert!(version.is_some());
+    assert_eq!(row, Some(json!({"id": 7, "value": 1})));
     cluster.shutdown().await;
 }
 

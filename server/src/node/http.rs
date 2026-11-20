@@ -183,7 +183,7 @@ impl HttpClient {
             .map(|m| m.ca.roots.clone())
             .unwrap_or_else(rustls::RootCertStore::empty);
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .map_err(|_| invalid())?

@@ -13,8 +13,8 @@ use crate::{
     oltp::mvcc::{
         MvccKey,
         catalog::{CatalogHandle, CatalogRead},
-        store::direct::DirectSchema as GroupSchema,
         index::{IndexDefinition, IndexPage, IndexRecord, IndexRoot},
+        store::direct::DirectSchema as GroupSchema,
         store::direct::MAX_DIRECT_INDEX_CHANGES,
     },
     oltp_replication::{
@@ -33,8 +33,12 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub(crate) struct DirectTable {
     pub descriptor: TableDescriptor,
+    /// The Catalog checks below read the record's epoch and lifecycle id
+    /// directly; only the test schema reads these two copies.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub schema_epoch: u64,
     /// The Catalog table record's lifecycle id this entry was read from.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub lifecycle_id: Uuid,
     /// Every writable (building or ready) index at `schema_epoch`.
     pub indexes: Vec<IndexDefinition>,
@@ -45,9 +49,7 @@ pub(crate) enum SchemaLookup {
     /// The catalog holds an intent (a DDL is in flight): use the queued path.
     Blocked,
     /// The catalog's table is at another schema epoch.
-    StaleEpoch {
-        current: u64,
-    },
+    StaleEpoch,
     /// No such table.
     Missing,
 }
@@ -75,7 +77,8 @@ pub(crate) trait DirectSchema: Send + Sync {
     fn lifecycle(&self, table_id: Uuid, authority: Authority) -> ConsensusFuture<'_, Option<Uuid>>;
 }
 
-/// Fixed tables, for tests and single-process composition.
+/// Fixed tables, for tests.
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct StaticSchema {
     tables: Mutex<HashMap<Uuid, Arc<DirectTable>>>,
@@ -83,7 +86,11 @@ pub(crate) struct StaticSchema {
     exclusive: Mutex<std::collections::HashSet<Uuid>>,
     /// The next this many lifecycle reads fail as an unreachable Catalog.
     failing_reads: Mutex<u32>,
+    /// Test hook: table reads never answer (a stalled Catalog leader).
+    #[cfg(test)]
+    stalled_table_reads: std::sync::atomic::AtomicBool,
 }
+#[cfg(test)]
 impl StaticSchema {
     /// Models a Catalog that cannot answer the next `count` lifecycle reads.
     pub(crate) fn fail_lifecycle_reads(&self, count: u32) {
@@ -99,6 +106,12 @@ impl StaticSchema {
             exclusive.remove(&table_id);
         }
     }
+    /// Models a Catalog leader that stops answering table reads.
+    #[cfg(test)]
+    pub(crate) fn stall_table_reads(&self, stalled: bool) {
+        self.stalled_table_reads
+            .store(stalled, std::sync::atomic::Ordering::Release);
+    }
     pub(crate) fn insert(&self, table: DirectTable) {
         self.tables
             .lock()
@@ -106,6 +119,7 @@ impl StaticSchema {
             .insert(table.descriptor.id, Arc::new(table));
     }
 }
+#[cfg(test)]
 impl DirectSchema for StaticSchema {
     fn lifecycle(&self, table_id: Uuid, _: Authority) -> ConsensusFuture<'_, Option<Uuid>> {
         let failing = {
@@ -146,6 +160,13 @@ impl DirectSchema for StaticSchema {
         group: Option<GroupSchema>,
         _: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup> {
+        #[cfg(test)]
+        if self
+            .stalled_table_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Box::pin(std::future::pending());
+        }
         let found = self
             .tables
             .lock()
@@ -155,9 +176,7 @@ impl DirectSchema for StaticSchema {
         Box::pin(async move {
             Ok(match found {
                 None => SchemaLookup::Missing,
-                Some(table) if table.schema_epoch != schema_epoch => SchemaLookup::StaleEpoch {
-                    current: table.schema_epoch,
-                },
+                Some(table) if table.schema_epoch != schema_epoch => SchemaLookup::StaleEpoch,
                 Some(table) if group.is_some_and(|group| !group.admits(table.lifecycle_id)) => {
                     SchemaLookup::Blocked
                 }
@@ -223,9 +242,7 @@ impl CatalogSchema {
             } => record,
         };
         if table.schema_epoch != schema_epoch {
-            return Ok(SchemaLookup::StaleEpoch {
-                current: table.schema_epoch,
-            });
+            return Ok(SchemaLookup::StaleEpoch);
         }
         if group.is_some_and(|group| !group.admits(table.lifecycle_id)) {
             // Fenced but not yet published (or a publication that failed
@@ -289,7 +306,10 @@ impl CatalogSchema {
             lifecycle_id: table.lifecycle_id,
             indexes,
         });
-        self.remember((table_id, schema_epoch, group.map(|group| group.epoch)), table.clone());
+        self.remember(
+            (table_id, schema_epoch, group.map(|group| group.epoch)),
+            table.clone(),
+        );
         Ok(SchemaLookup::Table(table))
     }
 }

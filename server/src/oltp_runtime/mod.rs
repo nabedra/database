@@ -193,7 +193,7 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
         .ok_or("NABEDRA_TOKEN is required")?;
     let tls = match (&options.tls_cert, &options.tls_key) {
         (Some(cert), Some(key)) => {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let _ = rustls::crypto::ring::default_provider().install_default();
             Some(
                 RustlsConfig::from_pem_file(cert, key)
                     .await
