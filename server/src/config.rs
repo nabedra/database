@@ -240,6 +240,21 @@ fn readable_file(path: &Path, error: ConfigError) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// How long forward markers and direct dedup records are kept: 24 hours
+/// (`DEFAULT_DIRECT_DEDUP_RETENTION_MS`, plan "Exactly-once across paths").
+pub(crate) const DIRECT_MARKER_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// The time a queued request may take from settling its id at the anchor
+/// (forward marker or history window) to finishing (queue wait plus
+/// execution) while the markers still answer a retry (RV-FINAL M2).
+pub(crate) const DIRECT_QUEUED_LIFETIME_ALLOWANCE_MS: u64 = 12 * 60 * 60 * 1000;
+/// `result_retention_ms` at most. A queued receipt then never outlives its
+/// marker unless the request took longer than the allowance, so a direct
+/// retry of a queued id finds the marker and never executes it again
+/// (Q05/Q06). `data.direct.v1` can activate on any cluster of this release,
+/// so the bound always applies.
+pub const MAX_RESULT_RETENTION_MS: u64 =
+    DIRECT_MARKER_RETENTION_MS - DIRECT_QUEUED_LIFETIME_ALLOWANCE_MS;
+
 /// Versioned cluster-wide queue and logical-request limits.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -303,13 +318,19 @@ impl ExecutionConfig {
             || self.max_retained_result_bytes_per_worker == 0
             || self.max_queue_bytes_per_replica > isize::MAX as u64
             || self.max_retained_result_bytes_per_worker > isize::MAX as u64
-            || !(1..=86_400_000).contains(&self.result_retention_ms)
+            || self.result_retention_ms == 0
             || self
                 .max_queue_bytes_per_replica
                 .checked_add(self.max_retained_result_bytes_per_worker)
                 .is_none()
         {
             return Err(ConfigError("invalid execution limits"));
+        }
+        if self.result_retention_ms > MAX_RESULT_RETENTION_MS {
+            return Err(ConfigError(
+                "result_retention_ms must not exceed 43200000 (12 h): queued receipts must expire \
+                 before the 24 h direct forward markers",
+            ));
         }
         Ok(())
     }
@@ -391,4 +412,38 @@ fn read_resource_config<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
         return Err(ConfigError("resource configuration exceeds byte limit"));
     }
     serde_json::from_slice(&bytes).map_err(|_| ConfigError("invalid resource configuration"))
+}
+
+#[cfg(all(test, feature = "oltp"))]
+mod direct_retention_tests {
+    use super::*;
+
+    /// RV-FINAL M2, Q05/Q06, O15: a queued receipt kept longer than the
+    /// direct markers minus the queued-lifetime allowance is refused at
+    /// startup, so a marker outlives every receipt of a request that finished
+    /// within the allowance.
+    #[test]
+    fn q05_q06_o15_rv_final_m2_result_retention_leaves_room_for_queued_lifetime() {
+        assert_eq!(MAX_RESULT_RETENTION_MS, 43_200_000);
+        assert_eq!(
+            crate::oltp::mvcc::store::direct::DEFAULT_DIRECT_DEDUP_RETENTION_MS,
+            DIRECT_MARKER_RETENTION_MS
+        );
+        let with = |result_retention_ms| ExecutionConfig {
+            result_retention_ms,
+            ..ExecutionConfig::default()
+        };
+        assert!(ExecutionConfig::default().validate().is_ok());
+        assert!(with(1).validate().is_ok());
+        assert!(with(MAX_RESULT_RETENTION_MS).validate().is_ok());
+        assert!(
+            with(MAX_RESULT_RETENTION_MS)
+                .result_retention_ms
+                .checked_add(DIRECT_QUEUED_LIFETIME_ALLOWANCE_MS)
+                .is_some_and(|end| end <= DIRECT_MARKER_RETENTION_MS)
+        );
+        for refused in [0, MAX_RESULT_RETENTION_MS + 1, 86_400_000, u64::MAX] {
+            assert!(with(refused).validate().is_err(), "{refused}");
+        }
+    }
 }

@@ -297,6 +297,14 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
   it, a leader answers `Fallback{History}` for any ID with no record at its anchor, so the queued path answers
   pre-activation IDs: the original result, a conflict, or `404` abandoned. A direct get also checks its key's
   record.
+- **Marker lifetime against receipt lifetime (RV-FINAL M2, 2026-11-20).** A forward marker (and the T7c history
+  window) must outlive every queued receipt of the same request ID, or a direct retry after the marker expired would
+  run the request again. A marker is stamped when the request is settled at its anchor and kept 24 h
+  (`DEFAULT_DIRECT_DEDUP_RETENTION_MS`). The receipt is kept `result_retention_ms` after the request finishes. The
+  invariant is `24 h ≥ result_retention_ms + (queue wait + execution)`. Startup validation caps
+  `result_retention_ms` at 12 h (`MAX_RESULT_RETENTION_MS`), which leaves a 12 h allowance for queue wait plus
+  execution. Queued requests have no hard lifetime, so a request settled more than 12 h before it finishes and
+  retried directly near the end of its receipt's retention is outside the guarantee. That is an accepted limit.
 
 ## Out of scope
 

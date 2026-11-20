@@ -58,9 +58,9 @@ const DIRECT_HIGH: &[u8] = b"mvcc/direct-high/v1";
 /// The highest `applied_unix_ms` stamped on this group (RV-T4 F7).
 const UNIX_HIGH: &[u8] = b"mvcc/direct-unix-high/v1";
 
-/// `direct_dedup_retention_ms` default: 24 hours.
-#[allow(dead_code)] // Read by the leader's expiry task (T5).
-pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// `direct_dedup_retention_ms` default: 24 hours. `result_retention_ms` is
+/// bounded against it at startup (RV-FINAL M2).
+pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = crate::config::DIRECT_MARKER_RETENTION_MS;
 /// Dedup records deleted per `DirectExpire` entry at most.
 pub(crate) const MAX_DIRECT_EXPIRE_ITEMS: u16 = 128;
 /// Rows per command. `insert_many` above this uses the queued path.
