@@ -444,7 +444,7 @@ class Rf1Serve:
         self.token = secrets.token_urlsafe(32)
         self.process = None
 
-    def start(self):
+    def start(self, cold_start=False):
         port = free_port()
         (self.root / 'data').mkdir(exist_ok=True)
         execution = self.root / 'execution.json'
@@ -453,6 +453,8 @@ class Rf1Serve:
         env['NABEDRA_TOKEN'] = self.token
         command = [self.binary, 'serve', '--data-dir', str(self.root / 'data'), '--database', DATABASE,
                    '--host', '127.0.0.1', '--port', str(port), '--workers', '4', '--execution-config', str(execution)]
+        if cold_start:
+            command.append('--cold-start')
         self.process = Process('serve', command, env, self.root / 'serve.log')
         self.url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + 90

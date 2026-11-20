@@ -9,7 +9,8 @@ API gateways, each a separate host process, mTLS between them; RF1 = `nabedra-db
                      D05 (SIGSTOP), D10 (gateway killed mid-stream), D09 (kill all, cold start)
   --suite barriers   needs --test-executable: D12 (leader budget 4), D02 (gateway killed
                      after the leader applied), D04 after quorum (leader killed)
-  --suite quorum     D04 before quorum (both followers SIGSTOPped, leader killed)
+  --suite quorum     needs --test-executable: D04 before quorum (leader held before it proposes,
+                     both followers SIGSTOPped, entry appended, leader killed)
 
 Each scenario prints one JSON line `{"scenario": ..., "status": "passed", ...}` with the
 observations it asserted, and the run writes them all to `--output/results.json`.
@@ -172,6 +173,7 @@ def d01_programs(label, gateways, token, ca, snapshot, create):
     for name, (url, routed) in gateways.items():
         for orm in ('python', 'typescript'):
             table = f'd01_{label}_{name}_{orm}'
+            print(json.dumps(dict(progress='D01', run=f'{label}/{name}/{orm}')), flush=True)
             create(url, table)
             results, snapshots = run_program(orm, url, table, token=token, ca=ca, snapshot=snapshot)
             observed = check_direct_section(f'{label}/{name}/{orm}', snapshots[0], snapshots[1], routed=routed)
@@ -203,17 +205,110 @@ def suite_rf1(args, output):
             reference, sections = d01_programs(f'rf1_{"on" if mode else "off"}', {'serve': (server.url, mode)},
                                                server.token, None, snapshot, create)
             results[mode] = reference
+            if mode:
+                d09_rf1(server)
             report('D01-RF1', topology='nabedra-db serve', direct_oltp=mode, capability=capability,
                    orms=['python', 'typescript'], steps=len(reference), direct_sections=sections)
         finally:
             server.close()
+    d11_rf1_cli(args, output)
     assert results[True] == results[False], [(a, b) for a, b in zip(results[True], results[False]) if a != b]
     (args.output / 'rf1-program-results.json').write_text(json.dumps(results[True], indent=1))
     report('D01-RF1-on-off', equal=True, steps=len(results[True]))
     return results[True]
 
 
+def d09_rf1(server):
+    """D09 at RF1, and the regression for the T9 finding that a restarted `serve` never
+    bound its retained Data replicas: SIGKILL under direct write load, cold start, every
+    acknowledged write present and every acknowledged id replayed."""
+    db = Database(url=server.url, token=server.token, database=DATABASE, timeout=30)
+    table = db.create_table('d09_rf1', {'id': int, 'value': int}, key='id')
+    stop, lock, history = threading.Event(), threading.Lock(), []
+    keys = iter(range(1_000_000))
+
+    def writer():
+        client = Http(server.url, server.token, 30)
+        while not stop.is_set():
+            with lock:
+                key = next(keys)
+            body = insert_body(table.id, key, key * 3)
+            try:
+                status, reply = client.exchange('/v1/operations', body)
+            except (OSError, http.client.HTTPException) as error:
+                history.append((body, None, repr(error)))
+                return
+            history.append((body, status, reply))
+
+    with ThreadPoolExecutor(4) as pool:
+        futures = [pool.submit(writer) for _ in range(4)]
+        try:
+            time.sleep(2.0)
+            server.process.kill()
+        finally:
+            stop.set()
+        for future in futures:
+            future.result()
+    acknowledged = [body for body, status, _ in history if status == 200]
+    assert acknowledged, 'no write was acknowledged before the kill'
+    server.start(cold_start=True)
+    deadline = time.monotonic() + 60
+    while not (server.stats().get('direct_capability') or {}).get('active'):
+        assert time.monotonic() < deadline, 'data.direct.v1 inactive after the cold start'
+        time.sleep(0.25)
+    before = server.stats()
+    table = Database(url=server.url, token=server.token, database=DATABASE, timeout=30).table('d09_rf1')
+    missing = [body for body in acknowledged if table.get(body['payload']['row']['id']) != body['payload']['row']]
+    assert not missing, missing[:5]
+    client = Http(server.url, server.token, 30)
+    for body in acknowledged:
+        assert client.exchange('/v1/operations', body) == (200, {'request_id': body['request_id'], 'data': None})
+    after = server.stats()
+    stats = {'serve': before}, {'serve': after}
+    assert direct(stats[1], 'entries_proposed') == direct(stats[0], 'entries_proposed'), 'a replay wrote an entry'
+    gateway = after['direct_gateway']
+    assert gateway['direct_done'] >= len(acknowledged), gateway
+    report('D09-RF1', acknowledged=len(acknowledged), unacknowledged=len(history) - len(acknowledged),
+           missing_acknowledged=0, replayed=direct(stats[1], 'replayed') - direct(stats[0], 'replayed'),
+           gateway_after_cold_start=gateway)
+
+
+def d11_rf1_cli(args, output):
+    """D11 index publication through the public CLI's local topology (the RF1 server
+    that serves index administration)."""
+    from oltp_runtime_acceptance import RuntimeServer
+    root = output / 'rf1-cli'
+    root.mkdir(parents=True, exist_ok=True)
+    server = RuntimeServer(args.binary, root, cli=True)
+    try:
+        server.start()
+        auth = json.loads((root / 'auth.json').read_text())
+        deadline = time.monotonic() + 60
+        while not (server.stats().get('direct_capability') or {}).get('active'):
+            assert time.monotonic() < deadline, 'RF1 CLI server never activated data.direct.v1'
+            time.sleep(0.25)
+
+        def admin(name, payload, request_id):
+            status, reply = call(server.url, '/v1/cluster/operations', operation(name, payload, request_id),
+                                 token=auth['admin_token'], timeout=60)
+            assert status == 200, (name, status, reply)
+            return reply['data']
+        d11_index(server.url, server.token, None, admin, lambda: {'rf1': server.stats()})
+    finally:
+        server.stop()
+        server.log.close()
+
+
 # RF3 cluster ------------------------------------------------------------------------------
+def queue_owner(cluster):
+    for name in cluster.live():
+        status, _ = call(cluster.urls[name], '/v1/operations', operation('table.list', {}),
+                         token=cluster.auth['data_token'])
+        if status == 200:
+            return name
+    raise AssertionError('no worker endpoint serves queued operations')
+
+
 def leader_of(cluster, request):
     """Send one routed mutation and return the worker whose executor ran it."""
     before = cluster.all_stats()
@@ -241,10 +336,31 @@ def suite_cluster(args, output, rf1_reference):
         def create(url, table):
             Database(url=url, token=token, database=DATABASE, ca_file=str(ca) if url.startswith('https') else None,
                      timeout=30).create_table(table, SCHEMA, key='id')
+        # Queued operations (table.create/describe) are served only through the queue
+        # owner's worker endpoint; other workers answer 401 (pre-existing, see report).
+        owner = queue_owner(cluster)
         gateways = {'api1': (api_on, True), 'api2': (api_off, False),
-                    'w1': (cluster.urls['w1'], True), 'w3': (cluster.urls['w3'], False)}
+                    owner: (cluster.urls[owner], cluster.direct[owner])}
         reference, sections = d01_programs('rf3', gateways, token, ca, cluster.all_stats, create)
-        report('D01-RF3', topology='3 registered workers + 2 API gateways, mTLS', capability=capability,
+        # Direct point operations through a non-owner worker gateway need no owner.
+        db_owner = Database(url=api_on, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
+        probe = db_owner.create_table('d01_non_owner', {'id': int, 'value': int}, key='id')
+        non_owner = {}
+        for name in WORKERS:
+            if name == owner:
+                continue
+            body = insert_body(probe.id, WORKERS.index(name), 1)
+            inserted = call(cluster.urls[name], '/v1/operations', body, token=token)
+            got = call(cluster.urls[name], '/v1/operations', operation('table.get', {
+                'table_id': probe.id, 'key': WORKERS.index(name)}), token=token)
+            listed = call(cluster.urls[name], '/v1/operations', operation('table.list', {}), token=token)
+            if cluster.direct[name]:
+                assert inserted == (200, {'request_id': body['request_id'], 'data': None}), (name, inserted)
+                assert got[0] == 200 and got[1]['data'] == {'id': WORKERS.index(name), 'value': 1}, (name, got)
+            non_owner[name] = dict(direct_oltp=cluster.direct[name], insert=inserted[0], get=got[0],
+                                   queued_table_list=listed[0], queued_error=(listed[1].get('error') or {}).get('code'))
+        report('D01-RF3', topology='3 registered workers + 2 API gateways, mTLS', capability=capability, queue_owner=owner,
+               non_owner_worker_gateways=non_owner,
                gateways={name: dict(url=url, direct_oltp=routed) for name, (url, routed) in gateways.items()},
                orms=['python', 'typescript'], steps=len(reference), direct_sections=sections)
         if rf1_reference is not None:
@@ -276,8 +392,8 @@ def suite_cluster(args, output, rf1_reference):
         report('D03', gateway='api1', same_body='replayed', other_body_same_key=other_body[1]['error'],
                other_key='executed', entries_proposed=entries, replayed=replayed)
 
-        # D11 index publication -------------------------------------------------------------
-        d11_index(cluster, api_on, token, ca)
+        # D11 index publication runs at RF1 (suite_rf1): index admin is not served by
+        # registered RF3 workers (pre-existing, see the T9 report).
         # D11 drop ----------------------------------------------------------------------------
         d11_drop(cluster, api_on, token, ca)
 
@@ -301,8 +417,10 @@ def dump(cluster):
         print(f'===== {name} log tail =====\n{cluster.tail(name)}', file=sys.stderr, flush=True)
 
 
-def d11_index(cluster, url, token, ca):
-    db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
+def d11_index(url, token, ca, admin, stats):
+    """D11 index publication racing direct writers. `admin(operation, payload, request_id)`
+    runs an admin operation; `stats()` returns `{name: /v1/runtime/stats}`."""
+    db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca) if ca else None, timeout=30)
     table = db.create_table('d11_index', {'id': int, 'category': int, 'label': str}, key='id')
     table.insert_many([{'id': i, 'category': i % 8, 'label': f'seed-{i}'} for i in range(64)])
     stop = threading.Event()
@@ -339,28 +457,30 @@ def d11_index(cluster, url, token, ca):
         finally:
             client.close()
 
-    before = cluster.all_stats()
+    before = stats()
     with ThreadPoolExecutor(4) as pool:
         futures = [pool.submit(writer, index) for index in range(4)]
-        time.sleep(1.0)
-        index_id = uid()
-        definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
-                      'covering': ['label']}
-        build_id = uid()
-        created = admin_owner(cluster, 'storage.index.create', definition, build_id)
-        selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
-        deadline = time.monotonic() + 120
-        state = created['state']
-        while state != 'ready':
-            assert state in ('building', 'pending', 'backfilling', 'validating'), created
-            assert time.monotonic() < deadline, f'index never became ready: {state}'
-            time.sleep(0.5)
-            state = admin_owner(cluster, 'storage.index.status', selector)['state']
-        time.sleep(1.0)
-        stop.set()
+        try:
+            time.sleep(1.0)
+            index_id = uid()
+            definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
+                          'covering': ['label']}
+            build_id = uid()
+            created = admin('storage.index.create', definition, build_id)
+            selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
+            deadline = time.monotonic() + 120
+            state = created['state']
+            while state != 'ready':
+                assert state in ('building', 'pending', 'backfilling', 'validating'), created
+                assert time.monotonic() < deadline, f'index never became ready: {state}'
+                time.sleep(0.5)
+                state = admin('storage.index.status', selector, None)['state']
+            time.sleep(1.0)
+        finally:
+            stop.set()
         for future in futures:
             future.result()
-    after = cluster.all_stats()
+    after = stats()
     rows = table.query().collect()
     assert all(error[1]['error']['outcome'] == 'not_applied' for error in errors), errors[:5]
     expected = {}
@@ -373,23 +493,24 @@ def d11_index(cluster, url, token, ca):
         selected = table.where(col('category') == category)
         indexed = {item['id'] for item in selected.collect()}
         plans[category] = selected.explain()
+        assert 'by_category' in plans[category], plans[category]
         assert indexed == expected.get(category, set()), (category, indexed ^ expected.get(category, set()))
     report('D11-index', table=table.id, rows=len(rows), acknowledged_direct_writes=len(acknowledged),
            not_applied_errors=len(errors), index_state=state,
            direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
-           plan_mentions_index='by_category' in plans[0], plan_sample=plans[0][:400])
+           plan_uses_index=True, plan_sample=plans[0][:300])
 
 
 def admin_owner(cluster, name, payload, request_id=None):
-    error = None
+    errors = []
     for worker in cluster.live():
         status, reply = call(cluster.urls[worker], '/v1/cluster/operations', operation(name, payload, request_id),
                              token=cluster.auth['admin_token'], timeout=60)
         if status == 200:
             return reply['data']
-        error = (worker, status, reply)
-    raise AssertionError(f'{name}: {error}')
+        errors.append((worker, status, reply))
+    raise AssertionError(f'{name}: {errors}')
 
 
 def d11_drop(cluster, url, token, ca):
@@ -419,11 +540,13 @@ def d11_drop(cluster, url, token, ca):
 
     with ThreadPoolExecutor(4) as pool:
         futures = [pool.submit(writer) for _ in range(4)]
-        time.sleep(1.0)
-        table.drop()
-        dropped_at[0] = time.monotonic()
-        time.sleep(1.5)
-        stop.set()
+        try:
+            time.sleep(1.0)
+            table.drop()
+            dropped_at[0] = time.monotonic()
+            time.sleep(1.5)
+        finally:
+            stop.set()
         for future in futures:
             future.result()
     after_drop = [entry for entry in history if entry[0] > dropped_at[0]]
@@ -512,9 +635,11 @@ def d10(cluster, kv, token, ca):
 
     with ThreadPoolExecutor(6) as pool:
         futures = [pool.submit(writer) for _ in range(6)]
-        time.sleep(1.5)
-        cluster.kill_api('api1')
-        stop.set()
+        try:
+            time.sleep(1.5)
+            cluster.kill_api('api1')
+        finally:
+            stop.set()
         for future in futures:
             future.result()
     lost = [entry for entry in history if entry[1] is None]
@@ -557,9 +682,11 @@ def d09(cluster, token, ca, output):
 
     with ThreadPoolExecutor(8) as pool:
         futures = [pool.submit(writer, index) for index in range(8)]
-        time.sleep(3.0)
-        cluster.kill_all()
-        stop.set()
+        try:
+            time.sleep(3.0)
+            cluster.kill_all()
+        finally:
+            stop.set()
         for future in futures:
             future.result()
     acknowledged = [body for body, status, reply in history if status == 200]
@@ -645,8 +772,10 @@ def suite_barriers(args, output):
         assert refused, 'no request exceeded the leader budget'
         assert all(reply['error']['code'] == 'overloaded' and reply['error']['outcome'] == 'not_applied'
                    for _, reply in refused), refused[:3]
+        # A typed 429 comes from the leader's in-flight budget or, earlier, from its
+        # full handler lane (`worker handler lane full`); both refuse before execution.
         overloaded = direct(after, 'overloaded_429') - direct(before, 'overloaded_429')
-        assert overloaded >= 1, overloaded
+        executed = direct(after, 'mutations') - direct(before, 'mutations')
         for body in accepted:
             assert table.get(body['payload']['row']['id']) == body['payload']['row']
         for body, _ in refused:
@@ -655,7 +784,8 @@ def suite_barriers(args, output):
         limits = {name: value['direct']['max_in_flight'] for name, value in after.items()}
         assert all(limit == budget for limit in limits.values()), limits
         assert all(value == 0 for value in in_flight.values()), in_flight
-        report('D12', offered=96, acknowledged=len(accepted), refused_429=len(refused), leader_429=overloaded,
+        report('D12', offered=96, acknowledged=len(accepted), refused_429=len(refused), leader_budget_429=overloaded,
+               lane_or_gateway_429=len(refused) - overloaded, leader_mutations_admitted=executed,
                max_in_flight=limits, in_flight_after=in_flight,
                scheduler_after={name: value['scheduler'] for name, value in after.items()},
                acknowledged_verified=len(accepted), refused_absent=len(refused))
@@ -719,7 +849,7 @@ def suite_barriers(args, output):
 
 
 def suite_quorum(args, output):
-    cluster = Rf3Cluster(args.binary, output / 'quorum', api_direct=(True,))
+    cluster = Rf3Cluster(args.binary, output / 'quorum', test_executable=args.test_executable, api_direct=(True,))
     try:
         cluster.start()
         cluster.wait_direct_active()
@@ -731,16 +861,19 @@ def suite_quorum(args, output):
         followers = [name for name in WORKERS if name != leader]
         request_id = uid()
         body = insert_body(table.id, 4000, 4, request_id)
-        before = cluster.stats(leader)
-        for name in followers:
-            cluster.workers[name].pause()
+        before = cluster.stats(leader)['direct']['entries_proposed']
+        gates(cluster, request_id, 'direct-proposing')
         with ThreadPoolExecutor(1) as pool:
             pending = pool.submit(lambda: Http(cluster.api_urls['api1'], token, 60, ca).exchange('/v1/operations', body))
-            deadline = time.monotonic() + 20
-            while (cluster.stats(leader)['direct'] or {}).get('entries_proposed', 0) <= before['direct']['entries_proposed']:
-                assert time.monotonic() < deadline, 'the leader never proposed'
-                time.sleep(0.05)
-            proposed_at_old_leader = True
+            assert reached(cluster, request_id) == leader
+            # The leader holds a registered timestamp and is about to propose: stop
+            # both followers, let it append the entry, then kill it before any quorum.
+            for name in followers:
+                cluster.workers[name].pause()
+            release(cluster, request_id)
+            time.sleep(1.5)
+            proposed_at_old_leader = cluster.stats(leader)['direct']['entries_proposed'] - before
+            assert proposed_at_old_leader == 1, proposed_at_old_leader
             cluster.workers[leader].kill()
             for name in followers:
                 cluster.workers[name].resume()
@@ -776,8 +909,8 @@ def main():
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
     suites = args.suite or ['rf1', 'cluster', 'barriers', 'quorum']
-    if 'barriers' in suites and not args.test_executable:
-        parser.error('--suite barriers needs --test-executable')
+    if {'barriers', 'quorum'} & set(suites) and not args.test_executable:
+        parser.error('--suite barriers and quorum need --test-executable')
     args.output.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='nabedra-direct-'))
     failed = []
