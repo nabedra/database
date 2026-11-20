@@ -1,0 +1,61 @@
+{
+ "run": "serial-scylla",
+ "settings": {
+  "rates": [
+   0.2
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 5.0,
+  "repetitions": 10,
+  "clients": 1,
+  "rows": 2000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": null,
+  "stop_on_rejection": false
+ },
+ "workload": "existing bigint primary-key updates to a bigint value",
+ "started_utc": "2026-11-20T19:59:45.110925+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.19.0.2": "batch",
+   "172.19.0.3": "batch",
+   "172.19.0.4": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "serial-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "0.2": {
+    "reps": 10,
+    "offered": 10,
+    "median_succeeded_rps": 0.2,
+    "median_p50_ms": 7.623020499999999,
+    "median_p95_ms": 7.623020499999999,
+    "median_p99_ms": 7.623020499999999,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 10,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ }
+}

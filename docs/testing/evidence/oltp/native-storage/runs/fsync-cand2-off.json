@@ -1,0 +1,238 @@
+{
+ "run": "fsync-cand2-off",
+ "settings": {
+  "rates": [
+   1,
+   5,
+   20
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 2000,
+  "seed": 20261118,
+  "timeout": 60.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": null,
+  "stop_on_rejection": false
+ },
+ "workload": "existing bigint primary-key updates to a bigint value",
+ "started_utc": "2026-11-20T22:02:18.546483+00:00",
+ "error": "RuntimeError: 5-warmup snapshot verification failed: {'rows': 2000, 'sha256': '2f6dc79a7d6234adc57edbd81f8a97ce1c18f1413aec2b6a4ff99d8f1b9933d6', 'mismatches': 1, 'first_mismatches': [{'key': 1695, 'expected': 0, 'actual': 31}], 'read_mismatches': 0, 'first_read_mismatches': [], 'unresolved_keys': 0, 'unresolved_keys_with_new_value': 0, 'unobserved_unresolved_values_before_phase': 0, 'unobserved_unresolved_values_after_snapshot': 0, 'prior_unresolved_values_observed': 0, 'first_prior_unresolved_values_observed': []}",
+ "correctness_verified": false,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "bf370a7e73e505dd69b1de977267a1378055e545d6f5600649c90988f2015ac2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:cda7dd3f9d7f7c09912f2c5c709069d38f2e605b9f715d2de1a7bcd70aa344c0",
+  "direct_oltp": "off",
+  "pool_format_version": 2,
+  "strace": "fsync,fdatasync,sync_file_range,syncfs",
+  "workspace_head": "b09d9b878be131942611e980cfcc3d96f10079bc",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "278a5bac7405674a763b003843b75ee499f7cc0e3d5cafddc96b47290737a762",
+   "benchmark_oltp_workload.py": "cc0acd0c9299cd4a74311f2e175d84bd9f4a4756c0ee0de40dfb1fee31c88a36"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220098560,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 67133110,
+   "w2": 67133110,
+   "w3": 67133110
+  },
+  "direct_activation_seconds_after_api_ready": 0.5644920489867218
+ },
+ "summary": {
+  "run": "fsync-cand2-off",
+  "error": "RuntimeError: 5-warmup snapshot verification failed: {'rows': 2000, 'sha256': '2f6dc79a7d6234adc57edbd81f8a97ce1c18f1413aec2b6a4ff99d8f1b9933d6', 'mismatches': 1, 'first_mismatches': [{'key': 1695, 'expected': 0, 'actual': 31}], 'read_mismatches': 0, 'first_read_mismatches': [], 'unresolved_keys': 0, 'unresolved_keys_with_new_value': 0, 'unobserved_unresolved_values_before_phase': 0, 'unobserved_unresolved_values_after_snapshot': 0, 'prior_unresolved_values_observed': 0, 'first_prior_unresolved_values_observed': []}",
+  "correctness_verified": false,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 0.6741818862239805,
+    "median_p50_ms": 4460.144803,
+    "median_p95_ms": 4593.175637,
+    "median_p99_ms": 4593.175637,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "direct_counters": {
+  "forward_markers_written": 33,
+  "forwards": 66,
+  "requests": 66,
+  "expire_entries": 2
+ },
+ "refusals": {
+  "update | rejected | 429 | worker outgoing lane full": 1
+ },
+ "resources": {
+  "window_s": 117.700497193,
+  "acknowledged_writes": 32,
+  "io": {
+   "w1": {
+    "wbytes": 3211264,
+    "wios": 1129,
+    "cpu_usec": 113505528,
+    "throttled_periods": 901,
+    "periods": 1197,
+    "window_s": 119.692960441
+   },
+   "w2": {
+    "wbytes": 3207168,
+    "wios": 1176,
+    "cpu_usec": 48541778,
+    "throttled_periods": 18,
+    "periods": 1196,
+    "window_s": 119.665252771
+   },
+   "w3": {
+    "wbytes": 3182592,
+    "wios": 1181,
+    "cpu_usec": 54256838,
+    "throttled_periods": 62,
+    "periods": 1196,
+    "window_s": 119.652101186
+   }
+  },
+  "wbytes_total": 9601024,
+  "wbytes_per_ack": 300032.0,
+  "strace": {
+   "w1": {
+    "calls": {
+     "fdatasync": 554
+    },
+    "fsync_fdatasync": 554,
+    "p50_ms": 1.239,
+    "p99_ms": 31.834
+   },
+   "w2": {
+    "calls": {
+     "fdatasync": 578
+    },
+    "fsync_fdatasync": 578,
+    "p50_ms": 1.195,
+    "p99_ms": 3.933
+   },
+   "w3": {
+    "calls": {
+     "fdatasync": 582
+    },
+    "fsync_fdatasync": 582,
+    "p50_ms": 1.183,
+    "p99_ms": 2.9859999999999998
+   }
+  },
+  "fsync_fdatasync_total": 1714,
+  "fsyncs_per_ack": 53.5625,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 34304000,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "14/1466"
+   },
+   "w3": {
+    "memory_peak": 131649536,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "72/2134"
+   },
+   "w2": {
+    "memory_peak": 130043904,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "25/2157"
+   },
+   "w1": {
+    "memory_peak": 161140736,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "1396/2178"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 58224640,
+    "max_file": 95285248
+   },
+   "w2": {
+    "max_anon": 47251456,
+    "max_file": 76861440
+   },
+   "w3": {
+    "max_anon": 46940160,
+    "max_file": 78561280
+   }
+  }
+ }
+}

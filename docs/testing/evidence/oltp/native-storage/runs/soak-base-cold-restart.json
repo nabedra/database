@@ -1,0 +1,104 @@
+{
+ "mode": "cold restart of all workers after SIGKILL",
+ "previous_run": "e842d6b1-4d82-4e68-93e3-65f0c4fd09ef",
+ "profile": {
+  "previous_run": "e842d6b1-4d82-4e68-93e3-65f0c4fd09ef",
+  "next_run": "5e855971-17c3-4c27-af6a-d51555b456d8",
+  "transition_id": "c580b4a7-b130-49b1-b286-b46e4c3eca18"
+ },
+ "start_command_seconds": 1.3115053529909346,
+ "started_at": {
+  "w1": "2026-11-20T23:05:36.082708941Z",
+  "w2": "2026-11-20T23:05:36.485290477Z",
+  "w3": "2026-11-20T23:05:36.92159919Z"
+ },
+ "ready": {
+  "w1": {
+   "seconds": 7.878748437011382,
+   "reply": {
+    "cluster_id": "c52c1d08-9fd7-44fe-a1ef-823db3e09ed4",
+    "consensus_timing": {
+     "election_max_ms": 3000,
+     "election_min_ms": 1500,
+     "heartbeat_ms": 500
+    },
+    "engine": "oltp",
+    "native_thread_budget": {
+     "control_threads": 1,
+     "housekeeping_timer_threads": 1,
+     "maintenance_high_threads": 1,
+     "maintenance_low_threads": 1,
+     "native_stack_bytes_per_thread": 8458240,
+     "query_control_stack_bytes_per_thread": 4194304,
+     "query_threads": 1,
+     "total_stack_reservation_bytes": 33763328
+    },
+    "ready_workers": 3,
+    "replication_factor": 3,
+    "run_id": "5e855971-17c3-4c27-af6a-d51555b456d8",
+    "status": "ready",
+    "topology": "typed-groups-distributed"
+   }
+  },
+  "w2": {
+   "seconds": 8.45952284600935,
+   "reply": {
+    "cluster_id": "c52c1d08-9fd7-44fe-a1ef-823db3e09ed4",
+    "consensus_timing": {
+     "election_max_ms": 3000,
+     "election_min_ms": 1500,
+     "heartbeat_ms": 500
+    },
+    "engine": "oltp",
+    "native_thread_budget": {
+     "control_threads": 1,
+     "housekeeping_timer_threads": 1,
+     "maintenance_high_threads": 1,
+     "maintenance_low_threads": 1,
+     "native_stack_bytes_per_thread": 8458240,
+     "query_control_stack_bytes_per_thread": 4194304,
+     "query_threads": 1,
+     "total_stack_reservation_bytes": 33763328
+    },
+    "ready_workers": 3,
+    "replication_factor": 3,
+    "run_id": "5e855971-17c3-4c27-af6a-d51555b456d8",
+    "status": "ready",
+    "topology": "typed-groups-distributed"
+   }
+  },
+  "w3": {
+   "seconds": 8.52609011399909,
+   "reply": {
+    "cluster_id": "c52c1d08-9fd7-44fe-a1ef-823db3e09ed4",
+    "consensus_timing": {
+     "election_max_ms": 3000,
+     "election_min_ms": 1500,
+     "heartbeat_ms": 500
+    },
+    "engine": "oltp",
+    "native_thread_budget": {
+     "control_threads": 1,
+     "housekeeping_timer_threads": 1,
+     "maintenance_high_threads": 1,
+     "maintenance_low_threads": 1,
+     "native_stack_bytes_per_thread": 8458240,
+     "query_control_stack_bytes_per_thread": 4194304,
+     "query_threads": 1,
+     "total_stack_reservation_bytes": 33763328
+    },
+    "ready_workers": 3,
+    "replication_factor": 3,
+    "run_id": "5e855971-17c3-4c27-af6a-d51555b456d8",
+    "status": "ready",
+    "topology": "typed-groups-distributed"
+   }
+  }
+ },
+ "all_ready_seconds": 8.52609011399909,
+ "api_probe": {
+  "attempts": 0,
+  "error": "[Errno 2] No such file or directory: '/Users/antoniopenapena/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/ns11/runs/soak-base/results.json'"
+ },
+ "note": "b29a178 soak stopped during seeding (about 20 MB written); cold restart timed on that cluster"
+}

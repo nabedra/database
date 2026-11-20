@@ -1,0 +1,648 @@
+{
+ "run": "soak-cand2-on-1",
+ "settings": {
+  "soak_rows": 80000,
+  "soak_payload_bytes": 2048,
+  "soak_seconds": 600.0,
+  "soak_phase_seconds": 60.0,
+  "soak_rate": 50.0,
+  "soak_seed_clients": 4,
+  "soak_verify_keys": 500,
+  "clients": 32,
+  "seed": 20261118,
+  "timeout": 10.0
+ },
+ "workload": "storage soak: updates of rows with incompressible payloads",
+ "started_utc": null,
+ "error": null,
+ "correctness_verified": false,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "bf370a7e73e505dd69b1de977267a1378055e545d6f5600649c90988f2015ac2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "b09d9b878be131942611e980cfcc3d96f10079bc",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "278a5bac7405674a763b003843b75ee499f7cc0e3d5cafddc96b47290737a762",
+   "benchmark_oltp_workload.py": "cc0acd0c9299cd4a74311f2e175d84bd9f4a4756c0ee0de40dfb1fee31c88a36"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220098560,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 1101227706,
+   "w2": 1101227600,
+   "w3": 1101227478
+  },
+  "direct_activation_seconds_after_api_ready": 2.650374846998602
+ },
+ "summary": {
+  "run": "soak-cand2-on-1",
+  "error": null,
+  "correctness_verified": false,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "50.0": {
+    "reps": 10,
+    "offered": 30000,
+    "median_succeeded_rps": 48.008012099919654,
+    "median_p50_ms": 44.206889000000004,
+    "median_p95_ms": 223.1340705,
+    "median_p99_ms": 337.454515,
+    "statuses": {
+     "client_capacity": 117,
+     "failed": 0,
+     "rejected": 1347,
+     "succeeded": 28536,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 28540
+  },
+  "entries_applied": 28536,
+  "entries_proposed": 28540,
+  "expire_entries": 10,
+  "latch_wait_micros": 185716,
+  "latch_waits": 22,
+  "mutation_micros_total": 801029645,
+  "mutations": 28544,
+  "mutations_done": 28544,
+  "requests": 28544,
+  "rows_proposed": 28540,
+  "not_leader": 8,
+  "proposal_failures": {
+   "stalled": 2,
+   "leadership": 2
+  },
+  "retries": {
+   "leadership": 9
+  }
+ },
+ "refusals": {
+  "update | rejected | 429 | executor admission capacity exhausted": 1347
+ },
+ "resources": {
+  "window_s": 606.38283666,
+  "acknowledged_writes": 28536,
+  "io": {
+   "w1": {
+    "wbytes": 2497187840,
+    "wios": 59657,
+    "cpu_usec": 419252403,
+    "throttled_periods": 1393,
+    "periods": 6103,
+    "window_s": 610.304624298
+   },
+   "w2": {
+    "wbytes": 2496602112,
+    "wios": 59486,
+    "cpu_usec": 278192460,
+    "throttled_periods": 278,
+    "periods": 6103,
+    "window_s": 610.26287678
+   },
+   "w3": {
+    "wbytes": 2495451136,
+    "wios": 59479,
+    "cpu_usec": 294272650,
+    "throttled_periods": 400,
+    "periods": 6102,
+    "window_s": 610.220442996
+   }
+  },
+  "wbytes_total": 7489241088,
+  "wbytes_per_ack": 262448.8746846089,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 34492416,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "252/8520"
+   },
+   "w3": {
+    "memory_peak": 75816960,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1819"
+   },
+   "w2": {
+    "memory_peak": 65495040,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1832"
+   },
+   "w1": {
+    "memory_peak": 79323136,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "1/1846"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 111230976,
+    "max_file": 1265180672
+   },
+   "w2": {
+    "max_anon": 103522304,
+    "max_file": 1293041664
+   },
+   "w3": {
+    "max_anon": 104022016,
+    "max_file": 1295204352
+   }
+  }
+ },
+ "cold-restart": {
+  "mode": "cold restart of all workers after SIGKILL",
+  "previous_run": "6e350479-f6f3-4339-9268-1c3c318a6747",
+  "profile": {
+   "previous_run": "6e350479-f6f3-4339-9268-1c3c318a6747",
+   "next_run": "586ed46b-3391-4d23-bbcc-be3e13913a8b",
+   "transition_id": "49e88c8f-b5c7-4bda-899c-46157b4fe0c7"
+  },
+  "start_command_seconds": 1.3503256000112742,
+  "started_at": {
+   "w1": "2026-11-20T22:31:22.203530911Z",
+   "w2": "2026-11-20T22:31:22.60196695Z",
+   "w3": "2026-11-20T22:31:23.102290068Z"
+  },
+  "ready": {
+   "w1": {
+    "seconds": 7.197658717021113,
+    "reply": {
+     "cluster_id": "3dc2d827-584a-43e4-9b15-fb9d8520f869",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "586ed46b-3391-4d23-bbcc-be3e13913a8b",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w2": {
+    "seconds": 7.2628584040212445,
+    "reply": {
+     "cluster_id": "3dc2d827-584a-43e4-9b15-fb9d8520f869",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "586ed46b-3391-4d23-bbcc-be3e13913a8b",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w3": {
+    "seconds": 7.324982535006711,
+    "reply": {
+     "cluster_id": "3dc2d827-584a-43e4-9b15-fb9d8520f869",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "586ed46b-3391-4d23-bbcc-be3e13913a8b",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   }
+  },
+  "all_ready_seconds": 7.324982535006711,
+  "direct_capability": {
+   "workers": {
+    "w1": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w2": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w3": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    }
+   },
+   "seconds_after_api_ready": 0.015192332997685298
+  },
+  "direct_active_seconds": 7.5133366130176,
+  "api_probe": {
+   "attempts": 17,
+   "last": {
+    "status": 503,
+    "reply": {
+     "request_id": "b0a565e3-8852-49b6-9866-28bc9619df3e",
+     "error": {
+      "code": "storage_unavailable",
+      "message": "direct request deadline exceeded before execution",
+      "outcome": "not_applied"
+     }
+    }
+   }
+  }
+ },
+ "soak": {
+  "verification": {
+   "keys_checked": 500,
+   "mismatches": 500,
+   "first_mismatches": [
+    {
+     "key": 67,
+     "get": "failed"
+    },
+    {
+     "key": 205,
+     "get": "failed"
+    },
+    {
+     "key": 268,
+     "get": "failed"
+    },
+    {
+     "key": 345,
+     "get": "failed"
+    },
+    {
+     "key": 375,
+     "get": "failed"
+    },
+    {
+     "key": 618,
+     "get": "failed"
+    },
+    {
+     "key": 640,
+     "get": "failed"
+    },
+    {
+     "key": 697,
+     "get": "failed"
+    },
+    {
+     "key": 931,
+     "get": "failed"
+    },
+    {
+     "key": 1001,
+     "get": "failed"
+    }
+   ],
+   "later_unresolved_values_seen": 0,
+   "keys_with_unresolved_values": 0
+  },
+  "summary": {
+   "offered": 30000,
+   "succeeded": 28536,
+   "rejected": 1347,
+   "phase_p99_ms": [
+    718.007158,
+    343.925697,
+    280.348428,
+    691.021746,
+    255.862734,
+    330.983333,
+    745.377194,
+    232.492205,
+    2928.132531,
+    160.951733
+   ]
+  },
+  "seed_details": {
+   "seed": {
+    "batches": 625,
+    "rows_per_batch": 128,
+    "rejected_retries": 0,
+    "errors": [],
+    "seconds": 56.90938273499978,
+    "rows": 80000,
+    "payload_bytes": 2048,
+    "logical_bytes": 165120000
+   }
+  }
+ },
+ "soak_phases": [
+  {
+   "label": "soak-0",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 77,
+    "succeeded": 2923,
+    "unresolved": 0
+   },
+   "succeeded_rps": 48.6282288167585,
+   "success_latency_ms": {
+    "count": 2923,
+    "p50": 52.853183,
+    "p90": 194.849605,
+    "p95": 305.766074,
+    "p99": 718.007158,
+    "max": 955.06386
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-1",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 156,
+    "succeeded": 2844,
+    "unresolved": 0
+   },
+   "succeeded_rps": 47.387795383080814,
+   "success_latency_ms": {
+    "count": 2844,
+    "p50": 45.204023,
+    "p90": 180.654732,
+    "p95": 251.584468,
+    "p99": 343.925697,
+    "max": 3809.082653
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-2",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 7,
+    "succeeded": 2993,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.88333333333333,
+   "success_latency_ms": {
+    "count": 2993,
+    "p50": 38.07294,
+    "p90": 103.837673,
+    "p95": 151.429241,
+    "p99": 280.348428,
+    "max": 338.670384
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-3",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 4,
+    "failed": 0,
+    "rejected": 306,
+    "succeeded": 2690,
+    "unresolved": 0
+   },
+   "succeeded_rps": 44.7846388164097,
+   "success_latency_ms": {
+    "count": 2690,
+    "p50": 44.471894,
+    "p90": 142.567347,
+    "p95": 252.153212,
+    "p99": 691.021746,
+    "max": 5685.398804
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-4",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 3,
+    "failed": 0,
+    "rejected": 66,
+    "succeeded": 2931,
+    "unresolved": 0
+   },
+   "succeeded_rps": 45.25789752031097,
+   "success_latency_ms": {
+    "count": 2931,
+    "p50": 41.243114,
+    "p90": 93.464561,
+    "p95": 127.864154,
+    "p99": 255.862734,
+    "max": 6031.664
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-5",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 18,
+    "failed": 0,
+    "rejected": 26,
+    "succeeded": 2956,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.1523113828335,
+   "success_latency_ms": {
+    "count": 2956,
+    "p50": 49.263988,
+    "p90": 132.903204,
+    "p95": 204.703651,
+    "p99": 330.983333,
+    "max": 1715.78743
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-6",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 32,
+    "failed": 0,
+    "rejected": 330,
+    "succeeded": 2638,
+    "unresolved": 0
+   },
+   "succeeded_rps": 43.94602746247711,
+   "success_latency_ms": {
+    "count": 2638,
+    "p50": 43.941884,
+    "p90": 133.984034,
+    "p95": 241.56449,
+    "p99": 745.377194,
+    "max": 6904.440732
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-7",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 4,
+    "succeeded": 2996,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.92614243525798,
+   "success_latency_ms": {
+    "count": 2996,
+    "p50": 39.839112,
+    "p90": 88.497883,
+    "p95": 115.95572,
+    "p99": 232.492205,
+    "max": 327.48994
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-8",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 60,
+    "failed": 0,
+    "rejected": 375,
+    "succeeded": 2565,
+    "unresolved": 0
+   },
+   "succeeded_rps": 42.73027637386682,
+   "success_latency_ms": {
+    "count": 2565,
+    "p50": 46.319924,
+    "p90": 155.255238,
+    "p95": 269.840574,
+    "p99": 2928.132531,
+    "max": 5874.778733
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-9",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 3000,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.98062408060254,
+   "success_latency_ms": {
+    "count": 3000,
+    "p50": 40.060022,
+    "p90": 90.115196,
+    "p95": 114.420493,
+    "p99": 160.951733,
+    "max": 221.046789
+   },
+   "unresolved_after_reconciliation": 0
+  }
+ ]
+}

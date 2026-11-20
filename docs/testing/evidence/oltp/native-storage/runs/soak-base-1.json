@@ -1,0 +1,255 @@
+{
+ "run": "soak-base-1",
+ "settings": {
+  "soak_rows": 80000,
+  "soak_payload_bytes": 2048,
+  "soak_seconds": 600.0,
+  "soak_phase_seconds": 60.0,
+  "soak_rate": 50.0,
+  "soak_seed_clients": 4,
+  "soak_verify_keys": 500,
+  "clients": 32,
+  "seed": 20261118,
+  "timeout": 10.0
+ },
+ "workload": "storage soak: updates of rows with incompressible payloads",
+ "started_utc": null,
+ "error": "RuntimeError: soak seeding failed: [\"RuntimeError: soak seed batch 256: {'request_body_bytes': 266652, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\", \"RuntimeError: soak seed batch 384: {'request_body_bytes': 266652, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\", \"RuntimeError: soak seed batch 2560: {'request_body_bytes': 266780, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\"]",
+ "correctness_verified": false,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "953a35f30ca8a524db9507ae5dc053818b1f87dd89f39734070d327779e1012e",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "pool_format_version": 1,
+  "workspace_head": "c8510da0c7b86402c5ec0f719eecd6b5a2c605a5",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "51ab8dd1339e06b0d29c59454db50246f77773903b21d5809cfd766ac774f124",
+   "benchmark_oltp_workload.py": "cc0acd0c9299cd4a74311f2e175d84bd9f4a4756c0ee0de40dfb1fee31c88a36"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220098560,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 20562979,
+   "w2": 20562885,
+   "w3": 20562882
+  }
+ },
+ "summary": {
+  "run": "soak-base-1",
+  "error": "RuntimeError: soak seeding failed: [\"RuntimeError: soak seed batch 256: {'request_body_bytes': 266652, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\", \"RuntimeError: soak seed batch 384: {'request_body_bytes': 266652, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\", \"RuntimeError: soak seed batch 2560: {'request_body_bytes': 266780, 'status': 'unresolved', 'transport_error': 'SSLEOFError', 'message': 'EOF occurred in violation of protocol (_ssl.c:2393)'}\"]",
+  "correctness_verified": false,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {}
+ },
+ "resources": {
+  "window_s": null,
+  "acknowledged_writes": null,
+  "io": null,
+  "wbytes_total": null,
+  "wbytes_per_ack": null,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 43192320,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "19/3710"
+   },
+   "w3": {
+    "memory_peak": 78397440,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "2/99"
+   },
+   "w2": {
+    "memory_peak": 88461312,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "2/115"
+   },
+   "w1": {
+    "memory_peak": 100335616,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "9/128"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 81956864,
+    "max_file": 54890496
+   },
+   "w2": {
+    "max_anon": 74895360,
+    "max_file": 36061184
+   },
+   "w3": {
+    "max_anon": 74301440,
+    "max_file": 35135488
+   }
+  }
+ },
+ "cold-restart": {
+  "mode": "cold restart of all workers after SIGKILL",
+  "previous_run": "0dd035cd-cdd4-462d-b21d-8686b98efff5",
+  "profile": {
+   "previous_run": "0dd035cd-cdd4-462d-b21d-8686b98efff5",
+   "next_run": "a6afb318-f304-4ae6-a9ae-66e09fbb3d4d",
+   "transition_id": "27bbf08e-81bb-46bc-8a34-ae69990c88ef"
+  },
+  "start_command_seconds": 1.4936400669976138,
+  "started_at": {
+   "w1": "2026-11-20T22:42:47.175444282Z",
+   "w2": "2026-11-20T22:42:47.559487613Z",
+   "w3": "2026-11-20T22:42:48.178342029Z"
+  },
+  "ready": {
+   "w1": {
+    "seconds": 8.390118025999982,
+    "reply": {
+     "cluster_id": "c5bc6b99-390e-4718-8b28-8eb7e079844e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "control_threads": 1,
+      "housekeeping_timer_threads": 1,
+      "maintenance_high_threads": 1,
+      "maintenance_low_threads": 1,
+      "native_stack_bytes_per_thread": 8458240,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "total_stack_reservation_bytes": 33763328
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "a6afb318-f304-4ae6-a9ae-66e09fbb3d4d",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w2": {
+    "seconds": 8.459896927990485,
+    "reply": {
+     "cluster_id": "c5bc6b99-390e-4718-8b28-8eb7e079844e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "control_threads": 1,
+      "housekeeping_timer_threads": 1,
+      "maintenance_high_threads": 1,
+      "maintenance_low_threads": 1,
+      "native_stack_bytes_per_thread": 8458240,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "total_stack_reservation_bytes": 33763328
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "a6afb318-f304-4ae6-a9ae-66e09fbb3d4d",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w3": {
+    "seconds": 8.5342640549934,
+    "reply": {
+     "cluster_id": "c5bc6b99-390e-4718-8b28-8eb7e079844e",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "control_threads": 1,
+      "housekeeping_timer_threads": 1,
+      "maintenance_high_threads": 1,
+      "maintenance_low_threads": 1,
+      "native_stack_bytes_per_thread": 8458240,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "total_stack_reservation_bytes": 33763328
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "a6afb318-f304-4ae6-a9ae-66e09fbb3d4d",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   }
+  },
+  "all_ready_seconds": 8.5342640549934,
+  "api_probe": {
+   "attempts": 0,
+   "error": "'seed_details'"
+  }
+ }
+}
