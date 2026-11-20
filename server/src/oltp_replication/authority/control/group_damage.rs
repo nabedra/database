@@ -153,7 +153,7 @@ pub(crate) enum GroupDamagePhase {
         committed_at: AppliedPosition,
         /// The placement Control published with it (NS14b).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        published: Option<GroupRecord>,
+        published: Option<Box<GroupRecord>>,
     },
 }
 

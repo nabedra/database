@@ -76,20 +76,48 @@ impl DataGroupFactory {
                         );
                         continue;
                     }
-                    let store = pool.retained_group(record.identity.clone()).await?;
-                    let running = self
-                        .manager
-                        .start_data(
-                            store,
-                            local.clone(),
-                            routes
-                                .members
-                                .iter()
-                                .map(|member| (member.node_id, member.clone()))
-                                .collect(),
-                            self.config.clone(),
-                        )
-                        .await?;
+                    let started = match pool.retained_group(record.identity.clone()).await {
+                        Ok(store) => {
+                            self.manager
+                                .start_data(
+                                    store,
+                                    local.clone(),
+                                    routes
+                                        .members
+                                        .iter()
+                                        .map(|member| (member.node_id, member.clone()))
+                                        .collect(),
+                                    self.config.clone(),
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    let running = match started {
+                        Ok(running) => running,
+                        // NS14b: Raft's own reads while starting the replica can
+                        // meet damage (a journal value, G3). kv quarantined the
+                        // group: report it and keep hosting the others.
+                        Err(error) => match pool.group_damage(record.identity.group_id) {
+                            Some(damage) => {
+                                tracing::error!(group = %record.identity.group_id,
+                                    node = local.node_id, %error,
+                                    "replica found damaged while starting; it is not hosted");
+                                self.settle_damage(
+                                    GroupDamageReport {
+                                        group: record.identity.clone(),
+                                        replica: local.clone(),
+                                        reason: damage.cause.into(),
+                                        first_bad_seq: damage.first_bad_seq,
+                                        refusal: None,
+                                    },
+                                    Some(pool),
+                                );
+                                continue;
+                            }
+                            None => return Err(error),
+                        },
+                    };
                     if !running
                         .raft
                         .is_initialized()

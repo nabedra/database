@@ -326,7 +326,7 @@ async fn o17_ns14_group_damaged_is_recorded_once_and_replaced_only_by_proof() {
     // The new placement is published: a new generation without the damaged
     // member, whose position is the committed change.
     let (current, current_members) = published(&f, placement.identity.group_id).await;
-    assert_eq!(current, new);
+    assert_eq!(current, *new);
     assert_ne!(current.generation, placement.generation);
     assert_eq!(current.membership_position, proof.committed_at);
     assert_eq!(current.replica_count, 3);

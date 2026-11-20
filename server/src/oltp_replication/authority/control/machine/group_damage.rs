@@ -230,7 +230,7 @@ pub(super) fn replaced(
     record.phase = GroupDamagePhase::Replaced {
         replacement: proof.replacement.clone(),
         committed_at: proof.committed_at,
-        published: Some(placement),
+        published: Some(Box::new(placement)),
     };
     save(tx, &record_key, &record)?;
     Ok(ControlReply::GroupDamage(Box::new(record)))

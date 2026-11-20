@@ -191,7 +191,7 @@ impl DamageReplacementEndpoint {
             .await?
             .into_iter()
             .find(|pool| pool.identity().pool_id == plan.replacement.pool_id)
-            .ok_or_else(|| unavailable())?;
+            .ok_or_else(unavailable)?;
         let store = pool
             .placement_learner(plan.group.clone(), plan.binding()?)
             .await?;
@@ -329,6 +329,10 @@ pub(crate) struct DamageScheduler {
     interval: Duration,
     running: Mutex<BTreeSet<(Uuid, u64)>>,
     pub(crate) stats: DamageSchedulerStats,
+    /// Test only: after hosting the fresh replica, signal the first `Notify`
+    /// and wait for the second (a Control leader that stops mid-replacement).
+    #[cfg(test)]
+    pub(crate) hold_after_host: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl DamageScheduler {
@@ -347,6 +351,8 @@ impl DamageScheduler {
             interval,
             running: Mutex::new(BTreeSet::new()),
             stats: DamageSchedulerStats::default(),
+            #[cfg(test)]
+            hold_after_host: Mutex::new(None),
         })
     }
 
@@ -449,6 +455,16 @@ impl DamageScheduler {
             Action::Host,
         )
         .await?;
+        #[cfg(test)]
+        if let Some((reached, release)) = self
+            .hold_after_host
+            .lock()
+            .ok()
+            .and_then(|hold| hold.clone())
+        {
+            reached.notify_one();
+            release.notified().await;
+        }
         let proof = self.replace(&plan).await?;
         let operation = derived_id(b"nabedra/group-damage-replaced/v1", &proof)?;
         let done = self
