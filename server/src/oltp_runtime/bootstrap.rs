@@ -1078,6 +1078,8 @@ fn accepted(reply: ControlReply) -> Result<(), ProtocolError> {
         Fault::Stale | Fault::Conflict | Fault::Incomplete => ErrorCode::Conflict,
         Fault::NotFound => ErrorCode::NotFound,
         Fault::NotInitialized | Fault::Busy | Fault::NotReady => ErrorCode::StorageUnavailable,
+        // `data.direct.v1` is active and this worker did not advertise it.
+        Fault::DirectCapabilityRequired => ErrorCode::UnsupportedOperation,
     };
     Err(ProtocolError::new(
         code,

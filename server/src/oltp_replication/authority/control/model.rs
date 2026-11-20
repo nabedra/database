@@ -172,6 +172,13 @@ impl ApiEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlCommand {
+    /// `data.direct.v1` adverts and activation. New in this build: see
+    /// `control::direct` for the upgrade order.
+    DirectCapability {
+        operation_id: Uuid,
+        actor: WorkerIdentity,
+        action: super::DirectCapabilityOperation,
+    },
     ScopedQueue {
         operation_id: Uuid,
         actor: WorkerIdentity,
@@ -406,7 +413,8 @@ pub(crate) enum ControlCommand {
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::ScopedQueue { operation_id, .. }
+            Self::DirectCapability { operation_id, .. }
+            | Self::ScopedQueue { operation_id, .. }
             | Self::EnsureScopedQueue { operation_id, .. }
             | Self::PoolDrain { operation_id, .. }
             | Self::BeginWorkerDrain { operation_id, .. }
@@ -533,10 +541,14 @@ pub(crate) enum Fault {
     NotFound,
     Incomplete,
     NotReady,
+    /// `data.direct.v1` is active and the worker did not advertise it, so it
+    /// cannot become a voter or learner. Emitted only after activation.
+    DirectCapabilityRequired,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
+    DirectCapability(super::DirectCapability),
     ScopedQueueUpdated,
     ScopedQueueTransfer(Box<super::ScopedQueueTransition>),
     ScopedQueue(Box<super::ScopedQueuePlacement>),

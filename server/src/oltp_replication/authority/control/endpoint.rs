@@ -87,6 +87,14 @@ enum ReadRequest {
         group_id: Uuid,
     },
     ScopedQueueCapability,
+    /// `data.direct.v1`: activation and the caller's advert. An older
+    /// Control leader rejects the unknown request; callers treat that as
+    /// "not active".
+    DirectCapability,
+    ChangeDirectCapability {
+        operation_id: Uuid,
+        action: super::DirectCapabilityOperation,
+    },
     ScopedQueueTransition {
         group_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +172,7 @@ impl ReadRequest {
                 | Self::GroupMembers { .. }
                 | Self::ScopedQueue { .. }
                 | Self::ScopedQueueCapability
+                | Self::DirectCapability
                 | Self::ScopedQueueTransition { .. }
                 | Self::ScopedQueuePredecessor { .. }
                 | Self::ScopedQueueEpochRetired { .. }
@@ -409,6 +418,22 @@ impl ControlEndpoint {
                     let state = self.handle.scoped_queue_capability().await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::DirectCapability => {
+                    let state = self.handle.direct_capability(session.remote()).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::ChangeDirectCapability {
+                    operation_id,
+                    action,
+                } => {
+                    let reply = self
+                        .handle
+                        .apply_direct_capability_rpc(&session, operation_id, action, leader)
+                        .await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &reply, HEADER_LIMIT)?
                 }
                 ReadRequest::ScopedQueueTransition {
                     group_id,
@@ -677,6 +702,44 @@ impl ControlClient {
             return Err(invalid("invalid Control scoped queue capability"));
         }
         Ok(capability)
+    }
+
+    /// The strong Control view of `data.direct.v1` for this caller.
+    pub(crate) async fn direct_capability(&self) -> Result<super::DirectCapability, ProtocolError> {
+        let reply = self.read(&ReadRequest::DirectCapability).await?;
+        let capability = *reply.decode_section::<super::DirectCapability>(0)?;
+        if capability.version != super::DIRECT_VERSION {
+            return Err(invalid("invalid Control direct capability"));
+        }
+        Ok(capability)
+    }
+
+    /// Advertises `data.direct.v1` for this caller's enrolled identity, or
+    /// (`Activate`) asks Control to re-evaluate activation.
+    pub(crate) async fn change_direct_capability(
+        &self,
+        operation_id: Uuid,
+        action: super::DirectCapabilityOperation,
+    ) -> Result<super::DirectCapability, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ChangeDirectCapability {
+                operation_id,
+                action,
+            })
+            .await?;
+        match &*reply.decode_section::<ControlReply>(0)? {
+            ControlReply::DirectCapability(capability)
+                if capability.version == super::DIRECT_VERSION =>
+            {
+                Ok(*capability)
+            }
+            ControlReply::Rejected(Fault::Unauthorized) => Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "Control rejected the direct capability caller",
+                Outcome::NotApplied,
+            )),
+            _ => Err(invalid("unexpected Control direct capability reply")),
+        }
     }
 
     pub(crate) async fn advertise_scoped_queue(

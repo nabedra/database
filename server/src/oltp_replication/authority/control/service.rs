@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod data_worker;
+mod direct;
 mod growth;
 mod placement;
 mod pool_drain;
