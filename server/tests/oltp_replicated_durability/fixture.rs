@@ -548,7 +548,7 @@ fn probe_native_store(pool: &Path, probe: &Path) -> Value {
         nabedra_kv::fs::real(),
         Arc::new(nabedra_kv::BlockCache::new(1 << 20)),
         Arc::new(nabedra_kv::MemtableBudget::new(8 << 20)),
-        nabedra_kv::Background::new(1),
+        nabedra_kv::Background::new(1).expect("kv background threads"),
     );
     let outcome = match nabedra_kv::Store::open(probe, options) {
         Err(error @ nabedra_kv::Error::Corruption { .. }) => {
