@@ -50,7 +50,7 @@ use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     future::Future,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -377,7 +377,6 @@ impl Cluster {
             schema,
             _dir: dir,
         };
-        let leader = cluster.leader().await;
         // The first proposals after an election can fail while the new
         // leader settles; the same transition is idempotent, so retry it.
         let (transition, catalog) = (Uuid::new_v4(), Uuid::new_v4());

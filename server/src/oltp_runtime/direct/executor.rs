@@ -100,6 +100,8 @@ struct Parsed {
     operation: Operation,
 }
 
+/// (row key, head version, old row, new row).
+type RowChange = (MvccKey, Option<CommitTs>, Option<Row>, Option<Row>);
 /// The planned writes of one attempt.
 struct Computed {
     writes: Vec<DirectWrite>,
@@ -771,6 +773,7 @@ impl DirectExecutor {
     }
 
     /// Step 4 with the queued planner's row and index functions.
+    #[allow(clippy::too_many_arguments)]
     async fn compute(
         &self,
         handle: &ParticipantHandle,
@@ -781,8 +784,7 @@ impl DirectExecutor {
         epochs: &ParticipantEpochs,
         deadline: Instant,
     ) -> Result<Option<Computed>, DirectResponse> {
-        // (row key, head version, old row, new row)
-        let mut changes: Vec<(MvccKey, Option<CommitTs>, Option<Row>, Option<Row>)> = Vec::new();
+        let mut changes: Vec<RowChange> = Vec::new();
         let result = match operation {
             Operation::Insert(p) | Operation::Upsert(p) => {
                 let insert = matches!(operation, Operation::Insert(_));

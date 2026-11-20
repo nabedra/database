@@ -15,8 +15,10 @@
 //! Mixed versions: an older receiver rejects the unknown method or the
 //! ingress purpose on a Data group before executing anything. Gateways send
 //! these methods only once `data.direct.v1` is active (T7).
-// T6 (gateway) and T7 (activation) construct and call this; until then only tests do.
-#![cfg_attr(not(test), allow(dead_code))]
+// T6 (gateway) and T7 (activation) construct and call parts of this
+// (the Catalog schema, installation, the expiry task); until then they are
+// unused outside tests, and some even in tests.
+#![allow(dead_code)]
 use crate::{
     oltp::pool::ChargedBytes,
     oltp_replication::types::{Digest, GroupIdentity, GroupKind, Text},

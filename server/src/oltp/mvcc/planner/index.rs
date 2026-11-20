@@ -40,11 +40,11 @@ pub(crate) fn index_entry_changes(
                 primary_key: primary.clone(),
             })
     };
-    let old_key = old.map(&entry).transpose()?;
+    let old_key = old.map(entry).transpose()?;
     let new_row = new
         .map(|raw| serde_json::from_str::<Row>(raw.as_str()).map_err(|_| not_found()))
         .transpose()?;
-    let new_key = new_row.as_ref().map(&entry).transpose()?;
+    let new_key = new_row.as_ref().map(entry).transpose()?;
     let put = match (new_key, new_row.as_ref()) {
         (Some(key), Some(row)) => Some((
             key,
