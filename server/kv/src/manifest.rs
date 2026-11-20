@@ -376,15 +376,18 @@ impl ManifestState {
         if let Some(segments) = &edit.segments {
             self.segments.clone_from(segments);
         }
-        for damage in &edit.quarantined {
-            if !self.quarantine.iter().any(|d| d.scope == damage.scope) {
-                self.quarantine.push(damage.clone());
-            }
-        }
+        // Releases first: a release edit lifts the quarantine its scope had, but a
+        // snapshot record carries the release history next to the current quarantine,
+        // and a scope released once and damaged later must stay quarantined.
         for (scope, seq) in &edit.released {
             self.quarantine.retain(|d| d.scope != *scope);
             self.released.retain(|(s, _)| s != scope);
             self.released.push((scope.clone(), *seq));
+        }
+        for damage in &edit.quarantined {
+            if !self.quarantine.iter().any(|d| d.scope == damage.scope) {
+                self.quarantine.push(damage.clone());
+            }
         }
         for (id, scope) in &edit.quarantined_runs {
             self.runs.remove(id);
@@ -719,6 +722,37 @@ mod tests {
             quarantined_runs: vec![(5, Bytes::from_static(b"@g"))],
             dropped_quarantined_runs: vec![4],
         }
+    }
+
+    /// KVfix3: a scope released once and quarantined later keeps its quarantine through
+    /// a snapshot record (a fresh manifest), while a later release still lifts it.
+    #[test]
+    fn ns07_snapshot_keeps_the_quarantine_of_a_once_released_scope() {
+        let scope = Bytes::from_static(b"@g");
+        let damage = Damage {
+            scope: scope.clone(),
+            reason: DamageReason::RunBlock,
+            file: FileId::Run { id: 3 },
+            first_bad_seq: None,
+        };
+        let mut state = ManifestState::new();
+        let release = |seq| VersionEdit {
+            released: vec![(scope.clone(), seq)],
+            ..VersionEdit::default()
+        };
+        state.apply(&release(10)).unwrap();
+        state
+            .apply(&VersionEdit {
+                quarantined: vec![damage.clone()],
+                ..VersionEdit::default()
+            })
+            .unwrap();
+        let mut rebuilt = ManifestState::new();
+        rebuilt.apply(&state.snapshot()).unwrap();
+        assert_eq!(rebuilt.quarantine, vec![damage]);
+        assert_eq!(rebuilt.released, vec![(scope.clone(), 10)]);
+        rebuilt.apply(&release(20)).unwrap();
+        assert!(rebuilt.quarantine.is_empty());
     }
 
     #[test]

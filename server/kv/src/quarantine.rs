@@ -6,6 +6,7 @@
 //! the scope. The set is small (R6 refuses a store above a few scopes), so lookups scan
 //! it; the common case, an empty set, costs one atomic load.
 
+use std::ops::Bound;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -83,6 +84,21 @@ impl Quarantine {
             .map(|d| d.scope.clone())
     }
 
+    /// True when some key in the range from `lower` to `upper` lies under a quarantined
+    /// scope. An iterator that moves across such a range without landing on a key there
+    /// (the scope's records were skipped by recovery, or are all deleted) must fail,
+    /// never return the rest of the range as if the scope were empty.
+    pub fn overlaps(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        if self.len() == 0 {
+            return false;
+        }
+        self.scopes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|d| range_overlaps_scope(lower, upper, &d.scope))
+    }
+
     /// `Err(Corruption)` when `key` is under a quarantined scope.
     pub fn check(&self, key: &[u8]) -> Result<(), Error> {
         match self.scope_of(key) {
@@ -98,6 +114,32 @@ pub(crate) fn quarantined_error() -> Error {
         offset: 0,
         what: "key belongs to a quarantined scope",
     }
+}
+
+/// True when some key `k` with `lower <= k <= upper` (each end as its bound says) starts
+/// with `scope`. Conservative only for a range with no key at all between two adjacent
+/// byte strings, which a caller never has. An empty scope never matches.
+pub(crate) fn range_overlaps_scope(lower: Bound<&[u8]>, upper: Bound<&[u8]>, scope: &[u8]) -> bool {
+    if scope.is_empty() {
+        return false;
+    }
+    let end = prefix_successor(scope);
+    // The intersection's lower end: the larger of `lower` and `scope` (inclusive).
+    let (lo, lo_incl): (&[u8], bool) = match lower {
+        Bound::Included(k) if k > scope => (k, true),
+        Bound::Excluded(k) if k >= scope => (k, false),
+        _ => (scope, true),
+    };
+    // Its upper end: the smaller of `upper` and the scope's end (exclusive).
+    let (hi, hi_incl): (&[u8], bool) = match (upper, end.as_deref()) {
+        (Bound::Unbounded, None) => return true,
+        (Bound::Unbounded, Some(e)) => (e, false),
+        (Bound::Included(h), Some(e)) if e <= h => (e, false),
+        (Bound::Included(h), _) => (h, true),
+        (Bound::Excluded(h), Some(e)) if e <= h => (e, false),
+        (Bound::Excluded(h), _) => (h, false),
+    };
+    lo < hi || (lo == hi && lo_incl && hi_incl)
 }
 
 /// The scope prefix both ends of `[lo, hi]` share under `scope_of`, if the whole range
