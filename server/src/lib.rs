@@ -10,6 +10,8 @@ compile_error!("select exactly one engine: olap, oltp, or cache");
 #[cfg(all(feature = "cache", feature = "s3"))]
 compile_error!("the cache engine does not support S3");
 
+#[cfg(feature = "s3")]
+pub(crate) mod aws_http;
 #[cfg(feature = "cache")]
 pub mod cache;
 
