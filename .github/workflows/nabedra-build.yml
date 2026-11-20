@@ -617,3 +617,51 @@ jobs:
           name: direct-evidence
           path: artifacts
           retention-days: 14
+
+  # NS11/T10: the release OLTP server for the comparative benchmark, built in the same
+  # Debian bookworm base as the Dockerfile's build stage (glibc of the benchmark images),
+  # plus the NS18 engine microbench in release. Opt-in: put [ci bench] in the pushed
+  # head commit message. The comparative benchmark itself runs on the controlled host.
+  bench:
+    name: release benchmark binary and NS18 microbench (NS11)
+    if: contains(github.event.head_commit.message, '[ci bench]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: rust:1.94.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          echo "build_seconds=$(( $(date +%s) - start ))" | tee ../bench-build.txt
+          mkdir -p ../bench-bin
+          cp target/release/nabedra-db "../bench-bin/nabedra-db-${GITHUB_SHA::7}"
+          cd ../bench-bin
+          sha256sum nabedra-db-* | tee -a ../bench-build.txt
+          ./nabedra-db-* --version | tee -a ../bench-build.txt
+          ldd nabedra-db-* | tee -a ../bench-build.txt
+          ldd --version | head -1 | tee -a ../bench-build.txt
+          cp ../bench-build.txt .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-binary
+          path: bench-bin
+          retention-days: 14
+      - name: NS18 microbench (release, ignored tests)
+        working-directory: server
+        run: |
+          set -o pipefail
+          nproc; free -m; df -h .
+          cargo test --locked --release -p nabedra-kv --test store_bench -- --ignored --nocapture --test-threads 1 2>&1 | tee ../ns18-bench.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ns18-bench-log
+          path: ns18-bench.log
+          retention-days: 14
