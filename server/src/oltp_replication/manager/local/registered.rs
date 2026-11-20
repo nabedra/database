@@ -560,6 +560,7 @@ impl RegisteredWorker {
             ownership: Some(ownership.clone()),
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
+            health: Arc::default(),
         });
         Ok(Self {
             manager,
