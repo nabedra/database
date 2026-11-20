@@ -412,7 +412,6 @@ impl ParticipantHandle {
     /// The dedup record or forward marker for `request_id` at `anchor`,
     /// read behind the linearizable barrier. Only the anchor range's leader
     /// executor calls it, so a remote handle refuses.
-    #[allow(dead_code)] // Called by the leader executor (T5).
     pub(crate) async fn direct_dedup(
         &self,
         table_id: Uuid,
@@ -675,7 +674,6 @@ impl ParticipantHandle {
     /// section 7): `None` until direct commits were activated on it. Read
     /// behind the linearizable barrier on the local replica; the leader
     /// executor (T5) calls it on the range leader.
-    #[allow(dead_code)] // Called by the leader executor (T5).
     pub(crate) async fn direct_schema(
         &self,
     ) -> Result<Option<super::direct::DirectSchema>, ProtocolError> {

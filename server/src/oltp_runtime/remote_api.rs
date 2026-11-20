@@ -266,7 +266,6 @@ impl RemoteRuntime {
         self.scope.cluster_id
     }
     /// The gateway's `data.direct.v1` switch (T6 reads it).
-    #[allow(dead_code)] // Read by the gateway router (T6).
     pub(crate) fn direct_switch(&self) -> &Arc<super::worker_runtime::direct_capability::DirectSwitch> {
         &self.direct
     }

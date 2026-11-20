@@ -23,10 +23,6 @@
 //!
 //! Nothing here is on by default. The executor proposes only while its
 //! `DirectGate` reports `data.direct.v1` active (T7 turns it on).
-// T6 (gateway) and T7 (activation) construct and call parts of this
-// (the Catalog schema, installation, the expiry task); until then they are
-// unused outside tests, and some even in tests.
-#![allow(dead_code)]
 mod admission;
 mod executor;
 mod latches;

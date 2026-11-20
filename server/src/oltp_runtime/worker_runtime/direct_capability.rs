@@ -106,12 +106,10 @@ impl DirectSwitch {
         self.active.load(Ordering::Acquire)
     }
     /// The `direct_oltp` configuration of this process.
-    #[allow(dead_code)] // Read by the gateway (T6) and leader executor (T5).
     pub(crate) fn direct_oltp(&self) -> bool {
         self.direct_oltp
     }
     /// Eligible operations may take the direct path.
-    #[allow(dead_code)] // Read by the gateway (T6) and leader executor (T5).
     pub(crate) fn routes_direct(&self) -> bool {
         self.direct_oltp && self.is_direct_active()
     }
@@ -119,7 +117,6 @@ impl DirectSwitch {
     /// `DirectForward` at its anchor (plan addendum), whatever `direct_oltp`
     /// says, because another gateway may have sent the same request id
     /// directly.
-    #[allow(dead_code)] // Read by the gateway (T6).
     pub(crate) fn requires_forward(&self) -> bool {
         self.is_direct_active()
     }

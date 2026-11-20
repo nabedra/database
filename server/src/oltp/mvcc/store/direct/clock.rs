@@ -73,7 +73,6 @@ pub(crate) struct LeaderToken {
     term: u64,
     generation: u64,
 }
-#[allow(dead_code)] // The leader executor (T5) reads the term.
 impl LeaderToken {
     pub(crate) fn term(&self) -> u64 {
         self.term
@@ -138,7 +137,6 @@ fn encoded(key: &MvccKey) -> Result<Vec<u8>, ProtocolError> {
     Ok(bytes)
 }
 
-#[allow(dead_code)] // The leader executor (T5) is the main caller.
 impl RangeClock {
     /// Every `ParticipantMachine` over one group store shares a clock, so the
     /// executor that registers commits and the readers see one state.
