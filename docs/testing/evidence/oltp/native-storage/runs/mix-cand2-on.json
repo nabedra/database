@@ -1,0 +1,401 @@
+{
+ "run": "mix-cand2-on",
+ "settings": {
+  "rates": [
+   1,
+   2,
+   5,
+   20,
+   50,
+   100,
+   200,
+   500,
+   1000
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-20T21:19:43.061338+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "bf370a7e73e505dd69b1de977267a1378055e545d6f5600649c90988f2015ac2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "c74c2d476b91748c25ac19467cc71ab62729833a",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "12e80d875b03533adf211d9418a437c8f19d69f57669976926d94833d6193f5d",
+   "benchmark_oltp_workload.py": "cc0acd0c9299cd4a74311f2e175d84bd9f4a4756c0ee0de40dfb1fee31c88a36"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220098560,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 67133110,
+   "w2": 67133110,
+   "w3": 67133110
+  },
+  "direct_activation_seconds_after_api_ready": 2.6506818080088124
+ },
+ "summary": {
+  "run": "mix-cand2-on",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 100,
+  "stop_reason": {
+   "median_p99_ms": 601.904278,
+   "rejected": 389
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 17.604488,
+    "median_p95_ms": 21.364978,
+    "median_p99_ms": 21.364978,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 17.604488,
+      "median_p99_ms": 21.142518,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 38.629983,
+      "median_p99_ms": 38.629983,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "2": {
+    "reps": 3,
+    "offered": 30,
+    "median_succeeded_rps": 2.0,
+    "median_p50_ms": 14.035072,
+    "median_p95_ms": 18.614948,
+    "median_p99_ms": 18.614948,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 30,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 14.035072,
+      "median_p99_ms": 18.614948,
+      "succeeded": 29,
+      "offered": 29
+     },
+     "update": {
+      "median_p50_ms": 111.830917,
+      "median_p99_ms": 111.830917,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 17.156205,
+    "median_p95_ms": 20.866654,
+    "median_p99_ms": 47.14721,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 17.129466,
+      "median_p99_ms": 25.183837,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 42.6739135,
+      "median_p99_ms": 42.6739135,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 13.678032,
+    "median_p95_ms": 33.179277,
+    "median_p99_ms": 48.531466,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 13.180013,
+      "median_p99_ms": 48.531466,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 35.986112,
+      "median_p99_ms": 46.496206,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 49.97784262334,
+    "median_p50_ms": 11.725707,
+    "median_p95_ms": 23.813635,
+    "median_p99_ms": 38.625179,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 11.545129,
+      "median_p99_ms": 23.364348,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 31.425237,
+      "median_p99_ms": 50.771224,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 66.20877061245815,
+    "median_p50_ms": 219.341282,
+    "median_p95_ms": 492.098501,
+    "median_p99_ms": 601.904278,
+    "statuses": {
+     "client_capacity": 91,
+     "failed": 0,
+     "rejected": 389,
+     "succeeded": 1020,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 224.466276,
+      "median_p99_ms": 601.904278,
+      "succeeded": 963,
+      "offered": 1414
+     },
+     "update": {
+      "median_p50_ms": 261.228601,
+      "median_p99_ms": 528.64497,
+      "succeeded": 57,
+      "offered": 86
+     }
+    }
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 133
+  },
+  "entries_applied": 133,
+  "entries_proposed": 133,
+  "get_micros_total": 5051822,
+  "gets": 2516,
+  "gets_done": 2516,
+  "mutation_micros_total": 3382481,
+  "mutations": 133,
+  "mutations_done": 133,
+  "requests": 2649,
+  "rows_proposed": 133,
+  "expire_entries": 2
+ },
+ "refusals": {
+  "get | rejected | 429 | executor admission capacity exhausted": 422,
+  "update | rejected | 429 | executor admission capacity exhausted": 26
+ },
+ "resources": {
+  "window_s": 319.972448691,
+  "acknowledged_writes": 133,
+  "io": {
+   "w1": {
+    "wbytes": 1478656,
+    "wios": 705,
+    "cpu_usec": 208231828,
+    "throttled_periods": 109,
+    "periods": 3256,
+    "window_s": 325.59944179
+   },
+   "w2": {
+    "wbytes": 1482752,
+    "wios": 706,
+    "cpu_usec": 41275092,
+    "throttled_periods": 0,
+    "periods": 3256,
+    "window_s": 325.598873697
+   },
+   "w3": {
+    "wbytes": 1486848,
+    "wios": 706,
+    "cpu_usec": 39328858,
+    "throttled_periods": 2,
+    "periods": 3256,
+    "window_s": 325.613551148
+   }
+  },
+  "wbytes_total": 4448256,
+  "wbytes_per_ack": 33445.533834586466,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 36507648,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "203/2635"
+   },
+   "w3": {
+    "memory_peak": 133644288,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "2/3541"
+   },
+   "w2": {
+    "memory_peak": 138346496,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/3556"
+   },
+   "w1": {
+    "memory_peak": 175849472,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "116/3571"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 78163968,
+    "max_file": 91992064
+   },
+   "w2": {
+    "max_anon": 49348608,
+    "max_file": 83021824
+   },
+   "w3": {
+    "max_anon": 51138560,
+    "max_file": 76554240
+   }
+  }
+ }
+}

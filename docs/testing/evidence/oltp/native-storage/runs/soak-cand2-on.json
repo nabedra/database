@@ -1,0 +1,599 @@
+{
+ "run": "soak-cand2-on",
+ "settings": {
+  "soak_rows": 80000,
+  "soak_payload_bytes": 2048,
+  "soak_seconds": 600.0,
+  "soak_phase_seconds": 60.0,
+  "soak_rate": 50.0,
+  "soak_seed_clients": 4,
+  "soak_verify_keys": 500,
+  "clients": 32,
+  "seed": 20261118,
+  "timeout": 10.0
+ },
+ "workload": "storage soak: updates of rows with incompressible payloads",
+ "started_utc": null,
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "bf370a7e73e505dd69b1de977267a1378055e545d6f5600649c90988f2015ac2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "c8510da0c7b86402c5ec0f719eecd6b5a2c605a5",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "51ab8dd1339e06b0d29c59454db50246f77773903b21d5809cfd766ac774f124",
+   "benchmark_oltp_workload.py": "cc0acd0c9299cd4a74311f2e175d84bd9f4a4756c0ee0de40dfb1fee31c88a36"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220098560,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 1101237744,
+   "w2": 1101237744,
+   "w3": 1101242955
+  },
+  "direct_activation_seconds_after_api_ready": 2.1133284450042993
+ },
+ "summary": {
+  "run": "soak-cand2-on",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": null,
+  "stop_reason": null,
+  "rates": {
+   "50.0": {
+    "reps": 10,
+    "offered": 30000,
+    "median_succeeded_rps": 48.2642579366827,
+    "median_p50_ms": 46.5781055,
+    "median_p95_ms": 229.5498685,
+    "median_p99_ms": 496.3743135,
+    "statuses": {
+     "client_capacity": 101,
+     "failed": 0,
+     "rejected": 1107,
+     "succeeded": 28792,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 28792
+  },
+  "entries_applied": 28792,
+  "entries_proposed": 28792,
+  "expire_entries": 11,
+  "latch_wait_micros": 205790,
+  "latch_waits": 20,
+  "mutation_micros_total": 812716498,
+  "mutations": 28792,
+  "mutations_done": 28792,
+  "requests": 28792,
+  "rows_proposed": 28792
+ },
+ "refusals": {
+  "update | rejected | 429 | executor admission capacity exhausted": 1107
+ },
+ "resources": {
+  "window_s": 604.577140649,
+  "acknowledged_writes": 28792,
+  "io": {
+   "w1": {
+    "wbytes": 2488848384,
+    "wios": 60022,
+    "cpu_usec": 487022203,
+    "throttled_periods": 2015,
+    "periods": 6075,
+    "window_s": 607.556089555
+   },
+   "w2": {
+    "wbytes": 2487672832,
+    "wios": 59875,
+    "cpu_usec": 279762915,
+    "throttled_periods": 238,
+    "periods": 6075,
+    "window_s": 607.501419741
+   },
+   "w3": {
+    "wbytes": 2478387200,
+    "wios": 59873,
+    "cpu_usec": 216953786,
+    "throttled_periods": 188,
+    "periods": 6075,
+    "window_s": 607.465503122
+   }
+  },
+  "wbytes_total": 7454908416,
+  "wbytes_per_ack": 258922.9096971381,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 33320960,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "304/8477"
+   },
+   "w3": {
+    "memory_peak": 65863680,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1832"
+   },
+   "w2": {
+    "memory_peak": 62181376,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1845"
+   },
+   "w1": {
+    "memory_peak": 76840960,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "2/1859"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 115060736,
+    "max_file": 1350254592
+   },
+   "w2": {
+    "max_anon": 105406464,
+    "max_file": 1324060672
+   },
+   "w3": {
+    "max_anon": 101470208,
+    "max_file": 1321816064
+   }
+  }
+ },
+ "cold-restart": {
+  "mode": "cold restart of all workers after SIGKILL",
+  "previous_run": "2b91b447-5f5a-405a-9383-e71ed33dd4e4",
+  "profile": {
+   "previous_run": "2b91b447-5f5a-405a-9383-e71ed33dd4e4",
+   "next_run": "3f8882ca-8912-42d2-9832-1f9dc3e778ac",
+   "transition_id": "7cc3cab6-013f-4b96-9426-be849627216a"
+  },
+  "start_command_seconds": 1.5142634420190006,
+  "started_at": {
+   "w1": "2026-11-20T22:54:26.493930461Z",
+   "w2": "2026-11-20T22:54:26.950448877Z",
+   "w3": "2026-11-20T22:54:27.541124734Z"
+  },
+  "ready": {
+   "w1": {
+    "seconds": 7.698545521008782,
+    "reply": {
+     "cluster_id": "a65359f4-7bfa-4e85-a7ec-b1cb9c539703",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "3f8882ca-8912-42d2-9832-1f9dc3e778ac",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w2": {
+    "seconds": 7.830906072020298,
+    "reply": {
+     "cluster_id": "a65359f4-7bfa-4e85-a7ec-b1cb9c539703",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "3f8882ca-8912-42d2-9832-1f9dc3e778ac",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   },
+   "w3": {
+    "seconds": 7.901695705018938,
+    "reply": {
+     "cluster_id": "a65359f4-7bfa-4e85-a7ec-b1cb9c539703",
+     "consensus_timing": {
+      "election_max_ms": 3000,
+      "election_min_ms": 1500,
+      "heartbeat_ms": 500
+     },
+     "engine": "oltp",
+     "native_thread_budget": {
+      "compaction_threads": 1,
+      "control_threads": 1,
+      "flush_threads": 1,
+      "journal_threads": 16,
+      "query_control_stack_bytes_per_thread": 4194304,
+      "query_threads": 1,
+      "storage_stack_bytes_per_thread": 4194304,
+      "total_stack_reservation_bytes": 83886080
+     },
+     "ready_workers": 3,
+     "replication_factor": 3,
+     "run_id": "3f8882ca-8912-42d2-9832-1f9dc3e778ac",
+     "status": "ready",
+     "topology": "typed-groups-distributed"
+    }
+   }
+  },
+  "all_ready_seconds": 7.901695705018938,
+  "direct_capability": {
+   "workers": {
+    "w1": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w2": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    },
+    "w3": {
+     "active": true,
+     "direct_oltp": true,
+     "history_settling": false
+    }
+   },
+   "seconds_after_api_ready": 0.015222418995108455
+  },
+  "direct_active_seconds": 8.131418129021768,
+  "api_probe": {
+   "attempts": 17,
+   "last": {
+    "status": 503,
+    "reply": {
+     "request_id": "f2ef8c47-3ad3-4467-880a-29c3db9a8f40",
+     "error": {
+      "code": "storage_unavailable",
+      "message": "direct request deadline exceeded before execution",
+      "outcome": "not_applied"
+     }
+    }
+   }
+  }
+ },
+ "soak": {
+  "verification": {
+   "keys_checked": 500,
+   "mismatches": 0,
+   "first_mismatches": [],
+   "later_unresolved_values_seen": 0,
+   "keys_with_unresolved_values": 0
+  },
+  "summary": {
+   "offered": 30000,
+   "succeeded": 28792,
+   "rejected": 1107,
+   "phase_p99_ms": [
+    714.627156,
+    297.885084,
+    285.272816,
+    923.61313,
+    325.985808,
+    229.299736,
+    879.521365,
+    608.823871,
+    849.886058,
+    383.924756
+   ]
+  },
+  "seed_details": {
+   "seed": {
+    "batches": 625,
+    "rows_per_batch": 128,
+    "rejected_retries": 0,
+    "errors": [],
+    "seconds": 55.04778264000015,
+    "rows": 80000,
+    "payload_bytes": 2048,
+    "logical_bytes": 165120000
+   }
+  }
+ },
+ "soak_phases": [
+  {
+   "label": "soak-0",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 5,
+    "failed": 0,
+    "rejected": 59,
+    "succeeded": 2936,
+    "unresolved": 0
+   },
+   "succeeded_rps": 48.90899484560085,
+   "success_latency_ms": {
+    "count": 2936,
+    "p50": 47.84433,
+    "p90": 176.870783,
+    "p95": 250.250801,
+    "p99": 714.627156,
+    "max": 1186.098068
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-1",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 142,
+    "succeeded": 2858,
+    "unresolved": 0
+   },
+   "succeeded_rps": 47.61952102776455,
+   "success_latency_ms": {
+    "count": 2858,
+    "p50": 45.853845,
+    "p90": 162.931531,
+    "p95": 224.171302,
+    "p99": 297.885084,
+    "max": 3448.928075
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-2",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 7,
+    "succeeded": 2993,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.88333333333333,
+   "success_latency_ms": {
+    "count": 2993,
+    "p50": 43.766279,
+    "p90": 143.002762,
+    "p95": 181.874389,
+    "p99": 285.272816,
+    "max": 454.336699
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-3",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 67,
+    "failed": 0,
+    "rejected": 232,
+    "succeeded": 2701,
+    "unresolved": 0
+   },
+   "succeeded_rps": 44.99428751967594,
+   "success_latency_ms": {
+    "count": 2701,
+    "p50": 49.731976,
+    "p90": 165.537916,
+    "p95": 238.70803,
+    "p99": 923.61313,
+    "max": 5294.187194
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-4",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 20,
+    "failed": 0,
+    "rejected": 85,
+    "succeeded": 2895,
+    "unresolved": 0
+   },
+   "succeeded_rps": 46.09739689841222,
+   "success_latency_ms": {
+    "count": 2895,
+    "p50": 46.513602,
+    "p90": 130.430594,
+    "p95": 190.32026,
+    "p99": 325.985808,
+    "max": 4658.036758
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-5",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 3000,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.96251196647586,
+   "success_latency_ms": {
+    "count": 3000,
+    "p50": 44.322359,
+    "p90": 117.743572,
+    "p95": 156.527221,
+    "p99": 229.299736,
+    "max": 281.43445
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-6",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 1,
+    "failed": 0,
+    "rejected": 287,
+    "succeeded": 2712,
+    "unresolved": 0
+   },
+   "succeeded_rps": 45.090792536881494,
+   "success_latency_ms": {
+    "count": 2712,
+    "p50": 53.018511,
+    "p90": 224.234901,
+    "p95": 322.784749,
+    "p99": 879.521365,
+    "max": 5084.761093
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-7",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 34,
+    "succeeded": 2966,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.25346257917245,
+   "success_latency_ms": {
+    "count": 2966,
+    "p50": 43.231768,
+    "p90": 140.773686,
+    "p95": 238.964291,
+    "p99": 608.823871,
+    "max": 904.181543
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-8",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 8,
+    "failed": 0,
+    "rejected": 241,
+    "succeeded": 2751,
+    "unresolved": 0
+   },
+   "succeeded_rps": 45.84235077973066,
+   "success_latency_ms": {
+    "count": 2751,
+    "p50": 46.642609,
+    "p90": 157.057111,
+    "p95": 219.727197,
+    "p99": 849.886058,
+    "max": 4956.328667
+   },
+   "unresolved_after_reconciliation": 0
+  },
+  {
+   "label": "soak-9",
+   "offered": 3000,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 20,
+    "succeeded": 2980,
+    "unresolved": 0
+   },
+   "succeeded_rps": 49.6473745045315,
+   "success_latency_ms": {
+    "count": 2980,
+    "p50": 49.119938,
+    "p90": 171.445764,
+    "p95": 234.928435,
+    "p99": 383.924756,
+    "max": 662.74594
+   },
+   "unresolved_after_reconciliation": 0
+  }
+ ]
+}
