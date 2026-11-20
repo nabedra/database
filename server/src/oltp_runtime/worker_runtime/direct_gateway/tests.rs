@@ -278,3 +278,193 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
     .await
     .expect("rf1 gateway watchdog");
 }
+
+/// T7b items 2 and 4 on one worker over mTLS: the executor's Catalog reader
+/// (`DirectLeader`, remote over the worker's own session) reads the table's
+/// exclusive lifecycle guard with the new `ParticipantExclusive` method;
+/// while a DDL holds it, the first request does not activate the group (no
+/// entry proposed, the pre-DDL lifecycle is never bound) and the request
+/// waits for the DDL instead of going ahead; after the release it
+/// completes. The gateway's topology fill uses the same `DirectLeader`
+/// reader (T6 concern 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls() {
+    use crate::oltp::mvcc::{
+        catalog::CatalogRead,
+        store::lifecycle::{GuardMode, LifecycleBinding},
+    };
+    use crate::oltp_replication::{
+        authority::status::{SettlementStatement, VerifiedSettlement},
+        types::{
+            AppliedPosition, DecisionStatement, Digest, ManifestRef, ReadTs, RequestBinding,
+            TxnDecision, TxnId,
+        },
+    };
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-t7b-guard-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let table_id: Uuid = serde_json::from_value(table.clone()).unwrap();
+        let switch = runtime.direct_switch().unwrap().clone();
+        let reader = switch
+            .direct_catalog()
+            .expect("DirectLeader Catalog reader");
+        // Over the wire with `DirectLeader`: no guard yet.
+        assert_eq!(
+            reader
+                .participant()
+                .lifecycle_exclusive(table_id)
+                .await
+                .unwrap(),
+            None
+        );
+        // A DDL takes the table's exclusive guard (its capability probe is
+        // not involved here: the guard alone must stop activation).
+        let authority = runtime
+            .services
+            .control
+            .current(&runtime.services.scope)
+            .await
+            .unwrap()
+            .ready
+            .view
+            .authority();
+        let catalog = runtime.services.catalog.clone();
+        let pin = catalog
+            .snapshot(ReadTs::new(u64::MAX).unwrap(), authority)
+            .unwrap();
+        let (version, schema_epoch) = match catalog.describe(&pin, table_id).await.unwrap() {
+            CatalogRead::Value {
+                version,
+                record: Some(record),
+            } => (version, record.schema_epoch),
+            _ => panic!("table record"),
+        };
+        let txn = TxnId {
+            request_id: Uuid::new_v4(),
+            attempt: 1,
+        };
+        let request = RequestBinding {
+            run_id: authority.run_id,
+            request_id: txn.request_id,
+            digest: Digest::from_bytes([5; 32]),
+            accepted_context: Digest::from_bytes([6; 32]),
+        };
+        let binding = LifecycleBinding {
+            guard_id: Uuid::new_v4(),
+            catalog_group_id: catalog.participant().identity().group_id,
+            table_id,
+            lifecycle_version: version,
+            schema_epoch,
+            txn,
+            request,
+            read_ts: ReadTs::new(u64::MAX - 1).unwrap(),
+            authority,
+        };
+        let guard = catalog
+            .participant()
+            .acquire_lifecycle(binding.clone(), GuardMode::Exclusive)
+            .await
+            .unwrap()
+            .expect("granted: no shared holder");
+        assert_eq!(
+            reader
+                .participant()
+                .lifecycle_exclusive(table_id)
+                .await
+                .unwrap(),
+            Some(binding.clone())
+        );
+        // The first eligible mutation of the never-activated group.
+        let insert = {
+            let app = app.clone();
+            let body = body(
+                Uuid::new_v4(),
+                "table.insert",
+                json!({"table_id": table, "row": {"id": 1, "value": 1, "tag": "a"}}),
+            );
+            tokio::spawn(async move { call(&app, body, true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(!insert.is_finished(), "the request waits for the DDL");
+        let leader =
+            crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
+                .unwrap()
+                .stats();
+        assert_eq!(leader["entries_proposed"], json!(0), "{leader}");
+        assert!(
+            leader["fallbacks"]["schema"].as_u64().unwrap() >= 1,
+            "{leader}"
+        );
+        // The DDL settles and releases its guard.
+        let manifest = ManifestRef {
+            status_group_id: Uuid::new_v4(),
+            digest: Digest::from_bytes([7; 32]),
+            participant_count: 1,
+        };
+        let at = AppliedPosition {
+            term: 1,
+            node_id: 1,
+            index: 1,
+        };
+        let settled = VerifiedSettlement::model_for_test(SettlementStatement {
+            txn,
+            request,
+            manifest,
+            decision: DecisionStatement {
+                txn,
+                request,
+                manifest,
+                decided_at: at,
+                decision: TxnDecision::Commit {
+                    commit_ts: crate::oltp_replication::types::CommitTs::new(1).unwrap(),
+                },
+            },
+            resolved_count: 1,
+            settled_at: at,
+        })
+        .unwrap();
+        catalog
+            .participant()
+            .release_lifecycle(authority, guard, settled)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .participant()
+                .lifecycle_exclusive(table_id)
+                .await
+                .unwrap(),
+            None
+        );
+        let (status, envelope) = insert.await.unwrap();
+        assert_eq!(status, 200, "{envelope}");
+        // The group is now active: the next mutation commits directly.
+        let (status, envelope) = call(
+            &app,
+            body(
+                Uuid::new_v4(),
+                "table.insert",
+                json!({"table_id": table, "row": {"id": 2, "value": 2, "tag": "b"}}),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, 200, "{envelope}");
+        let gateway = runtime.direct_gateway_handle().unwrap().stats();
+        assert!(gateway.direct_done >= 1, "{gateway:?}");
+        assert_eq!(gateway.catalog_reads, 1, "{gateway:?}");
+        let leader =
+            crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
+                .unwrap()
+                .stats();
+        assert!(leader["entries_applied"].as_u64().unwrap() >= 1, "{leader}");
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("rf1 guard watchdog");
+}
