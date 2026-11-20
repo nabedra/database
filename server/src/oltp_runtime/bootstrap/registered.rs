@@ -676,6 +676,9 @@ impl LocalServices {
                     manager: manager.clone(),
                     rpc: rpc.clone(),
                 },
+                Rejoin {
+                    limits: legacy_limits,
+                },
                 stop.subscribe(),
             );
             if let Some(genesis) = worker.restored.take() {
@@ -828,6 +831,82 @@ async fn ready_members(
         after = page.after;
     }
 }
+/// What a live worker needs to join the ready set again after the owner
+/// removed it (it was paused or partitioned, and is back with the same
+/// incarnation and its RAM queue now stale).
+struct Rejoin {
+    limits: QueueLimits,
+}
+impl Rejoin {
+    /// Begins (or adopts) this worker's own Join of the current ready set and
+    /// replaces its stale replica with an empty joining one for that ticket.
+    /// Returns the ticket once the replica waits for the owner's queue copy.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin(
+        &self,
+        control: &ControlHandle,
+        operator: &LocalOperatorPermit,
+        local: WorkerIdentity,
+        replica: &Mutex<WorkerReplica>,
+        current: QueueAuthority,
+        members: Vec<WorkerIdentity>,
+    ) -> Result<Option<Uuid>, ProtocolError> {
+        // A positively excluded process never serves the queue again; only a
+        // new incarnation may join.
+        if control.worker_replaced(local).await? {
+            return Ok(None);
+        }
+        let state = control.inspect().await?.ok_or_else(unavailable)?;
+        if state.ready != current.ready {
+            return Ok(None);
+        }
+        let ticket = match &state.pending {
+            None => {
+                let operation = crate::oltp_runtime::authority_fence::transition_id(
+                    "registered-queue-rejoin",
+                    &(local, state.ready),
+                )?;
+                match control
+                    .begin_join_local(operator, operation, state.ready.view, local)
+                    .await?
+                    .reply
+                {
+                    ControlReply::JoinBegun { ticket, .. } => ticket,
+                    _ => return Ok(None),
+                }
+            }
+            // The Join applied but its reply was lost: adopt it before any page.
+            Some(Pending::Ready(pending))
+                if pending.change
+                    == crate::oltp_replication::authority::control::ReadyChange::Join
+                    && pending.target == local
+                    && pending.expected == current.ready
+                    && pending.phase == ReadyPhase::Building
+                    && pending.source_after.is_none()
+                    && !pending.target_seen =>
+            {
+                JoinTicket {
+                    ticket_id: pending.transition_id,
+                    target: local,
+                    source_ready: pending.expected,
+                }
+            }
+            _ => return Ok(None),
+        };
+        replica
+            .lock()
+            .map_err(|_| unavailable())?
+            .rejoin(current, members, self.limits, ticket)
+            .map_err(QueueError::protocol)?;
+        eprintln!(
+            "nabedra-db: registered {} queue rejoin begun",
+            local.worker_id
+        );
+        Ok(Some(ticket.ticket_id))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_membership(
     control: Arc<ControlHandle>,
     scope: QueueScope,
@@ -836,9 +915,12 @@ fn spawn_membership(
     queue: Arc<QueueCoordinator>,
     peer: Arc<QueuePeerClient>,
     join_owner: data_worker::JoinOwner,
+    rejoin: Rejoin,
     mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The ticket of this worker's own Join while it rejoins the ready set.
+        let mut rejoining: Option<Uuid> = None;
         loop {
             if *stop.borrow_and_update() {
                 break;
@@ -848,16 +930,45 @@ fn spawn_membership(
                 let previous = replica.lock().map_err(|_| unavailable())?.authority();
                 if current != previous {
                     let members = ready_members(&control, current.ready).await?;
-                    replica
-                        .lock()
-                        .map_err(|_| unavailable())?
-                        .fenced_takeover(previous, current, members)
-                        .map_err(QueueError::protocol)?;
+                    if members.contains(&local) {
+                        replica
+                            .lock()
+                            .map_err(|_| unavailable())?
+                            .fenced_takeover(previous, current, members)
+                            .map_err(QueueError::protocol)?;
+                        if rejoining.take().is_some() {
+                            eprintln!("nabedra-db: registered {} queue rejoined", local.worker_id);
+                        }
+                    } else {
+                        // Removed while unresponsive (D05/LIVE1): join again.
+                        rejoining = rejoin
+                            .begin(
+                                &control,
+                                &join_owner.operator,
+                                local,
+                                &replica,
+                                current,
+                                members,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                }
+                if rejoining.is_none() && current.owner != local {
+                    return Ok(());
+                }
+                let state = control.inspect().await?.ok_or_else(unavailable)?;
+                if let (Some(ticket), Some(Pending::Ready(pending))) = (rejoining, &state.pending)
+                    && pending.transition_id == ticket
+                    && pending.target == local
+                    && pending.phase != ReadyPhase::AwaitingQueueProof
+                {
+                    // The Building pages and the Timestamp fence of its own Join;
+                    // the owner copies the queue and publishes.
+                    join_owner.advance(&control, pending).await?;
                 }
                 if current.owner == local {
-                    if let Some(Pending::Ready(pending)) =
-                        control.inspect().await?.ok_or_else(unavailable)?.pending
-                    {
+                    if let Some(Pending::Ready(pending)) = state.pending {
                         if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
                             return Ok(());
                         }

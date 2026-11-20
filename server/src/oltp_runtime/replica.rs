@@ -663,6 +663,81 @@ impl WorkerReplica {
             Some(ticket),
         )
     }
+    /// A live worker the owner removed from the ready set (it stopped
+    /// answering, then came back with the same incarnation) joins again.
+    /// Its legacy RAM queue is stale: removal already collected every
+    /// surviving copy from the remaining holders. The queue is replaced by an
+    /// empty joining queue for `ticket`, in place, keeping this replica's
+    /// memory charge and queue lease (LIVE1).
+    pub(crate) fn rejoin(
+        &mut self,
+        authority: QueueAuthority,
+        members: impl IntoIterator<Item = WorkerIdentity>,
+        limits: QueueLimits,
+        ticket: JoinTicket,
+    ) -> Result<(), QueueError> {
+        if ticket.ticket_id.is_nil()
+            || ticket.target != self.local
+            || ticket.source_ready != authority.ready
+            || limits.result_retention_ms != self.retention_ms
+        {
+            return Err(QueueError::Invalid);
+        }
+        authority.ready.view.validate().map_err(invalid)?;
+        authority.owner.validate().map_err(invalid)?;
+        let mut ordered = BTreeMap::new();
+        let mut hasher = ReadySetHasher::default();
+        for member in members {
+            hasher.push(member).map_err(invalid)?;
+            ordered.insert(member.worker_id, member);
+        }
+        if hasher.count() != authority.ready.ready_count
+            || hasher.finish() != authority.ready.ready_root
+            || ordered.contains_key(&self.local.worker_id)
+            || ordered.get(&authority.owner.worker_id) != Some(&authority.owner)
+        {
+            return Err(QueueError::Invalid);
+        }
+        let membership_memory = self
+            .shared
+            .scheduler()
+            .charge_memory(
+                self.shared.scheduler_node_id(),
+                ordered
+                    .len()
+                    .checked_mul(256)
+                    .ok_or(QueueError::Overloaded)? as u64,
+            )
+            .map_err(|_| QueueError::Overloaded)?;
+        let queue = RequestQueue::new_with_metadata_overhead(
+            authority.ready.view.run_id,
+            authority.ready.view.owner_term,
+            authority.ready.view.membership_revision,
+            limits,
+            ordered.keys().copied().collect(),
+            PROOF_METADATA_BYTES,
+        )?;
+        self.authority = authority;
+        self.members = Arc::new(ordered);
+        self.queue = queue;
+        self.barriers.clear();
+        self.queue_latency = QueueLatency::default();
+        self.terminal_metadata.clear();
+        self.read_grants.clear();
+        self.retired_through_sequence = 0;
+        self.retirement_generation = 0;
+        self.change_cut = 0;
+        self.changes.clear();
+        self.export = None;
+        self.import = Some(transfer::JoinImport::new(ticket));
+        self.bootstrap = None;
+        self.removal = None;
+        self.removal_root = None;
+        self.removal_worker_after = None;
+        self.removal_record_after = None;
+        self._membership_memory = membership_memory;
+        Ok(())
+    }
     fn construct(
         shared: Arc<WorkerSharedResources>,
         scope: QueueScope,
