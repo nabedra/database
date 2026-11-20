@@ -34,6 +34,7 @@ mod snapshots;
 mod tests;
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
@@ -1043,11 +1044,37 @@ impl Inner {
             Some(journal) => journal.close(),
             None => Ok(()),
         };
+        self.release_memtables();
         lock(&self.lock_file).take();
         if self.latched.load(Ordering::Acquire) {
             return Err(Error::RecoveryRequired);
         }
         result
+    }
+
+    /// Drops the store's memtables at close, so their budget charge is gone when `close`
+    /// or the last `Store` drop returns (NS17). `Inner` itself may outlive that: a
+    /// background thread holds the `Arc<Inner>` it upgraded until its job returns, which
+    /// is after `end_job` let `shutdown` go on. Once the journal is closed nothing applies
+    /// to a memtable or reads the current super-version again; snapshots and iterators
+    /// that outlive the store keep their own super-version, so their memtables stay
+    /// charged until they drop.
+    fn release_memtables(&self) {
+        let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
+        let empty = MemEntry::new(
+            Memtable::new(self.memtable_options, None),
+            self.tracker.clone(),
+            sv.mem.last_seq(),
+        );
+        let version = sv.version.clone();
+        self.publish_sv(
+            &mut sv,
+            SuperVersion {
+                mem: empty,
+                imm: Vec::new(),
+                version,
+            },
+        );
     }
 
     fn schedule_flush(&self) {
@@ -1408,14 +1435,22 @@ impl Inner {
         let min_referenced = self.tracker.min_referenced_segment();
         let segments = journal.segments();
         let oldest_snapshot = self.snapshots.oldest();
-        let gc = lock(&self.gc);
+        let mut gc = lock(&self.gc);
+        // A segment counts as cleared only once its relocations succeeded.
+        let running = gc.settle_relocations();
+        let cleared: BTreeMap<u64, Seq> = gc
+            .cleared
+            .iter()
+            .filter(|(s, _)| !running.contains(s))
+            .map(|(&s, &seq)| (s, seq))
+            .collect();
         let state = gc::RetireState {
             flushed_seq,
             durable_seq,
             visible_seq,
             min_referenced,
             oldest_snapshot,
-            cleared: Some(&gc.cleared),
+            cleared: Some(&cleared),
         };
         gc::retirable(&segments, &state)
             .into_iter()
@@ -1562,7 +1597,11 @@ impl Inner {
         let Some(pick) = pick else {
             return Ok(false);
         };
-        match self.run_compaction(&pick) {
+        let result = self.run_compaction(&pick);
+        // The pick holds the inputs. Let them go before the purge below, so the inputs
+        // no snapshot pins are deleted by this compaction, not left until the next one.
+        drop(pick);
+        match result {
             Ok(()) => {}
             Err(Error::Corruption {
                 file: FileId::Run { id },

@@ -370,3 +370,125 @@ fn ns04_ns13_crash_at_every_relocation_operation() {
 fn ns04_ns13_crash_at_every_operation_full() {
     enumerate(1);
 }
+
+/// NS13 (KVfix3): journal GC relocates live values in records that fit a segment's
+/// record area. With 12 KiB segments that area is 4 KiB; GC cut relocation batches at a
+/// 3 KiB target checked before each entry, so three live 1.4 KiB values of one group went
+/// into one 4.3 KiB record and `gc_journal` failed with "batch larger than a journal
+/// segment" (NS10 long campaign, seed 69).
+#[test]
+fn ns13_gc_relocation_records_fit_small_segments() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let mut o = options(&fs, &bg);
+    o.journal.segment_bytes = 12 << 10;
+    o.journal.max_group_bytes = 4 << 10;
+    o.max_journal_bytes = 3 * (12 << 10);
+    let store = Store::open(&dir, o).unwrap().store;
+    let mut model = Model::new();
+    let put = |store: &Store, model: &mut Model, group: u64, idx: u64, fill: u8| {
+        let key = entry_key(group, idx);
+        let mut value = format!("<{group}:{idx}>").into_bytes();
+        value.resize(1400, fill);
+        let b = ModelBatch {
+            scope: group_prefix(group),
+            ops: vec![Op::PutJournal(key, value)],
+        };
+        b.apply(model);
+        write(store, &b, Durability::Sync).unwrap();
+    };
+    // g00's live values sit in the oldest segment.
+    for idx in 0..3 {
+        put(&store, &mut model, 0, idx, b'a');
+    }
+    // g01 fills many segments and deletes everything it wrote.
+    for idx in 0..60 {
+        put(&store, &mut model, 1, idx, b'b');
+    }
+    let purge = ModelBatch {
+        scope: group_prefix(1),
+        ops: vec![Op::DeleteRange(group_prefix(1), log_end(1))],
+    };
+    purge.apply(&mut model);
+    write(&store, &purge, Durability::Sync).unwrap();
+    store.flush().unwrap();
+    store.compact().unwrap();
+    for _ in 0..4 {
+        store.gc_journal().unwrap();
+    }
+    assert!(
+        journal_files(&fs, &dir) <= 6,
+        "GC retired nothing: {} segments",
+        journal_files(&fs, &dir)
+    );
+    assert!(!store.requires_recovery());
+    assert_eq!(dump(&store.snapshot()), model);
+}
+
+/// NS13, NS09 (KVfix3): journal GC never drops a live value whose liveness check could
+/// not read the key. `holds` took a read error for "no longer held", so the value was
+/// not relocated and its segment was recycled under its locator: later reads failed with
+/// "journal locator names a recycled segment" (NS10 long campaign, seed 510). EIO is
+/// injected on each run read of the GC passes in turn, whichever thread makes it.
+#[test]
+fn ns13_gc_never_drops_a_value_whose_liveness_read_fails() {
+    use nabedra_kv::fs::{Fault, FsOp};
+    let mut hit = 0;
+    for n in 1..=40 {
+        let (fs, dir) = fault_fs();
+        let bg = Background::new(2).unwrap();
+        let mut o = small_options(Arc::new(fs.clone()), bg.clone());
+        o.journal.segment_bytes = SEGMENT;
+        o.journal.max_group_bytes = 16 << 10;
+        o.max_journal_bytes = 3 * SEGMENT;
+        o.memtable_bytes = 24 << 10;
+        o.max_replay_bytes = 48 << 10;
+        let store = Store::open(&dir, o).unwrap().store;
+        let mut model = Model::new();
+        let put = |store: &Store, model: &mut Model, group: u64, idx: u64| {
+            let mut value = format!("<{group}:{idx}>").into_bytes();
+            value.resize(900, b'a' + group as u8);
+            let b = ModelBatch {
+                scope: group_prefix(group),
+                ops: vec![Op::PutJournal(entry_key(group, idx), value)],
+            };
+            b.apply(model);
+            write(store, &b, Durability::Sync).unwrap();
+        };
+        for idx in 0..6 {
+            put(&store, &mut model, 0, idx);
+        }
+        for idx in 0..200 {
+            put(&store, &mut model, 1, idx);
+        }
+        let purge = ModelBatch {
+            scope: group_prefix(1),
+            ops: vec![Op::DeleteRange(group_prefix(1), log_end(1))],
+        };
+        purge.apply(&mut model);
+        write(&store, &purge, Durability::Sync).unwrap();
+        store.flush().unwrap();
+        // Background compaction quiet: the reads below are the GC passes'.
+        store.compact().unwrap();
+        fs.inject(Fault::on(FsOp::Read).path_prefix(dir.join("runs")).nth(n));
+        for _ in 0..4 {
+            let _ = store.gc_journal();
+        }
+        if fs.calls().iter().any(|c| c.op == FsOp::Read && !c.ok) {
+            hit += 1;
+        }
+        fs.clear_faults();
+        if !store.requires_recovery() {
+            for _ in 0..4 {
+                store.gc_journal().unwrap();
+            }
+        }
+        // Whatever GC did, every value is still there (reopen after a latch).
+        drop(store);
+        let reopened = Store::open(&dir, small_options(Arc::new(fs.clone()), bg.clone()))
+            .unwrap()
+            .store;
+        assert_eq!(dump(&reopened.snapshot()), model, "EIO on run read {n}");
+    }
+    assert!(hit > 0, "no injected read fired");
+}

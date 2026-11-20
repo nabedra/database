@@ -145,7 +145,7 @@ pub struct Mix {
 }
 
 impl Mix {
-    pub fn full() -> Mix {
+    pub const fn full() -> Mix {
         Mix {
             groups: 6,
             keys: 48,

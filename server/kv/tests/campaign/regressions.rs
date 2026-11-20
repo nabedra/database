@@ -18,7 +18,87 @@ pub struct Case {
 }
 
 /// Fixed findings: these must pass.
-pub const FIXED: &[Case] = &[];
+pub const FIXED: &[Case] = &[
+    // KVfix3, CI 7f1e328 (Linux release, `ns05_ns10_thousands_of_seeds`): an `EioReadRun`
+    // fault still armed at a clean reopen failed a run read inside the harness's state
+    // dump. The harness now retries a dump once after an injected `Io` read error.
+    Case {
+        seed: 28,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[357, 358, 361, 365],
+        note: "injected run read EIO during the dump after a clean reopen",
+    },
+    // KVfix3, CI 34ce7f4 (Linux debug, `ns05_ns10_power_loss_faults_and_recoveries_sampled`):
+    // an armed crash froze the machine during the dump after a clean reopen (background
+    // work after the open reached the armed operation), and the harness failed the run
+    // instead of cutting. Whether the crash lands in the dump depends on timing.
+    Case {
+        seed: 6,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[
+            271, 272, 295, 296, 297, 302, 306, 308, 309, 311, 312, 314, 315, 316, 317, 318, 319,
+            320, 321, 322, 323, 324, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361,
+            362, 363, 364, 365, 366, 367,
+        ],
+        note: "armed crash during the dump after a clean reopen (timing)",
+    },
+    // KVfix3, CI 55f6d85 (Linux debug, run 44726640722): an `EioRename` fault still armed
+    // at a clean reopen failed the open's `CURRENT` switch; the harness failed the run
+    // instead of recovering from the crash image.
+    Case {
+        seed: 11,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[224, 246],
+        note: "clean reopen failed under an injected rename EIO",
+    },
+    // KVfix3, CI 163dad7 (Linux release, `ns05_ns10_thousands_of_seeds`, run 44716044857):
+    // a store-wide scan met a damaged run block without latching (R5), and once latched,
+    // a group quarantine found at read time could not be persisted.
+    Case {
+        seed: 0,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[
+            281, 286, 287, 288, 289, 290, 291, 307, 308, 309, 311, 312, 313, 314, 315, 316, 317,
+            318, 319, 320, 321, 322, 323, 324, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361,
+            362, 363, 364, 368, 369, 370, 371, 372,
+        ],
+        note: "store-wide scan over a damaged run block; quarantine after an R5 latch",
+    },
+    // KVfix3, local release long run (seeds 0-199): G1 skipped g00's only record, the
+    // store quarantined g00, and a scan of g00 returned `Ok` with nothing (a silently
+    // missing key) because iterators checked the quarantine only on keys they landed on.
+    Case {
+        seed: 69,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[198],
+        note: "scan of a quarantined scope with no keys left",
+    },
+    // KVfix3, CI fd298dd (Linux release, `ns05_ns10_thousands_of_seeds`, run
+    // 44742741642): the journal refused GC's relocation records with `NoSpace` (their
+    // sequences voided but visible), GC retired the segments anyway, and a later read
+    // found "journal locator names a recycled segment". The shrunk case passes in debug.
+    Case {
+        seed: 510,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[
+            50, 51, 52, 53, 60, 61, 62, 76, 77, 78, 79, 80, 85, 86, 87, 88, 89, 90, 150, 151, 152,
+            153, 154, 155, 156, 157, 158, 159,
+        ],
+        note: "relocation refused by a full journal, segments retired anyway",
+    },
+];
 
 /// Unfixed findings (each has an ignored test naming it in `main.rs`).
 pub const OPEN_FINDINGS: &[Case] = &[];

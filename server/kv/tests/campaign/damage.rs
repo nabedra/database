@@ -328,7 +328,13 @@ pub fn trials(
             .iter()
             .map(|d| d.scope.clone())
             .collect();
-        if !quarantined.is_subset(&again) {
+        // A latched store writes no manifest edit (`log_edit` refuses, and the background
+        // job that retries pending quarantines never starts), so a scope quarantined at
+        // read time after an R5 latch lives only in memory and a crash loses it. Open's
+        // own quarantines are persisted before open returns and must survive. Either way
+        // the damage is still there: the reads below find it again, never a wrong value.
+        let must_keep = if latched { &at_open } else { &quarantined };
+        if !must_keep.is_subset(&again) {
             return Err(format!(
                 "{ctx}: the second open lost quarantined scopes: had {quarantined:?}, now {again:?}"
             ));
@@ -338,16 +344,35 @@ pub fn trials(
         if store.requires_recovery() {
             continue;
         }
+        // NS5 deviation 7 (R5): compaction cannot set aside a damaged run whose key range
+        // spans scopes, so it latches `RecoveryRequired`. Reads quarantine only the scopes
+        // they meet, and `release_scope` drops only the runs set aside for its scope, so
+        // such a run stays in the version and the first background compaction that picks
+        // it latches the store. That compaction may run at any point from the second open
+        // to the close (timing), so for a run byte a latch there is an accepted outcome.
+        // It must be a real latch, never another error.
+        let r5 = |store: &Store, e: &Error| {
+            target == Target::RunByte
+                && matches!(e, Error::RecoveryRequired)
+                && store.requires_recovery()
+        };
         // Release every quarantined scope: it must come back empty and serve again.
         let mut released = model.clone();
+        let mut latched_by_compaction = false;
         for s in store.quarantined().into_iter().map(|d| d.scope) {
             let g = std::str::from_utf8(&s[1..3])
                 .ok()
                 .and_then(|n| n.parse::<u64>().ok())
                 .ok_or_else(|| format!("{ctx}: unexpected scope {}", show(&s)))?;
-            store
-                .release_scope(&s)
-                .map_err(|e| format!("{ctx}: release_scope {}: {e}", show(&s)))?;
+            match store.release_scope(&s) {
+                Ok(_) => {}
+                Err(e) if r5(&store, &e) => {
+                    // The release's delete may or may not be durable: stop here.
+                    latched_by_compaction = true;
+                    break;
+                }
+                Err(e) => return Err(format!("{ctx}: release_scope {}: {e}", show(&s))),
+            }
             counts.releases += 1;
             release_batch(g).apply(&mut released);
             if store.quarantined().iter().any(|d| d.scope == s) {
@@ -357,10 +382,18 @@ pub fn trials(
                 ));
             }
         }
+        if latched_by_compaction {
+            counts.latched += 1;
+            continue;
+        }
         check_reads(&store, cfg, &released, &format!("{ctx} (after release)"))?;
-        store
-            .close()
-            .map_err(|e| format!("{ctx}: close after release: {e}"))?;
+        match store.close() {
+            Ok(()) => {}
+            // `close` returns `RecoveryRequired` only for a latched store. Every release
+            // returned, so `released` is durable; the reopen below checks it.
+            Err(Error::RecoveryRequired) if target == Target::RunByte => counts.latched += 1,
+            Err(e) => return Err(format!("{ctx}: close after release: {e}")),
+        }
         let third = Store::open(&dir(), opts(&img2))
             .map_err(|e| format!("{ctx}: open after release failed: {e}"))?;
         if matches!(target, Target::GroupNeedle) && !third.quarantined.is_empty() {

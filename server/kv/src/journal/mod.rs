@@ -156,6 +156,16 @@ impl Commit {
     pub async fn done(self) -> Result<Seq> {
         self.rx.await.unwrap_or(Err(Error::RecoveryRequired))
     }
+
+    /// The outcome if the commit has completed, without blocking. Returns `Some` once;
+    /// the caller drops the commit after that.
+    pub fn try_result(&mut self) -> Option<Result<Seq>> {
+        match self.rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(Error::RecoveryRequired)),
+        }
+    }
 }
 
 /// How the end of the journal looked at open.
