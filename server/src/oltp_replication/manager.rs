@@ -39,6 +39,8 @@ pub(crate) use lifecycle::{
 pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
 #[cfg(test)]
 mod damage_tests;
+#[cfg(test)]
+mod damage_scheduler_tests;
 mod retirement;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
