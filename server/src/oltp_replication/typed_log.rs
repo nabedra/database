@@ -432,7 +432,13 @@ impl<C: TypedConfig> TypedLogStore<C> {
                 let Some((entry, _)) = reader.next(cursor, end).await? else {
                     return Ok(None);
                 };
-                let next = entry.index().checked_add(1);
+                // Stop at the exclusive end without another read: OpenRaft
+                // answers proposers while it consumes this stream, and the
+                // apply must not need a native slot after the last answer.
+                let next = entry
+                    .index()
+                    .checked_add(1)
+                    .filter(|next| end.is_none_or(|end| *next < end));
                 Ok(Some((entry, (reader, next))))
             },
         ))
