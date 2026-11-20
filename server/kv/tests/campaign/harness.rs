@@ -18,7 +18,7 @@ use nabedra_kv::fs::{Fault, FaultError, FaultFs, Fs, FsOp};
 use nabedra_kv::{Background, Durability, Error, MemtableBudget, Opened, Options, Snapshot, Store};
 
 use crate::common::{ModelBatch, Op, Rng, group_prefix, small_options};
-use crate::oracle::{self, History, Model, ReadFailure};
+use crate::oracle::{self, DumpFailure, History, Model, ReadFailure};
 use crate::sleepy::{Sleepy, SleepyFs};
 use crate::workload::{CutKind, FaultSpec, Mix, Step};
 
@@ -627,10 +627,34 @@ impl<'a> Exec<'a> {
     }
 
     fn read_error(&mut self, e: Error) -> Flow {
-        if self.faulted && matches!(e, Error::Io(_)) && !self.fs.is_crashed() {
+        if self.injected_read_error(&e) {
             return Flow::Continue;
         }
         self.on_error(e, "read")
+    }
+
+    /// An `Io` read error while a fault is injected and the machine runs: an expected
+    /// outcome (an `EioReadRun` fault fails the n-th run read, wherever it lands). `Io`
+    /// is never damage, so the store neither quarantines nor latches for it.
+    fn injected_read_error(&self, e: &Error) -> bool {
+        self.faulted && matches!(e, Error::Io(_)) && !self.fs.is_crashed()
+    }
+
+    /// The whole state of `snap`, both ways. An injected read error is retried once:
+    /// EIO faults fire once, so the second dump reads every block, and its result must
+    /// still be exact. Any other failure, or a second `Io`, is the caller's.
+    fn dump_retrying(&self, snap: &Snapshot) -> Result<Model, String> {
+        let mut retried = false;
+        loop {
+            match oracle::dump(snap) {
+                Ok(m) => return Ok(m),
+                Err(DumpFailure::Scan(_, e)) if !retried && self.injected_read_error(&e) => {
+                    retried = true;
+                }
+                Err(DumpFailure::Scan(what, e)) => return Err(format!("{what} scan: {e}")),
+                Err(DumpFailure::Differ(m)) => return Err(m),
+            }
+        }
     }
 
     fn on_error(&mut self, e: Error, what: &'static str) -> Flow {
@@ -655,7 +679,7 @@ impl<'a> Exec<'a> {
     fn reopen(&mut self) -> Flow {
         self.report.reopens += 1;
         for (snap, m) in &self.held {
-            match oracle::dump_both(snap) {
+            match self.dump_retrying(snap) {
                 Ok(d) if &d == m => {}
                 Ok(d) => {
                     return Flow::Fail(format!(
@@ -687,7 +711,7 @@ impl<'a> Exec<'a> {
                     return Flow::Fail(format!("reopen quarantined {:?}", opened.quarantined));
                 }
                 self.store = Some(Arc::new(opened.store));
-                match oracle::dump_both(&self.store().snapshot()) {
+                match self.dump_retrying(&self.store().snapshot()) {
                     Ok(d) if d == self.model => Flow::Continue,
                     Ok(d) => Flow::Fail(format!(
                         "after clean reopen: {}",
@@ -701,6 +725,16 @@ impl<'a> Exec<'a> {
                     && let Some(kind) = self.armed
                 {
                     return Flow::Cut(kind, "armed crash during reopen");
+                }
+                // An open on a disk that is full or failing may fail: it writes a fresh
+                // manifest and `CURRENT`, and may roll the journal into a new segment,
+                // whose preallocation fails under `NoSpacePreallocate` unless background
+                // recycling left a spare one (so it depends on timing). The store is
+                // closed and the outcome is known (nothing was submitted since the clean
+                // close), so recover from the crash image: it must equal the model.
+                if self.faulted && matches!(e, Error::NoSpace | Error::Io(_)) {
+                    self.report.fault_cuts += 1;
+                    return Flow::Cut(CutKind::Crash, "clean reopen failed under a fault");
                 }
                 Flow::Fail(format!("clean reopen failed: {e}"))
             }

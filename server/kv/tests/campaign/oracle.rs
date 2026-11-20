@@ -122,15 +122,32 @@ pub fn scan(
 
 /// The whole state, scanned both ways; the two scans must agree.
 pub fn dump_both(snap: &Snapshot) -> Result<Model, String> {
+    dump(snap).map_err(|f| match f {
+        DumpFailure::Scan(what, e) => format!("{what} scan: {e}"),
+        DumpFailure::Differ(m) => m,
+    })
+}
+
+/// Why [`dump`] failed.
+pub enum DumpFailure {
+    /// The named scan ("forward" or "reverse") returned an engine error.
+    Scan(&'static str, Error),
+    /// Both scans succeeded but disagree.
+    Differ(String),
+}
+
+/// [`dump_both`] with the engine error kept, so a caller can tell an injected read
+/// fault from a wrong answer.
+pub fn dump(snap: &Snapshot) -> Result<Model, DumpFailure> {
     let fwd = scan(snap, Bound::Unbounded, Bound::Unbounded, false)
-        .map_err(|e| format!("forward scan: {e}"))?;
+        .map_err(|e| DumpFailure::Scan("forward", e))?;
     let rev = scan(snap, Bound::Unbounded, Bound::Unbounded, true)
-        .map_err(|e| format!("reverse scan: {e}"))?;
+        .map_err(|e| DumpFailure::Scan("reverse", e))?;
     if fwd != rev {
-        return Err(format!(
+        return Err(DumpFailure::Differ(format!(
             "forward and reverse scans differ: {}",
             first_difference(&rev, &fwd)
-        ));
+        )));
     }
     Ok(fwd)
 }

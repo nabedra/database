@@ -18,7 +18,34 @@ pub struct Case {
 }
 
 /// Fixed findings: these must pass.
-pub const FIXED: &[Case] = &[];
+pub const FIXED: &[Case] = &[
+    // KVfix3, CI 7f1e328 (Linux release, `ns05_ns10_thousands_of_seeds`): an `EioReadRun`
+    // fault still armed at a clean reopen failed a run read inside the harness's state
+    // dump. The harness now retries a dump once after an injected `Io` read error.
+    Case {
+        seed: 28,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[357, 358, 361, 365],
+        note: "injected run read EIO during the dump after a clean reopen",
+    },
+    // KVfix3, CI 34ce7f4 (Linux debug, `ns05_ns10_power_loss_faults_and_recoveries_sampled`):
+    // the same harness gap; whether the n-th run read lands in the dump depends on
+    // background timing.
+    Case {
+        seed: 6,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 0,
+        keep: &[
+            271, 272, 295, 296, 297, 302, 306, 308, 309, 311, 312, 314, 315, 316, 317, 318, 319,
+            320, 321, 322, 323, 324, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361,
+            362, 363, 364, 365, 366, 367,
+        ],
+        note: "injected run read EIO during the dump after a clean reopen (timing)",
+    },
+];
 
 /// Unfixed findings (each has an ignored test naming it in `main.rs`).
 pub const OPEN_FINDINGS: &[Case] = &[];
