@@ -4,7 +4,7 @@
 use super::{
     authority::consensus::Applied,
     entry::{LogId, OwnedRaftEntry, Vote},
-    hosted::{HostedState, TypedMachine, TypedSnapshot},
+    hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
         Purpose, RAFT_PROGRESS_DECODE_BYTES, RAFT_PROGRESS_HEADER_BYTES, ReceivePlan, ReplicaLease,
@@ -18,7 +18,6 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
 use openraft::{
-    Raft,
     errors::{RPCError, ReplicationClosed, StreamingError, Unreachable},
     network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
     raft::{
@@ -529,7 +528,8 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    raft: Raft<C, HostedState<C, M>>,
+    /// Follows a supervisor restart of the host's core (RV-APPLY F4).
+    raft: Arc<RaftCores<C, M>>,
     state: HostedState<C, M>,
     incoming: Arc<tokio::sync::Mutex<Option<snapshot::Incoming>>>,
     resident: ReplicaLease,
@@ -542,7 +542,7 @@ where
     M: TypedMachine<C>,
 {
     pub(crate) fn new(
-        raft: Raft<C, HostedState<C, M>>,
+        raft: Arc<RaftCores<C, M>>,
         state: HostedState<C, M>,
         resident: ReplicaLease,
         shared: Arc<WorkerSharedResources>,
