@@ -62,4 +62,21 @@ pub(crate) trait Consensus<C: OwnedPayload, R>: Send + Sync {
     fn propose(&self, command: OwnedCommand<C>) -> ConsensusFuture<'_, Applied<R>>;
     /// Complete only after ReadIndex and local applied-position advancement.
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier>;
+    /// The same barrier, but a leader may answer from a valid leader lease
+    /// and fall back to ReadIndex when the lease is stale (plan section 6).
+    #[cfg_attr(not(test), allow(dead_code))] // The direct executor (T5) until T7 wires it.
+    fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.ensure_linearizable()
+    }
+    /// The node this replica last observed as leader, if any. A routing
+    /// hint only, never an authority.
+    #[cfg_attr(not(test), allow(dead_code))] // The direct executor (T5) until T7 wires it.
+    fn current_leader(&self) -> Option<u64> {
+        None
+    }
+    /// This replica's permanent node id, when it has one.
+    #[cfg_attr(not(test), allow(dead_code))] // The direct executor (T5) until T7 wires it.
+    fn local_node(&self) -> Option<u64> {
+        None
+    }
 }

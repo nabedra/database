@@ -11,6 +11,57 @@ pub(crate) struct IndexPayload {
     pub base_version: Option<crate::oltp_replication::types::CommitTs>,
     pub cover: Row,
 }
+/// The entries one index changes when a row goes from `old` to `new`.
+/// Shared by the queued planner and the direct executor (plan section 6).
+pub(crate) struct IndexEntryChanges {
+    /// The old entry's key, when the change moves or removes it. An absent
+    /// old entry still receives a tombstone: a delayed backfill must never
+    /// resurrect its stale key.
+    pub delete: Option<MvccKey>,
+    /// The new entry and its covering payload.
+    pub put: Option<(MvccKey, CanonicalJson)>,
+}
+/// Computes `IndexEntryChanges` for one validated, writable index.
+pub(crate) fn index_entry_changes(
+    definition: &IndexDefinition,
+    table: &TableDescriptor,
+    primary: &Key,
+    old: Option<&Row>,
+    new: Option<&CanonicalJson>,
+    resources: &crate::oltp::pool::WorkerSharedResources,
+) -> Result<IndexEntryChanges, ProtocolError> {
+    let entry = |row: &Row| {
+        definition
+            .values(table, row)
+            .map(|values| MvccKey::IndexEntry {
+                table_id: table.id,
+                index_id: definition.index_id,
+                values,
+                primary_key: primary.clone(),
+            })
+    };
+    let old_key = old.map(&entry).transpose()?;
+    let new_row = new
+        .map(|raw| serde_json::from_str::<Row>(raw.as_str()).map_err(|_| not_found()))
+        .transpose()?;
+    let new_key = new_row.as_ref().map(&entry).transpose()?;
+    let put = match (new_key, new_row.as_ref()) {
+        (Some(key), Some(row)) => Some((
+            key,
+            CanonicalJson::from_serializable(
+                resources,
+                &IndexPayload {
+                    base_version: None,
+                    cover: definition.cover(table, row),
+                },
+                super::super::MAX_FIXED_COMMAND_BYTES,
+            )?,
+        )),
+        _ => None,
+    };
+    let delete = old_key.filter(|old| put.as_ref().is_none_or(|(new, _)| new != old));
+    Ok(IndexEntryChanges { delete, put })
+}
 impl NativePlanner {
     /// Stream definition pages; there is no table-wide index-count allocation.
     pub(super) async fn index_changes(
@@ -115,79 +166,37 @@ impl NativePlanner {
                 let schema = table.clone();
                 let definition = record.clone();
                 let resources = self.catalog.resources().clone();
-                let (old_key, new_key, cover) = self
+                let changes = self
                     .cpu(owner.clone(), move || {
                         definition.definition.validate(&schema.descriptor)?;
-                        let old_key = old_row
-                            .as_ref()
-                            .map(|row| {
-                                definition.definition.values(&schema.descriptor, row).map(
-                                    |values| MvccKey::IndexEntry {
-                                        table_id: schema.descriptor.id,
-                                        index_id: definition.definition.index_id,
-                                        values,
-                                        primary_key: primary.clone(),
-                                    },
-                                )
-                            })
-                            .transpose()?;
-                        let new_row = raw_new
-                            .as_ref()
-                            .map(|raw| {
-                                serde_json::from_str::<Row>(raw.as_str()).map_err(|_| not_found())
-                            })
-                            .transpose()?;
-                        let new_key = new_row
-                            .as_ref()
-                            .map(|row| {
-                                definition.definition.values(&schema.descriptor, row).map(
-                                    |values| MvccKey::IndexEntry {
-                                        table_id: schema.descriptor.id,
-                                        index_id: definition.definition.index_id,
-                                        values,
-                                        primary_key: primary.clone(),
-                                    },
-                                )
-                            })
-                            .transpose()?;
-                        let cover = new_row
-                            .as_ref()
-                            .map(|row| {
-                                CanonicalJson::from_serializable(
-                                    &resources,
-                                    &IndexPayload {
-                                        base_version: None,
-                                        cover: definition.definition.cover(&schema.descriptor, row),
-                                    },
-                                    super::super::MAX_FIXED_COMMAND_BYTES,
-                                )
-                            })
-                            .transpose()?;
-                        Ok((old_key, new_key, cover))
+                        index_entry_changes(
+                            &definition.definition,
+                            &schema.descriptor,
+                            &primary,
+                            old_row.as_deref(),
+                            raw_new.as_ref(),
+                            &resources,
+                        )
                     })
                     .await?;
-                if let Some(old_key) = old_key {
-                    if new_key.as_ref() != Some(&old_key) {
-                        let expected = self
-                            .index_version(pin, &participant, old_key.clone())
-                            .await?;
-                        // An absent old entry still receives a tombstone. A
-                        // delayed backfill must never resurrect its stale key.
-                        result.push(PreparedWrite {
-                            key: old_key,
-                            expected_version: expected,
-                            change: Change::Delete,
-                        });
-                    }
+                if let Some(old_key) = changes.delete {
+                    let expected = self
+                        .index_version(pin, &participant, old_key.clone())
+                        .await?;
+                    result.push(PreparedWrite {
+                        key: old_key,
+                        expected_version: expected,
+                        change: Change::Delete,
+                    });
                 }
-                if let Some(new_key) = new_key {
+                if let Some((new_key, cover)) = changes.put {
                     let expected = self
                         .index_version(pin, &participant, new_key.clone())
                         .await?;
                     result.push(PreparedWrite {
                         key: new_key,
                         expected_version: expected,
-                        change: Change::Put(cover.ok_or_else(not_found)?),
+                        change: Change::Put(cover),
                     });
                 }
             }

@@ -285,6 +285,10 @@ impl HostedGroupManager {
                     if matches!(identity.kind, GroupKind::Data { .. } | GroupKind::Catalog) {
                         group.bind(Purpose::Storage, services.clone())?;
                         group.bind(Purpose::Settlement, services.clone())?;
+                        if matches!(identity.kind, GroupKind::Data { .. }) {
+                            // The ingress lane for `Method::Direct` (T5).
+                            group.bind(Purpose::ApiIngress, services.clone())?;
+                        }
                     } else {
                         group.bind(Purpose::ServiceMutation, services.clone())?;
                     }
@@ -419,8 +423,11 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedData, ProtocolError> {
-        self.start(ParticipantMachine::new(store)?, local, peers, config)
-            .await
+        let running = self
+            .start(ParticipantMachine::new(store)?, local, peers, config)
+            .await?;
+        super::hosted::direct_leadership::watch(&running);
+        Ok(running)
     }
     pub(crate) async fn start_catalog(
         &self,
