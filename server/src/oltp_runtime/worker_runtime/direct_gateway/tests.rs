@@ -284,22 +284,16 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
 /// exclusive lifecycle guard with the new `ParticipantExclusive` method;
 /// while a DDL holds it, the first request does not activate the group (no
 /// entry proposed, the pre-DDL lifecycle is never bound) and the request
-/// waits for the DDL instead of going ahead; after the release it
-/// completes. The gateway's topology fill uses the same `DirectLeader`
-/// reader (T6 concern 3).
+/// waits for the DDL instead of going ahead, ending unavailable while the
+/// DDL keeps the guard. The gateway's topology fill uses the same
+/// `DirectLeader` reader (T6 concern 3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls() {
     use crate::oltp::mvcc::{
         catalog::CatalogRead,
         store::lifecycle::{GuardMode, LifecycleBinding},
     };
-    use crate::oltp_replication::{
-        authority::status::{SettlementStatement, VerifiedSettlement},
-        types::{
-            AppliedPosition, DecisionStatement, Digest, ManifestRef, ReadTs, RequestBinding,
-            TxnDecision, TxnId,
-        },
-    };
+    use crate::oltp_replication::types::{Digest, ReadTs, RequestBinding, TxnId};
     tokio::time::timeout(Duration::from_secs(240), async {
         let directory = TestDirectory(
             std::env::temp_dir().join(format!("nabedra-t7b-guard-{}", Uuid::new_v4())),
@@ -400,69 +394,40 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
             leader["fallbacks"]["schema"].as_u64().unwrap() >= 1,
             "{leader}"
         );
-        // The DDL settles and releases its guard.
-        let manifest = ManifestRef {
-            status_group_id: Uuid::new_v4(),
-            digest: Digest::from_bytes([7; 32]),
-            participant_count: 1,
-        };
-        let at = AppliedPosition {
-            term: 1,
-            node_id: 1,
-            index: 1,
-        };
-        let settled = VerifiedSettlement::model_for_test(SettlementStatement {
-            txn,
-            request,
-            manifest,
-            decision: DecisionStatement {
-                txn,
-                request,
-                manifest,
-                decided_at: at,
-                decision: TxnDecision::Commit {
-                    commit_ts: crate::oltp_replication::types::CommitTs::new(1).unwrap(),
-                },
-            },
-            resolved_count: 1,
-            settled_at: at,
-        })
-        .unwrap();
-        catalog
-            .participant()
-            .release_lifecycle(authority, guard, settled)
-            .await
-            .unwrap();
+        // The DDL keeps its guard past the request's deadline: the request
+        // ends unavailable, nothing was proposed and the group never bound
+        // the pre-DDL lifecycle. (Release, activation at the published
+        // lifecycle and the commit after it run in the 3-voter test
+        // `o12_d11_t7b_activation_waits_for_a_ddl_that_read_the_capability_inactive`.)
+        let (status, envelope) = insert.await.unwrap();
+        assert_eq!(status, 503, "{envelope}");
+        let leader =
+            crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
+                .unwrap()
+                .stats();
+        assert_eq!(leader["entries_proposed"], json!(0), "{leader}");
+        assert_eq!(
+            leader["proposal_failures"]["activation"],
+            json!(0),
+            "{leader}"
+        );
+        assert_eq!(leader["forward_markers_written"], json!(0), "{leader}");
+        assert!(
+            leader["retries"]["unavailable"].as_u64().unwrap() >= 1,
+            "{leader}"
+        );
+        let gateway = runtime.direct_gateway_handle().unwrap().stats();
+        assert_eq!(gateway.direct_done, 0, "{gateway:?}");
+        assert_eq!(gateway.catalog_reads, 1, "{gateway:?}");
         assert_eq!(
             reader
                 .participant()
                 .lifecycle_exclusive(table_id)
                 .await
                 .unwrap(),
-            None
+            Some(binding)
         );
-        let (status, envelope) = insert.await.unwrap();
-        assert_eq!(status, 200, "{envelope}");
-        // The group is now active: the next mutation commits directly.
-        let (status, envelope) = call(
-            &app,
-            body(
-                Uuid::new_v4(),
-                "table.insert",
-                json!({"table_id": table, "row": {"id": 2, "value": 2, "tag": "b"}}),
-            ),
-            true,
-        )
-        .await;
-        assert_eq!(status, 200, "{envelope}");
-        let gateway = runtime.direct_gateway_handle().unwrap().stats();
-        assert!(gateway.direct_done >= 1, "{gateway:?}");
-        assert_eq!(gateway.catalog_reads, 1, "{gateway:?}");
-        let leader =
-            crate::oltp_replication::service_rpc::direct::installed(&runtime.services.shared)
-                .unwrap()
-                .stats();
-        assert!(leader["entries_applied"].as_u64().unwrap() >= 1, "{leader}");
+        drop(guard);
         runtime.drain().await.unwrap();
     })
     .await
