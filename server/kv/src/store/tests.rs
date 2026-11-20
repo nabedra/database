@@ -224,3 +224,120 @@ fn ns17_close_frees_memtable_charges_while_a_background_thread_holds_the_store()
         drop(background_thread);
     }
 }
+
+/// Occupies a one-thread [`Background`] until released, so a test drives flushes and
+/// compactions on its own thread in a fixed order.
+struct Blocker {
+    released: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: std::sync::Mutex<bool>,
+    entered_wake: std::sync::Condvar,
+}
+
+impl Blocker {
+    fn occupy(bg: &Arc<Background>) -> Arc<Blocker> {
+        let blocker = Arc::new(Blocker {
+            released: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+            entered: std::sync::Mutex::new(false),
+            entered_wake: std::sync::Condvar::new(),
+        });
+        let job: Arc<dyn super::background::Job> = blocker.clone();
+        bg.schedule_flush(Arc::downgrade(&job), std::time::Duration::ZERO);
+        let mut entered = blocker.entered.lock().unwrap();
+        while !*entered {
+            entered = blocker.entered_wake.wait(entered).unwrap();
+        }
+        drop(entered);
+        blocker
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Releases the [`Blocker`] when dropped, also while a failed assertion unwinds: the
+/// `Background` joins its thread on drop.
+struct Release(Arc<Blocker>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl super::background::Job for Blocker {
+    fn run_flush(&self) -> Option<std::time::Duration> {
+        *self.entered.lock().unwrap() = true;
+        self.entered_wake.notify_all();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.wake.wait(released).unwrap();
+        }
+        None
+    }
+    fn run_compaction(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+/// NS03 (KVfix3): a compaction deletes its own inputs before it returns when nothing
+/// else pins them. `compact_once` purged obsolete runs while its `pick` still held the
+/// inputs, so their files stayed until the next compaction's purge: a snapshot taken in
+/// that window holds the new version while `runs/` still lists the old inputs, which
+/// made `ns03_snapshot_survives_flush_and_compaction_and_pins_runs` flaky on CI.
+#[test]
+fn ns03_compaction_deletes_its_unpinned_inputs_before_it_returns() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let bg = Background::new(1).unwrap();
+    let _release = Release(Blocker::occupy(&bg));
+    let store = Store::open(Path::new("/db/kv"), small(Arc::new(fs.clone()), &bg, 64))
+        .unwrap()
+        .store;
+    // Two L0 runs reach the L0 trigger (2).
+    for round in 0..2u32 {
+        for i in 0..50u32 {
+            let mut b = WriteBatch::new();
+            b.put(
+                format!("k{i:04}").as_bytes(),
+                format!("v{round}").as_bytes(),
+            );
+            store
+                .submit(b, Durability::NoSync, Box::new(()))
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        store.flush().unwrap();
+    }
+    assert_eq!(store.level_runs()[0], 2, "levels {:?}", store.level_runs());
+    let files = || -> Vec<String> {
+        let mut v: Vec<String> = fs
+            .list(Path::new("/db/kv/runs"))
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let inputs = files();
+    assert!(store.inner.compact_once().unwrap());
+    let mut live: Vec<String> = store
+        .inner
+        .current_sv()
+        .version
+        .runs()
+        .map(|r| format!("{}.run", r.id()))
+        .collect();
+    live.sort();
+    assert_eq!(
+        files(),
+        live,
+        "after one compaction of {inputs:?}: runs/ must hold exactly the current runs"
+    );
+    store.close().unwrap();
+}

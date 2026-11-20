@@ -215,7 +215,16 @@ fn ns03_snapshot_survives_flush_and_compaction_and_pins_runs() {
         v.sort();
         v
     };
-    let pinned = run_files(&fs);
+    // The runs this snapshot pins, not a listing of `runs/`: the directory can also
+    // hold outputs of a background compaction still in flight and inputs whose last
+    // reference is about to drop, which no snapshot pins and a later purge may delete.
+    let mut pinned: Vec<String> = snap
+        .run_ids()
+        .into_iter()
+        .map(|id| format!("{id}.run"))
+        .collect();
+    pinned.sort();
+    assert!(!pinned.is_empty());
     for tag in 200..600 {
         let b = random_batch(&mut rng, 3, 40, tag);
         write(&store, &b, Durability::NoSync).unwrap();

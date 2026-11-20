@@ -1588,7 +1588,11 @@ impl Inner {
         let Some(pick) = pick else {
             return Ok(false);
         };
-        match self.run_compaction(&pick) {
+        let result = self.run_compaction(&pick);
+        // The pick holds the inputs. Let them go before the purge below, so the inputs
+        // no snapshot pins are deleted by this compaction, not left until the next one.
+        drop(pick);
+        match result {
             Ok(()) => {}
             Err(Error::Corruption {
                 file: FileId::Run { id },

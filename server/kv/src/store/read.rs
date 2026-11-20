@@ -182,6 +182,13 @@ impl Snapshot {
         self.seq
     }
 
+    /// Ids of the runs this snapshot pins (`<id>.run` under `runs/`), in no order. For
+    /// tests that check a pinned run's file is never deleted (NS03).
+    #[doc(hidden)]
+    pub fn run_ids(&self) -> Vec<u64> {
+        self.sv.version.runs().map(|r| r.id()).collect()
+    }
+
     pub(super) fn super_version(&self) -> &Arc<SuperVersion> {
         &self.sv
     }
