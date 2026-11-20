@@ -967,22 +967,22 @@ fn spawn_membership(
                     // the owner copies the queue and publishes.
                     join_owner.advance(&control, pending).await?;
                 }
-                if current.owner == local {
-                    if let Some(Pending::Ready(pending)) = state.pending {
-                        if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
-                            return Ok(());
-                        }
-                        if pending.phase == ReadyPhase::AwaitingQueueProof {
-                            let ticket = JoinTicket {
-                                ticket_id: pending.transition_id,
-                                target: pending.target,
-                                source_ready: pending.expected,
-                            };
-                            let proof = queue.copy_join(ticket, &peer).await?;
-                            accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
-                        } else if control.data_worker(pending.target).await?.is_some() {
-                            join_owner.advance(&control, &pending).await?;
-                        }
+                if current.owner == local
+                    && let Some(Pending::Ready(pending)) = state.pending
+                {
+                    if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
+                        return Ok(());
+                    }
+                    if pending.phase == ReadyPhase::AwaitingQueueProof {
+                        let ticket = JoinTicket {
+                            ticket_id: pending.transition_id,
+                            target: pending.target,
+                            source_ready: pending.expected,
+                        };
+                        let proof = queue.copy_join(ticket, &peer).await?;
+                        accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
+                    } else if control.data_worker(pending.target).await?.is_some() {
+                        join_owner.advance(&control, &pending).await?;
                     }
                 }
                 Ok::<_, ProtocolError>(())
