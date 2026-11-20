@@ -626,7 +626,7 @@ impl Store {
 
     /// Queues `batch`. Never blocks on I/O. Submission order is commit order. `on_done`
     /// is dropped on the journal thread after the write is visible (and durable, for
-    /// `Sync`), or after it failed.
+    /// `Sync`), or after it failed, and before the returned commit completes.
     pub fn submit(
         &self,
         batch: WriteBatch,
