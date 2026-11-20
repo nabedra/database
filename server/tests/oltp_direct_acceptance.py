@@ -583,8 +583,19 @@ def timed_update(api, kv, key, value, request_id=None):
     return body, status, reply, round(time.monotonic() - started, 3)
 
 
+def ready_counts(cluster):
+    counts = {}
+    for name in cluster.live():
+        try:
+            counts[name] = call(cluster.urls[name], '/health/ready', token=cluster.auth['data_token'],
+                                timeout=3)[1].get('ready_workers')
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            counts[name] = repr(error)[:80]
+    return counts
+
+
 def recover(cluster, api, kv, key, deadline_seconds=180):
-    cluster.wait_workers()
+    """Wait until writes commit again (a resumed worker may stay out of the ready set)."""
     deadline = time.monotonic() + deadline_seconds
     value = 1000
     while True:
@@ -621,9 +632,11 @@ def suite_d05(args, output):
         finally:
             cluster.workers[followers[0]].resume()
         one_ok = all(item['status'] == 200 for item in one)
-        recovered = recover(cluster, api, kv, 500)
+        time.sleep(5)
         report('D05-one-paused', status='passed' if one_ok else 'known-finding', leader=leader,
-               paused=followers[0], writes=one, finding=None if one_ok else D05_FINDING)
+               paused=followers[0], writes=one, finding=None if one_ok else D05_FINDING,
+               ready_workers_5s_after_resume=ready_counts(cluster))
+        recovered = recover(cluster, api, kv, 500)
 
         # Two followers paused: no success response and the row is unchanged.
         before = kv.get(500)['value']
@@ -637,7 +650,6 @@ def suite_d05(args, output):
             for name in followers:
                 cluster.workers[name].resume()
         assert status != 200, (status, reply)
-        cluster.wait_workers()
         outcome = reply['error']['outcome'] if isinstance(reply, dict) else 'transport'
         deadline = time.monotonic() + 180
         while True:
