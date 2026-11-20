@@ -1668,6 +1668,67 @@ async fn d04_leader_loss_before_and_after_quorum_retries_complete_on_the_new_lea
     cluster.shutdown().await;
 }
 
+/// RV-FINAL H1, D07, O16, NS11: the leader's core stops on a failed apply
+/// (a fail-once test hook) and the supervisor's restart runs a new core on
+/// the same log and state. The leadership watcher follows the new core: the
+/// clock steps down while the core is stopped, the restarted node wins the
+/// next election, its clock serves again and a direct update commits. Before
+/// the fix the watcher ended with the first core and `serving` stayed false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d07_o16_rv_final_h1_restarted_core_serves_direct_commits_again() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    let v = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    v.consensus.retry().fail_applies.store(1, Ordering::Release);
+    // The next applied entry stops the core. Its outcome is not asserted.
+    let executor = v.executor.clone();
+    let handle = v.handle.clone();
+    let id = Uuid::new_v4();
+    let body = cluster.body(
+        id,
+        "table.update",
+        serde_json::json!({"key": 1, "values": {"value": 2}}),
+    );
+    let request = cluster.request_at(leader, &body, id, 1, Duration::from_secs(3));
+    let pending = tokio::spawn(async move { executor.execute(&handle, request).await });
+    watchdog(|| async { (!v.consensus.raft.is_running()).then_some(()) }).await;
+    watchdog(|| async { (!clock.serving()).then_some(()) }).await;
+    // What the supervisor does after its backoff.
+    v.consensus.restart().await.unwrap();
+    assert_eq!(v.consensus.raft.restarts(), 1);
+    let _ = pending.await.unwrap();
+    // Only node 1 elects, so the restarted node leads again.
+    assert_eq!(cluster.leader().await, leader);
+    cluster.serving(leader).await;
+    assert!(clock.serving(), "the clock serves on the restarted core");
+    let response = cluster
+        .op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 1, "values": {"value": 3}}),
+        )
+        .await;
+    assert_eq!(response, done("true"));
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done(r#"{"id":1,"score":0.0,"tag":"a","value":3}"#)
+    );
+    cluster.shutdown().await;
+}
+
 /// Rule 2 wiring for `table.get` (plan section 6): a get of a key with a
 /// pending commit waits for it, and a get never waits on other keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
