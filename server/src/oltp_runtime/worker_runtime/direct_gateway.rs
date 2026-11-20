@@ -99,3 +99,6 @@ impl WorkerRuntime {
         direct::catalog_fill(&self.services.catalog, authority, table_id).await
     }
 }
+
+#[cfg(test)]
+mod tests;

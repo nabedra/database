@@ -682,6 +682,17 @@ impl DirectGateway {
                 self.transport.send(range.group(), voter, request, forward),
             )
             .await;
+            #[cfg(test)]
+            if std::env::var_os("T6_TRACE").is_some() {
+                eprintln!(
+                    "t6 {} forward={forward} node={} group={} epochs={}/{}: {sent:?}",
+                    request.request_id,
+                    voter.node_id,
+                    range.group().group_id,
+                    request.schema_epoch,
+                    request.routing_epoch
+                );
+            }
             let reply = match sent {
                 // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
