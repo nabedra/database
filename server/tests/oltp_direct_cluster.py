@@ -178,8 +178,13 @@ def announcement(process, timeout=60):
 
 class Rf3Cluster:
     def __init__(self, binary, root, *, test_executable=None, direct=None, api_direct=(True,),
-                 worker_env=None, key_type='ed25519', worker_memory=2048 * MIB):
+                 worker_env=None, key_type='ed25519', worker_memory=2048 * MIB, mounts=False):
         self.binary = str(Path(binary).resolve())
+        # Cold start (D09) requires each pool on its own Docker-profile mount
+        # (`cold::validate`). With `mounts`, every worker directory is a tmpfs
+        # mounted with `sudo -n` and labelled like a provisioned Docker volume.
+        self.mounts = mounts
+        self.mounted = []
         self.test_executable = str(Path(test_executable).resolve()) if test_executable else None
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -238,6 +243,8 @@ class Rf3Cluster:
                         private_key=str(self.root / f'{name}.key'), authority_ca=str(self.ca),
                         bootstrap_id=self.bootstrap_id, initial_run=self.run_id, required_voters=len(WORKERS),
                         placements=placements, control_enrollments=peers, operator_pins=pins)
+            if self.mounts:
+                node.update(mount=self.mount_pool(name, pool[name], enrollment[name]))
             self.config[name] = dict(version=1, bind=f'127.0.0.1:{free_port()}', auth_file=str(self.root / 'auth.json'),
                                      node=node, resources=resources(self.worker_memory),
                                      execution=EXECUTION | dict(direct_oltp=self.direct[name]))
@@ -251,6 +258,28 @@ class Rf3Cluster:
         for index, direct in enumerate(self.api_direct, start=1):
             self.start_api(f'api{index}', direct)
         return self
+
+    @staticmethod
+    def mounts_available():
+        return sys.platform.startswith('linux') and subprocess.run(
+            ['sudo', '-n', 'true'], capture_output=True, timeout=30).returncode == 0
+
+    def mount_pool(self, name, pool_id, enrollment):
+        directory = self.root / name / 'data'
+        directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run(['sudo', '-n', 'mount', '-t', 'tmpfs', '-o',
+                        f'size=2g,mode=0700,uid={os.getuid()},gid={os.getgid()}', 'tmpfs', str(directory)],
+                       check=True, capture_output=True, timeout=60)
+        self.mounted.append(directory)
+        volume, marker = f'nabedra-direct-{name}-{self.cluster_id[:8]}', uid()
+        write_json(directory / '.nabedra-docker-volume.json',
+                   dict(format_version=1, volume_name=volume, volume_marker=marker), 0o600)
+        identity = {field: enrollment[field]
+                    for field in ('worker_id', 'incarnation', 'enrollment_revision', 'certificate_sha256')}
+        return dict(profile={'docker': {'volume_marker': marker}}, worker=identity, generation=1,
+                    identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
+                                  worker_id=enrollment['worker_id'], pool_id=pool_id),
+                    mount_path=str(directory), provider_volume_id='docker-volume:' + volume, filesystem_uuid='')
 
     def launch_worker(self, name):
         config = self.config[name]
@@ -415,6 +444,10 @@ class Rf3Cluster:
         for name in WORKERS:
             node = self.config[name]['node']
             node.update(cold=profile, enrollment=nexts[name], control_enrollments=peers, operator_pins=pins)
+            if 'mount' in node:
+                node['mount']['worker'] = {field: nexts[name][field] for field in
+                                           ('worker_id', 'incarnation', 'enrollment_revision', 'certificate_sha256')}
+                node['mount']['generation'] += 1
             self.enrollments[name] = nexts[name]
         self.run_id = profile['next_run']
         for name in WORKERS:
@@ -431,6 +464,9 @@ class Rf3Cluster:
                 process.stop()
             except Exception as error:  # cleanup must reach every process
                 print(f'cleanup {process.name}: {error!r}', file=sys.stderr)
+        for directory in self.mounted:
+            subprocess.run(['sudo', '-n', 'umount', str(directory)], capture_output=True, timeout=60)
+        self.mounted.clear()
 
 
 class Rf1Serve:

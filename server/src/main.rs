@@ -69,7 +69,9 @@ async fn run_cli() -> ExitCode {
                         )
                         .with_target("nabedra_database_server::oltp_runtime", rpc_trace)
                         .with_target("nabedra_database_server::oltp_replication::manager::data_factory", rpc_trace)
-                        .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace),
+                        .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::typed_network", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::multiplex", rpc_trace),
                 ),
         )
         .try_init()
