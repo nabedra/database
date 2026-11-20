@@ -674,3 +674,51 @@ jobs:
           name: ns18-bench-log
           path: ns18-bench.log
           retention-days: 14
+
+  # PERF1: CPU profile of the RF3 direct path. Opt-in with [ci perf] next to [ci bench]: runs the
+  # benchmark driver on this runner (same caps as NS11) with the bench job's release binary, records
+  # per-stage timings from /v1/runtime/stats and samples every worker with perf.
+  perf:
+    name: direct path CPU profile and stage timings (PERF1)
+    if: contains(github.event.head_commit.message, '[ci perf]') && contains(github.event.head_commit.message, '[ci bench]')
+    needs: bench
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-binary
+          path: bench-bin
+      - name: Benchmark image and perf
+        run: |
+          chmod +x bench-bin/nabedra-db-*
+          printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -qq linux-tools-azure
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          perf --version; nproc; free -m
+      - name: Serial pair with stage timings
+        run: |
+          bin=$(ls "$PWD"/bench-bin/nabedra-db-*)
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$bin" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/serial" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
+            --clients 1 --rows 2000 --seed 20261118 --timeout 10
+      - name: 20 updates/s with perf
+        run: |
+          bin=$(ls "$PWD"/bench-bin/nabedra-db-*)
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$bin" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/rate20" --rates 20 --seconds 60 --warmup-seconds 5 --repetitions 1 \
+            --clients 32 --rows 2000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-profile
+          path: perf-out
+          retention-days: 14

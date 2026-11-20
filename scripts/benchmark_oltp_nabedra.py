@@ -9,6 +9,7 @@ import http.client
 from io import SEEK_END
 import json
 import math
+import os
 from pathlib import Path
 import re
 import secrets
@@ -363,12 +364,16 @@ def summarize_direct(before, after):
     for name in (*WORKERS, 'api'):
         old, new = (before or {}).get(name) or {}, (after or {}).get(name) or {}
         section = {}
-        for key in ('direct', 'direct_gateway'):
+        # PERF1: per-stage latency histograms; the API's own are `api_stage_timing`
+        # (its `stage_timing` is the worker it forwards stats from).
+        keys = ('direct', 'direct_gateway', 'api_stage_timing') if name == 'api' else (
+            'direct', 'direct_gateway', 'stage_timing')
+        for key in keys:
             if isinstance(new.get(key), dict):
                 delta = counter_delta(old.get(key), new[key])
                 # in_flight and max_in_flight are gauges.
                 for gauge in ('in_flight', 'max_in_flight'):
-                    if gauge in new[key]:
+                    if gauge in new[key] and key in ('direct', 'direct_gateway'):
                         delta[gauge] = new[key][gauge]
                 section[key] = delta
         if isinstance(new.get('direct_capability'), dict):
@@ -1017,12 +1022,17 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             driver = self.launch('driver', DRIVER_CPU, DRIVER_MEMORY, 'python3',
                 ['/source/scripts/benchmark_oltp_nabedra.py', '--driver', '--output', '/results', *settings])
             print(f'Running the OLTP workload in {driver}', flush=True)
+            if args.perf_record:
+                profiler = threading.Thread(target=self.perf_record, daemon=True)
+                profiler.start()
             budget = len(args.rates) * (args.warmup_seconds + args.repetitions * args.seconds
                                         + (args.repetitions + 1) * (args.timeout + 30)) + 120
             if args.soak:
                 budget = 7200 + 2 * args.soak_seconds
             state = int(self.docker('wait', driver, timeout=budget))
             self.docker('cp', f'{driver}:/results/.', str(args.output), timeout=120)
+            if args.perf_record:
+                profiler.join(timeout=args.perf_record + 600)
         finally:
             self.sampling.set()
             sampler.join(timeout=60)
@@ -1048,6 +1058,53 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             except (RuntimeError, ValueError, subprocess.SubprocessError) as error:
                 self.metadata.setdefault('data_bytes', {})[name] = str(error)
         return state
+
+    def perf_record(self):
+        """PERF1: on a Linux host, sample every worker's CPU stacks with perf while the workload runs."""
+        args = self.args
+        try:
+            time.sleep(args.perf_delay)
+            pids = {name: self.docker('inspect', '--format', '{{.State.Pid}}', f'{self.prefix}-{name}').strip()
+                    for name in WORKERS}
+            write_json(args.output / 'perf-pids.json', pids)
+            data = args.output / 'perf.data'
+            # The workers run as root in their containers: perf needs root to attach.
+            perf = ['perf'] if os.geteuid() == 0 else ['sudo', '-n', 'perf']
+            subprocess.run([*perf, 'record', '-F', str(args.perf_frequency), '--call-graph', 'dwarf,8192',
+                            '-p', ','.join(pids.values()), '-o', str(data), '--', 'sleep', str(args.perf_record)],
+                           check=True, capture_output=True, timeout=args.perf_record + 300)
+            with (args.output / 'perf-report.txt').open('w') as stream:
+                subprocess.run([*perf, 'report', '-i', str(data), '--stdio', '--no-children', '--sort', 'pid,dso,sym',
+                                '--percent-limit', '0.2', '-g', 'none'], stdout=stream, stderr=subprocess.STDOUT,
+                               timeout=900)
+            folded = {}
+            script = subprocess.Popen([*perf, 'script', '-i', str(data), '-F', 'pid,ip,sym'],
+                                      stdout=subprocess.PIPE, text=True, errors='replace')
+            pid, stack = None, []
+            for line in [*script.stdout, '']:
+                line = line.rstrip('\n')
+                if not line.strip():
+                    if pid is not None and stack:
+                        key = (pid, ';'.join(reversed(stack)))
+                        folded[key] = folded.get(key, 0) + 1
+                    pid, stack = None, []
+                elif pid is None:
+                    pid = line.split()[0]
+                else:
+                    fields = line.split(None, 1)
+                    symbol = fields[1] if len(fields) > 1 else fields[0]
+                    stack.append(re.sub(r'\+0x[0-9a-f]+$', '', symbol).replace(';', ':'))
+            script.wait(timeout=900)
+            names = {pid: name for name, pid in pids.items()}
+            for name in WORKERS:
+                with (args.output / f'perf-folded-{name}.txt').open('w') as stream:
+                    for (pid, stack), count in sorted(folded.items()):
+                        if names.get(pid) == name:
+                            stream.write(f'{stack} {count}\n')
+            subprocess.run([*perf[:-1], 'rm', '-f', str(data)] if perf[0] == 'sudo' else ['rm', '-f', str(data)],
+                           check=False, timeout=60)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            write_json(args.output / 'perf-error.json', {'error': f'{type(error).__name__}: {error}'})
 
     def record_status_leader_hints(self):
         placement = self.metadata['status_seed_placement']
@@ -1173,6 +1230,10 @@ def main():
     parser.add_argument('--cold-restart', action='store_true',
                         help='after the workload, SIGKILL every worker and time the cold start onto a new run')
     parser.add_argument('--cgroup-interval', type=float, default=5, help='seconds between worker cgroup samples')
+    parser.add_argument('--perf-record', type=float, default=0,
+                        help='Linux host only: perf-sample the workers for this many seconds during the workload')
+    parser.add_argument('--perf-delay', type=float, default=20, help='seconds after the driver starts before perf starts')
+    parser.add_argument('--perf-frequency', type=int, default=249)
     parser.add_argument('--soak', action='store_true', help='run the storage soak instead of the rate sweep')
     parser.add_argument('--soak-rows', type=int, default=80_000)
     parser.add_argument('--soak-payload-bytes', type=int, default=2048)
