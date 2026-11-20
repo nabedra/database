@@ -326,6 +326,9 @@ where
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
     /// Guards the single direct-leadership watcher of a Data replica.
     pub(in crate::oltp_replication) direct_watch: std::sync::Once,
+    /// This host's claim on deferred application sync. Released on shutdown,
+    /// or when the host drops (RV-T2 Q5); clears only this host's claim.
+    deferred_applies: std::sync::Mutex<Option<crate::oltp::pool::DeferredApplies>>,
 }
 /// Entries per AppendEntries RPC. A peer whose `nabedra-otp/2` session
 /// negotiated multi-entry appends receives up to this many entries (and about
@@ -381,7 +384,10 @@ where
         // Before Raft can replay or apply anything: unsynced application is
         // safe only when the log shares this state's WAL. Otherwise every
         // application write stays synced.
-        if !state.store().defer_apply_sync(log.group()) {
+        // The token lives in the host. If `Raft::new` fails it drops here, so no
+        // host that never started leaves deferral on (RV-NS6 F6).
+        let deferred_applies = state.store().defer_apply_sync(log.group());
+        if deferred_applies.is_none() {
             tracing::warn!(group=%state.store().identity().group_id,
                 "typed Raft log and state use different pools; application stays synced");
         }
@@ -400,24 +406,20 @@ where
             state,
             membership_changes: tokio::sync::Mutex::new(()),
             direct_watch: std::sync::Once::new(),
+            deferred_applies: std::sync::Mutex::new(deferred_applies),
         }))
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
         let stopped = self.raft.shutdown().await;
         self.log.drain().await;
         // No running log replays unsynced application any more (RV-T2 Q5).
-        self.state.store().stop_deferred_applies();
+        drop(
+            self.deferred_applies
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
         stopped.map_err(|_| unavailable())
-    }
-}
-impl<C, M> Drop for RaftConsensus<C, M>
-where
-    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
-    M: TypedMachine<C>,
-{
-    fn drop(&mut self) {
-        // Clearing the flag only makes later application writes synced again.
-        self.state.store().stop_deferred_applies();
     }
 }
 impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>

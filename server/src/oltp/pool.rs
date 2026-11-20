@@ -105,13 +105,16 @@ struct GroupInner {
     generation: Arc<tokio::sync::RwLock<()>>,
     log_order: Arc<tokio::sync::Mutex<()>>,
     log_metadata_order: Arc<tokio::sync::Mutex<()>>,
-    /// Set only by the Raft host after it proves this group's log lives in the
-    /// same physical pool, and therefore the same journal. Cleared when the host
-    /// stops (RV-T2 Q5).
-    deferred_apply: AtomicBool,
+    /// The [`DeferredApplies`] owner that lets application writes skip their
+    /// fsync, or 0. Set only by the Raft host after it proves this group's log
+    /// lives in the same physical pool, and therefore the same journal; cleared
+    /// when that host's token drops (RV-T2 Q5, RV-NS6 F6).
+    deferred_apply: AtomicU64,
+    /// Last [`DeferredApplies`] owner number handed out.
+    deferral_owners: AtomicU64,
     /// Last unsynced application write: (applied index, journal sequence).
     deferred_tail: std::sync::Mutex<Option<(u64, u64)>>,
-    synced_writes: AtomicU64,
+    synced_requests: AtomicU64,
     deferred_writes: AtomicU64,
     _handle_slot: GroupCapacityLease,
 }
@@ -126,8 +129,9 @@ pub struct PoolWriteStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct GroupWriteStats {
     /// Synced write requests issued by this replica's log and state transactions.
-    /// Group commit may cover several with one journal fsync.
-    pub synced_writes: u64,
+    /// Group commit may cover several with one journal fsync; real fsyncs are
+    /// [`PoolWriteStats::synced_writes`] (RV-NS6 F10).
+    pub synced_requests: u64,
     /// Unsynced application writes made durable by a later synced write.
     pub deferred_writes: u64,
     /// Newest applied index a crash could still lose, if any.
@@ -158,18 +162,15 @@ enum Submitted {
     Pending {
         response: ChargedBytes,
         commit: nabedra_kv::Commit,
-        released: storage::Released,
         deferred: bool,
     },
-    /// L0 slowdown: the batch waits `delay` off the executor, then is submitted.
+    /// L0 slowdown: a detached task, spawned by the executor, waits out the delay
+    /// and then submits the batch. It owns the batch and its guards, so the write
+    /// lands even when the caller is gone (RV-NS6 F4).
     Paced {
         response: ChargedBytes,
-        delay: std::time::Duration,
-        batch: WriteBatch,
-        durability: Durability,
-        on_done: Box<dyn std::any::Any + Send>,
-        released: storage::Released,
-        deferred_index: Option<Option<u64>>,
+        task: tokio::task::JoinHandle<Result<nabedra_kv::Commit, ProtocolError>>,
+        deferred: bool,
     },
 }
 #[derive(Clone, Copy)]
@@ -189,6 +190,25 @@ impl From<ExecutionClass> for ReplyLane {
 #[derive(Clone)]
 pub struct GroupStore {
     inner: Arc<GroupInner>,
+}
+/// A Raft host's claim on deferred application sync, from
+/// [`GroupStore::defer_apply_sync`]. Dropping it syncs later application
+/// writes again, since no running log replays them (RV-T2 Q5). Only the claim
+/// that set the switch clears it: an old host dropped after a new one started
+/// leaves the new host's deferral alone (RV-NS6 F6).
+pub(crate) struct DeferredApplies {
+    group: Arc<GroupInner>,
+    owner: u64,
+}
+impl Drop for DeferredApplies {
+    fn drop(&mut self) {
+        let _ = self.group.deferred_apply.compare_exchange(
+            self.owner,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
 }
 
 pub use mount::VerifiedPoolMount;
@@ -267,12 +287,14 @@ impl OltpPool {
         tune(&mut options);
         let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
         let store = OwnedStore(Some(opened.store));
-        // R6 at pool level: a damaged open that quarantines more than 8 groups, or
-        // more than 10% of the pool's groups (always allowing one), is more likely
+        // R6 at pool level: an open that quarantines more than 8 groups, or more
+        // than 10% of the pool's groups (always allowing one), is more likely
         // systemic than local, so the pool is refused instead (plan section 3).
-        let damaged = opened.quarantined.len();
-        if damaged > 0 {
-            let groups = damaged + count_healthy_groups(&store)?;
+        // Only this open's new damage counts (RV-NS6 F2): groups quarantined by an
+        // earlier open or at run time stay quarantined but are not counted again.
+        let damaged = opened.quarantined_now.len();
+        if !opened.quarantined.is_empty() {
+            let groups = opened.quarantined.len() + count_healthy_groups(&store)?;
             if damaged > 8 || (damaged > 1 && damaged * 10 > groups) {
                 tracing::error!(
                     path = %path.display(),
@@ -312,7 +334,7 @@ impl OltpPool {
                     group = ?group_of_scope(&damage.scope),
                     reason = ?damage.reason,
                     file = ?damage.file,
-                    "OLTP storage damage found at run time; group quarantined"
+                    "OLTP storage damage found at run time; group quarantined, its writes are refused"
                 );
             }));
         }
@@ -431,15 +453,23 @@ impl OltpPool {
             .filter_map(|damage| group_of_scope(&damage.scope))
             .collect()
     }
+    /// True once the group's scope is quarantined, at open or at run time. One
+    /// atomic load while nothing is quarantined.
     fn group_quarantined(&self, id: Uuid) -> bool {
-        let scope = group_scope(id);
-        self.inner
-            .store
-            .quarantined()
-            .iter()
-            .any(|damage| damage.scope.as_ref() == scope)
+        self.inner.store.is_quarantined(&group_scope(id))
     }
-    /// Queues `batch`, confined to `scope`. Never blocks on I/O.
+    /// Section 3 rule 1 (RV-NS6 F3): a quarantined group never writes again under
+    /// its old identity, so its Raft node can neither append nor vote. Only the
+    /// group is refused; the pool and its other groups keep serving. NS14 adds
+    /// `GroupDamaged` and stops the host.
+    fn refuse_quarantined(&self, id: Uuid) -> Result<(), ProtocolError> {
+        if self.group_quarantined(id) {
+            return Err(quarantined_group());
+        }
+        Ok(())
+    }
+    /// Queues `batch`, confined to `scope`. Never blocks on I/O. A batch for a
+    /// quarantined group is refused before the journal, so nothing is written.
     fn submit(
         &self,
         scope: &[u8],
@@ -448,6 +478,9 @@ impl OltpPool {
         on_done: Box<dyn std::any::Any + Send>,
     ) -> Result<nabedra_kv::Commit, ProtocolError> {
         self.healthy()?;
+        if let Some(group) = group_of_scope(scope) {
+            self.refuse_quarantined(group)?;
+        }
         batch.set_scope(scope);
         self.inner
             .store
@@ -546,6 +579,10 @@ impl OltpPool {
                 }
 
                 groups.retain(|_, group| group.strong_count() > 0);
+                // Section 3 rule 1: a damaged group never starts under its old
+                // identity, also when run-time damage found it while a handle is
+                // still open (RV-NS6 F3). NS14 replaces and releases it.
+                pool.refuse_quarantined(identity.group_id)?;
                 if let Some(group) = groups.get(&identity.group_id).and_then(Weak::upgrade) {
                     if group.identity != identity {
                         return Err(failure(
@@ -554,14 +591,6 @@ impl OltpPool {
                         ));
                     }
                     return Ok(GroupStore { inner: group });
-                }
-                if pool.group_quarantined(identity.group_id) {
-                    // Section 3 rule 1: a damaged group never starts under its
-                    // old identity. NS14 replaces and releases it.
-                    return Err(failure(
-                        ErrorCode::StorageUnavailable,
-                        "OLTP group is quarantined after storage damage",
-                    ));
                 }
                 let slot = pool.inner.shared.reserve_group_handle()?;
                 let key = identity_key(identity.group_id);
@@ -611,9 +640,10 @@ impl OltpPool {
                     generation: Arc::new(tokio::sync::RwLock::new(())),
                     log_order: Arc::new(tokio::sync::Mutex::new(())),
                     log_metadata_order: Arc::new(tokio::sync::Mutex::new(())),
-                    deferred_apply: AtomicBool::new(false),
+                    deferred_apply: AtomicU64::new(0),
+                    deferral_owners: AtomicU64::new(0),
                     deferred_tail: std::sync::Mutex::new(None),
-                    synced_writes: AtomicU64::new(0),
+                    synced_requests: AtomicU64::new(0),
                     deferred_writes: AtomicU64::new(0),
                     _handle_slot: slot,
                 });
@@ -863,17 +893,24 @@ impl GroupStore {
         )
         .await
     }
-    /// Lets Raft application writes skip their own fsync. The caller is the
-    /// Raft host and passes the store that holds this group's synced log; the
-    /// switch is refused unless both are the same group in the same physical
-    /// pool, so the log and the state share one journal and one sync domain.
-    pub(crate) fn defer_apply_sync(&self, log: &GroupStore) -> bool {
+    /// Lets Raft application writes skip their own fsync while the returned
+    /// token lives. The caller is the Raft host and passes the store that holds
+    /// this group's synced log; the switch is refused (`None`) unless both are
+    /// the same group in the same physical pool, so the log and the state share
+    /// one journal and one sync domain. Dropping the token turns deferral off,
+    /// unless a newer host took it over in the meantime (RV-NS6 F6).
+    #[must_use = "application writes are synced again once the token drops"]
+    pub(crate) fn defer_apply_sync(&self, log: &GroupStore) -> Option<DeferredApplies> {
         if !Arc::ptr_eq(&self.pool().inner, &log.pool().inner) || self.identity() != log.identity()
         {
-            return false;
+            return None;
         }
-        self.inner.deferred_apply.store(true, Ordering::Release);
-        true
+        let owner = self.inner.deferral_owners.fetch_add(1, Ordering::AcqRel) + 1;
+        self.inner.deferred_apply.store(owner, Ordering::Release);
+        Some(DeferredApplies {
+            group: self.inner.clone(),
+            owner,
+        })
     }
     /// Submits a group transaction's batch and records the deferred tail.
     fn submit_group(
@@ -890,27 +927,32 @@ impl GroupStore {
             on_done,
         )?;
         if let Some(Some(index)) = deferred_index {
-            *self
-                .inner
-                .deferred_tail
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner()) = Some((index, commit.seq()));
+            self.record_deferred_tail(index, commit.seq());
         }
         Ok(commit)
     }
-    /// The Raft host stopped: later application writes are synced again, since no
-    /// running log replays them (RV-T2 Q5).
-    pub(crate) fn stop_deferred_applies(&self) {
-        self.inner.deferred_apply.store(false, Ordering::Release);
+    /// Keeps the newest unsynced application write, by journal sequence. The tail
+    /// is stored after `submit` returns, and by then the journal may already have
+    /// released this write's order guard, so the next apply can store its newer
+    /// tail first (RV-NS6 F5). The tail never moves backwards.
+    fn record_deferred_tail(&self, index: u64, seq: u64) {
+        let mut tail = self
+            .inner
+            .deferred_tail
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if tail.is_none_or(|(_, newest)| newest < seq) {
+            *tail = Some((index, seq));
+        }
     }
     pub fn applies_deferred(&self) -> bool {
-        self.inner.deferred_apply.load(Ordering::Acquire)
+        self.inner.deferred_apply.load(Ordering::Acquire) != 0
     }
     /// Synced-request and unsynced-write counts of this replica, for
     /// `/v1/runtime/stats`. Real fsyncs are counted per pool.
     pub fn write_stats(&self) -> GroupWriteStats {
         GroupWriteStats {
-            synced_writes: self.inner.synced_writes.load(Ordering::Relaxed),
+            synced_requests: self.inner.synced_requests.load(Ordering::Relaxed),
             deferred_writes: self.inner.deferred_writes.load(Ordering::Relaxed),
             unsynced_applied_index: self.unsynced_applied_index(),
         }
@@ -930,7 +972,7 @@ impl GroupStore {
     /// the purge record in the journal, and the purge record is itself synced.
     /// A durable purge therefore implies durable applied state up to its index.
     pub(crate) async fn ensure_applied_durable(&self, index: u64) -> Result<(), ProtocolError> {
-        if !self.applies_deferred() {
+        if !self.applies_deferred() && self.unsynced_applied_index().is_none() {
             return Ok(());
         }
         let applied = self
@@ -950,9 +992,13 @@ impl GroupStore {
     }
     /// Snapshot export calls this while it holds the group's application order,
     /// before it takes a compute permit, so the exported applied index is durable
-    /// before any snapshot names it.
+    /// before any snapshot names it. It keys on unsynced writes in the journal,
+    /// not on the deferral switch: a tail written while a host deferred stays
+    /// unsynced after that host stops (RV-NS6 F6). Nor on the recorded tail,
+    /// which is stored only after `submit` returns, possibly after the journal
+    /// already released the order lock this caller holds.
     pub(super) async fn sync_deferred_applies(&self) -> Result<(), ProtocolError> {
-        if self.applies_deferred() && self.pool().has_unsynced_writes() {
+        if self.pool().has_unsynced_writes() {
             self.pool().sync_wal().await?;
         }
         Ok(())
@@ -1005,14 +1051,22 @@ impl GroupStore {
         };
         let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output)?;
-        // The executor builds the batch and submits it; it never waits for storage.
-        // The journal thread drops the order guard, the generation guard and the
-        // batch charge after the write is visible (and durable, for synced writes),
-        // so a cancelled caller cannot release ordering early (plan section 5).
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        // The executor builds the batch and submits it, or hands it to a paced
+        // task; it never waits for storage. Either way the write is dispatched
+        // before the executor returns, so a caller cancelled meanwhile cannot drop
+        // it. The journal thread drops the order guard, the generation guard and
+        // the batch charge after the write is visible (and durable, for synced
+        // writes) and before the commit completes, so a cancelled caller cannot
+        // release ordering early and a returned write has released both (plan
+        // section 5).
         let submitted = prepared
             .execute(0, 0, move || {
                 let guards = (owner, generation_owner);
                 group.pool().healthy()?;
+                // Also refuses an empty synced write (a vote or append that changed
+                // nothing) of a quarantined group: it would acknowledge durability.
+                group.pool().refuse_quarantined(group.identity().group_id)?;
                 let write_started = std::cell::Cell::new(false);
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let snapshot = group.pool().snapshot();
@@ -1106,26 +1160,30 @@ impl GroupStore {
                     } else {
                         Durability::Sync
                     };
-                    let (on_done, released) = storage::retain((guards, batch_charge));
+                    let on_done: Box<dyn std::any::Any + Send> = Box::new((guards, batch_charge));
                     // L0 slowdown pacing is opt-in per writer (NS5b). A slowed
                     // write leaves the executor and waits on a timer instead.
                     let delay = group.pool().inner.store.write_delay(batch.encoded_bytes());
-                    if !delay.is_zero() {
+                    if let Some(runtime) = runtime.as_ref().filter(|_| !delay.is_zero()) {
+                        let paced = group.clone();
+                        let task = runtime.spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            paced.submit_group(batch, durability, on_done, deferred_index)
+                        });
                         return Ok(Submitted::Paced {
                             response,
-                            delay,
-                            batch,
-                            durability,
-                            on_done,
-                            released,
-                            deferred_index,
+                            task,
+                            deferred: deferred_index.is_some(),
                         });
+                    }
+                    if !delay.is_zero() {
+                        // No runtime to put a timer on: pace here, on the executor.
+                        std::thread::sleep(delay);
                     }
                     let commit = group.submit_group(batch, durability, on_done, deferred_index)?;
                     Ok(Submitted::Pending {
                         response,
                         commit,
-                        released,
                         deferred: deferred_index.is_some(),
                     })
                 }));
@@ -1143,30 +1201,19 @@ impl GroupStore {
         let submitted = match submitted {
             Submitted::Paced {
                 response,
-                delay,
-                batch,
-                durability,
-                on_done,
-                released,
-                deferred_index,
+                task,
+                deferred,
             } => {
-                // The task owns the batch and its guards: a cancelled caller
-                // neither drops a dispatched write nor releases ordering early.
-                let group = self.clone();
-                let commit = tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    group.submit_group(batch, durability, on_done, deferred_index)
-                })
-                .await
-                .map_err(|_| {
+                // Dropping the handle on cancellation detaches the task, which
+                // still submits the write.
+                let commit = task.await.map_err(|_| {
                     self.pool().latch();
                     recovery_unknown()
                 })??;
                 Submitted::Pending {
                     response,
                     commit,
-                    released,
-                    deferred: deferred_index.is_some(),
+                    deferred,
                 }
             }
             submitted => submitted,
@@ -1177,26 +1224,26 @@ impl GroupStore {
             Submitted::Empty { response, sync } => {
                 if sync {
                     self.pool().sync_wal().await?;
-                    self.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
+                    self.inner.synced_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(response)
             }
             Submitted::Pending {
                 response,
                 commit,
-                released,
                 deferred,
             } => {
-                let committed = commit.done().await;
-                // The journal thread completes the commit, then drops the order
-                // and generation guards and the batch charge. Return only after
-                // that, so the caller's next request sees them released.
-                released.wait().await;
-                committed.map_err(|error| self.pool().failed(error))?;
+                // The journal thread drops the order and generation guards and the
+                // batch charge before it completes the commit (e655139), so the
+                // caller's next request sees them released (RV-NS6 F7).
+                commit
+                    .done()
+                    .await
+                    .map_err(|error| self.pool().failed(error))?;
                 if deferred {
                     self.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.inner.synced_writes.fetch_add(1, Ordering::Relaxed);
+                    self.inner.synced_requests.fetch_add(1, Ordering::Relaxed);
                     self.pool()
                         .inner
                         .synced_requests
@@ -1980,6 +2027,12 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         .and_then(|file| file.sync_all())
         .map_err(|_| storage_error_message())?;
     Ok(())
+}
+fn quarantined_group() -> ProtocolError {
+    failure(
+        ErrorCode::StorageUnavailable,
+        "OLTP group is quarantined after storage damage",
+    )
 }
 fn storage_error_message() -> ProtocolError {
     failure(
