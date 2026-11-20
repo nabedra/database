@@ -416,8 +416,16 @@ pub(crate) enum ControlCommand {
         worker: WorkerIdentity,
         report: Box<super::GroupDamageReport>,
     },
+    /// NS14b rule 3: Control's scheduler claims a damaged replica's group for
+    /// one fresh identity and placement. Proposed only behind `GroupDamageGate`.
+    GroupDamageReplacementBegin {
+        operation_id: Uuid,
+        authorization: AuthorizationStamp,
+        plan: Box<super::group_damage::GroupDamageReplacementPlan>,
+    },
     /// NS14 rule 3: the membership change that removed the damaged replica
-    /// committed. Proposed only behind `GroupDamageGate`.
+    /// committed; NS14b publishes the new placement with it. Proposed only
+    /// behind `GroupDamageGate`.
     GroupDamageReplaced {
         operation_id: Uuid,
         authorization: AuthorizationStamp,
@@ -469,6 +477,7 @@ impl ControlCommand {
             | Self::GroupFenced { operation_id, .. }
             | Self::PublishFence { operation_id, .. }
             | Self::GroupDamaged { operation_id, .. }
+            | Self::GroupDamageReplacementBegin { operation_id, .. }
             | Self::GroupDamageReplaced { operation_id, .. } => *operation_id,
         }
     }
@@ -540,6 +549,11 @@ impl OwnedPayload for ControlCommand {
             }
             Self::GroupDamageReplaced { proof, .. } => {
                 size_of::<super::GroupDamageReplacement>() + proof.group.database.capacity_bytes()
+            }
+            Self::GroupDamageReplacementBegin { plan, .. } => {
+                size_of::<super::group_damage::GroupDamageReplacementPlan>()
+                    + 2 * plan.group.database.capacity_bytes()
+                    + plan.members.capacity() * size_of::<ReplicaMember>()
             }
             _ => 0,
         })

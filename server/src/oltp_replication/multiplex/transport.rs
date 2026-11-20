@@ -1322,7 +1322,7 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
             Ok(TrafficClass::ServiceMutation)
         }
         Purpose::GroupLifecycle if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
-        Purpose::ReplicaPlacement if group.kind == GroupKind::Control => {
+        Purpose::ReplicaPlacement | Purpose::GroupDamage if group.kind == GroupKind::Control => {
             Ok(TrafficClass::Settlement)
         }
         Purpose::ShardSplit if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
@@ -1521,6 +1521,7 @@ impl Hello {
             15 => Purpose::ShardSplitImage,
             16 => Purpose::ReplicaPlacement,
             17 => Purpose::RaftProgress,
+            18 => Purpose::GroupDamage,
             _ => return Err(malformed("unknown worker RPC purpose")),
         };
         let member = |start| WorkerIdentity {
