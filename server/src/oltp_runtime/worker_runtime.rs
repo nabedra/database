@@ -4,6 +4,7 @@ mod admission_cleanup;
 pub(crate) mod archive;
 mod automatic_split;
 pub(super) mod cold_history;
+pub(crate) mod direct_capability;
 mod deployment;
 mod index_admin;
 mod index_backend;
@@ -85,6 +86,8 @@ pub(crate) struct WorkerRuntime {
     /// Set while `data.direct.v1` is active (T7). Direct commits have no
     /// Status decision, so incremental backups would miss them.
     direct_commits_active: AtomicBool,
+    /// This worker's `data.direct.v1` view and `direct_oltp` switch (T7).
+    direct: std::sync::OnceLock<Arc<direct_capability::DirectSwitch>>,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -223,6 +226,7 @@ impl WorkerRuntime {
             admission_cleanup,
             accepting: AtomicBool::new(true),
             direct_commits_active: AtomicBool::new(false),
+            direct: std::sync::OnceLock::new(),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),
@@ -283,6 +287,24 @@ impl WorkerRuntime {
                 .advertise_scoped_queue(operation)
                 .await?;
             scoped.start_maintenance()?;
+        }
+        {
+            let direct = direct_capability::DirectSwitch::new(
+                runtime.services.control_client.clone(),
+                runtime.services.local,
+                execution.direct_oltp,
+            );
+            runtime.planner.set_direct_probe(direct.clone())?;
+            // T4fix F2: direct commits have no Status decision, so incremental
+            // backups are refused from activation on.
+            let weak = Arc::downgrade(&runtime);
+            direct.on_active(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.set_direct_commits_active(true);
+                }
+            });
+            direct.start();
+            runtime.direct.set(direct).map_err(|_| unknown())?;
         }
         if runtime.services.cold_history.is_some() {
             *runtime.cold_cleanup.lock().map_err(|_| unknown())? =
@@ -918,6 +940,9 @@ impl WorkerRuntime {
         self.index_builds.drain().await;
         self.supervision.drain().await;
         self.admission_cleanup.join().await?;
+        if let Some(direct) = self.direct.get() {
+            direct.stop().await;
+        }
         let retirement = self.retirement.lock().map_err(|_| unknown())?.take();
         if let Some(retirement) = retirement {
             retirement.await.map_err(|_| unknown())?;

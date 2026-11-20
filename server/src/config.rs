@@ -252,6 +252,17 @@ pub struct ExecutionConfig {
     pub queue_replication: QueueReplication,
     pub queue_lifetime: QueueLifetime,
     pub partition_size: PartitionSize,
+    /// Eligible point operations take the direct path once `data.direct.v1`
+    /// is active (plan "Rollout"). `false` keeps the capability but routes
+    /// them queued; they still settle their request id at the anchor first.
+    #[serde(default = "direct_oltp_default", skip_serializing_if = "is_true")]
+    pub direct_oltp: bool,
+}
+fn direct_oltp_default() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -274,6 +285,7 @@ impl Default for ExecutionConfig {
             queue_replication: QueueReplication::AllReadyWorkers,
             queue_lifetime: QueueLifetime::LiveCluster,
             partition_size: PartitionSize::default(),
+            direct_oltp: true,
         }
     }
 }

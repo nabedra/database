@@ -23,6 +23,7 @@ use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use uuid::Uuid;
 mod backup;
+pub(crate) mod direct_fence;
 mod index;
 mod index_build;
 mod migration;
@@ -127,6 +128,7 @@ pub(crate) struct NativePlanner {
     resolver: Arc<dyn ParticipantResolver>,
     query_metrics: Arc<query_metrics::QueryMetrics>,
     query_scheduler: QueryScheduler,
+    direct: direct_fence::DirectProbeSlot,
 }
 /// Retain only one charged route page and its selected participant during a
 /// mutation plan. The cache cannot outlive or be reused with another pin.
@@ -154,6 +156,7 @@ impl NativePlanner {
             resolver,
             query_metrics,
             query_scheduler,
+            direct: Default::default(),
         })
     }
     pub(crate) fn with_scoped_execution(
@@ -170,6 +173,7 @@ impl NativePlanner {
             }),
             query_metrics: self.query_metrics.clone(),
             query_scheduler: self.query_scheduler.clone(),
+            direct: self.direct.clone(),
         })
     }
 
@@ -697,6 +701,9 @@ impl NativePlanner {
                     .read::<RoutingRoot>(pin, MvccKey::CatalogRoutingRoot { table_id: id })
                     .await?,
             )?;
+            // Plan section 7: stop direct writers in the Data log before the
+            // Catalog publishes the drop. The exclusive guard is held.
+            self.fence_direct_writers(pin, id, None).await?;
             let writes = vec![
                 PreparedWrite {
                     key: MvccKey::CatalogName { name },

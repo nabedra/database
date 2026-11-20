@@ -128,6 +128,8 @@ struct Joined {
     auth: Auth,
     sample_slot: Semaphore,
     scoped: Option<(Arc<ScopedWorker>, crate::scheduling::MemoryCharge)>,
+    /// `data.direct.v1`: this worker hosts Data replicas, so it advertises.
+    direct: Arc<super::worker_runtime::direct_capability::DirectSwitch>,
 }
 
 pub async fn run(path: PathBuf) -> Result<(), &'static str> {
@@ -555,6 +557,12 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         registration.bind(Purpose::ShardSplit, split.clone())?;
         registration.bind(Purpose::ShardSplitProof, split.clone())?;
         registration.bind(Purpose::ShardSplitImage, split)?;
+        let direct = super::worker_runtime::direct_capability::DirectSwitch::new(
+            control.clone(),
+            local,
+            config.execution.direct_oltp,
+        );
+        direct.start();
         Ok(Arc::new(Joined {
             scope,
             intent: node.intent,
@@ -567,6 +575,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             auth,
             sample_slot: Semaphore::new(1),
             scoped,
+            direct,
         }))
     })
     .await
@@ -593,6 +602,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 placement.shutdown().await
             });
             let result = serve(http, joined.clone()).await;
+            joined.direct.stop().await;
             if let Some((scoped, _)) = &joined.scoped {
                 scoped.drain().await;
             }
