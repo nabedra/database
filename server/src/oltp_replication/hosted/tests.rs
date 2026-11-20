@@ -390,12 +390,18 @@ async fn d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log() {
         let pool = OltpPool::open_development_on(&path, layout.pool.clone(), shared.clone(), fs())
             .unwrap();
         let store = pool.retained_group(layout.group.clone()).await.unwrap();
-        let applied = store.applied_state(BUDGET).await.unwrap().unwrap();
+        // An application write survives only if a later synced write (a log
+        // append) covered it. When every append is synced before the first
+        // application write reaches the journal, as on a slow runner, no
+        // application survives and the group has no applied state at all.
+        let applied = store
+            .applied_state(BUDGET)
+            .await
+            .unwrap()
+            .map(|applied| applied.position.index);
         assert!(
-            applied.position.index < last_index,
-            "the unsynced application tail must be lost: applied {} last {}",
-            applied.position.index,
-            last_index
+            applied.is_none_or(|index| index < last_index),
+            "the unsynced application tail must be lost: applied {applied:?} last {last_index}"
         );
         let before = read_count(&store).await;
         assert!(before < commands);
