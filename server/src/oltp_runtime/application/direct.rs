@@ -555,6 +555,16 @@ impl DirectGateway {
                     !get,
                 )))
             }
+            // RV-FINAL L2: after an uncertain attempt, a definite failure
+            // may come from checks the leader runs before its dedup lookup
+            // (the table and its descriptor), for a request that committed.
+            // Settle the id at the anchor instead: a dedup record replays the
+            // result, otherwise a marker sends it queued, which answers it.
+            // A conflict comes after the lookup and stands.
+            Ok(Terminal::Failed(error)) if uncertain && error.code != ErrorCode::Conflict => {
+                self.settle(&anchor, &mut request, deadline, &mut uncertain)
+                    .await
+            }
             Ok(Terminal::Failed(error)) => Err(error),
             // The marker is already in place.
             Ok(Terminal::Fallback(FallbackReason::Forwarded)) => {
@@ -623,6 +633,11 @@ impl DirectGateway {
                     if !pause(deadline, &mut delay).await {
                         return Err(self.final_error(unknown()));
                     }
+                }
+                // RV-FINAL L2: the id may have committed directly and the
+                // anchor could not settle it, so the outcome is unknown.
+                Ok(Terminal::Failed(error)) if *uncertain && error.code != ErrorCode::Conflict => {
+                    return Err(self.final_error(unknown()));
                 }
                 Ok(Terminal::Failed(error)) => return Err(self.final_error(error)),
                 Err(error)
