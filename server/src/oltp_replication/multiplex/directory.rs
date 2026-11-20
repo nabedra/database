@@ -494,7 +494,11 @@ mod tests {
         );
         let mut catalog = data.clone();
         catalog.kind = GroupKind::Catalog;
-        assert!(directory.verify(old, &catalog, Purpose::ApiIngress).is_err());
+        assert!(
+            directory
+                .verify(old, &catalog, Purpose::ApiIngress)
+                .is_err()
+        );
         let mut foreign = control.clone();
         foreign.database = Text::try_from("other").unwrap();
         assert!(
