@@ -23,9 +23,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::batch::{BatchOp, WriteBatch};
+use crate::batch::{BatchOp, MAX_SCOPE_LEN, WriteBatch};
 use crate::error::{Damage, DamageReason, Error, Result};
 use crate::gc;
+use crate::journal::format::{RECORD_HEADER_LEN, RECORDS_START};
 use crate::journal::{Durability, Journal, RecordKind, VALUE_RECYCLED};
 use crate::source::InternalIterator;
 use crate::types::{Kind, Locator, Seq, parse_internal_key};
@@ -37,6 +38,10 @@ use super::{Inner, lock, read};
 const GC_SEGMENTS_PER_PASS: usize = 4;
 /// Journal values per relocation record, at most (also a quarter of a segment).
 const RELOCATE_BATCH_BYTES: usize = 1 << 20;
+
+/// Upper bound on one batch operation's encoding beyond its key and value bytes: the
+/// kind byte and two varint lengths.
+const OP_OVERHEAD: usize = 1 + 2 * 5;
 /// How soon to look again while relocations wait to become retirable.
 const GC_WAIT: Duration = Duration::from_millis(20);
 const GC_RETRY_AFTER_ERROR: Duration = Duration::from_secs(1);
@@ -284,7 +289,13 @@ impl Inner {
     /// Submits `Relocate` records (one scope each, bounded size) for `live`. Returns the
     /// last relocation's sequence, or `None` when there was nothing to move.
     fn relocate(&self, journal: &Journal, live: Vec<(Bytes, Locator)>) -> Result<Option<Seq>> {
-        let limit = RELOCATE_BATCH_BYTES.min((self.segment_bytes / 4) as usize);
+        // The payload one record can hold: a segment's record area less a record header
+        // and the longest scope. Batches are cut before an entry that would not fit, not
+        // after the size passed a target (KVfix3: 12 KiB segments have a 4 KiB record
+        // area, and a 3 KiB target plus one value went past it).
+        let capacity = (self.segment_bytes.saturating_sub(RECORDS_START) as usize)
+            .saturating_sub(RECORD_HEADER_LEN + MAX_SCOPE_LEN);
+        let limit = RELOCATE_BATCH_BYTES.min(capacity / 2);
         let mut last = None;
         let mut batch = WriteBatch::new();
         let mut scope = Bytes::new();
@@ -334,6 +345,13 @@ impl Inner {
                 }
                 Err(e) => return Err(e),
             };
+            // Two operations: the old locator and the value. Each costs its key, its
+            // payload and at most `OP_OVERHEAD` of kind and lengths.
+            let entry = 2 * (key.len() + OP_OVERHEAD) + Locator::LEN + value.len();
+            if !batch.is_empty() && batch.encoded_bytes() + entry > capacity {
+                submit(&mut batch)?;
+                batch.set_scope(&scope);
+            }
             batch.put(&key, &loc.encode());
             batch.put_journal(&key, &value);
         }

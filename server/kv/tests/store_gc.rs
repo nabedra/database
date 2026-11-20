@@ -370,3 +370,57 @@ fn ns04_ns13_crash_at_every_relocation_operation() {
 fn ns04_ns13_crash_at_every_operation_full() {
     enumerate(1);
 }
+
+/// NS13 (KVfix3): journal GC relocates live values in records that fit a segment's
+/// record area. With 12 KiB segments that area is 4 KiB; GC cut relocation batches at a
+/// 3 KiB target checked before each entry, so three live 1.4 KiB values of one group went
+/// into one 4.3 KiB record and `gc_journal` failed with "batch larger than a journal
+/// segment" (NS10 long campaign, seed 69).
+#[test]
+fn ns13_gc_relocation_records_fit_small_segments() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let mut o = options(&fs, &bg);
+    o.journal.segment_bytes = 12 << 10;
+    o.journal.max_group_bytes = 4 << 10;
+    o.max_journal_bytes = 3 * (12 << 10);
+    let store = Store::open(&dir, o).unwrap().store;
+    let mut model = Model::new();
+    let put = |store: &Store, model: &mut Model, group: u64, idx: u64, fill: u8| {
+        let key = entry_key(group, idx);
+        let mut value = format!("<{group}:{idx}>").into_bytes();
+        value.resize(1400, fill);
+        let b = ModelBatch {
+            scope: group_prefix(group),
+            ops: vec![Op::PutJournal(key, value)],
+        };
+        b.apply(model);
+        write(store, &b, Durability::Sync).unwrap();
+    };
+    // g00's live values sit in the oldest segment.
+    for idx in 0..3 {
+        put(&store, &mut model, 0, idx, b'a');
+    }
+    // g01 fills many segments and deletes everything it wrote.
+    for idx in 0..60 {
+        put(&store, &mut model, 1, idx, b'b');
+    }
+    let purge = ModelBatch {
+        scope: group_prefix(1),
+        ops: vec![Op::DeleteRange(group_prefix(1), log_end(1))],
+    };
+    purge.apply(&mut model);
+    write(&store, &purge, Durability::Sync).unwrap();
+    store.flush().unwrap();
+    store.compact().unwrap();
+    for _ in 0..4 {
+        store.gc_journal().unwrap();
+    }
+    assert!(
+        journal_files(&fs, &dir) <= 6,
+        "GC retired nothing: {} segments",
+        journal_files(&fs, &dir)
+    );
+    assert!(!store.requires_recovery());
+    assert_eq!(dump(&store.snapshot()), model);
+}
