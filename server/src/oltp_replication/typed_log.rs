@@ -2,6 +2,11 @@
 //! bounded metadata, leave native/CPU capacity, reserve decode ownership, then
 //! verify the same bytes before decoding. Streaming recovery owns one entry at
 //! a time; a full-range API fails explicitly rather than allocating without bound.
+//!
+//! Entry bodies (`e‖index`) are journal values: the journal record holds the bytes
+//! and the LSM a locator, so an entry is written to disk once and journal GC
+//! recycles its segment after the purge. IDs, the tail and the purge marker stay
+//! small keys; truncation and purge are range deletes.
 use super::{
     entry::{CommandData, LeaderId, LogId, Membership, OwnedRaftEntry, Payload, Vote},
     owned::OwnedCommand,
@@ -717,7 +722,9 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                                     let index = entry.index();
                                     let bytes = tx.encode_value(&entry)?;
                                     let id = tx.encode_value(&entry.log_id)?;
-                                    tx.put(&index_key(ENTRY, index), bytes.as_slice())?;
+                                    // The entry body lives once, in the journal; the
+                                    // LSM keeps a 32-byte locator (NS7).
+                                    tx.put_journal(&index_key(ENTRY, index), bytes.as_slice())?;
                                     tx.put(&index_key(ID, index), id.as_slice())?;
                                     tx.put(TAIL, id.as_slice())?;
                                 }
@@ -802,18 +809,22 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 if previous.is_some_and(|previous| previous.index > id.index) {
                     return Err(protocol("purge moves backwards"));
                 }
-                let entry_end = id
-                    .index
-                    .checked_add(1)
-                    .map(|n| index_key(ENTRY, n).to_vec())
-                    .unwrap_or_else(|| vec![ENTRY + 1]);
-                let id_end = id
-                    .index
-                    .checked_add(1)
-                    .map(|n| index_key(ID, n).to_vec())
-                    .unwrap_or_else(|| vec![ID + 1]);
-                tx.delete_range(&[ENTRY], &entry_end)?;
-                tx.delete_range(&[ID], &id_end)?;
+                // Delete only `(previous, id]`: the prefix up to `previous` is already
+                // gone, and re-covering it would stack ever longer range tombstones.
+                let start = match previous {
+                    None => Some(0),
+                    Some(previous) => previous.index.checked_add(1),
+                };
+                if let Some(start) = start.filter(|start| *start <= id.index) {
+                    for prefix in [ENTRY, ID] {
+                        let end = id
+                            .index
+                            .checked_add(1)
+                            .map(|n| index_key(prefix, n).to_vec())
+                            .unwrap_or_else(|| vec![prefix + 1]);
+                        tx.delete_range(&index_key(prefix, start), &end)?;
+                    }
+                }
                 let bytes = tx.encode_value(&id)?;
                 tx.put(PURGED, bytes.as_slice())?;
                 Ok(Transition::Commit(tx.copy_output(b"")?))
