@@ -185,6 +185,45 @@ pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
     }
 }
 
+/// A write's guards and charges, handed to the journal as `on_done`.
+struct Retained {
+    payload: Option<Box<dyn std::any::Any + Send>>,
+    released: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Drop for Retained {
+    fn drop(&mut self) {
+        drop(self.payload.take());
+        if let Some(released) = self.released.take() {
+            let _ = released.send(());
+        }
+    }
+}
+/// Resolves once a [`retain`]ed payload has dropped.
+pub(super) struct Released(tokio::sync::oneshot::Receiver<()>);
+impl Released {
+    pub(super) async fn wait(self) {
+        // An error means the sender dropped, which also happens only after the
+        // payload dropped.
+        let _ = self.0.await;
+    }
+}
+/// Wraps `payload` as a commit's `on_done`. The journal thread wakes the
+/// committer before it drops `on_done`; awaiting the returned [`Released`]
+/// after `Commit::done` restores RocksDB's order, in which a write's guards and
+/// charges were released before the write returned.
+pub(super) fn retain(
+    payload: impl std::any::Any + Send,
+) -> (Box<dyn std::any::Any + Send>, Released) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    (
+        Box::new(Retained {
+            payload: Some(Box::new(payload)),
+            released: Some(tx),
+        }),
+        Released(rx),
+    )
+}
+
 /// Waits for a commit on any thread, including one that drives an async runtime,
 /// where `Commit::wait` would panic. Only the synchronous pool paths that already
 /// blocked on RocksDB use it: open, close, snapshot install and export, group

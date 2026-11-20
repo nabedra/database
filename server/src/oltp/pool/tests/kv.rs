@@ -1121,3 +1121,36 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     let applied = group.applied_state(budget()).await.unwrap().unwrap();
     assert_eq!(applied.position, meta(2).position);
 }
+
+/// O05 / M02 regression (NS6): the journal thread wakes a committer before it
+/// drops the write's `on_done` (order and generation guards, batch charge).
+/// A group write must still return only after those are released, as it did
+/// on RocksDB, or the caller's next request can find the arena still charged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
+    let dir = Dir::new();
+    let resources = shared(SharedResourceConfig::default());
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    assert!(group.defer_apply_sync(&group));
+    let baseline = resources.scheduler().usage();
+    for index in 0..300u64 {
+        let value = vec![index as u8; 1 << 10];
+        let reply = if index % 2 == 0 {
+            group
+                .transaction(meta(index / 2), budget(), put_entry(index, b"state", value))
+                .await
+                .unwrap()
+        } else {
+            group
+                .log_transaction(budget(), put_entry(index, b"log", value))
+                .await
+                .unwrap()
+        };
+        drop(reply);
+        assert_eq!(resources.scheduler().usage(), baseline, "write {index}");
+        // The order guard is free as well: the next write takes it at once.
+        assert!(group.inner.order.try_lock().is_ok(), "write {index}");
+        assert!(group.inner.log_order.try_lock().is_ok(), "write {index}");
+    }
+}

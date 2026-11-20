@@ -158,6 +158,7 @@ enum Submitted {
     Pending {
         response: ChargedBytes,
         commit: nabedra_kv::Commit,
+        released: storage::Released,
         deferred: bool,
     },
     /// L0 slowdown: the batch waits `delay` off the executor, then is submitted.
@@ -167,6 +168,7 @@ enum Submitted {
         batch: WriteBatch,
         durability: Durability,
         on_done: Box<dyn std::any::Any + Send>,
+        released: storage::Released,
         deferred_index: Option<Option<u64>>,
     },
 }
@@ -1104,7 +1106,7 @@ impl GroupStore {
                     } else {
                         Durability::Sync
                     };
-                    let on_done: Box<dyn std::any::Any + Send> = Box::new((guards, batch_charge));
+                    let (on_done, released) = storage::retain((guards, batch_charge));
                     // L0 slowdown pacing is opt-in per writer (NS5b). A slowed
                     // write leaves the executor and waits on a timer instead.
                     let delay = group.pool().inner.store.write_delay(batch.encoded_bytes());
@@ -1115,6 +1117,7 @@ impl GroupStore {
                             batch,
                             durability,
                             on_done,
+                            released,
                             deferred_index,
                         });
                     }
@@ -1122,6 +1125,7 @@ impl GroupStore {
                     Ok(Submitted::Pending {
                         response,
                         commit,
+                        released,
                         deferred: deferred_index.is_some(),
                     })
                 }));
@@ -1143,6 +1147,7 @@ impl GroupStore {
                 batch,
                 durability,
                 on_done,
+                released,
                 deferred_index,
             } => {
                 // The task owns the batch and its guards: a cancelled caller
@@ -1160,6 +1165,7 @@ impl GroupStore {
                 Submitted::Pending {
                     response,
                     commit,
+                    released,
                     deferred: deferred_index.is_some(),
                 }
             }
@@ -1178,12 +1184,15 @@ impl GroupStore {
             Submitted::Pending {
                 response,
                 commit,
+                released,
                 deferred,
             } => {
-                commit
-                    .done()
-                    .await
-                    .map_err(|error| self.pool().failed(error))?;
+                let committed = commit.done().await;
+                // The journal thread completes the commit, then drops the order
+                // and generation guards and the batch charge. Return only after
+                // that, so the caller's next request sees them released.
+                released.wait().await;
+                committed.map_err(|error| self.pool().failed(error))?;
                 if deferred {
                     self.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
                 } else {
