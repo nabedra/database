@@ -421,6 +421,9 @@ where
 {
     cores: [OnceLock<HostRaft<C, M>>; MAX_CORES],
     current: AtomicUsize,
+    /// The current core's index, published after each replacement so
+    /// watchers of a core's metrics follow a restart (RV-FINAL H1).
+    generation: tokio::sync::watch::Sender<usize>,
 }
 impl<C, M> RaftCores<C, M>
 where
@@ -433,6 +436,7 @@ where
         Self {
             cores,
             current: AtomicUsize::new(0),
+            generation: tokio::sync::watch::Sender::new(0),
         }
     }
     /// How many times this host's core was replaced.
@@ -449,7 +453,25 @@ where
         };
         slot.set(raft)?;
         self.current.store(next, Ordering::Release);
+        self.generation.send_replace(next);
         Ok(())
+    }
+    /// The current core's index and that same core's metrics.
+    pub(crate) fn current_metrics(
+        &self,
+    ) -> (
+        usize,
+        openraft::type_config::alias::WatchReceiverOf<C, openraft::RaftMetrics<C>>,
+    ) {
+        let index = self.current.load(Ordering::Acquire);
+        let core = self.cores[index]
+            .get()
+            .expect("the current Raft core is set before it is published");
+        (index, core.metrics())
+    }
+    /// Changes to the current core's index. Closes when the host drops.
+    pub(crate) fn subscribe_restarts(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.generation.subscribe()
     }
     /// The current core has not stopped (`RaftMetrics::running_state`).
     pub(crate) fn is_running(&self) -> bool {
@@ -481,7 +503,8 @@ where
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
-    /// Guards the single direct-leadership watcher of a Data replica.
+    /// Guards the single direct-leadership watcher of a Data replica. The
+    /// watcher follows every core of the host (RV-FINAL H1).
     pub(in crate::oltp_replication) direct_watch: std::sync::Once,
     /// This host's claim on deferred application sync. Released on shutdown,
     /// or when the host drops (RV-T2 Q5); clears only this host's claim.

@@ -1,7 +1,8 @@
 # Heavy builds and verification for the remove-RocksDB track, on free standard runners.
-# See .agents/skills/nabedra-builds/SKILL.md. Pilot: push-triggered on the track's branches only.
-# Opt-in jobs: put [ci docker], [ci campaign] or [ci acceptance] in the pushed head commit message,
-# or use workflow_dispatch once this file is on the default branch.
+# See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
+# pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
+# Opt-in jobs: put [ci docker], [ci campaign], [ci acceptance] or [ci direct] in the pushed head
+# commit message, or use workflow_dispatch once this file is on the default branch.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
 # and manifests, and saves it right after its build step, before any test runs, so a failing test
@@ -15,8 +16,12 @@ name: nabedra build
 on:
   push:
     branches:
+      - main
       - nabedra/remove-rocksdb
       - "nabedra/rr-*"
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       docker:
@@ -29,6 +34,10 @@ on:
         default: false
       acceptance:
         description: Linux OLTP acceptance (no AWS, no benchmarks)
+        type: boolean
+        default: false
+      direct:
+        description: Direct point path D01-D12 and suites with direct_oltp on/off (T9)
         type: boolean
         default: false
 
@@ -531,7 +540,7 @@ jobs:
   # direct_oltp on and off. Opt-in: put [ci direct] in the pushed head commit message.
   direct:
     name: direct point path D01-D12, suites with direct_oltp on/off (T9)
-    if: contains(github.event.head_commit.message, '[ci direct]')
+    if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:

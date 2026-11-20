@@ -1668,6 +1668,176 @@ async fn d04_leader_loss_before_and_after_quorum_retries_complete_on_the_new_lea
     cluster.shutdown().await;
 }
 
+/// RV-FINAL H1, D07, O16, NS11: the leader's core stops on a failed apply
+/// (a fail-once test hook) and the supervisor's restart runs a new core on
+/// the same log and state. The leadership watcher follows the new core: the
+/// clock steps down while the core is stopped, the restarted node wins the
+/// next election, its clock serves again and a direct update commits. Before
+/// the fix the watcher ended with the first core and `serving` stayed false.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d07_o16_rv_final_h1_restarted_core_serves_direct_commits_again() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    let v = &cluster.voters[leader];
+    let clock = cluster.clock(leader);
+    v.consensus.retry().fail_applies.store(1, Ordering::Release);
+    // The next applied entry stops the core. Its outcome is not asserted.
+    let executor = v.executor.clone();
+    let handle = v.handle.clone();
+    let id = Uuid::new_v4();
+    let body = cluster.body(
+        id,
+        "table.update",
+        serde_json::json!({"key": 1, "values": {"value": 2}}),
+    );
+    let request = cluster.request_at(leader, &body, id, 1, Duration::from_secs(3));
+    let pending = tokio::spawn(async move { executor.execute(&handle, request).await });
+    watchdog(|| async { (!v.consensus.raft.is_running()).then_some(()) }).await;
+    watchdog(|| async { (!clock.serving()).then_some(()) }).await;
+    // What the supervisor does after its backoff.
+    v.consensus.restart().await.unwrap();
+    assert_eq!(v.consensus.raft.restarts(), 1);
+    let _ = pending.await.unwrap();
+    // Only node 1 elects, so the restarted node leads again.
+    assert_eq!(cluster.leader().await, leader);
+    cluster.serving(leader).await;
+    assert!(clock.serving(), "the clock serves on the restarted core");
+    let response = cluster
+        .op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 1, "values": {"value": 3}}),
+        )
+        .await;
+    assert_eq!(response, done("true"));
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done(r#"{"id":1,"score":0.0,"tag":"a","value":3}"#)
+    );
+    cluster.shutdown().await;
+}
+
+/// RV-FINAL M1, U01, F01/F03: a leader whose device is full refuses the
+/// proposal before Raft sees it. The direct update answers that refusal at
+/// once (`storage_unavailable`, `not_applied`, the no-space message), as the
+/// queued path does, after one proposal and one timestamp fetch; before the
+/// fix it looped until its deadline and answered `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    let v = &cluster.voters[leader];
+    let before = v.executor.stats();
+    let refused = v.consensus.health().snapshot().proposals_refused_no_space;
+    v.consensus.retry().mark_no_space();
+    let started = std::time::Instant::now();
+    let response = cluster
+        .op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 1, "values": {"value": 2}}),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let DirectResponse::Failed(error) = &response else {
+        panic!("{response:?}");
+    };
+    assert_eq!(
+        (error.code, error.outcome),
+        (ErrorCode::StorageUnavailable, Outcome::NotApplied),
+        "{error:?}"
+    );
+    assert!(crate::oltp::pool::is_no_space(error), "{error:?}");
+    // The request deadline is 10 s; the refusal comes back without waiting.
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    let after = v.executor.stats();
+    assert_eq!(
+        after.entries_proposed - before.entries_proposed,
+        1,
+        "{after:?}"
+    );
+    assert_eq!(after.outcome_unknown, before.outcome_unknown, "{after:?}");
+    assert_eq!(
+        v.consensus.health().snapshot().proposals_refused_no_space - refused,
+        1
+    );
+    // Nothing applied: the row keeps its value (a get proposes nothing).
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done(r#"{"id":1,"score":0.0,"tag":"a","value":1}"#)
+    );
+    cluster.shutdown().await;
+}
+
+/// RV-FINAL L3, C07, F03: a Catalog leader that stops answering table
+/// reads holds neither a direct mutation nor a forward past the request
+/// deadline. Both answer `not_applied` (nothing was proposed) instead of
+/// waiting until the gateway's own deadline cuts the call as uncertain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let v = &cluster.voters[leader];
+    let proposed = v.executor.stats().entries_proposed;
+    cluster.schema.stall_table_reads(true);
+    for forward in [false, true] {
+        let id = Uuid::new_v4();
+        let body = cluster.body(
+            id,
+            "table.upsert",
+            serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+        );
+        let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            if forward {
+                v.executor.forward(&v.handle, request).await
+            } else {
+                v.executor.execute(&v.handle, request).await
+            }
+        })
+        .await
+        .expect("a stalled Catalog read outlived the request deadline");
+        assert_eq!(
+            code(&response),
+            Some((ErrorCode::StorageUnavailable, Outcome::NotApplied)),
+            "forward={forward}: {response:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+    cluster.schema.stall_table_reads(false);
+    assert_eq!(
+        v.executor.stats().entries_proposed,
+        proposed,
+        "nothing was proposed"
+    );
+    cluster.shutdown().await;
+}
+
 /// Rule 2 wiring for `table.get` (plan section 6): a get of a key with a
 /// pending commit waits for it, and a get never waits on other keys.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

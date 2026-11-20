@@ -350,7 +350,6 @@ impl ParticipantMachine {
     }
     /// The range leader's read/commit clock, shared by every machine over
     /// this group store.
-    #[allow(dead_code)] // Driven by the leader executor (T5).
     pub(crate) fn range_clock(&self) -> &Arc<direct::RangeClock> {
         &self.clock
     }

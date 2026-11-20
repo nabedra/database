@@ -93,7 +93,7 @@ pub(crate) struct DamagedReplicaRemoved {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReleaseOutcome {
     Released,
-    /// The group was no longer quarantined (an earlier release finished).
+    /// The group retained nothing here any more (an earlier release finished).
     AlreadyReleased,
 }
 
@@ -353,7 +353,16 @@ impl OltpPool {
                     Outcome::NotApplied,
                 ));
             }
-            let outcome = if pool.group_quarantined(id) {
+            // A replica given up by its supervisor (RV-APPLY F4) is not
+            // quarantined, but its bytes are just as unneeded once the
+            // change removing it committed (RV-FINAL M4).
+            let retained = pool.group_quarantined(id)
+                || pool
+                    .snapshot()
+                    .get(&super::identity_key(id))
+                    .map_err(storage_error)?
+                    .is_some();
+            let outcome = if retained {
                 pool.healthy()?;
                 pool.inner
                     .store

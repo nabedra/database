@@ -58,9 +58,9 @@ const DIRECT_HIGH: &[u8] = b"mvcc/direct-high/v1";
 /// The highest `applied_unix_ms` stamped on this group (RV-T4 F7).
 const UNIX_HIGH: &[u8] = b"mvcc/direct-unix-high/v1";
 
-/// `direct_dedup_retention_ms` default: 24 hours.
-#[allow(dead_code)] // Read by the leader's expiry task (T5).
-pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// `direct_dedup_retention_ms` default: 24 hours. `result_retention_ms` is
+/// bounded against it at startup (RV-FINAL M2).
+pub(crate) const DEFAULT_DIRECT_DEDUP_RETENTION_MS: u64 = crate::config::DIRECT_MARKER_RETENTION_MS;
 /// Dedup records deleted per `DirectExpire` entry at most.
 pub(crate) const MAX_DIRECT_EXPIRE_ITEMS: u16 = 128;
 /// Rows per command. `insert_many` above this uses the queued path.
@@ -159,7 +159,6 @@ impl DirectSchema {
     /// Whether a descriptor read from the Catalog table record with
     /// `lifecycle_id` may compute direct commits at `self.epoch`. A leader
     /// whose cached descriptor fails this check refreshes it or falls back.
-    #[allow(dead_code)] // Read by the leader executor (T5).
     pub(crate) fn admits(&self, lifecycle_id: Uuid) -> bool {
         self.lifecycle == Some(lifecycle_id)
     }
@@ -191,7 +190,6 @@ pub(crate) enum DirectSchemaChange {
 
 /// The cutoff a leader proposes at `now_unix_ms` for `retention_ms`.
 /// `None` while nothing can be old enough yet.
-#[allow(dead_code)] // Called by the leader's expiry task (T5).
 pub(crate) fn expiry_cutoff(now_unix_ms: u64, retention_ms: u64) -> Option<u64> {
     now_unix_ms
         .checked_sub(retention_ms.max(1))
@@ -323,7 +321,6 @@ impl DirectCommit {
         }
     }
     /// Every row and index key this commit writes, for `RangeClock` pending.
-    #[allow(dead_code)] // Called by the leader executor (T5).
     pub(crate) fn keys(&self) -> Vec<MvccKey> {
         self.writes
             .iter()

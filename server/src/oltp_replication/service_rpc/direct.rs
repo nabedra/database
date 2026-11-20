@@ -15,10 +15,6 @@
 //! Mixed versions: an older receiver rejects the unknown method or the
 //! ingress purpose on a Data group before executing anything. Gateways send
 //! these methods only once `data.direct.v1` is active (T7).
-// T6 (gateway) and T7 (activation) construct and call parts of this
-// (the Catalog schema, installation, the expiry task); until then they are
-// unused outside tests, and some even in tests.
-#![allow(dead_code)]
 use crate::{
     oltp::pool::ChargedBytes,
     oltp_replication::types::{Digest, GroupIdentity, GroupKind, Text},
@@ -384,13 +380,6 @@ pub(crate) enum DirectSendError {
     /// unknown outcome. The gateway resends the same id and body.
     Uncertain(ProtocolError),
 }
-impl DirectSendError {
-    pub(crate) fn error(&self) -> &ProtocolError {
-        match self {
-            Self::NotApplied(error) | Self::Uncertain(error) => error,
-        }
-    }
-}
 
 /// The gateway side of `Method::Direct` for one Data group (plan section 3):
 /// sends a request to one voter over the worker's persistent session on the
@@ -416,9 +405,6 @@ impl DirectLink {
         Ok(Self {
             client: super::Client::new(group, shared, transport, control, action)?,
         })
-    }
-    pub(crate) fn group(&self) -> &GroupIdentity {
-        &self.client.group
     }
     /// Sends `request` to replica `node` on `worker`. `forward` sends
     /// `Method::DirectForward` instead of `Method::Direct`.
