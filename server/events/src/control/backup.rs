@@ -183,7 +183,9 @@ pub async fn run_restore(config: &Config, backup: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let stored = broker.stored_group_ids()?;
+    // Quarantined groups count: a volume that holds only damaged groups is not fresh,
+    // and a damaged copy of a backup group must not be restored over (RV-EV L5).
+    let stored = broker.hosted_group_ids()?;
     if pending_marker.is_none() {
         ensure!(stored.is_empty(), "restore requires a fresh broker volume");
         write_marker(pending.clone(), &serde_json::to_vec(&wanted)?)?;

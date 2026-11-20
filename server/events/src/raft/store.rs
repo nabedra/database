@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
@@ -14,11 +17,18 @@ use nabedra_kv::{
 };
 use openraft::{LogId, SnapshotMeta, StoredMembership};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError, mpsc};
 use uuid::Uuid;
 
 use super::Node;
 
+#[cfg(test)]
+mod rv_ev_tests;
+/// Small memtables and journal segments on `fs`, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_options(fs: &nabedra_kv::fs::FaultFs) -> nabedra_kv::Options {
+    tests::small(fs)
+}
 #[cfg(test)]
 mod tests;
 
@@ -40,6 +50,12 @@ const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MEMTABLE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
 const MEMTABLE_BYTES: usize = 16 * 1024 * 1024;
 const BACKGROUND_THREADS: usize = 2;
+/// A Raft storage write that meets a full device is retried after this delay, doubling
+/// up to [`NO_SPACE_MAX_BACKOFF`], for as long as its group stays open (RV-EV M1).
+const NO_SPACE_FIRST_BACKOFF: Duration = Duration::from_millis(10);
+const NO_SPACE_MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// How often a parked retry checks whether its group is closing.
+const RETRY_POLL: Duration = Duration::from_millis(5);
 
 /// The scope of a key: `group/{id}/` for a group key, else store-wide (0). Damage to a
 /// group's records quarantines only that group; damage to any other record refuses the
@@ -83,6 +99,110 @@ pub(super) struct Database {
     io: Arc<Semaphore>,
     bulk: Arc<Semaphore>,
     damaged: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Woken when the store may have latched `RecoveryRequired` (store-wide damage or an
+    /// ambiguous write failure).
+    recovery: Arc<Notify>,
+    no_space: NoSpace,
+    #[cfg(test)]
+    pub(super) inject_no_space: Mutex<BTreeMap<&'static str, u32>>,
+}
+
+/// Full-device accounting for `/v1/admin/broker` (RV-EV M1).
+#[derive(Default)]
+struct NoSpace {
+    /// The last write met a full device, and no write has succeeded since.
+    active: AtomicBool,
+    last_ms: AtomicU64,
+    retries: Mutex<BTreeMap<&'static str, u64>>,
+}
+
+/// The broker store's health, as `/v1/admin/broker` reports it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageHealth {
+    /// The store refuses all work until the process reopens it (RV-EV M2).
+    pub recovery_required: bool,
+    /// The last storage write met a full device and none has succeeded since. Raft writes
+    /// retry until space frees up (RV-EV M1).
+    pub no_space: bool,
+    /// Unix milliseconds of the last full-device write, if any.
+    pub last_no_space_ms: Option<u64>,
+    /// Retries of full-device writes, by Raft storage operation.
+    pub no_space_retries: BTreeMap<String, u64>,
+    pub journal_bytes: u64,
+    pub stall_ms: u64,
+}
+
+/// The retry context of the Raft storage job running on this blocking thread: which
+/// group it serves and the I/O permit it holds. `Database::write` retries `NoSpace` only
+/// inside one, so broker-level writes (hosting, retirement) still fail fast.
+struct RetryScope {
+    label: &'static str,
+    closing: Arc<AtomicBool>,
+    semaphore: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+thread_local! {
+    static RETRY: RefCell<Option<RetryScope>> = const { RefCell::new(None) };
+}
+
+/// Clears this thread's retry scope (and drops its permit) when the job ends.
+struct RetryGuard;
+
+impl RetryGuard {
+    fn enter(scope: RetryScope) -> RetryGuard {
+        RETRY.with_borrow_mut(|slot| *slot = Some(scope));
+        RetryGuard
+    }
+}
+
+impl Drop for RetryGuard {
+    fn drop(&mut self) {
+        RETRY.with_borrow_mut(|slot| slot.take());
+    }
+}
+
+fn retry_label() -> Option<&'static str> {
+    RETRY.with_borrow(|scope| scope.as_ref().map(|scope| scope.label))
+}
+
+/// Parks the current Raft storage job for `delay` without holding its I/O permit, then
+/// takes a permit again. Fails when there is no retry scope or the group is closing.
+fn park_for_space(delay: Duration) -> Result<()> {
+    RETRY.with_borrow_mut(|scope| {
+        let scope = scope
+            .as_mut()
+            .ok_or_else(|| anyhow!("no retry scope for this storage write"))?;
+        let closing = |scope: &RetryScope| scope.closing.load(Ordering::Acquire);
+        // Other groups' storage work proceeds while this one waits for space.
+        scope.permit.take();
+        let deadline = Instant::now() + delay;
+        loop {
+            ensure!(!closing(scope), "Raft group storage is closing");
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(RETRY_POLL.min(deadline - now));
+        }
+        loop {
+            ensure!(!closing(scope), "Raft group storage is closing");
+            match scope.semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    scope.permit = Some(permit);
+                    return Ok(());
+                }
+                Err(TryAcquireError::NoPermits) => std::thread::sleep(RETRY_POLL),
+                Err(TryAcquireError::Closed) => anyhow::bail!("storage permits closed"),
+            }
+        }
+    })
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -95,7 +215,7 @@ struct Identity {
 /// closing joins the store's threads. Reopening the same directory waits for its close.
 static CLOSING: Mutex<Vec<(PathBuf, JoinHandle<()>)>> = Mutex::new(Vec::new());
 
-fn wait_for_close(dir: &Path) {
+pub(super) fn wait_for_close(dir: &Path) {
     let pending: Vec<_> = {
         let mut closing = CLOSING.lock().unwrap_or_else(PoisonError::into_inner);
         let (done, rest) = std::mem::take(&mut *closing)
@@ -214,6 +334,8 @@ impl Database {
             tracing::info!(?recovery, "Events store opened");
         }
         let (damaged, receiver) = mpsc::unbounded_channel();
+        let recovery = Arc::new(Notify::new());
+        let latched = recovery.clone();
         store.on_damage(Box::new(move |damage| match quarantined_group(&damage) {
             Some(group) => {
                 tracing::error!(
@@ -222,10 +344,13 @@ impl Database {
                 );
                 let _ = damaged.send(group.group);
             }
-            None => tracing::error!(
-                ?damage,
-                "Events store-wide damage; the store refuses work until it is reopened"
-            ),
+            None => {
+                tracing::error!(
+                    ?damage,
+                    "Events store-wide damage; the store refuses work until it is reopened"
+                );
+                latched.notify_one();
+            }
         }));
         let database = Self {
             store: Some(store),
@@ -234,6 +359,10 @@ impl Database {
             io: Arc::new(Semaphore::new(8)),
             bulk: Arc::new(Semaphore::new(1)),
             damaged: Mutex::new(Some(receiver)),
+            recovery,
+            no_space: NoSpace::default(),
+            #[cfg(test)]
+            inject_no_space: Mutex::default(),
         };
         for damage in &quarantined {
             match quarantined_group(damage) {
@@ -263,6 +392,10 @@ impl Database {
         Ok(Arc::new(database))
     }
 
+    pub fn kv_dir(&self) -> &Path {
+        &self.kv_dir
+    }
+
     fn store(&self) -> &Store {
         self.store
             .as_ref()
@@ -289,12 +422,138 @@ impl Database {
     /// Commit `batch` durably. Blocks: call it only from blocking work (`run`). A batch
     /// whose keys all lie under one `group/{id}/` takes that scope, so damage to it
     /// quarantines only that group; any other batch is store-wide.
+    ///
+    /// A batch into a quarantined group is refused: that group neither votes nor
+    /// acknowledges (section 3, rule 1; RV-EV L3). Writes are paced while L0 is at its
+    /// slowdown trigger (RV-FINAL L6). Inside a Raft storage job (`GroupStore::run*`), a
+    /// full device (`NoSpace`, nothing written) is retried with capped backoff until it
+    /// succeeds or the group closes, so a transient full disk never stops a Raft core
+    /// (RV-EV M1).
     pub fn write(&self, mut batch: WriteBatch) -> Result<()> {
         confine(&mut batch);
-        self.store()
+        if !batch.scope().is_empty() && self.store().is_quarantined(batch.scope()) {
+            return Err(nabedra_kv::Error::Corruption {
+                file: nabedra_kv::FileId::Other,
+                offset: 0,
+                what: "write into a quarantined group",
+            }
+            .into());
+        }
+        let mut backoff = NO_SPACE_FIRST_BACKOFF;
+        loop {
+            let label = retry_label();
+            let attempt = match label {
+                Some(_) => batch.clone(),
+                None => std::mem::take(&mut batch),
+            };
+            match self.submit_sync(attempt, label) {
+                Ok(()) => {
+                    self.no_space.active.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(nabedra_kv::Error::NoSpace) => {
+                    self.no_space.active.store(true, Ordering::Relaxed);
+                    self.no_space.last_ms.store(unix_ms(), Ordering::Relaxed);
+                    let Some(label) = label else {
+                        return Err(nabedra_kv::Error::NoSpace.into());
+                    };
+                    *self
+                        .no_space
+                        .retries
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .entry(label)
+                        .or_default() += 1;
+                    if backoff == NO_SPACE_FIRST_BACKOFF {
+                        tracing::warn!(
+                            write = label,
+                            "Events storage device is full; retrying until space frees up"
+                        );
+                    }
+                    park_for_space(backoff).context("Events storage device is full")?;
+                    backoff = (backoff * 2).min(NO_SPACE_MAX_BACKOFF);
+                }
+                Err(error) => {
+                    if error.is_ambiguous() || self.requires_recovery() {
+                        self.recovery.notify_one();
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+    }
+
+    fn submit_sync(
+        &self,
+        batch: WriteBatch,
+        label: Option<&'static str>,
+    ) -> nabedra_kv::Result<()> {
+        #[cfg(test)]
+        if let Some(label) = label
+            && let Some(left) = self
+                .inject_no_space
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_mut(label)
+                .filter(|left| **left > 0)
+        {
+            *left -= 1;
+            return Err(nabedra_kv::Error::NoSpace);
+        }
+        let _ = label;
+        let store = self.store();
+        store.pace(batch.encoded_bytes());
+        store
             .submit(batch, Durability::Sync, Box::new(()))
             .and_then(nabedra_kv::Commit::wait)?;
         Ok(())
+    }
+
+    /// The store latched `RecoveryRequired`: it refuses all work until it is reopened.
+    pub fn requires_recovery(&self) -> bool {
+        self.store().requires_recovery()
+    }
+
+    /// Resolves once the store requires recovery. Checks again every second in case a
+    /// latch was not signalled.
+    pub async fn recovery_required(&self) {
+        loop {
+            if self.requires_recovery() {
+                return;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(1), self.recovery.notified()).await;
+        }
+    }
+
+    pub fn health(&self) -> StorageHealth {
+        let stats = self.store().stats();
+        let last = self.no_space.last_ms.load(Ordering::Relaxed);
+        StorageHealth {
+            recovery_required: self.requires_recovery(),
+            no_space: self.no_space.active.load(Ordering::Relaxed),
+            last_no_space_ms: (last != 0).then_some(last),
+            no_space_retries: self
+                .no_space
+                .retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .map(|(label, count)| ((*label).to_owned(), *count))
+                .collect(),
+            journal_bytes: stats.journal_bytes,
+            stall_ms: stats.stall_ms,
+        }
+    }
+
+    /// Free space the store needs beyond any configured reserve to keep committing Raft
+    /// progress: two journal segments (the active one and the next roll) and the output
+    /// of one L0 compaction, which is written before its inputs are deleted (RV-EV M1).
+    pub fn disk_headroom_bytes() -> u64 {
+        let options = nabedra_kv::journal::JournalOptions::default();
+        let levels = nabedra_kv::LevelOptions::default();
+        2 * options.segment_bytes
+            + levels.l0_compaction_trigger as u64 * MEMTABLE_BYTES as u64
+            + levels.max_bytes_for_level_base
     }
 
     /// Groups whose storage is quarantined.
@@ -344,10 +603,34 @@ impl Database {
         semaphore: &Arc<Semaphore>,
         work: impl FnOnce(&Self) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.run_scoped(semaphore, None, work).await
+    }
+
+    /// Runs `work` on a blocking thread holding a permit of `semaphore`. With a retry
+    /// scope (a Raft storage job), `write` retries a full device and gives the permit
+    /// back while it waits.
+    async fn run_scoped<T: Send + 'static>(
+        self: &Arc<Self>,
+        semaphore: &Arc<Semaphore>,
+        retry: Option<(&'static str, Arc<AtomicBool>)>,
+        work: impl FnOnce(&Self) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let permit = semaphore.clone().acquire_owned().await?;
         let database = self.clone();
+        let semaphore = semaphore.clone();
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let (_permit, _scope) = match retry {
+                Some((label, closing)) => (
+                    None,
+                    Some(RetryGuard::enter(RetryScope {
+                        label,
+                        closing,
+                        semaphore,
+                        permit: Some(permit),
+                    })),
+                ),
+                None => (Some(permit), None),
+            };
             // The last reference may drop here, which closes the store off the runtime's
             // async workers.
             work(&database)
@@ -449,6 +732,9 @@ pub(super) struct GroupStore {
     pub id: Arc<str>,
     root: Arc<[u8]>,
     sealed: Arc<RwLock<bool>>,
+    /// Set before the group's Raft core shuts down, so a write parked on a full device
+    /// gives up instead of holding the shutdown.
+    closing: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -471,6 +757,7 @@ impl GroupStore {
             id: Arc::from(id),
             root: Arc::from(group_root(id)),
             sealed: Arc::default(),
+            closing: Arc::default(),
         }
     }
 
@@ -478,29 +765,54 @@ impl GroupStore {
         &self,
         work: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.run_bounded(&self.db.io, work).await
+        self.run_bounded(&self.db.io, "storage", work).await
+    }
+
+    /// [`GroupStore::run`] for a Raft storage operation named `label` in the full-device
+    /// retry counters.
+    pub async fn run_as<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        work: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run_bounded(&self.db.io, label, work).await
     }
 
     pub async fn run_bulk<T: Send + 'static>(
         &self,
         work: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.run_bounded(&self.db.bulk, work).await
+        self.run_bounded(&self.db.bulk, "bulk", work).await
+    }
+
+    pub async fn run_bulk_as<T: Send + 'static>(
+        &self,
+        label: &'static str,
+        work: impl FnOnce(&Database) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run_bounded(&self.db.bulk, label, work).await
     }
 
     async fn run_bounded<T: Send + 'static>(
         &self,
         pool: &Arc<Semaphore>,
+        label: &'static str,
         work: impl FnOnce(&Database) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let activity = self.sealed.clone().read_owned().await;
         ensure!(!*activity, "Raft group storage has closed");
         self.db
-            .run_bounded(pool, move |db| {
+            .run_scoped(pool, Some((label, self.closing.clone())), move |db| {
                 let _activity = activity;
                 work(db)
             })
             .await
+    }
+
+    /// Stop full-device retries of this group's storage work. Call before shutting its
+    /// Raft core down: the core waits for its storage calls.
+    pub fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
     }
 
     /// Drain this open generation before its identifier can be reused. A
@@ -594,6 +906,24 @@ impl GroupStore {
             std::fs::remove_dir_all(dir)?;
         }
         Ok(())
+    }
+
+    /// Release the damaged bytes of this group if its retirement is durable but the
+    /// release did not finish (section 3, rule 4; RV-EV L1). True if it released them.
+    pub fn finish_release(&self) -> Result<bool> {
+        if !self.db.is_quarantined(&self.id)
+            || self.retired_at()?.is_none()
+            || self.db.is_hosted(&self.id)?
+        {
+            return Ok(false);
+        }
+        tracing::info!(group = %self.id, "releasing a retired damaged group");
+        self.db.store().release_scope(&self.root)?;
+        let dir = self.snapshot_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(true)
     }
 
     pub fn clean_snapshot_dir(&self) -> Result<()> {

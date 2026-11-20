@@ -30,13 +30,15 @@ use uuid::Uuid;
 pub use network::PeerTransport;
 pub use snapshot::SnapshotCut;
 pub use state_machine::StateMachine;
-pub use store::{QuarantinedGroup, Transaction};
+pub use store::{QuarantinedGroup, StorageHealth, Transaction};
 
 use batch::PublishBatcher;
 use log::LogStore;
 use network::NetworkFactory;
 use snapshot::{CHUNK_BYTES, MAX_SNAPSHOT_BYTES, SnapshotFile, Snapshots};
 use state_machine::AppliedState;
+#[cfg(test)]
+pub(crate) use store::test_options;
 use store::{Database, GroupStore};
 
 pub(super) type Node = openraft::BasicNode;
@@ -257,6 +259,33 @@ impl Broker {
             .collect())
     }
 
+    /// A raw synced write, for tests that damage or seed records.
+    #[cfg(test)]
+    pub(crate) async fn test_write(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let (key, value) = (key.to_vec(), value.to_vec());
+        self.database
+            .run(move |db| {
+                let mut write = WriteBatch::new();
+                write.put(&key, &value);
+                db.write(write)
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_read(&self, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        self.database.get(key)
+    }
+
+    pub fn is_quarantined(&self, id: &str) -> bool {
+        self.database.is_quarantined(id)
+    }
+
+    /// Every hosted group, including the quarantined ones (RV-EV L5).
+    pub fn hosted_group_ids(&self) -> Result<Vec<String>> {
+        self.database.stored_group_ids()
+    }
+
     /// Hosted groups whose storage is damaged. They are not started; an operator re-adds
     /// this replica through the membership and backup tools.
     pub fn quarantined_groups(&self) -> Vec<QuarantinedGroup> {
@@ -265,6 +294,56 @@ impl Broker {
 
     pub fn disk_available_bytes(&self) -> Result<u64> {
         Ok(fs2::available_space(&self.database.root)?)
+    }
+
+    /// Free space the store keeps for Raft progress beyond the configured reserve: two
+    /// journal segments and one compaction's output (RV-EV M1).
+    pub fn disk_headroom_bytes(&self) -> u64 {
+        Database::disk_headroom_bytes()
+    }
+
+    /// The store latched `RecoveryRequired`: every write fails until the process reopens
+    /// it, which applies the recovery rules R1-R3 (RV-EV M2).
+    pub fn requires_recovery(&self) -> bool {
+        self.database.requires_recovery()
+    }
+
+    /// Resolves once the store requires recovery.
+    pub async fn recovery_required(&self) {
+        self.database.recovery_required().await
+    }
+
+    pub fn storage_health(&self) -> StorageHealth {
+        self.database.health()
+    }
+
+    /// Graceful stop: close every group, then close the store and wait for it, so the next
+    /// open finds a clean close instead of a crash (RV-EV L4). Other owners of the broker
+    /// must have dropped it; the store closes once the last reference is gone, and this
+    /// waits up to `wait` for that.
+    pub async fn shutdown(self: Arc<Self>, wait: Duration) -> Result<()> {
+        let mut result = Ok(());
+        for id in self.group_ids() {
+            if let Err(error) = self.close_group(&id).await {
+                tracing::error!(group = %id, %error, "could not close an Events group");
+                result = Err(error.into());
+            }
+        }
+        let database = Arc::downgrade(&self.database);
+        let dir = self.database.kv_dir().to_path_buf();
+        drop(self);
+        let deadline = tokio::time::Instant::now() + wait;
+        while database.strong_count() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "the Events store is still in use; it closes when its last user stops"
+                );
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::task::spawn_blocking(move || store::wait_for_close(&dir)).await?;
+        result
     }
 
     pub async fn open_group(
@@ -452,6 +531,8 @@ impl Broker {
             .map_err(|_| anyhow!("group registry lock poisoned"))?
             .remove(id);
         if let Some(group) = group {
+            // A storage write parked on a full device would hold the core's shutdown.
+            group.snapshots.store.begin_close();
             let shutdown = group.raft.shutdown().await;
             group.snapshots.store.seal().await;
             shutdown.map_err(anyhow::Error::from)?;
@@ -479,7 +560,13 @@ impl Broker {
                 .run(move |_| retirement_matches(&inspect, local_id, removed_at))
                 .await?
             {
-                return Ok(false);
+                // A durable retirement of a damaged replica whose release failed (for
+                // example on a full device) finishes here, without a restart (RV-EV L1).
+                let pending = store.clone();
+                return Ok(broker
+                    .database
+                    .run_bulk(move |_| pending.finish_release())
+                    .await?);
             }
             broker.close_group_locked(&store.id).await?;
             Ok(broker

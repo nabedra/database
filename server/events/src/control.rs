@@ -3,6 +3,8 @@ mod catalog;
 mod forward;
 mod operate;
 mod serve;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
@@ -30,7 +32,7 @@ use forward::GroupCall;
 use operate::BackupLayout;
 
 pub use backup::{run_backup, run_restore};
-pub use serve::serve;
+pub use serve::{RECOVERY_EXIT_CODE, StoreRecoveryRequired, serve};
 
 const METADATA: &str = "metadata";
 const RESTORE_REBIND: &str = "restore-rebind";
@@ -432,11 +434,24 @@ impl Control {
         Ok(value)
     }
 
+    /// Ready while a group call succeeded recently and the store is usable: a store that
+    /// requires recovery cannot do any work, whatever other brokers answer (RV-EV M2).
     fn ready(&self) -> bool {
-        self.ready_at
-            .lock()
-            .expect("readiness lock")
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(6))
+        !self.broker.requires_recovery()
+            && self
+                .ready_at
+                .lock()
+                .expect("readiness lock")
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(6))
+    }
+
+    /// Free space below which publishes are refused: the configured reserve plus the room
+    /// the store needs to keep committing acknowledgments, claims and replication (RV-EV
+    /// M1).
+    fn disk_reserve_bytes(&self) -> u64 {
+        self.config
+            .min_free_disk_bytes
+            .saturating_add(self.broker.disk_headroom_bytes())
     }
 
     async fn partition_call<T: serde::de::DeserializeOwned>(
