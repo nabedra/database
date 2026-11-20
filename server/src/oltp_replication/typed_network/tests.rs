@@ -130,7 +130,7 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
                 dir.0.join(format!("pool{index}")),
                 PoolIdentity {
                     engine: "oltp".into(),
-                    pool_format_version: 1,
+                    pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                     cluster_id: cluster,
                     worker_id: worker.worker_id,
                     pool_id: members[&(index as u64 + 1)].pool_id,
@@ -350,7 +350,7 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
                 dir.0.join(format!("pool{index}")),
                 PoolIdentity {
                     engine: "oltp".into(),
-                    pool_format_version: 1,
+                    pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                     cluster_id: cluster,
                     worker_id: worker.worker_id,
                     pool_id: member.pool_id,

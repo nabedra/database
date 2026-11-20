@@ -402,7 +402,19 @@ where
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
         let stopped = self.raft.shutdown().await;
         self.log.drain().await;
+        // No running log replays unsynced application any more (RV-T2 Q5).
+        self.state.store().stop_deferred_applies();
         stopped.map_err(|_| unavailable())
+    }
+}
+impl<C, M> Drop for RaftConsensus<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    fn drop(&mut self) {
+        // Clearing the flag only makes later application writes synced again.
+        self.state.store().stop_deferred_applies();
     }
 }
 impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>

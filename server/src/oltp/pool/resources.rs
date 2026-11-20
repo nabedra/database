@@ -4,7 +4,6 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
 };
-use rocksdb::{Cache, Env, WriteBufferManager};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -72,9 +71,8 @@ impl Default for SharedResourceConfig {
 /// One owner per worker, shared by all volumes, groups and RAM queue accounting.
 /// The scheduler ID is not a permanent Raft node ID or worker enrollment UUID.
 pub struct WorkerSharedResources {
-    pub(super) cache: Cache,
-    pub(super) write_buffers: WriteBufferManager,
-    pub(super) env: Env,
+    /// Block cache, memtable budget and flush/compaction threads of every pool.
+    pub(super) storage: super::storage::NativeStorage,
     pub(super) config: SharedResourceConfig,
     pub(super) pool_slots: Arc<Semaphore>,
     handle_slots: Arc<Semaphore>,
@@ -166,10 +164,11 @@ impl WorkerSharedResources {
         )])?;
         // Stack reservation and native overhead are conservative logical charges.
         // The OS page cache and allocator RSS still require measured deployment limits.
-        let thread_budget = super::super::NativeThreadBudget::new(
+        let thread_budget = super::super::NativeThreadBudget::with_pools(
             config.query_threads,
             config.control_threads,
             config.background_threads,
+            config.max_open_pools,
         )?;
         let native_bytes = config
             .cache_bytes
@@ -214,14 +213,12 @@ impl WorkerSharedResources {
         } else {
             None
         };
-        let env = super::super::native_environment(config.background_threads)?;
         let owner = Arc::new(Self {
-            cache: Cache::new_lru_cache(config.cache_bytes),
-            write_buffers: WriteBufferManager::new_write_buffer_manager(
+            storage: super::storage::NativeStorage::new(
+                config.cache_bytes,
                 config.write_buffer_bytes,
-                true,
+                config.background_threads as usize,
             ),
-            env,
             config,
             pool_slots: Arc::new(Semaphore::new(config.max_open_pools)),
             handle_slots: Arc::new(Semaphore::new(config.max_group_handles)),
@@ -715,9 +712,13 @@ impl WorkerSharedResources {
     pub(crate) fn block_cache_usage(&self) -> BlockCacheUsage {
         BlockCacheUsage {
             configured_bytes: self.config.cache_bytes,
-            usage_bytes: self.cache.get_usage(),
-            pinned_bytes: self.cache.get_pinned_usage(),
+            usage_bytes: self.storage.cache.usage_bytes(),
+            pinned_bytes: self.storage.cache.pinned_bytes(),
         }
+    }
+    /// Store counters of every open pool on this worker (`/v1/runtime/stats`).
+    pub(crate) fn storage_stats(&self) -> super::StorageStats {
+        self.storage.stats()
     }
     pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
         let limit = self.config.max_resident_groups;

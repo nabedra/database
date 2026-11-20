@@ -276,9 +276,8 @@ impl GroupStore {
                 group.pool().healthy()?;
                 let Some(current) = group
                     .pool()
-                    .inner
-                    .db
-                    .get_pinned(group_key(group.identity().group_id, b'f', &[]))
+                    .snapshot()
+                    .get(&group_key(group.identity().group_id, b'f', &[]))
                     .map_err(|_| recovery_unknown())?
                 else {
                     return Ok(None);
@@ -331,6 +330,10 @@ impl GroupStore {
         budget: TransactionBudget,
     ) -> Result<GroupSnapshot, ProtocolError> {
         let owner = self.inner.order.clone().lock_owned().await;
+        // The application order is held, so every applied write of this group
+        // has completed. Sync any unsynced one before a snapshot can name its
+        // index, without holding a compute permit while storage syncs.
+        self.sync_deferred_applies().await?;
         let group = self.clone();
         let output = self
             .resources()
@@ -349,17 +352,13 @@ impl GroupStore {
                 let _owner = owner;
                 let (mut scratch, _batch, _output) = reservations;
                 group.pool().healthy()?;
-                // The application order is held, so every applied write of
-                // this group has completed. Sync any unsynced one before a
-                // snapshot can name its index.
-                group.sync_deferred_applies()?;
-                let native = group.pool().inner.db.snapshot();
+                let native = group.pool().snapshot();
                 let applied = group.read_applied(&native, &mut scratch)?;
                 let membership = native
-                    .get_pinned(group_key(group.identity().group_id, b'm', &[]))
+                    .get(&group_key(group.identity().group_id, b'm', &[]))
                     .map_err(storage_error)?;
                 let response = native
-                    .get_pinned(group_key(group.identity().group_id, b'r', &[]))
+                    .get(&group_key(group.identity().group_id, b'r', &[]))
                     .map_err(storage_error)?;
                 let header = GroupSnapshotHeader {
                     identity: group.identity().clone(),
@@ -391,14 +390,15 @@ impl GroupStore {
                     write_hashed(&mut file, &mut checksum, encoded.as_slice())?;
                     for (tag, key) in [(1, b'p'), (2, b'm'), (3, b'r')] {
                         if let Some(value) = native
-                            .get_pinned(group_key(group.identity().group_id, key, &[]))
+                            .get(&group_key(group.identity().group_id, key, &[]))
                             .map_err(storage_error)?
                         {
                             write_record(&mut file, &mut checksum, tag, &[], &value)?;
                         }
                     }
                     let prefix = group.prefix(&native, false)?;
-                    let mut iterator = native.raw_iterator();
+                    let mut iterator =
+                        RawIter::bounded(&native, &prefix, &prefix_end(&prefix), false);
                     iterator.seek(&prefix);
                     while iterator.valid() {
                         let key = iterator.key().ok_or_else(recovery_unknown)?;
@@ -410,11 +410,11 @@ impl GroupStore {
                             &mut checksum,
                             4,
                             &key[prefix.len()..],
-                            iterator.value().ok_or_else(recovery_unknown)?,
+                            &iterator.value()?,
                         )?;
                         iterator.next();
                     }
-                    iterator.status().map_err(storage_error)?;
+                    iterator.status()?;
                     file.write_all(&[255])
                         .and_then(|_| file.write_all(&checksum.finalize()))
                         .and_then(|_| file.sync_all())
@@ -424,13 +424,15 @@ impl GroupStore {
                         .file_name()
                         .and_then(|v| v.to_str())
                         .ok_or_else(storage_error_message)?;
-                    let mut batch = WriteBatch::default();
+                    let mut batch = WriteBatch::new();
                     batch.put(
-                        group_key(group.identity().group_id, b'f', &[]),
+                        &group_key(group.identity().group_id, b'f', &[]),
                         name.as_bytes(),
                     );
                     published = true;
-                    group.pool().durable_write(batch)?;
+                    group
+                        .pool()
+                        .durable_write(&group_scope(group.identity().group_id), batch)?;
                     cleanup_files(
                         &group.pool().inner.path,
                         group.identity().group_id,
@@ -467,6 +469,10 @@ impl GroupStore {
     ) -> Result<(), ProtocolError> {
         let generation_owner = self.inner.generation.clone().write_owned().await;
         let owner = self.inner.order.clone().lock_owned().await;
+        // The application order is held, so every applied write of this group
+        // has completed. Sync any unsynced one before a snapshot can name its
+        // index, without holding a compute permit while storage syncs.
+        self.sync_deferred_applies().await?;
         let group = self.clone();
         let output = self
             .resources()
@@ -573,7 +579,8 @@ impl GroupStore {
             if header.identity != *self.identity() || header != source.header {
                 return Err(storage_error_message());
             }
-            let current = self.pool().inner.db.snapshot();
+            let scope = group_scope(self.identity().group_id);
+            let current = self.pool().snapshot();
             let applied = self.read_applied(&current, &mut scratch)?;
             match (applied.as_ref(), header.applied) {
                 (Some(existing), Some(incoming))
@@ -591,14 +598,14 @@ impl GroupStore {
             let generation = active.checked_add(1).ok_or_else(capacity)?;
             let prefix = group_key(self.identity().group_id, b's', &generation.to_be_bytes());
             let meta_prefix = group_key(self.identity().group_id, b'u', &generation.to_be_bytes());
-            let mut start = WriteBatch::default();
-            start.delete_range(&prefix, &super::super::codec::end(&prefix));
-            start.delete_range(&meta_prefix, &super::super::codec::end(&meta_prefix));
+            let mut start = WriteBatch::new();
+            start.delete_range(&prefix, &prefix_end(&prefix));
+            start.delete_range(&meta_prefix, &prefix_end(&meta_prefix));
             start.put(
-                group_key(self.identity().group_id, b't', &[]),
-                generation.to_be_bytes(),
+                &group_key(self.identity().group_id, b't', &[]),
+                &generation.to_be_bytes(),
             );
-            self.pool().durable_write(start)?;
+            self.pool().durable_write(&scope, start)?;
             stage = Some(generation);
             if budget.batch_bytes < 256 {
                 return Err(capacity());
@@ -672,7 +679,7 @@ impl GroupStore {
                     .checked_add(cost)
                     .is_none_or(|n| n > budget.batch_bytes)
                 {
-                    self.pool().durable_write(batch)?;
+                    self.pool().durable_write(&scope, batch)?;
                     batch = WriteBatch::with_capacity_bytes(budget.batch_bytes);
                     used = 12;
                 }
@@ -698,11 +705,11 @@ impl GroupStore {
             {
                 return Err(storage_error_message());
             }
-            self.pool().durable_write(batch)?;
-            let staged = self.pool().inner.db.snapshot();
+            self.pool().durable_write(&scope, batch)?;
+            let staged = self.pool().snapshot();
             let read_stage = |tag| {
                 staged
-                    .get_pinned([meta_prefix.as_slice(), &[tag]].concat())
+                    .get(&[meta_prefix.as_slice(), &[tag]].concat())
                     .map_err(storage_error)
             };
             let p = read_stage(1)?;
@@ -728,9 +735,9 @@ impl GroupStore {
                     if cost > batch_charge.remaining() {
                         return Err(capacity());
                     }
-                    activate.put(key, &value);
+                    activate.put(&key, &value);
                 } else {
-                    activate.delete(key);
+                    activate.delete(&key);
                 }
             }
             let name = path
@@ -738,18 +745,18 @@ impl GroupStore {
                 .and_then(|v| v.to_str())
                 .ok_or_else(storage_error_message)?;
             activate.put(
-                group_key(self.identity().group_id, b'f', &[]),
+                &group_key(self.identity().group_id, b'f', &[]),
                 name.as_bytes(),
             );
             activate.put(
-                group_key(self.identity().group_id, b'a', &[]),
-                generation.to_be_bytes(),
+                &group_key(self.identity().group_id, b'a', &[]),
+                &generation.to_be_bytes(),
             );
-            activate.delete(group_key(self.identity().group_id, b't', &[]));
+            activate.delete(&group_key(self.identity().group_id, b't', &[]));
             let old = group_key(self.identity().group_id, b's', &active.to_be_bytes());
-            activate.delete_range(&old, &super::super::codec::end(&old));
-            activate.delete_range(&meta_prefix, &super::super::codec::end(&meta_prefix));
-            self.pool().durable_write(activate)?;
+            activate.delete_range(&old, &prefix_end(&old));
+            activate.delete_range(&meta_prefix, &prefix_end(&meta_prefix));
+            self.pool().durable_write(&scope, activate)?;
             retained = true;
             stage = None;
             hook(InstallPoint::AfterActivation)?;
@@ -801,10 +808,7 @@ fn decode_applied(data: &[u8]) -> Result<(AppliedPosition, Digest), ProtocolErro
 }
 fn read_generation(pool: &OltpPool, id: Uuid, tag: u8) -> Result<u64, ProtocolError> {
     let bytes = pool
-        .inner
-        .db
-        .get_pinned(group_key(id, tag, &[]))
-        .map_err(storage_error)?
+        .get_latest(&group_key(id, tag, &[]))?
         .ok_or_else(storage_error_message)?;
     Ok(u64::from_be_bytes(
         bytes
@@ -866,13 +870,13 @@ fn clear_stage(pool: &OltpPool, id: Uuid, generation: u64) -> Result<(), Protoco
     if read_generation(pool, id, b'a')? == generation {
         return Err(storage_error_message());
     }
-    let mut batch = WriteBatch::default();
+    let mut batch = WriteBatch::new();
     for &tag in b"su" {
         let prefix = group_key(id, tag, &generation.to_be_bytes());
-        batch.delete_range(&prefix, &super::super::codec::end(&prefix));
+        batch.delete_range(&prefix, &prefix_end(&prefix));
     }
-    batch.delete(group_key(id, b't', &[]));
-    pool.durable_write(batch)
+    batch.delete(&group_key(id, b't', &[]));
+    pool.durable_write(&group_scope(id), batch)
 }
 pub(super) fn recover_group(
     pool: &OltpPool,
@@ -930,20 +934,13 @@ pub(super) fn recover_group(
     }
 
     if pool
-        .inner
-        .db
-        .get_pinned(group_key(identity.group_id, b't', &[]))
-        .map_err(storage_error)?
+        .get_latest(&group_key(identity.group_id, b't', &[]))?
         .is_some()
     {
         let generation = read_generation(pool, identity.group_id, b't')?;
         clear_stage(pool, identity.group_id, generation)?;
     }
-    let current = pool
-        .inner
-        .db
-        .get_pinned(group_key(identity.group_id, b'f', &[]))
-        .map_err(storage_error)?;
+    let current = pool.get_latest(&group_key(identity.group_id, b'f', &[]))?;
     let name = current
         .as_ref()
         .map(|v| std::str::from_utf8(v).map_err(|_| storage_error_message()))

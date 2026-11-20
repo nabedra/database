@@ -519,7 +519,7 @@ mod tests {
             profile: PoolMountProfile::Ebs,
             identity: PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: group.cluster_id,
                 worker_id: enrollment.worker_id,
                 pool_id: Uuid::from_u128(5),
