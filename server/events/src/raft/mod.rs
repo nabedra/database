@@ -37,6 +37,8 @@ use log::LogStore;
 use network::NetworkFactory;
 use snapshot::{CHUNK_BYTES, MAX_SNAPSHOT_BYTES, SnapshotFile, Snapshots};
 use state_machine::AppliedState;
+#[cfg(test)]
+pub(crate) use store::test_options;
 use store::{Database, GroupStore};
 
 pub(super) type Node = openraft::BasicNode;
@@ -255,6 +257,24 @@ impl Broker {
             .into_iter()
             .filter(|id| quarantined.iter().all(|group| &group.group != id))
             .collect())
+    }
+
+    /// A raw synced write, for tests that damage or seed records.
+    #[cfg(test)]
+    pub(crate) async fn test_write(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let (key, value) = (key.to_vec(), value.to_vec());
+        self.database
+            .run(move |db| {
+                let mut write = WriteBatch::new();
+                write.put(&key, &value);
+                db.write(write)
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_read(&self, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        self.database.get(key)
     }
 
     pub fn is_quarantined(&self, id: &str) -> bool {

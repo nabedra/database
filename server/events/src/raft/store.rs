@@ -23,6 +23,13 @@ use uuid::Uuid;
 use super::Node;
 
 #[cfg(test)]
+mod rv_ev_tests;
+/// Small memtables and journal segments on `fs`, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn test_options(fs: &nabedra_kv::fs::FaultFs) -> nabedra_kv::Options {
+    tests::small(fs)
+}
+#[cfg(test)]
 mod tests;
 
 const DATABASE_IDENTITY: &[u8] = b"identity/v1";

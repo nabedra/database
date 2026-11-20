@@ -3,6 +3,8 @@ mod catalog;
 mod forward;
 mod operate;
 mod serve;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;

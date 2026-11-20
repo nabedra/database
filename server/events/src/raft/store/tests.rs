@@ -62,22 +62,22 @@ async fn group_close_fences_detached_storage_work() -> Result<()> {
 
 // ---- NS27: Events on nabedra-kv -------------------------------------------------------
 
-const CLUSTER: Uuid = Uuid::from_u128(0x27);
+pub(super) const CLUSTER: Uuid = Uuid::from_u128(0x27);
 
-fn entry(term: u64, index: u64) -> Entry<TypeConfig> {
+pub(super) fn entry(term: u64, index: u64) -> Entry<TypeConfig> {
     Entry {
         log_id: log_id(term, index),
         payload: EntryPayload::Blank,
     }
 }
 
-fn log_id(term: u64, index: u64) -> LogId<u64> {
+pub(super) fn log_id(term: u64, index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(term, 1), index)
 }
 
 /// Small memtables and journal segments, so a short workload flushes, compacts and rolls
 /// segments and the crash boundaries cover background work too.
-fn small(fs: &FaultFs) -> nabedra_kv::Options {
+pub(super) fn small(fs: &FaultFs) -> nabedra_kv::Options {
     let mut options = Database::options(Arc::new(fs.clone()));
     options.memtable_bytes = 6 << 10;
     options.max_replay_bytes = 12 << 10;
@@ -89,7 +89,7 @@ fn small(fs: &FaultFs) -> nabedra_kv::Options {
     options
 }
 
-fn fault_root(fs: &FaultFs, root: &Path) {
+pub(super) fn fault_root(fs: &FaultFs, root: &Path) {
     fs.create_dir_all_durable(root);
 }
 
@@ -463,7 +463,7 @@ fn ns27_last_log_id_matches_the_oracle_after_truncate_and_purge() -> Result<()> 
     Ok(())
 }
 
-fn broker_config(dir: &Path) -> BrokerConfig {
+pub(super) fn broker_config(dir: &Path) -> BrokerConfig {
     BrokerConfig {
         id: 1,
         cluster_id: CLUSTER,
@@ -476,7 +476,7 @@ fn broker_config(dir: &Path) -> BrokerConfig {
 }
 
 /// Every `(file, offset)` under `dir` that holds `needle`.
-fn find(fs: &FaultFs, dir: &Path, needle: &[u8]) -> Vec<(PathBuf, u64)> {
+pub(super) fn find(fs: &FaultFs, dir: &Path, needle: &[u8]) -> Vec<(PathBuf, u64)> {
     let mut hits = Vec::new();
     for path in fs.list(dir).unwrap_or_default() {
         let Ok(data) = fs.contents(&path) else {
@@ -491,7 +491,7 @@ fn find(fs: &FaultFs, dir: &Path, needle: &[u8]) -> Vec<(PathBuf, u64)> {
     hits
 }
 
-fn wait_until(what: &str, done: impl Fn() -> bool) {
+pub(super) fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
