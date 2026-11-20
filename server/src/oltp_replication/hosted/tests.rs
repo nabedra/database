@@ -439,7 +439,7 @@ async fn o06_o11_group_commit_needs_fewer_fsyncs_than_entries() {
     let group_after = node.store.write_stats();
     // Real journal fsyncs (RV-T2 Q1), not synced write requests.
     let fsyncs = pool_after.synced_writes - pool_before.synced_writes;
-    let requests = group_after.synced_writes - group_before.synced_writes;
+    let requests = group_after.synced_requests - group_before.synced_requests;
     let deferred = group_after.deferred_writes - group_before.deferred_writes;
     eprintln!(
         "o06_o11 group commit: {commands} entries, {fsyncs} fsyncs, {requests} synced requests, {deferred} unsynced"
@@ -478,7 +478,7 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
         .map(|index| OwnedRaftEntry::<Bump>::new(id(index), Payload::Blank))
         .collect();
     log.append(entries, IOFlushed::noop()).await.unwrap();
-    assert!(store.defer_apply_sync(log.group()));
+    let _deferred = store.defer_apply_sync(log.group()).unwrap();
     let apply = |index: u64| {
         store.transaction(
             ApplyMeta {
@@ -601,10 +601,10 @@ async fn o06_o11_wide_append_writes_bounded_synced_batches() {
         chunk.len() <= MAX_APPEND_ENTRIES
             && sizes[chunk.clone()].iter().sum::<usize>() <= MAX_APPEND_BYTES
     }));
-    let before = store.write_stats().synced_writes;
+    let before = store.write_stats().synced_requests;
     log.append(entries, IOFlushed::noop()).await.unwrap();
     assert_eq!(
-        store.write_stats().synced_writes - before,
+        store.write_stats().synced_requests - before,
         expected.len() as u64
     );
     assert_eq!(

@@ -15,7 +15,7 @@ use nabedra_kv::{Background, Durability, Error, Store, WriteBatch};
 #[test]
 fn ns_unit_store_round_trip_survives_flush_compaction_and_reopen() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, small_options(Arc::new(fs.clone()), bg.clone()));
     let mut model = BTreeMap::new();
     let mut rng = Rng(7);
@@ -57,7 +57,10 @@ fn ns_unit_store_round_trip_survives_flush_compaction_and_reopen() {
 #[test]
 fn ns21_range_tombstones_apply_across_memtables_and_runs() {
     let (fs, dir) = fault_fs();
-    let store = open(&dir, small_options(Arc::new(fs), Background::new(2)));
+    let store = open(
+        &dir,
+        small_options(Arc::new(fs), Background::new(2).unwrap()),
+    );
     for k in 0..20 {
         put(&store, &group_key(1, k), b"old");
     }
@@ -164,7 +167,7 @@ fn ns22_foreign_directories_are_refused_untouched() {
         }
         out
     };
-    let bg = Background::new(1);
+    let bg = Background::new(1).unwrap();
     for dir in [&rocks, &unknown, &legacy] {
         let before = snapshot(dir);
         let fs: Arc<dyn Fs> = Arc::new(RealFs);
@@ -189,7 +192,7 @@ fn ns03_snapshot_survives_flush_and_compaction_and_pins_runs() {
     let (fs, dir) = fault_fs();
     let store = open(
         &dir,
-        small_options(Arc::new(fs.clone()), Background::new(2)),
+        small_options(Arc::new(fs.clone()), Background::new(2).unwrap()),
     );
     let mut model = BTreeMap::new();
     let mut rng = Rng(3);
@@ -256,7 +259,7 @@ fn ns03_snapshot_survives_flush_and_compaction_and_pins_runs() {
 #[test]
 fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, small_options(Arc::new(fs.clone()), bg.clone()));
     let mut model = BTreeMap::new();
     let mut rng = Rng(11);
@@ -327,7 +330,7 @@ fn ns15_engine_sync_kinds_by_file() {
     let (fs, dir) = fault_fs();
     let store = open(
         &dir,
-        small_options(Arc::new(fs.clone()), Background::new(2)),
+        small_options(Arc::new(fs.clone()), Background::new(2).unwrap()),
     );
     let mut rng = Rng(15);
     for tag in 0..100 {
@@ -390,7 +393,7 @@ fn ns15_commit_completes_after_its_payload_is_dropped() {
     let dir = TempDir::new("ns15_payload_drop_order");
     let store = open(
         dir.path(),
-        small_options(Arc::new(RealFs), Background::new(2)),
+        small_options(Arc::new(RealFs), Background::new(2).unwrap()),
     );
     for i in 0..200u32 {
         let dropped = Arc::new(AtomicBool::new(false));

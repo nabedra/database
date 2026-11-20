@@ -53,7 +53,7 @@ fn find(fs: &FaultFs, path: &Path, needle: &[u8]) -> u64 {
 #[test]
 fn ns09_eio_on_journal_sync_latches_and_recovers_from_disk() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     let mut acked = BTreeMap::new();
     for i in 0..20u32 {
@@ -114,7 +114,7 @@ fn ns09_eio_on_journal_sync_latches_and_recovers_from_disk() {
 #[test]
 fn ns09_eio_on_run_write_latches_and_recovers_from_disk() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = small_options(Arc::new(fs.clone()), bg.clone());
     o.memtable_bytes = 8 << 10;
     let store = open(&dir, o);
@@ -157,7 +157,7 @@ fn ns09_eio_on_run_write_latches_and_recovers_from_disk() {
 #[test]
 fn ns18_l0_slowdown_paces_the_submitter_not_the_journal() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut o = options(&fs, &bg);
     o.levels.l0_compaction_trigger = 100;
     o.levels.l0_slowdown_writes = 2;
@@ -207,7 +207,7 @@ fn ns18_l0_slowdown_paces_the_submitter_not_the_journal() {
 #[test]
 fn ns07_g2_run_time_quarantine_is_durable_before_the_read_returns() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     put_scoped(&store, b"g01/a", b"<<g1-damaged>>", Durability::Sync).unwrap();
     put_scoped(&store, b"g02/a", b"<<g2-fine>>", Durability::Sync).unwrap();
@@ -252,7 +252,7 @@ fn ns07_g2_run_time_quarantine_is_durable_before_the_read_returns() {
 #[test]
 fn ns10_memory_usage_charges_tombstones_pinned_memtables_and_writers() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     for i in 0..50u32 {
         put_scoped(
@@ -304,7 +304,7 @@ fn ns10_memory_usage_charges_tombstones_pinned_memtables_and_writers() {
 #[test]
 fn ns06_journal_behind_the_manifest_is_reported() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     put_scoped(&store, b"g01/a", b"<<first>>", Durability::Sync).unwrap();
     put_scoped(&store, b"g01/b", b"<<second>>", Durability::Sync).unwrap();
@@ -360,7 +360,7 @@ fn ns06_journal_behind_the_manifest_is_reported() {
 fn ns07_g2_damaged_top_level_index_found_at_open() {
     for spanning in [false, true] {
         let (fs, dir) = fault_fs();
-        let bg = Background::new(2);
+        let bg = Background::new(2).unwrap();
         let store = open(&dir, options(&fs, &bg));
         put_scoped(&store, b"g01/a", b"one", Durability::Sync).unwrap();
         if spanning {

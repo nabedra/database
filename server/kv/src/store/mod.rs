@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-pub use background::Background;
+pub use background::{Background, THREAD_STACK_BYTES};
 pub use read::{Iter, Snapshot};
 
 use crate::batch::{WriteBatch, prefix_successor};
@@ -161,6 +161,10 @@ pub struct Opened {
     pub store: Store,
     /// Every quarantined scope, found by this open or persisted by an earlier one.
     pub quarantined: Vec<Damage>,
+    /// The scopes this open quarantined, one entry per scope: damage found by this
+    /// open in a scope that no earlier open or run-time quarantine had persisted. R6
+    /// ("more than N scopes quarantined by one open") counts these only.
+    pub quarantined_now: Vec<Damage>,
     pub recovery: RecoveryReport,
 }
 
@@ -435,6 +439,8 @@ impl Store {
             tracker.clone(),
             state.flushed_seq,
         );
+        let persisted_scopes: Vec<Bytes> =
+            state.quarantine.iter().map(|d| d.scope.clone()).collect();
         let mut quarantine_list = state.quarantine.clone();
         for d in &new_damage {
             if !quarantine_list.iter().any(|q| q.scope == d.scope) {
@@ -568,8 +574,19 @@ impl Store {
             }
         }
 
+        // Scopes this open quarantined. A scope persisted by an earlier open or at run
+        // time, or named twice (two damaged runs of one group), counts once or not at all.
+        let mut quarantined_now: Vec<Damage> = Vec::new();
+        for damage in &new_damage {
+            if !persisted_scopes.contains(&damage.scope)
+                && !quarantined_now.iter().any(|d| d.scope == damage.scope)
+            {
+                quarantined_now.push(damage.clone());
+            }
+        }
+
         // R6: damage this wide is more likely systemic than local.
-        if new_damage.len() > options.max_quarantined.max_scopes {
+        if quarantined_now.len() > options.max_quarantined.max_scopes {
             return Err(Error::Corruption {
                 file: FileId::Other,
                 offset: 0,
@@ -620,6 +637,7 @@ impl Store {
         Ok(Opened {
             store: Store { inner },
             quarantined,
+            quarantined_now,
             recovery,
         })
     }
@@ -757,6 +775,12 @@ impl Store {
     /// Scopes currently quarantined.
     pub fn quarantined(&self) -> Vec<Damage> {
         self.inner.quarantine.list()
+    }
+
+    /// True while `key` lies under a quarantined scope, found at open or at run time.
+    /// One atomic load when nothing is quarantined; callers may test it on every write.
+    pub fn is_quarantined(&self, key: &[u8]) -> bool {
+        self.inner.quarantine.scope_of(key).is_some()
     }
 
     pub fn stats(&self) -> StoreStats {

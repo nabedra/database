@@ -179,7 +179,7 @@ fn mutating_ops(list: &[ModelBatch], bg: &Arc<Background>) -> u64 {
 
 #[test]
 fn ns04_crash_at_every_mutating_operation() {
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let (list, models) = batches(5);
     let total = mutating_ops(&list, &bg);
     eprintln!("NS04: {total} mutating operations in the reference run");
@@ -200,7 +200,7 @@ fn ns04_crash_at_every_mutating_operation() {
 }
 
 fn power_loss_campaign(model: PowerLoss, seeds_var: &str, default_seeds: u64) {
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let (list, models) = batches(7);
     let total = mutating_ops(&list, &bg);
     let mut rng = Rng(55);

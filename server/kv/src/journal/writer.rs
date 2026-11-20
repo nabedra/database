@@ -255,6 +255,7 @@ impl Writer {
     pub(super) fn spawn(self, sink: Arc<dyn JournalSink>) -> Result<JoinHandle<()>> {
         std::thread::Builder::new()
             .name("kv-journal".into())
+            .stack_size(crate::store::THREAD_STACK_BYTES)
             .spawn(move || self.run(&*sink))
             .map_err(segment::io)
     }
@@ -737,6 +738,7 @@ pub(super) struct Prep {
 pub(super) fn spawn_preparer(shared: Arc<Shared>) -> Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("kv-journal-prep".into())
+        .stack_size(crate::store::THREAD_STACK_BYTES)
         .spawn(move || prepare_loop(&shared))
         .map_err(segment::io)
 }
@@ -796,8 +798,11 @@ fn record_len(batch: &WriteBatch) -> u64 {
 fn complete(item: Item, result: Result<Seq>) {
     match item {
         Item::Write { waiter, batch, .. } => {
-            waiter.complete(result);
+            // Free the batch buffer before `complete` drops `on_done`, which may hold
+            // the charge for those bytes (M02): a woken committer can build its next
+            // batch only once this one's memory is gone.
             drop(batch);
+            waiter.complete(result);
         }
         Item::Sync { waiter, .. } => waiter.complete(result),
     }

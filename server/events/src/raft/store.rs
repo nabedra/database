@@ -148,7 +148,9 @@ impl Database {
             fs,
             Arc::new(BlockCache::new(CACHE_BYTES)),
             Arc::new(MemtableBudget::new(MEMTABLE_BUDGET_BYTES)),
-            Background::new(BACKGROUND_THREADS),
+            // `Background::new` returns the OS's refusal to start a thread (RV-NS6 F9);
+            // the broker cannot run without its store threads.
+            Background::new(BACKGROUND_THREADS).expect("start the Events kv background threads"),
         );
         options.memtable_bytes = MEMTABLE_BYTES;
         options.scope_of = scope_of;

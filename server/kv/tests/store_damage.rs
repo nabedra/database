@@ -95,7 +95,7 @@ fn val(tag: &str) -> Vec<u8> {
 #[test]
 fn ns07_g1_group_record_damage_quarantines_only_that_group() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     let g1 = group_prefix(1);
     let g2 = group_prefix(2);
@@ -198,11 +198,98 @@ fn ns07_g1_group_record_damage_quarantines_only_that_group() {
     );
 }
 
+/// NS07 / R6 (RV-NS6 F2): `Opened::quarantined_now` names only the scopes this open
+/// quarantined. Damage persisted by an earlier open stays in `quarantined` but is not
+/// counted again, so two isolated damages found at different opens never add up.
+#[test]
+fn ns07_r6_quarantined_now_names_only_this_opens_damage() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    let sync = Durability::Sync;
+    write_kv(
+        &store,
+        &group_prefix(1),
+        &group_key(1, 1),
+        &val("g1-a"),
+        false,
+        sync,
+    );
+    write_kv(
+        &store,
+        &group_prefix(3),
+        &group_key(3, 1),
+        &val("g3-a"),
+        false,
+        sync,
+    );
+    let image = fs.kill();
+    drop(store);
+    let (seg, off) = find_one(&image, &dir.join("journal"), b"<<g1-a>>");
+    image.flip_bit(&seg, off + 20, 3).unwrap();
+
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    let scopes = |list: &[Damage]| {
+        let mut scopes: Vec<Vec<u8>> = list.iter().map(|d| d.scope.to_vec()).collect();
+        scopes.sort();
+        scopes
+    };
+    assert_eq!(scopes(&opened.quarantined), vec![group_prefix(1)]);
+    assert_eq!(scopes(&opened.quarantined_now), vec![group_prefix(1)]);
+    let s = opened.store;
+    write_kv(
+        &s,
+        &group_prefix(2),
+        &group_key(2, 1),
+        &val("g2-a"),
+        false,
+        sync,
+    );
+    write_kv(
+        &s,
+        &group_prefix(3),
+        &group_key(3, 2),
+        &val("g3-b"),
+        false,
+        sync,
+    );
+    s.close().unwrap();
+    let image = image.kill();
+    let (seg, off) = find_one(&image, &dir.join("journal"), b"<<g2-a>>");
+    image.flip_bit(&seg, off + 20, 3).unwrap();
+
+    // The second open finds g01's record damaged again and g02's for the first time.
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    assert_eq!(
+        scopes(&opened.quarantined),
+        vec![group_prefix(1), group_prefix(2)]
+    );
+    assert_eq!(scopes(&opened.quarantined_now), vec![group_prefix(2)]);
+    assert_eq!(
+        opened
+            .store
+            .snapshot()
+            .get(&group_key(3, 2))
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        val("g3-b")
+    );
+    opened.store.close().unwrap();
+    let opened = Store::open(&dir, options(&image.kill(), &bg)).unwrap();
+    assert_eq!(opened.quarantined.len(), 2);
+    assert!(
+        opened.quarantined_now.is_empty(),
+        "{:?}",
+        opened.quarantined_now
+    );
+}
+
 /// NS07 R1: damage to a durable store-wide record refuses the store, and stays refused.
 #[test]
 fn ns07_r1_store_wide_record_damage_refuses() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     write_kv(&store, b"", b"s/k1", &val("sw-a"), false, Durability::Sync);
     write_kv(
@@ -234,7 +321,7 @@ fn ns07_r1_store_wide_record_damage_refuses() {
 #[test]
 fn ns07_g2_run_block_damage_quarantines_on_read() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     for k in 0..30 {
         write_kv(
@@ -305,6 +392,12 @@ fn ns07_g2_run_block_damage_quarantines_on_read() {
         opened.quarantined[0].scope.as_ref(),
         group_prefix(1).as_slice()
     );
+    // RV-NS6 F2: persisted at run time, so not quarantined by this open.
+    assert!(
+        opened.quarantined_now.is_empty(),
+        "{:?}",
+        opened.quarantined_now
+    );
 }
 
 /// NS07 G2 at open: a damaged footer of a run holding one group quarantines that group;
@@ -313,7 +406,7 @@ fn ns07_g2_run_block_damage_quarantines_on_read() {
 fn ns07_g2_run_footer_damage_at_open() {
     for spanning in [false, true] {
         let (fs, dir) = fault_fs();
-        let bg = Background::new(2);
+        let bg = Background::new(2).unwrap();
         let store = open(&dir, options(&fs, &bg));
         for k in 0..10 {
             write_kv(
@@ -392,7 +485,7 @@ fn ns07_g2_run_footer_damage_at_open() {
 fn ns07_g3_journal_value_damage() {
     for flushed in [false, true] {
         let (fs, dir) = fault_fs();
-        let bg = Background::new(2);
+        let bg = Background::new(2).unwrap();
         let store = open(&dir, options(&fs, &bg));
         let seen: Arc<Mutex<Vec<Damage>>> = Arc::default();
         let sink = seen.clone();
@@ -463,7 +556,7 @@ fn ns07_g3_journal_value_damage() {
 #[test]
 fn ns07_r3_current_and_manifest_damage_refuse() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let store = open(&dir, options(&fs, &bg));
     for round in 0..3 {
         write_kv(
@@ -561,7 +654,7 @@ fn check_prefix(store: &Store) {
 /// counters, and a second open is identical.
 #[test]
 fn ns06_ns25_torn_tails_recover_to_an_exact_prefix() {
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     for case in ["torn payload", "torn header", "zero header"] {
         let (image, dir, seg, off) = image_with_unsynced_tail(&bg);
         let block = off / 4096 * 4096;

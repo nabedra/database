@@ -348,9 +348,10 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     )
     .unwrap();
     let mut groups = Vec::new();
+    let mut deferrals = Vec::new();
     for _ in 0..GROUPS {
         let group = pool.group(group_identity(&pool)).await.unwrap();
-        assert!(group.defer_apply_sync(&group));
+        deferrals.push(group.defer_apply_sync(&group).unwrap());
         groups.push(group);
     }
     let before = pool.inner.store.stats();
@@ -398,7 +399,7 @@ async fn ns08_o05_o06_group_commit_shares_fsyncs_across_64_groups_and_4_lanes() 
     assert!(syncs < synced, "{syncs} fsyncs for {synced} synced commits");
     for group in &groups {
         assert_eq!(group.write_stats().deferred_writes, 2 * ROUNDS);
-        assert_eq!(group.write_stats().synced_writes, 2 * ROUNDS);
+        assert_eq!(group.write_stats().synced_requests, 2 * ROUNDS);
     }
 
     // Hold the journal sync: synced writers on every Query-lane group wait for
@@ -521,7 +522,7 @@ async fn o11_separate_pool_log_keeps_application_synced() {
     let id = group_identity(&first);
     let state = first.group(id.clone()).await.unwrap();
     let log = second.group(id).await.unwrap();
-    assert!(!state.defer_apply_sync(&log));
+    assert!(state.defer_apply_sync(&log).is_none());
     assert!(!state.applies_deferred());
     for index in 0..4 {
         state
@@ -534,7 +535,7 @@ async fn o11_separate_pool_log_keeps_application_synced() {
             .unwrap();
     }
     let stats = state.write_stats();
-    assert_eq!((stats.synced_writes, stats.deferred_writes), (4, 0));
+    assert_eq!((stats.synced_requests, stats.deferred_writes), (4, 0));
     assert_eq!(stats.unsynced_applied_index, None);
     assert!(!first.has_unsynced_writes());
 }
@@ -549,9 +550,10 @@ async fn o11_concurrent_groups_track_unsynced_applies_against_an_oracle() {
     let resources = shared(SharedResourceConfig::default());
     let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
     let mut groups = Vec::new();
+    let mut deferrals = Vec::new();
     for _ in 0..6 {
         let group = pool.group(group_identity(&pool)).await.unwrap();
-        assert!(group.defer_apply_sync(&group));
+        deferrals.push(group.defer_apply_sync(&group).unwrap());
         groups.push(group);
     }
     let mut rng = 0x5eed_u64;
@@ -619,19 +621,19 @@ async fn o11_stopped_host_clears_deferred_application() {
     let resources = shared(SharedResourceConfig::default());
     let pool = OltpPool::open_development(&dir.0, pool_identity(), resources).unwrap();
     let group = pool.group(group_identity(&pool)).await.unwrap();
-    assert!(group.defer_apply_sync(&group));
+    let host = group.defer_apply_sync(&group).unwrap();
     group
         .transaction(meta(0), budget(), put_entry(0, b"row", vec![0]))
         .await
         .unwrap();
     assert_eq!(group.write_stats().deferred_writes, 1);
-    group.stop_deferred_applies();
+    drop(host);
     group
         .transaction(meta(1), budget(), put_entry(1, b"row", vec![1]))
         .await
         .unwrap();
     let stats = group.write_stats();
-    assert_eq!((stats.deferred_writes, stats.synced_writes), (1, 1));
+    assert_eq!((stats.deferred_writes, stats.synced_requests), (1, 1));
     assert_eq!(stats.unsynced_applied_index, None);
 }
 
@@ -811,8 +813,36 @@ async fn o06_ns07_damaged_group_is_quarantined_reported_and_never_started() {
     }
     drop(pool);
 
-    // R6: two of twelve groups (more than 10%) is refused.
+    // R6 counts the groups quarantined by one open (RV-NS6 F2): group 03 was
+    // quarantined by the previous open, so new damage in group 07 is one of
+    // twelve. The pool opens with both quarantined.
     damage_journal_value(&dir, &fault, b"damage-target-07-0123456789abcdef");
+    let pool = reopen(&dir, &fault, identity.clone(), resources.clone()).unwrap();
+    let mut quarantined = pool.quarantined_groups();
+    quarantined.sort();
+    let mut expected = vec![ids[3].group_id, ids[7].group_id];
+    expected.sort();
+    assert_eq!(quarantined, expected);
+    assert_eq!(resources.storage_stats().quarantined_groups, 2);
+    for n in [3, 7] {
+        let refused = pool.retained_group(ids[n].clone()).await.err().unwrap();
+        assert!(
+            refused.message.contains("quarantined"),
+            "{}",
+            refused.message
+        );
+    }
+    let healthy = pool.retained_group(ids[1].clone()).await.unwrap();
+    healthy
+        .log_transaction(budget(), put_entry(2, b"entry3", b"still".to_vec()))
+        .await
+        .unwrap();
+    drop(healthy);
+    drop(pool);
+
+    // R6: two of twelve groups (more than 10%) quarantined by one open is refused.
+    damage_journal_value(&dir, &fault, b"damage-target-09-0123456789abcdef");
+    damage_journal_value(&dir, &fault, b"damage-target-10-0123456789abcdef");
     let error = reopen(&dir, &fault, identity, resources).err().unwrap();
     assert_eq!(error.code, ErrorCode::StorageUnavailable);
     assert!(error.message.contains("too many"), "{}", error.message);
@@ -1046,7 +1076,8 @@ fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
 /// NS08 / NS17 (pool level, NS5b pacing): with L0 at its slowdown trigger, a
 /// group write is paced on a timer, not on the executor. The single query
 /// thread keeps serving reads while the write waits, the write lands after its
-/// delay, and a cancelled caller does not drop the dispatched write.
+/// delay, and a cancelled caller does not drop the dispatched write, also when
+/// it is cancelled while the executor still builds the write (RV-NS6 F4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     let dir = Dir::new();
@@ -1120,6 +1151,47 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
     .expect("the dispatched write was dropped with its caller");
     let applied = group.applied_state(budget()).await.unwrap().unwrap();
     assert_eq!(applied.position, meta(2).position);
+
+    // RV-NS6 F4: a caller cancelled while the executor still builds its paced
+    // write. The executor finishes the batch after the caller is gone; the
+    // write must land all the same, exactly once.
+    assert!(pool.inner.store.stats().l0_runs >= 1);
+    let started = std::time::Instant::now();
+    let writer = group.clone();
+    let cancelled = tokio::spawn(async move {
+        writer
+            .transaction(meta(3), budget(), move |tx| {
+                // Still inside the executor when the caller is cancelled.
+                std::thread::sleep(Duration::from_millis(200));
+                tx.put(b"row", &[5u8; 16 << 10])?;
+                Ok(Transition::Commit(tx.copy_output(&3u64.to_be_bytes())?))
+            })
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancelled.abort();
+    let _ = cancelled.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while get(&group, b"row").await != vec![5u8; 16 << 10] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a write cancelled while the executor built it was dropped");
+    // It took the paced path: 200 ms in the executor, then the pacing delay.
+    let landed = started.elapsed();
+    assert!(
+        landed >= Duration::from_millis(350),
+        "landed after {landed:?}"
+    );
+    let applied = group.applied_state(budget()).await.unwrap().unwrap();
+    assert_eq!(applied.position, meta(3).position);
+    // Order holds: the next write lands after it.
+    group
+        .transaction(meta(4), budget(), put_entry(4, b"row", vec![4u8; 16 << 10]))
+        .await
+        .unwrap();
+    assert_eq!(get(&group, b"row").await, vec![4u8; 16 << 10]);
 }
 
 /// O05 / M02 regression (NS6): the journal thread wakes a committer before it
@@ -1132,7 +1204,7 @@ async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
     let resources = shared(SharedResourceConfig::default());
     let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
     let group = pool.group(group_identity(&pool)).await.unwrap();
-    assert!(group.defer_apply_sync(&group));
+    let _host = group.defer_apply_sync(&group).unwrap();
     let baseline = resources.scheduler().usage();
     for index in 0..300u64 {
         let value = vec![index as u8; 1 << 10];
@@ -1154,3 +1226,5 @@ async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
         assert!(group.inner.log_order.try_lock().is_ok(), "write {index}");
     }
 }
+
+mod rv_ns6;
