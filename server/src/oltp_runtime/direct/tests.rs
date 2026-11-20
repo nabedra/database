@@ -274,7 +274,7 @@ impl Cluster {
                 dir.0.join(format!("pool{node}")),
                 PoolIdentity {
                     engine: "oltp".into(),
-                    pool_format_version: 1,
+                    pool_format_version: 2,
                     cluster_id,
                     worker_id: worker.worker_id,
                     pool_id: members[&node].pool_id,
