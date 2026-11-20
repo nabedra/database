@@ -252,8 +252,9 @@ jobs:
       - name: Acceptance (NS27)
         run: |
           docker pull python:3.11-slim-bookworm
+          mkdir -p events-acceptance
           python server/events/tests/acceptance.py --image nabedra-events:ci --cpus 2 --memory-mib 1536 \
-            --fault-image python:3.11-slim-bookworm --output events-acceptance --logs events-acceptance/logs
+            --fault-image python:3.11-slim-bookworm --output events-acceptance/result.json --logs events-acceptance/logs
       - if: always()
         uses: actions/upload-artifact@v4
         with:
