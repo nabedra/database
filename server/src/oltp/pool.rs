@@ -160,6 +160,15 @@ enum Submitted {
         commit: nabedra_kv::Commit,
         deferred: bool,
     },
+    /// L0 slowdown: the batch waits `delay` off the executor, then is submitted.
+    Paced {
+        response: ChargedBytes,
+        delay: std::time::Duration,
+        batch: WriteBatch,
+        durability: Durability,
+        on_done: Box<dyn std::any::Any + Send>,
+        deferred_index: Option<Option<u64>>,
+    },
 }
 #[derive(Clone, Copy)]
 enum ReplyLane {
@@ -202,7 +211,21 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         fs: Arc<dyn nabedra_kv::fs::Fs>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_path_on(path.as_ref(), identity, shared, None, fs, Some(1 << 20))
+        Self::open_development_tuned(path, identity, shared, fs, |_| {})
+    }
+    /// Test-only: [`Self::open_development_on`] with store options adjusted by `tune`.
+    #[cfg(test)]
+    pub(crate) fn open_development_tuned(
+        path: impl AsRef<Path>,
+        identity: PoolIdentity,
+        shared: Arc<WorkerSharedResources>,
+        fs: Arc<dyn nabedra_kv::fs::Fs>,
+        tune: fn(&mut nabedra_kv::Options),
+    ) -> Result<Self, ProtocolError> {
+        Self::open_path_on(path.as_ref(), identity, shared, None, fs, &|options| {
+            options.journal.segment_bytes = 1 << 20;
+            tune(options);
+        })
     }
     fn open_path(
         path: &Path,
@@ -210,7 +233,14 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_path_on(path, identity, shared, mount, nabedra_kv::fs::real(), None)
+        Self::open_path_on(
+            path,
+            identity,
+            shared,
+            mount,
+            nabedra_kv::fs::real(),
+            &|_| {},
+        )
     }
     fn open_path_on(
         path: &Path,
@@ -218,7 +248,7 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
         fs: Arc<dyn nabedra_kv::fs::Fs>,
-        segment_bytes: Option<u64>,
+        tune: &dyn Fn(&mut nabedra_kv::Options),
     ) -> Result<Self, ProtocolError> {
         identity.validate()?;
         super::native::validate_thread_defaults(shared.thread_budget())?;
@@ -232,9 +262,7 @@ impl OltpPool {
         open_pool_manifest(path, &identity)?;
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
-        if let Some(bytes) = segment_bytes {
-            options.journal.segment_bytes = bytes;
-        }
+        tune(&mut options);
         let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
         let store = OwnedStore(Some(opened.store));
         // R6 at pool level: a damaged open that quarantines more than 8 groups, or
@@ -424,6 +452,15 @@ impl OltpPool {
             .submit(batch, durability, on_done)
             .map_err(|error| self.failed(error))
     }
+    /// L0 slowdown pacing for a synchronous writer (executor threads). The store
+    /// paces only callers that ask; a caller on an async runtime thread never
+    /// sleeps here (it awaits [`Store::write_delay`] instead).
+    fn pace_blocking(&self, bytes: usize) {
+        let delay = self.inner.store.write_delay(bytes);
+        if !delay.is_zero() && tokio::runtime::Handle::try_current().is_err() {
+            std::thread::sleep(delay);
+        }
+    }
     /// The protocol error for a failed write; ambiguous failures latch the pool.
     fn failed(&self, error: nabedra_kv::Error) -> ProtocolError {
         if let nabedra_kv::Error::InvalidArgument(_) = error {
@@ -439,6 +476,7 @@ impl OltpPool {
     /// A synced write from a synchronous pool path (executor threads, and pool
     /// open). Ordinary group transactions use the asynchronous commit instead.
     fn durable_write(&self, scope: &[u8], batch: WriteBatch) -> Result<(), ProtocolError> {
+        self.pace_blocking(batch.encoded_bytes());
         let commit = self.submit(scope, batch, Durability::Sync, Box::new(()))?;
         wait_commit(commit).map_err(|error| self.failed(error))?;
         self.inner.synced_requests.fetch_add(1, Ordering::Relaxed);
@@ -835,6 +873,29 @@ impl GroupStore {
         self.inner.deferred_apply.store(true, Ordering::Release);
         true
     }
+    /// Submits a group transaction's batch and records the deferred tail.
+    fn submit_group(
+        &self,
+        batch: WriteBatch,
+        durability: Durability,
+        on_done: Box<dyn std::any::Any + Send>,
+        deferred_index: Option<Option<u64>>,
+    ) -> Result<nabedra_kv::Commit, ProtocolError> {
+        let commit = self.pool().submit(
+            &group_scope(self.identity().group_id),
+            batch,
+            durability,
+            on_done,
+        )?;
+        if let Some(Some(index)) = deferred_index {
+            *self
+                .inner
+                .deferred_tail
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some((index, commit.seq()));
+        }
+        Ok(commit)
+    }
     /// The Raft host stopped: later application writes are synced again, since no
     /// running log replays them (RV-T2 Q5).
     pub(crate) fn stop_deferred_applies(&self) {
@@ -1043,20 +1104,21 @@ impl GroupStore {
                     } else {
                         Durability::Sync
                     };
-                    let commit = group.pool().submit(
-                        &group_scope(group.identity().group_id),
-                        batch,
-                        durability,
-                        Box::new((guards, batch_charge)),
-                    )?;
-                    if let Some(Some(index)) = deferred_index {
-                        *group
-                            .inner
-                            .deferred_tail
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner()) =
-                            Some((index, commit.seq()));
+                    let on_done: Box<dyn std::any::Any + Send> = Box::new((guards, batch_charge));
+                    // L0 slowdown pacing is opt-in per writer (NS5b). A slowed
+                    // write leaves the executor and waits on a timer instead.
+                    let delay = group.pool().inner.store.write_delay(batch.encoded_bytes());
+                    if !delay.is_zero() {
+                        return Ok(Submitted::Paced {
+                            response,
+                            delay,
+                            batch,
+                            durability,
+                            on_done,
+                            deferred_index,
+                        });
                     }
+                    let commit = group.submit_group(batch, durability, on_done, deferred_index)?;
                     Ok(Submitted::Pending {
                         response,
                         commit,
@@ -1074,7 +1136,37 @@ impl GroupStore {
                 }
             })
             .await?;
+        let submitted = match submitted {
+            Submitted::Paced {
+                response,
+                delay,
+                batch,
+                durability,
+                on_done,
+                deferred_index,
+            } => {
+                // The task owns the batch and its guards: a cancelled caller
+                // neither drops a dispatched write nor releases ordering early.
+                let group = self.clone();
+                let commit = tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    group.submit_group(batch, durability, on_done, deferred_index)
+                })
+                .await
+                .map_err(|_| {
+                    self.pool().latch();
+                    recovery_unknown()
+                })??;
+                Submitted::Pending {
+                    response,
+                    commit,
+                    deferred: deferred_index.is_some(),
+                }
+            }
+            submitted => submitted,
+        };
         match submitted {
+            Submitted::Paced { .. } => unreachable!("paced writes were submitted above"),
             Submitted::Done(response) => Ok(response),
             Submitted::Empty { response, sync } => {
                 if sync {

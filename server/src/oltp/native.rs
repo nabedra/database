@@ -16,6 +16,9 @@ unsafe extern "C" {
 #[cfg(all(unix, not(target_os = "macos")))]
 use libc::pthread_attr_getguardsize;
 
+/// Threads each open `nabedra-kv` store runs: the journal writer and its
+/// segment preparer.
+const JOURNAL_THREADS_PER_POOL: usize = 2;
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct NativeThreadBudget {
     pub query_threads: usize,
@@ -24,7 +27,8 @@ pub struct NativeThreadBudget {
     pub flush_threads: usize,
     /// `kv-compact`: `background_threads - 1` per worker.
     pub compaction_threads: usize,
-    /// `kv-journal`: one per open pool, at most `max_open_pools`.
+    /// `kv-journal` and `kv-journal-prep` (segment preparation): two per open
+    /// pool, at most `2 * max_open_pools`.
     pub journal_threads: usize,
     pub query_control_stack_bytes_per_thread: usize,
     pub storage_stack_bytes_per_thread: usize,
@@ -52,8 +56,11 @@ impl NativeThreadBudget {
         // Every thread is a Rust thread: query and control request 2 MiB stacks,
         // and `nabedra-kv` threads take Rust's 2 MiB default. Reserve 4 MiB each
         // to include guards and per-thread allocator metadata.
+        let journal = max_open_pools
+            .checked_mul(JOURNAL_THREADS_PER_POOL)
+            .ok_or_else(invalid)?;
         let storage = (background as usize)
-            .checked_add(max_open_pools)
+            .checked_add(journal)
             .ok_or_else(invalid)?;
         let bytes = query
             .checked_add(control)
@@ -65,7 +72,7 @@ impl NativeThreadBudget {
             control_threads: control,
             flush_threads: 1,
             compaction_threads: background as usize - 1,
-            journal_threads: max_open_pools,
+            journal_threads: journal,
             query_control_stack_bytes_per_thread: rust_stack,
             storage_stack_bytes_per_thread: rust_stack,
             total_stack_reservation_bytes: bytes,
@@ -126,12 +133,12 @@ mod tests {
         let report = NativeThreadBudget::with_pools(1, 1, 128, 8).unwrap();
         assert_eq!(report.flush_threads, 1);
         assert_eq!(report.compaction_threads, 127);
-        assert_eq!(report.journal_threads, 8);
+        assert_eq!(report.journal_threads, 16);
         assert!(report.storage_stack_bytes_per_thread >= 4 << 20);
         assert_eq!(
             report.total_stack_reservation_bytes,
             2 * report.query_control_stack_bytes_per_thread
-                + (128 + 8) * report.storage_stack_bytes_per_thread
+                + (128 + 16) * report.storage_stack_bytes_per_thread
         );
         assert!(NativeThreadBudget::with_pools(usize::MAX, 1, 128, 8).is_err());
         assert!(NativeThreadBudget::with_pools(1, 1, 1, 8).is_err());

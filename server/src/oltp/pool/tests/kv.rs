@@ -941,12 +941,11 @@ async fn ns10_o21_two_pools_beyond_memory_budget_stay_inside_their_charges() {
 
 /// O05: `nabedra-kv` threads. Run in a child process so other tests' threads
 /// do not count: each worker starts `kv-flush` x1 and `kv-compact` x(n-1), and
-/// each open pool one `kv-journal` that stops when the pool closes.
+/// each open pool `kv-journal` and `kv-journal-prep`, which stop when the pool closes.
 #[test]
-fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
+fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
     const FLAG: &str = "NABEDRA_NS6_THREAD_PROBE";
-    const NAME: &str =
-        "oltp::pool::tests::kv::o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool";
+    const NAME: &str = "oltp::pool::tests::kv::o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool";
     if std::env::var_os(FLAG).is_none() {
         for background in ["2", "5"] {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1008,7 +1007,7 @@ fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
     let budget = resources.thread_budget();
     assert_eq!(budget.flush_threads, 1);
     assert_eq!(budget.compaction_threads, background as usize - 1);
-    assert_eq!(budget.journal_threads, config.max_open_pools);
+    assert_eq!(budget.journal_threads, 2 * config.max_open_pools);
     let identity = pool_identity();
     let first_dir = Dir::new();
     let second_dir = Dir::new();
@@ -1025,13 +1024,14 @@ fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
     )
     .unwrap();
     let after_second = count();
-    assert_eq!(after_first - after_worker, 1);
-    assert_eq!(after_second - after_first, 1);
+    assert_eq!(after_first - after_worker, 2);
+    assert_eq!(after_second - after_first, 2);
     #[cfg(target_os = "linux")]
     {
         assert_eq!(named("kv-flush"), 1);
         assert_eq!(named("kv-compact"), background as usize - 1);
         assert_eq!(named("kv-journal"), 2);
+        assert_eq!(named("kv-journal-prep"), 2);
         assert_eq!(named("rocksdb:high") + named("rocksdb:low"), 0);
     }
     drop(second);
@@ -1041,4 +1041,83 @@ fn o05_kv_threads_are_per_worker_plus_one_journal_per_open_pool() {
     );
     drop(first);
     drop(resources);
+}
+
+/// NS08 / NS17 (pool level, NS5b pacing): with L0 at its slowdown trigger, a
+/// group write is paced on a timer, not on the executor. The single query
+/// thread keeps serving reads while the write waits, the write lands after its
+/// delay, and a cancelled caller does not drop the dispatched write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
+    let dir = Dir::new();
+    let fault = FaultFs::new();
+    fs::create_dir_all(&dir.0).unwrap();
+    fault.create_dir_all_durable(&dir.0);
+    let resources = shared(SharedResourceConfig::default());
+    let pool = OltpPool::open_development_tuned(
+        &dir.0,
+        pool_identity(),
+        resources,
+        Arc::new(fault.clone()),
+        |options| {
+            options.levels.l0_compaction_trigger = 64;
+            options.levels.l0_slowdown_writes = 1;
+            options.levels.l0_stop_writes = 64;
+            // 64 KiB/s: a 16 KiB batch waits about 250 ms.
+            options.levels.delayed_write_rate = 64 << 10;
+        },
+    )
+    .unwrap();
+    let group = pool.group(group_identity(&pool)).await.unwrap();
+    group
+        .transaction(meta(0), budget(), put_entry(0, b"row", b"before".to_vec()))
+        .await
+        .unwrap();
+    // One flushed L0 run reaches the slowdown trigger.
+    let flushing = pool.clone();
+    tokio::task::spawn_blocking(move || flushing.inner.store.flush().unwrap())
+        .await
+        .unwrap();
+    assert!(pool.inner.store.stats().l0_runs >= 1);
+
+    let started = std::time::Instant::now();
+    let writer = group.clone();
+    let paced = tokio::spawn(async move {
+        writer
+            .transaction(meta(1), budget(), put_entry(1, b"row", vec![7u8; 16 << 10]))
+            .await
+            .unwrap();
+        started.elapsed()
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!paced.is_finished(), "the write was not paced");
+    // The paced write holds no executor slot: the one query thread serves a read.
+    let read = tokio::time::timeout(Duration::from_millis(150), get(&group, b"row"))
+        .await
+        .expect("read waited behind a paced write");
+    assert_eq!(read, b"before");
+    let waited = paced.await.unwrap();
+    assert!(waited >= Duration::from_millis(150), "paced for {waited:?}");
+    assert_eq!(get(&group, b"row").await, vec![7u8; 16 << 10]);
+
+    // A caller cancelled while its write waits on the pacing timer: the write
+    // still lands, exactly once, in order.
+    let writer = group.clone();
+    let cancelled = tokio::spawn(async move {
+        writer
+            .transaction(meta(2), budget(), put_entry(2, b"row", vec![9u8; 16 << 10]))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancelled.abort();
+    let _ = cancelled.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while get(&group, b"row").await != vec![9u8; 16 << 10] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the dispatched write was dropped with its caller");
+    let applied = group.applied_state(budget()).await.unwrap().unwrap();
+    assert_eq!(applied.position, meta(2).position);
 }

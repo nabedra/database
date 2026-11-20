@@ -81,6 +81,12 @@ pub struct StorageStats {
     pub corruption_detected: u64,
     pub tail_truncations: u64,
     pub quarantined_groups: u32,
+    /// Journal records the manifest expected but the last open did not find.
+    pub journal_behind_manifest: u64,
+    /// Reads that met a locator into a recycled journal segment (each latches).
+    pub recycled_value_reads: u64,
+    /// Store memory charged to the pool overhead.
+    pub overhead_bytes: u64,
 }
 impl StorageStats {
     fn add(&mut self, stats: &StoreStats, quarantined: usize) {
@@ -102,6 +108,9 @@ impl StorageStats {
         self.corruption_detected += stats.corruption_detected;
         self.tail_truncations += stats.tail_truncations;
         self.quarantined_groups += quarantined as u32;
+        self.journal_behind_manifest += stats.journal_behind_manifest;
+        self.recycled_value_reads += stats.recycled_value_reads;
+        self.overhead_bytes += stats.overhead_bytes;
     }
 }
 
