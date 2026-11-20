@@ -2,7 +2,10 @@
 //! not publish routes or authorize volume/worker removal. The controller must
 //! retain its durable per-group transition while using these capabilities.
 use super::*;
-use crate::oltp::pool::{ByteClass, ScratchLease};
+use crate::oltp::pool::{ByteClass, DamagedReplicaRemoved, OltpPool, ReleaseOutcome, ScratchLease};
+use crate::oltp_replication::authority::control::{
+    ControlClient, ControlHandle, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport,
+};
 use openraft::raft::Precondition;
 use std::{collections::BTreeSet, time::Duration};
 
@@ -397,5 +400,255 @@ where
             return Err(invalid());
         }
         Ok(observed)
+    }
+}
+
+// ----- NS14: quarantined groups (plan section 3, "Raft safety of a quarantined group") -----
+
+/// Where a worker sends `GroupDamaged` and reads Control's record: the remote
+/// [`ControlClient`](super::super::authority::control::ControlClient), or the
+/// local handle on a worker that hosts Control.
+pub(crate) trait DamageControl: Send + Sync {
+    fn report(
+        &self,
+        report: GroupDamageReport,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupDamageRecord, ProtocolError>> + Send + '_>>;
+    fn record(
+        &self,
+        group_id: uuid::Uuid,
+        node_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupDamageRecord>, ProtocolError>> + Send + '_>>;
+}
+impl DamageControl for ControlClient {
+    fn report(
+        &self,
+        report: GroupDamageReport,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupDamageRecord, ProtocolError>> + Send + '_>> {
+        Box::pin(self.report_group_damage(report))
+    }
+    fn record(
+        &self,
+        group_id: uuid::Uuid,
+        node_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupDamageRecord>, ProtocolError>> + Send + '_>>
+    {
+        Box::pin(self.group_damage(group_id, node_id))
+    }
+}
+/// The local Control handle, reporting as this worker.
+pub(crate) struct LocalDamageControl {
+    pub(crate) handle: Arc<ControlHandle>,
+    pub(crate) worker: WorkerIdentity,
+}
+impl DamageControl for LocalDamageControl {
+    fn report(
+        &self,
+        report: GroupDamageReport,
+    ) -> Pin<Box<dyn Future<Output = Result<GroupDamageRecord, ProtocolError>> + Send + '_>> {
+        Box::pin(self.handle.report_group_damage(self.worker, report))
+    }
+    fn record(
+        &self,
+        group_id: uuid::Uuid,
+        node_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupDamageRecord>, ProtocolError>> + Send + '_>>
+    {
+        Box::pin(self.handle.group_damage(group_id, node_id))
+    }
+}
+
+/// Receives the replicas the manager stopped after run-time damage.
+pub(crate) trait DamageSink: Send + Sync {
+    fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool);
+}
+
+/// Rules 2 and 4 on the damaged worker. Reports the replica until Control
+/// acknowledges it, then polls Control's record. Once the record says the
+/// change removing this replica committed, releases the group's bytes and
+/// returns. A refused pool (`pool` is `None`) has nothing to release, so the
+/// acknowledgment ends it. Never deletes anything without that record (rule 5).
+pub(crate) async fn settle_damage(
+    control: Arc<dyn DamageControl>,
+    report: GroupDamageReport,
+    pool: Option<OltpPool>,
+    retry: Duration,
+) -> ReleaseOutcome {
+    let mut delay = retry;
+    let mut acknowledged = false;
+    loop {
+        let step = async {
+            let record = if acknowledged {
+                control
+                    .record(report.group.group_id, report.replica.node_id)
+                    .await?
+                    .ok_or_else(unavailable)?
+            } else {
+                control.report(report.clone()).await?
+            };
+            acknowledged = true;
+            match (record.removal(), &pool) {
+                (_, None) => Ok(Some(ReleaseOutcome::AlreadyReleased)),
+                (Some(removed), Some(pool)) => pool.release_damaged_group(removed).await.map(Some),
+                (None, Some(_)) => Ok(None),
+            }
+        }
+        .await;
+        match step {
+            Ok(Some(outcome)) => return outcome,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                group = %report.group.group_id,
+                node = report.replica.node_id,
+                %error,
+                "group damage report not settled yet; retrying"
+            ),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(30));
+    }
+}
+
+impl HostedGroupManager {
+    /// Installs where run-time damage is reported (rule 2).
+    pub(crate) fn install_damage_sink(&self, sink: Arc<dyn DamageSink>) {
+        if let Ok(mut slot) = self.damage_sink.lock() {
+            *slot = Some(sink);
+        }
+    }
+
+    /// Section 3 rule 1 at run time: when kv quarantines this replica's group,
+    /// the host stops. Its routes close first, so the replica never votes,
+    /// acknowledges, serves a ReadIndex or exports a snapshot again; then Raft
+    /// shuts down, and the replica is reported. The watcher holds the host,
+    /// the routes and the sink weakly, and ends when the pool closes.
+    pub(super) fn stop_on_damage<C, M>(&self, running: &Managed<C, M>, node: u64)
+    where
+        C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+        M: TypedMachine<C>,
+    {
+        let store = running.state.store();
+        let group = store.identity().group_id;
+        let mut damage = store.pool().watch_damage();
+        let routes = Arc::downgrade(&self.routes);
+        let sink = Arc::downgrade(&self.damage_sink);
+        let host = Arc::downgrade(running);
+        tokio::spawn(async move {
+            let damaged = damage
+                .wait_for(|groups| groups.contains(&group))
+                .await
+                .is_ok();
+            if !damaged {
+                return;
+            }
+            let Some(running) = host.upgrade() else {
+                return;
+            };
+            let Some(routes) = routes.upgrade() else {
+                return;
+            };
+            let stopped = {
+                let Ok(mut routes) = routes.lock() else {
+                    return;
+                };
+                let Some(entry) = routes.get_mut(&group) else {
+                    return;
+                };
+                let same = entry.replicas.get(&node).is_some_and(|route| {
+                    std::ptr::addr_eq(Arc::as_ptr(&route.typed), Arc::as_ptr(&running))
+                });
+                if !same {
+                    return;
+                }
+                let route = entry.replicas.remove(&node);
+                (entry.dispatcher.clone(), entry.services.clone(), route)
+            };
+            let (dispatcher, services, route) = stopped;
+            tracing::error!(
+                %group,
+                node,
+                "stopping the Raft host of a group damaged at run time; this identity never \
+                 votes or acknowledges again"
+            );
+            if let Some(services) = services {
+                let _ = services.retire(node).await;
+            }
+            let _ = dispatcher.retire(node).await;
+            if let Err(error) = running.shutdown().await {
+                tracing::warn!(%group, node, %error, "damaged host stopped with an error");
+            }
+            let sink = sink
+                .upgrade()
+                .and_then(|sink| sink.lock().ok().and_then(|sink| sink.clone()));
+            if let (Some(sink), Some(route)) = (sink, route) {
+                let store = running.state.store();
+                sink.damaged(store.identity().clone(), route.member, store.pool().clone());
+            }
+        });
+    }
+}
+
+/// Rule 3 evidence after the leader replaced a damaged voter.
+pub(crate) struct DamagedReplacement {
+    pub(crate) membership: GroupMembershipObservation,
+    pub(crate) removed: DamagedReplicaRemoved,
+    pub(crate) proof: GroupDamageReplacement,
+}
+
+impl<C, M> RaftConsensus<C, M>
+where
+    C: TypedConfig<
+            R = Applied<Option<<C as TypedConfig>::Reply>>,
+            MembershipEdit = openraft::impls::ChangeMembers<u64, ReplicaMember>,
+        >,
+    M: TypedMachine<C>,
+{
+    /// Section 3 rule 3 on the group's leader: replaces the damaged voter with
+    /// a fresh identity through the joint-membership `replace_voter`. The new
+    /// replica starts as a learner, catches up (a snapshot when the log no
+    /// longer covers it, O16) and is promoted; the damaged identity leaves the
+    /// voters. Rule 5: without a quorum that excludes the damaged replica the
+    /// quorum read or the change fails, and nothing is recorded or deleted.
+    /// Idempotent after the change committed.
+    pub(crate) async fn replace_damaged_voter(
+        &self,
+        damaged: &ReplicaMember,
+        fresh: ReplicaMember,
+    ) -> Result<DamagedReplacement, ProtocolError> {
+        damaged.validate().map_err(|_| invalid())?;
+        fresh.validate().map_err(|_| invalid())?;
+        if fresh.node_id == damaged.node_id {
+            return Err(invalid());
+        }
+        let current = self.observe_membership().await?;
+        let membership = if current.replicas.iter().any(|member| member == damaged) {
+            if current
+                .replicas
+                .iter()
+                .any(|member| member.node_id == fresh.node_id)
+            {
+                return Err(invalid());
+            }
+            let learner = self.replicate_learner(current, fresh.clone()).await?;
+            self.replace_voter(learner, damaged.node_id).await?
+        } else if current.replicas.iter().any(|member| member == &fresh) {
+            current
+        } else {
+            return Err(invalid());
+        };
+        let proof = GroupDamageReplacement {
+            group: membership.group.clone(),
+            removed: damaged.clone(),
+            replacement: fresh,
+            committed_at: membership.applied_at,
+        };
+        Ok(DamagedReplacement {
+            removed: DamagedReplicaRemoved {
+                group: membership.group.clone(),
+                removed: damaged.clone(),
+                committed_at: membership.applied_at,
+            },
+            membership,
+            proof,
+        })
     }
 }

@@ -31,7 +31,13 @@ use std::{
 
 mod data_factory;
 mod lifecycle;
-pub(crate) use lifecycle::{AppliedPlacementMembership, ReplicatedLearner};
+pub(crate) use lifecycle::{
+    AppliedPlacementMembership, DamageSink, ReplicatedLearner, settle_damage,
+};
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{DamageControl, DamagedReplacement, LocalDamageControl};
+#[cfg(test)]
+mod damage_tests;
 mod retirement;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
@@ -107,9 +113,12 @@ pub(crate) struct HostedGroupManager {
     shared: Arc<WorkerSharedResources>,
     client: WorkerClient,
     registry: Arc<EndpointRegistry>,
-    routes: Mutex<BTreeMap<uuid::Uuid, GroupRoutes>>,
+    /// Shared with the run-time damage watchers (NS14), which hold it weakly.
+    routes: Arc<Mutex<BTreeMap<uuid::Uuid, GroupRoutes>>>,
     ownership: Option<Arc<dyn Send + Sync>>,
     starts: tokio::sync::Mutex<()>,
+    /// Where a replica stopped by run-time damage is reported (NS14 rule 2).
+    damage_sink: Arc<Mutex<Option<Arc<dyn DamageSink>>>>,
 }
 impl HostedGroupManager {
     fn hosted_data(
@@ -141,9 +150,10 @@ impl HostedGroupManager {
             shared,
             client,
             registry,
-            routes: Mutex::new(BTreeMap::new()),
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
             ownership: None,
             starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
@@ -246,6 +256,16 @@ impl HostedGroupManager {
         {
             return Err(invalid());
         }
+        // Section 3 rule 1: a quarantined group never starts under its old
+        // identity: no vote, append acknowledgment, ReadIndex, snapshot export
+        // or route.
+        if machine
+            .store()
+            .pool()
+            .is_group_quarantined(machine.store().identity().group_id)
+        {
+            return Err(crate::oltp::pool::quarantined_group());
+        }
         let config = batched_config(config)?;
         let config_digest = super::owned::serialized_digest(config.as_ref())?;
         if let Some(existing) =
@@ -260,6 +280,7 @@ impl HostedGroupManager {
             return Ok(existing);
         }
         let identity = machine.store().identity().clone();
+        let node_id = local.node_id;
         let (group, resident) = self
             .registry
             .reserve_replica(identity.clone(), local.node_id)?;
@@ -345,7 +366,20 @@ impl HostedGroupManager {
                     retiring: false,
                 },
             );
+        self.stop_on_damage(&running, node_id);
         Ok(running)
+    }
+    /// Node IDs of the replicas of `group` this worker currently hosts.
+    pub(crate) fn hosted_replicas(&self, group: uuid::Uuid) -> Vec<u64> {
+        self.routes
+            .lock()
+            .map(|routes| {
+                routes
+                    .get(&group)
+                    .map(|group| group.replicas.keys().copied().collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
     fn existing<C, M>(
         &self,
