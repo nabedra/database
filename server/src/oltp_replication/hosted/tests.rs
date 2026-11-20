@@ -91,6 +91,7 @@ impl TypedMachine<CounterConfig> for Counter {
         command: OwnedCommand<Bump>,
     ) -> Result<ChargedBytes, ProtocolError> {
         let id = command.payload()?.id;
+        let big = command.payload()?.pad == BIG_REPLY;
         self.store
             .transaction(meta, BUDGET, move |tx| {
                 let marker = marker(id);
@@ -107,12 +108,26 @@ impl TypedMachine<CounterConfig> for Counter {
                 } + 1;
                 tx.put(&marker, b"1")?;
                 tx.put(b"count", &count.to_be_bytes())?;
+                if big {
+                    return Ok(Transition::Commit(tx.copy_output(&big_reply())?));
+                }
                 Ok(Transition::Commit(
                     tx.copy_output(count.to_string().as_bytes())?,
                 ))
             })
             .await
     }
+}
+/// A command whose durable reply fits the output budget but whose decode
+/// budget exceeds `MAX_REPLY_DECODE_BYTES` (RV-APPLY F6).
+const BIG_REPLY: &str = "test.big-reply";
+fn big_reply() -> Vec<u8> {
+    let mut reply = b"[0".to_vec();
+    for _ in 0..1800 {
+        reply.extend_from_slice(b",0");
+    }
+    reply.push(b']');
+    reply
 }
 fn marker(id: u64) -> Vec<u8> {
     let mut key = b"applied/".to_vec();
@@ -121,6 +136,7 @@ fn marker(id: u64) -> Vec<u8> {
 }
 
 /// A single voter never opens a peer connection.
+#[derive(Clone)]
 struct NoPeers;
 struct NoPeer;
 impl RaftNetworkFactory<CounterConfig> for NoPeers {
@@ -1134,3 +1150,4 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
 mod replicated;
 
 mod kv_crash;
+mod transient;

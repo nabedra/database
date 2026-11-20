@@ -58,6 +58,21 @@ async fn voters(
     Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
     GroupIdentity,
 ) {
+    voters_with(dir, one_shot, &BTreeMap::new(), false).await
+}
+/// [`voters`] where node `n`'s pool runs on `faults[n]` (`FaultFs`), and,
+/// with `elect_all`, every node may elect (a forced election).
+async fn voters_with(
+    dir: &Path,
+    one_shot: &[u64],
+    faults: &BTreeMap<u64, FaultFs>,
+    elect_all: bool,
+) -> (
+    Vec<Voter>,
+    Vec<oneshot::Sender<()>>,
+    Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
+    GroupIdentity,
+) {
     let certificates = tls::certificates(dir, 3);
     let cluster = Uuid::new_v4();
     let group = GroupIdentity {
@@ -110,17 +125,29 @@ async fn voters(
     {
         let node = index as u64 + 1;
         let shared = shared();
-        let pool = OltpPool::open_development(
-            dir.join(format!("pool{node}")),
-            PoolIdentity {
-                engine: "oltp".into(),
-                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: cluster,
-                worker_id: worker.worker_id,
-                pool_id: members[&node].pool_id,
-            },
-            shared.clone(),
-        )
+        let path = dir.join(format!("pool{node}"));
+        let identity = PoolIdentity {
+            engine: "oltp".into(),
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
+            cluster_id: cluster,
+            worker_id: worker.worker_id,
+            pool_id: members[&node].pool_id,
+        };
+        let pool = match faults.get(&node) {
+            Some(fault) => {
+                std::fs::create_dir_all(&path).unwrap();
+                fault.create_dir_all_durable(&path);
+                let fs: Arc<dyn Fs> = Arc::new(fault.clone());
+                OltpPool::open_development_tuned(
+                    &path,
+                    identity,
+                    shared.clone(),
+                    fs,
+                    super::transient::small_segments,
+                )
+            }
+            None => OltpPool::open_development(&path, identity, shared.clone()),
+        }
         .unwrap();
         let store = pool.group(group.clone()).await.unwrap();
         let registry = Arc::new(EndpointRegistry::new(shared.clone()));
@@ -154,7 +181,7 @@ async fn voters(
         )
         .unwrap();
         let config = batched_config(openraft::Config {
-            enable_elect: node == 1,
+            enable_elect: elect_all || node == 1,
             // Generous timeouts: the one-shot voter replicates at the
             // pre-session pace (a TLS handshake and an fsync per entry), and
             // a loaded test machine must not cause leader churn.
@@ -351,4 +378,132 @@ async fn d10_o06_o11_followers_receive_multi_entry_appends_with_few_fsyncs() {
     for task in tasks {
         task.await.unwrap().unwrap();
     }
+}
+
+fn fill_device(dir: &Path, fault: &FaultFs, node: u64) {
+    super::transient::fill_device(fault, &dir.join(format!("pool{node}")));
+}
+fn running(voter: &Voter) -> bool {
+    voter
+        .consensus
+        .raft
+        .metrics()
+        .borrow_watched()
+        .running_state
+        .is_ok()
+}
+async fn applied_everywhere(voters: &[Voter], commands: u64) {
+    for voter in voters {
+        timeout_loop(|| async { (read_count(&voter.store).await == commands).then_some(()) }).await;
+    }
+}
+async fn stop_all(
+    voters: Vec<Voter>,
+    stops: Vec<oneshot::Sender<()>>,
+    tasks: Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
+) {
+    for voter in &voters {
+        tokio::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
+            .await
+            .expect("shutdown")
+            .unwrap();
+    }
+    for stop in stops {
+        let _ = stop.send(());
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+}
+
+/// RV-APPLY F1, NS11, O06, O17 (RF3): one follower's device fills up. Its
+/// appends retry NoSpace while the other two commit; its core stays up, and
+/// once space frees up it catches up to the leader without a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ns11_o06_o17_rv_apply_rf3_follower_out_of_space_catches_up_without_restart() {
+    let dir = Dir::new();
+    let fault = FaultFs::new();
+    let faults = BTreeMap::from([(3, fault.clone())]);
+    let (voters, stops, tasks, _group) = voters_with(&dir.0, &[], &faults, false).await;
+    let leader = leader(&voters).await;
+    assert_eq!(voters[leader].node, 1);
+    propose_all(&voters[leader], 0..10).await;
+    applied_everywhere(&voters, 10).await;
+    fill_device(&dir.0, &fault, 3);
+    // Enough traffic to reach the follower's next journal segment roll.
+    let follower = &voters[2];
+    let mut sent = 10;
+    while follower.consensus.health().snapshot().no_space_retries == 0 {
+        assert!(sent < 2000, "the follower never met its full device");
+        propose_all(&voters[leader], sent..sent + 20).await;
+        sent += 20;
+    }
+    for voter in &voters[..2] {
+        timeout_loop(|| async { (read_count(&voter.store).await == sent).then_some(()) }).await;
+    }
+    assert!(running(follower), "ENOSPC stopped the follower's core");
+    assert!(read_count(&follower.store).await < sent);
+    assert!(!follower.pool.requires_recovery());
+    fault.clear_faults();
+    propose_all(&voters[leader], sent..sent + 10).await;
+    applied_everywhere(&voters, sent + 10).await;
+    assert!(running(follower));
+    assert_eq!(
+        follower.consensus.raft.restarts(),
+        0,
+        "caught up on the same core"
+    );
+    eprintln!(
+        "F1 RF3 follower: {:?}",
+        follower.consensus.health().snapshot()
+    );
+    stop_all(voters, stops, tasks).await;
+}
+
+/// RV-APPLY F1, NS11, O06 (RF3): a forced election on a follower whose vote
+/// save meets a full device. A segment-roll ENOSPC cannot be aimed at one
+/// vote write, so a test hook fails the next 20 vote saves with the same
+/// `NoSpace` error. `save_vote` retries instead of stopping the core; then the
+/// election completes and the group commits on every voter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ns11_o06_rv_apply_rf3_save_vote_retries_during_a_forced_election() {
+    let dir = Dir::new();
+    let fault = FaultFs::new();
+    let faults = BTreeMap::from([(3, fault.clone())]);
+    let (voters, stops, tasks, _group) = voters_with(&dir.0, &[], &faults, true).await;
+    let first = leader(&voters).await;
+    propose_all(&voters[first], 0..10).await;
+    applied_everywhere(&voters, 10).await;
+    let candidate = voters.iter().position(|voter| voter.node == 3).unwrap();
+    let candidate = &voters[candidate];
+    let _ = &fault;
+    candidate
+        .consensus
+        .retry()
+        .fail_votes
+        .store(20, std::sync::atomic::Ordering::Release);
+    candidate
+        .consensus
+        .raft
+        .trigger()
+        .elect(false)
+        .await
+        .unwrap();
+    timeout_loop(|| async {
+        let retries = candidate.consensus.health().snapshot().retries;
+        (retries["vote"] > 0).then_some(())
+    })
+    .await;
+    assert!(running(candidate), "a NoSpace vote stopped the core");
+    // The group settles on a leader and commits on all three voters.
+    let settled = leader(&voters).await;
+    propose_all(&voters[settled], 10..20).await;
+    applied_everywhere(&voters, 20).await;
+    assert!(voters.iter().all(running));
+    assert!(
+        voters
+            .iter()
+            .all(|voter| voter.consensus.raft.restarts() == 0)
+    );
+    stop_all(voters, stops, tasks).await;
 }

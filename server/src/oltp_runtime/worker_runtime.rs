@@ -1850,6 +1850,8 @@ impl HttpRuntime for WorkerRuntime {
                         "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
                     })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                    // RV-APPLY: transient retries and stopped cores.
+                    "raft":self.services.manager.raft_health(),
                 }))
                 .map_err(|_| unknown())?,
             })

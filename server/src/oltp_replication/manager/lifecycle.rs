@@ -437,6 +437,10 @@ impl DamageControl for ControlClient {
 /// Receives the replicas the manager stopped after run-time damage.
 pub(crate) trait DamageSink: Send + Sync {
     fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool);
+    /// RV-APPLY F4: the supervisor stopped this replica after its Raft core
+    /// kept failing. Nothing is released: the bytes stay until an operator
+    /// acts, but Control replaces the replica.
+    fn gave_up(&self, _group: GroupIdentity, _replica: ReplicaMember) {}
 }
 
 /// Rules 2 and 4 on the damaged worker. Reports the replica until Control
@@ -519,7 +523,7 @@ pub(crate) fn spawn_settlement(
 /// Control's own membership flows replace them.
 pub(crate) struct ReportingDamageSink {
     control: Mutex<Option<std::sync::Weak<ControlClient>>>,
-    waiting: Mutex<Vec<(GroupDamageReport, OltpPool)>>,
+    waiting: Mutex<Vec<(GroupDamageReport, Option<OltpPool>)>>,
     settling: SettlingReplicas,
 }
 impl ReportingDamageSink {
@@ -543,7 +547,7 @@ impl ReportingDamageSink {
             .map(|mut waiting| std::mem::take(&mut *waiting))
             .unwrap_or_default();
         for (report, pool) in waiting {
-            spawn_settlement(control.clone(), self.settling.clone(), report, Some(pool));
+            spawn_settlement(control.clone(), self.settling.clone(), report, pool);
         }
     }
 }
@@ -564,13 +568,36 @@ impl DamageSink for ReportingDamageSink {
             first_bad_seq: damage.first_bad_seq,
             refusal: None,
         };
+        self.send(report, Some(pool));
+    }
+    /// Reported with the existing wire reason `pool_refused` (class `other`):
+    /// an older Control decodes it, and like a refused pool nothing is
+    /// released (`pool` is `None`). A dedicated reason needs a gated variant.
+    fn gave_up(&self, group: GroupIdentity, replica: ReplicaMember) {
+        if group.kind == GroupKind::Control {
+            tracing::error!(group = %group.group_id, node = replica.node_id,
+                "a Control replica was given up; replace it through Control membership");
+            return;
+        }
+        let report = GroupDamageReport {
+            group,
+            replica,
+            reason: crate::oltp_replication::authority::control::GroupDamageReason::PoolRefused,
+            first_bad_seq: None,
+            refusal: Some(crate::oltp_replication::authority::control::PoolRefusal::Other),
+        };
+        self.send(report, None);
+    }
+}
+impl ReportingDamageSink {
+    fn send(&self, report: GroupDamageReport, pool: Option<OltpPool>) {
         let control = self
             .control
             .lock()
             .ok()
             .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade));
         match control {
-            Some(control) => spawn_settlement(control, self.settling.clone(), report, Some(pool)),
+            Some(control) => spawn_settlement(control, self.settling.clone(), report, pool),
             None => {
                 if let Ok(mut waiting) = self.waiting.lock()
                     && waiting.len() < Self::MAX_WAITING

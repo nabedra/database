@@ -207,12 +207,33 @@ pub(super) fn unsupported_format(found: &str) -> ProtocolError {
         &format!("unsupported store format: {found}"),
     )
 }
-pub(super) fn no_space() -> ProtocolError {
-    failure(
-        ErrorCode::StorageUnavailable,
-        "OLTP storage device is full; the write was not applied",
-    )
+const NO_SPACE: &str = "OLTP storage device is full; the write was not applied";
+pub(crate) fn no_space() -> ProtocolError {
+    failure(ErrorCode::StorageUnavailable, NO_SPACE)
 }
+/// A write refused because the device is full (NS11). Nothing was written, so
+/// the caller may retry it unchanged once space frees up. The protocol has no
+/// code of its own for it (a new code changes every ORM and old peer), so the
+/// message identifies it.
+pub(crate) fn is_no_space(error: &ProtocolError) -> bool {
+    error.code == ErrorCode::StorageUnavailable && error.message.starts_with(NO_SPACE)
+}
+/// A failed snapshot file operation: a full device (`ENOSPC`, `EDQUOT`) is the
+/// recoverable [`no_space`], anything else stays the generic file error.
+pub(super) fn file_error(error: std::io::Error) -> ProtocolError {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) {
+        no_space()
+    } else {
+        failure(
+            ErrorCode::StorageUnavailable,
+            "typed physical pool unavailable or identity mismatch",
+        )
+    }
+}
+
 /// The outcome of a failed commit: `NoSpace` wrote nothing; anything else is
 /// ambiguous and latches the pool (O29).
 pub(super) fn commit_error(error: nabedra_kv::Error) -> (bool, ProtocolError) {
