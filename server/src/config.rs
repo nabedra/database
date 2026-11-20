@@ -258,7 +258,13 @@ pub struct ExecutionConfig {
     #[serde(default = "direct_oltp_default", skip_serializing_if = "is_true")]
     pub direct_oltp: bool,
 }
-fn direct_oltp_default() -> bool {
+pub(crate) fn direct_oltp_default() -> bool {
+    // T9: the library suite runs once more with `direct_oltp` off by default
+    // (`NABEDRA_TEST_DIRECT_OLTP=off`). Release builds always default to on.
+    #[cfg(test)]
+    if std::env::var_os("NABEDRA_TEST_DIRECT_OLTP").is_some_and(|value| value == "off") {
+        return false;
+    }
     true
 }
 fn is_true(value: &bool) -> bool {
@@ -285,7 +291,7 @@ impl Default for ExecutionConfig {
             queue_replication: QueueReplication::AllReadyWorkers,
             queue_lifetime: QueueLifetime::LiveCluster,
             partition_size: PartitionSize::default(),
-            direct_oltp: true,
+            direct_oltp: direct_oltp_default(),
         }
     }
 }
