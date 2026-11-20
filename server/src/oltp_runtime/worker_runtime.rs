@@ -5,6 +5,7 @@ pub(crate) mod archive;
 mod automatic_split;
 pub(super) mod cold_history;
 mod deployment;
+mod direct_gateway;
 mod index_admin;
 mod index_backend;
 mod migration;
@@ -85,6 +86,11 @@ pub(crate) struct WorkerRuntime {
     /// Set while `data.direct.v1` is active (T7). Direct commits have no
     /// Status decision, so incremental backups would miss them.
     direct_commits_active: AtomicBool,
+    /// The direct-path gateway of this worker's HTTP API (T6).
+    direct_gateway: std::sync::OnceLock<(
+        Arc<super::application::direct::DirectGateway>,
+        Arc<direct_gateway::WorkerSwitch>,
+    )>,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -223,12 +229,14 @@ impl WorkerRuntime {
             admission_cleanup,
             accepting: AtomicBool::new(true),
             direct_commits_active: AtomicBool::new(false),
+            direct_gateway: std::sync::OnceLock::new(),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),
             cold_cleanup: Mutex::new(None),
             automatic_split: Mutex::new(automatic_split::Observation::default()),
         });
+        runtime.install_direct_gateway();
         let weak = Arc::downgrade(&runtime);
         if let Some(issuer) = &runtime.services.admission_issuer {
             for client in &runtime.services.remote_status {
@@ -1690,6 +1698,9 @@ impl HttpRuntime for WorkerRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
     }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        self.direct_gateway_handle().cloned()
+    }
     fn scheduler(&self) -> ResourceScheduler {
         self.services.shared.scheduler()
     }
@@ -1798,7 +1809,8 @@ impl HttpRuntime for WorkerRuntime {
                     "native_thread_budget":self.services.shared.thread_budget(),
                     // `null` until T7 installs the direct executor.
                     "direct":crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                        .map(|service| service.stats())
+                        .map(|service| service.stats()),
+                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                 }))
                 .map_err(|_| unknown())?,
             })

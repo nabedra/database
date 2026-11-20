@@ -176,6 +176,12 @@ fn content_type(headers: &HeaderMap) -> bool {
         })
         && values.next().is_none()
 }
+/// A single valid `Content-Length` within the body limit.
+fn declared_length(headers: &HeaderMap) -> Option<usize> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let length = values.next()?.to_str().ok()?.parse::<usize>().ok()?;
+    (values.next().is_none() && length <= protocol::MAX_BODY_BYTES).then_some(length)
+}
 async fn body(body: Body) -> Result<Vec<u8>, ProtocolError> {
     bounded_body(body, protocol::MAX_BODY_BYTES).await
 }
@@ -217,25 +223,49 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         Ok(value) => value,
         Err(error) => return failure(None, error),
     };
+    // While `data.direct.v1` is active, a request with a declared length is
+    // charged twice that length; the queued path still charges its full
+    // parsing budget before it decodes anything (plan section 6).
+    let direct = state
+        .runtime
+        .direct_gateway()
+        .filter(|gateway| gateway.mode() != super::application::direct::DirectMode::Off)
+        .zip(declared_length(request.headers()));
     let operation = admitted.spawn(move || async move {
-        let staging = state
-            .runtime
-            .scheduler()
-            .charge_memory(
-                state.runtime.scheduler_node_id(),
-                (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64,
-            )
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::Overloaded,
-                    "request parsing memory capacity exhausted",
-                    Outcome::NotApplied,
-                )
-            })?;
-        let bytes = body(request.into_body()).await?;
+        let charge = |bytes: u64| {
+            state
+                .runtime
+                .scheduler()
+                .charge_memory(state.runtime.scheduler_node_id(), bytes)
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCode::Overloaded,
+                        "request parsing memory capacity exhausted",
+                        Outcome::NotApplied,
+                    )
+                })
+        };
+        let full = (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64;
+        let mut staging = charge(
+            direct
+                .as_ref()
+                .map_or(full, |(_, length)| 2 * *length as u64),
+        )?;
+        let bytes = match &direct {
+            Some((_, length)) => bounded_body(request.into_body(), *length).await?,
+            None => body(request.into_body()).await?,
+        };
+        if let Some((gateway, _)) = direct {
+            use super::application::direct::Routed;
+            match gateway.route(&bytes, asynchronous).await {
+                Ok(Routed::Done(encoded)) => return Ok((state, None, Err(Ok(encoded)))),
+                Err(error) => return Ok((state, scan_request_id(&bytes), Err(Err(error)))),
+                Ok(Routed::Queued) => staging = charge(full)?,
+            }
+        }
         let parsed = match protocol::parse_request(&bytes) {
             Ok(parsed) => parsed,
-            Err(error) => return Ok((state, scan_request_id(&bytes), Err(error))),
+            Err(error) => return Ok((state, scan_request_id(&bytes), Ok(Err(error)))),
         };
         let id = Some(parsed.request_id);
         let point = super::application::PointRequest::from_operation(
@@ -243,7 +273,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         );
         drop(parsed);
         let record = state.runtime.clone().submit(bytes, staging, point).await;
-        Ok((state, id, record))
+        Ok((state, id, Ok(record)))
     });
     let (state, id, record) = match operation {
         Ok(operation) => match operation.receive().await {
@@ -253,8 +283,10 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         Err(error) => return failure(None, error),
     };
     let mut record = match record {
-        Ok(value) => value,
-        Err(error) => return failure(id, error),
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) | Err(Err(error)) => return failure(id, error),
+        // Answered on the direct path.
+        Err(Ok(encoded)) => return complete(encoded),
     };
     // The RAM queue owns the complete body. HTTP waiters retain only identity.
     record.body = Vec::new();

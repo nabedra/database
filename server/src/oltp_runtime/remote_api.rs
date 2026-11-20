@@ -68,6 +68,9 @@ pub(crate) struct RemoteRuntime {
     shared: Arc<WorkerSharedResources>,
     control: Arc<ControlClient>,
     client: Arc<ApplicationClient>,
+    direct: Arc<super::application::direct::DirectGateway>,
+    #[allow(dead_code)] // T7 sets it from `data.direct.v1` and `direct_oltp`.
+    direct_switch: Arc<super::application::direct::GatewaySwitch>,
     scope: QueueScope,
     ingress: Executor,
     accepting: AtomicBool,
@@ -219,10 +222,29 @@ impl RemoteRuntime {
             }
         };
         let refresh = tokio::spawn(directory.run_refresh(control.clone(), stop.subscribe()));
+        // Off until T7 reports `data.direct.v1` active through the switch.
+        let direct_switch = Arc::new(super::application::direct::GatewaySwitch::default());
+        let direct = super::application::direct::DirectGateway::new(
+            shared.clone(),
+            scope.database.clone(),
+            direct_switch.clone(),
+            Arc::new(super::application::direct::ApiTopology {
+                client: client.clone(),
+                control: control.clone(),
+            }),
+            Arc::new(super::application::direct::WireTransport::new(
+                shared.clone(),
+                transport.client(),
+                control.clone(),
+                crate::oltp_replication::authority::control::ServiceAction::ApiIngress,
+            )),
+        );
         Ok(Arc::new(Self {
             shared,
             control,
             client,
+            direct,
+            direct_switch,
             scope,
             ingress: Executor::new(2, 16)?,
             accepting: AtomicBool::new(true),
@@ -232,6 +254,11 @@ impl RemoteRuntime {
     }
     pub(crate) fn cluster_id(&self) -> Uuid {
         self.scope.cluster_id
+    }
+    /// `data.direct.v1` and `direct_oltp` for this API's gateway (T7).
+    #[allow(dead_code)]
+    pub(crate) fn direct_switch(&self) -> &super::application::direct::GatewaySwitch {
+        &self.direct_switch
     }
     pub(crate) fn application(
         self: &Arc<Self>,
@@ -316,6 +343,9 @@ impl Drop for RemoteRuntime {
 impl HttpRuntime for RemoteRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
+    }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        Some(self.direct.clone())
     }
     fn scheduler(&self) -> ResourceScheduler {
         self.shared.scheduler()

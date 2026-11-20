@@ -34,6 +34,11 @@ impl std::ops::Deref for OwnedReceipt {
 
 pub(crate) trait HttpRuntime: Send + Sync + 'static {
     fn ingress(&self) -> &Executor;
+    /// The direct-path gateway (T6), if this runtime has one. It routes
+    /// nothing while `data.direct.v1` is inactive.
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        None
+    }
     fn scheduler(&self) -> ResourceScheduler;
     fn scheduler_node_id(&self) -> u64;
     fn submit(
