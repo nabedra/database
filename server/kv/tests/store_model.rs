@@ -145,7 +145,7 @@ fn check_walk(rng: &mut Rng, snap: &Snapshot, model: &Model, ctx: &str) {
 
 fn run_model(seed: u64, ops: u64) {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(3);
+    let bg = Background::new(3).unwrap();
     let options = |fs: &FaultFs| small_options(Arc::new(fs.clone()), bg.clone());
     let mut store: Option<Store> = Some(open(&dir, options(&fs)));
     let mut rng = Rng(seed);

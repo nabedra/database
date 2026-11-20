@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-pub use background::Background;
+pub use background::{Background, THREAD_STACK_BYTES};
 pub use read::{Iter, Snapshot};
 
 use crate::batch::{WriteBatch, prefix_successor};

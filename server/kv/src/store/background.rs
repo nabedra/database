@@ -8,6 +8,13 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::error::Result;
+
+/// Stack size of every thread `nabedra-kv` starts (`kv-flush`, `kv-compact`,
+/// `kv-journal`, `kv-journal-prep`). Set explicitly so `RUST_MIN_STACK` cannot change
+/// it: the server's native thread budget reserves this much per thread (O05).
+pub const THREAD_STACK_BYTES: usize = 2 << 20;
+
 /// Work a store hands to the pool. Each call returns a delay after which to run it again
 /// (for example after `NoSpace`), or `None` when there is nothing left to do.
 pub(crate) trait Job: Send + Sync {
@@ -58,8 +65,16 @@ impl std::fmt::Debug for Background {
 }
 
 impl Background {
-    /// Starts `threads` (at least 1) background threads.
-    pub fn new(threads: usize) -> Arc<Background> {
+    /// Starts `threads` (at least 1) background threads, each with a
+    /// [`THREAD_STACK_BYTES`] stack. A thread the OS refuses to start is an
+    /// `Error::Io`; the threads already started are stopped and joined first.
+    pub fn new(threads: usize) -> Result<Arc<Background>> {
+        Self::with_stack(threads, THREAD_STACK_BYTES)
+    }
+
+    /// [`Background::new`] with another stack size, for tests of spawn failures.
+    #[doc(hidden)]
+    pub fn with_stack(threads: usize, stack_bytes: usize) -> Result<Arc<Background>> {
         let threads = threads.max(1);
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues::default()),
@@ -67,29 +82,27 @@ impl Background {
             compaction_ready: Condvar::new(),
             compaction_threads: threads - 1,
         });
-        let mut handles = Vec::with_capacity(threads);
-        {
-            let shared = shared.clone();
-            handles.push(
-                std::thread::Builder::new()
-                    .name("kv-flush".into())
-                    .spawn(move || run(&shared, true))
-                    .expect("spawn kv-flush"),
-            );
-        }
-        for _ in 1..threads {
-            let shared = shared.clone();
-            handles.push(
-                std::thread::Builder::new()
-                    .name("kv-compact".into())
-                    .spawn(move || run(&shared, false))
-                    .expect("spawn kv-compact"),
-            );
-        }
-        Arc::new(Background {
+        let background = Background {
             shared,
-            threads: Mutex::new(handles),
-        })
+            threads: Mutex::new(Vec::with_capacity(threads)),
+        };
+        for n in 0..threads {
+            let shared = background.shared.clone();
+            let flush_thread = n == 0;
+            let name = if flush_thread {
+                "kv-flush"
+            } else {
+                "kv-compact"
+            };
+            // On failure `background` drops here, which stops and joins the threads
+            // started so far.
+            let handle = std::thread::Builder::new()
+                .name(name.into())
+                .stack_size(stack_bytes)
+                .spawn(move || run(&shared, flush_thread))?;
+            lock(&background.threads).push(handle);
+        }
+        Ok(Arc::new(background))
     }
 
     /// Number of threads.

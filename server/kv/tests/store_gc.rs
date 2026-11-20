@@ -192,7 +192,7 @@ fn run(fs: &FaultFs, bg: &Arc<Background>, steps: &[Step]) -> Option<(Store, Out
 #[test]
 fn ns13_raft_log_on_journal_values_recycles_segments_past_a_lagging_group() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let (steps, models) = workload(13, 400);
     let (store, out) = run(&fs, &bg, &steps).expect("opens");
     let model = models.last().unwrap();
@@ -241,7 +241,7 @@ fn ns13_raft_log_on_journal_values_recycles_segments_past_a_lagging_group() {
 #[test]
 fn ns03_snapshot_held_across_journal_gc_and_relocation() {
     let (fs, dir) = fault_fs();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let (steps, models) = workload(3, 400);
     // Run up to just before the final GC with a snapshot taken early, after the lagging
     // group wrote.
@@ -321,7 +321,7 @@ fn verify(fs: FaultFs, bg: &Arc<Background>, models: &[Model], out: &Outcome, ct
 }
 
 fn enumerate(stride: u64) {
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let (steps, models) = workload(17, 160);
     // Reference run: find the GC steps that relocated.
     let (fs, _) = fault_fs();

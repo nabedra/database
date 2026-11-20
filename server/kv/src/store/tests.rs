@@ -122,7 +122,7 @@ fn ns10_full_scan_respects_the_open_run_limit() {
         inner: fault,
         live_runs: live.clone(),
     });
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let limit = 8;
     let store = Store::open(Path::new("/db/kv"), small(fs, &bg, limit))
         .unwrap()

@@ -36,13 +36,24 @@ pub(super) struct NativeStorage {
     pub(super) pools: Mutex<Vec<Weak<PoolInner>>>,
 }
 impl NativeStorage {
-    pub(super) fn new(cache_bytes: usize, write_buffer_bytes: usize, background: usize) -> Self {
-        Self {
+    pub(super) fn new(
+        cache_bytes: usize,
+        write_buffer_bytes: usize,
+        background: usize,
+    ) -> Result<Self, ProtocolError> {
+        Ok(Self {
             cache: Arc::new(BlockCache::new(cache_bytes)),
             memtables: Arc::new(MemtableBudget::new(write_buffer_bytes)),
-            background: Background::new(background),
+            // F9: the OS refusing a thread fails the worker's setup, never panics.
+            background: Background::new(background).map_err(|error| {
+                tracing::error!(%error, "could not start the OLTP storage background threads");
+                failure(
+                    ErrorCode::StorageUnavailable,
+                    "could not start the OLTP storage background threads",
+                )
+            })?,
             pools: Mutex::new(Vec::new()),
-        }
+        })
     }
     pub(super) fn register(&self, pool: &Arc<PoolInner>) {
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());

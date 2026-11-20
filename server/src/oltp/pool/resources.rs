@@ -218,7 +218,7 @@ impl WorkerSharedResources {
                 config.cache_bytes,
                 config.write_buffer_bytes,
                 config.background_threads as usize,
-            ),
+            )?,
             config,
             pool_slots: Arc::new(Semaphore::new(config.max_open_pools)),
             handle_slots: Arc::new(Semaphore::new(config.max_group_handles)),
