@@ -12,6 +12,12 @@ expensive verification. Keep deployments and comparative performance benchmarks
 on their designated infrastructure. AWS infrastructure is user-managed.
 Agent use of AWS is limited to authorized S3 work. Keep those tests small.
 
+- When a change needs Docker build, packaging, or image acceptance checks,
+  run them on Actions. For the Nabedra pilot, include `[ci docker]` in the
+  pushed checkpoint's commit message or select `docker` in a manual dispatch
+  once available. Build and test each image in the same runner job. Use the
+  run logs and acceptance artifacts for evidence. Export an image only when
+  another environment needs to run it.
 - Run independent OLTP and Events jobs separately. Put long crash campaigns and
   full Linux acceptance in on-demand jobs. Reuse a build within a job, cap Cargo
   and test concurrency to fit the runner, and cache dependencies by toolchain,
