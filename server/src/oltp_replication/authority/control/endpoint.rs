@@ -158,6 +158,15 @@ enum ReadRequest {
         expected: Box<GroupRecord>,
         after: Option<u64>,
     },
+    /// NS14 rule 2: the caller cannot serve this replica. An older Control
+    /// rejects the variant; the worker keeps retrying.
+    GroupDamaged {
+        report: Box<super::GroupDamageReport>,
+    },
+    GroupDamage {
+        group_id: Uuid,
+        node_id: u64,
+    },
 }
 
 impl ReadRequest {
@@ -492,6 +501,23 @@ impl ControlEndpoint {
                     expected,
                     authority,
                 } => self.handle.split_source(*expected, authority).await?,
+                ReadRequest::GroupDamaged { report } => {
+                    // The transport identity is the reporter (rule 2).
+                    let record = self
+                        .handle
+                        .report_group_damage(session.remote(), *report)
+                        .await?;
+                    self.shared.encode_in(
+                        ByteClass::Progress,
+                        &ControlReply::GroupDamage(Box::new(record)),
+                        HEADER_LIMIT,
+                    )?
+                }
+                ReadRequest::GroupDamage { group_id, node_id } => {
+                    let record = self.handle.group_damage(group_id, node_id).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &record, HEADER_LIMIT)?
+                }
                 ReadRequest::ServiceRole {
                     remote,
                     action,
@@ -973,6 +999,34 @@ impl ControlClient {
         }
     }
 
+    /// NS14 rule 2 from a worker that does not host Control. Idempotent.
+    pub(crate) async fn report_group_damage(
+        &self,
+        report: super::GroupDamageReport,
+    ) -> Result<super::GroupDamageRecord, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::GroupDamaged {
+                report: Box::new(report),
+            })
+            .await?;
+        let reply = reply.decode_section::<ControlReply>(0)?;
+        match &*reply {
+            ControlReply::GroupDamage(record) => Ok((**record).clone()),
+            _ => Err(invalid("unexpected Control reply to a damage report")),
+        }
+    }
+    /// NS14: Control's record of one replica's damage.
+    pub(crate) async fn group_damage(
+        &self,
+        group_id: Uuid,
+        node_id: u64,
+    ) -> Result<Option<super::GroupDamageRecord>, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::GroupDamage { group_id, node_id })
+            .await?;
+        Ok((*reply.decode_section::<Option<super::GroupDamageRecord>>(0)?).clone())
+    }
+
     async fn change_scoped_queue(
         &self,
         operation_id: Uuid,
@@ -1227,7 +1281,11 @@ impl ControlClient {
         let deadline = request
             .supports_bounded_failover()
             .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
-        let use_route_hint = deadline.is_some() || matches!(request, ReadRequest::ChangeScopedQueue { .. });
+        let use_route_hint = deadline.is_some()
+            || matches!(
+                request,
+                ReadRequest::ChangeScopedQueue { .. } | ReadRequest::GroupDamaged { .. }
+            );
         let mut last = unavailable();
         loop {
             let configured_preferred = self.routes.preferred();

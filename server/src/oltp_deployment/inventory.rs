@@ -70,6 +70,9 @@ pub(crate) struct WorkerPools {
     entries: Mutex<BTreeMap<Uuid, Entry>>,
     registration: Mutex<()>,
     closing: Mutex<BTreeMap<Uuid, Uuid>>,
+    /// Secondary pools refused at open (plan section 3 rule 6, O26): the worker
+    /// keeps serving its other pools and reports these pools' replicas lost.
+    refused: Mutex<BTreeMap<Uuid, ProtocolError>>,
     drain_actor: tokio::sync::Mutex<()>,
     _owner: ScratchLease,
 }
@@ -108,6 +111,7 @@ impl WorkerPools {
             )])),
             registration: Mutex::new(()),
             closing: Mutex::new(BTreeMap::new()),
+            refused: Mutex::new(BTreeMap::new()),
             drain_actor: tokio::sync::Mutex::new(()),
             _owner: owner,
         }))
@@ -115,6 +119,18 @@ impl WorkerPools {
 
     pub(crate) fn worker_identity(&self) -> WorkerIdentity {
         self.worker
+    }
+
+    /// Rule 6: records a secondary pool that could not be opened. Its replicas
+    /// are reported lost; the worker keeps serving every other pool.
+    pub(crate) fn mark_refused(&self, id: Uuid, error: ProtocolError) {
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.insert(id, error);
+        }
+    }
+    /// The open error of a refused secondary pool.
+    pub(crate) fn refused(&self, id: Uuid) -> Option<ProtocolError> {
+        self.refused.lock().ok()?.get(&id).cloned()
     }
 
     pub(crate) fn get(&self, id: Uuid) -> Result<Option<OltpPool>, ProtocolError> {

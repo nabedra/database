@@ -549,9 +549,10 @@ impl RegisteredWorker {
             shared: shared.clone(),
             client: transport.client(),
             registry,
-            routes: Mutex::new(BTreeMap::new()),
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
             ownership: Some(ownership.clone()),
             starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
         });
         Ok(Self {
             manager,
