@@ -9,9 +9,11 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / 'server' / 'Cargo.toml'
 EVENTS_MANIFEST = ROOT / 'server' / 'events' / 'Cargo.toml'
 # NS26: storage is the in-tree nabedra-kv engine. No build links RocksDB or the C
-# toolchain crates its binding pulled in.
+# toolchain crates its binding pulled in. BLD5: `ring` is the only TLS provider, so
+# no build links aws-lc or needs the cmake build tool.
 FORBIDDEN_NATIVE = frozenset({'rocksdb', 'librocksdb-sys', 'bindgen', 'clang-sys',
-                              'libz-sys', 'bzip2-sys'})
+                              'libz-sys', 'bzip2-sys', 'aws-lc-rs', 'aws-lc-sys',
+                              'aws-lc-fips-sys', 'cmake'})
 CASES = (
     ('default', 'olap', True, []),
     ('olap', 'olap', False, ['--no-default-features', '--features', 'olap']),
@@ -43,11 +45,11 @@ def assert_no_forbidden_native(name, packages):
 
 def assert_dependency_packages(name, engine, s3, tree):
     packages = package_names(tree)
-    aws = {p for p in packages if p.startswith('aws-') and not p.startswith('aws-lc-')}
+    assert_no_forbidden_native(name, packages)
+    aws = {p for p in packages if p.startswith('aws-')}
     olap = {p for p in packages if p.startswith('arrow-') or p == 'parquet'}
     assert bool(aws) == s3, (name, 'AWS dependencies', sorted(aws))
     assert bool(olap) == (engine == 'olap'), (name, 'OLAP dependencies', sorted(olap))
-    assert_no_forbidden_native(name, packages)
     assert ('openraft' in packages) == (engine in ('oltp', 'cache')), (name, 'consensus dependency')
     if engine == 'oltp':
         assert 'nabedra-kv' in packages, (name, 'native storage engine')

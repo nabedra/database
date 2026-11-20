@@ -30,14 +30,14 @@ olap = ["dep:arrow-array", "dep:arrow-ipc", "dep:arrow-schema", "dep:parquet"]
 oltp = ["dep:nabedra-kv", "dep:openraft", "dep:tokio-rustls", "dep:socket2"]
 cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", "dep:openraft", "dep:tokio-rustls"]
 oltp-backup-s3 = ["oltp", "s3"]
-s3 = ["dep:aws-config", "dep:aws-sdk-s3"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
 
 [dependencies]
 ring = "=0.17.14"
 sha2 = "=0.11.1"
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
-axum-server = { version = "=0.9.2", default-features = false, features = ["tls-rustls"] }
-rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+axum-server = { version = "=0.9.2", default-features = false, features = ["tls-rustls-ring"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "registry", "std"] }
 http-body-util = "=0.1.5"
 mime = "=0.3.18"
@@ -46,15 +46,18 @@ clap = { version = "=4.6.7", features = ["derive"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["raw_value", "arbitrary_precision"] }
 uuid = { version = "=1.29.2", features = ["serde", "v4"] }
-aws-config = { version = "=1.13.1", optional = true }
-aws-sdk-s3 = { version = "=1.158.0", optional = true }
+# The SDK's default HTTPS client uses aws-lc; ring is the only TLS provider, so
+# the S3 clients get an explicit rustls + ring client (`crate::aws_http`).
+aws-config = { version = "=1.13.1", optional = true, default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-s3 = { version = "=1.158.0", optional = true, default-features = false, features = ["sigv4a", "http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "=1.5.2", optional = true, default-features = false, features = ["rustls-ring"] }
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal", "io-util"] }
 
 arrow-array = { version = "=60.1.0", optional = true }
 arrow-schema = { version = "=60.1.0", optional = true }
 parquet = { version = "=60.1.0", optional = true, default-features = false, features = ["arrow"] }
 openraft = { version = "=0.10.0", optional = true, default-features = false, features = ["tokio-rt", "serde"] }
-tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["tls12", "aws_lc_rs"] }
+tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["tls12", "ring"] }
 # Already in the tree through tokio; used only to enable TCP keepalive.
 socket2 = { version = "=0.6.5", optional = true }
 bytes = "=1.12.1"
@@ -66,7 +69,7 @@ toml = { version = "=1.2.1", default-features = false, features = ["parse", "ser
 # Cached HTTP transport; explicit TLS, no proxy or retry middleware.
 hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["client-legacy", "http1", "tokio"] }
-hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "tls12", "aws-lc-rs"] }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["http1", "tls12", "ring"] }
 tokio-util = { version = "=0.7.20", features = ["io"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 

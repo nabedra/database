@@ -83,7 +83,7 @@ cargo build --locked --manifest-path server/Cargo.toml --no-default-features --f
 OLTP stores data on an attached filesystem with `nabedra-kv`, the in-tree storage
 engine in [`kv/`](kv) (design: [native storage engine plan](../plans/native-storage-engine.md)).
 It does not need an S3 bucket or AWS credentials. The build needs Rust and a C
-compiler for the TLS crates (`ring`, `aws-lc-sys`); no C++ compiler, CMake or
+compiler for `ring`, the only TLS crypto provider; no C++ compiler, CMake or
 libclang. OLTP data directories from releases before `nabedra-kv` are refused with an
 error that names the path; start those workers on empty volumes.
 `nabedra-db --version` identifies the compiled engine.

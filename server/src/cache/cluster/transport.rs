@@ -85,7 +85,7 @@ impl PeerTls {
         for ca in read_certs(&root.join(&config.ca))? {
             roots.add(ca).map_err(io::Error::other)?;
         }
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = WebPkiClientVerifier::builder_with_provider(
             Arc::new(roots.clone()),
             Arc::clone(&provider),

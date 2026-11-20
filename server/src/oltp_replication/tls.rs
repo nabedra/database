@@ -32,7 +32,7 @@ impl TlsMaterial {
         if roots.is_empty() {
             return Err(invalid("missing peer CA"));
         }
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
             Arc::new(roots.clone()),
             provider.clone(),
