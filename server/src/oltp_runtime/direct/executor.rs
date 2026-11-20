@@ -482,7 +482,7 @@ impl DirectExecutor {
                     reason: FallbackReason::Schema,
                 });
             }
-            SchemaLookup::StaleEpoch { .. } => return Err(stale_route(Some(epochs))),
+            SchemaLookup::StaleEpoch => return Err(stale_route(Some(epochs))),
             SchemaLookup::Missing => {
                 return Err(failed(ProtocolError::new(
                     ErrorCode::NotFound,
@@ -1173,7 +1173,7 @@ impl DirectExecutor {
                 SchemaLookup::Table(table) => table,
                 // The anchor key still follows from the stored key column
                 // only through the descriptor, so a forward needs one.
-                SchemaLookup::StaleEpoch { .. } => return Err(stale_route(Some(&epochs))),
+                SchemaLookup::StaleEpoch => return Err(stale_route(Some(&epochs))),
                 SchemaLookup::Blocked | SchemaLookup::Missing => {
                     return Err(failed(ProtocolError::new(
                         ErrorCode::StorageUnavailable,

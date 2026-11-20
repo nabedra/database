@@ -409,23 +409,6 @@ impl ParticipantHandle {
         self.local_consensus().ensure_linearizable().await?;
         self.local_machine().read_at(read_ts, key).await
     }
-    /// The dedup record or forward marker for `request_id` at `anchor`,
-    /// read behind the linearizable barrier. Only the anchor range's leader
-    /// executor calls it, so a remote handle refuses.
-    pub(crate) async fn direct_dedup(
-        &self,
-        table_id: Uuid,
-        anchor: Key,
-        request_id: Uuid,
-    ) -> Result<Option<super::direct::DedupLookup>, ProtocolError> {
-        if self.remote.is_some() {
-            return Err(invalid());
-        }
-        self.local_consensus().ensure_linearizable().await?;
-        self.local_machine()
-            .direct_dedup(table_id, anchor, request_id)
-            .await
-    }
     pub(crate) fn with_scoped_execution(
         &self,
         scope: ScopedCatalogRead,
@@ -497,7 +480,10 @@ impl ParticipantHandle {
                     return Err(recovery_unknown());
                 }
                 let state: Txn = serde_json::from_slice(&state).map_err(|_| recovery_unknown())?;
-                if state.manifest != manifest || state.decision.is_some() || state.point_home.is_some() {
+                if state.manifest != manifest
+                    || state.decision.is_some()
+                    || state.point_home.is_some()
+                {
                     return Err(invalid());
                 }
                 let evidence = state.sealed.ok_or_else(invalid)?;
@@ -672,8 +658,9 @@ impl ParticipantHandle {
     }
     /// The group's direct-commit schema state (`data.direct.v1`, plan
     /// section 7): `None` until direct commits were activated on it. Read
-    /// behind the linearizable barrier on the local replica; the leader
-    /// executor (T5) calls it on the range leader.
+    /// behind the linearizable barrier on the local replica. Tests read it;
+    /// the executor reads the epochs through `direct_epochs`.
+    #[cfg(test)]
     pub(crate) async fn direct_schema(
         &self,
     ) -> Result<Option<super::direct::DirectSchema>, ProtocolError> {

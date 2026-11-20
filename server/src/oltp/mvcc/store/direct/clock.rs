@@ -74,6 +74,7 @@ pub(crate) struct LeaderToken {
     generation: u64,
 }
 impl LeaderToken {
+    #[cfg(test)]
     pub(crate) fn term(&self) -> u64 {
         self.term
     }
@@ -167,10 +168,12 @@ impl RangeClock {
     }
 
     /// The highest snapshot timestamp served on this range, if any.
+    #[cfg(test)]
     pub(crate) fn max_read_ts(&self) -> Option<ReadTs> {
         ReadTs::new(self.lock().max_read_ts).ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
         self.lock().pending.len()
     }
@@ -184,6 +187,7 @@ impl RangeClock {
     /// Rule 1 as a pure check: true when `commit_ts` is at or below an
     /// already-served snapshot, so the caller must fetch a new timestamp.
     /// `register_pending` repeats this check atomically.
+    #[cfg(test)]
     pub(crate) fn needs_new_timestamp(&self, commit_ts: CommitTs) -> bool {
         commit_ts.get() <= self.lock().max_read_ts
     }
@@ -278,6 +282,7 @@ impl RangeClock {
     }
 
     /// True once this node leads and an entry of its term applied.
+    #[cfg(test)]
     pub(crate) fn serving(&self) -> bool {
         self.lock().serving()
     }

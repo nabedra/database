@@ -78,8 +78,6 @@ pub(crate) struct RemoteRuntime {
     accepting: AtomicBool,
     stop: watch::Sender<bool>,
     tasks: Mutex<Option<(JoinHandle<Result<(), ProtocolError>>, JoinHandle<()>)>>,
-    /// `data.direct.v1` and `direct_oltp` for the gateway (T6).
-    direct: Arc<super::worker_runtime::direct_capability::DirectSwitch>,
 }
 impl RemoteRuntime {
     pub(crate) async fn open(
@@ -259,15 +257,10 @@ impl RemoteRuntime {
             accepting: AtomicBool::new(true),
             stop,
             tasks: Mutex::new(Some((task, refresh))),
-            direct,
         }))
     }
     pub(crate) fn cluster_id(&self) -> Uuid {
         self.scope.cluster_id
-    }
-    /// The gateway's `data.direct.v1` switch (T6 reads it).
-    pub(crate) fn direct_switch(&self) -> &Arc<super::worker_runtime::direct_capability::DirectSwitch> {
-        &self.direct
     }
     pub(crate) fn application(
         self: &Arc<Self>,

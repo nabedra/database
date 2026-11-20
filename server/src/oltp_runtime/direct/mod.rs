@@ -33,8 +33,10 @@ mod tests;
 
 #[allow(unused_imports)] // T6 and T7 wire these.
 pub(crate) use executor::{DirectConfig, DirectExecutor, DirectGate};
+#[cfg(test)]
+pub(crate) use schema::StaticSchema;
 #[allow(unused_imports)]
-pub(crate) use schema::{CatalogSchema, DirectSchema, DirectTable, SchemaLookup, StaticSchema};
+pub(crate) use schema::{CatalogSchema, DirectSchema, DirectTable, SchemaLookup};
 #[allow(unused_imports)]
 pub(crate) use stats::DirectStatsSnapshot;
 
