@@ -51,7 +51,6 @@ impl PeerDirectory for Directory {
 
 /// One worker process: pool on `FaultFs`, manager, transport.
 struct Worker {
-    index: usize,
     fault: FaultFs,
     shared: Arc<WorkerSharedResources>,
     pool: Option<OltpPool>,
@@ -158,7 +157,6 @@ impl Cluster {
             std::fs::create_dir_all(&path).unwrap();
             fault.create_dir_all_durable(&path);
             cluster.workers.push(Worker {
-                index,
                 fault,
                 shared,
                 pool: None,
@@ -508,7 +506,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
             .applied_index_at_least(Some(replaced.membership.applied_at().index), "caught up")
             .await
             .unwrap();
-        assert!(cluster.applied_term(3).await >= acknowledged + 1);
+        assert!(cluster.applied_term(3).await > acknowledged);
         term += 1;
         let next = cluster.fence(leader, term).await;
         cluster

@@ -35,7 +35,7 @@ pub(crate) use lifecycle::{
     AppliedPlacementMembership, DamageSink, ReplicatedLearner, settle_damage,
 };
 #[allow(unused_imports)]
-pub(crate) use lifecycle::{DamageControl, DamagedReplacement, LocalDamageControl};
+pub(crate) use lifecycle::{DamageControl, DamagedReplacement};
 #[cfg(test)]
 mod damage_tests;
 mod retirement;
@@ -370,6 +370,7 @@ impl HostedGroupManager {
         Ok(running)
     }
     /// Node IDs of the replicas of `group` this worker currently hosts.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn hosted_replicas(&self, group: uuid::Uuid) -> Vec<u64> {
         self.routes
             .lock()

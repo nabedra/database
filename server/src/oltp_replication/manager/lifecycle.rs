@@ -4,7 +4,7 @@
 use super::*;
 use crate::oltp::pool::{ByteClass, DamagedReplicaRemoved, OltpPool, ReleaseOutcome, ScratchLease};
 use crate::oltp_replication::authority::control::{
-    ControlClient, ControlHandle, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport,
+    ControlClient, GroupDamageRecord, GroupDamageReplacement, GroupDamageReport,
 };
 use openraft::raft::Precondition;
 use std::{collections::BTreeSet, time::Duration};
@@ -405,9 +405,8 @@ where
 
 // ----- NS14: quarantined groups (plan section 3, "Raft safety of a quarantined group") -----
 
-/// Where a worker sends `GroupDamaged` and reads Control's record: the remote
-/// [`ControlClient`](super::super::authority::control::ControlClient), or the
-/// local handle on a worker that hosts Control.
+/// Where a worker sends `GroupDamaged` and reads Control's record: the
+/// [`ControlClient`](super::super::authority::control::ControlClient).
 pub(crate) trait DamageControl: Send + Sync {
     fn report(
         &self,
@@ -435,28 +434,6 @@ impl DamageControl for ControlClient {
         Box::pin(self.group_damage(group_id, node_id))
     }
 }
-/// The local Control handle, reporting as this worker.
-pub(crate) struct LocalDamageControl {
-    pub(crate) handle: Arc<ControlHandle>,
-    pub(crate) worker: WorkerIdentity,
-}
-impl DamageControl for LocalDamageControl {
-    fn report(
-        &self,
-        report: GroupDamageReport,
-    ) -> Pin<Box<dyn Future<Output = Result<GroupDamageRecord, ProtocolError>> + Send + '_>> {
-        Box::pin(self.handle.report_group_damage(self.worker, report))
-    }
-    fn record(
-        &self,
-        group_id: uuid::Uuid,
-        node_id: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<GroupDamageRecord>, ProtocolError>> + Send + '_>>
-    {
-        Box::pin(self.handle.group_damage(group_id, node_id))
-    }
-}
-
 /// Receives the replicas the manager stopped after run-time damage.
 pub(crate) trait DamageSink: Send + Sync {
     fn damaged(&self, group: GroupIdentity, replica: ReplicaMember, pool: OltpPool);
@@ -588,6 +565,7 @@ impl HostedGroupManager {
 }
 
 /// Rule 3 evidence after the leader replaced a damaged voter.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DamagedReplacement {
     pub(crate) membership: GroupMembershipObservation,
     pub(crate) removed: DamagedReplicaRemoved,
