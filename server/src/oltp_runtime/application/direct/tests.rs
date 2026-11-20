@@ -579,8 +579,10 @@ impl Cluster {
 /// The leaders' executors, reached in process. `lose` drops that many
 /// replies after the leader executed them (a lost reply); a node in
 /// `down` is unreachable.
+/// A replica's executor and handle, by (group id, node id).
+type Replicas = HashMap<(Uuid, u64), (Arc<DirectExecutor>, Arc<ParticipantHandle>)>;
 struct InProcess {
-    routes: Mutex<HashMap<(Uuid, u64), (Arc<DirectExecutor>, Arc<ParticipantHandle>)>>,
+    routes: Mutex<Replicas>,
     down: Mutex<HashSet<u64>>,
     lose: AtomicUsize,
     sent: AtomicU64,

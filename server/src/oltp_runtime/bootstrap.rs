@@ -680,7 +680,9 @@ impl LocalServices {
                 control,
                 operator,
                 direct_timestamps: Some(timestamps.clone()
-                    as Arc<dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource>),
+                    as Arc<
+                        dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+                    >),
                 timestamps,
                 status,
                 catalog,
