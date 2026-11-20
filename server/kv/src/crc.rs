@@ -27,7 +27,7 @@ pub fn extend(crc: u32, data: &[u8]) -> u32 {
 const MASK_DELTA: u32 = 0xA282_EAD8;
 
 /// Masks a CRC before it is stored next to the data it covers, so a CRC of bytes that
-/// themselves contain CRCs stays well distributed (the LevelDB/RocksDB convention).
+/// themselves contain CRCs stays well distributed (the LevelDB convention).
 pub fn mask(crc: u32) -> u32 {
     crc.rotate_right(15).wrapping_add(MASK_DELTA)
 }

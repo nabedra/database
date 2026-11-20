@@ -299,7 +299,7 @@ impl<'a> Exec<'a> {
         Exec {
             cfg,
             watchdog,
-            bg: Background::new(2),
+            bg: Background::new(2).unwrap(),
             budget: Arc::new(MemtableBudget::new(8 << 20)),
             fs,
             sleepy: None,

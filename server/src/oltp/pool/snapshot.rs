@@ -947,6 +947,11 @@ pub(super) fn recover_group(
         .transpose()?;
     cleanup_files(&pool.inner.path, identity.group_id, name)
 }
+/// NS14 rule 4: retires every snapshot file of a group whose damaged bytes
+/// were released. Idempotent.
+pub(super) fn retire_group_files(root: &Path, id: Uuid) -> Result<(), ProtocolError> {
+    cleanup_files(root, id, None)
+}
 fn cleanup_files(root: &Path, id: Uuid, keep: Option<&str>) -> Result<(), ProtocolError> {
     let directory = root.join("snapshots").join(id.to_string());
     if let Some(name) = keep

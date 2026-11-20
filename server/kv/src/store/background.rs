@@ -1,5 +1,5 @@
-//! [`Background`]: the worker-shared flush and compaction threads (replaces RocksDB's
-//! `Env` thread pools). One `kv-flush` thread and `threads - 1` `kv-compact` threads
+//! [`Background`]: the worker-shared flush and compaction threads (replaces the
+//! previous engine's background thread pools). One `kv-flush` thread and `threads - 1` `kv-compact` threads
 //! serve every store opened with the same `Background`. With one thread, the flush
 //! thread also compacts.
 

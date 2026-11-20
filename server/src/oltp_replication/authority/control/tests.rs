@@ -33,6 +33,7 @@ use std::{
 };
 use uuid::Uuid;
 mod direct;
+mod group_damage;
 mod growth;
 mod pool_drain;
 mod restart;

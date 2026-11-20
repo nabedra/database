@@ -46,7 +46,19 @@ pub(super) async fn open_configured(
             }
             _ => None,
         };
-        pools.open_configured(&entry, anchor, exclusion.as_ref())?;
+        // Section 3 rule 6 (O26): a secondary pool that cannot open (damage
+        // refused by R1 to R6, EIO, a bad mount) takes the failed-mount path.
+        // The worker stays up and its other pools serve; the pool's replicas
+        // are reported lost when the retained groups are rehosted.
+        let id = entry.mount.identity.pool_id;
+        if let Err(error) = pools.open_configured(&entry, anchor, exclusion.as_ref()) {
+            tracing::error!(
+                pool = %id,
+                %error,
+                "secondary OLTP pool refused at open; the worker keeps serving its other pools"
+            );
+            pools.mark_refused(id, error);
+        }
     }
     Ok(())
 }

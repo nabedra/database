@@ -3,7 +3,7 @@
 //! Every store opened with the same [`MemtableBudget`] joins one [`BudgetGroup`]. The
 //! group knows its stores, so a writer stalled on an exhausted budget can have the store
 //! holding the most unflushed memtable memory flushed, even when that store is idle
-//! (RocksDB's write-buffer-manager flush). It also tracks **pinned** bytes: memtables
+//! (a write-buffer-manager flush). It also tracks **pinned** bytes: memtables
 //! that are already flushed to runs but still alive because a snapshot or iterator holds
 //! them. They stay charged to the budget (its `used()` is the real memory), but writers
 //! stall only on the *unpinned* charge, so one long-lived snapshot cannot stop every

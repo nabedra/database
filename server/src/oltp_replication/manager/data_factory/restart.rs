@@ -36,7 +36,39 @@ impl DataGroupFactory {
                     .iter()
                     .filter(|member| member.worker_id == self.local.worker_id)
                 {
-                    let pool = pools.retained_for_group(local.pool_id, &self.control).await?;
+                    // Section 3 rules 1, 2 and 6: a replica on a refused pool or
+                    // of a quarantined group is not started. It is reported to
+                    // Control, and the worker keeps hosting everything else.
+                    let pool = match pools.retained_for_group(local.pool_id, &self.control).await {
+                        Ok(pool) => pool,
+                        Err(error) if pools.refused(local.pool_id).is_some() => {
+                            tracing::error!(group = %record.identity.group_id, node = local.node_id,
+                                %error, "replica on a refused pool is not started");
+                            self.settle_damage(
+                                GroupDamageReport {
+                                    group: record.identity.clone(),
+                                    replica: local.clone(),
+                                    reason: GroupDamageReason::PoolRefused,
+                                    first_bad_seq: None,
+                                },
+                                None,
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(damage) = pool.group_damage(record.identity.group_id) {
+                        self.settle_damage(
+                            GroupDamageReport {
+                                group: record.identity.clone(),
+                                replica: local.clone(),
+                                reason: damage.cause.into(),
+                                first_bad_seq: damage.first_bad_seq,
+                            },
+                            Some(pool),
+                        );
+                        continue;
+                    }
                     let store = pool.retained_group(record.identity.clone()).await?;
                     let running = self
                         .manager

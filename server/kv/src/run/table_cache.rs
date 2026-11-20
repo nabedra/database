@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::fs::{Fs, OpenMode};
 use crate::run::reader::{Run, RunReadContext};
 
-/// Default `max_open_runs`, the same as RocksDB's `max_open_files` today.
+/// Default `max_open_runs`, the same as the previous engine's `max_open_files`.
 pub const DEFAULT_MAX_OPEN_RUNS: usize = 128;
 
 /// Most shards a [`TableCache`] uses.

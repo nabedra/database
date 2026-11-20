@@ -1196,8 +1196,8 @@ async fn ns08_ns17_l0_slowdown_paces_writes_off_the_executor() {
 
 /// O05 / M02 regression (NS6): the journal thread wakes a committer before it
 /// drops the write's `on_done` (order and generation guards, batch charge).
-/// A group write must still return only after those are released, as it did
-/// on RocksDB, or the caller's next request can find the arena still charged.
+/// A group write must still return only after those are released, or the
+/// caller's next request can find the arena still charged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
     let dir = Dir::new();
@@ -1228,3 +1228,5 @@ async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
 }
 
 mod rv_ns6;
+
+mod ns14;

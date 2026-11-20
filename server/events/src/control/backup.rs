@@ -160,7 +160,8 @@ pub async fn run_restore(config: &Config, backup: &Path) -> Result<()> {
         broker_id: config.broker_id,
         manifest_sha256: bundle.sha256,
     };
-    // The RocksDB lock also serializes this marker protocol with broker startup.
+    // The store's exclusive `kv/LOCK` also serializes this marker protocol with
+    // broker startup.
     let broker = config.open_broker()?;
     let pending = config.data_dir.join(RESTORE_IN_PROGRESS);
     let complete = config.data_dir.join(RESTORE_REBIND);

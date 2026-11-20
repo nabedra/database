@@ -376,7 +376,7 @@ async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_work
         };
         assert!(
             OltpPool::open_development(&dir.0, identity.clone(), resources.clone()).is_err(),
-            "RocksDB lock disappeared while transfer retained its file"
+            "store lock disappeared while transfer retained its file"
         );
         gate.release();
         completed.await.unwrap();

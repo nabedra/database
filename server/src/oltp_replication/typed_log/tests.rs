@@ -237,7 +237,7 @@ impl nabedra_kv::fs::FsFile for GatedFile {
 
 /// O06/O11, C07/F03: hold the actual journal sync of a typed append (a gated
 /// `FaultFs` under the pool's store) and observe the typed callback. Formerly a
-/// Linux-only test driven by a Python harness that gated the RocksDB WAL file;
+/// Linux-only test driven by a Python harness that gated the previous engine's WAL;
 /// it now runs everywhere. While the sync is held: the callback has not fired,
 /// a cancelled append keeps its owned write and order, the next append waits
 /// behind it, no executor thread waits for the fsync, and an unrelated pool's

@@ -251,7 +251,7 @@ async fn start(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Retain the slot and temporary directory until the disk job settles even if
-    // the client's connection disappears while RocksDB is exporting the image.
+    // the client's connection disappears while the store is exporting the image.
     tokio::spawn(async move { prepare(&server, request).await })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

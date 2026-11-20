@@ -29,9 +29,10 @@ Do not overcheck. Never ever create AI slop tests that do not add a ton of value
 Do check point 0's most fundamental checks for compilation, syntax errors, plausible errors that might occur during code execution in some edge case scenario...
 
 4. Work in realistic environments
-Always use a testing yet realistic environment. E.g., if you are creating a program that is intended to run on AWS S3, ask the user for credentials/access to the appropriate env (look you might already have them available at some `.env`) to run localized tests on realistic envs. If you have to implement a database on Kubernetes, run locally a set of Docker or Kubernetes runtime and test the whole program there. You have to emulate realistic setups with realistic behaviour that real users might indeed exhibit when engaging with the environment. NOTE: make sure to run tests that are suitable to the CPU, RAM and other computational resources available; you might be working with an Intel i5 and you might have to work around CPU limits there by batching the tests with N rather than 10N parallel threads, or go little by little with a queue of tasks, etc.
-
-NOTE: if you use paid tools such as AWS S3 for the tests, it is even more important to make them high-value and limited in cost. Always try to minimize costs when using paid tools and do not over do the testing, e.g. by running thousands of EC2 instances running for hours. The tests should be very respectful with costs.
+Use a realistic test environment that fits the workload and reproduces how
+users run the system. For remote builds, heavy Docker and Kubernetes checks,
+and authorized S3 testing, follow the
+[Nabedra builds skill](../nabedra-builds/SKILL.md).
 
 # Number of tests
 Aim for 3-10 big essential tests/categories max per functionality/use case category and then do some variations of each, 3-5 per category. Each essential test should amount to a big use or edge case that needs to be tested. Use `references/example.md` as a reference: there we have 5 big use case categories, 2-3 essential tests/categories, then in the implementation YOU should make variations of each of those bulleted-points essential tests. E.g., to check that the queue doesn't break under scaling (one possible essential test for the scaling use case) you'd check with 3-5 different configurations (request size, number of parallel requests, when they burst...) 

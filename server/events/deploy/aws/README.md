@@ -53,9 +53,9 @@ Cloud-init installs the service and records the expected EBS volume ID.
 Every startup checks the disk serial, mounts its filesystem at the broker
 data directory, verifies the artifact checksum, and fetches the current
 secret. It formats an unsigned blank disk only if requested and clears the
-local format flag after mounting. The non-root broker opens RocksDB only
-after its exact data directory is mounted. EBS attachments stop the old host
-before detaching the volume. Terraform protects the registered data disks
+local format flag after mounting. The non-root broker opens its `nabedra-kv`
+store only after its exact data directory is mounted. EBS attachments stop the
+old host before detaching the volume. Terraform protects the registered data disks
 from destruction while they are managed by this configuration.
 [Stable EBS device identification](https://docs.aws.amazon.com/ebs/latest/userguide/identify-nvme-ebs-device.html) · [Terraform volume attachment options](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/volume_attachment)
 
@@ -201,7 +201,7 @@ retention, replica count and failure profile.
 
 Estimate retained encoded bytes per partition from payload distribution,
 event rate and retention time. Multiply by the assigned replica count.
-Measure additional space and I/O for RocksDB compaction, log segments,
+Measure additional space and I/O for storage compaction, journal segments,
 snapshot staging and learner catch-up. Leave enough headroom for a
 replacement to catch up while producers continue. Add partitions for
 independently ordered keys when a single partition leader saturates.

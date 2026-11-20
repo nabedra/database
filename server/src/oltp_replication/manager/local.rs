@@ -160,9 +160,10 @@ impl LocalWorker {
             shared: shared.clone(),
             client: transport.client(),
             registry,
-            routes: Mutex::new(BTreeMap::new()),
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
             ownership: Some(ownership.clone()),
             starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
         });
         let operator = LocalOperatorPermit::from_local_bootstrap(
             WorkerIdentity::from(&enrollment),
@@ -197,8 +198,8 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
             let mut t: LocalTopology = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             if (t.directory_dev, t.directory_inode, t.lock_dev, t.lock_inode)
                 != (directory_dev, directory_inode, lock_dev, lock_inode)
-                // The pool's store exists: `pool/kv/CURRENT` (format 2). A RocksDB
-                // `pool/CURRENT` passes here so the pool open refuses it with
+                // The pool's store exists: `pool/kv/CURRENT` (format 2). A format 1
+                // `pool/CURRENT` (previous engine) passes here so the pool open refuses it with
                 // a clear unsupported-format error (NS22).
                 || !(path.join("pool").join("kv").join("CURRENT").is_file()
                     || path.join("pool").join("CURRENT").is_file())

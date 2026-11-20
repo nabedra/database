@@ -253,7 +253,7 @@ pub fn trials(
     needles: &[(Vec<u8>, Vec<u8>)],
 ) -> Result<DamageCounts, String> {
     let mut counts = DamageCounts::default();
-    let bg = Background::new(2);
+    let bg = Background::new(2).unwrap();
     let mut rng = Rng(cfg.seed ^ 0xD4_4A6E);
     let mut attempts = 0;
     while counts.trials < cfg.damage_trials as u64 && attempts < cfg.damage_trials * 4 {
