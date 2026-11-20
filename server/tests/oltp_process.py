@@ -39,6 +39,26 @@ def raw(url, path, body=None, *, token="test-token", database="test", headers=No
         return error.code, json.load(error)
 
 
+# ExecutionConfig::default().result_retention_ms, with a margin for clock reads.
+READ_RETENTION_SECONDS = 290
+# Client timeout for the 110,001-row growth checks (a debug-build count takes ~1 min).
+GROWTH_TIMEOUT = 600
+
+
+def direct_mode(url, deadline_seconds=60):
+    """True once the direct point path serves requests; False when direct_oltp is off."""
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        status, stats = raw(url, "/v1/runtime/stats")
+        capability = (stats.get("direct_capability") or {}) if status == 200 else {}
+        if status == 200 and not capability.get("direct_oltp"):
+            return False
+        if capability.get("active"):
+            return True
+        assert time.monotonic() < deadline, (status, stats)
+        time.sleep(0.5)
+
+
 class Server:
     def __init__(self, binary, directory, diagnostics=None):
         self.binary, self.directory = binary, directory
@@ -192,6 +212,7 @@ def main(binary, evidence_dir, condition, build_profile):
             status, value = raw(server.url, "/v1/operations", op)
             assert status == 409 and value["error"]["outcome"] == "not_applied", value
             assert users.get("new") is None and users.get("alice")["age"] == 25
+            direct = direct_mode(server.url)
             identity = str(uuid.uuid4())
             insert = {"request_id": identity, "operation": "table.insert", "payload": {"table_id": users.id, "row": {"id": "durable", "age": 42}}}
             status, receipt = raw(server.url, "/v1/requests", insert)
@@ -199,23 +220,38 @@ def main(binary, evidence_dir, condition, build_profile):
             assert terminal(server.url, run, identity)["state"] == "succeeded"
             assert raw(server.url, "/v1/operations", insert) == (200, {"request_id": identity, "data": None})
             changed = {**insert, "payload": {"table_id": users.id, "row": {"id": "another", "age": 42}}}
-            assert raw(server.url, "/v1/operations", changed)[0] == 409
+            reused = raw(server.url, "/v1/operations", changed)
+            if direct:
+                # Decided (D03): the direct path detects request-ID reuse per table
+                # and key, so the same ID on another key executes once.
+                assert reused == (200, {"request_id": identity, "data": None}), reused
+                assert users.get("another") == {"id": "another", "age": 42}
+            else:
+                # The queued path keeps one global request identity.
+                assert reused[0] == 409, reused
             assert raw(server.url, f"/v1/requests/{run}/{identity}", token="invalid")[0] == 401
             assert raw(server.url, f"/v1/requests/{run}/{identity}", database="other")[0] == 401
             assert raw(server.url, "/v1/operations", insert, headers={"X-Nabedra-Storage": "forged"})[0] == 401
             assert raw(server.url, "/v1/cluster/operations", {})[0] == 400
             query_id = str(uuid.uuid4())
+            query_at = time.monotonic()
             status, query_receipt = raw(server.url, "/v1/requests", {"request_id": query_id, "operation": "table.list", "payload": {}})
             assert status == 202
             assert terminal(server.url, run, query_id)["state"] == "succeeded"
             # Exercise the unchanged ORM decoder through real HTTP beyond the
             # removed 100,000 count ceiling, keeping each batch/request bounded.
-            growth = db.create_table("growth", {"id": int, "value": str}, key="id")
+            # A full count of 110,001 rows takes about a minute on a debug build
+            # (55 s locally, LIVE1); the server answers, so the client must outwait
+            # it instead of reporting a lost response at the ORM's 30 s default.
+            slow = Database(url=server.url, token="test-token", database="test", mode="olap", timeout=GROWTH_TIMEOUT)
+            growth = slow.create_table("growth", {"id": int, "value": str}, key="id")
             growth_id = growth.id
             for start in range(0, 110001, 10000):
                 rows = [{"id": i, "value": f"value-{i}"} for i in range(start, min(start + 10000, 110001))]
                 assert growth.insert_many(rows) == len(rows)
+            started = time.monotonic()
             assert growth.query().count() == 110001
+            print(f"oltp_process: count of 110001 rows took {time.monotonic() - started:.2f}s", file=sys.stderr, flush=True)
             assert growth.query().limit(100001).count() == 100001
             assert growth.get(100000) == {"id": 100000, "value": "value-100000"}
             original_id = users.id
@@ -227,12 +263,22 @@ def main(binary, evidence_dir, condition, build_profile):
             assert users.id == original_id and users.get("durable") == {"id": "durable", "age": 42}
             assert terminal(server.url, run, identity)["state"] == "succeeded"
             status, abandoned = raw(server.url, f"/v1/requests/{run}/{query_id}")
-            assert status == 404 and abandoned["error"]["outcome"] == "unknown", abandoned
-            assert raw(server.url, "/v1/operations", changed)[0] == 409
+            if time.monotonic() - query_at < READ_RETENTION_SECONDS:
+                assert status == 404 and abandoned["error"]["outcome"] == "unknown", abandoned
+            else:
+                # The read's receipt outlived result_retention_ms (debug-build growth
+                # checks take minutes): it is gone, not replayed.
+                assert status == 404 and abandoned["error"]["code"] == "not_found", abandoned
+            if direct:
+                assert raw(server.url, "/v1/operations", changed) == (200, {"request_id": identity, "data": None})
+            else:
+                assert raw(server.url, "/v1/operations", changed)[0] == 409
             assert raw(server.url, "/v1/operations", insert) == (200, {"request_id": identity, "data": None})
             assert users.where(col("id") == "durable").count() == 1
-            growth = db.table("growth")
+            growth = Database(url=server.url, token="test-token", database="test", timeout=GROWTH_TIMEOUT).table("growth")
+            started = time.monotonic()
             assert growth.id == growth_id and growth.query().count() == 110001
+            print(f"oltp_process: count of 110001 rows after restart took {time.monotonic() - started:.2f}s", file=sys.stderr, flush=True)
             assert growth.get(110000) == {"id": 110000, "value": "value-110000"}
             growth.drop()
             measurement = benchmark(users, condition)
@@ -244,9 +290,11 @@ def main(binary, evidence_dir, condition, build_profile):
             assert recreated.id != original_id
             server.stop()
             rejected = subprocess.run([binary, "serve", "--data-dir", directory, "--database", "other", "--port", "0"], env={**os.environ, "NABEDRA_TOKEN": "test-token"}, capture_output=True, text=True, timeout=15)
-            assert rejected.returncode != 0 and "selector differs" in rejected.stderr, rejected.stderr
+            # Attaching storage under another database is refused at startup
+            # (the message changed in b38f82d; "selector differs" is gone).
+            assert rejected.returncode != 0 and "invalid hosted group placement or identity" in rejected.stderr, rejected.stderr
             remote = subprocess.run([binary, "worker", "--bootstrap", "missing.json"], capture_output=True, text=True, timeout=5)
-            assert remote.returncode != 0 and "protocol_error" in remote.stderr, remote.stderr
+            assert remote.returncode != 0 and "registered worker configuration invalid" in remote.stderr, remote.stderr
             subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", directory + "/key.pem", "-out", directory + "/cert.pem"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
             server.start(tls=True)
             secure = Database(url=server.url, token="test-token", database="test", ca_file=directory + "/cert.pem")

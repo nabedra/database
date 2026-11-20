@@ -372,10 +372,7 @@ impl TimestampEndpoint {
             Method::TimestampCall {
                 operation: 41,
                 mutation: true,
-            } => matches!(
-                head.action,
-                ServiceAction::Owner | ServiceAction::ParticipantProof { .. }
-            ),
+            } => allocate_direct_permitted(&head.action),
             Method::TimestampCall {
                 operation: 3,
                 mutation: true,
@@ -417,11 +414,7 @@ impl TimestampEndpoint {
                             if source_group == route.source_group
                     )
             }
-            // `AllocateDirect` (operation 41) also for a direct range leader.
-            Method::TimestampCall { operation, .. } => {
-                head.action == ServiceAction::Owner
-                    || head.action == ServiceAction::DirectLeader && operation == 41
-            }
+            Method::TimestampCall { .. } => head.action == ServiceAction::Owner,
             _ => false,
         };
         if !permitted {
@@ -1348,9 +1341,13 @@ impl TimestampClient {
         // These reads also arrive from Status or participant proof clients.
         // A point decision write can repeat only in reconciliation mode.
         // Fences return the receipt stored for the same transition and command.
+        // AllocateDirect repeats safely (values above every completed
+        // allocation), so a stalled leader gets a per-replica deadline and
+        // the call moves on to the new leader (D05/LIVE1).
         if matches!(
             request,
-            Request::ScopedReadPin { .. }
+            Request::AllocateDirect { .. }
+                | Request::ScopedReadPin { .. }
                 | Request::ScopedCopyProof { .. }
                 | Request::VerifyTimestampPointPin(_)
                 | Request::CommitTimestampPoint { reconcile: true, .. }
@@ -1372,7 +1369,6 @@ impl TimestampClient {
                 | Request::Allocate { .. }
                 | Request::Allocation { .. }
                 | Request::Released { .. }
-                | Request::AllocateDirect { .. }
         );
         self.client.named(request.method(), request, converge).await
     }
@@ -2258,6 +2254,18 @@ impl TimestampService for TimestampClient {
             async move { TimestampClient::fence(self, transition_id, expected, next, ready).await },
         )
     }
+}
+
+/// Who may call `AllocateDirect` (operation 41): the queue owner, a participant
+/// proof, or a direct range leader (T7's `DirectLeader`, granted by Control only
+/// while `data.direct.v1` is active). It is the only arm for operation 41, so no
+/// other arm can shadow it (T9 finding: the `DirectLeader` grant sat in a later,
+/// unreachable arm and every remote `AllocateDirect` was refused as invalid).
+fn allocate_direct_permitted(action: &ServiceAction) -> bool {
+    matches!(
+        action,
+        ServiceAction::Owner | ServiceAction::ParticipantProof { .. } | ServiceAction::DirectLeader
+    )
 }
 
 #[cfg(test)]

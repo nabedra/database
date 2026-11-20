@@ -60,6 +60,11 @@ const EXPIRE_PROPOSAL_DEADLINE: Duration = Duration::from_secs(5);
 /// false; requests fall back with `Inactive`, and nothing is written.
 pub(crate) trait DirectGate: Send + Sync {
     fn direct_active(&self) -> bool;
+    /// The queued-history window (T7c): a mutation whose anchor holds no
+    /// dedup record falls back with `History` instead of executing.
+    fn history_settling(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -563,6 +568,38 @@ impl DirectExecutor {
                         }
                     }
                     Err(error) => return Err(failed(error)),
+                    Ok(read @ LatestRead::Value { .. }) => {
+                        // T7c: a get whose id the queued path accepted (a
+                        // forward marker at its key) is answered there:
+                        // after a cold start that is 404 abandoned, never a
+                        // fresh read. In the queued-history window an id
+                        // without a record may be such a request too.
+                        // Reads leave no record, so nothing else changes.
+                        match by(
+                            deadline,
+                            handle.direct_dedup_after_barrier(
+                                request.table_id,
+                                payload.key.clone(),
+                                request.request_id,
+                            ),
+                        )
+                        .await
+                        {
+                            Err(error) if error.code == ErrorCode::StorageUnavailable => {
+                                if !self.pause(deadline, RetryCause::Unavailable).await {
+                                    return Err(failed(error));
+                                }
+                            }
+                            Err(error) => return Err(failed(error)),
+                            Ok(Some(found)) => return self.settled(found, request.digest),
+                            Ok(None) if self.gate.history_settling() => {
+                                return Err(DirectResponse::Fallback {
+                                    reason: FallbackReason::History,
+                                });
+                            }
+                            Ok(None) => return self.get_result(read, &epochs),
+                        }
+                    }
                     Ok(read) => return self.get_result(read, &epochs),
                 }
             }
@@ -622,6 +659,8 @@ impl DirectExecutor {
                 .collect(),
             Operation::Update(p) => vec![key(p.key.clone())],
             Operation::Delete(p) => vec![key(p.key.clone())],
+            // Only a forward reaches here with a get: its marker's anchor.
+            Operation::Get(p) => vec![key(p.key.clone())],
             _ => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Ineligible,
@@ -762,6 +801,13 @@ impl DirectExecutor {
             }
             Err(error) => return Err(failed(error)),
             Ok(Some(found)) => return self.settled(found, request.digest).map(Attempt::Done),
+            // T7c: this id may belong to a queued request accepted before
+            // activation without a marker. Only the queued path knows it.
+            Ok(None) if self.gate.history_settling() => {
+                return Err(DirectResponse::Fallback {
+                    reason: FallbackReason::History,
+                });
+            }
             Ok(None) => {}
         }
         let mut current = Vec::with_capacity(keys.len());
@@ -847,6 +893,10 @@ impl DirectExecutor {
             }
         };
         self.stats.proposed(rows, index_changes);
+        // T9 process barrier (D04 before quorum): timestamp registered, entry not
+        // yet proposed.
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id).await;
         let applied = match by(deadline, handle.propose(command)).await {
             Ok(applied) => applied,
             Err(error) => {
@@ -861,6 +911,11 @@ impl DirectExecutor {
         let fault = match applied.reply {
             ParticipantReply::Direct(DirectReply::Applied { .. }) => {
                 self.stats.applied();
+                // T9 process barrier (D02, D04): the entry has reached quorum and
+                // applied here; the reply has not left the leader yet.
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::pause("direct-applied", request.request_id)
+                    .await;
                 return Ok(Attempt::Done(DirectResponse::Done(
                     DirectData::from_json(result.as_str()).map_err(failed)?,
                 )));

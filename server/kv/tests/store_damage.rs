@@ -400,6 +400,195 @@ fn ns07_g2_run_block_damage_quarantines_on_read() {
     );
 }
 
+/// NS07 G2 and rule 4 (KVfix3): a scope released earlier and damaged later stays
+/// quarantined across every reopen. `ManifestState::apply` lifted a record's quarantines
+/// for the scopes the same record released, and a fresh manifest stores the whole state
+/// as one record, so the second open after the damage dropped the quarantine of any
+/// scope with a past release (NS10 NS07 trials, seed 38).
+#[test]
+fn ns07_quarantine_of_a_once_released_scope_survives_reopens() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    store.release_scope(&group_prefix(1)).unwrap();
+    for k in 0..30 {
+        write_kv(
+            &store,
+            &group_prefix(1),
+            &group_key(1, k),
+            &val(&format!("g1-{k:02}")),
+            false,
+            Durability::NoSync,
+        );
+    }
+    store.flush().unwrap();
+    drop(store);
+    let (run, off) = find_one(&fs, &dir.join("runs"), b"<<g1-07>>");
+    fs.flip_bit(&run, off + 50, 6).unwrap();
+    let s = Store::open(&dir, options(&fs, &bg)).unwrap().store;
+    assert!(is_corruption(&s.snapshot().get(&group_key(1, 7))));
+    assert_eq!(s.quarantined().len(), 1);
+    drop(s);
+    // Each open writes a fresh manifest holding the whole state; each round reopens a
+    // crash image of the previous one, so only durable state counts.
+    let mut image = fs.crash();
+    for round in 0..3 {
+        let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+        let scopes: Vec<Vec<u8>> = opened
+            .quarantined
+            .iter()
+            .map(|d| d.scope.to_vec())
+            .collect();
+        assert_eq!(scopes, vec![group_prefix(1)], "open {round}");
+        drop(opened);
+        image = image.crash();
+    }
+}
+
+/// NS07 G1 (KVfix3): an iterator that crosses a quarantined scope fails even when no
+/// key of that scope is left to land on. Recovery skipped g01's only record, so g01 is
+/// empty; scans of g01 returned `Ok` with nothing, and scans across it silently skipped
+/// it (NS10 long campaign, seed 69: "scan of g00/ returned wrong data: missing ...").
+#[test]
+fn ns07_g1_scans_fail_across_a_quarantined_scope_with_no_keys_left() {
+    use std::ops::Bound;
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let store = open(&dir, options(&fs, &bg));
+    for (g, tag) in [(0, "g0-a"), (1, "g1-a"), (2, "g2-a")] {
+        write_kv(
+            &store,
+            &group_prefix(g),
+            &group_key(g, 1),
+            &val(tag),
+            false,
+            Durability::Sync,
+        );
+    }
+    let image = fs.kill();
+    drop(store);
+    let (seg, off) = find_one(&image, &dir.join("journal"), b"<<g1-a>>");
+    image.flip_bit(&seg, off + 20, 3).unwrap();
+    let opened = Store::open(&dir, options(&image, &bg)).unwrap();
+    assert_eq!(opened.quarantined.len(), 1, "{:?}", opened.quarantined);
+    let s = opened.store;
+    let snap = s.snapshot();
+    let g1 = group_prefix(1);
+    let g2 = group_prefix(2);
+    // Returns the keys seen and whether the scan ended in `Corruption`.
+    let scan = |lower: Bound<&[u8]>, upper: Bound<&[u8]>, reverse: bool| {
+        let mut it = snap.iter(lower, upper, false);
+        if reverse {
+            it.seek_to_last();
+        } else {
+            it.seek_to_first();
+        }
+        let mut seen = Vec::new();
+        while it.valid() {
+            seen.push(it.key().to_vec());
+            if reverse {
+                it.prev();
+            } else {
+                it.next();
+            }
+        }
+        (seen, matches!(it.status(), Err(Error::Corruption { .. })))
+    };
+    for reverse in [false, true] {
+        // The quarantined scope alone.
+        let (seen, corrupt) = scan(Bound::Included(&g1), Bound::Excluded(&g2), reverse);
+        assert!(seen.is_empty() && corrupt, "g01 alone, reverse {reverse}");
+        // Across it: g00's key or g02's key may come first, then the scan fails.
+        let (seen, corrupt) = scan(Bound::Unbounded, Bound::Unbounded, reverse);
+        assert!(corrupt, "across g01, reverse {reverse}: {seen:?}");
+        assert!(seen.len() <= 1, "{seen:?}");
+        // A healthy scope still scans.
+        let (seen, corrupt) = scan(Bound::Included(&g2), Bound::Unbounded, reverse);
+        assert!(
+            !corrupt && seen == vec![group_key(2, 1)],
+            "g02, reverse {reverse}"
+        );
+    }
+    // A seek past the quarantined scope does not cross it.
+    let mut it = snap.iter(Bound::Unbounded, Bound::Unbounded, false);
+    it.seek(&g2);
+    assert!(it.valid());
+    assert_eq!(it.key(), group_key(2, 1).as_slice());
+}
+
+/// A run holding only `keys` (written with `scope`) whose value tagged `damaged` has a
+/// flipped bit, reopened. Returns the open store.
+fn store_with_damaged_run(
+    fs: &FaultFs,
+    dir: &Path,
+    bg: &Arc<Background>,
+    scope: &[u8],
+    keys: &[Vec<u8>],
+    damaged: &str,
+) -> Store {
+    let store = open(dir, options(fs, bg));
+    for (k, key) in keys.iter().enumerate() {
+        write_kv(
+            &store,
+            scope,
+            key,
+            &val(&format!("v-{k:02}")),
+            false,
+            Durability::NoSync,
+        );
+    }
+    store.flush().unwrap();
+    drop(store);
+    let (run, off) = find_one(fs, &dir.join("runs"), format!("<<{damaged}>>").as_bytes());
+    fs.flip_bit(&run, off + 50, 6).unwrap();
+    let opened = Store::open(dir, options(fs, bg)).unwrap();
+    assert!(opened.quarantined.is_empty());
+    opened.store
+}
+
+/// A full scan of `[lower, upper)`; true if it ended in `Corruption`.
+fn scan_meets_corruption(store: &Store, lower: &[u8], upper: Option<&[u8]>) -> bool {
+    use std::ops::Bound;
+    let snap = store.snapshot();
+    let upper = upper.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut it = snap.iter(Bound::Included(lower), upper, false);
+    it.seek_to_first();
+    while it.valid() {
+        it.next();
+    }
+    matches!(it.status(), Err(Error::Corruption { .. }))
+}
+
+/// NS07 R5 (KVfix3): a scan over store-wide keys that meets a damaged block latches
+/// `RecoveryRequired`. Iterators attributed run damage only when their bounds lay in
+/// one group scope, so a store-wide scan returned `Corruption` and latched nothing
+/// (NS10 long campaign, seed 0 damage trial 3).
+#[test]
+fn ns07_r5_store_wide_scan_meeting_run_damage_latches() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let keys: Vec<Vec<u8>> = (0..30).map(|k| format!("s/k{k:03}").into_bytes()).collect();
+    let s = store_with_damaged_run(&fs, &dir, &bg, b"", &keys, "v-07");
+    assert!(scan_meets_corruption(&s, b"s/", Some(b"s0")));
+    assert!(s.requires_recovery(), "R5: store-wide damage must latch");
+    assert!(s.quarantined().is_empty(), "{:?}", s.quarantined());
+}
+
+/// NS07 G2 (KVfix3): a scan whose bounds span scopes that meets a damaged block in a
+/// run holding one group quarantines that group (the run's range, plan section 3)
+/// instead of reporting nothing.
+#[test]
+fn ns07_g2_unbounded_scan_quarantines_a_single_group_run() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let keys: Vec<Vec<u8>> = (0..30).map(|k| group_key(1, k)).collect();
+    let s = store_with_damaged_run(&fs, &dir, &bg, &group_prefix(1), &keys, "v-07");
+    assert!(scan_meets_corruption(&s, b"", None));
+    assert!(!s.requires_recovery());
+    let q: Vec<Vec<u8>> = s.quarantined().iter().map(|d| d.scope.to_vec()).collect();
+    assert_eq!(q, vec![group_prefix(1)]);
+}
+
 /// NS07 G2 at open: a damaged footer of a run holding one group quarantines that group;
 /// one spanning groups refuses the store.
 #[test]

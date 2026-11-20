@@ -308,6 +308,39 @@ impl Drop for ReleaseOnDrop {
     }
 }
 
+/// O26/NS04: a closed pool reopens at once although a child process forked
+/// while it was open still holds a copy of every descriptor. Test fixtures fork
+/// `openssl` from other test threads, and a child that has not reached `exec`
+/// yet shares the store lock's open file description. Before the store unlocked
+/// that description explicitly, the reopen failed with "operation would block"
+/// until the child exec'd (CIfix2, Linux CI).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o26_ns04_pool_reopens_while_a_forked_child_holds_its_descriptors() {
+    let dir = Dir::new();
+    let resources = shared(SharedResourceConfig::default());
+    let identity = pool_identity();
+    let pool = OltpPool::open_development(&dir.0, identity.clone(), resources.clone()).unwrap();
+    // SAFETY: the child only waits for a signal (async-signal-safe) and is
+    // killed below; it never returns into the test harness.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    assert!(child > 0, "fork failed");
+    drop(pool);
+    let reopened = OltpPool::open_development(&dir.0, identity, resources.clone());
+    // SAFETY: `child` is this test's own child process.
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        libc::waitpid(child, std::ptr::null_mut(), 0);
+    }
+    drop(reopened.expect("a forked child kept the closed pool's store locked"));
+    resources.drain().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_worker_drain() {
     tokio::time::timeout(Duration::from_secs(30), async {

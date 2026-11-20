@@ -171,6 +171,7 @@ impl WorkerRuntime {
     #[cfg(test)]
     pub(crate) async fn without_direct_for_test(&self) {
         if let Some(direct) = self.direct.get() {
+            direct.disable_for_test();
             direct.stop().await;
         }
         self.set_direct_commits_active(false);

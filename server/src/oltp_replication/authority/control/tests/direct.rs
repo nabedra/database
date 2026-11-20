@@ -15,6 +15,7 @@ impl Fixture {
             operation_id: Uuid::new_v4(),
             actor,
             action,
+            unix_ms: crate::oltp_replication::authority::control::direct::wall_ms(),
         })
         .await
     }
@@ -290,4 +291,68 @@ async fn o02_t7_after_activation_a_member_without_the_advert_cannot_join_as_vote
             .await,
         ControlReply::JoinBegun { .. }
     ));
+}
+
+impl Fixture {
+    async fn queued_history(&mut self, owner: WorkerIdentity) -> DirectCapability {
+        let reply = self
+            .direct(owner, DirectCapabilityOperation::QueuedHistory)
+            .await;
+        let ControlReply::DirectCapability(capability) = reply else {
+            panic!("unexpected queued-history reply: {reply:?}");
+        };
+        assert!(capability.advertised, "the note is the owner's advert");
+        capability
+    }
+}
+
+/// T7c, O15: a queue owner's `QueuedHistory` note before an unsettled
+/// eligible reservation. While Control cannot activate, the note is durable
+/// and the later activation carries `queued_history` and its wall clock,
+/// which opens the window. When Control can activate, the note activates
+/// without history (the owner then settles the request first); after
+/// activation a note changes nothing.
+#[tokio::test]
+async fn o15_t7c_queued_history_note_opens_the_window_only_before_activation() {
+    // Recorded while inactive, carried by the activation, durable.
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
+    let workers = fixture.ready_cluster(2).await;
+    let before = crate::oltp_replication::authority::control::direct::wall_ms();
+    assert_eq!(fixture.queued_history(workers[0]).await.activation, None);
+    // Repeated notes are harmless.
+    assert_eq!(fixture.queued_history(workers[0]).await.activation, None);
+    let activation = fixture
+        .advertise(workers[1])
+        .await
+        .activation
+        .expect("the last advert activates");
+    assert!(activation.queued_history, "{activation:?}");
+    assert!(activation.unix_ms >= before, "{activation:?}");
+    assert_eq!(
+        activation.history_until(1_000),
+        Some(activation.unix_ms + 1_000)
+    );
+    drop(fixture);
+    let mut reopened = Fixture::open(&directory, scope, pool).await;
+    // After activation a note answers active and changes nothing.
+    assert_eq!(
+        reopened.queued_history(workers[1]).await.activation,
+        Some(activation)
+    );
+
+    // A note that can activate does so, without history.
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    let workers = fixture.ready_cluster(2).await;
+    assert_eq!(fixture.advertise(workers[1]).await.activation, None);
+    let activation = fixture
+        .queued_history(workers[0])
+        .await
+        .activation
+        .expect("the owner's note activates");
+    assert!(!activation.queued_history, "{activation:?}");
+    assert_eq!(activation.history_until(1_000), None);
 }

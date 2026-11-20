@@ -263,6 +263,13 @@ impl Endpoint for ApplicationEndpoint {
                     match request.method {
                         Method::ScopedSubmit { bytes, .. } => {
                             let body = request_body(bytes, &sections)?;
+                            // T7c: settled at its anchor before any queue
+                            // reserves it, as on the ready-set queue.
+                            self.runtime
+                                .upgrade()
+                                .ok_or_else(unavailable)?
+                                .settle_before_reserve(body.as_ref())
+                                .await?;
                             let record = worker.submit(placement, body, session.remote()).await?;
                             Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
                         }

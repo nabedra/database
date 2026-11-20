@@ -42,6 +42,7 @@ mod damage_tests;
 #[cfg(test)]
 mod damage_scheduler_tests;
 mod retirement;
+mod supervision;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
 pub(crate) use data_factory::placement::{
@@ -79,7 +80,14 @@ where
     M: TypedMachine<C>,
 {
     fn leader(&self) -> Option<u64> {
-        self.raft.metrics().borrow_watched().current_leader
+        // A stopped core never counts as the leader (RV-APPLY F4).
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics
+            .running_state
+            .is_ok()
+            .then_some(metrics.current_leader)
+            .flatten()
     }
     fn members(&self) -> Vec<ReplicaMember> {
         self.raft
@@ -125,6 +133,8 @@ pub(crate) struct HostedGroupManager {
     starts: tokio::sync::Mutex<()>,
     /// Where a replica stopped by run-time damage is reported (NS14 rule 2).
     damage_sink: Arc<Mutex<Option<Arc<dyn DamageSink>>>>,
+    /// Retry, restart and stop counters of every core (`/v1/runtime/stats`).
+    health: Arc<super::hosted::transient::RaftHealthStats>,
 }
 impl HostedGroupManager {
     fn hosted_data(
@@ -160,6 +170,7 @@ impl HostedGroupManager {
             ownership: None,
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
+            health: Arc::default(),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
@@ -343,7 +354,8 @@ impl HostedGroupManager {
             .map_err(|_| unavailable())?
             .with_resident(resident.clone())?;
         let state = HostedState::new(machine, resident.clone())?;
-        let running = RaftConsensus::start(config, network, log, state).await?;
+        let running =
+            RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),
@@ -373,6 +385,7 @@ impl HostedGroupManager {
                 },
             );
         self.stop_on_damage(&running, node_id);
+        self.supervise(&running, node_id);
         Ok(running)
     }
     /// Node IDs of the replicas of `group` this worker currently hosts.

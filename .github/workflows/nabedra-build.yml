@@ -331,7 +331,9 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
+          # NS01 at 1e6 steps (~2.5 h) runs in its own job, campaign-ns01.
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 \
+            --skip ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign.log
       - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
@@ -352,6 +354,41 @@ jobs:
             campaign.log
             store-long.log
             kv-crash.log
+          retention-days: 14
+
+  campaign-ns01:
+    name: crash campaign NS01 1e6 (release, long)
+    if: inputs.campaign || contains(github.event.head_commit.message, '[ci campaign]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: campaign-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: campaign-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: NS01 differential, 1e6 steps with cuts and faults
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p nabedra-kv --test campaign -- --ignored --nocapture --exact \
+            ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign-ns01.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-ns01-log
+          path: campaign-ns01.log
           retention-days: 14
 
   docker-oltp:
@@ -479,11 +516,104 @@ jobs:
           python-version: "3.11"
       - name: Acceptance (no AWS, no comparative benchmarks)
         run: |
-          python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
-            --category recovery --category growth --output artifacts/oltp-acceptance
+          # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
+          rc=0; python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
+            --category recovery --category growth --output artifacts/oltp-acceptance || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 2 ]
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oltp-acceptance
           path: artifacts/oltp-acceptance
+          retention-days: 14
+
+  # T9: direct point path scenarios D01-D12 on real processes, and the existing suites with
+  # direct_oltp on and off. Opt-in: put [ci direct] in the pushed head commit message.
+  direct:
+    name: direct point path D01-D12, suites with direct_oltp on/off (T9)
+    if: contains(github.event.head_commit.message, '[ci direct]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Restore only: the OLTP job's cache (saved from the integration branch).
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build the OLTP server, the library test executable and the TypeScript ORM
+        id: build
+        run: |
+          set -o pipefail
+          (cd server && cargo build --locked --no-default-features --features oltp --bin nabedra-db)
+          (cd server && cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json-render-diagnostics) \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and (.target.kind | index("lib"))) | .executable' \
+            | tail -1 > test-executable.txt
+          test -x "$(cat test-executable.txt)"
+          echo "NABEDRA_BIN=$PWD/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          echo "NABEDRA_TEST_EXE=$(cat test-executable.txt)" >> "$GITHUB_ENV"
+          echo "NABEDRA_DIRECT_OFF_BINARY=$PWD/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          (cd orm/typescript && npm ci --no-audit --no-fund && npm run build)
+          mkdir -p artifacts
+      - name: D01-D12 and U01 on real processes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          python server/tests/oltp_direct_acceptance.py --binary "$NABEDRA_BIN" --test-executable "$NABEDRA_TEST_EXE" \
+            --output artifacts/direct 2>&1 | tee artifacts/direct.log
+      - name: ORM suites, direct_oltp on and off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          python -m pip install --quiet "httpx>=0.27,<1"
+          status=0
+          (cd orm/python && PYTHONPATH=src python -m unittest discover -s tests) 2>&1 | tee artifacts/orm-python-unit.log || status=1
+          off="$GITHUB_WORKSPACE/server/tests/direct_off_server.sh"
+          for mode in on off; do
+            binary="$NABEDRA_BIN"; [ "$mode" = off ] && binary="$off"
+            (cd orm/typescript && NABEDRA_TEST_SERVER_BINARY="$binary" npm test) 2>&1 | tee "artifacts/orm-typescript-$mode.log" || status=1
+            python server/tests/oltp_process.py --binary "$binary" 2>&1 | tee "artifacts/orm-python-process-$mode.log" || status=1
+          done
+          exit $status
+      - name: OLTP library suite, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
+      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          status=0
+          for mode in on off; do
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
+              --category recovery --category growth --output "artifacts/acceptance-$mode" > "artifacts/acceptance-$mode.log" 2>&1 || rc=$?
+            # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
+            if [ "${rc:-0}" != 0 ] && [ "$rc" != 2 ]; then status=1; fi; rc=0
+            tail -40 "artifacts/acceptance-$mode.log"
+          done
+          exit $status
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-evidence
+          path: artifacts
           retention-days: 14

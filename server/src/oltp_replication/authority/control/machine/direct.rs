@@ -10,6 +10,9 @@ use crate::oltp_replication::authority::control::direct::{
 
 const ACTIVATION: &[u8] = b"ct/direct-capability";
 const READERS: &[u8] = b"ct/direct-reader/";
+/// Present once a queue owner reserved an eligible mutation unsettled while
+/// the capability was inactive (T7c). Never deleted.
+const QUEUED_HISTORY: &[u8] = b"ct/direct-queued-history";
 
 pub(in crate::oltp_replication::authority::control) fn activation_key() -> &'static [u8] {
     ACTIVATION
@@ -26,6 +29,7 @@ pub(super) fn apply(
     position: AppliedPosition,
     actor: WorkerIdentity,
     action: &DirectCapabilityOperation,
+    unix_ms: u64,
 ) -> Result<ControlReply, ProtocolError> {
     if actor.validate().is_err() || !is_member(tx, actor)? {
         return fault(Fault::Unauthorized);
@@ -40,6 +44,11 @@ pub(super) fn apply(
             save(tx, &reader_key(actor), &actor)?;
             Some(actor)
         }
+        // The owner runs this build: its note is also its advert.
+        DirectCapabilityOperation::QueuedHistory => {
+            save(tx, &reader_key(actor), &actor)?;
+            Some(actor)
+        }
         DirectCapabilityOperation::Activate => None,
     };
     let activation = match load::<DirectActivation>(tx, ACTIVATION)? {
@@ -49,11 +58,20 @@ pub(super) fn apply(
                 activated_at: position,
                 run_id: state.ready.view.run_id,
                 enrollment_revision: state.enrollment_revision,
+                queued_history: tx.get(QUEUED_HISTORY)?.is_some(),
+                unix_ms,
             };
             save(tx, ACTIVATION, &activation)?;
             Some(activation)
         }
-        None => None,
+        None => {
+            // Recorded in the same entry that answers "inactive": every
+            // later activation sees it (T7c).
+            if matches!(action, DirectCapabilityOperation::QueuedHistory) {
+                save(tx, QUEUED_HISTORY, &true)?;
+            }
+            None
+        }
     };
     Ok(ControlReply::DirectCapability(DirectCapability {
         version: DIRECT_VERSION,
@@ -105,6 +123,19 @@ pub(super) fn admits_worker_id(
     supports(tx, WorkerIdentity::from(&record.enrollment))
 }
 
+/// Test processes (T7c): while the file named by
+/// `NABEDRA_OLTP_TEST_DIRECT_HOLD` exists, Control does not activate, as if
+/// a member had not advertised yet. Release builds have no such hook.
+#[cfg(test)]
+fn held_for_test() -> bool {
+    std::env::var_os("NABEDRA_OLTP_TEST_DIRECT_HOLD")
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+#[cfg(not(test))]
+fn held_for_test() -> bool {
+    false
+}
+
 /// Every enrolled worker and API advertised its current identity, and no
 /// membership change that could add an unchecked member is in flight.
 fn can_activate(
@@ -117,6 +148,7 @@ fn can_activate(
         || state.ready.ready_count == 0
         || state.invalid_ready != 0
         || tx.get(placement::ACTIVE)?.is_some()
+        || held_for_test()
     {
         return Ok(false);
     }

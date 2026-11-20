@@ -310,6 +310,10 @@ struct Client {
     control: Arc<ControlClient>,
     action: ServiceAction,
     leader: AtomicU64,
+    /// The last replica whose bounded attempt timed out (0: none). It is
+    /// tried last until it answers again, so a paused leader costs one
+    /// attempt deadline, not one per call (D05/LIVE1).
+    stalled: AtomicU64,
     _metadata: Arc<ScratchLease>,
 }
 impl Client {
@@ -332,6 +336,7 @@ impl Client {
             control,
             action,
             leader: AtomicU64::new(0),
+            stalled: AtomicU64::new(0),
             _metadata: metadata,
         })
     }
@@ -492,6 +497,7 @@ impl Client {
         retry_last: Option<u64>,
         convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
+        let stalled = self.stalled.load(Ordering::Relaxed);
         let preferred = match self.leader.load(Ordering::Relaxed) {
             0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
             node => node,
@@ -500,7 +506,9 @@ impl Client {
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
             for member in routes.members.iter().filter(|member| {
-                let priority = if Some(member.node_id) == retry_last {
+                let priority = if Some(member.node_id) == retry_last
+                    || (stalled != 0 && member.node_id == stalled)
+                {
                     2
                 } else {
                     u8::from(member.node_id != preferred)
@@ -522,14 +530,21 @@ impl Client {
                         SCOPED_MUTATION_TIMEOUT
                     };
                     let peer_deadline = deadline.min(Instant::now() + attempt);
-                    timeout_at(peer_deadline, call)
-                        .await
-                        .unwrap_or(Err(CallError::Transport(RequestError::Unreachable)))
+                    timeout_at(peer_deadline, call).await.unwrap_or_else(|_| {
+                        self.stalled.store(member.node_id, Ordering::Relaxed);
+                        Err(CallError::Transport(RequestError::Unreachable))
+                    })
                 } else {
                     call.await
                 };
                 match reply {
                     Ok(Ok(response)) => {
+                        let _ = self.stalled.compare_exchange(
+                            member.node_id,
+                            0,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         if action == ServiceAction::Owner || convergence_deadline.is_some() {
                             routes.record_successful_node(member.node_id);
                         }
@@ -794,7 +809,10 @@ impl Client {
                 64 << 10,
             )
             .await
-            .map_err(CallError::Transport)?;
+            .map_err(|error| {
+                tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
+                CallError::Transport(error)
+            })?;
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport completed");
         if reply.remote_identity().worker_id != worker.worker_id()
             || reply.group() != &self.group

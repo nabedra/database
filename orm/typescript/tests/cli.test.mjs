@@ -40,3 +40,35 @@ test("CLI preserves grouped commands, version output and protected init", async 
   const doctor = await launch("database", "--json", "doctor", "--config", config)
   assert.equal(doctor.stdout.trim(), "nabedra-db 0.1.1 oltp")
 })
+
+test("D01/T9 OLTP config accepts the direct_oltp switch", async () => {
+  // T9 finding: `direct_oltp` (plan "Rollout") must reach the server through the CLI.
+  const { validate } = await import(new URL("../dist/cliConfig.js", import.meta.url).href)
+  const execution = {
+    max_workers_per_request: 1, max_pending_requests: 8, max_queue_bytes_per_replica: 1 << 20,
+    max_retained_result_bytes_per_worker: 1 << 20, result_retention_ms: 1000,
+    queue_replication: "all_ready_workers", queue_lifetime: "live_cluster", partition_size: "64 MiB",
+  }
+  const local = {
+    version: 1, engine: "oltp", bind: "127.0.0.1:0", database: "application", auth_file: "auth.json",
+    topology: { mode: "local", data_dir: "volume" }, worker: { execution: { ...execution, direct_oltp: false } },
+  }
+  validate(local)
+  const peer = {
+    worker_id: crypto.randomUUID(), incarnation: crypto.randomUUID(), certificate_sha256: "a".repeat(64),
+    endpoint: "127.0.0.1:9000", server_name: "localhost", enrollment_revision: 1,
+  }
+  const remote = {
+    version: 1, engine: "oltp", bind: "127.0.0.1:0", database: "application", auth_file: "auth.json",
+    topology: {
+      mode: "remote", cluster_id: crypto.randomUUID(), control_group_id: crypto.randomUUID(),
+      enrollment: { database: "application", enrollment: peer },
+      worker_tls: { cert_file: "c.pem", key_file: "k.pem", ca_file: "ca.pem" },
+      control_peers: [peer], direct_oltp: false,
+    },
+  }
+  validate(remote)
+  assert.throws(() => validate({ ...remote, topology: { ...remote.topology, direct_oltp: "false" } }))
+  assert.throws(() => validate({ ...remote, worker: { execution: { ...execution, direct_oltp: 0 } } }))
+  assert.throws(() => validate({ ...local, topology: { ...local.topology, direct_oltp: false } }))
+})

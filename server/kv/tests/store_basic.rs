@@ -215,7 +215,16 @@ fn ns03_snapshot_survives_flush_and_compaction_and_pins_runs() {
         v.sort();
         v
     };
-    let pinned = run_files(&fs);
+    // The runs this snapshot pins, not a listing of `runs/`: the directory can also
+    // hold outputs of a background compaction still in flight and inputs whose last
+    // reference is about to drop, which no snapshot pins and a later purge may delete.
+    let mut pinned: Vec<String> = snap
+        .run_ids()
+        .into_iter()
+        .map(|id| format!("{id}.run"))
+        .collect();
+    pinned.sort();
+    assert!(!pinned.is_empty());
     for tag in 200..600 {
         let b = random_batch(&mut rng, 3, 40, tag);
         write(&store, &b, Durability::NoSync).unwrap();
@@ -260,7 +269,13 @@ fn ns03_snapshot_survives_flush_and_compaction_and_pins_runs() {
 fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
     let (fs, dir) = fault_fs();
     let bg = Background::new(2).unwrap();
-    let store = open(&dir, small_options(Arc::new(fs.clone()), bg.clone()));
+    // Holds background compaction while the compaction fault below is arranged.
+    let gate = Gate::new(fs.clone());
+    let _open = OpenOnDrop(gate.clone());
+    let store = open(
+        &dir,
+        small_options(Arc::new(GateFs(gate.clone())), bg.clone()),
+    );
     let mut model = BTreeMap::new();
     let mut rng = Rng(11);
     let mut tag = 0;
@@ -302,7 +317,11 @@ fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
         store.flush().unwrap();
         assert_eq!(dump(&store.snapshot()), model, "{label}");
     }
-    // Compaction.
+    // Compaction. The flush schedules a background compaction; with the gate closed it
+    // cannot write anything before the fault is in place (it may hold the compaction
+    // lock, waiting), so the work is still there for `compact` and meets ENOSPC. On CI
+    // the background thread sometimes finished it first and `compact` returned `Ok`.
+    gate.close();
     fill(&store, &mut model, 60);
     store.flush().unwrap();
     fs.inject(
@@ -311,6 +330,7 @@ fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
             .error(FaultError::Enospc)
             .repeat(),
     );
+    gate.open();
     assert_eq!(store.compact(), Err(Error::NoSpace));
     assert_eq!(dump(&store.snapshot()), model);
     fs.clear_faults();

@@ -131,9 +131,13 @@ pub(crate) enum FallbackReason {
     /// The table's schema could not be read without blocking (a DDL holds
     /// the catalog) or names an index this leader cannot maintain.
     Schema,
+    /// The queued-history window (T7c): the request id has no dedup record
+    /// here and may belong to a queued request accepted before activation,
+    /// which only the queued path can answer. Nothing was written.
+    History,
 }
 impl FallbackReason {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Inactive,
         Self::Ineligible,
         Self::Intent,
@@ -141,6 +145,7 @@ impl FallbackReason {
         Self::Forwarded,
         Self::ResourceLimit,
         Self::Schema,
+        Self::History,
     ];
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -151,6 +156,7 @@ impl FallbackReason {
             Self::Forwarded => "forwarded",
             Self::ResourceLimit => "resource_limit",
             Self::Schema => "schema",
+            Self::History => "history",
         }
     }
 }

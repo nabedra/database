@@ -80,8 +80,8 @@ fn run_tombstones(file: &RunFile, run: &Run) -> Arc<FragmentedRangeTombstones> {
 
 /// The newest point version of `key` visible at `seq` in `sv`: `(kind, stored value)`,
 /// with range tombstones of every source applied. Run damage is reported (G2) when
-/// `report` is set; journal GC's relocation check passes false and treats any error as
-/// "the key no longer holds the old locator".
+/// `report` is set; journal GC's relocation check passes false and fails its pass on any
+/// error (an unreadable key is never taken for one that no longer holds its locator).
 pub(super) fn newest(
     inner: &Inner,
     sv: &SuperVersion,
@@ -180,6 +180,24 @@ impl Snapshot {
 
     pub fn seq(&self) -> Seq {
         self.seq
+    }
+
+    /// The one group scope run `id` of this snapshot's version lies in, or the empty
+    /// (store-wide) scope when it holds store-wide keys, spans scopes or is not found.
+    fn run_scope(&self, id: u64) -> Bytes {
+        self.sv
+            .version
+            .runs()
+            .find(|r| r.id() == id)
+            .and_then(|r| single_scope(self.inner.scope_of, &r.lo, &r.hi, r.hi_exclusive))
+            .unwrap_or_default()
+    }
+
+    /// Ids of the runs this snapshot pins (`<id>.run` under `runs/`), in no order. For
+    /// tests that check a pinned run's file is never deleted (NS03).
+    #[doc(hidden)]
+    pub fn run_ids(&self) -> Vec<u64> {
+        self.sv.version.runs().map(|r| r.id()).collect()
     }
 
     pub(super) fn super_version(&self) -> &Arc<SuperVersion> {
@@ -311,6 +329,8 @@ impl Snapshot {
             inner: db,
             snapshot: self.clone(),
             scope,
+            lower: owned(lower),
+            upper: owned(upper),
             error: None,
             reported: false,
         }
@@ -350,37 +370,113 @@ pub struct Iter {
     /// The one scope the bounds lie in, if any: run damage found by this iterator is
     /// attributed to it.
     scope: Option<Bytes>,
+    lower: Bound<Vec<u8>>,
+    upper: Bound<Vec<u8>>,
     error: Option<Error>,
     reported: bool,
 }
 
-impl Iter {
-    fn after_move(&mut self) {
-        self.error = None;
-        if self.inner.valid() {
-            let quarantine = &self.snapshot.inner.quarantine;
-            if quarantine.len() > 0 && quarantine.check(self.inner.key()).is_err() {
-                self.error = Some(quarantined_error());
+fn owned(bound: Bound<&[u8]>) -> Bound<Vec<u8>> {
+    bound.map(<[u8]>::to_vec)
+}
+
+/// The larger of two lower bounds.
+fn max_lower<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    match (a, b) {
+        (Bound::Unbounded, x) | (x, Bound::Unbounded) => x,
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y))
+            if x != y =>
+        {
+            if x > y {
+                a
+            } else {
+                b
             }
+        }
+        (Bound::Excluded(_), _) => a,
+        _ => b,
+    }
+}
+
+/// The smaller of two upper bounds.
+fn min_upper<'a>(a: Bound<&'a [u8]>, b: Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    match (a, b) {
+        (Bound::Unbounded, x) | (x, Bound::Unbounded) => x,
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y))
+            if x != y =>
+        {
+            if x < y {
+                a
+            } else {
+                b
+            }
+        }
+        (Bound::Excluded(_), _) => a,
+        _ => b,
+    }
+}
+
+impl Iter {
+    /// After a move that started at `from` (a seek target, a bound, or the key it left):
+    /// the move crossed the range between `from` and where it stopped, in `forward`
+    /// direction. Any quarantined scope in that range fails the iterator, whether or not
+    /// it landed on one of the scope's keys (G1, G2: reads in a quarantined range return
+    /// `Corruption`, never the rest of the range as if the scope were empty).
+    ///
+    /// `from` is `None` for a step that started before anything was quarantined: only
+    /// the key it lands on is checked then.
+    fn after_move(&mut self, from: Option<Bound<&[u8]>>, forward: bool) {
+        self.error = None;
+        let quarantine = &self.snapshot.inner.quarantine;
+        if quarantine.len() > 0 && self.inner.status().is_ok() {
+            // A step that started before the quarantine: check only where it stopped.
+            let from = match from {
+                Some(from) => Some(from),
+                None if self.inner.valid() => Some(Bound::Included(self.inner.key())),
+                None => None,
+            };
+            let stop = if self.inner.valid() {
+                Bound::Included(self.inner.key())
+            } else if forward {
+                self.upper.as_ref().map(Vec::as_slice)
+            } else {
+                self.lower.as_ref().map(Vec::as_slice)
+            };
+            let crossed = match from {
+                Some(from) if forward => quarantine.overlaps(from, stop),
+                Some(from) => quarantine.overlaps(stop, from),
+                None => false,
+            };
+            if crossed {
+                self.error = Some(quarantined_error());
+                return;
+            }
+        }
+        if self.inner.valid() {
             return;
         }
         if let Err(error) = self.inner.status()
             && !self.reported
             && let Error::Corruption {
-                file: file @ FileId::Run { .. },
+                file: file @ FileId::Run { id },
                 ..
             } = error
         {
             self.reported = true;
-            let damage = Damage {
-                scope: self.scope.clone().unwrap_or_default(),
+            // G2: the bounds' scope when they lie in one, else the damaged run's range
+            // (plan section 3, "else the run's range"). A run in no single group scope
+            // (store-wide keys, or spanning scopes) reports the empty scope, which latches
+            // R5, as compaction does when it meets the same run (NS5 deviation 7).
+            let scope = match &self.scope {
+                Some(scope) => scope.clone(),
+                None => self.snapshot.run_scope(id),
+            };
+            self.snapshot.inner.report_damage(Damage {
+                scope,
                 reason: DamageReason::RunBlock,
                 file,
                 first_bad_seq: None,
-            };
-            if self.scope.is_some() {
-                self.snapshot.inner.report_damage(damage);
-            }
+            });
         }
     }
 
@@ -388,36 +484,51 @@ impl Iter {
         self.error.is_none() && self.inner.valid()
     }
 
+    /// The key the iterator is on, kept across a step only while something is
+    /// quarantined (the start of the range the step crosses).
+    fn step_start(&self) -> Option<Vec<u8>> {
+        (self.snapshot.inner.quarantine.len() > 0 && self.inner.valid())
+            .then(|| self.inner.key().to_vec())
+    }
+
     pub fn seek_to_first(&mut self) {
         self.inner.seek_to_first();
-        self.after_move();
+        let lower = self.lower.clone();
+        self.after_move(Some(lower.as_ref().map(Vec::as_slice)), true);
     }
 
     pub fn seek_to_last(&mut self) {
         self.inner.seek_to_last();
-        self.after_move();
+        let upper = self.upper.clone();
+        self.after_move(Some(upper.as_ref().map(Vec::as_slice)), false);
     }
 
     pub fn seek(&mut self, target: &[u8]) {
         self.inner.seek(target);
-        self.after_move();
+        let lower = self.lower.clone();
+        let from = max_lower(Bound::Included(target), lower.as_ref().map(Vec::as_slice));
+        self.after_move(Some(from), true);
     }
 
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.inner.seek_for_prev(target);
-        self.after_move();
+        let upper = self.upper.clone();
+        let from = min_upper(Bound::Included(target), upper.as_ref().map(Vec::as_slice));
+        self.after_move(Some(from), false);
     }
 
     /// Requires `valid()`.
     pub fn next(&mut self) {
+        let start = self.step_start();
         self.inner.next();
-        self.after_move();
+        self.after_move(start.as_deref().map(Bound::Excluded), true);
     }
 
     /// Requires `valid()`.
     pub fn prev(&mut self) {
+        let start = self.step_start();
         self.inner.prev();
-        self.after_move();
+        self.after_move(start.as_deref().map(Bound::Excluded), false);
     }
 
     /// The current user key. Requires `valid()`.

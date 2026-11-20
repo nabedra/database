@@ -857,7 +857,8 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     }
     assert_eq!(transport.sent.load(Ordering::Relaxed), sent);
     // `direct_oltp: false` while active: a mutation is settled at its
-    // anchor (a forward marker), then queued; a get is just queued.
+    // anchor (a forward marker), then queued; so is a get (T7c), so its id
+    // cannot later be answered directly.
     switch.set_active(true);
     switch.set_direct_oltp(false);
     let id = Uuid::new_v4();
@@ -890,7 +891,8 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         .await,
         Answer::Queued
     );
-    assert_eq!(transport.sent.load(Ordering::Relaxed), sent);
+    assert!(transport.sent.load(Ordering::Relaxed) > sent, "a forward");
+    assert!(cluster.settled(group, 1, get).await, "get forward marker");
     // The same id directly later: the marker sends it queued again, and it
     // never applies directly.
     switch.set_direct_oltp(true);
@@ -1362,7 +1364,7 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     let stats = gateway.stats();
     assert_eq!(stats.fallbacks, 8, "{stats:?}");
     assert_eq!(stats.forwards, 8, "{stats:?}");
-    // A get on the intent key also takes the queued path (no marker needed).
+    // A get on the intent key also takes the queued path, settled first (T7c).
     let get = Uuid::new_v4();
     assert_eq!(
         answer(

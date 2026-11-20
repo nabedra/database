@@ -1903,3 +1903,85 @@ fn o13_q06_delayed_install_cannot_restore_retired_terminal_and_new_sequences_ski
 }
 
 mod scoped_acceptance;
+
+/// D05/LIVE1: the owner removed a holder that stopped answering. When it comes
+/// back with the same incarnation its RAM queue is stale and it cannot take
+/// over the published ready set. It joins again in place: an empty joining
+/// queue for its own ticket, filled by the owner's join copy, keeping its
+/// memory charge and queue lease.
+#[test]
+fn d05_live1_removed_replica_rejoins_in_place() {
+    let fixture = Fixture::new(3);
+    let current = fixture.authority;
+    let limits = QueueLimits {
+        max_pending_requests: 20,
+        max_queue_bytes_per_replica: 4 << 20,
+        max_retained_result_bytes_per_worker: 1 << 20,
+        result_retention_ms: 100,
+    };
+    let mut owner = fixture.replica(0);
+    let mut holders = [fixture.replica(1), fixture.replica(2)];
+    let id = Uuid::new_v4();
+    let body = fixture.body(id);
+    let pending = owner
+        .propose(current, body.clone(), fixture.context(id, &body), 0)
+        .unwrap();
+    copy(&mut owner, &mut holders, &pending).unwrap();
+    let [survivor, mut removed] = holders;
+    let removed_shared = removed.shared_resources();
+    let charged = removed_shared.scheduler().usage();
+
+    // The owner removes the third holder.
+    let authority = |members: &[WorkerIdentity], revision| {
+        let mut ready = ReadySetHasher::default();
+        for member in members {
+            ready.push(*member).unwrap();
+        }
+        QueueAuthority {
+            owner: fixture.members[0],
+            ready: ReadyMembership {
+                view: AuthorityView { membership_revision: revision, ..current.ready.view },
+                ready_root: ready.finish(),
+                ready_count: ready.count(),
+            },
+        }
+    };
+    let remaining = fixture.members[..2].to_vec();
+    let next = authority(&remaining, 2);
+    owner.fenced_takeover(current, next, remaining.clone()).unwrap();
+    let mut survivor = survivor;
+    survivor.fenced_takeover(current, next, remaining.clone()).unwrap();
+    assert_eq!(
+        removed.fenced_takeover(current, next, remaining.clone()),
+        Err(QueueError::Invalid)
+    );
+
+    // Its own Join ticket replaces the stale queue in place.
+    let local = fixture.members[2];
+    let ticket = JoinTicket { ticket_id: Uuid::new_v4(), target: local, source_ready: next.ready };
+    let foreign = JoinTicket { target: fixture.members[1], ..ticket };
+    assert_eq!(removed.rejoin(next, remaining.clone(), limits, foreign), Err(QueueError::Invalid));
+    assert_eq!(
+        removed.rejoin(next, fixture.members.clone(), limits, ticket),
+        Err(QueueError::Invalid)
+    );
+    removed.rejoin(next, remaining.clone(), limits, ticket).unwrap();
+    assert_eq!(removed.authority(), next);
+    assert!(removed.record(id).is_none());
+    assert!(!removed.is_ready_member());
+    assert_eq!(removed_shared.scheduler().usage()[0].2, charged[0].2 - 256);
+
+    // The owner's join copy restores the accepted record, then the published
+    // ready set includes the worker again.
+    let snapshot = owner.begin_join(next, ticket).unwrap();
+    let page = owner.join_page(next, snapshot, JoinPhase::Snapshot, None).unwrap();
+    removed.install_join_page(next, next.owner, &page).unwrap();
+    owner.seal_join(next, snapshot).unwrap();
+    let delta = owner.join_page(next, snapshot, JoinPhase::Delta, None).unwrap();
+    removed.install_join_page(next, next.owner, &delta).unwrap();
+    assert_eq!(removed.join_statement(next).unwrap(), owner.join_statement(next).unwrap());
+    let joined = authority(&fixture.members, 3);
+    removed.fenced_takeover(next, joined, fixture.members.clone()).unwrap();
+    assert!(removed.is_ready_member());
+    assert_eq!(removed.record(id).unwrap().request_id, id);
+}

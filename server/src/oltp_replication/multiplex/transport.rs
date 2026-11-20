@@ -237,6 +237,8 @@ struct ReplicaResidency {
     _slot: GroupCapacityLease,
     metadata_used: std::sync::atomic::AtomicUsize,
     log_metadata_used: std::sync::atomic::AtomicUsize,
+    /// Woken whenever a metadata charge is released (RV-APPLY F3, F5).
+    metadata_released: tokio::sync::Notify,
     ownership: std::sync::OnceLock<Arc<dyn Send + Sync>>,
 }
 /// One live Raft instance, keyed by permanent node ID inside its group. A
@@ -269,6 +271,42 @@ impl ReplicaLease {
     }
     pub(crate) fn proposal_metadata(&self, bytes: usize) -> Result<ReplicaMetadata, ProtocolError> {
         self.reserve_metadata_limit(bytes, true, (2 << 20) - (128 << 10))
+    }
+    /// [`Self::metadata`] that waits for room instead of failing. Every
+    /// holder releases on drop (snapshot objects, transfer descriptions), so
+    /// the wait ends. Used where a refusal would stop the Raft core (RV-APPLY
+    /// F3). A request larger than the whole budget fails at once.
+    pub(crate) async fn metadata_wait(
+        &self,
+        bytes: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        self.wait_metadata(bytes, false, RAFT_REPLICA_BYTES / 2)
+            .await
+    }
+    /// [`Self::log_metadata`] that waits for room (RV-APPLY F5: the leader's
+    /// own Blank and Membership entries in `append`).
+    pub(crate) async fn log_metadata_wait(
+        &self,
+        bytes: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        self.wait_metadata(bytes, true, 2 << 20).await
+    }
+    async fn wait_metadata(
+        &self,
+        bytes: usize,
+        log: bool,
+        limit: usize,
+    ) -> Result<ReplicaMetadata, ProtocolError> {
+        if bytes > limit {
+            return Err(malformed("replica metadata request exceeds its budget"));
+        }
+        loop {
+            let released = self.0.metadata_released.notified();
+            if let Ok(owner) = self.reserve_metadata_limit(bytes, log, limit) {
+                return Ok(owner);
+            }
+            released.await;
+        }
     }
     pub(crate) fn log_metadata_used(&self) -> usize {
         self.0
@@ -334,6 +372,7 @@ impl Drop for ReplicaMetadata {
             &self.owner.0.metadata_used
         })
         .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.owner.0.metadata_released.notify_waiters();
     }
 }
 #[derive(Clone)]
@@ -371,6 +410,7 @@ impl ResidentGroup {
             _slot: slot,
             metadata_used: std::sync::atomic::AtomicUsize::new(0),
             log_metadata_used: std::sync::atomic::AtomicUsize::new(0),
+            metadata_released: tokio::sync::Notify::new(),
             ownership: std::sync::OnceLock::new(),
         });
         replicas.insert(node_id, Arc::downgrade(&replica));
@@ -506,7 +546,12 @@ struct Common {
     handshakes: Arc<Semaphore>,
     preflight: [Arc<Semaphore>; CLASSES],
     handlers: [Arc<Semaphore>; CLASSES],
-    outgoing: [Arc<Semaphore>; CLASSES],
+    /// Caller slots per peer lane (peer worker, traffic class). A peer that
+    /// stops reading (SIGSTOP, a black-holed route) holds only its own lane's
+    /// slots until their deadlines; requests to other peers keep theirs. With
+    /// one class-wide pool, its stalled requests took every slot, and Raft
+    /// votes and heartbeats to the healthy peers were refused locally (LIVE1).
+    outgoing: OutgoingLanes,
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
@@ -517,6 +562,9 @@ struct Common {
     pending_sessions: Arc<Semaphore>,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
+    /// Tests close a whole class with `hold_outgoing_for_test`.
+    #[cfg(test)]
+    outgoing_hold: [Arc<Semaphore>; CLASSES],
     /// Tests hold caller session writers before they dequeue a frame.
     #[cfg(test)]
     hold_writes: tokio::sync::watch::Sender<bool>,
@@ -682,9 +730,7 @@ impl WorkerTransport {
                 handlers: std::array::from_fn(|i| {
                     Arc::new(Semaphore::new(config.handler_slots[i]))
                 }),
-                outgoing: std::array::from_fn(|i| {
-                    Arc::new(Semaphore::new(config.handler_slots[i]))
-                }),
+                outgoing: OutgoingLanes::default(),
                 authority_roles: Semaphore::new(
                     config.handler_slots[TrafficClass::Authority as usize] - 1,
                 ),
@@ -700,6 +746,10 @@ impl WorkerTransport {
                 pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
+                #[cfg(test)]
+                outgoing_hold: std::array::from_fn(|_| {
+                    Arc::new(Semaphore::new(TEST_HOLD_PERMITS as usize))
+                }),
                 #[cfg(test)]
                 hold_writes: tokio::sync::watch::channel(false).0,
                 #[cfg(test)]
@@ -968,14 +1018,7 @@ impl WorkerClient {
             .validate()
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
-        let _slot = self.common.outgoing[class as usize]
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                #[cfg(test)]
-                self.common.outgoing_lane_full[class as usize].notify_one();
-                RequestError::OutgoingLaneFull
-            })?;
+        let _slot = self.try_outgoing(target.worker_id(), class)?;
         let deadline = self.common.config.deadline;
         let mut resolving = false;
         timeout(
@@ -1020,7 +1063,7 @@ impl WorkerClient {
         let deadline = Instant::now()
             .checked_add(self.common.config.deadline)
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
-        let _slots = self.authority_slots(deadline).await?;
+        let _slots = self.authority_slots(target, deadline).await?;
         if Instant::now() >= deadline {
             return Err(RequestError::OutgoingLaneFull);
         }
@@ -1041,28 +1084,26 @@ impl WorkerClient {
     }
     async fn authority_slots(
         &self,
+        target: Uuid,
         deadline: Instant,
-    ) -> Result<(Option<SemaphorePermit<'_>>, OwnedSemaphorePermit), RequestError> {
-        let index = TrafficClass::Authority as usize;
-        let outgoing = &self.common.outgoing[index];
+    ) -> Result<(Option<SemaphorePermit<'_>>, OutgoingSlot), RequestError> {
+        let class = TrafficClass::Authority;
+        let index = class as usize;
         let roles = &self.common.authority_roles;
         // Keep an existing slot available to ordinary Authority traffic.
         // A one-slot lane has no capacity to reserve and keeps immediate admission.
         if self.common.config.handler_slots[index] == 1 {
-            return outgoing
-                .clone()
-                .try_acquire_owned()
-                .map(|slot| (None, slot))
-                .map_err(|_| RequestError::OutgoingLaneFull);
+            return self.try_outgoing(target, class).map(|slot| (None, slot));
         }
-        if let Ok(slots) = roles.try_acquire().and_then(|role| {
-            outgoing
-                .clone()
-                .try_acquire_owned()
-                .map(|slot| (Some(role), slot))
-        }) {
-            return Ok(slots);
+        if let Ok(role) = roles.try_acquire()
+            && let Ok(slot) = self.try_outgoing(target, class)
+        {
+            return Ok((Some(role), slot));
         }
+        let outgoing = self
+            .common
+            .outgoing
+            .lane(target, class, &self.common.config);
         let _waiter = self
             .common
             .authority_waiters
@@ -1070,8 +1111,20 @@ impl WorkerClient {
             .map_err(|_| RequestError::OutgoingLaneFull)?;
         let acquire = timeout_at(deadline, async {
             let role = roles.acquire().await?;
-            let slot = outgoing.clone().acquire_owned().await?;
-            Ok::<_, tokio::sync::AcquireError>((Some(role), slot))
+            #[cfg(test)]
+            let held = self.common.outgoing_hold[index]
+                .clone()
+                .acquire_owned()
+                .await?;
+            let slot = outgoing.acquire_owned().await?;
+            Ok::<_, tokio::sync::AcquireError>((
+                Some(role),
+                OutgoingSlot {
+                    _slot: slot,
+                    #[cfg(test)]
+                    _held: held,
+                },
+            ))
         });
         // The caller already owns the charged request header. Charge the
         // pending acquisition and timer until a permit becomes available.
@@ -1259,12 +1312,58 @@ impl WorkerClient {
         self.common.config.payload_bytes[class as usize]
     }
 
+    /// One caller slot on the lane to `target` for `class`, or a local
+    /// `OutgoingLaneFull` refusal before anything is written.
+    fn try_outgoing(
+        &self,
+        target: Uuid,
+        class: TrafficClass,
+    ) -> Result<OutgoingSlot, RequestError> {
+        let full = || {
+            #[cfg(test)]
+            self.common.outgoing_lane_full[class as usize].notify_one();
+            RequestError::OutgoingLaneFull
+        };
+        #[cfg(test)]
+        let held = self.common.outgoing_hold[class as usize]
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| full())?;
+        let slot = self
+            .common
+            .outgoing
+            .lane(target, class, &self.common.config)
+            .try_acquire_owned()
+            .map_err(|_| full())?;
+        Ok(OutgoingSlot {
+            _slot: slot,
+            #[cfg(test)]
+            _held: held,
+        })
+    }
+
+    /// Closes `class` to every peer until the permit drops. The class must be idle.
     #[cfg(test)]
     pub(crate) fn hold_outgoing_for_test(&self, class: TrafficClass) -> OwnedSemaphorePermit {
-        self.common.outgoing[class as usize]
+        self.common.outgoing_hold[class as usize]
             .clone()
-            .try_acquire_many_owned(self.common.config.handler_slots[class as usize] as u32)
+            .try_acquire_many_owned(TEST_HOLD_PERMITS)
             .expect("outgoing lane is idle")
+    }
+
+    /// Takes `slots` caller slots of the lane to `target` for `class`.
+    #[cfg(test)]
+    pub(crate) fn take_outgoing_for_test(
+        &self,
+        target: Uuid,
+        class: TrafficClass,
+        slots: u32,
+    ) -> OwnedSemaphorePermit {
+        self.common
+            .outgoing
+            .lane(target, class, &self.common.config)
+            .try_acquire_many_owned(slots)
+            .expect("outgoing lane has the slots")
     }
 
     #[cfg(test)]
@@ -1272,6 +1371,49 @@ impl WorkerClient {
         self.common.outgoing_lane_full[class as usize]
             .notified()
             .await;
+    }
+}
+
+#[cfg(test)]
+const TEST_HOLD_PERMITS: u32 = 1 << 20;
+
+/// A caller slot on one peer lane. Dropping it frees the slot.
+struct OutgoingSlot {
+    _slot: OwnedSemaphorePermit,
+    #[cfg(test)]
+    _held: OwnedSemaphorePermit,
+}
+
+/// Caller slots per peer lane, created on first use. Each lane has the
+/// receiver's handler capacity for its class, so a caller never has more
+/// streams in flight to one receiver than that receiver's handler admits.
+#[derive(Default)]
+struct OutgoingLanes {
+    lanes: Mutex<std::collections::HashMap<Uuid, Arc<[Arc<Semaphore>; CLASSES]>>>,
+}
+impl OutgoingLanes {
+    /// Lanes are kept per worker ID, not per incarnation. Idle lanes of
+    /// departed workers are dropped once the map exceeds this many peers.
+    const PRUNE_AT: usize = 1024;
+
+    fn lane(&self, worker: Uuid, class: TrafficClass, config: &TransportConfig) -> Arc<Semaphore> {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !lanes.contains_key(&worker) && lanes.len() >= Self::PRUNE_AT {
+            lanes.retain(|_, lane| {
+                lane.iter()
+                    .zip(&config.handler_slots)
+                    .any(|(slots, &capacity)| slots.available_permits() != capacity)
+            });
+        }
+        lanes.entry(worker).or_insert_with(|| {
+            Arc::new(std::array::from_fn(|i| {
+                Arc::new(Semaphore::new(config.handler_slots[i]))
+            }))
+        })[class as usize]
+            .clone()
     }
 }
 

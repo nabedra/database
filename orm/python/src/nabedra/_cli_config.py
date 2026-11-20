@@ -123,15 +123,16 @@ def _validate_oltp(config):
     listen(config['bind'], tls)
     topology = config['topology']
     fields(topology, ('mode',), ('data_dir', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls',
-                                'control_peers', 'scoped_oltp'))
+                                'control_peers', 'scoped_oltp', 'direct_oltp'))
     if topology['mode'] == 'local':
         fields(topology, ('mode', 'data_dir'))
         text(topology['data_dir'])
     elif topology['mode'] == 'remote':
         fields(topology, ('mode', 'cluster_id', 'control_group_id', 'enrollment', 'worker_tls', 'control_peers'),
-               ('scoped_oltp',))
-        if 'scoped_oltp' in topology and type(topology['scoped_oltp']) is not bool:
-            raise ConfigError('scoped_oltp must be a boolean')
+               ('scoped_oltp', 'direct_oltp'))
+        for switch in ('scoped_oltp', 'direct_oltp'):
+            if switch in topology and type(topology[switch]) is not bool:
+                raise ConfigError(f'{switch} must be a boolean')
         for key in ('cluster_id', 'control_group_id'):
             if str(UUID(topology[key])) != topology[key] or not UUID(topology[key]).int:
                 raise ConfigError('Invalid OLTP group identity')
@@ -156,7 +157,7 @@ def _validate_oltp(config):
     fields(worker, (), ('resources', 'execution', 'queue_size'))
     if 'queue_size' in worker:
         integer(worker['queue_size'], 1, 65536)
-    _validate_worker_limits(worker)
+    _validate_worker_limits(worker, oltp=True)
     return config
 
 
@@ -174,7 +175,7 @@ def _validate_enrollment(value):
         raise ConfigError('Invalid enrollment endpoint')
 
 
-def _validate_worker_limits(worker, minimum_threads=1):
+def _validate_worker_limits(worker, minimum_threads=1, oltp=False):
     if 'resources' in worker:
         r = worker['resources']
         fields(r, 'max_threads memory_limit_bytes task_memory_limit_bytes control_memory_reserve_bytes'.split())
@@ -185,7 +186,12 @@ def _validate_worker_limits(worker, minimum_threads=1):
             raise ConfigError('Worker memory limits contradict each other')
     if 'execution' in worker:
         e = worker['execution']
-        fields(e, 'max_workers_per_request max_pending_requests max_queue_bytes_per_replica max_retained_result_bytes_per_worker result_retention_ms queue_replication queue_lifetime partition_size'.split())
+        # OLTP only: `direct_oltp` routes eligible point operations on the direct path
+        # once `data.direct.v1` is active (default true on the server).
+        fields(e, 'max_workers_per_request max_pending_requests max_queue_bytes_per_replica max_retained_result_bytes_per_worker result_retention_ms queue_replication queue_lifetime partition_size'.split(),
+               ('direct_oltp',) if oltp else ())
+        if 'direct_oltp' in e and type(e['direct_oltp']) is not bool:
+            raise ConfigError('direct_oltp must be a boolean')
         for key in ('max_workers_per_request', 'max_pending_requests', 'max_queue_bytes_per_replica', 'max_retained_result_bytes_per_worker', 'result_retention_ms'):
             integer(e[key], 1, 2**63 - 1)
         if e['queue_replication'] != 'all_ready_workers' or e['queue_lifetime'] != 'live_cluster':

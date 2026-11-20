@@ -120,7 +120,7 @@ function enrollment(value: unknown): JsonObject {
   return data
 }
 
-function workerLimits(worker: JsonObject): void {
+function workerLimits(worker: JsonObject, oltp = false): void {
   if (Object.hasOwn(worker, "resources")) {
     const bytes = ["memory_limit_bytes", "task_memory_limit_bytes", "control_memory_reserve_bytes"]
     const resources = fields(worker.resources, ["max_threads", ...bytes])
@@ -131,7 +131,13 @@ function workerLimits(worker: JsonObject): void {
   if (Object.hasOwn(worker, "execution")) {
     const limits = ["max_workers_per_request", "max_pending_requests", "max_queue_bytes_per_replica",
       "max_retained_result_bytes_per_worker", "result_retention_ms"]
-    const execution = fields(worker.execution, [...limits, "queue_replication", "queue_lifetime", "partition_size"])
+    // OLTP only: `direct_oltp` routes eligible point operations on the direct path
+    // once `data.direct.v1` is active (default true on the server).
+    const execution = fields(worker.execution, [...limits, "queue_replication", "queue_lifetime", "partition_size"],
+      oltp ? ["direct_oltp"] : [])
+    if (Object.hasOwn(execution, "direct_oltp") && typeof execution.direct_oltp !== "boolean") {
+      throw new ConfigError("direct_oltp must be a boolean")
+    }
     for (const key of limits) integer(execution[key], 1, maxInt64)
     if (execution.queue_replication !== "all_ready_workers" || execution.queue_lifetime !== "live_cluster") {
       throw new ConfigError("Unsupported queue policy")
@@ -155,13 +161,13 @@ function validateOltp(value: unknown): JsonObject {
   }
   listen(config.bind, config.tls)
 
-  const basic = fields(config.topology, ["mode"], ["data_dir", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers", "scoped_oltp"])
+  const basic = fields(config.topology, ["mode"], ["data_dir", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers", "scoped_oltp", "direct_oltp"])
   if (basic.mode === "local") {
     text(fields(basic, ["mode", "data_dir"]).data_dir)
   } else if (basic.mode === "remote") {
-    const topology = fields(basic, ["mode", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers"], ["scoped_oltp"])
-    if ("scoped_oltp" in topology && typeof topology.scoped_oltp !== "boolean") {
-      throw new ConfigError("scoped_oltp must be a boolean")
+    const topology = fields(basic, ["mode", "cluster_id", "control_group_id", "enrollment", "worker_tls", "control_peers"], ["scoped_oltp", "direct_oltp"])
+    for (const flag of ["scoped_oltp", "direct_oltp"]) {
+      if (flag in topology && typeof topology[flag] !== "boolean") throw new ConfigError(`${flag} must be a boolean`)
     }
     for (const key of ["cluster_id", "control_group_id"]) validateUuid(topology[key], false)
     for (const path of Object.values(fields(topology.worker_tls, ["cert_file", "key_file", "ca_file"]))) text(path)
@@ -179,7 +185,7 @@ function validateOltp(value: unknown): JsonObject {
   const worker = fields(Object.hasOwn(config, "worker") ? config.worker : {},
     [], ["resources", "execution", "queue_size"])
   if (Object.hasOwn(worker, "queue_size")) integer(worker.queue_size, 1, 65_536)
-  workerLimits(worker)
+  workerLimits(worker, true)
   return config
 }
 
