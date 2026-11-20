@@ -83,6 +83,21 @@ pub const FIXED: &[Case] = &[
         keep: &[198],
         note: "scan of a quarantined scope with no keys left",
     },
+    // KVfix3, CI fd298dd (Linux release, `ns05_ns10_thousands_of_seeds`, run
+    // 44742741642): the journal refused GC's relocation records with `NoSpace` (their
+    // sequences voided but visible), GC retired the segments anyway, and a later read
+    // found "journal locator names a recycled segment". The shrunk case passes in debug.
+    Case {
+        seed: 510,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[
+            50, 51, 52, 53, 60, 61, 62, 76, 77, 78, 79, 80, 85, 86, 87, 88, 89, 90, 150, 151, 152,
+            153, 154, 155, 156, 157, 158, 159,
+        ],
+        note: "relocation refused by a full journal, segments retired anyway",
+    },
 ];
 
 /// Unfixed findings (each has an ignored test naming it in `main.rs`).
