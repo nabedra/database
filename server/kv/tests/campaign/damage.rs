@@ -328,7 +328,13 @@ pub fn trials(
             .iter()
             .map(|d| d.scope.clone())
             .collect();
-        if !quarantined.is_subset(&again) {
+        // A latched store writes no manifest edit (`log_edit` refuses, and the background
+        // job that retries pending quarantines never starts), so a scope quarantined at
+        // read time after an R5 latch lives only in memory and a crash loses it. Open's
+        // own quarantines are persisted before open returns and must survive. Either way
+        // the damage is still there: the reads below find it again, never a wrong value.
+        let must_keep = if latched { &at_open } else { &quarantined };
+        if !must_keep.is_subset(&again) {
             return Err(format!(
                 "{ctx}: the second open lost quarantined scopes: had {quarantined:?}, now {again:?}"
             ));

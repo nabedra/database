@@ -57,6 +57,32 @@ pub const FIXED: &[Case] = &[
         keep: &[224, 246],
         note: "clean reopen failed under an injected rename EIO",
     },
+    // KVfix3, CI 163dad7 (Linux release, `ns05_ns10_thousands_of_seeds`, run 44716044857):
+    // a store-wide scan met a damaged run block without latching (R5), and once latched,
+    // a group quarantine found at read time could not be persisted.
+    Case {
+        seed: 0,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[
+            281, 286, 287, 288, 289, 290, 291, 307, 308, 309, 311, 312, 313, 314, 315, 316, 317,
+            318, 319, 320, 321, 322, 323, 324, 352, 353, 354, 355, 356, 357, 358, 359, 360, 361,
+            362, 363, 364, 368, 369, 370, 371, 372,
+        ],
+        note: "store-wide scan over a damaged run block; quarantine after an R5 latch",
+    },
+    // KVfix3, local release long run (seeds 0-199): G1 skipped g00's only record, the
+    // store quarantined g00, and a scan of g00 returned `Ok` with nothing (a silently
+    // missing key) because iterators checked the quarantine only on keys they landed on.
+    Case {
+        seed: 69,
+        steps: 400,
+        mix: Mix::full(),
+        damage_trials: 8,
+        keep: &[198],
+        note: "scan of a quarantined scope with no keys left",
+    },
 ];
 
 /// Unfixed findings (each has an ignored test naming it in `main.rs`).
