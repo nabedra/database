@@ -297,7 +297,10 @@ impl OltpPool {
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
         tune(&mut options);
-        let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
+        let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(|error| {
+            tracing::error!(path = %path.display(), %error, "OLTP pool refused at open");
+            damage::open_refused(error)
+        })?;
         let store = OwnedStore(Some(opened.store));
         // R6 at pool level, sticky (NS14, `damage.rs`): new damage of more than 8
         // groups, or more than 10% of the pool's groups (always allowing one), is

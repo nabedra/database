@@ -316,10 +316,12 @@ impl OltpPool {
         self.inner.damage.events.subscribe()
     }
     /// Writes of quarantined groups refused since this open (rule 1 evidence).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn quarantine_refusals(&self) -> u64 {
         self.inner.damage.refused_writes.load(Ordering::Relaxed)
     }
     /// Damaged groups released since this open.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn damage_releases(&self) -> u64 {
         self.inner.damage.releases.load(Ordering::Relaxed)
     }
@@ -403,6 +405,24 @@ pub(crate) fn quarantined_group() -> ProtocolError {
         ErrorCode::StorageUnavailable,
         "storage corrupt: OLTP group is quarantined after storage damage",
     )
+}
+
+/// R1 to R4 at open (NS24): the refusal names what kv found. Corruption (R1,
+/// R3, and kv's own limit of 8 damaged scopes) and an unreadable store (R2)
+/// stay `StorageUnavailable`, so callers and ORMs see the code they already
+/// handle; the message tells an operator which case it is.
+pub(super) fn open_refused(error: nabedra_kv::Error) -> ProtocolError {
+    match error {
+        nabedra_kv::Error::Corruption { what, .. } => failure(
+            ErrorCode::StorageUnavailable,
+            &format!("OLTP pool refused: storage corrupt: {what}"),
+        ),
+        nabedra_kv::Error::Io(kind) => failure(
+            ErrorCode::StorageUnavailable,
+            &format!("OLTP pool refused: storage I/O error: {kind}"),
+        ),
+        other => storage_error(other),
+    }
 }
 
 fn refused_by_r6() -> ProtocolError {

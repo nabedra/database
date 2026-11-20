@@ -24,6 +24,8 @@ impl ControlHandle {
         }
     }
     /// Installs the predicate that allows the NS14 commands.
+    // NS14: the Control-side scheduler that calls this is not wired yet (report).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_group_damage_gate(&self, gate: Arc<dyn GroupDamageGate>) {
         *self
             .group_damage_gate
@@ -58,6 +60,7 @@ impl ControlHandle {
 
     /// Rule 3, after the leader's `replace_voter` committed. A local operator
     /// call: the driver runs in a process that hosts Control.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn group_damage_replaced_local(
         &self,
         permit: &LocalOperatorPermit,

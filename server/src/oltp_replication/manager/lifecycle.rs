@@ -609,6 +609,8 @@ where
     /// voters. Rule 5: without a quorum that excludes the damaged replica the
     /// quorum read or the change fails, and nothing is recorded or deleted.
     /// Idempotent after the change committed.
+    // NS14: the Control-side scheduler that calls this is not wired yet (report).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn replace_damaged_voter(
         &self,
         damaged: &ReplicaMember,
