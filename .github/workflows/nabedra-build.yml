@@ -331,7 +331,9 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 2>&1 | tee ../campaign.log
+          # NS01 at 1e6 steps (~2.5 h) runs in its own job, campaign-ns01.
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 \
+            --skip ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign.log
       - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
@@ -352,6 +354,41 @@ jobs:
             campaign.log
             store-long.log
             kv-crash.log
+          retention-days: 14
+
+  campaign-ns01:
+    name: crash campaign NS01 1e6 (release, long)
+    if: inputs.campaign || contains(github.event.head_commit.message, '[ci campaign]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: campaign-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: campaign-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: NS01 differential, 1e6 steps with cuts and faults
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p nabedra-kv --test campaign -- --ignored --nocapture --exact \
+            ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign-ns01.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-ns01-log
+          path: campaign-ns01.log
           retention-days: 14
 
   docker-oltp:
