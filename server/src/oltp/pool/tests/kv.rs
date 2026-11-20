@@ -1065,6 +1065,12 @@ fn o05_kv_threads_are_per_worker_plus_two_journal_threads_per_open_pool() {
         assert_eq!(named("rocksdb:high") + named("rocksdb:low"), 0);
     }
     drop(second);
+    // Closing joins the pool's threads, but Linux can list an exited thread in
+    // /proc/self/task for a moment afterwards; wait for it to go.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while count() != after_first && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(count(), after_first);
     eprintln!(
         "O05 kv probe: before={before} worker={after_worker} first_pool={after_first} second_pool={after_second} background={background} budget={budget:?}"
