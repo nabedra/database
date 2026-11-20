@@ -457,7 +457,7 @@ class Cluster:
                         bootstrap_id=self.bootstrap_id, initial_run=self.run_id, required_voters=len(WORKERS),
                         placements=placements, control_enrollments=enrollments, operator_pins=operator_pins,
                         mount=dict(profile={'docker': {'volume_marker': marker}}, worker=identity, generation=1,
-                                   identity=dict(engine='oltp', pool_format_version=1, cluster_id=self.cluster_id,
+                                   identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
                                                  worker_id=worker['worker_id'], pool_id=pool[name]),
                                    mount_path='/data', provider_volume_id='docker-volume:' + volume, filesystem_uuid=''))
             if self.scoped_oltp:

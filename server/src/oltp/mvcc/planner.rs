@@ -25,6 +25,7 @@ use uuid::Uuid;
 mod backup;
 pub(crate) mod direct_fence;
 mod index;
+pub(crate) use index::index_entry_changes;
 mod index_build;
 mod migration;
 #[cfg(test)]
@@ -350,10 +351,7 @@ impl NativePlanner {
                         let values = p.values;
                         let canonical = self
                             .cpu(owner.clone(), move || {
-                                let mut candidate = (*row).clone();
-                                for (k, v) in values {
-                                    candidate.insert(k, v);
-                                }
+                                let candidate = updated_row(&row, values);
                                 CanonicalJson::from_serializable(
                                     &shared,
                                     &candidate,
@@ -456,7 +454,7 @@ impl NativePlanner {
                 let shared = self.catalog.resources().clone();
                 let (key, key_order, canonical) = self
                     .cpu(owner.clone(), move || {
-                        let key = crate::oltp::codec::scalar_key(&row[&column]);
+                        let key = primary_key_of(&column, &row);
                         let order = key_sort(&key);
                         let canonical = CanonicalJson::from_serializable(
                             &shared,
@@ -1093,6 +1091,20 @@ fn value<T>(
         CatalogRead::Value { version, record } => Ok((version, record)),
         CatalogRead::Blocked(i) => Err(PlanError::Blocked(i)),
     }
+}
+/// The primary key of `row`, whose key column is `column`. Shared by the
+/// queued planner and the direct executor.
+pub(crate) fn primary_key_of(column: &str, row: &Row) -> Key {
+    crate::oltp::codec::scalar_key(&row[column])
+}
+/// `table.update`: `values` written over `row`. Shared by the queued
+/// planner and the direct executor.
+pub(crate) fn updated_row(row: &Row, values: Row) -> Row {
+    let mut candidate = row.clone();
+    for (k, v) in values {
+        candidate.insert(k, v);
+    }
+    candidate
 }
 fn table_id(op: &Operation) -> Option<Uuid> {
     match op {

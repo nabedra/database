@@ -26,7 +26,7 @@ fn o23_r03_retained_secondary_requires_its_completed_claim_and_fresh_mount() {
             },
             identity: PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: Uuid::new_v4(),
                 worker_id: worker.worker_id,
                 pool_id,

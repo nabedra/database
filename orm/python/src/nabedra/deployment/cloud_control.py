@@ -158,7 +158,7 @@ def _ebs_mount(mount, cluster_id, worker=None):
     mounted_worker = expected['worker']
     path = expected['mount_path']
     if (expected['profile'] != 'ebs' or pool['cluster_id'] != cluster_id or pool['engine'] != 'oltp'
-            or pool['pool_format_version'] != 1 or pool['worker_id'] != mounted_worker['worker_id']
+            or pool['pool_format_version'] != 2 or pool['worker_id'] != mounted_worker['worker_id']
             or (worker is not None and worker != mounted_worker)
             or not re.fullmatch(r'vol-(?:[a-f0-9]{8}|[a-f0-9]{17})', expected['provider_volume_id'])
             or not isinstance(path, str) or not path.startswith('/') or '\x00' in path

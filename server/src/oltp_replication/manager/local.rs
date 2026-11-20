@@ -125,7 +125,7 @@ impl LocalWorker {
             &ownership.path.join("pool"),
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: topology.cluster_id,
                 worker_id: topology.worker_id,
                 pool_id: topology.pool_id,
@@ -197,7 +197,11 @@ fn topology(owner: &DirectoryOwner, database: &Text<128>) -> Result<LocalTopolog
             let mut t: LocalTopology = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             if (t.directory_dev, t.directory_inode, t.lock_dev, t.lock_inode)
                 != (directory_dev, directory_inode, lock_dev, lock_inode)
-                || !path.join("pool").join("CURRENT").is_file()
+                // The pool's store exists: `pool/kv/CURRENT` (format 2). A RocksDB
+                // `pool/CURRENT` passes here so the pool open refuses it with
+                // a clear unsupported-format error (NS22).
+                || !(path.join("pool").join("kv").join("CURRENT").is_file()
+                    || path.join("pool").join("CURRENT").is_file())
                 || t.format != 1
                 || t.database != *database
                 || t.node_id == 0

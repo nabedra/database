@@ -119,6 +119,10 @@ impl ParticipantEndpoint {
                     ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
                 ) || matches!(head.action,ServiceAction::ParticipantProof{source_group} if source_group==self.proof.handle.identity().group_id)
             }
+            Method::Direct(_) | Method::DirectForward(_) => {
+                matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
+                    && direct::allowed(&head)
+            }
             Method::ParticipantFence { transition_id, .. } => match head.action {
                 ServiceAction::ControlFence { transition_id: actual }
                 | ServiceAction::ScopedQueueFenceReceipt { transfer_id: actual, .. } => {
@@ -608,7 +612,9 @@ impl Endpoint for ParticipantEndpoint {
             let head = self.parse(session, bytes)?;
             // Unused tickets reserve bounded metadata. Only the owner can
             // Run, after the exact grant reaches the ready queue replicas.
-            if !matches!(head.method, Method::ParticipantScanOpen { .. }) {
+            if matches!(head.method, Method::Direct(_) | Method::DirectForward(_)) {
+                direct::authorize(&self.proof.control, session, &head).await?;
+            } else if !matches!(head.method, Method::ParticipantScanOpen { .. }) {
                 authorize(&self.proof.control, session, &head).await?;
             }
             Ok(ReceivePlan {
@@ -1033,6 +1039,11 @@ impl Endpoint for ParticipantEndpoint {
                     }
                     Method::ParticipantResolveTimestampPoint => {
                         self.resolve_timestamp_point(&session, &head, sections).await
+                    }
+                    Method::Direct(header) | Method::DirectForward(header) => {
+                        let forward = matches!(head.method, Method::DirectForward(_));
+                        direct::serve(&self.proof.handle, &session, header, forward, &sections)
+                            .await
                     }
                     Method::ParticipantPropose { progress } => {
                         let shared = self.proof.shared.clone();

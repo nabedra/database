@@ -365,7 +365,7 @@ class DockerGrowthAdapter:
         enrollment = bootstrap['node']['intent']['enrollment']
         run_id = identity(before['pin']['ready']['view']['run_id'])
         mount = dict(profile={'docker': {'volume_marker': target.pool_id}},
-                     identity=dict(engine='oltp', pool_format_version=1, cluster_id=self.cluster_id,
+                     identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
                                    worker_id=worker['worker_id'], pool_id=target.pool_id),
                      worker=worker, generation=target.pool_generation, mount_path='/data',
                      provider_volume_id=target.resource_id, filesystem_uuid='')

@@ -257,12 +257,13 @@ struct Waiter {
 }
 
 impl Waiter {
-    /// Completes the commit, then drops the payload (on the calling thread, which is the
-    /// journal thread for every queued item).
+    /// Drops the payload, then completes the commit, both on the calling thread (the
+    /// journal thread for every queued item). A caller that sees its commit complete can
+    /// rely on the payload's guards and charges being released already.
     fn complete(self, result: Result<Seq>) {
         let Waiter { tx, on_done } = self;
-        let _ = tx.send(result);
         drop(on_done);
+        let _ = tx.send(result);
     }
 }
 
@@ -464,7 +465,7 @@ impl Journal {
 
     /// Queues `batch` as one record. Never does I/O. Sequence numbers follow submission
     /// order; the batch takes `batch.count()` of them. `on_done` is dropped on the journal
-    /// thread after the commit completes (successfully or not).
+    /// thread once the outcome is known (success or failure), before the commit completes.
     pub fn submit(
         &self,
         batch: WriteBatch,

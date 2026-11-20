@@ -324,6 +324,8 @@ where
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
+    /// Guards the single direct-leadership watcher of a Data replica.
+    pub(in crate::oltp_replication) direct_watch: std::sync::Once,
 }
 /// Entries per AppendEntries RPC. A peer whose `nabedra-otp/2` session
 /// negotiated multi-entry appends receives up to this many entries (and about
@@ -397,12 +399,25 @@ where
             log,
             state,
             membership_changes: tokio::sync::Mutex::new(()),
+            direct_watch: std::sync::Once::new(),
         }))
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
         let stopped = self.raft.shutdown().await;
         self.log.drain().await;
+        // No running log replays unsynced application any more (RV-T2 Q5).
+        self.state.store().stop_deferred_applies();
         stopped.map_err(|_| unavailable())
+    }
+}
+impl<C, M> Drop for RaftConsensus<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    fn drop(&mut self) {
+        // Clearing the flag only makes later application writes synced again.
+        self.state.store().stop_deferred_applies();
     }
 }
 impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>
@@ -436,13 +451,40 @@ where
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        Box::pin(self.read_barrier(ReadPolicy::ReadIndex))
+    }
+    fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
+            match self.read_barrier(ReadPolicy::LeaseRead).await {
+                Ok(barrier) => Ok(barrier),
+                // A stale lease (or any lease failure) falls back to a
+                // quorum round trip.
+                Err(_) => self.read_barrier(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
+    fn current_leader(&self) -> Option<u64> {
+        use openraft::type_config::async_runtime::watch::WatchReceiver;
+        self.raft.metrics().borrow_watched().current_leader
+    }
+    fn local_node(&self) -> Option<u64> {
+        Some(self.state._resident.node_id())
+    }
+}
+impl<C, M> RaftConsensus<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
+        {
+            let lease = matches!(policy, ReadPolicy::LeaseRead);
             let barrier = self
                 .raft
-                .ensure_linearizable(ReadPolicy::ReadIndex)
+                .ensure_linearizable(policy)
                 .await
                 .map_err(|error| {
-                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed ReadIndex failed");
+                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
                     unavailable()
                 })?;
             let applied = self
@@ -458,7 +500,7 @@ where
             Ok(ReadBarrier {
                 applied: applied.position,
             })
-        })
+        }
     }
 }
 pub(crate) fn position(id: LogId) -> AppliedPosition {
@@ -497,5 +539,6 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
     }
 }
 
+pub(crate) mod direct_leadership;
 #[cfg(test)]
 mod tests;

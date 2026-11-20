@@ -75,7 +75,7 @@ class KubeFixture extends EksProvider {
 
 function mountState(clusterId, worker, poolId) {
   return { profile: "ebs", worker, generation: 1, mount_path: "/data/primary", provider_volume_id: volumeId,
-    filesystem_uuid: randomUUID(), identity: { engine: "oltp", pool_format_version: 1, cluster_id: clusterId,
+    filesystem_uuid: randomUUID(), identity: { engine: "oltp", pool_format_version: 2, cluster_id: clusterId,
       worker_id: worker.worker_id, pool_id: poolId } }
 }
 

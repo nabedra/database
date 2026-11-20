@@ -11,6 +11,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::sync::Arc;
+pub(crate) mod direct;
 mod grant_cache;
 pub(crate) use grant_cache::GrantCache;
 use grant_cache::GrantKey;
@@ -170,6 +171,12 @@ enum Method {
     ParticipantPropose {
         progress: bool,
     },
+    /// A point operation for the range leader (plan section 6). The body is
+    /// the first payload section.
+    Direct(direct::DirectHeader),
+    /// Settle a request id at its anchor before the queued path (addendum
+    /// 2026-11-19). The body is the first payload section.
+    DirectForward(direct::DirectHeader),
 }
 impl Method {
     fn purpose(self) -> Purpose {
@@ -188,6 +195,7 @@ impl Method {
             | Self::ParticipantFence { .. }
             | Self::ParticipantResolveTimestampPoint
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
+            Self::Direct(_) | Self::DirectForward(_) => Purpose::ApiIngress,
             _ => Purpose::Authority,
         }
     }
@@ -196,6 +204,7 @@ impl Method {
             Purpose::Storage => TrafficClass::Storage,
             Purpose::Settlement => TrafficClass::Settlement,
             Purpose::ServiceMutation => TrafficClass::ServiceMutation,
+            Purpose::ApiIngress => TrafficClass::ApiIngress,
             _ => TrafficClass::ServiceAuthority,
         }
     }
@@ -234,6 +243,7 @@ impl Method {
             | Self::ParticipantTimestampPointRejection { .. }
             | Self::ParticipantTimestampPointResolution { .. }
             | Self::ParticipantResolveTimestampPoint => 8 << 10,
+            Self::Direct(_) | Self::DirectForward(_) => crate::protocol::MAX_BODY_BYTES,
             _ => 0,
         }
     }
@@ -973,7 +983,11 @@ fn parse(
         || session.group() != group
         || !matches!(
             session.purpose(),
-            Purpose::Authority | Purpose::Storage | Purpose::Settlement | Purpose::ServiceMutation
+            Purpose::Authority
+                | Purpose::Storage
+                | Purpose::Settlement
+                | Purpose::ServiceMutation
+                | Purpose::ApiIngress
         )
     {
         return Err(invalid());

@@ -1818,8 +1818,12 @@ impl HttpRuntime for WorkerRuntime {
                     "engine":"oltp", "queue":queue, "scheduler":scheduler,
                     "accept_to_dispatch":accept_to_dispatch,
                     "block_cache":self.services.shared.block_cache_usage(),
+                    "storage":self.services.shared.storage_stats(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
-                    "native_thread_budget":self.services.shared.thread_budget()
+                    "native_thread_budget":self.services.shared.thread_budget(),
+                    // `null` until T7 installs the direct executor.
+                    "direct":crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                        .map(|service| service.stats())
                 }))
                 .map_err(|_| unknown())?,
             })

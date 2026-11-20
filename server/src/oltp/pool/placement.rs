@@ -15,16 +15,13 @@ impl OltpPool {
         self.resources()
             .execute(ExecutionClass::Control, 0, 0, move || {
                 pool.healthy()?;
-                if pool
-                    .inner
-                    .db
-                    .get_pinned(identity_key(group.group_id))
+                let snapshot = pool.snapshot();
+                if snapshot
+                    .get(&identity_key(group.group_id))
                     .map_err(storage_error)?
                     .is_some()
-                    || pool
-                        .inner
-                        .db
-                        .get_pinned(learner_key(group.group_id))
+                    || snapshot
+                        .get(&learner_key(group.group_id))
                         .map_err(storage_error)?
                         .is_some()
                 {
@@ -54,15 +51,12 @@ impl OltpPool {
         group: &GroupIdentity,
         binding: Digest,
     ) -> Result<(), ProtocolError> {
-        let prior = self
-            .inner
-            .db
-            .get_pinned(learner_key(group.group_id))
+        let snapshot = self.snapshot();
+        let prior = snapshot
+            .get(&learner_key(group.group_id))
             .map_err(storage_error)?;
-        let retained = self
-            .inner
-            .db
-            .get_pinned(identity_key(group.group_id))
+        let retained = snapshot
+            .get(&identity_key(group.group_id))
             .map_err(storage_error)?
             .is_some();
         match (prior, retained) {
@@ -88,10 +82,7 @@ impl GroupStore {
                 let key = group_key(group.identity().group_id, b'x', generation.as_bytes());
                 group
                     .pool()
-                    .inner
-                    .db
-                    .get_pinned(key)
-                    .map_err(storage_error)?
+                    .get_latest(&key)?
                     .map(|bytes| {
                         serde_json::from_slice(bytes.as_ref()).map_err(|_| recovery_unknown())
                     })
@@ -118,22 +109,18 @@ impl GroupStore {
                 let value = group
                     .resources()
                     .encode_in(ByteClass::Progress, &stamp, 4096)?;
-                if let Some(prior) = group
-                    .pool()
-                    .inner
-                    .db
-                    .get_pinned(&key)
-                    .map_err(storage_error)?
-                {
+                if let Some(prior) = group.pool().get_latest(&key)? {
                     return if prior.as_ref() == value.as_slice() {
                         Ok(())
                     } else {
                         Err(recovery_unknown())
                     };
                 }
-                let mut batch = WriteBatch::default();
-                batch.put(key, value.as_slice());
-                group.pool().durable_write(batch)
+                let mut batch = WriteBatch::new();
+                batch.put(&key, value.as_slice());
+                group
+                    .pool()
+                    .durable_write(&group_scope(group.identity().group_id), batch)
             })
             .await
     }

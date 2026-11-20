@@ -41,8 +41,8 @@ pub(crate) mod split_closure;
 pub(crate) mod split_usage;
 pub(crate) mod timestamp_resolution;
 pub(crate) use handle::{
-    ParticipantEpochs, ParticipantFuture, ParticipantHandle, PointEvidenceRead, RemoteParticipant,
-    ScheduledReadFuture, VerifiedParticipantResolution, VerifiedParticipantSeal,
+    LatestRead, ParticipantEpochs, ParticipantFuture, ParticipantHandle, PointEvidenceRead,
+    RemoteParticipant, ScheduledReadFuture, VerifiedParticipantResolution, VerifiedParticipantSeal,
 };
 const CONFIG: &[u8] = b"mvcc/config/v1";
 const HEAD: u8 = b'h';

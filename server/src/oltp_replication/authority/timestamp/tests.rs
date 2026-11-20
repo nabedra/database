@@ -42,7 +42,7 @@ impl Fixture {
             &dir.0,
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: Uuid::new_v4(),
                 worker_id: Uuid::new_v4(),
                 pool_id: Uuid::new_v4(),

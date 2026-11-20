@@ -416,7 +416,7 @@ impl RegisteredWorker {
         }
         let identity = PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: control.identity.cluster_id,
             worker_id: config.enrollment.worker_id,
             pool_id: config.pool_id,

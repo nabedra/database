@@ -114,7 +114,7 @@ async fn voters(
             dir.join(format!("pool{node}")),
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: cluster,
                 worker_id: worker.worker_id,
                 pool_id: members[&node].pool_id,

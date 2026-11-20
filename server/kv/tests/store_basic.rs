@@ -374,3 +374,40 @@ fn ns15_engine_sync_kinds_by_file() {
         );
     }
 }
+
+/// NS6 concern 2: a completed commit has already dropped its `on_done` payload.
+#[test]
+fn ns15_commit_completes_after_its_payload_is_dropped() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Flag(Arc<AtomicBool>);
+    impl Drop for Flag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dir = TempDir::new("ns15_payload_drop_order");
+    let store = open(
+        dir.path(),
+        small_options(Arc::new(RealFs), Background::new(2)),
+    );
+    for i in 0..200u32 {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut batch = WriteBatch::new();
+        batch.put(&i.to_be_bytes(), b"v");
+        let durability = if i % 2 == 0 {
+            Durability::Sync
+        } else {
+            Durability::NoSync
+        };
+        let commit = store
+            .submit(batch, durability, Box::new(Flag(dropped.clone())))
+            .unwrap();
+        commit.wait().unwrap();
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "payload alive after commit {i}"
+        );
+    }
+}
