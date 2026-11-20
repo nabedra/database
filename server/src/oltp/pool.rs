@@ -2,7 +2,11 @@
 //! deliberately separate directory formats and are never silently adopted.
 mod activation;
 mod closed;
+mod damage;
 pub(crate) use activation::{ReplicaActivationStatement, VerifiedReplicaActivation};
+pub use damage::ACCEPT_DAMAGE_FILE;
+use damage::group_of_scope;
+pub(crate) use damage::{DamageCause, DamagedReplicaRemoved, ReleaseOutcome, quarantined_group};
 pub(crate) mod mount;
 pub(crate) use closed::{PoolCloseOutcome, PoolClosedStatement, VerifiedPoolClosed};
 mod placement;
@@ -90,6 +94,8 @@ struct PoolInner {
     recovery: Arc<AtomicBool>,
     groups: Arc<tokio::sync::Mutex<BTreeMap<Uuid, Weak<GroupInner>>>>,
     synced_requests: AtomicU64,
+    /// Quarantine bookkeeping (NS14): run-time damage events, refusals, R6.
+    damage: Arc<damage::DamageState>,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
     _mount: Option<VerifiedPoolMount>,
@@ -293,37 +299,23 @@ impl OltpPool {
         tune(&mut options);
         let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(storage_error)?;
         let store = OwnedStore(Some(opened.store));
-        // R6 at pool level: an open that quarantines more than 8 groups, or more
-        // than 10% of the pool's groups (always allowing one), is more likely
-        // systemic than local, so the pool is refused instead (plan section 3).
-        // Only this open's new damage counts (RV-NS6 F2): groups quarantined by an
-        // earlier open or at run time stay quarantined but are not counted again.
-        let damaged = opened.quarantined_now.len();
-        if !opened.quarantined.is_empty() {
-            let groups = opened.quarantined.len() + count_healthy_groups(&store)?;
-            if damaged > 8 || (damaged > 1 && damaged * 10 > groups) {
-                tracing::error!(
-                    path = %path.display(),
-                    damaged,
-                    groups,
-                    "refusing OLTP pool: too many damaged groups"
-                );
-                return Err(failure(
-                    ErrorCode::StorageUnavailable,
-                    "OLTP pool refused: damage spans too many groups",
-                ));
-            }
-            for damage in &opened.quarantined {
-                tracing::warn!(
-                    path = %path.display(),
-                    group = ?group_of_scope(&damage.scope),
-                    reason = ?damage.reason,
-                    file = ?damage.file,
-                    first_bad_seq = ?damage.first_bad_seq,
-                    "OLTP group quarantined at open; it will not start"
-                );
-            }
-        }
+        // R6 at pool level, sticky (NS14, `damage.rs`): new damage of more than 8
+        // groups, or more than 10% of the pool's groups (always allowing one), is
+        // more likely systemic than local, so the pool is refused instead (plan
+        // section 3). Groups this pool already accepted are not counted again
+        // (RV-NS6 F2); a refused open accepts nothing, so it refuses again.
+        let accepted = if opened.quarantined.is_empty() {
+            damage::admit(path, &store, &[], &[], 0)?
+        } else {
+            let healthy = count_healthy_groups(&store)?;
+            damage::admit(
+                path,
+                &store,
+                &opened.quarantined,
+                &opened.quarantined_now,
+                healthy,
+            )?
+        };
         if opened.recovery.tail_truncations > 0 {
             tracing::warn!(
                 path = %path.display(),
@@ -332,8 +324,10 @@ impl OltpPool {
             );
         }
         let recovery = Arc::new(AtomicBool::new(false));
+        let damage_state = Arc::new(damage::DamageState::new());
         {
             let path = path.to_owned();
+            let damage_state = damage_state.clone();
             store.on_damage(Box::new(move |damage| {
                 tracing::error!(
                     path = %path.display(),
@@ -342,6 +336,8 @@ impl OltpPool {
                     file = ?damage.file,
                     "OLTP storage damage found at run time; group quarantined, its writes are refused"
                 );
+                // Rule 1: the group's host stops; R6: the group is accepted.
+                damage_state.found(&damage);
             }));
         }
         let snapshot = store.snapshot();
@@ -375,6 +371,9 @@ impl OltpPool {
             }
         }
         drop(snapshot);
+        if let Some(accepted) = accepted {
+            damage::persist_accepted(path, &store, &accepted)?;
+        }
         let inner = Arc::new(PoolInner {
             store,
             identity,
@@ -383,11 +382,13 @@ impl OltpPool {
             recovery,
             groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             synced_requests: AtomicU64::new(0),
+            damage: damage_state,
             _pool_slot: pool_slot,
             _overhead: overhead,
             _mount: mount,
         });
         inner.shared.storage.register(&inner);
+        inner.damage.bind(Arc::downgrade(&inner));
         Ok(Self { inner })
     }
 
@@ -470,6 +471,7 @@ impl OltpPool {
     /// `GroupDamaged` and stops the host.
     fn refuse_quarantined(&self, id: Uuid) -> Result<(), ProtocolError> {
         if self.group_quarantined(id) {
+            self.inner.damage.count_refusal();
             return Err(quarantined_group());
         }
         Ok(())
@@ -2047,12 +2049,6 @@ fn open_pool_manifest(path: &Path, identity: &PoolIdentity) -> Result<(), Protoc
         .map_err(|_| storage_error_message())?;
     Ok(())
 }
-fn quarantined_group() -> ProtocolError {
-    failure(
-        ErrorCode::StorageUnavailable,
-        "OLTP group is quarantined after storage damage",
-    )
-}
 fn storage_error_message() -> ProtocolError {
     failure(
         ErrorCode::StorageUnavailable,
@@ -2088,12 +2084,6 @@ impl Drop for OwnedStore {
             _ => drop(store),
         }
     }
-}
-/// The group a quarantined scope names (`0x40 ‖ id`).
-fn group_of_scope(scope: &[u8]) -> Option<Uuid> {
-    (scope.len() == GROUP_SCOPE_BYTES && scope[0] == 0x40)
-        .then(|| Uuid::from_slice(&scope[1..]).ok())
-        .flatten()
 }
 /// Groups with a readable identity record, skipping quarantined scopes (R6).
 fn count_healthy_groups(store: &Store) -> Result<usize, ProtocolError> {
