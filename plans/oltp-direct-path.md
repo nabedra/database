@@ -90,11 +90,11 @@ In [`hosted.rs`](../server/src/oltp_replication/hosted.rs) replace `single_entry
 
 | Write | Today | Change |
 | --- | --- | --- |
-| Log append in [`typed_log.rs`](../server/src/oltp_replication/typed_log.rs) | One synced `WriteBatch` per entry | One synced `WriteBatch` per append batch. RocksDB group-commits concurrent syncs from other groups on the same pool. |
+| Log append in [`typed_log.rs`](../server/src/oltp_replication/typed_log.rs) | One synced `WriteBatch` per entry | One synced `WriteBatch` per append batch. The pool's nabedra-kv journal group-commits concurrent syncs from other groups on the same pool. |
 | `save_committed` | Synced | Unsynced. OpenRaft treats it as a recovery hint. |
 | Apply in [`pool.rs`](../server/src/oltp/pool.rs) `mutate` | One synced batch per entry | One unsynced batch for all entries in the apply call, with position, reply and membership inside it. |
 
-An unsynced apply is safe because the log and the state share one RocksDB WAL. A crash loses only a suffix of the WAL, and the surviving log replays what the lost applies covered. Purge the log and build snapshots only up to an applied index that a later synced write has made durable. Keep `AbsoluteConsistency` WAL recovery. Rerun O06, O11, O29 and the Raft-append cancellation regression on this change alone before building on it.
+An unsynced apply is safe because the log and the state share one nabedra-kv journal. A crash loses only a suffix of the journal, and the surviving log replays what the lost applies covered. Purge the log and build snapshots only up to an applied index that a later synced write has made durable. Journal recovery follows `plans/native-storage-engine.md` section 3 (exact-prefix truncation of a torn tail, never past a record a later sync proved durable). Rerun O06, O11, O29 and the Raft-append cancellation regression on this change alone before building on it.
 
 Sections 1 and 2 also speed up the queued path. Benchmark them alone as a checkpoint.
 

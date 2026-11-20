@@ -406,7 +406,7 @@ The Events Docker build context becomes `server`, copying `kv/` and `events/` an
 4. `Dockerfile` and `server/events/deploy/Dockerfile`: drop clang, libclang-dev and cmake, and `libstdc++6` if unused; move the Events context (NS12).
 5. `scripts/check_engine_features.py`, and the `ROCKSDB_LIB_DIR` and `ROCKSDB_STATIC` notes in docs and briefs (NS12).
 6. Docs listed in section 1 (NS12).
-7. `rg -i rocksdb` over the tree, excluding `docs/testing/evidence/**`, `server/events/tests/evidence/**`, this plan and the release notes, returns nothing (NS26).
+7. `rg -i rocksdb` over the tree, excluding `docs/testing/evidence/**`, `server/events/tests/evidence/**`, `orm/python/tests/events/evidence.md`, `server/tests/render_oltp_evidence.py` (historical evidence), this plan and the release notes, returns nothing except the clean-break detection code and its tests (NS22) and the forbidden-crate list in `scripts/check_engine_features.py` (NS26).
 
 ---
 
