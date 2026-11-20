@@ -860,7 +860,9 @@ impl WorkerTransport {
             trace.phase = RaftTransportPhase::Handle;
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
-            let _handler = handler;
+            // Free the lane before the reply can reach the peer, as on a
+            // session: its next request must not find this call's slot held.
+            drop(handler);
             trace.phase = RaftTransportPhase::SendReply;
             write_reply(&mut stream, hello.nonce, 0, &reply).await
         }

@@ -1010,9 +1010,13 @@ impl PreparedNative {
         };
         let (tx, rx) = oneshot::channel();
         executor.send(Box::new(move || {
-            let _lease = self.lease;
+            let lease = self.lease;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
+            // Release the slot and the worker owner before the caller can see
+            // the result: a caller that then drops its last owner must find the
+            // worker unbound, or a reopen is refused (C02, CIfix1).
+            drop(lease);
             let _ = tx.send((result, guard));
         }))?;
         rx.await.map_err(|_| super::super::recovery_unknown())

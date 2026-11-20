@@ -414,11 +414,25 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         let followers: Vec<usize> = (0..3).filter(|index| *index != leader).collect();
         let (damaged, other) = (followers[0], followers[1]);
         let mut term = 0;
+        let mut last = None;
         for _ in 0..5 {
             term += 1;
-            cluster.fence(leader, term).await;
+            last = Some(cluster.fence(leader, term).await);
         }
         let acknowledged = term;
+        // A fence commits on the leader and one follower. The damaged follower
+        // must hold the fence records (the damage needle) before it stops, so
+        // wait until it acknowledged the last one: a follower acknowledges an
+        // append only once it is durable. A slow runner can otherwise stop it
+        // with none of them ("needle not found in the journal", Linux CI).
+        let last = last.unwrap().index;
+        let damaged_node = damaged as u64 + 1;
+        while cluster
+            .matched(leader, damaged_node)
+            .is_none_or(|index| index < last)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         // The damaged follower goes down; its journal is damaged (G1).
         cluster.stop(damaged).await;
@@ -445,7 +459,6 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
 
         // The group keeps committing without it; the damaged replica never
         // acknowledges again (its matched index stays below the new writes).
-        let damaged_node = damaged as u64 + 1;
         term += 1;
         let after_restart = cluster.fence(leader, term).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
