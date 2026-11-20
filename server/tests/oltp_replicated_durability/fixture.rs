@@ -492,15 +492,26 @@ async fn offline(base: &Path, root: &Path, topology: &Topology, node: u64, mode:
         let native = tokio::task::spawn_blocking(move || probe_native_store(&probe.0, &probe.1))
             .await
             .unwrap();
-        let refused = OltpPool::open_development(corruption, topology.identity(node), shared)
-            .err()
-            .expect("OLTP open accepted corrupt voter WAL");
-        assert_eq!(refused.code, ErrorCode::StorageUnavailable);
-        assert_eq!(refused.message, "OLTP storage unavailable or corrupt");
+        // The pool either refuses the store (R1, or R6 when too many groups are
+        // damaged) or opens with the damaged group quarantined and never started (G1).
+        let pool = match OltpPool::open_development(corruption, topology.identity(node), shared) {
+            Err(refused) => {
+                assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused:?}");
+                json!({"refused": refused})
+            }
+            Ok(opened) => {
+                let quarantined = opened.quarantined_groups();
+                assert!(
+                    !quarantined.is_empty(),
+                    "OLTP open accepted corrupt voter WAL"
+                );
+                json!({"quarantined_groups": quarantined})
+            }
+        };
         write(
             root,
             "corrupt-result.json",
-            &json!({"native": native, "pool_error": refused}),
+            &json!({"native": native, "pool": pool}),
         );
         return;
     }
@@ -516,7 +527,7 @@ async fn offline(base: &Path, root: &Path, topology: &Topology, node: u64, mode:
 /// Opens a copy of the voter's `nabedra-kv` store (`<pool>/kv`, plan section 2 "Files"),
 /// so recovery cannot repair the copy that the pool assertion opens next. The store must
 /// detect the flipped journal byte: either refuse to open (R1, `Corruption`) or open with
-/// the damaged group quarantined (G1). Opening clean, for example by truncating the damage
+/// the damaged scope quarantined (G1). Opening clean, for example by truncating the damage
 /// as a torn tail (L2), fails the fixture.
 fn probe_native_store(pool: &Path, probe: &Path) -> Value {
     fn copy_tree(from: &Path, to: &Path) {
