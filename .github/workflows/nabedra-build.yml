@@ -646,7 +646,7 @@ jobs:
           sha256sum nabedra-db-* | tee -a ../bench-build.txt
           ./nabedra-db-* --version | tee -a ../bench-build.txt
           ldd nabedra-db-* | tee -a ../bench-build.txt
-          ldd --version | head -1 | tee -a ../bench-build.txt
+          { ldd --version || true; } | sed -n 1p | tee -a ../bench-build.txt
           cp ../bench-build.txt .
       - uses: actions/upload-artifact@v4
         with:
