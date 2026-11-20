@@ -13,11 +13,11 @@ Status: measured 2026-11-20 at `b2196d2` (local) and in Actions runs `4470764035
 | Crypto | Never in-house. TLS and hashing stay on vetted crates. | User, 2026-11-19 |
 | Dependencies | Prefer in-tree code over heavy crates. | User, 2026-11-19 |
 
-## Open decisions for the user
+## User decisions (2026-11-20)
 
-1. BLD5: use the `ring` provider only. This drops the post-quantum hybrid key exchange (`X25519MLKEM768`) that the `aws-lc-rs` provider offers, and any later FIPS option.
-2. BLD4: the in-tree S3 client signs requests with SigV4, which is protocol code built on vetted HMAC-SHA256 and SHA-256 from `ring`. Confirm this does not count as "our own cryptography".
-3. BLD4: which AWS credential sources to keep (table in BLD4). The docs promise `AWS_PROFILE`, environment credentials and "roles".
+1. BLD5 approved: `ring` as the only TLS provider is acceptable.
+2. BLD4 rejected: AWS SDKs (`aws-sdk-s3`, `aws-config`, boto3) are permitted and encouraged, so S3 stays on the SDK. Its compile cost only affects S3-enabled builds; CI absorbs it.
+3. AWS credentials for authorized, small S3 tests come from the git-ignored `.env` in the main checkout.
 
 ---
 
