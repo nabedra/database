@@ -60,7 +60,9 @@ impl RaftStateMachine<TypeConfig> for AppliedState {
             let replies = self
                 .snapshots
                 .store
-                .run(move |_| {
+                // Each entry commits on its own; a full device retries only the
+                // commit that failed, so no entry is applied twice (RV-EV M1).
+                .run_as("apply", move |_| {
                     let mut replies = Vec::with_capacity(batch.len());
                     for entry in batch {
                         let mut tx = store.transaction()?;

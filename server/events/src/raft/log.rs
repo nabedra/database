@@ -148,13 +148,14 @@ impl LogStore {
 
     async fn persist(
         &self,
+        label: &'static str,
         key: &'static [u8],
         value: impl Serialize + Send + 'static,
         subject: ErrorSubject<u64>,
     ) -> Result<(), StorageError<u64>> {
         let store = self.clone();
         self.0
-            .run(move |_| store.put_record(key, &value))
+            .run_as(label, move |_| store.put_record(key, &value))
             .await
             .map_err(|error| storage_error(subject, ErrorVerb::Write, error))
     }
@@ -198,7 +199,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        self.persist(VOTE_KEY, *vote, ErrorSubject::Vote).await
+        self.persist("vote", VOTE_KEY, *vote, ErrorSubject::Vote)
+            .await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
@@ -213,7 +215,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
-        self.persist(b"committed", committed, ErrorSubject::Logs)
+        self.persist("committed", b"committed", committed, ErrorSubject::Logs)
             .await
     }
 
@@ -236,7 +238,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     {
         let store = self.clone();
         let entries: Vec<_> = entries.into_iter().collect();
-        let result = self.0.run(move |_| store.append_entries(entries)).await;
+        // A full device is retried per sub-batch inside the job, so the callback reports
+        // success only after the last one is durable (RV-EV M1).
+        let result = self
+            .0
+            .run_as("append", move |_| store.append_entries(entries))
+            .await;
         callback.log_io_completed(
             result
                 .as_ref()
@@ -249,7 +256,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let store = self.clone();
         self.0
-            .run(move |_| store.truncate_from(log_id.index))
+            .run_as("truncate", move |_| store.truncate_from(log_id.index))
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))
     }
@@ -257,7 +264,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let store = self.clone();
         self.0
-            .run(move |_| store.purge_through(log_id))
+            .run_as("purge", move |_| store.purge_through(log_id))
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))
     }

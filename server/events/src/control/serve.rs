@@ -17,6 +17,21 @@ use crate::http;
 
 const STOP_GRACE: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a broker whose store requires recovery keeps answering (readiness 503,
+/// in-flight replies) before it stops.
+const RECOVERY_GRACE: Duration = Duration::from_secs(2);
+/// How long a graceful stop waits for the last users of the store before closing it.
+const STORE_CLOSE_WAIT: Duration = Duration::from_secs(10);
+
+/// The process exit code of a broker that stopped because its store requires recovery.
+/// The next start reopens the store, which applies the recovery rules R1-R3 (plan
+/// section 3): it recovers, or refuses to open loudly (RV-EV M2).
+pub const RECOVERY_EXIT_CODE: i32 = 75;
+
+/// `serve` stopped because the store latched `RecoveryRequired`.
+#[derive(Debug, thiserror::Error)]
+#[error("the Events store requires recovery; restart the broker to reopen it")]
+pub struct StoreRecoveryRequired;
 
 pub async fn serve(config: Config) -> Result<()> {
     let public_listener =
@@ -54,18 +69,13 @@ pub async fn serve(config: Config) -> Result<()> {
 
     let public_handle = Handle::<SocketAddr>::new();
     let peer_handle = Handle::<SocketAddr>::new();
-    let mut public = Box::pin(listen(
+    let public = listen(
         public_listener,
         public_tls,
         public_routes,
         public_handle.clone(),
-    ));
-    let mut peer = Box::pin(listen(
-        private_listener,
-        peer_tls,
-        peer_routes,
-        peer_handle.clone(),
-    ));
+    );
+    let peer = listen(private_listener, peer_tls, peer_routes, peer_handle.clone());
 
     let controllers = tokio::spawn(control.clone().controllers());
     let monitor = tokio::spawn(control.clone().monitor());
@@ -78,22 +88,40 @@ pub async fn serve(config: Config) -> Result<()> {
         })
     });
 
-    let result = tokio::select! {
-        result = &mut public => {
-            peer_handle.graceful_shutdown(Some(STOP_GRACE));
-            let other = peer.await;
-            result.and(other)
-        }
-        result = &mut peer => {
-            public_handle.graceful_shutdown(Some(STOP_GRACE));
-            let other = public.await;
-            result.and(other)
-        }
-        result = shutdown_signal() => {
-            public_handle.graceful_shutdown(Some(STOP_GRACE));
-            peer_handle.graceful_shutdown(Some(STOP_GRACE));
-            let (public, peer) = tokio::join!(public, peer);
-            result.and(public).and(peer)
+    // The listeners (and the routes that own the broker) drop at the end of this block.
+    let (result, latched) = {
+        let mut public = Box::pin(public);
+        let mut peer = Box::pin(peer);
+        tokio::select! {
+            result = &mut public => {
+                peer_handle.graceful_shutdown(Some(STOP_GRACE));
+                let other = peer.await;
+                (result.and(other), false)
+            }
+            result = &mut peer => {
+                public_handle.graceful_shutdown(Some(STOP_GRACE));
+                let other = public.await;
+                (result.and(other), false)
+            }
+            result = shutdown_signal() => {
+                public_handle.graceful_shutdown(Some(STOP_GRACE));
+                peer_handle.graceful_shutdown(Some(STOP_GRACE));
+                let (public, peer) = tokio::join!(public, peer);
+                (result.and(public).and(peer), false)
+            }
+            () = broker.recovery_required() => {
+                // Every group's next write fails. Report it (readiness 503, the status
+                // endpoint), then stop so that a restart reopens and recovers the store.
+                tracing::error!(
+                    grace = ?RECOVERY_GRACE,
+                    "the Events store requires recovery; stopping the broker"
+                );
+                tokio::time::sleep(RECOVERY_GRACE).await;
+                public_handle.graceful_shutdown(Some(RECOVERY_GRACE));
+                peer_handle.graceful_shutdown(Some(RECOVERY_GRACE));
+                let (public, peer) = tokio::join!(public, peer);
+                (public.and(peer), true)
+            }
         }
     };
 
@@ -104,10 +132,12 @@ pub async fn serve(config: Config) -> Result<()> {
         task.abort();
         let _ = task.await;
     }
-    for id in broker.group_ids() {
-        broker.close_group(&id).await?;
+    // Close every group, then the store itself, so a planned stop is a clean close.
+    let stopped = broker.shutdown(STORE_CLOSE_WAIT).await;
+    if latched {
+        return Err(StoreRecoveryRequired.into());
     }
-    result
+    result.and(stopped)
 }
 
 async fn listen(

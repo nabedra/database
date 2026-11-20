@@ -413,7 +413,7 @@ impl Snapshots {
         let file = file.io.into_std().await;
         let manager = self.clone();
         self.store
-            .run_bulk(move |_| {
+            .run_bulk_as("install_snapshot", move |_| {
                 manager.stage_image(file, Some(expected), Some(temporary))?;
                 Ok(())
             })
@@ -484,7 +484,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Snapshots {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let manager = self.clone();
         self.store
-            .run_bulk(move |_| manager.build())
+            .run_bulk_as("build_snapshot", move |_| manager.build())
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))
     }

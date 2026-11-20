@@ -293,7 +293,7 @@ impl Control {
                         if self
                             .disk_available
                             .load(std::sync::atomic::Ordering::Relaxed)
-                            < self.config.min_free_disk_bytes
+                            < self.disk_reserve_bytes()
                         {
                             return Err(Error::Disk.into());
                         }

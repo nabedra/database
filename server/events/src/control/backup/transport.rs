@@ -295,7 +295,7 @@ async fn prepare(server: &Server, request: Start) -> Result<SnapshotCut, StatusC
         .broker
         .disk_available_bytes()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .saturating_sub(server.control.config.min_free_disk_bytes);
+        .saturating_sub(server.control.disk_reserve_bytes());
     if limit < CHUNK_BYTES as u64 {
         return Err(StatusCode::INSUFFICIENT_STORAGE);
     }
