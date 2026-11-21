@@ -320,6 +320,21 @@ impl WorkerRuntime {
             }
             read = self.services.catalog.read::<IndexRecord>(&pin, key).await?;
         }
+        // IDX1 temporary diagnostic: name the intent that blocks an index admin read.
+        if let CatalogRead::Blocked(intent) = &read {
+            let inspected = self.services.status.inspect_transaction(intent.txn).await;
+            eprintln!(
+                "nabedra-db: IDX1 diagnostic: index admin read blocked: table={} index={} build={} reconciling={} \
+                 intent_txn={} decided={:?} at_ms={}",
+                selector.table_id,
+                selector.index_id,
+                selector.build_id,
+                operation.is_some(),
+                intent.txn.request_id,
+                inspected.map(|state| state.map(|state| state.decision.is_some())),
+                now(),
+            );
+        }
         let CatalogRead::Value { record, .. } = read else {
             return Err(unknown());
         };
