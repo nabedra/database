@@ -389,6 +389,32 @@ async fn o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount() 
     assert_eq!(recovery.get::<Uuid>(ACTIVE.to_vec()).await, None);
     assert!(!directory_view.revoked(recovery.voters[1]));
     assert!(!directory_view.has_mounted_replacement());
+
+    // Import the extra revocation that REP4 could commit before stopping.
+    let historical = WorkerIdentity::from(&worker(1024));
+    recovery
+        .seed(move |tx| {
+            let raw = tx.encode_value(&historical)?;
+            tx.put(&revoked_id(historical.worker_id), raw.as_ref())
+        })
+        .await;
+    let survivor = recovery.voters[0];
+    let restarted = AppliedPeerDirectory::from_bootstrap(
+        recovery.group.identity.clone(),
+        vec![WorkerEnrollment {
+            incarnation: survivor.incarnation,
+            ..worker(survivor.worker_id.as_u128())
+        }],
+        recovery.fixture.machine.store().resources().clone(),
+    )
+    .unwrap();
+    recovery.fixture.machine = ControlMachine::new(recovery.fixture.machine.store().clone())
+        .unwrap()
+        .with_replacement_directory(restarted.clone())
+        .await
+        .unwrap();
+    assert!(restarted.revoked(historical));
+    assert!(!restarted.revoked(survivor));
 }
 
 #[tokio::test]

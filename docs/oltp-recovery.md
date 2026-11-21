@@ -186,10 +186,10 @@ worker requires agreement from a majority of its configured Control peers
 before dispatch and refuses the request if it cannot establish agreement. Update Data workers' Control placements and enrollments before their
 next restart. A confirmed revocation removes the stale bootstrap trust.
 
-Control retains up to 1,024 committed worker revocations. It refuses the
+Control accepts up to 1,024 committed worker revocations. It refuses the
 next mount before enrolling the candidate or changing any placement. The
-fixed bound keeps the revocation index charged to the Control workers'
-progress memory and makes peer verification independent of inventory scans.
+revocation index uses a fixed progress-memory reservation and can also
+load the extra revocation a prior release could commit past the limit.
 
 For a quarantined Data replica or refused secondary pool, check
 `quarantined_groups` under `storage` and `refused_pools` in
