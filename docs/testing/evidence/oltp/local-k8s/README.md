@@ -150,6 +150,21 @@ the fixture now writes that file with owner-only permissions.
 [Data worker output](scale-attempt/worker-output.txt) ·
 [Scale attempt trace](scale-attempt/trace.jsonl)
 
+The corrected worker passed native mount enrollment and reached queue
+join. The runtime reported `Unauthorized: Control refused data worker queue join`.
+The log does not identify the underlying Control reply. A fourth ready
+worker and drain permit were not observed. [Scale rerun trace](scale-retry/trace.jsonl) ·
+[Scale rerun worker output](scale-retry/worker-output.txt)
+
+The isolated rolling and R02 run passed. The final table matched exactly
+353 rows and the count matched. The audit verified 250 acknowledged
+direct writes and settled all 68 queued receipts, of which 58 needed
+an identical-ID retry. Both ranges reported the same three applied Data
+voters on every worker. After two data nodes stopped in sequence, the
+remaining worker still held both the queued and running requests with
+their original body and context hashes.
+[Rolling and R02 trace](rolling-last-holder/trace.jsonl)
+
 The Linux process tests reran after the hardening merge. Retained restart
 verified 78 acknowledged writes, two settled receipts and three applied
 Data voters across two ranges. The lost-system-worker replacement test
