@@ -965,6 +965,11 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .await
             .unwrap();
         acked.await.unwrap().unwrap();
+        let delayed_marker = if std::env::var_os("NABEDRA_FLAKE2_DELAY_OLD_MARKER").is_some() {
+            Some(rig.shared.prepare(ExecutionClass::Control).await.unwrap())
+        } else {
+            None
+        };
         log.save_committed(Some(id(0))).await.unwrap();
 
         rig.gated.state(|gate| gate.closed = true);
@@ -973,6 +978,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .await
             .unwrap();
         rig.entered().await;
+        drop(delayed_marker);
         assert_eq!(
             log_ids(log.limited_get_log_entries(0, 2).await.unwrap()),
             [id(0), id(1)]
@@ -1061,6 +1067,11 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             .await
             .unwrap();
         acked.await.unwrap().unwrap();
+        let delayed_marker = if std::env::var_os("NABEDRA_FLAKE2_DELAY_OLD_MARKER").is_some() {
+            Some(rig.shared.prepare(ExecutionClass::Control).await.unwrap())
+        } else {
+            None
+        };
         log.save_committed(Some(id(0))).await.unwrap();
 
         rig.gated.state(|gate| gate.closed = true);
@@ -1069,6 +1080,7 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             .await
             .unwrap();
         rig.entered().await;
+        drop(delayed_marker);
         let apply = tokio::spawn({
             let mut log = log.clone();
             async move {

@@ -1262,6 +1262,77 @@ fn c02_o05_ns04_native_job_releases_its_worker_owner_before_its_result() {
 }
 
 #[tokio::test]
+async fn f03_native_drain_waits_for_cancelled_guard_drop() {
+    struct HeldDrop {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        gate: Arc<Gate>,
+    }
+    impl Drop for HeldDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.take().unwrap().send(());
+            self.gate.wait();
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resources = shared(SharedResourceConfig::default());
+        let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let reservation = prepared.reserve_compute(44, 1024).await.unwrap();
+        let work_gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let drop_gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let release_work = ReleaseOnDrop(work_gate.clone());
+        let release_drop = ReleaseOnDrop(drop_gate.clone());
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (dropping, cleanup) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            prepared
+                .run_with_guard(
+                    (
+                        HeldDrop {
+                            entered: Some(dropping),
+                            gate: drop_gate,
+                        },
+                        reservation,
+                    ),
+                    move || {
+                        started.send(()).unwrap();
+                        work_gate.wait();
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        running.await.expect("native work started");
+        task.abort();
+        assert!(task.await.err().is_some_and(|error| error.is_cancelled()));
+        drop(release_work);
+        cleanup.await.expect("cancelled guard started dropping");
+
+        let mut drain = std::pin::pin!(resources.drain());
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(drain.as_mut(), cx).is_pending(),
+                "native drain returned while the cancelled guard still held its scheduler permit"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(resources.scheduler().usage()[0].1, 1);
+        drop(release_drop);
+        drain.await;
+        assert_eq!(resources.scheduler().usage()[0].1, 0);
+    })
+    .await
+    .expect("native work, cancellation cleanup and drain watchdog");
+}
+
+#[tokio::test]
 async fn f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic() {
     struct PanicOnDrop;
     impl Drop for PanicOnDrop {

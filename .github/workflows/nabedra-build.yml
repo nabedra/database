@@ -245,6 +245,46 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: FLAKE2 repetitions
+        if: github.ref == 'refs/heads/nabedra/hd-flake2' && contains(github.event.head_commit.message, '[ci flake2]')
+        working-directory: server
+        run: |
+          exe=$(cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "nabedra_database") | .executable')
+          test -x "$exe"
+          log="$RUNNER_TEMP/flake2.log"
+          total_failed=0
+          repeat() {
+            local name=$1 rounds=$2 passed=0 failed=0 timed_out=0 status
+            for ((round=1; round<=rounds; round++)); do
+              status=0
+              timeout --kill-after=2s 8s "$exe" "$name" --exact > "$log" 2>&1 || status=$?
+              echo "FLAKE2 $name round $round/$rounds exit $status"
+              if [[ $status == 0 ]] && rg -q '^test result: ok\. 1 passed;' "$log"; then
+                rg '^test result:' "$log"
+                ((passed+=1))
+              else
+                cat "$log"
+                ((failed+=1))
+                if [[ $status == 124 || $status == 137 ]]; then ((timed_out+=1)); fi
+              fi
+            done
+            echo "FLAKE2 summary $name passed=$passed failed=$failed timed_out=$timed_out"
+            total_failed=$((total_failed + failed))
+          }
+          crash=oltp_replication::typed_log::tests::o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked_entries
+          marker=oltp_replication::typed_log::tests::o11_perf2d_commit_marker_and_apply_follow_the_local_sync
+          repeat "$crash" 50
+          repeat "$marker" 50
+          repeat oltp::pool::tests::c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_cancelled_native_charges 50
+          repeat oltp::pool::tests::f03_native_drain_waits_for_cancelled_guard_drop 50
+          if [[ "${{ contains(github.event.head_commit.message, '[flake2 baseline]') }}" == true ]]; then
+            echo "FLAKE2 force the old marker to submit after the gated append"
+            export NABEDRA_FLAKE2_DELAY_OLD_MARKER=1
+            repeat "$crash" 1
+            repeat "$marker" 1
+          fi
+          test "$total_failed" -eq 0
       - name: Library suite
         working-directory: server
         run: |
