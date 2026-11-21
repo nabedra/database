@@ -648,6 +648,8 @@ impl LocalServices {
                     control_client.clone(),
                 ),
             );
+            // PERF1: keep a window reserved after a queued allocation discards it.
+            timestamps.spawn_direct_prefill();
             let queue = QueueCoordinator::new(replica.clone(), control.clone(), peer);
             shared.bind_read_queue(&queue)?;
             Ok((

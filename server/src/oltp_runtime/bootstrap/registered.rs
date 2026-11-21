@@ -191,6 +191,8 @@ impl LocalServices {
                     rpc.clone(),
                 ),
             );
+            // PERF1: keep a window reserved after a queued allocation discards it.
+            native_timestamps.spawn_direct_prefill();
             for (running, handle) in &status_groups {
                 let node = running.state.resident().node_id();
                 let endpoint = StatusEndpoint::new(

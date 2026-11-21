@@ -49,6 +49,13 @@ pub(crate) const MAX_DIRECT_WINDOW: u64 = 1 << 20;
 pub(crate) const MAX_DIRECT_COUNT: u64 = 4096;
 /// Reservations retried when `ReserveWindow` meets a stale authority.
 const REFILL_ATTEMPTS: usize = 8;
+/// A discarded window is reserved again in the background only while this
+/// leader served `AllocateDirect` within this long (PERF1).
+const PREFILL_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on one background reservation.
+const PREFILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+/// The background task checks this often that its handle still exists.
+const PREFILL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A contiguous run of commit timestamps from `AllocateDirect`. Every value is
 /// above every timestamp returned by an allocation that completed before the
@@ -171,6 +178,14 @@ struct WindowState {
 pub(super) struct DirectWindows {
     state: Mutex<WindowState>,
     refill: tokio::sync::Mutex<()>,
+    /// Fired when an apply discards a window (a queued allocation moved the
+    /// watermark) or a reservation lost that race. Its own `Arc`, so the
+    /// background task that waits on it never keeps these windows alive.
+    prefill: Arc<tokio::sync::Notify>,
+    /// Milliseconds since `served_epoch` of the last `AllocateDirect` that
+    /// passed this node's read barrier; 0 before the first.
+    served_ms: AtomicU64,
+    served_epoch: std::time::Instant,
     gate: RwLock<Option<Arc<dyn DirectTimestampGate>>>,
     window_size: AtomicU64,
     reservations: AtomicU64,
@@ -182,6 +197,9 @@ impl DirectWindows {
         Self {
             state: Mutex::new(WindowState::default()),
             refill: tokio::sync::Mutex::new(()),
+            prefill: Arc::default(),
+            served_ms: AtomicU64::new(0),
+            served_epoch: std::time::Instant::now(),
             gate: RwLock::new(None),
             window_size: AtomicU64::new(DEFAULT_DIRECT_WINDOW),
             reservations: AtomicU64::new(0),
@@ -224,7 +242,24 @@ impl DirectWindows {
         state.observed = Some(mark);
         if state.window.take().is_some() {
             self.discards.fetch_add(1, Ordering::Relaxed);
+            self.prefill.notify_one();
         }
+    }
+    fn served(&self) {
+        let ms = u64::try_from(self.served_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.served_ms.store(ms.max(1), Ordering::Relaxed);
+    }
+    fn recently_served(&self) -> bool {
+        let served = self.served_ms.load(Ordering::Relaxed);
+        let now = u64::try_from(self.served_epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        served != 0 && now.saturating_sub(served) <= PREFILL_IDLE.as_millis() as u64
+    }
+    /// A window reserved by `leader` is installed.
+    fn holds(&self, leader: LeaderKey) -> bool {
+        self.lock()
+            .window
+            .as_ref()
+            .is_some_and(|window| window.leader == leader)
     }
     fn discard(&self, state: &mut WindowState) {
         if state.window.take().is_some() {
@@ -283,6 +318,7 @@ impl DirectWindows {
             .is_some_and(|mark| mark.high_watermark == last && mark.authority == authority);
         if !current {
             self.raced.fetch_add(1, Ordering::Relaxed);
+            self.prefill.notify_one();
             return Ok(head);
         }
         self.discard(&mut state);
@@ -292,6 +328,26 @@ impl DirectWindows {
             last,
         });
         Ok(head)
+    }
+    /// Install the whole reservation `[first, last]` made by `leader` as the
+    /// window, under the same rule as [`Self::install_and_take`]: only if it is
+    /// still the newest applied state. Nothing is handed out here.
+    fn install(&self, leader: LeaderKey, authority: Authority, first: u64, last: u64) -> bool {
+        let mut state = self.lock();
+        let current = state
+            .observed
+            .is_some_and(|mark| mark.high_watermark == last && mark.authority == authority);
+        if !current {
+            self.raced.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.discard(&mut state);
+        state.window = Some(Window {
+            leader,
+            next: first,
+            last,
+        });
+        true
     }
     fn gate(&self) -> Option<Arc<dyn DirectTimestampGate>> {
         self.gate
@@ -391,6 +447,7 @@ impl TimestampHandle {
         .await?;
         let leader = leader_of(barrier.applied);
         let direct = &self.machine.direct;
+        direct.served();
         if let Some(range) = direct.take(leader, count) {
             return Ok(range);
         }
@@ -400,6 +457,16 @@ impl TimestampHandle {
         if let Some(range) = direct.take(leader, count) {
             return Ok(range);
         }
+        let (leader, authority, first, last) = self.reserve_window(count).await?;
+        direct.install_and_take(leader, authority, first, last, count)
+    }
+    /// One `ReserveWindow` of at least `count` values, retried on a stale
+    /// authority. The caller holds `refill`.
+    async fn reserve_window(
+        &self,
+        count: u64,
+    ) -> Result<(LeaderKey, Authority, u64, u64), ProtocolError> {
+        let direct = &self.machine.direct;
         let gate = direct.gate().ok_or_else(direct_disabled)?;
         if !gate.reserve_window_supported(self.identity()).await? {
             return Err(direct_disabled());
@@ -422,13 +489,12 @@ impl TimestampHandle {
                     && last.get().checked_sub(first.get()) == Some(size - 1) =>
                 {
                     direct.reservations.fetch_add(1, Ordering::Relaxed);
-                    return direct.install_and_take(
+                    return Ok((
                         leader_of(applied.position),
                         authority,
                         first.get(),
                         last.get(),
-                        count,
-                    );
+                    ));
                 }
                 TimestampReply::Rejected(super::Fault::StaleAuthority) => {}
                 reply => return Err(super::handle::rejected(reply)),
@@ -442,6 +508,63 @@ impl TimestampHandle {
             ),
             Outcome::NotApplied,
         ))
+    }
+    /// Reserve a new window ahead of the next caller after an apply discarded
+    /// the last one (PERF1). The same reservation and install rules as a
+    /// caller's refill apply; it hands nothing out, so a window installed here
+    /// is used only by callers whose own barrier names its leader. Values in a
+    /// window that a later queued allocation discards are skipped, never issued.
+    pub(crate) async fn prefill_direct_window(&self) -> Result<bool, ProtocolError> {
+        let direct = &self.machine.direct;
+        if !direct.recently_served() {
+            return Ok(false);
+        }
+        let barrier = self.consensus.ensure_linearizable_lease().await?;
+        let leader = leader_of(barrier.applied);
+        let _refill = direct.refill.lock().await;
+        if direct.holds(leader) {
+            return Ok(false);
+        }
+        let (leader, authority, first, last) = self.reserve_window(1).await?;
+        Ok(direct.install(leader, authority, first, last))
+    }
+    /// Starts the task that keeps a window reserved while this node serves
+    /// `AllocateDirect`: after an apply discards the window, it reserves the
+    /// next one in the background, so a direct commit after a queued
+    /// allocation does not wait for a `ReserveWindow` entry (PERF1). The task
+    /// holds no strong reference while it waits and ends with the handle.
+    pub(crate) fn spawn_direct_prefill(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let handle = Arc::downgrade(self);
+        let wake = self.machine.direct.prefill.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::time::timeout(PREFILL_POLL, wake.notified())
+                    .await
+                    .is_err()
+                {
+                    if handle.strong_count() == 0 {
+                        return;
+                    }
+                    continue;
+                }
+                let Some(handle) = handle.upgrade() else {
+                    return;
+                };
+                let started = std::time::Instant::now();
+                match tokio::time::timeout(PREFILL_DEADLINE, handle.prefill_direct_window()).await {
+                    Ok(Ok(true)) => {
+                        crate::oltp_runtime::stage_timing::perf_stage!("ts.window.prefilled")
+                            .since(started);
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        tracing::debug!(code = ?error.code, message = %error.message,
+                            "direct timestamp window prefill failed");
+                    }
+                    Err(_) => tracing::debug!("direct timestamp window prefill timed out"),
+                }
+            }
+        })
     }
 }
 impl DirectTimestampSource for TimestampHandle {

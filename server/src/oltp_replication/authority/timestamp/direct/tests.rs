@@ -980,3 +980,58 @@ async fn o09_d06_perf1_allocate_direct_uses_the_lease_barrier() {
     let c = handle.allocate_direct(1).await.unwrap().first().get();
     assert!(c > q, "direct value {c} after queued {q} must be higher");
 }
+
+/// PERF1: after a queued allocation discards the window, the background task
+/// reserves the next one, so the next direct allocation proposes nothing and
+/// is still above the queued value (O09 real-time order).
+#[tokio::test]
+async fn o09_d06_perf1_discarded_window_is_reserved_again_in_the_background() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let prefill = handle.spawn_direct_prefill();
+    let a = handle.allocate_direct(1).await.unwrap().first().get();
+    assert_eq!(handle.direct_window_stats().reservations, 1);
+    let q = queued(&handle, authority).await;
+    assert_eq!(q, a + DEFAULT_DIRECT_WINDOW);
+    assert_eq!(handle.direct_window_stats().discards, 1);
+    until(|| handle.direct_window_stats().reservations == 2).await;
+    let proposals = cluster.reserve_window_proposals().await;
+    assert_eq!(proposals, 2);
+    let c = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(c > q, "direct value {c} after queued {q} must be higher");
+    let d = handle.allocate_direct(3).await.unwrap();
+    assert_eq!(d.first().get(), c + 1, "served from the prefilled window");
+    assert_eq!(cluster.reserve_window_proposals().await, proposals);
+    // A second discard is refilled too; values stay above every queued one.
+    let q2 = queued(&handle, authority).await;
+    until(|| handle.direct_window_stats().reservations == 3).await;
+    let e = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(e > q2, "direct value {e} after queued {q2} must be higher");
+    assert_eq!(cluster.reserve_window_proposals().await, 3);
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), prefill)
+        .await
+        .expect("the prefill task ends with its handle")
+        .unwrap();
+}
+
+/// PERF1: a queued-only node (no `AllocateDirect` served, no window) writes
+/// no background reservations.
+#[tokio::test]
+async fn o09_perf1_no_prefill_without_direct_allocations() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let _prefill = handle.spawn_direct_prefill();
+    for _ in 0..3 {
+        queued(&handle, authority).await;
+    }
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(cluster.reserve_window_proposals().await, 0);
+    assert_eq!(handle.direct_window_stats().reservations, 0);
+}
