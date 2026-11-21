@@ -999,6 +999,14 @@ def disk_pressure_settlement(test_executable):
                 free = os.statvfs(server.directory)
                 assert free.f_bavail * free.f_frsize <= keep, free
                 try:
+                    blocked = operation('table.insert', dict(
+                        table_id=table.id, row=dict(id='blocked', value=1)))
+                    assert client.exchange('/v1/operations', blocked) == (503, dict(
+                        request_id=blocked['request_id'], error=dict(
+                            code='storage_unavailable', outcome='not_applied',
+                            message='OLTP filesystem has insufficient unreserved storage',
+                        ),
+                    ))
                     for request in (commit, abort):
                         release(server.root, request)
                     exact_receipt(client.exchange, server.run_id, commit, None)
@@ -1016,6 +1024,7 @@ def disk_pressure_settlement(test_executable):
                     wait_until(abort_receipt, 'prepared transaction did not settle ABORT under disk pressure', timeout=20)
                     assert table.get('commit') == dict(id='commit', value=1)
                     assert table.get('abort') is None
+                    assert table.get('blocked') is None
                     assert table.query().count() == 1
                     table.drop()
                     assert db.tables() == []

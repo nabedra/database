@@ -1963,6 +1963,7 @@ impl HttpRuntime for WorkerRuntime {
                 "accept_to_dispatch":accept_to_dispatch,
                 "block_cache":self.services.shared.block_cache_usage(),
                 "storage":self.services.shared.storage_stats(),
+                "storage_reservations":self.services.shared.storage_reservations(),
                 // Rule 6: secondary pools refused at open, with the error class.
                 "refused_pools":self.services.pools.refused_report(),
                 "working_decode_bytes":self.services.shared.working_decode_bytes(),

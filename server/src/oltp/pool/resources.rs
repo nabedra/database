@@ -721,6 +721,9 @@ impl WorkerSharedResources {
     pub(crate) fn storage_stats(&self) -> super::StorageStats {
         self.storage.stats()
     }
+    pub(crate) fn storage_reservations(&self) -> Vec<super::disk::DiskReservationStats> {
+        self.storage.disk_stats()
+    }
     pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
         let limit = self.config.max_resident_groups;
         let free = self

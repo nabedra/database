@@ -3,10 +3,12 @@
 mod activation;
 mod closed;
 mod damage;
+mod disk;
 pub(crate) use activation::{ReplicaActivationStatement, VerifiedReplicaActivation};
 pub use damage::ACCEPT_DAMAGE_FILE;
 use damage::group_of_scope;
 pub(crate) use damage::{DamageCause, DamagedReplicaRemoved, ReleaseOutcome, quarantined_group};
+pub(crate) use disk::{DiskReservation, is_disk_reservation_refusal};
 pub(crate) mod mount;
 pub(crate) use closed::{PoolCloseOutcome, PoolClosedStatement, VerifiedPoolClosed};
 mod placement;
@@ -100,6 +102,7 @@ struct PoolInner {
     synced_requests: AtomicU64,
     /// Quarantine bookkeeping (NS14): run-time damage events, refusals, R6.
     damage: Arc<damage::DamageState>,
+    disk: disk::PoolDisk,
     _pool_slot: OwnedSemaphorePermit,
     _overhead: MemoryCharge,
     _mount: Option<VerifiedPoolMount>,
@@ -297,6 +300,7 @@ impl OltpPool {
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
         tune(&mut options);
+        let disk = disk::PoolDisk::open(path, options.journal.segment_bytes)?;
         let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(|error| {
             tracing::error!(path = %path.display(), %error, "OLTP pool refused at open");
             damage::open_refused(error)
@@ -380,6 +384,7 @@ impl OltpPool {
             groups: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             synced_requests: AtomicU64::new(0),
             damage: damage_state,
+            disk,
             _pool_slot: pool_slot,
             _overhead: overhead,
             _mount: mount,
@@ -399,6 +404,9 @@ impl OltpPool {
     }
     pub fn identity(&self) -> &PoolIdentity {
         &self.inner.identity
+    }
+    pub(crate) fn reserve_proposal_disk(&self) -> Result<DiskReservation, ProtocolError> {
+        self.inner.disk.reserve()
     }
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.inner.shared

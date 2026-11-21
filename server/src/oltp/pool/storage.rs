@@ -3,6 +3,7 @@
 //! readers use. It replaces the storage helpers the pool used to import from the
 //! deleted standalone `oltp` engine (plan section 5).
 use super::{PoolInner, failure, recovery_unknown};
+use super::disk::DiskReservationStats;
 use crate::protocol::{ErrorCode, ProtocolError};
 use bytes::Bytes;
 use nabedra_kv::{
@@ -64,6 +65,21 @@ impl NativeStorage {
         let mut pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
         pools.retain(|pool| pool.strong_count() > 0);
         pools.push(Arc::downgrade(pool));
+    }
+    pub(super) fn disk_stats(&self) -> Vec<DiskReservationStats> {
+        // A close checks for outstanding pool handles under this lock.
+        let mut stats = std::collections::BTreeMap::new();
+        let mut last_owned = Vec::new();
+        {
+            let pools = self.pools.lock().unwrap_or_else(|p| p.into_inner());
+            for pool in pools.iter().filter_map(Weak::upgrade) {
+                let device = pool.disk.device();
+                stats.entry(device).or_insert_with(|| pool.disk.stats());
+                last_owned.extend(Arc::into_inner(pool));
+            }
+        }
+        drop(last_owned);
+        stats.into_values().collect()
     }
     /// Sums the open pools' store counters. Every handle `stats()` takes is also
     /// released under the registry lock, so `close_with_native`'s last-owner check
