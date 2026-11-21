@@ -581,6 +581,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
     let page = first.buffers.as_ref().unwrap();
     assert_page_bounds(page);
     assert_eq!(page.rows, 128);
+    assert_eq!(page.source_rows, 128);
     assert!(!page.exhausted);
     fixture.assert_building(&original(7)).await;
     let historical = fixture.pin_query("query.collect").await;
@@ -605,7 +606,8 @@ async fn backfill_and_retirement() -> (usize, usize) {
     let second = reached(second).await;
     let page = second.buffers.as_ref().unwrap();
     assert_page_bounds(page);
-    assert_eq!(page.rows, 1);
+    // The scan can also return empty records for keys inserted after the source cut.
+    assert_eq!(page.source_rows, 1);
     assert!(page.exhausted);
     assert!(page.cursor_bytes > 0);
     let page_peak = first_bytes.max(page.page_bytes + page.cursor_bytes);

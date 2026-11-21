@@ -503,6 +503,7 @@ impl IndexService {
                                 crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Backfill,
                                 || Some(crate::oltp_runtime::recovery_tests::index_holds::PageBuffers {
                                     rows: records.len(),
+                                    source_rows: records.iter().filter(|record| record.value.is_some()).count(),
                                     page_bytes: response.decode_owner().unwrap().bytes(),
                                     cursor_bytes: after_owner.as_ref().map_or(0, |owner| owner.bytes()),
                                     exhausted: *exhausted,

@@ -41,6 +41,7 @@ pub(crate) enum Checkpoint {
 #[derive(Debug)]
 pub(crate) struct PageBuffers {
     pub rows: usize,
+    pub source_rows: usize,
     pub page_bytes: usize,
     pub cursor_bytes: usize,
     pub exhausted: bool,
