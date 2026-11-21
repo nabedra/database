@@ -114,11 +114,36 @@ jobs:
       - name: Test
         working-directory: server
         run: cargo test --locked --no-fail-fast -p nabedra-kv 2>&1 | tee ../kv-test.log
+      # GATEfix G7: memory of a freshly opened store (journal zero fill) at the base commit and
+      # at the head, each test binary in its own systemd scope on the runner's disk. Opt-in.
+      - name: G7 store memory, base vs head
+        if: contains(github.event.head_commit.message, '[ci g7]')
+        env:
+          G7_BASE: 1ea46224549b565ee3e559b39319970661ea5bc0
+        run: |
+          git fetch --no-tags --depth=1 origin "$G7_BASE"
+          git worktree add --detach ../g7-base "$G7_BASE"
+          cp server/kv/tests/g7_memory.rs ../g7-base/server/kv/tests/
+          mkdir -p "$RUNNER_TEMP/g7"
+          for side in base head; do
+            manifest=server/Cargo.toml; [ "$side" = base ] && manifest=../g7-base/server/Cargo.toml
+            exe=$(CARGO_TARGET_DIR="$PWD/server/target/g7-$side" cargo test --locked --manifest-path "$manifest" \
+              -p nabedra-kv --test g7_memory --no-run --message-format=json \
+              | jq -r 'select(.executable != null and .target.name == "g7_memory") | .executable')
+            for run in 1 2 3; do
+              sudo systemd-run --scope --quiet -p MemoryAccounting=yes --uid="$(id -u)" --gid="$(id -g)" \
+                --setenv=G7_DIR="$RUNNER_TEMP/g7" "$exe" --ignored --nocapture --exact g7_measure_store_memory_after_open \
+                | sed -n "s/^g7_memory /g7_memory $side run $run /p" | tee -a g7-memory.log
+            done
+          done
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kv-test-log
-          path: kv-test.log
+          path: |
+            kv-test.log
+            g7-memory.log
+          if-no-files-found: ignore
           retention-days: 14
 
   features:

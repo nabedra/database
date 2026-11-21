@@ -1111,3 +1111,74 @@ fn ns08_spare_segments_are_prepared_off_the_commit_path() {
     assert!(files <= j.segments().len() + 1, "{files} files");
     j.crash();
 }
+
+// ---------------------------------------------------------------------------------------
+// G7 (NS11): page cache of zero-filled and retired segments
+
+/// Each zero-filled segment's pages are dropped once its zeros and header are synced,
+/// and a retired segment's pages once it is free again. NS11 measured the 64 MiB zero
+/// fill staying in the page cache charged to every worker (G7).
+#[test]
+fn g7_zero_filled_and_retired_segments_drop_their_pages() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let shared: Arc<dyn Fs> = Arc::new(fs.clone());
+    let sink = Arc::new(Sink::default());
+    let segment_bytes = 16 << 10;
+    let options = JournalOptions {
+        segment_bytes,
+        ..opts()
+    };
+    let dir = Path::new("/db/journal");
+    let (j, _) = Journal::open(shared, dir, options, 0, sink.clone()).unwrap();
+    for i in 0..12u8 {
+        j.submit(sized(&[b'v', i], 2000), Durability::Sync, Box::new(()))
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let calls = fs.calls();
+    let free_files: Vec<_> = calls
+        .iter()
+        .filter(|c| {
+            c.op == FsOp::Open && c.len == 2 && c.path.extension().is_some_and(|e| e == "free")
+        })
+        .map(|c| c.path.clone())
+        .collect();
+    assert!(free_files.len() >= 2, "the journal rolled: {free_files:?}");
+    for path in &free_files {
+        let at = |op: FsOp| {
+            calls
+                .iter()
+                .position(|c| c.op == op && &c.path == path && c.ok)
+        };
+        let synced = at(FsOp::SyncAll).unwrap_or_else(|| panic!("{path:?} synced"));
+        let dropped = at(FsOp::AdviseDontNeed).unwrap_or_else(|| panic!("{path:?} dropped"));
+        assert!(synced < dropped, "{path:?}: pages dropped before the sync");
+        assert_eq!(
+            (calls[dropped].offset, calls[dropped].len),
+            (0, segment_bytes)
+        );
+    }
+    fs.clear_calls();
+    let first = j.segments()[0].segment;
+    j.retire(first).unwrap();
+    let calls = fs.calls();
+    let free = segment::path_of(dir, first, segment::FREE_EXT);
+    let renamed = calls
+        .iter()
+        .position(|c| c.op == FsOp::Rename && c.target.as_deref() == Some(free.as_path()))
+        .expect("retired segment renamed to free");
+    // File calls are logged under the path the file was created at; retiring touches
+    // no other segment.
+    let dropped = calls
+        .iter()
+        .position(|c| c.op == FsOp::AdviseDontNeed)
+        .expect("retired segment pages dropped");
+    assert!(renamed < dropped);
+    assert_eq!(
+        (calls[dropped].offset, calls[dropped].len),
+        (0, segment_bytes)
+    );
+    j.crash();
+}

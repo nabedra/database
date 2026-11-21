@@ -205,6 +205,9 @@ pub(super) fn create_free(
         // A new file: nothing is synced yet, so both copies go in one write.
         file.write_all_at(&header.encode_blocks(), 0)?;
         file.sync_all()?;
+        // The zeros are durable and every later write covers them, so their pages
+        // need not stay cached (and charged to the process) until then (G7).
+        file.advise_dont_need(0, segment_bytes);
         fs.sync_dir(dir)
     })();
     if let Err(error) = result {
@@ -289,6 +292,8 @@ pub(super) fn release(
     }
     let path = path_of(dir, seg.number, FREE_EXT);
     fs.rename(&seg.path, &path).map_err(io)?;
+    // Nothing reads a free segment's records again (G7).
+    seg.file.advise_dont_need(0, file_len);
     Ok(Some(FreeSeg {
         path,
         file: seg.file,
