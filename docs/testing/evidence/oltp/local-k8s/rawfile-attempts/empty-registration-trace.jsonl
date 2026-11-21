@@ -1,0 +1,21 @@
+{"check": "host", "context": "desktop-linux", "csi": "openebs-rawfile", "docker": "28.3.3", "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw", "elapsed_seconds": 0.279, "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64", "kind": "kind v0.33.0 go1.27.0 darwin/amd64", "scenario": "preflight", "server_sha256": null, "server_source": "20c102659f058c6a512cb1b924087032ea07a44d", "source": "cbf821720f4c3a3fe06a59c5c4e754767453c55a", "test_executable_sha256": null}
+{"check": "docker-lane", "elapsed_seconds": 1110.621, "status": "acquired"}
+{"check": "kind-create", "cluster": "nabedra-live3-cbd387fa", "elapsed_seconds": 1110.641, "node_image": "mirror.gcr.io/kindest/node:v1.34.11"}
+{"check": "vm-memory", "elapsed_seconds": 1128.364, "total_bytes": 8220102656, "used_bytes": 994336768}
+{"check": "vm-memory", "elapsed_seconds": 1135.281, "total_bytes": 8220102656, "used_bytes": 1116270592}
+{"check": "vm-memory", "elapsed_seconds": 1142.023, "total_bytes": 8220102656, "used_bytes": 1451356160}
+{"check": "vm-memory", "elapsed_seconds": 1149.263, "total_bytes": 8220102656, "used_bytes": 1494827008}
+{"check": "vm-memory", "elapsed_seconds": 1156.187, "total_bytes": 8220102656, "used_bytes": 1676111872}
+{"check": "vm-memory", "elapsed_seconds": 1164.13, "total_bytes": 8220102656, "used_bytes": 1797955584}
+{"check": "vm-memory", "elapsed_seconds": 1172.064, "total_bytes": 8220102656, "used_bytes": 1919123456}
+{"check": "vm-memory", "elapsed_seconds": 1179.813, "total_bytes": 8220102656, "used_bytes": 1995067392}
+{"check": "vm-memory", "elapsed_seconds": 1188.521, "total_bytes": 8220102656, "used_bytes": 2021285888}
+{"check": "vm-memory", "elapsed_seconds": 1201.036, "total_bytes": 8220102656, "used_bytes": 2045095936}
+{"check": "vm-memory", "elapsed_seconds": 1209.37, "total_bytes": 8220102656, "used_bytes": 2062233600}
+{"check": "vm-memory", "elapsed_seconds": 1217.463, "total_bytes": 8220102656, "used_bytes": 2079842304}
+{"check": "vm-memory", "elapsed_seconds": 1225.001, "total_bytes": 8220102656, "used_bytes": 2097266688}
+{"check": "vm-memory", "elapsed_seconds": 1233.294, "total_bytes": 8220102656, "used_bytes": 2114359296}
+{"check": "session-failed", "elapsed_seconds": 1263.067, "message": "'NoneType' object is not iterable", "type": "TypeError"}
+{"check": "vm-memory", "elapsed_seconds": 1263.167, "total_bytes": 8220102656, "used_bytes": 2138071040}
+{"check": "kind-delete", "elapsed_seconds": 1275.348, "kind_exit": 0, "peak_vm_used_bytes": 2138071040, "remaining_nodes": [], "status": "passed"}
+{"check": "docker-lane", "elapsed_seconds": 1275.355, "status": "released"}

@@ -1,0 +1,24 @@
+NAMESPACE            NAME                                                           READY   STATUS    RESTARTS        AGE     IP           NODE                                   NOMINATED NODE   READINESS GATES
+default              live3-rawfile-rawfile-localpv-controller-7f564f8b9b-plnwv      2/2     Running   0               3m30s   10.244.0.5   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+default              live3-rawfile-rawfile-localpv-node-f5np6                       3/3     Running   1 (2m59s ago)   3m30s   10.244.3.2   nabedra-live3-88b7fc08-worker          <none>           <none>
+default              live3-rawfile-rawfile-localpv-node-hlt7r                       3/3     Running   1 (2m59s ago)   3m30s   10.244.1.2   nabedra-live3-88b7fc08-worker2         <none>           <none>
+default              live3-rawfile-rawfile-localpv-node-qgczx                       3/3     Running   1 (2m59s ago)   3m30s   10.244.2.2   nabedra-live3-88b7fc08-worker3         <none>           <none>
+kube-system          coredns-66bc5c9577-86t9t                                       1/1     Running   0               5m8s    10.244.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          coredns-66bc5c9577-c2lff                                       1/1     Running   0               5m8s    10.244.0.2   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          etcd-nabedra-live3-88b7fc08-control-plane                      1/1     Running   0               5m15s   172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          kindnet-2srpt                                                  1/1     Running   0               5m5s    172.19.0.3   nabedra-live3-88b7fc08-worker3         <none>           <none>
+kube-system          kindnet-9thzw                                                  1/1     Running   0               5m5s    172.19.0.2   nabedra-live3-88b7fc08-worker2         <none>           <none>
+kube-system          kindnet-vq76n                                                  1/1     Running   0               5m5s    172.19.0.5   nabedra-live3-88b7fc08-worker          <none>           <none>
+kube-system          kindnet-wrjvr                                                  1/1     Running   0               5m9s    172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          kube-apiserver-nabedra-live3-88b7fc08-control-plane            1/1     Running   0               5m15s   172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          kube-controller-manager-nabedra-live3-88b7fc08-control-plane   1/1     Running   0               5m15s   172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          kube-proxy-62f4v                                               1/1     Running   0               5m5s    172.19.0.2   nabedra-live3-88b7fc08-worker2         <none>           <none>
+kube-system          kube-proxy-89kkn                                               1/1     Running   0               5m5s    172.19.0.5   nabedra-live3-88b7fc08-worker          <none>           <none>
+kube-system          kube-proxy-8mbqc                                               1/1     Running   0               5m9s    172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+kube-system          kube-proxy-r7pw8                                               1/1     Running   0               5m5s    172.19.0.3   nabedra-live3-88b7fc08-worker3         <none>           <none>
+kube-system          kube-scheduler-nabedra-live3-88b7fc08-control-plane            1/1     Running   0               5m15s   172.19.0.4   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+live3                api                                                            1/1     Running   0               84s     10.244.0.6   nabedra-live3-88b7fc08-control-plane   <none>           <none>
+live3                w1-0                                                           1/1     Running   0               103s    10.244.3.3   nabedra-live3-88b7fc08-worker          <none>           <none>
+live3                w2-0                                                           1/1     Running   0               102s    10.244.1.3   nabedra-live3-88b7fc08-worker2         <none>           <none>
+live3                w3-0                                                           1/1     Running   0               53s     10.244.2.4   nabedra-live3-88b7fc08-worker3         <none>           <none>
+local-path-storage   local-path-provisioner-57f858859-n5cbn                         1/1     Running   0               5m8s    10.244.0.3   nabedra-live3-88b7fc08-control-plane   <none>           <none>

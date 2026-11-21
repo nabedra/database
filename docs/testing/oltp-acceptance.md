@@ -30,6 +30,12 @@ Scenario library tests end in `acceptance_oNN` and use `#[ignore = "run through 
 
 `NABEDRA_OLTP_BINARY` names the copied actual server. `--olap-binary` supplies `NABEDRA_OLAP_BINARY` for parity; `--provider-config` supplies an explicit provider test configuration. Real cloud scenarios require actual configured access and approved bounded resources. Modeled provider evidence does not replace them. Unavailable external checks stay `not-run` while local implementation and integration continue.
 
+LIVE3 runs the local Kubernetes clauses of O17, O18 and O27 with
+`scripts/local-kind/acceptance.py`. Execute it separately from this runner
+and keep its results under [local kind evidence](evidence/oltp/local-k8s/README.md).
+The local cluster has its own assertion results. Full O18 and O27 remain
+`not-run` in this runner until their required real-provider clauses execute.
+
 The runner owns the clause IDs, derived from the contract table. Use `--list` to look them up. After executing a clause's required variations, the scenario test emits one line in this format.
 
 ```text

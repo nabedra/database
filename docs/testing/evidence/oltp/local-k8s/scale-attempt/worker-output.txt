@@ -1,0 +1,2 @@
+nabedra-db: data worker StorageUnavailable: registered pool mount, device or exclusive ownership does not match inventory
+nabedra-db: data worker failed

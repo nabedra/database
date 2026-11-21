@@ -1,0 +1,18 @@
+Processing /wheels/hiredis-3.2.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+Installing collected packages: hiredis
+Successfully installed hiredis-3.2.1
+stock--tls--65536b--get-hit--budget1--rate650--pair0--nabedra 649.0 correct ops/s p50=2825879ns p99=111060129ns {'ok': 10000}
+stock--tls--65536b--get-hit--budget1--rate650--pair0--valkey 649.6 correct ops/s p50=2927568ns p99=165558397ns {'ok': 10000}
+stock--tls--65536b--get-hit--budget1--rate650--pair1--nabedra 648.5 correct ops/s p50=2541359ns p99=72931445ns {'ok': 10000}
+stock--tls--65536b--get-hit--budget1--rate650--pair1--valkey 648.4 correct ops/s p50=2919748ns p99=142125237ns {'ok': 10000}
+stock--tls--65536b--get-hit--budget1--rate650--pair2--nabedra 646.2 correct ops/s p50=2828769ns p99=337307215ns {'ok': 10000}
+stock--tls--65536b--get-hit--budget1--rate650--pair2--valkey 649.8 correct ops/s p50=2596044ns p99=65541156ns {'ok': 10000}
+stock stock--tls--65536b--get-hit--budget1 650=miss; throughput=[]
+stock--tls--65536b--set-px--budget1--rate650--pair0--nabedra 649.8 correct ops/s p50=2377727ns p99=97736842ns {'ok': 10000}
+stock--tls--65536b--set-px--budget1--rate650--pair0--valkey 649.4 correct ops/s p50=2368790ns p99=106136692ns {'ok': 10000}
+stock--tls--65536b--set-px--budget1--rate650--pair1--nabedra 648.6 correct ops/s p50=2170038ns p99=24459799ns {'ok': 10000}
+stock--tls--65536b--set-px--budget1--rate650--pair1--valkey 649.2 correct ops/s p50=2228625ns p99=30151855ns {'ok': 10000}
+stock--tls--65536b--set-px--budget1--rate650--pair2--nabedra 649.9 correct ops/s p50=2179855ns p99=105872269ns {'ok': 10000}
+stock--tls--65536b--set-px--budget1--rate650--pair2--valkey 648.3 correct ops/s p50=2299252ns p99=49580518ns {'ok': 10000}
+stock stock--tls--65536b--set-px--budget1 650=miss; throughput=[]
+K04a=not-run-on-ec2 /result/pair/summary.json

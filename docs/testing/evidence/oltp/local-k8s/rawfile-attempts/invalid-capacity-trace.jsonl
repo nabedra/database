@@ -1,0 +1,31 @@
+{"check": "host", "context": "desktop-linux", "csi": "openebs-rawfile", "docker": "28.3.3", "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw", "elapsed_seconds": 0.942, "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64", "kind": "kind v0.33.0 go1.27.0 darwin/amd64", "scenario": "storage", "server_sha256": "7cbe66ae9817d27906024a7d9833d35c33d12024aee6a96dffb78ea7397e7880", "server_source": "20c102659f058c6a512cb1b924087032ea07a44d", "source": "8c47f78926e7763c553fd7e7d0b706ce7e4ee664", "test_executable_sha256": null}
+{"check": "docker-lane", "elapsed_seconds": 121.017, "status": "acquired"}
+{"check": "kind-create", "cluster": "nabedra-live3-0ce2e762", "elapsed_seconds": 121.063, "node_image": "mirror.gcr.io/kindest/node:v1.34.11"}
+{"check": "vm-memory", "elapsed_seconds": 196.843, "total_bytes": 8220102656, "used_bytes": 966201344}
+{"check": "vm-memory", "elapsed_seconds": 204.17, "total_bytes": 8220102656, "used_bytes": 1121570816}
+{"check": "vm-memory", "elapsed_seconds": 211.755, "total_bytes": 8220102656, "used_bytes": 1142034432}
+{"check": "vm-memory", "elapsed_seconds": 221.372, "total_bytes": 8220102656, "used_bytes": 1234108416}
+{"check": "vm-memory", "elapsed_seconds": 228.648, "total_bytes": 8220102656, "used_bytes": 1267441664}
+{"check": "vm-memory", "elapsed_seconds": 235.818, "total_bytes": 8220102656, "used_bytes": 1420079104}
+{"check": "vm-memory", "elapsed_seconds": 242.894, "total_bytes": 8220102656, "used_bytes": 1490440192}
+{"check": "vm-memory", "elapsed_seconds": 252.039, "total_bytes": 8220102656, "used_bytes": 1566105600}
+{"check": "vm-memory", "elapsed_seconds": 260.211, "total_bytes": 8220102656, "used_bytes": 1625477120}
+{"check": "vm-memory", "elapsed_seconds": 271.002, "total_bytes": 8220102656, "used_bytes": 1770131456}
+{"check": "vm-memory", "elapsed_seconds": 281.854, "total_bytes": 8220102656, "used_bytes": 1840320512}
+{"check": "vm-memory", "elapsed_seconds": 290.849, "total_bytes": 8220102656, "used_bytes": 1902788608}
+{"check": "vm-memory", "elapsed_seconds": 300.915, "total_bytes": 8220102656, "used_bytes": 1950699520}
+{"check": "vm-memory", "elapsed_seconds": 311.706, "total_bytes": 8220102656, "used_bytes": 2064011264}
+{"check": "vm-memory", "elapsed_seconds": 321.012, "total_bytes": 8220102656, "used_bytes": 2164903936}
+{"check": "vm-memory", "elapsed_seconds": 356.549, "total_bytes": 8220102656, "used_bytes": 2261565440}
+{"check": "vm-memory", "elapsed_seconds": 365.918, "total_bytes": 8220102656, "used_bytes": 2281029632}
+{"check": "vm-memory", "elapsed_seconds": 383.804, "total_bytes": 8220102656, "used_bytes": 2283425792}
+{"check": "vm-memory", "elapsed_seconds": 399.411, "total_bytes": 8220102656, "used_bytes": 2295099392}
+{"check": "vm-memory", "elapsed_seconds": 666.767, "total_bytes": 8220102656, "used_bytes": 2358435840}
+{"check": "vm-memory", "elapsed_seconds": 686.688, "total_bytes": 8220102656, "used_bytes": 2384060416}
+{"check": "vm-memory", "elapsed_seconds": 711.936, "total_bytes": 8220102656, "used_bytes": 2394120192}
+{"check": "vm-memory", "elapsed_seconds": 720.611, "total_bytes": 8220102656, "used_bytes": 2468917248}
+{"check": "vm-memory", "elapsed_seconds": 751.006, "total_bytes": 8220102656, "used_bytes": 2490347520}
+{"check": "vm-memory", "elapsed_seconds": 761.897, "total_bytes": 8220102656, "used_bytes": 2634264576}
+{"check": "session-failed", "elapsed_seconds": 997.615, "message": "('kubectl', '--kubeconfig', '/var/folders/y7/8q3dh_z95ls92c5x7j6ygh500000gn/T/nabedra-live3-dyh8woyy/kubeconfig', '--request-timeout=20s', '-n', 'live3', 'wait', 'pod/w1-0', '--for=condition=Ready', '--timeout=145s') exited 1\nerror: timed out waiting for the condition on pods/w1-0\n", "type": "RuntimeError"}
+{"check": "kind-delete", "elapsed_seconds": 1024.625, "kind_exit": 0, "peak_vm_used_bytes": 2634264576, "remaining_nodes": [], "status": "passed"}
+{"check": "docker-lane", "elapsed_seconds": 1024.868, "status": "released"}
