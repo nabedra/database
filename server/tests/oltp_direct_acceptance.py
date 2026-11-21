@@ -558,6 +558,10 @@ def d11_index(url, token, ca, admin, stats):
            not_applied_errors=len(errors), index_state=state, status_retried=retried[:8],
            status_retries=len(retried),
            direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
+           # GC2: DirectBatch entries (`data.direct.batch` enabled by the processes
+           # themselves) and the commits they carried.
+           direct_batch_entries=direct(after, 'batch_entries') - direct(before, 'batch_entries'),
+           direct_batched_commits=direct(after, 'batched_commits') - direct(before, 'batched_commits'),
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
            plan_uses_index=True, plan_sample=plans[0][:300])
 
