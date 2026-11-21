@@ -1377,6 +1377,9 @@ async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_increment
         )
         .await
         .expect("a full backup runs while direct commits are active");
+    // Model the interval before this worker's watcher updates the archive
+    // gate. Control has already activated the capability.
+    source.set_direct_commits_active(false);
     let refused = source
         .backup_native(
             &path.join("incremental"),
@@ -1389,4 +1392,6 @@ async fn o02_o19_t7_a_lone_worker_activates_data_direct_v1_and_refuses_increment
         .await
         .expect_err("incremental backups are refused once active");
     assert_eq!(refused.code, ErrorCode::UnsupportedOperation);
+    assert!(refused.message.contains("take a full backup"), "{refused:?}");
+    assert!(!path.join("incremental").exists());
 }
