@@ -186,6 +186,12 @@ pub struct StoreStats {
     pub stall_ms: u64,
     pub memtable_bytes: u64,
     pub l0_runs: u32,
+    /// Most L0 runs seen since open (PERF1).
+    pub l0_runs_peak: u32,
+    /// Nonzero delays [`Store::write_delay`] returned (L0 at `l0_slowdown_writes`),
+    /// and their sum in microseconds (PERF1).
+    pub write_delays: u64,
+    pub write_delay_us: u64,
     pub recovery_ms: u64,
     pub corruption_detected: u64,
     pub tail_truncations: u64,
@@ -262,6 +268,9 @@ struct Counters {
     relocated_bytes: AtomicU64,
     recycled_reads: AtomicU64,
     journal_behind: AtomicU64,
+    write_delays: AtomicU64,
+    write_delay_us: AtomicU64,
+    l0_runs_peak: AtomicUsize,
 }
 
 type DamageHook = Arc<dyn Fn(Damage) + Send + Sync>;
@@ -1268,8 +1277,19 @@ impl Inner {
         if delay < 1_000_000 {
             Duration::ZERO
         } else {
+            self.counters.write_delays.fetch_add(1, Ordering::Relaxed);
+            self.counters
+                .write_delay_us
+                .fetch_add(delay / 1_000, Ordering::Relaxed);
             Duration::from_nanos(delay)
         }
+    }
+
+    fn set_l0_runs(&self, runs: usize) {
+        self.l0_runs.store(runs, Ordering::Relaxed);
+        self.counters
+            .l0_runs_peak
+            .fetch_max(runs, Ordering::Relaxed);
     }
 
     // ----- flush -----
@@ -1391,7 +1411,7 @@ impl Inner {
         }
         let version = Arc::new(vs.current.with_changes(&[], added));
         vs.current = version.clone();
-        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
+        self.set_l0_runs(version.l0_count());
         {
             let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
             let imm_list = sv
@@ -1719,7 +1739,7 @@ impl Inner {
 
     fn install_version(&self, vs: &mut VersionSet, version: Arc<Version>) {
         vs.current = version.clone();
-        self.l0_runs.store(version.l0_count(), Ordering::Relaxed);
+        self.set_l0_runs(version.l0_count());
         let mut sv = self.sv.write().unwrap_or_else(PoisonError::into_inner);
         let (mem, imm) = (sv.mem.clone(), sv.imm.clone());
         self.publish_sv(&mut sv, SuperVersion { mem, imm, version });
@@ -1935,6 +1955,13 @@ impl Inner {
                 .map(|m| m.mem.approximate_memory() as u64)
                 .sum(),
             l0_runs: sv.version.l0_count() as u32,
+            l0_runs_peak: self
+                .counters
+                .l0_runs_peak
+                .load(Ordering::Relaxed)
+                .max(sv.version.l0_count()) as u32,
+            write_delays: self.counters.write_delays.load(Ordering::Relaxed),
+            write_delay_us: self.counters.write_delay_us.load(Ordering::Relaxed),
             recovery_ms: self.recovery_ms.load(Ordering::Relaxed),
             corruption_detected: self.run_stats.corruption_detected()
                 + journal.value_corruptions

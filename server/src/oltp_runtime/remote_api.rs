@@ -75,6 +75,7 @@ pub(crate) struct RemoteRuntime {
     gateway: Arc<super::application::direct::DirectGateway>,
     scope: QueueScope,
     ingress: Executor,
+    direct_ingress: Executor,
     accepting: AtomicBool,
     stop: watch::Sender<bool>,
     tasks: Mutex<Option<(JoinHandle<Result<(), ProtocolError>>, JoinHandle<()>)>>,
@@ -256,6 +257,7 @@ impl RemoteRuntime {
             gateway,
             scope,
             ingress: Executor::new(2, 16)?,
+            direct_ingress: Executor::new(super::http_runtime::DIRECT_INGRESS_SLOTS, 0)?,
             accepting: AtomicBool::new(true),
             stop,
             tasks: Mutex::new(Some((task, refresh))),
@@ -276,9 +278,11 @@ impl RemoteRuntime {
     pub(crate) fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Release);
         self.ingress.stop_accepting();
+        self.direct_ingress.stop_accepting();
     }
     pub(crate) async fn drain(&self) -> Result<(), ProtocolError> {
         self.stop_accepting();
+        self.direct_ingress.drain().await;
         self.ingress.drain().await;
         self.direct.stop().await;
         let _ = self.stop.send(true);
@@ -349,6 +353,9 @@ impl Drop for RemoteRuntime {
 impl HttpRuntime for RemoteRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
+    }
+    fn direct_ingress(&self) -> &Executor {
+        &self.direct_ingress
     }
     fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
         Some(self.gateway.clone())

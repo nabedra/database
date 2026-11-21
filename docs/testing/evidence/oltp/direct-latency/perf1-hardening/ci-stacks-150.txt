@@ -1,0 +1,82 @@
+api: 1269 samples, 0.051 CPU, 0.34 ms per update
+  tokio scheduling (kernel)         23.4%   0.079 ms/update
+  http                              20.3%   0.069 ms/update
+  tokio scheduling                  15.3%   0.052 ms/update
+  gateway rpc / transport           10.0%   0.034 ms/update
+  kernel (other)                     8.1%   0.027 ms/update
+  json                               5.5%   0.019 ms/update
+  tls                                5.0%   0.017 ms/update
+  other                              3.3%   0.011 ms/update
+  routing/topology                   2.7%   0.009 ms/update
+  allocator (kernel)                 2.4%   0.008 ms/update
+  native executor hops               2.0%   0.007 ms/update
+  tls (kernel)                       1.1%   0.004 ms/update
+  leader execution                   0.6%   0.002 ms/update
+  http (kernel)                      0.2%   0.001 ms/update
+  json (kernel)                      0.2%   0.001 ms/update
+w1: 9759 samples, 0.391 CPU, 2.61 ms per update
+  tokio scheduling (kernel)         18.2%   0.475 ms/update
+  tokio scheduling                  14.8%   0.385 ms/update
+  raft                               9.8%   0.257 ms/update
+  storage (nabedra-kv)               8.4%   0.218 ms/update
+  json                               6.2%   0.162 ms/update
+  native executor hops               6.1%   0.160 ms/update
+  allocator (kernel)                 6.1%   0.159 ms/update
+  gateway rpc / transport            5.9%   0.153 ms/update
+  other                              5.7%   0.147 ms/update
+  leader execution                   4.9%   0.128 ms/update
+  kernel (other)                     4.5%   0.117 ms/update
+  native executor hops (kernel)      3.3%   0.085 ms/update
+  storage (nabedra-kv) (kernel)      3.2%   0.085 ms/update
+  tls                                2.1%   0.055 ms/update
+  tls (kernel)                       0.4%   0.010 ms/update
+  gateway rpc / transport (kernel)   0.1%   0.004 ms/update
+  raft (kernel)                      0.1%   0.004 ms/update
+  json (kernel)                      0.1%   0.001 ms/update
+  routing/topology                   0.1%   0.001 ms/update
+  allocator                          0.0%   0.001 ms/update
+  leader execution (kernel)          0.0%   0.001 ms/update
+w2: 6736 samples, 0.270 CPU, 1.80 ms per update
+  tokio scheduling (kernel)         20.1%   0.361 ms/update
+  tokio scheduling                  13.2%   0.238 ms/update
+  raft                              10.0%   0.180 ms/update
+  storage (nabedra-kv)               8.8%   0.158 ms/update
+  allocator (kernel)                 6.7%   0.121 ms/update
+  json                               6.4%   0.115 ms/update
+  gateway rpc / transport            5.9%   0.106 ms/update
+  native executor hops               5.8%   0.104 ms/update
+  other                              4.9%   0.088 ms/update
+  kernel (other)                     4.1%   0.074 ms/update
+  storage (nabedra-kv) (kernel)      4.1%   0.074 ms/update
+  leader execution                   3.9%   0.070 ms/update
+  native executor hops (kernel)      3.6%   0.065 ms/update
+  tls                                1.8%   0.031 ms/update
+  tls (kernel)                       0.2%   0.004 ms/update
+  raft (kernel)                      0.2%   0.003 ms/update
+  gateway rpc / transport (kernel)   0.1%   0.002 ms/update
+  json (kernel)                      0.1%   0.001 ms/update
+  allocator                          0.1%   0.001 ms/update
+  leader execution (kernel)          0.1%   0.001 ms/update
+  routing/topology                   0.0%   0.001 ms/update
+w3: 5820 samples, 0.233 CPU, 1.55 ms per update
+  tokio scheduling (kernel)         19.1%   0.297 ms/update
+  tokio scheduling                  13.3%   0.206 ms/update
+  raft                              10.0%   0.155 ms/update
+  storage (nabedra-kv)               9.8%   0.152 ms/update
+  json                               6.8%   0.105 ms/update
+  allocator (kernel)                 6.3%   0.098 ms/update
+  native executor hops               5.9%   0.091 ms/update
+  storage (nabedra-kv) (kernel)      4.7%   0.073 ms/update
+  other                              4.6%   0.072 ms/update
+  gateway rpc / transport            4.5%   0.070 ms/update
+  native executor hops (kernel)      4.3%   0.067 ms/update
+  leader execution                   4.2%   0.065 ms/update
+  kernel (other)                     3.9%   0.061 ms/update
+  tls                                1.8%   0.027 ms/update
+  tls (kernel)                       0.3%   0.005 ms/update
+  raft (kernel)                      0.2%   0.003 ms/update
+  routing/topology                   0.2%   0.002 ms/update
+  gateway rpc / transport (kernel)   0.1%   0.002 ms/update
+  leader execution (kernel)          0.1%   0.001 ms/update
+  json (kernel)                      0.0%   0.001 ms/update
+  allocator                          0.0%   0.000 ms/update

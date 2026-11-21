@@ -540,7 +540,12 @@ def d11_index(url, token, ca, admin, stats):
         for future in futures:
             future.result()
     after = stats()
-    rows = table.query().collect()
+    # One `query.collect` returns at most 10,000 rows. Read every key in id ranges below that,
+    # since the writers' row count depends on how fast the direct path is (PERF1 removed the
+    # API's two-worker gate, and run 44895705548 then wrote more rows than one collect returns).
+    rows = []
+    for low in range(0, counter[0], 5000):
+        rows += table.where((col('id') >= low) & (col('id') < low + 5000)).collect()
     assert all(error[1]['error']['outcome'] == 'not_applied' for error in errors), errors[:5]
     expected = {}
     for item in rows:

@@ -1,0 +1,9 @@
+soak100-before-api0.35 rc=0 seconds=335 load=0.44 0.72 0.41
+soak100-after-api0.35 rc=0 seconds=331 load=0.58 1.00 0.69
+soak100-before-apinone rc=0 seconds=330 load=1.07 1.16 0.87
+soak100-after-apinone rc=0 seconds=332 load=0.46 1.05 0.96
+soak100-after-apinone-hold rc=0 seconds=323 load=1.32 1.21 1.06
+soak50-before-api0.35 rc=0 seconds=330 load=1.37 1.13 1.07
+soak50-after-api0.35 rc=0 seconds=330 load=0.12 0.66 0.91
+soak50-after-apinone rc=0 seconds=330 load=0.24 0.60 0.83
+soak50-after-apinone-hold rc=0 seconds=325 load=0.58 0.47 0.70

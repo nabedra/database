@@ -18,7 +18,7 @@ pub use transport::{
     WorkerClient, WorkerTransport,
 };
 pub(crate) use transport::{
-    PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
+    OutgoingReservation, PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
 };
 
 pub const MAX_SECTIONS: usize = 3;

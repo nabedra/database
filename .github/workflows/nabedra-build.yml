@@ -828,7 +828,8 @@ jobs:
   # PERF1: CPU profile of the RF3 direct path. Opt-in with [ci perf]: builds a release binary with
   # frame pointers (for perf call graphs; the bench job's binary stays the comparison build), runs
   # the benchmark driver on this runner with the NS11 caps, records per-stage timings from
-  # /v1/runtime/stats and samples every worker with perf at idle (serial pair) and at 50 updates/s.
+  # /v1/runtime/stats and samples every worker and the API with perf at idle (serial pair), at 50 and at
+  # 150 updates/s.
   perf:
     name: direct path CPU profile and stage timings (PERF1)
     if: contains(github.event.head_commit.message, '[ci perf]')
@@ -866,6 +867,15 @@ jobs:
           python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/rate50" --rates 50 --seconds 60 --warmup-seconds 5 --repetitions 1 \
             --clients 32 --rows 5000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
+      # PERF1 (hardening): per-update CPU at the API (perf now samples it too) and the leader at 150/s,
+      # above the old two-worker API admission ceiling.
+      - name: 150 updates/s with perf
+        run: |
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/rate150" --rates 150 --seconds 60 --warmup-seconds 5 --repetitions 1 \
+            --clients 32 --rows 10000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
       - if: always()
         uses: actions/upload-artifact@v4
@@ -909,4 +919,104 @@ jobs:
         with:
           name: gc1-measure
           path: gc1-measure.log
+
+  # PERF1 (hardening): factor A/B on runners, relative numbers only (the controlled host gives the
+  # headline numbers). Opt-in with [ci perf1]. `perf1-bin` builds this commit's release server;
+  # the before binary is BENCH2's 5eb80fb artifact (run 44878990620), whose product code equals
+  # 7e110cb. One variable at a time, same driver, data, rates and NS11 caps unless stated.
+  perf1-bin:
+    name: PERF1 factor binary
+    if: contains(github.event.head_commit.message, '[ci perf1]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rust:1.94.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          mkdir -p ../perf1-bin && cp target/release/nabedra-db ../perf1-bin/nabedra-db-after
+          sha256sum ../perf1-bin/nabedra-db-after
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf1-after-binary
+          path: perf1-bin
+          retention-days: 7
+
+  perf1-factors:
+    name: PERF1 factors (${{ matrix.factor }})
+    needs: perf1-bin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 170
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        factor: [api, compaction]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: perf1-after-binary
+          path: perf1-bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-binary
+          path: perf1-before
+          run-id: 44878990620
+          github-token: ${{ github.token }}
+      - name: Binaries and image
+        run: |
+          mv perf1-before/nabedra-db-5eb80fb perf1-bin/nabedra-db-before
+          chmod +x perf1-bin/*
+          sha256sum perf1-bin/*
+          printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+          nproc; free -m; df -h .
+      - name: Runs
+        run: |
+          cd scripts
+          OUT="$GITHUB_WORKSPACE/perf1-out"; mkdir -p "$OUT"
+          run() {  # run <name> <before|after> <api-cpus> <args...>
+            local name=$1 binary=$2 api=$3; shift 3
+            local rc=0 start=$(date +%s)
+            python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf1-bin/nabedra-db-$binary" \
+              --direct-oltp on --api-cpus "$api" --seed 20261118 --timeout 10 --output "$OUT/$name" "$@" \
+              > "$OUT/$name.console.log" 2>&1 || rc=$?
+            echo "$name rc=$rc seconds=$(( $(date +%s) - start )) load=$(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$OUT/runs.txt"
+          }
+          FAC="--rates 100,200,400 --seconds 5 --warmup-seconds 3 --repetitions 3 --clients 32 --rows 5000"
+          SOAK="--soak --soak-rows 80000 --soak-payload-bytes 2048 --soak-seconds 300 --soak-phase-seconds 60 --clients 32 --soak-verify-keys 500"
+          if [ "${{ matrix.factor }}" = api ]; then
+            for api in 0.35 none 0.7 1.0; do
+              for b in before after; do run "fac-$b-api$api" $b $api $FAC; done
+            done
+          else
+            run soak100-before-api0.35 before 0.35 $SOAK --soak-rate 100
+            run soak100-after-api0.35 after 0.35 $SOAK --soak-rate 100
+            run soak100-before-apinone before none $SOAK --soak-rate 100
+            run soak100-after-apinone after none $SOAK --soak-rate 100
+            run soak100-after-apinone-hold after none $SOAK --soak-rate 100 --hold-compaction
+            run soak50-before-api0.35 before 0.35 $SOAK --soak-rate 50
+            run soak50-after-api0.35 after 0.35 $SOAK --soak-rate 50
+            run soak50-after-apinone after none $SOAK --soak-rate 50
+            run soak50-after-apinone-hold after none $SOAK --soak-rate 50 --hold-compaction
+          fi
+      - name: Summary
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/perf1-out"
+          cat "$OUT/runs.txt" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/perf1-hardening/analyze.py "$OUT"/*/ --json "$OUT/summary.json" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf1-factors-${{ matrix.factor }}
+          path: perf1-out
           retention-days: 14

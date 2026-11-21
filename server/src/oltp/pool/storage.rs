@@ -114,6 +114,11 @@ pub struct StorageStats {
     pub stall_ms: u64,
     pub memtable_bytes: u64,
     pub l0_runs: u32,
+    /// The largest per-store L0 peak since open (PERF1).
+    pub l0_runs_peak: u32,
+    /// `Store::write_delay` pacing at the L0 slowdown point (PERF1).
+    pub write_delays: u64,
+    pub write_delay_us: u64,
     pub recovery_ms: u64,
     pub corruption_detected: u64,
     pub tail_truncations: u64,
@@ -141,6 +146,9 @@ impl StorageStats {
         self.stall_ms += stats.stall_ms;
         self.memtable_bytes += stats.memtable_bytes;
         self.l0_runs += stats.l0_runs;
+        self.l0_runs_peak = self.l0_runs_peak.max(stats.l0_runs_peak);
+        self.write_delays += stats.write_delays;
+        self.write_delay_us += stats.write_delay_us;
         self.recovery_ms = self.recovery_ms.max(stats.recovery_ms);
         self.corruption_detected += stats.corruption_detected;
         self.tail_truncations += stats.tail_truncations;
@@ -187,7 +195,30 @@ pub(super) fn store_options(
     options.scope_of = scope_of;
     options.memtable_bytes = (write_buffer_bytes / 2).max(1 << 20);
     options.max_replay_bytes = (write_buffer_bytes as u64).max(4 << 20);
+    if hold_compaction() {
+        hold_compaction_levels(&mut options.levels);
+    }
     options
+}
+
+/// Benchmark only (PERF1): `NABEDRA_BENCH_HOLD_COMPACTION=1` holds compaction off,
+/// so a soak can measure what compaction costs foreground writes. L0 then grows
+/// without bound and point reads slow down; never set it in production.
+const HOLD_COMPACTION_ENV: &str = "NABEDRA_BENCH_HOLD_COMPACTION";
+fn hold_compaction() -> bool {
+    let hold = std::env::var_os(HOLD_COMPACTION_ENV).is_some_and(|value| value == "1");
+    if hold {
+        tracing::warn!("{HOLD_COMPACTION_ENV}=1: compaction is held off (benchmark only)");
+    }
+    hold
+}
+/// Raises every L0 trigger out of reach: no L0 compaction (so no deeper level
+/// fills either), no write delay and no L0 stop. Flushes, the journal and its
+/// fsyncs are unchanged.
+fn hold_compaction_levels(levels: &mut nabedra_kv::LevelOptions) {
+    levels.l0_compaction_trigger = 1 << 20;
+    levels.l0_slowdown_writes = 1 << 20;
+    levels.l0_stop_writes = 1 << 20;
 }
 
 /// Maps an engine error onto the pool's protocol errors.

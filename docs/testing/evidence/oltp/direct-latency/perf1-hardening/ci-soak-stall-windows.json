@@ -1,0 +1,248 @@
+{
+ "soak100-before-api0.35": [
+  {
+   "start_s": 17.6,
+   "end_s": 17.7,
+   "requests": 2,
+   "max_ms": 2.144064
+  },
+  {
+   "start_s": 43.9,
+   "end_s": 45.3,
+   "requests": 158,
+   "max_ms": 1451.976196
+  },
+  {
+   "start_s": 95.8,
+   "end_s": 98.2,
+   "requests": 242,
+   "max_ms": 2451.252006
+  },
+  {
+   "start_s": 146.6,
+   "end_s": 148.9,
+   "requests": 225,
+   "max_ms": 2287.379179
+  },
+  {
+   "start_s": 199.3,
+   "end_s": 202.2,
+   "requests": 279,
+   "max_ms": 2937.9198
+  },
+  {
+   "start_s": 251.8,
+   "end_s": 254.0,
+   "requests": 214,
+   "max_ms": 2178.976927
+  }
+ ],
+ "soak100-after-api0.35": [
+  {
+   "start_s": 43.9,
+   "end_s": 45.3,
+   "requests": 159,
+   "max_ms": 1412.36731
+  },
+  {
+   "start_s": 95.7,
+   "end_s": 97.6,
+   "requests": 192,
+   "max_ms": 1933.915294
+  },
+  {
+   "start_s": 145.8,
+   "end_s": 148.1,
+   "requests": 227,
+   "max_ms": 2341.943938
+  },
+  {
+   "start_s": 198.3,
+   "end_s": 201.1,
+   "requests": 270,
+   "max_ms": 2728.058977
+  },
+  {
+   "start_s": 250.7,
+   "end_s": 253.0,
+   "requests": 223,
+   "max_ms": 2310.443265
+  }
+ ],
+ "soak100-before-apinone": [
+  {
+   "start_s": 43.9,
+   "end_s": 45.4,
+   "requests": 169,
+   "max_ms": 1568.191027
+  },
+  {
+   "start_s": 95.9,
+   "end_s": 98.0,
+   "requests": 211,
+   "max_ms": 2131.773337
+  },
+  {
+   "start_s": 146.4,
+   "end_s": 148.8,
+   "requests": 240,
+   "max_ms": 2416.845915
+  },
+  {
+   "start_s": 199.2,
+   "end_s": 202.8,
+   "requests": 342,
+   "max_ms": 3562.911998
+  },
+  {
+   "start_s": 252.5,
+   "end_s": 254.7,
+   "requests": 222,
+   "max_ms": 2261.04525
+  }
+ ],
+ "soak100-after-apinone": [
+  {
+   "start_s": 43.9,
+   "end_s": 45.4,
+   "requests": 170,
+   "max_ms": 1560.405064
+  },
+  {
+   "start_s": 95.7,
+   "end_s": 97.8,
+   "requests": 194,
+   "max_ms": 2061.971568
+  },
+  {
+   "start_s": 145.9,
+   "end_s": 147.6,
+   "requests": 162,
+   "max_ms": 1717.512328
+  },
+  {
+   "start_s": 198.0,
+   "end_s": 200.1,
+   "requests": 238,
+   "max_ms": 2150.642416
+  },
+  {
+   "start_s": 249.8,
+   "end_s": 252.5,
+   "requests": 266,
+   "max_ms": 2742.228629
+  }
+ ],
+ "soak100-after-apinone-hold": [
+  {
+   "start_s": 43.9,
+   "end_s": 46.6,
+   "requests": 287,
+   "max_ms": 2789.189607
+  },
+  {
+   "start_s": 97.0,
+   "end_s": 99.3,
+   "requests": 229,
+   "max_ms": 2287.805543
+  },
+  {
+   "start_s": 147.5,
+   "end_s": 149.9,
+   "requests": 246,
+   "max_ms": 2479.985509
+  },
+  {
+   "start_s": 200.1,
+   "end_s": 202.1,
+   "requests": 183,
+   "max_ms": 2035.964093
+  },
+  {
+   "start_s": 251.6,
+   "end_s": 254.9,
+   "requests": 315,
+   "max_ms": 3274.160567
+  }
+ ],
+ "soak50-before-api0.35": [
+  {
+   "start_s": 87.5,
+   "end_s": 89.8,
+   "requests": 112,
+   "max_ms": 2262.974379
+  },
+  {
+   "start_s": 189.3,
+   "end_s": 191.1,
+   "requests": 97,
+   "max_ms": 1874.457394
+  },
+  {
+   "start_s": 290.4,
+   "end_s": 292.8,
+   "requests": 107,
+   "max_ms": 2440.30161
+  }
+ ],
+ "soak50-after-api0.35": [
+  {
+   "start_s": 87.5,
+   "end_s": 89.6,
+   "requests": 108,
+   "max_ms": 2140.165123
+  },
+  {
+   "start_s": 188.9,
+   "end_s": 190.9,
+   "requests": 104,
+   "max_ms": 2019.676627
+  },
+  {
+   "start_s": 289.7,
+   "end_s": 292.0,
+   "requests": 98,
+   "max_ms": 2310.568219
+  }
+ ],
+ "soak50-after-apinone": [
+  {
+   "start_s": 87.5,
+   "end_s": 89.1,
+   "requests": 77,
+   "max_ms": 1619.343347
+  },
+  {
+   "start_s": 188.2,
+   "end_s": 190.0,
+   "requests": 97,
+   "max_ms": 1930.568821
+  },
+  {
+   "start_s": 288.7,
+   "end_s": 290.9,
+   "requests": 89,
+   "max_ms": 2233.811721
+  }
+ ],
+ "soak50-after-apinone-hold": [
+  {
+   "start_s": 87.5,
+   "end_s": 89.2,
+   "requests": 82,
+   "max_ms": 1698.990678
+  },
+  {
+   "start_s": 188.3,
+   "end_s": 190.2,
+   "requests": 97,
+   "max_ms": 1931.094348
+  },
+  {
+   "start_s": 288.9,
+   "end_s": 290.9,
+   "requests": 80,
+   "max_ms": 1966.459261
+  }
+ ]
+}
