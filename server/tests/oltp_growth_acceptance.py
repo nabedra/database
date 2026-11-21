@@ -418,7 +418,7 @@ def add_pool(cluster, worker, label, policy, *, check_identity=False):
     return mount
 
 
-def move(cluster, group, worker, mount):
+def move(cluster, group, worker, mount, *, source_leads=False):
     before = placement(cluster, group)
     identity = worker_identity(cluster, worker)
     source = next(member for member in before['members'] if member['worker_id'] == identity['worker_id'])
@@ -429,14 +429,28 @@ def move(cluster, group, worker, mount):
                    remove_node=source['node_id'], target=target, worker=identity,
                    pool_generation=mount['generation'])
     request = operation('storage.replica.move', payload, move_id)
+    attempts = deque(maxlen=4)
+    if source_leads:
+        (cluster.barrier_dir(worker) / f'move-elect-source-{move_id}').touch()
 
     def advanced():
         status, reply = admin(cluster, worker, request, timeout=75)
         if status in (429, 503, 504):
+            attempts.append((status, reply))
             return None
         return success(status, reply)
 
-    result = wait_for(advanced, 'same-ID replica move', 165)
+    try:
+        result = wait_for(advanced, 'same-ID replica move', 165)
+    except AssertionError as error:
+        try:
+            state = admin(cluster, worker, operation('storage.replica.move.status', {}, move_id),
+                          timeout=5)
+        except TRANSPORT_ERRORS as status_error:
+            state = repr(status_error)
+        raise AssertionError(
+            f'move {move_id} from {source} to {target}: {state}; recent replies: {list(attempts)}'
+        ) from error
     assert result['phase']['state'] == 'retired', result
     after = placement(cluster, group)
     phase = result['phase']
@@ -465,7 +479,9 @@ def drain_and_detach(facade, owner, mount, target):
     assert status == 409 and 'replica' in reply['error']['message'], (status, reply)
     assert admin(cluster, owner, permit)[0] != 200
     assert success(*admin(cluster, owner, operation('storage.pool.drain.status', {}, drain_id)))['phase'] == 'draining'
-    move(cluster, group, owner, target)
+    # The second learner must replay a membership that predates the
+    # colocated source's replica ID. Exercise that source as leader.
+    move(cluster, group, owner, target, source_leads=True)
 
     refusals = deque(maxlen=4)
 

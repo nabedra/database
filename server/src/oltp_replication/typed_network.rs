@@ -637,23 +637,31 @@ where
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow_watched();
         let membership = metrics.membership_config.membership();
-        let member = membership
-            .nodes()
-            .find(|(node, _)| **node == from_node)
-            .map(|(_, member)| member)
-            .or_else(|| {
-                if membership.nodes().next().is_none() {
-                    self.bootstrap.get(&from_node)
-                } else {
-                    None
-                }
-            })
+        let member = raft_sender(membership, &self.bootstrap, from_node)
             .ok_or_else(|| invalid("sender is outside enrolled replica membership"))?;
         if member.worker_id != session.remote().worker_id {
             return Err(invalid("sender node is bound to another physical worker"));
         }
         Ok(())
     }
+}
+
+fn raft_sender<'a>(
+    membership: &'a super::entry::Membership,
+    bootstrap: &'a BTreeMap<u64, ReplicaMember>,
+    sender: u64,
+) -> Option<&'a ReplicaMember> {
+    membership
+        .nodes()
+        .find(|(node, _)| **node == sender)
+        .map(|(_, member)| member)
+        .or_else(|| {
+            if membership.nodes().next().is_none() {
+                bootstrap.get(&sender)
+            } else {
+                None
+            }
+        })
 }
 impl<C, M> Endpoint for ReplicaEndpoint<C, M>
 where

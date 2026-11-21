@@ -27,6 +27,32 @@ mod progress;
 #[path = "../../../tests/oltp_replicated_durability/fixture.rs"]
 mod replicated_durability;
 
+#[test]
+fn o26_learner_accepts_current_leader_while_replaying_historical_membership() {
+    let member = |node_id| ReplicaMember {
+        node_id,
+        worker_id: Uuid::new_v4(),
+        pool_id: Uuid::new_v4(),
+    };
+    let first = member(1);
+    let second = member(2);
+    let third = member(3);
+    let leader = ReplicaMember {
+        worker_id: first.worker_id,
+        ..member(4)
+    };
+    let bootstrap = BTreeMap::from([
+        (2, second.clone()),
+        (3, third.clone()),
+        (4, leader.clone()),
+    ]);
+    let history = crate::oltp_replication::entry::Membership::new(
+        vec![[1, 2, 3].into_iter().collect()],
+        BTreeMap::from([(1, first), (2, second), (3, third)]),
+    );
+    assert_eq!(raft_sender(&history, &bootstrap, 4), Some(&leader));
+}
+
 struct Temporary(PathBuf);
 impl Drop for Temporary {
     fn drop(&mut self) {

@@ -94,6 +94,22 @@ impl ReplicaPlacement {
                     .await?;
                 None
             } else {
+                #[cfg(test)]
+                if crate::oltp_runtime::recovery_tests::elect_move_source(plan.id) {
+                    let group = &plan.request.group;
+                    let node = plan.request.remove_node;
+                    let source = self.factory.manager.hosted_data(group, node)?;
+                    tokio::time::timeout(Duration::from_secs(30), async {
+                        while source.raft.current_leader().await != Some(node)
+                            || source.ensure_linearizable().await.is_err()
+                        {
+                            source.raft.trigger().elect(false).await.unwrap();
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                        }
+                    })
+                    .await
+                    .expect("pool-drain source is the Data leader");
+                }
                 let pool = self
                     .pools
                     .eligible_for_claimed_move(&plan, &self.factory.control)
