@@ -1307,8 +1307,10 @@ async fn o06_o18_failed_settlement_keeps_the_independent_range_warm() {
         gateway.route(&write, true).await.err().unwrap().code,
         ErrorCode::OutcomeUnknown
     );
+    // The left range needed its own fill before settling the write.
+    assert_eq!(source.reads(), (2, 2));
     assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
-    assert_eq!(source.reads(), (1, 2));
+    assert_eq!(source.reads(), (2, 2));
     cluster.shutdown().await;
 }
 
