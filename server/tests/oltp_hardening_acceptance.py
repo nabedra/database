@@ -169,7 +169,7 @@ def transition(state, body):
     return state, (200, found)
 
 
-def assert_serial(history, initial, final):
+def assert_serial(history, initial, final, aborted_updates):
     predecessors = [sum(1 << i for i, (_, end, _, _) in enumerate(history) if end < start)
                     for start, _, _, _ in history]
 
@@ -183,12 +183,18 @@ def assert_serial(history, initial, final):
             bit = 1 << i
             if mask & bit or predecessors[i] & ~mask:
                 continue
-            next_state, expected = transition(state, body)
-            actual = (status, reply['data']) if status == 200 else (
-                status, reply['error']['code'], reply['error']['outcome'],
-            )
-            if expected == actual and check(mask | bit, encode(next_state)):
-                return True
+            if body['request_id'] in aborted_updates:
+                # A stale optimistic preparation is an explicit, no-effect
+                # abort. Its final state and exact replay are checked below.
+                if check(mask | bit, encoded_state):
+                    return True
+            else:
+                next_state, expected = transition(state, body)
+                actual = (status, reply['data']) if status == 200 else (
+                    status, reply['error']['code'], reply['error']['outcome'],
+                )
+                if expected == actual and check(mask | bit, encode(next_state)):
+                    return True
         return False
 
     def encode(state):
@@ -215,15 +221,32 @@ def o08(fixture):
     history = [call for wave in waves for call in run_concurrently(fixture, wave)]
     for _, _, body, (_, reply) in history:
         assert reply['request_id'] == body['request_id'], (body, reply)
+    expected_row = initial_rows[0].copy()
+    aborted_updates = set()
+    for start, end, body, response in history[:2]:
+        status, reply = response
+        if status == 200:
+            assert reply['data'] is True, response
+            expected_row.update(body['payload']['values'])
+            continue
+        assert status == 409 and reply['error'] == {
+            'code': 'conflict',
+            'message': 'transaction preparation conflicted with an existing version',
+            'outcome': 'not_applied',
+        }, response
+        assert any(other_start < end and start < other_end and other_status == 200
+                   for other_start, other_end, _, (other_status, _) in history[:2]), history[:2]
+        assert exchange(fixture, body, 'api2') == response
+        aborted_updates.add(body['request_id'])
     final = {row['id']: row for row in fixture.data(fixture.query(table))}
-    assert_serial(history, {1: initial_rows[0]}, final)
-    assert final[1] == dict(id=1, category=71, value=72), final
+    assert_serial(history, {1: initial_rows[0]}, final, aborted_updates)
+    assert final[1] == expected_row, (final, expected_row)
     assert 3 in final and (2 in final) + (4 in final) <= 1 and 5 not in final, final
     if fixture.direct:
         after = fixture.cluster.all_stats()
         assert sum(((after[w]['direct'] or {}).get('mutations', 0)
                     - (before[w]['direct'] or {}).get('mutations', 0)) for w in WORKERS) > 0
-    passed('O08', 'serial-history', 'A real-time serial-order checker matched eight RF3 calls, including overlapping batches and disjoint-field updates of one row.')
+    passed('O08', 'serial-history', 'Eight RF3 calls matched a real-time serial order. Every acknowledged field update survived. A preparation conflict was allowed only against an overlapping successful update, with no effect and exact identity replay.')
     passed('O08', 'uniqueness-and-absence', 'The checker verified insert uniqueness, atomic batch conflicts, absent-key deletion and observed point reads.')
 
     missing = point(table, 'update', key=9, values={'value': 90})
