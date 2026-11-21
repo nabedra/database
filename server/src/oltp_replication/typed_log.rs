@@ -970,9 +970,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         )
         .since(submit);
         tokio::spawn(async move {
-            use crate::oltp_runtime::stage_timing::by_kind;
+            use crate::oltp_runtime::stage_timing::{by_kind, perf_stage};
             let kind = store.identity().kind.clone();
             let started = std::time::Instant::now();
+            let data = matches!(kind, crate::oltp_replication::types::GroupKind::Data { .. });
+            if data {
+                super::hosted::proposal_clock::mark(perf_stage!("raft.data.propose_to_append"));
+            }
             let _writer = writer;
             let _order = match held {
                 Some(guard) => guard,
@@ -1128,6 +1132,9 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 ["raft.data.append", "raft.ts.append", "raft.meta.append"],
             )
             .since(started);
+            if data {
+                super::hosted::proposal_clock::mark(perf_stage!("raft.data.propose_to_flush"));
+            }
             if let Err(error) = &result {
                 tracing::error!(group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
             }

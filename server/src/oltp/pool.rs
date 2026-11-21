@@ -1046,7 +1046,17 @@ impl GroupStore {
         } else {
             None
         };
+        // RD2: a Data apply's legs on its host (order lock, budgets, native
+        // execute incl. its admission, journal completion).
+        use crate::{oltp_replication::types::GroupKind, oltp_runtime::stage_timing::perf_stage};
+        let data_apply = matches!(lane, MutationLane::State)
+            && matches!(self.identity().kind, GroupKind::Data { .. });
+        let stage_started = std::time::Instant::now();
         let owner = order.clone().lock_owned().await;
+        if data_apply {
+            perf_stage!("pool.data_apply.order").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let group = self.clone();
         let output = match execution_class {
             ExecutionClass::Query => {
@@ -1062,6 +1072,10 @@ impl GroupStore {
         };
         let prepared = self.resources().prepare(execution_class).await?;
         let reservations = prepared.buffers(budget, output).await?;
+        if data_apply {
+            perf_stage!("pool.data_apply.prepare").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let runtime = tokio::runtime::Handle::try_current().ok();
         // The executor builds the batch and submits it, or hands it to a paced
         // task; it never waits for storage. Either way the write is dispatched
@@ -1209,6 +1223,10 @@ impl GroupStore {
                 }
             })
             .await?;
+        if data_apply {
+            perf_stage!("pool.data_apply.execute").since(stage_started);
+        }
+        let stage_started = std::time::Instant::now();
         let submitted = match submitted {
             Submitted::Paced {
                 response,
@@ -1251,6 +1269,9 @@ impl GroupStore {
                     .done()
                     .await
                     .map_err(|error| self.pool().failed(error))?;
+                if data_apply {
+                    perf_stage!("pool.data_apply.commit").since(stage_started);
+                }
                 if deferred {
                     self.inner.deferred_writes.fetch_add(1, Ordering::Relaxed);
                 } else {
