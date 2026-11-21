@@ -78,6 +78,29 @@ pub(super) fn observe_record(replica: &super::replica::WorkerReplica) {
     };
     write_record(replica, &PathBuf::from(directory), id);
 }
+pub(super) fn observe_data_voters(manager: &crate::oltp_replication::manager::HostedGroupManager) {
+    use crate::oltp_replication::types::GroupIdentity;
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return;
+    };
+    let Ok(raw) = std::fs::read(directory.join("inspect-data-voters.json")) else {
+        return;
+    };
+    assert!(raw.len() <= 4096);
+    let groups: Vec<(GroupIdentity, u64)> = serde_json::from_slice(&raw).unwrap();
+    assert!(groups.len() <= 8);
+    let state = groups
+        .iter()
+        .map(|(group, node)| manager.data_voter_state(group, *node))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        directory.join("data-voters.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+}
+
 pub(super) fn observe_application_status_lookup(run: Uuid, id: Uuid) {
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") {
         use std::io::Write;

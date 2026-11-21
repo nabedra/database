@@ -305,16 +305,23 @@ impl PeerDirectory for AppliedPeerDirectory {
         if group.cluster_id != self.cluster {
             return Err(invalid());
         }
-        if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
-            .as_ref().filter(|candidate| candidate.enrollment.worker_id == peer.worker_id)
+        if let Some(candidate) = self
+            .prepared
+            .read()
+            .map_err(|_| unavailable())?
+            .as_ref()
+            .filter(|candidate| candidate.enrollment.worker_id == peer.worker_id)
         {
-            return if WorkerIdentity::from(&candidate.enrollment) == peer
-                && group == &self.control
-                && purpose == Purpose::ControlDelegation
-            {
+            if WorkerIdentity::from(&candidate.enrollment) != peer {
+                return Err(invalid());
+            }
+            return if group == &self.control && purpose == Purpose::ControlDelegation {
                 Ok(TransportTrust::PreparedControl)
             } else {
-                Err(invalid())
+                // The worker's voter placements still point here during a
+                // retained restart. Until enrollment, route callers must
+                // continue to the surviving replicas.
+                Err(unavailable())
             };
         }
         let entries = self.entries.read().map_err(|_| unavailable())?;
@@ -407,6 +414,75 @@ mod tests {
             enrollment_revision: 1,
         }
     }
+
+    #[test]
+    fn r03_prepared_restart_routes_past_the_unavailable_voter() {
+        let shared = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let control = GroupIdentity {
+            cluster_id: Uuid::new_v4(),
+            database: Text::try_from("tenant").unwrap(),
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Control,
+            group_format_version: 1,
+        };
+        let old = enrollment();
+        let directory = AppliedPeerDirectory::from_bootstrap(
+            control.clone(),
+            vec![old.clone()],
+            shared.clone(),
+        )
+        .unwrap();
+        let next = WorkerEnrollment {
+            incarnation: Uuid::new_v4(),
+            enrollment_revision: 2,
+            ..old.clone()
+        };
+        *directory.prepared.write().unwrap() = Some(Entry {
+            enrollment: next.clone(),
+            role: Role::PreparedControl,
+            seen: 1,
+            _charge: Arc::new(
+                shared
+                    .reserve_scratch(crate::oltp::pool::ByteClass::Progress, 1024)
+                    .unwrap(),
+            ),
+        });
+        let target = WorkerIdentity::from(&directory.resolve(old.worker_id).unwrap());
+        assert_eq!(target, WorkerIdentity::from(&next));
+        assert_eq!(
+            directory.verify(target, &control, Purpose::ControlDelegation),
+            Ok(TransportTrust::PreparedControl)
+        );
+        assert_eq!(
+            directory.verify(target, &control, Purpose::Raft),
+            Err(unavailable())
+        );
+        assert_eq!(
+            directory.verify(
+                WorkerIdentity::from(&old),
+                &control,
+                Purpose::ControlDelegation
+            ),
+            Err(invalid())
+        );
+        let data = GroupIdentity {
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Data {
+                table_id: Uuid::new_v4(),
+                shard_id: Uuid::new_v4(),
+            },
+            ..control
+        };
+        for purpose in [Purpose::Raft, Purpose::Authority, Purpose::ServiceMutation] {
+            assert_eq!(directory.verify(target, &data, purpose), Err(unavailable()));
+        }
+    }
+
     #[test]
     fn o15_api_transport_role_cannot_become_a_voter_or_queue_copy_source() {
         let shared = WorkerSharedResources::new(

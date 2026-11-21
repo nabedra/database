@@ -99,14 +99,8 @@ impl WorkerRuntime {
         if owner.backup_id.is_nil() || owner.attempt == 0 {
             return Err(unknown());
         }
-        // Incremental segments export only Status-decided transactions, so
-        // they would lose every direct commit and its dedup record (RV-T4 F2).
-        if previous.is_some() && self.direct_commits_active() {
-            return Err(crate::oltp::failure(
-                ErrorCode::UnsupportedOperation,
-                "incremental backups are unavailable while direct commits (data.direct.v1) \
-                 are active: take a full backup",
-            ));
+        if previous.is_some() {
+            self.check_incremental_backup().await?;
         }
         if let Some(repository) = &self.services.archive_repository {
             repository.require_write()?;
@@ -163,6 +157,21 @@ impl WorkerRuntime {
     /// and `routes_direct()` for the leader executor (T5) and gateway (T6).
     pub(crate) fn direct_switch(&self) -> Option<&Arc<super::direct_capability::DirectSwitch>> {
         self.direct.get()
+    }
+
+    async fn check_incremental_backup(&self) -> Result<(), ProtocolError> {
+        // Incremental segments export only Status-decided transactions. The
+        // local watcher may lag the durable activation in Control.
+        if self.direct_commits_active()
+            || self.direct_switch().ok_or_else(unknown)?.refresh().await?
+        {
+            return Err(crate::oltp::failure(
+                ErrorCode::UnsupportedOperation,
+                "incremental backups are unavailable while direct commits (data.direct.v1) \
+                 are active: take a full backup",
+            ));
+        }
+        Ok(())
     }
     /// Incremental backups exist only while `data.direct.v1` is inactive (a
     /// cluster with an older member). A single test worker activates it on
@@ -284,6 +293,12 @@ impl WorkerRuntime {
             .begin_backup(authority, owner)
             .await?;
         *active_pin = Some(pin);
+        // Activation may have committed since the first check. A direct
+        // timestamp allocated after this cut is above it, so check Control
+        // after the cut is fixed and before exporting incremental history.
+        if previous.is_some() {
+            self.check_incremental_backup().await?;
+        }
         let catalog = self.services.catalog.snapshot(pin.read_ts, authority)?;
         let archive_id = key.archive_id;
         let scope = HistoryScope {

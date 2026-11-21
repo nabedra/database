@@ -197,9 +197,12 @@ impl DirectSwitch {
         true
     }
 
-    /// A strong Control read. `false` also when Control cannot answer the
-    /// request (an older Control leader rejects it).
+    /// A strong Control read unless sticky activation was already observed.
     pub(crate) async fn refresh(&self) -> Result<bool, ProtocolError> {
+        #[cfg(test)]
+        if self.disabled_for_test.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         if self.is_direct_active() {
             return Ok(true);
         }

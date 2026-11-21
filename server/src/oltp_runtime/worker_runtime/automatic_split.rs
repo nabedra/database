@@ -748,22 +748,6 @@ async fn settle(
                 .status
                 .failure_settled_proof(attempt.txn, attempt.request)
                 .await?;
-            if attempt.image.is_none() {
-                let GroupKind::Data { table_id, .. } = intent.source.kind else {
-                    return Err(unknown());
-                };
-                if let Some(binding) = runtime
-                    .services
-                    .catalog
-                    .participant()
-                    .lifecycle_holder(table_id)
-                    .await?
-                    && binding.txn == attempt.txn
-                    && binding.request == attempt.request
-                {
-                    runtime.help_lifecycle(binding).await?;
-                }
-            }
             runtime
                 .settle_split_proof(client, &attempt, authority, proof)
                 .await
