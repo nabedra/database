@@ -107,22 +107,24 @@ def query(facade, table, kind='collect', expression=None, api='api1'):
     return facade.data(operation(f'query.{kind}', dict(table_id=table.id, query=query._to_wire())), api)
 
 
-def read_after_transition(facade, body, api='api2'):
+def read_after_transition(facade, body, api='api2', *, timeout=8):
     request = body
 
     def settled():
         nonlocal request
-        status, reply = facade.api(api, OPERATIONS, request, timeout=8)
-        if status in (429, 503, 504):
+        status, reply = facade.api(api, OPERATIONS, request, timeout=timeout)
+        if status in (429, 504):
             return None
-        if status == 404 and reply['error']['message'] == 'receipt unavailable or expired':
+        if status == 503 or (status == 404 and reply['error']['message'] == 'receipt unavailable or expired'):
+            # These are fresh probes. Retrying an unavailable terminal read
+            # under its old ID would keep returning the cached failure.
             request = operation(body['operation'], body['payload'])
             return None
         assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
         # The wrapper stays truthy even for an empty result or a missing row.
         return reply
 
-    return wait_for(settled, 'read through a published membership change', 45)['data']
+    return wait_for(settled, 'read through a published membership change', max(45, timeout * 3))['data']
 
 
 def create(facade, name):
@@ -226,8 +228,6 @@ def snapshot_recovery(facade):
         assert first['applied']['index'] < first['incoming']['index'] and not activated.exists(), first
         cluster.workers[victim].kill()
         cluster.workers[victim].stop()
-        neighbor_get = operation('table.get', dict(table_id=neighbor.id, key=777))
-        assert read_after_transition(test, neighbor_get) == row(777)
         staged.unlink()
         control.write_text('observe')
         local = Path(config['node']['directory']) / 'NABEDRA_REGISTERED_WORKER.json'
@@ -244,7 +244,8 @@ def snapshot_recovery(facade):
         assert second['generation'] == second['staged_generation'] == restarted['staged_generation']
         assert second['applied'] == second['incoming'] == restarted['incoming']
         assert read_after_transition(test, test.query(table)) == [row(key) for key in range(81)]
-        assert read_after_transition(test, operation('table.get', neighbor_get['payload'])) == row(777)
+        neighbor_get = operation('table.get', dict(table_id=neighbor.id, key=777))
+        assert read_after_transition(test, neighbor_get) == row(777)
     except BaseException:
         dump(cluster)
         raise
@@ -481,8 +482,9 @@ def drain_and_detach(facade, owner, mount, target):
     subprocess.run(['sudo', '-n', 'umount', str(directory)], check=True, capture_output=True, timeout=60)
     cluster.mounted.remove(directory)
     assert not list(directory.iterdir()), list(directory.iterdir())
-    assert query(facade, table) == expected
-    assert query(facade, table, 'count') == len(expected)
+    assert read_after_transition(facade, facade.query(table)) == expected
+    count = operation('query.count', dict(table_id=table.id, query=table.query()._to_wire()))
+    assert read_after_transition(facade, count) == len(expected)
 
 
 def native_threads(process):
@@ -626,6 +628,25 @@ def check_capacity_deficit(facade):
         cluster.close()
 
 
+def insert_exact(facade, table, rows):
+    body = batch(table, rows)
+    deadline = time.monotonic() + 180
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            status, reply = facade.api('api1', OPERATIONS, body, timeout=90)
+            if status == 200:
+                assert reply == dict(request_id=body['request_id'], data=len(rows)), reply
+                return
+            if status not in (429, 503, 504):
+                raise AssertionError((rows[0]['id'], rows[-1]['id'], status, reply))
+            last = (status, reply)
+        except TRANSPORT_ERRORS as error:
+            last = repr(error)
+        time.sleep(.2)
+    raise AssertionError(f"batch {body['request_id']} did not settle: {last}")
+
+
 def o21(facade):
     table = facade.db.create_table('large_table', {'id': int, 'text': str, 'value': int}, key='id')
     cluster = facade.cluster
@@ -633,19 +654,7 @@ def o21(facade):
     total = 102_001
 
     def bulk(first, end):
-        body = batch(table, [dict(id=key, text=text, value=key % 7) for key in range(first, end)])
-        deadline = time.monotonic() + 180
-        while True:
-            try:
-                status, reply = facade.api('api1', OPERATIONS, body, timeout=90)
-                if status == 200:
-                    assert reply == dict(request_id=body['request_id'], data=end - first), reply
-                    return
-                assert status in (429, 503, 504), (first, end, status, reply)
-            except TRANSPORT_ERRORS:
-                pass
-            assert time.monotonic() < deadline, (first, end, body['request_id'])
-            time.sleep(.2)
+        insert_exact(facade, table, [dict(id=key, text=text, value=key % 7) for key in range(first, end)])
 
     started = time.monotonic()
     bulk(0, 500)
@@ -705,11 +714,13 @@ def o21(facade):
     bulk(100_000, 100_001)
     assert query(facade, table, 'count') == 100_001
     bulk(100_001, total)
+    assert query(facade, table, 'count') == total
     assert total * len(text) > 64 * MIB
     victim = next(worker for worker in reversed(WORKERS) if worker != owner)
     survivors = stop_worker(cluster, victim)
     launch_retained(cluster, victim, retained_config(cluster, victim, survivors))
-    assert query(facade, table, 'count') == total
+    count = operation('query.count', dict(table_id=table.id, query=table.query()._to_wire()))
+    assert read_after_transition(facade, count, timeout=30) == total
     assert get(facade, table, 100_000) == dict(id=100_000, text=text, value=100_000 % 7)
     assert get(facade, table, total) is None
     assert get(facade, table, 0) == dict(id=0, text=text, value=-1)
@@ -919,8 +930,21 @@ def o28(facade):
            'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
     count_overflow(facade, table, rows[1]['id'])
     assert query(facade, table, 'count') == len(expected)
-    pending_clause('O28', 'large-counts',
-                   'The reducer returned a checked overflow error after seeding its test accumulator near u64::MAX. Counts past 100,000 still require an executed large dataset in this paged fixture.')
+
+    # Put new rows on the first and last ranges. The count must aggregate
+    # matching rows from both ends of the two-page routing map.
+    total = 100_001
+    needed = total - len(expected)
+    for offset in range(0, needed, 1024):
+        fields = [dict(id=f'{("0000" if index % 2 == 0 else "zzzz")}.bulk-{index:06}',
+                       category=9, value=index)
+                  for index in range(offset, min(offset + 1024, needed))]
+        insert_exact(facade, table, fields)
+    assert query(facade, table, 'count') == total
+    assert query(facade, table, 'count', table.query().limit(100_000)) == 100_000
+    assert query(facade, table, 'count', table.where(category=9)) == needed
+    passed('O28', 'large-counts',
+           'Both routing pages contributed to a count of 100,001. The explicit limit returned 100,000 and the checked overflow case returned limit_exceeded.')
 
 
 @contextmanager
@@ -976,7 +1000,7 @@ def main():
             archive.mkdir(mode=0o700)
         cluster = GrowthCluster(
             args.binary, root, mounts=True, metadata_profile=paged, archive=archive,
-            bulk_load=args.scenario in ('O21', 'O26'),
+            bulk_load=args.scenario in ('O21', 'O26', 'O28'),
             worker_memory=(3584 if paged else 2048) * MIB,
             automatic=dict(shard_target_bytes=8 * MIB, minimum_free_bytes=64 * MIB)
             if args.scenario == 'O21' else None,
