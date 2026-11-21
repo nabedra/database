@@ -1,0 +1,83 @@
+name: RES2 evidence
+
+on:
+  push:
+    branches: [nabedra/hd-res2]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: res2-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    if: contains(github.event.head_commit.message, '[ci res2]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      GC1_MODES: 'on'
+      GC1_BATCH: 'on'
+      GC1_RANGES: '1'
+      GC1_ROWS: '128'
+      GC1_SERIAL: '1000'
+      GC1_RATES: '0.1'
+      GC1_PACKING: '0.1'
+      GC1_SECONDS: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build release executables with old and new admission
+        shell: bash
+        run: |
+          base=ff6e8f35a81f865981a1ef6c814aea0ba2baafac
+          git merge-base --is-ancestor "$base" HEAD
+          mkdir -p evidence
+          build() {
+            local executable
+            executable=$(cargo test --manifest-path server/Cargo.toml --locked --release \
+              --no-default-features --features oltp --lib --no-run --message-format=json \
+              | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable')
+            test -x "$executable"
+            cp "$executable" "$RUNNER_TEMP/res2-$1"
+          }
+          build head
+          git restore --source "$base" -- server/src/oltp/pool.rs server/src/oltp/pool/disk.rs server/src/oltp_replication/hosted/disk_admission.rs
+          build base
+      - name: Reproduce the fixed reservation failure and verify proportional admission
+        shell: bash
+        run: |
+          mount_dir=$(mktemp -d)
+          sudo mount -t tmpfs -o "size=2g,uid=$(id -u),gid=$(id -g),mode=0700" tmpfs "$mount_dir"
+          trap 'sudo umount "$mount_dir" && rmdir "$mount_dir"' EXIT
+          for mode in base head; do
+            rc=0
+            TMPDIR="$mount_dir" "$RUNNER_TEMP/res2-$mode" o08_o13_small_data_proposals_share_two_gib \
+              --ignored --nocapture 2>&1 | tee "evidence/$mode-reservation.log" || rc=$?
+            if [ "$mode" = base ]; then
+              test "$rc" -eq 101
+              grep 'refused before Raft could apply' "evidence/$mode-reservation.log"
+            else
+              test "$rc" -eq 0
+              grep 'test result: ok. 1 passed; 0 failed;' "evidence/$mode-reservation.log"
+            fi
+          done
+      - name: Measure serial RF3 updates on the same runner
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          for mode in base head head base base head; do
+            "$RUNNER_TEMP/res2-$mode" gc1_measure --ignored --nocapture --test-threads 1 \
+              | tee -a "evidence/$mode-serial.log"
+          done
+          for mode in base head; do
+            sed -n 's/^GC1 //p' "evidence/$mode-serial.log" | jq -c 'select(.serial) | {p50_ms, p99_ms, ok, failed, refused, stages, storage}'
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: res2-evidence
+          path: evidence
