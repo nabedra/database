@@ -118,7 +118,9 @@ impl ReplicaPlacement {
                     .placement_learner(plan.request.group.clone(), plan.binding()?)
                     .await?;
                 let running = self
-                    .host(store.clone(), &plan.request.target, &plan.old)
+                    .factory
+                    .manager
+                    .start_placement_learner(store.clone(), &plan, self.factory.config.clone())
                     .await?;
                 Some((store, running))
             };

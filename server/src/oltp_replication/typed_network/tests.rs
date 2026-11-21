@@ -41,17 +41,42 @@ fn o26_learner_accepts_current_leader_while_replaying_historical_membership() {
         worker_id: first.worker_id,
         ..member(4)
     };
-    let bootstrap = BTreeMap::from([
-        (2, second.clone()),
-        (3, third.clone()),
-        (4, leader.clone()),
-    ]);
-    let history = crate::oltp_replication::entry::Membership::new(
+    let bootstrap = BTreeMap::from([(2, second.clone()), (3, third.clone()), (4, leader.clone())]);
+    let history = Membership::new(
         vec![[1, 2, 3].into_iter().collect()],
         BTreeMap::from([(1, first), (2, second), (3, third)]),
     )
     .unwrap();
-    assert_eq!(raft_sender(&history, &bootstrap, 4), Some(&leader));
+    let stored = |index| {
+        openraft::StoredMembership::new(
+            Some(crate::oltp_replication::hosted::log_id(AppliedPosition {
+                term: 1,
+                node_id: 1,
+                index,
+            })),
+            history.clone(),
+        )
+    };
+    let prefix = stored(1);
+    let published_index = 8;
+    assert_eq!(
+        raft_sender(&prefix, &bootstrap, Some(published_index), 4),
+        Some(&leader)
+    );
+    assert_eq!(raft_sender(&prefix, &bootstrap, None, 4), None);
+    assert_eq!(
+        raft_sender(&prefix, &bootstrap, Some(published_index), 5),
+        None
+    );
+    assert_eq!(
+        raft_sender(
+            &stored(published_index),
+            &bootstrap,
+            Some(published_index),
+            4
+        ),
+        None
+    );
 }
 
 struct Temporary(PathBuf);

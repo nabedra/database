@@ -296,7 +296,7 @@ where
         bytes: &[u8],
     ) -> Result<ReceivePlan, ProtocolError> {
         let head = parse(bytes)?;
-        self.verify_sender(session, head.from_node, head.to_node)?;
+        self.verify_sender(session, head.from_node, head.to_node, true)?;
         if head.transfer.is_nil()
             || head.vote.leader_id().node_id != head.from_node
             || head.checksum.is_some() != matches!(head.method, Method::Finish)

@@ -611,15 +611,7 @@ impl RemotePlacementTarget {
             .placement_learner(plan.request.group.clone(), plan.binding()?)
             .await?;
         self.manager
-            .start_data(
-                store,
-                plan.request.target.clone(),
-                plan.old
-                    .iter()
-                    .map(|member| (member.node_id, member.clone()))
-                    .collect(),
-                self.config.clone(),
-            )
+            .start_placement_learner(store, plan, self.config.clone())
             .await?;
         Ok(())
     }

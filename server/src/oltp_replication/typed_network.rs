@@ -3,7 +3,7 @@
 //! Current process enrollment remains a transport concern, not a Raft node ID.
 use super::{
     authority::consensus::Applied,
-    entry::{LogId, OwnedRaftEntry, Payload, Vote},
+    entry::{CommittedLeaderId, LogId, Membership, OwnedRaftEntry, Payload, Vote},
     hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
@@ -565,6 +565,7 @@ where
     resident: ReplicaLease,
     shared: Arc<WorkerSharedResources>,
     bootstrap: Arc<BTreeMap<u64, ReplicaMember>>,
+    catch_up_before: Option<u64>,
 }
 impl<C, M> ReplicaEndpoint<C, M>
 where
@@ -588,7 +589,12 @@ where
             resident,
             shared,
             bootstrap: Arc::new(bootstrap),
+            catch_up_before: None,
         })
+    }
+    pub(crate) fn with_learner_catch_up(mut self, catch_up_before: Option<u64>) -> Self {
+        self.catch_up_before = catch_up_before;
+        self
     }
     fn verify(
         &self,
@@ -622,7 +628,12 @@ where
             }
             _ => {}
         }
-        self.verify_sender(session, head.from_node, head.to_node)?;
+        self.verify_sender(
+            session,
+            head.from_node,
+            head.to_node,
+            matches!(head.method, Method::Append),
+        )?;
         Ok(traffic)
     }
     fn verify_sender(
@@ -630,15 +641,20 @@ where
         session: &AuthenticatedSession,
         from_node: u64,
         to_node: u64,
+        catch_up: bool,
     ) -> Result<(), ProtocolError> {
         if session.group() != self.resident.identity() || to_node != self.resident.node_id() {
             return Err(invalid("typed RPC target mismatch"));
         }
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow_watched();
-        let membership = metrics.membership_config.membership();
-        let member = raft_sender(membership, &self.bootstrap, from_node)
-            .ok_or_else(|| invalid("sender is outside enrolled replica membership"))?;
+        let member = raft_sender(
+            &metrics.membership_config,
+            &self.bootstrap,
+            self.catch_up_before.filter(|_| catch_up),
+            from_node,
+        )
+        .ok_or_else(|| invalid("sender is outside enrolled replica membership"))?;
         if member.worker_id != session.remote().worker_id {
             return Err(invalid("sender node is bound to another physical worker"));
         }
@@ -647,16 +663,24 @@ where
 }
 
 fn raft_sender<'a>(
-    membership: &'a super::entry::Membership,
+    stored: &'a openraft::StoredMembership<CommittedLeaderId, Membership>,
     bootstrap: &'a BTreeMap<u64, ReplicaMember>,
+    catch_up_before: Option<u64>,
     sender: u64,
 ) -> Option<&'a ReplicaMember> {
+    let membership = stored.membership();
     membership
         .nodes()
         .find(|(node, _)| **node == sender)
         .map(|(_, member)| member)
         .or_else(|| {
-            if membership.nodes().next().is_none() {
+            // A newly hosted learner can receive historical membership
+            // entries before it sees the previously published placement.
+            // Until then, its authorized bootstrap voters can send catch-up
+            // traffic even if a historical membership does not list them.
+            let replaying_history = catch_up_before
+                .is_some_and(|index| stored.log_id().is_none_or(|log| log.index < index));
+            if replaying_history || membership.nodes().next().is_none() {
                 bootstrap.get(&sender)
             } else {
                 None
