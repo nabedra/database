@@ -30,6 +30,15 @@ pub(crate) fn snapshot_test_config(mut config: openraft::Config) -> openraft::Co
     config
 }
 
+pub(crate) fn data_raft_isolated(group: uuid::Uuid) -> bool {
+    if std::env::var_os("NABEDRA_OLTP_TEST_SHORT_DATA_SNAPSHOTS").is_none() {
+        return false;
+    }
+    std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")
+        .map(PathBuf::from)
+        .is_some_and(|dir| dir.join(format!("data-raft-{group}.isolate")).is_file())
+}
+
 pub(crate) fn count_overflow_requested(read_ts: u64) -> bool {
     std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")
         .map(PathBuf::from)

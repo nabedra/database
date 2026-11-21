@@ -205,6 +205,10 @@ impl<C: TypedConfig> TypedNetwork<C> {
             return Err(invalid("target node disagrees with membership"));
         }
         let group = self.factory.resident.identity();
+        #[cfg(test)]
+        if crate::oltp_growth_acceptance::data_raft_isolated(group.group_id) {
+            return Err(unavailable());
+        }
         let (purpose, traffic) = header.route(&group.kind);
         let shared = self.factory.shared.clone();
         let byte_class = traffic.byte_class();
@@ -654,6 +658,11 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
+            #[cfg(test)]
+            if crate::oltp_growth_acceptance::data_raft_isolated(self.resident.identity().group_id)
+            {
+                return Err(unavailable());
+            }
             if session.purpose() == Purpose::Snapshot {
                 return self.snapshot_preflight(session, bytes);
             }

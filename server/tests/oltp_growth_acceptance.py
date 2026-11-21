@@ -224,21 +224,22 @@ def snapshot_recovery(facade):
         control = barrier / f'native-snapshot-{group}.mode'
         staged = barrier / f'native-snapshot-{group}-staged.json'
         activated = barrier / f'native-snapshot-{group}-activated.json'
+        isolated = barrier / f'data-raft-{group}.isolate'
         control.write_text('pause')
-        survivors = [worker for worker in WORKERS if worker != victim]
-        # Keep the original enrolled voter alive while it falls behind. Its
-        # first snapshot install then has no rolling enrollment in flight.
-        cluster.workers[victim].pause()
-        wait_for(lambda: two_ready(cluster, survivors), 'paused follower removed from queue readiness', 90)
+        isolated.touch()
+        # Lag one Data voter while the same worker still serves Control and
+        # the replicated queue. The first process loss occurs at staging.
+        assert read_after_transition(test, test.query(table)) == [row(0)]
         for key in range(1, 81):
             request = operation('table.insert', dict(table_id=table.id, row=row(key)))
             assert test.data(request) is None
-        cluster.workers[victim].resume()
+        isolated.unlink()
         first = wait_for(lambda: json.loads(staged.read_text()) if staged.exists() else None,
                          'native install staged on the lagging follower', 120)
         assert first['staged_generation'] == first['generation'] + 1, first
         assert first['applied']['index'] < first['incoming']['index'] and not activated.exists(), first
-        stop_worker(cluster, victim)
+        assert cluster.wait_workers()[victim]['run_id'] == cluster.run_id
+        survivors = stop_worker(cluster, victim)
         staged.unlink()
         control.write_text('observe')
         launch_retained(cluster, victim, retained_config(cluster, victim, survivors))
