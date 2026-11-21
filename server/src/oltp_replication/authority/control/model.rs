@@ -598,6 +598,8 @@ pub(crate) enum Fault {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
     SystemReplacementEnabled(AppliedPosition),
+    SystemReplacementMounted,
+    SystemReplacementPublished(GroupRecord),
     SystemReplacementPrepared(Box<super::ReplacementRecord>),
     DirectCapability(super::DirectCapability),
     ScopedQueueUpdated,

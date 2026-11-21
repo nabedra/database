@@ -74,6 +74,16 @@ trait Running: Send + Sync {
         &'a self,
         request: &'a system_recovery::QuorumRequest,
     ) -> system_recovery::QuorumFuture<'a>;
+    fn reconcile_system_replacement<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a>;
+    fn verify_replacement_applied<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a>;
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + '_>>;
     fn removed_applied(
         &self,
@@ -91,6 +101,42 @@ where
         request: &'a system_recovery::QuorumRequest,
     ) -> system_recovery::QuorumFuture<'a> {
         Box::pin(self.check_surviving_quorum(request))
+    }
+    fn reconcile_system_replacement<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a> {
+        Box::pin(async move {
+            let removed = plan.old.iter().find(|member| member.worker_id == lost).ok_or_else(invalid)?;
+            let next = plan.next(lost)?;
+            Ok(self.reconcile_voter_replacement(&plan.old, &next, &plan.learner, removed.node_id, None)
+                .await?.applied_at())
+        })
+    }
+    fn verify_replacement_applied<'a>(
+        &'a self,
+        plan: &'a crate::oltp_replication::authority::control::ReplacementGroup,
+        lost: uuid::Uuid,
+    ) -> system_recovery::PositionFuture<'a> {
+        Box::pin(async move {
+            let mut local = self.state.clone();
+            let (applied, membership) = openraft::storage::RaftStateMachine::<C>::applied_state(&mut local)
+                .await.map_err(|_| unavailable())?;
+            let membership_position = membership.log_id().ok_or_else(unavailable)?;
+            let next = plan.next(lost)?;
+            let [voters] = membership.membership().get_joint_config().as_slice() else {
+                return Err(unavailable());
+            };
+            if voters.len() != next.len()
+                || next.iter().any(|member| !voters.contains(&member.node_id)
+                    || membership.membership().get_node(&member.node_id) != Some(member))
+                || applied.is_none_or(|applied| applied.index < membership_position.index)
+            {
+                return Err(unavailable());
+            }
+            Ok(super::hosted::position(membership_position))
+        })
     }
     fn leader(&self) -> Option<u64> {
         // A stopped core never counts as the leader (RV-APPLY F4).
@@ -193,7 +239,7 @@ impl HostedGroupManager {
         let metrics = metrics.borrow_watched();
         let index = metrics.last_applied.as_ref()?.index;
         metrics.running_state.as_ref().ok()?;
-        let voters = metrics.membership_config.membership().voter_ids().collect();
+        let voters = metrics.committed_membership_config.membership().voter_ids().collect();
         Some((voters, index))
     }
 
@@ -215,6 +261,67 @@ impl HostedGroupManager {
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.shared
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_transfer_data_snapshot(
+        &self,
+        group: &GroupIdentity,
+        target: uuid::Uuid,
+    ) -> Result<u64, ProtocolError> {
+        use openraft::{
+            RaftSnapshotBuilder,
+            network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
+            storage::RaftStateMachine,
+        };
+
+        let (source, target) = {
+            let routes = self.routes.lock().map_err(|_| unavailable())?;
+            let replica = routes
+                .get(&group.group_id)
+                .and_then(|route| {
+                    route
+                        .replicas
+                        .values()
+                        .find(|replica| replica.running.leader() == Some(replica.member.node_id))
+                })
+                .ok_or_else(unavailable)?;
+            let target = replica
+                .running
+                .members()
+                .into_iter()
+                .find(|member| member.worker_id == target)
+                .ok_or_else(unavailable)?;
+            (replica.member.clone(), target)
+        };
+        let host = self.hosted_data(group, source.node_id)?;
+        host.ensure_linearizable().await?;
+        let mut state = host.state.clone();
+        let snapshot = state
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .map_err(|_| unavailable())?;
+        let cut = snapshot.meta.last_log_id.ok_or_else(unavailable)?.index;
+        let mut factory = TypedNetworkFactory::<DataConfig>::new(
+            self.client(),
+            source,
+            host.state.resident(),
+            self.shared.clone(),
+        )?;
+        let vote = host.raft.metrics().borrow_watched().vote;
+        factory
+            .new_client(target.node_id, &target)
+            .await
+            .full_snapshot(
+                vote,
+                snapshot,
+                std::future::pending(),
+                RPCOption::new(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(cut)
     }
     pub(crate) fn client(&self) -> WorkerClient {
         self.client.clone()
@@ -414,6 +521,7 @@ impl HostedGroupManager {
         let state = HostedState::new(machine, resident.clone())?;
         let running =
             RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
+        let _ = running.peer_features.set(self.client.clone());
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),
@@ -507,6 +615,17 @@ impl HostedGroupManager {
     ) -> Result<ManagedControl, ProtocolError> {
         self.start(ControlMachine::new(store)?, local, peers, config)
             .await
+    }
+    pub(crate) async fn start_registered_control(
+        &self,
+        store: GroupStore,
+        local: ReplicaMember,
+        peers: BTreeMap<u64, ReplicaMember>,
+        config: openraft::Config,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<ManagedControl, ProtocolError> {
+        let machine = ControlMachine::new(store)?.with_replacement_directory(directory).await?;
+        self.start(machine, local, peers, config).await
     }
     pub(crate) async fn start_timestamps(
         &self,

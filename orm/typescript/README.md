@@ -1,10 +1,14 @@
 # Nabedra TypeScript ORM
 
-The TypeScript client creates tables, reads and writes rows, and builds queries
-for the Nabedra Database server. It requires Node.js 22.13 or newer.
+This is the TypeScript client for the Nabedra Database server. It creates
+tables, reads and writes rows, and builds queries. It needs Node.js 22.13 or
+newer.
 
-Run `npm ci` and `npm pack` from this directory, then install the tarball in your
-application. Configure `NABEDRA_TOKEN` with the server's data token.
+## Get started
+
+To install from this checkout, run `npm ci` and `npm pack` in this directory,
+then install the resulting tarball in your application. Set
+`NABEDRA_TOKEN` to the server's data token before you connect.
 
 ```typescript
 import { Database, col } from "nabedra"
@@ -15,17 +19,23 @@ await users.insertMany([{ id: "alice", age: 24n }, { id: "bob", age: 17n }])
 const adults = await users.where(col("age").ge(18n)).select("id", "age").collect()
 ```
 
-Schemas use `String`, `BigInt`, `Number`, and `Boolean` for UTF-8 strings,
-signed int64, float64, and booleans. The SDK preserves int64 values throughout
-the signed 64-bit range. Table handles inferred from `createTable` type-check
-keys, rows, updates, filter objects, and projections.
+A schema maps each column to `String`, `BigInt`, `Number` or `Boolean`, which
+stand for UTF-8 strings, signed 64-bit integers, 64-bit floats and booleans.
+Integers keep their exact value across the whole signed 64-bit range. When you
+get a table handle from `createTable`, its types follow the schema, so the
+compiler checks the keys, rows, updates, filter objects and projections you
+pass to it.
 
-Builders run synchronously. Await operations that contact the server. Use
-`caFile` for an HTTPS endpoint that uses a private CA. Timeout options are in
-seconds. An `UnknownOutcomeError` carries the request identity for a write
-whose response could not be authenticated or validated. Writes are never
-retried automatically. `submit` and `receipt` let callers track accepted work
-by run and request ID.
+Building a query is synchronous, and anything that talks to the server returns
+a promise. For an HTTPS server with a private CA, pass `caFile`. Timeouts are
+in seconds.
+
+The client never retries a write. When it can't authenticate or validate a
+write's response, it throws `UnknownOutcomeError`, which carries the request
+identity so you can find out what happened. To track accepted work yourself,
+use `submit` and `receipt` with the run and request ID.
+
+Queries can also stream their results in batches:
 
 ```typescript
 const query = users.query().select("id", "age")
@@ -35,15 +45,43 @@ for await (const batch of batches) {
 }
 ```
 
-Run `npm test` for the type and protocol tests. Set `NABEDRA_TEST_SERVER_BINARY`
-to an absolute path to an OLTP server binary to enable the live fixture.
+## Cache
+
+`Cache.connect` opens a connection pool to a Nabedra Cache server. Close it
+when you are done.
+
+```typescript
+import { Cache } from "nabedra/cache"
+
+const cache = await Cache.connect("rediss://cache.example.com:6379", {
+  username, password, namespace: "catalog", caFile: "/path/to/ca.pem",
+})
+try {
+  await cache.set("sku:42", new TextEncoder().encode("in stock"), { ttlMs: 30_000, when: "absent" })
+  const value = await cache.get("sku:42")
+} finally {
+  await cache.close()
+}
+```
+
+You can also import `Cache` from `nabedra`. The same handle has `delete`,
+`expire`, `persist`, `ttlMs` and `increment`. `get` returns the stored bytes
+unchanged, or `null` when the key is missing. Counters take and return
+`bigint`.
+
+For a cluster, pass `cluster: true` and a list of seed endpoints. If the
+cluster nodes have different hostnames from the seeds, list them in
+`allowedNodes` or give their common DNS suffix in `allowedNodeSuffix`. The
+[shared Cache contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+describes deadlines, routing and errors.
 
 ## Other entry points
 
-The package root also exports `Cluster`, `serve`, `KubernetesProvider`, and the
-application gateway. Use `nabedra/events` for the producer and subscription
-client and `nabedra/events/sink` for the OLAP sink. To launch the sink, save
-the following as `sink.mjs` and run `node sink.mjs --config sink.json`.
+Besides `Database`, the package root exports `Cluster`, `serve`,
+`KubernetesProvider` and the application gateway. The Events producer and
+subscription client live in `nabedra/events`, and the OLAP sink lives in
+`nabedra/events/sink`. To run the sink, save this as `sink.mjs` and start it
+with `node sink.mjs --config sink.json`:
 
 ```javascript
 import { main } from "nabedra/events/sink"
@@ -51,14 +89,18 @@ import { main } from "nabedra/events/sink"
 await main()
 ```
 
-Infrastructure operators can
-import the growth, drain, Docker, EC2, and EKS adapters under `nabedra/deployment`.
-The `nabedra database` CLI uses a compatible installed `nabedra-db` binary.
+`nabedra/deployment` has the growth and drain adapters, and the Docker, EC2
+and EKS adapters. The `nabedra database` CLI runs an installed `nabedra-db`
+binary, which must be a compatible version.
 
-For AWS-backed deployment, provide the SDK's aggregated EC2 client with retry
-and timeout settings. The adapter checks the explicit metadata before it makes
-calls. Use milliseconds for SDK settings and seconds for Nabedra metadata.
-[EC2 client configuration](https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ec2).
+### EC2 client settings
+
+The EC2 adapters take an AWS SDK `EC2` client that you configure yourself,
+plus a `meta` object that states its retry and timeout settings. The adapter
+checks that metadata before it makes any call. Note the units: the SDK takes
+milliseconds, while the Nabedra metadata is in seconds. See the
+[EC2 client reference](https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/client/ec2)
+for the SDK options.
 
 ```typescript
 import { EC2 } from "@aws-sdk/client-ec2"
@@ -82,38 +124,20 @@ const client: Ec2Client = Object.assign(new EC2({
 }), { meta: { config: metadata, regionName: region } })
 ```
 
-Pass `client` as `Ec2Provider.client`, `EksProvider.stagingEc2Client`, or
-`EksReplacementVerifier.ec2Client` in the constructor options. When an adapter
-accepts a deadline, pass an absolute monotonic time in seconds, for example
-`{ deadline: performance.now() / 1_000 + 30 }`. Existing Docker and Kubernetes
-worker images use their configured in-container bootstrap commands.
+Pass `client` in the constructor options as `Ec2Provider.client`,
+`EksProvider.stagingEc2Client` or `EksReplacementVerifier.ec2Client`. Adapters
+that accept a deadline want an absolute monotonic time in seconds, for example
+`{ deadline: performance.now() / 1_000 + 30 }`. Docker and Kubernetes worker
+images keep using the bootstrap commands configured inside their containers.
 
-Set `NABEDRA_TEST_PYTHON` to an absolute Python 3.11+ executable for the
-differential tests. Set `NABEDRA_TEST_OLAP_BINARY` as well to test live row and
-Arrow streaming with the repository's OLAP process fixture.
+## Tests
 
-## Cache
+`npm test` runs the type and protocol tests. A few more suites turn on when you
+set these variables to absolute paths:
 
-Connect to a Nabedra Cache endpoint and close the pool after use.
-
-```typescript
-import { Cache } from "nabedra/cache"
-
-const cache = await Cache.connect("rediss://cache.example.com:6379", {
-  username, password, namespace: "catalog", caFile: "/path/to/ca.pem",
-})
-try {
-  await cache.set("sku:42", new TextEncoder().encode("in stock"), { ttlMs: 30_000, when: "absent" })
-  const value = await cache.get("sku:42")
-} finally {
-  await cache.close()
-}
-```
-
-`Cache` is also exported from `nabedra`. Call `delete`, `expire`, `persist`,
-`ttlMs` and `increment` on the same handle. `get` returns exact bytes or
-`null`, and counters accept and return `bigint`. Use `cluster: true` with
-bootstrap endpoints and `allowedNodes` or `allowedNodeSuffix` when node names
-differ from the seeds. The
-[shared contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
-describes deadlines, routing and errors.
+- `NABEDRA_TEST_SERVER_BINARY`, an OLTP server binary, runs the live server
+  tests.
+- `NABEDRA_TEST_PYTHON`, a Python 3.11 or newer executable, runs the
+  differential tests that compare this package with the Python ORM.
+- `NABEDRA_TEST_OLAP_BINARY`, an OLAP server binary, adds live row and Arrow
+  streaming tests on top of the differential tests.

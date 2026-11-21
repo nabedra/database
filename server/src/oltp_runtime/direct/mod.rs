@@ -14,7 +14,9 @@
 //! 4. computes the new rows, index changes and the exact result with the
 //!    queued planner's row and index functions;
 //! 5. allocates `commit_ts`, registers it with the range clock, proposes one
-//!    `DirectCommit` and awaits its apply;
+//!    `DirectCommit` and awaits its apply; while `data.direct.batch` is
+//!    enabled, commits that arrive while the range's proposal is in flight
+//!    share one `DirectBatch` entry (GC2, `batcher`);
 //! 6. on a conflict from a leadership race, a stale timestamp or a waiter
 //!    failed by a leadership change, goes back to step 3 within the deadline.
 //!
@@ -24,6 +26,7 @@
 //! Nothing here is on by default. The executor proposes only while its
 //! `DirectGate` reports `data.direct.v1` active (T7 turns it on).
 mod admission;
+mod batcher;
 mod executor;
 mod latches;
 mod schema;

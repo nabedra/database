@@ -2687,4 +2687,5 @@ async fn d06_latest_reads_track_pending_writers_per_key() {
     assert_eq!((clock.pending_len(), clock.pending_key_count()), (0, 0));
 }
 
+mod batch;
 mod t7;

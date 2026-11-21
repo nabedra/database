@@ -51,7 +51,7 @@ impl OpenedCold {
         record: &RetainedIdentity,
     ) -> Result<Option<Self>, ProtocolError> {
         let Some(profile) = config.cold else {
-            if previous.is_some() && config.rolling.is_none() {
+            if previous.is_some() && config.rolling.is_none() && config.system_replacement.is_none() {
                 return Err(invalid());
             }
             return Ok(None);

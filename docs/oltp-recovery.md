@@ -96,40 +96,74 @@ while reconciling receipts in the original run. If a second failure prevents
 quorum, wait for a retained voter to return. A full backup restore creates
 a new run and recovers data through the archived cut.
 
-### Check and record a system replacement intent
-
-The registered RF3 admin endpoint can check quorum and record a replacement
-intent for a fresh Docker-profile mount. Same-run recovery still requires
-learner startup, promotion, and revocation of the lost identity. Keep using
-the surviving quorum or a full backup restore for service recovery.
+### Replace a permanently lost system voter
 
 1. Before losing a voter, upgrade every Control voter and send
    `worker.system_replacement.enable` with an empty payload to the Control
-   leader. Control writes the activation only after every current voter
-   advertises `control.system-replacement.v1` over its authenticated peer
-   connection. Keep binaries that decode this capability after activation.
-2. After permanent loss, wait for Control to remove the exact lost
-   incarnation from the ready set. Then send
-   `worker.system_replacement.check` to a surviving worker with the current
-   `run_id` and the lost `previous` identity. Use the same fields as the
-   retained restart request. The check refuses a worker that still answers
-   an authenticated probe or recently acknowledged a Raft heartbeat. It
-   requires the current leader and a fresh acknowledgment from the other
-   surviving voter in every affected group, including Data. A successful
-   result describes an observation of up to 64 affected groups.
-3. To record the intent, send `worker.system_replacement.prepare` to the
-   current Control leader. Include the same `run_id` and `previous`, plus
-   `id` equal to the request UUID, `next` with the fresh worker enrollment,
-   and `mount` with the exact Docker-profile mount expectation. Use a fresh
-   worker ID, incarnation, certificate, and pool ID. Set the enrollment
-   revision and mount generation to 1. The leader rechecks quorum before
-   recording the exact old voters and planned learner for each group.
-   Retry the same UUID and body to read the original committed result. A
-   different intent for the same lost worker returns a conflict.
+   leader. The leader checks the authenticated
+   `control.system-replacement.execute.v1` advert from every Control voter
+   before it enables execution. This also activates
+   `control.system-replacement.v1` if it was inactive. Use execution-capable
+   binaries for future worker enrollment.
+2. Fence the lost process outside the cluster. Keep both surviving voters
+   and their mounts running. Wait for Control to remove the lost incarnation
+   from the ready set. Send `worker.system_replacement.check` to a survivor
+   with the current `run_id` and the lost `previous` identity. The same identity
+   fields apply as for a retained restart. Control checks for authenticated
+   activity from the lost worker and requires fresh evidence from both
+   survivors in every affected group. The operation supports up to 64 groups.
+3. Provision a fresh worker ID, incarnation, TLS certificate, and Docker-profile
+   pool. Use revision 1 and mount generation 1. Provision an independent
+   Ed25519 signing key on that mount at `NABEDRA_RESTART_KEY` with mode
+   `0600`. This file contains the raw 32-byte seed. The `mount_public_key`
+   field is the 32-byte public key encoded in hexadecimal.
 
-Send these operations to `POST /v1/cluster/operations` with the admin
-token. A successful preparation leaves the original voters recorded in
-Control. Continue to keep the old process fenced outside the cluster.
+   These commands provision the signing seed and print its public key. Set
+   `replacement_mount` to the provisioned mount path before running them.
+
+   ```sh
+   umask 077
+   key_file="$(mktemp)"
+   openssl genpkey -algorithm Ed25519 -out "$key_file"
+   openssl pkey -in "$key_file" -outform DER | tail -c 32 > "$replacement_mount/NABEDRA_RESTART_KEY"
+   openssl pkey -in "$key_file" -pubout -outform DER | tail -c 32 | xxd -p -c 32
+   rm -f "$key_file"
+   ```
+
+4. Send `worker.system_replacement.prepare` to the Control leader. Include
+   `run_id`, `previous`, `id` equal to the request UUID, `next` with the new
+   enrollment, `mount` with the Docker mount expectation, and
+   `mount_public_key`. The response contains the committed intent and exact
+   group plan. An identical retry returns the same record.
+5. In the new worker's bootstrap file, put the returned record in
+   `node.system_replacement`. Set `node.enrollment`, `node.mount`,
+   `node.directory`, `node.pool_id`, `node.scheduler_node_id`, TLS paths, and
+   binds for the new worker. Copy the current pre-replacement system placements
+   and Control enrollments into `node.placements` and `node.control_enrollments`.
+   For format 2, keep the original policy placements in
+   `node.bootstrap_placements` when the current placements differ from the
+   original placement. Use the current run as `node.initial_run` and omit
+   `node.cold`, `node.rolling`, `node.restore`, and secondary pools. Start
+   `nabedra-db worker --bootstrap /path/to/bootstrap.json`.
+6. Poll `worker.system_replacement.status` on a survivor with the same
+   `run_id` and `previous` as in the check. `mounted` means Control checked
+   the signed mount proof, revoked the lost worker ID and certificate, and
+   claimed the planned groups. `complete` means Control published every stable
+   voter set. Each group uses Raft's joint transition and requires learner
+   catch-up. Group changes wait for the necessary quorum if a survivor pauses.
+7. Check `GET /health/ready` on the replacement. Before it serves requests, it
+   verifies its applied Raft voter sets and completes the replicated RAM queue
+   join. Poll outstanding receipts in the original run and retry uncertain
+   mutations with their original ID and body. Save the new placements and
+   enrollments for future retained restarts. Keep the original format 2
+   `bootstrap_placements` and remove `system_replacement` from subsequent
+   retained-restart bootstrap files. Once queue join begins, a process restart
+   requires the normal retained-mount procedure with a new incarnation.
+
+Send the admin operations to `POST /v1/cluster/operations` with the admin
+token. A prepared intent authorizes only its exact candidate. Raft peers
+recheck the certificate against applied Control revocations on each request,
+including on an existing connection.
 
 For a quarantined Data replica or refused secondary pool, check
 `quarantined_groups` under `storage` and `refused_pools` in

@@ -301,6 +301,16 @@ impl TopologyCache {
             .entries
             .remove(&table_id);
     }
+    fn remove_if_current(&self, route: &Arc<TableRoute>) {
+        let mut lru = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if lru
+            .entries
+            .get(&route.table_id)
+            .is_some_and(|(current, _)| Arc::ptr_eq(current, route))
+        {
+            lru.entries.remove(&route.table_id);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
@@ -556,13 +566,13 @@ impl DirectGateway {
         let mut uncertain = false;
         if !get && (mode != DirectMode::Direct || asynchronous) {
             return self
-                .settle(&anchor, &mut request, deadline, &mut uncertain)
+                .settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                 .await;
         }
         if scanned.op == Op::InsertMany && (!one_range || body.len() > MAX_DIRECT_BATCH_BODY) {
             GatewayStats::bump(&self.stats.fallbacks);
             return self
-                .settle(&anchor, &mut request, deadline, &mut uncertain)
+                .settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                 .await;
         }
         let batch = (scanned.op == Op::InsertMany).then_some((&scanned, &table));
@@ -588,7 +598,7 @@ impl DirectGateway {
             Ok(Terminal::Failed(error))
                 if uncertain && !get && error.code != ErrorCode::Conflict =>
             {
-                self.settle(&anchor, &mut request, deadline, &mut uncertain)
+                self.settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
             Ok(Terminal::Failed(error)) => Err(error),
@@ -605,7 +615,7 @@ impl DirectGateway {
             }
             Ok(Terminal::Fallback(_)) => {
                 GatewayStats::bump(&self.stats.fallbacks);
-                self.settle(&anchor, &mut request, deadline, &mut uncertain)
+                self.settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
             Err(error) if get && error.outcome == Outcome::Unknown => Err(ProtocolError::new(
@@ -636,6 +646,7 @@ impl DirectGateway {
     /// result; an unreachable anchor is `outcome_unknown`.
     async fn settle(
         &self,
+        route: &Arc<TableRoute>,
         anchor: &Key,
         request: &mut DirectRequest,
         deadline: Instant,
@@ -686,7 +697,12 @@ impl DirectGateway {
                 }
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
-                Err(_) => return Err(self.final_error(unknown())),
+                Err(_) => {
+                    // A retired parent cannot answer StaleRoute. Drop only
+                    // this attempt's route so an exact retry can read Catalog.
+                    self.cache.remove_if_current(route);
+                    return Err(self.final_error(unknown()));
+                }
             }
         }
     }
@@ -786,6 +802,7 @@ impl DirectGateway {
                 // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
                     *uncertain = true;
+                    self.cache.remove_if_current(&table);
                     return Err(deadline_error(true));
                 }
                 Ok(reply) => reply,
@@ -808,6 +825,7 @@ impl DirectGateway {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
+                        self.cache.remove_if_current(&table);
                         return Err(error);
                     }
                     if error.outcome == Outcome::Unknown {

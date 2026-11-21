@@ -66,7 +66,7 @@ impl SplitEndpoint {
         let data = DataGroupClient::new(manager, control_group, bootstrap_voters)?;
         Ok(Arc::new(Self {
             host: Host::Data(host),
-            client: SplitClient::new(data, control, timestamps),
+            client: SplitClient::new(data, control, timestamps, catalog.clone()),
             catalog,
             status,
             usage: Default::default(),
@@ -85,6 +85,9 @@ impl SplitEndpoint {
     }
 
     fn fixed_peer(&self, session: &AuthenticatedSession) -> bool {
+        if let Host::System { factory, .. } = &self.host {
+            return factory.control.is_operator(&session.remote());
+        }
         self.client
             .data
             .voters
@@ -774,14 +777,16 @@ impl SplitEndpoint {
                     let Host::System { factory, .. } = &self.host else {
                         return Err(unauthorized());
                     };
-                    if node != factory.local.node_id {
-                        return Err(unauthorized());
-                    }
+                    let voters = factory.initial_voters().await?.into_inner();
+                    let local = voters.iter().find(|member| member.node_id == node
+                        && member.worker_id == factory.local.worker_id
+                        && member.pool_id == factory.local.pool_id)
+                        .ok_or_else(unauthorized)?;
                     if operation == Operation::Host {
-                        factory.host_group(&binding.target, true).await?;
-                        return output!((&binding.target, &factory.local));
+                        factory.host_at(&binding.target, local, &voters, true).await?;
+                        return output!((&binding.target, local));
                     }
-                    (factory.local.clone(), factory.voters.to_vec())
+                    (local.clone(), voters)
                 };
                 let spec = DataGroupSpec {
                     group: binding.target.clone(),

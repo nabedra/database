@@ -732,6 +732,8 @@ impl GroupStore {
             {
                 return Err(storage_error_message());
             }
+            #[cfg(test)]
+            self.observe_install_cut("staged", header.applied, generation, &mut scratch)?;
             hook(InstallPoint::BeforeActivation)?;
             let mut activate = WriteBatch::with_capacity_bytes(budget.batch_bytes);
             let mut cost = 512usize;
@@ -768,6 +770,8 @@ impl GroupStore {
             self.pool().durable_write(&scope, activate)?;
             retained = true;
             stage = None;
+            #[cfg(test)]
+            self.observe_install_cut("activated", header.applied, generation, &mut scratch)?;
             hook(InstallPoint::AfterActivation)?;
             sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
             cleanup_files(
@@ -784,6 +788,51 @@ impl GroupStore {
             let _ = fs::remove_file(&path);
         }
         result
+    }
+
+    #[cfg(test)]
+    fn observe_install_cut(
+        &self,
+        phase: &str,
+        incoming: Option<AppliedPosition>,
+        staged_generation: u64,
+        scratch: &mut ByteReservation,
+    ) -> Result<(), ProtocolError> {
+        let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let group = self.identity().group_id;
+        let control = directory.join(format!("native-snapshot-{group}.mode"));
+        let Ok(mode) = fs::read_to_string(&control) else {
+            return Ok(());
+        };
+        let visible = self.pool().snapshot();
+        let applied = self
+            .read_applied(&visible, scratch)?
+            .map(|entry| entry.position);
+        let generation = read_generation(self.pool(), group, b'a')?;
+        let observation = serde_json::json!({
+            "generation": generation,
+            "applied": applied,
+            "staged_generation": staged_generation,
+            "incoming": incoming,
+        });
+        let path = directory.join(format!("native-snapshot-{group}-{phase}.json"));
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, serde_json::to_vec(&observation).unwrap()).unwrap();
+        fs::rename(temporary, path).unwrap();
+        if phase == "staged" && mode == "pause" {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while control.is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot install watchdog expired"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Ok(())
     }
 }
 

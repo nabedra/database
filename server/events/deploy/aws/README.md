@@ -1,11 +1,14 @@
 # Run Events on AWS
 
-The Terraform configuration provisions an HTTPS Application Load Balancer and
-one private EC2 instance and separately managed encrypted EBS volume per broker
-ID. Each broker's private DNS name is stable across host replacements. Start
-with three metadata voters in distinct Availability Zones and create
-production topics with replication factor 3. The OLAP cluster and sink have
-their own hosts, storage and credentials.
+The Terraform configuration in this folder creates an HTTPS Application Load
+Balancer (ALB) and, for each broker ID, one private EC2 instance with its own
+encrypted EBS volume. Terraform manages the volume separately from the
+instance, so you can replace a host and keep its disk. Each broker's private
+DNS name also stays the same when its host is replaced.
+
+Start with three metadata voters in different Availability Zones, and create
+production topics with replication factor 3. The OLAP cluster and the sink run
+on their own hosts, with their own storage and credentials.
 
 ```mermaid
 flowchart LR
@@ -23,109 +26,125 @@ flowchart LR
 
 ## Provision the brokers
 
-1. Supply an existing VPC, at least three private broker subnets, an ALB subnet
-   in each broker zone, a VPC-associated private Route 53 zone, and a client
-   hostname with a matching regional ACM certificate. The private hosts need
-   network access to their regional S3 artifacts, Secrets Manager and SSM. Use
-   SSM for operator sessions. The instance security group allows only the ALB
-   to reach TCP 8080 and other brokers to reach TCP 8081.
-2. Supply an EC2 Nitro AMI compatible with the broker binary. The packaged image
-   builds on Debian 12. For a host install use a compatible Linux AMI with
-   cloud-init, systemd, AWS CLI v2, SSM Agent, Bash, jq, util-linux, XFS tools and
-   the C++ runtime. Publish the binary to an immutable private S3 artifact key
-   and record its SHA-256.
-3. Create one Secrets Manager secret per broker. Use the same cluster UUID,
-   grant and session signing rings, peer CA trust and peer token throughout
-   the cluster. Each broker gets its own private peer credential. Its server
-   certificate must cover `broker-<id>.<peer-zone>` as a DNS SAN. Issue its
-   outgoing client certificate under a trusted peer CA with client-auth usage.
-4. Copy [the input example](terraform.tfvars.example) into a local tfvars file
-   and replace the sample settings. Mark `format_blank_volume=true` only for
-   intended blank disks. Give the lowest metadata voter the genesis flag in
-   its secret for the first deployment. Keep that flag false everywhere else.
-5. Run `terraform init`, review `terraform plan`, and apply the reviewed plan.
-   Confirm the three targets are healthy and inspect the committed metadata
-   voter list through `/v1/admin/groups/metadata`. Clear the genesis flag and
-   formatting flags after bootstrap. Restart the genesis broker with the
-   updated secret once its two peers are healthy.
+1. Bring an existing VPC with at least three private subnets for brokers, an
+   ALB subnet in each broker zone, a private Route 53 zone associated with the
+   VPC, and a client hostname with a matching regional ACM certificate. The
+   private hosts need network access to their regional S3 artifacts, Secrets
+   Manager and SSM. Operators connect through SSM sessions. The instance
+   security group allows only the ALB to reach TCP 8080, and only other brokers
+   to reach TCP 8081.
+2. Choose an EC2 Nitro AMI that can run the broker binary. The packaged image
+   is built on Debian 12. To install on the host instead, use a Linux AMI with
+   cloud-init, systemd, AWS CLI v2, the SSM Agent, Bash, jq, util-linux and the
+   XFS tools. The broker has no C++ dependencies. Upload the binary to a private S3 key that you
+   never overwrite, and record its SHA-256.
+3. Create one Secrets Manager secret per broker. Every secret in the cluster
+   has the same cluster UUID, grant and session signing rings, peer CA and peer
+   token, but each broker gets its own peer credential. A broker's server
+   certificate must list `broker-<id>.<peer-zone>` as a DNS SAN. Issue its
+   outgoing client certificate from a trusted peer CA, with client-auth usage.
+   The [secret shape](#secret-shape) section lists the fields.
+4. Copy [the example inputs](terraform.tfvars.example) to a local tfvars file
+   and replace the sample values. Set `format_blank_volume=true` only for disks
+   you mean to format. For the first deployment, set the genesis flag in the
+   secret of the broker with the lowest ID among the metadata voters, and leave
+   it false everywhere else.
+5. Run `terraform init`, review `terraform plan`, and apply the plan you
+   reviewed. Check that all three targets are healthy, then read the committed
+   metadata voter list from `/v1/admin/groups/metadata`. Once bootstrap is
+   done, clear the genesis flag and the formatting flags. When the genesis
+   broker's two peers are healthy, restart it with the updated secret.
 
-Cloud-init installs the service and records the expected EBS volume ID.
-Every startup checks the disk serial, mounts its filesystem at the broker
-data directory, verifies the artifact checksum, and fetches the current
-secret. It formats an unsigned blank disk only if requested and clears the
-local format flag after mounting. The non-root broker opens its `nabedra-kv`
-store only after its exact data directory is mounted. EBS attachments stop the
-old host before detaching the volume. Terraform protects the registered data disks
-from destruction while they are managed by this configuration.
+Cloud-init installs the service and records which EBS volume ID the host
+should have. On every start, the host checks the disk serial, mounts the
+filesystem at the broker's data directory, verifies the binary's checksum and
+fetches the current secret. It formats a blank disk only when you asked for
+it, and clears the local format flag after mounting. The broker runs as a
+non-root user and opens its `nabedra-kv` store only after its own data
+directory is mounted.
+
+If the store hits a storage fault, the broker stops accepting writes and exits
+with code 75. The systemd unit has `Restart=on-failure`, so the broker restarts
+after 10 seconds and recovers the store when it reopens it. Alert on repeated
+restarts, since they point at a failing disk.
+
+When Terraform moves a volume, it stops the old host before detaching the
+disk. It also refuses to destroy the registered data disks while this
+configuration manages them.
 [Stable EBS device identification](https://docs.aws.amazon.com/ebs/latest/userguide/identify-nvme-ebs-device.html) · [Terraform volume attachment options](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/volume_attachment)
 
-The ALB presents the configured ACM certificate to clients and encrypts
-the connection to the HTTPS target. Broker ingress is limited to
-the ALB's security group. Peer traffic uses mutual TLS with private CA trust,
-plus cluster credential verification at the HTTP layer. Keep peer DNS names
-and the cluster UUID stable during an in-place replacement.
+Clients see the ACM certificate on the ALB, and the ALB also uses HTTPS to
+reach each broker. Brokers accept client traffic only from the ALB's security
+group. Brokers talk to each other over mutual TLS with the private CA, and on
+top of that check the cluster credential on every HTTP request. When you
+replace a host in place, keep its peer DNS name and the cluster UUID.
 [ALB HTTPS target connections](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html)
 
 ### Secret shape
 
-Supply a JSON object with these fields. PEM strings include their line breaks.
+Each secret is a JSON object with these fields. PEM strings keep their line
+breaks.
 
 | Field | Contents |
 | --- | --- |
-| `peer_token` | Shared random cluster token, 32 to 256 printable ASCII characters |
-| `keyring` | `cluster_id` and independent `grant` and `session` signing rings |
-| `initialize_new_cluster` | Boolean, true only for an intentional first genesis |
-| `public_cert`, `public_key` | Server PEM chain and key for the broker's ALB target listener |
-| `peer_ca` | PEM root chain used to verify private client and server connections |
-| `peer_cert`, `peer_key` | Broker-specific peer listener PEM server chain and key |
-| `peer_identity` | PEM client chain and private key used to dial peers |
+| `peer_token` | Random cluster token shared by every broker, 32 to 256 printable ASCII characters |
+| `keyring` | `cluster_id` and separate `grant` and `session` signing rings |
+| `initialize_new_cluster` | Boolean, true only for the broker that starts a brand-new cluster |
+| `public_cert`, `public_key` | PEM server chain and key for the listener the ALB connects to |
+| `peer_ca` | PEM root chain that verifies private client and server connections |
+| `peer_cert`, `peer_key` | PEM server chain and key for this broker's peer listener |
+| `peer_identity` | PEM client chain and private key this broker uses to connect to peers |
 
-Each signing ring is `{"active":"v1","keys":[{"id":"v1","secret_hex":"…","accept_until_ms":…}]}`.
-Provide a full, random 64-character hexadecimal secret and a future
-expiration as epoch milliseconds. Keep secret payloads outside Terraform
-inputs. The broker role only gets its specific secret and binary object.
-The separate backup policy is available as `backup_operator_policy_arn`
-for attachment to an authorized operator role.
+Each signing ring looks like
+`{"active":"v1","keys":[{"id":"v1","secret_hex":"…","accept_until_ms":…}]}`.
+Use a random secret of 64 hexadecimal characters and an expiry in the future,
+in epoch milliseconds.
+
+Keep secret values out of Terraform inputs. Each broker's role can read only
+its own secret and the binary. A separate backup policy is exported as
+`backup_operator_policy_arn`, for you to attach to an authorized operator role.
 
 ## Scale and replace brokers
 
-For a new broker, allocate a new ID, its own EBS volume and certificate,
-and the bootstrap config for the existing cluster. Keep its genesis flag
-false. Register it with `add_broker` if the live catalog lacks that ID. Use
-`rebalance` or select placement with `move_partition` and inspect the
-published voters and applied indexes. Move metadata voters separately
-with `move_metadata`. Partitions continue to use their existing IDs.
+**Adding a broker.** Give it a new ID, its own EBS volume and certificate, and
+a bootstrap config that points at the existing cluster. Keep its genesis flag
+false. If the live catalog doesn't know that ID yet, register it with
+`add_broker`. Then spread data onto it with `rebalance`, or place partitions
+yourself with `move_partition`, and check the published voters and applied
+indexes. Metadata voters move separately, with `move_metadata`. Partitions keep
+their IDs throughout.
 
-For a planned retirement, wait for `drain` to complete and verify each
-group's replacement membership has committed. Then set
-`provision_instance=false` for the retired ID and apply. Keep its map entry
-to retain the data volume.
+**Retiring a broker.** Wait for `drain` to finish, and check that every group's
+new membership has committed. Then set `provision_instance=false` for that ID
+and apply. Keep its entry in the map so that its data volume stays.
 
-For a failed host with usable EBS, verify the previous host is stopped and
-fenced. Replace that broker's EC2 instance in its existing Availability Zone
-and reattach its recorded volume. The initial metadata and topic data
-reopen from the same disk. Verify its ready response and Raft applied indexes
-before the next maintenance action. Never force-detach a live disk.
+**A failed host whose EBS volume is fine.** First make sure the old host is
+stopped and fenced. Then replace that broker's EC2 instance in the same
+Availability Zone and reattach its recorded volume. The broker reopens its
+metadata and topic data from that disk. Check its ready response and its Raft
+applied indexes before the next maintenance step. Never force-detach a disk
+that is still attached to a live host.
 
-For a lost disk or zone, keep the surviving quorum running. Add a broker
-with a new ID and fresh volume in the recovered or replacement zone. Move
-the affected metadata and partition replicas to the added broker while
-the surviving quorum is available. Wait for the learner to catch up and
-confirm the committed replacement covers three zones again. Remove the
-unavailable broker from traffic after its groups have replacements.
-If an affected group has lost quorum, attempt to recover its original disks
-from their existing hosts or volumes. If that fails, restore a verified
-backup into a fresh cluster. Restarting an empty group cannot recover its
-previous committed history.
+**A lost disk or zone.** Keep the surviving quorum running, and add a broker
+with a new ID and a fresh volume in the recovered or replacement zone. While
+the quorum is still available, move the affected metadata and partition
+replicas to the new broker. Wait for it to catch up, and confirm that the
+committed membership spans three zones again. Only then take the unavailable
+broker out of traffic.
+
+If a group has lost quorum, first try to recover its original disks from their
+hosts or volumes. If that fails, restore a verified backup into a fresh
+cluster. Restarting an empty group can't bring back its committed history.
 
 ## Back up and restore
 
-Export while metadata membership is stable and the groups have quorum.
-Run the export from a broker or authorized private host using the broker
-binary and a config with private peer credentials. Allocate scratch space
-for both broker snapshot transfer and the export bundle. The CLI compares
-layout before and after export and records a committed cut per group. The
-cuts represent partition histories at independently applied indexes.
+Take backups while metadata membership is stable and every group has quorum.
+Run the export on a broker or another authorized private host, using the
+broker binary and a config that has private peer credentials. The host needs
+scratch space for the snapshots it receives from brokers and for the bundle
+itself. The CLI compares the layout before and after the export, and records a
+committed cut for each group. Each group's cut is taken at that group's own
+applied index, so together the cuts don't describe a single moment in time.
 
 ```sh
 bundle=/srv/events-backup/orders-2026-11-17T2000
@@ -138,70 +157,94 @@ aws s3 cp "$bundle/manifest.json" "$destination/manifest.json" \
   --sse aws:kms --sse-kms-key-id "$backup_kms_key_arn"
 ```
 
-Use a unique prefix per run and upload the manifest after the images. Use a
-versioned encrypted bucket and retain backup policy separately from event
-retention. Monitor backup age and record the partition cuts and export
-duration. Restore rehearsals cover download and checksum verification,
-provisioning and mount time, election, and visibility of expected events and
-checkpoints.
+Give every run its own prefix, and upload the manifest last, after the images.
+Store backups in a versioned, encrypted bucket with a retention policy that is
+separate from event retention. Monitor how old the latest backup is, and record
+each run's partition cuts and export time. When you rehearse a restore, time
+the download and checksum verification, provisioning and mounting, leader
+election, and the point at which the expected events and checkpoints are
+readable.
 
-For recovery, download the complete bundle. Prepare an offline target with
-empty mounted disks, a new cluster UUID and keys, and the broker IDs,
-placements and zones recorded in the manifest. Original broker IDs, zones
-and metadata voters must match the manifest. Private DNS can point to the
-new hosts. Set `start_broker=false` for each new EC2 instance so cloud-init
-mounts and configures its disk without starting the broker. Use a separate client hostname until recovery is verified. Keep the
-target genesis flag false and run on every target broker.
+To recover, download the whole bundle and prepare an offline target cluster.
+It needs empty mounted disks, a new cluster UUID and new keys, and the same
+broker IDs, placements and zones that the manifest records. The original
+broker IDs, zones and metadata voters must match the manifest, but private DNS
+can point at the new hosts. Set `start_broker=false` for each new EC2 instance,
+so that cloud-init mounts and configures the disk without starting the broker.
+Use a separate client hostname until you have verified the recovery. Leave the
+genesis flag false on the target, and run restore on every target broker:
 
 ```sh
 nabedra-events restore --config "$config" --backup "$downloaded_bundle"
 ```
 
-Run restore as the same host user that owns the broker disk. Enable and
-start `nabedra-events.service` on all restored targets, confirm every group is healthy and replay representative
-checkpoint ranges against the expected cuts before pointing client DNS at
-the target. Use newly issued credentials. Record realized RPO from the cuts
-and RTO from the start of recovery through verified client availability.
+Run restore as the same user that owns the broker's disk. Then enable and
+start `nabedra-events.service` on every restored broker, check that every group
+is healthy, and replay representative checkpoint ranges against the expected
+cuts. Only then point client DNS at the new cluster, and issue new credentials
+for it. Record the actual RPO from the cuts, and the RTO from the start of
+recovery until clients can use the cluster again.
 
 ## Rotate credentials and upgrade
 
-Add the next grant or session signing key to every broker's accepted keys
-while the original key stays active. Roll that configuration across brokers
-one at a time. Switch the active ID in a second roll and keep the prior key
-usable until grants and deliveries signed by it have expired, including
-clock skew. Reissue scoped grants before their expiration. Rotate peer
-certificates in the same order, by trusting both CAs first, rolling the new
-broker and client certificates, then removing the old CA. The shared peer
-token is single-valued. Rotating it requires a coordinated service restart.
-Schedule that restart with current backups and stop producer admission
-until broker quorum returns.
+**Signing keys.** Rotating a grant or session signing key takes two rolling
+restarts. In the first, add the new key to every broker's accepted keys while
+the old key stays active, one broker at a time. In the second, switch the
+active ID to the new key. Keep the old key accepted until every grant and
+delivery it signed has expired, plus an allowance for clock skew. Reissue
+scoped grants before they expire.
 
-For a binary upgrade, verify mixed-version wire and disk behavior on a
-separate cluster, including snapshot transfer and retained-volume reopen.
-Back up before the roll. Update the artifact key and checksum for one
-broker at a time and explicitly replace that EC2 instance, or stage the
-verified binary on that host using its operator session. User data changes
-alone leave running hosts in place. Keep the broker's volume and ID, then
-wait for its target health, leader elections and applied indexes to settle
-before replacing the next. If the new version writes an incompatible disk
-format, restore the prior binary and its compatible backup to a fresh target.
+**Peer certificates.** Roll these out in the same order. First trust both the
+old and the new CA, then roll out the new server and client certificates, and
+finally remove the old CA.
 
-## Monitor service and size disks
+**Peer token.** The shared peer token holds only one value, so changing it
+means restarting every broker together. Schedule that restart when your
+backups are current, and stop producers from publishing until the brokers have
+quorum again.
 
-Probe `/readyz` and sample operator status for individual groups and
-partitions. The ALB can still serve healthy routes when a partition lacks
-quorum. Collect publisher and subscriber latency, overload and unknown
-outcomes, per-broker request load, CPU and memory, leader and follower
-applied indexes, partition tail minus subscription checkpoint, failed
-backups and volume headroom. Track clock offset across brokers. Use ALB
-latency and target health alongside EC2 and EBS I/O, networking and disk
-telemetry. Track inter-zone transfers when sizing RF3. Report performance
-and recovery targets per workload and verify them under the intended
-retention, replica count and failure profile.
+**Binary upgrades.** First test the new version alongside the old one on a
+separate cluster, including the wire protocol, the disk format, snapshot
+transfer and reopening a kept volume. Take a backup before you start. Then,
+one broker at a time, update the artifact key and checksum and either replace
+that EC2 instance explicitly or put the verified binary on the host through an
+operator session. Changing the user data alone doesn't touch hosts that are
+already running. Keep each broker's volume and ID, and wait for its target
+health, leader elections and applied indexes to settle before you move on to
+the next broker. If the new version writes a disk format the old one can't
+read, roll back by restoring the old binary and a compatible backup to a fresh
+cluster.
 
-Estimate retained encoded bytes per partition from payload distribution,
-event rate and retention time. Multiply by the assigned replica count.
-Measure additional space and I/O for storage compaction, journal segments,
-snapshot staging and learner catch-up. Leave enough headroom for a
-replacement to catch up while producers continue. Add partitions for
-independently ordered keys when a single partition leader saturates.
+## Monitor the service and size disks
+
+Probe `/readyz`, and sample the operator status of individual groups and
+partitions as well. The ALB can keep serving healthy routes while one
+partition has lost quorum, so a healthy load balancer doesn't mean every
+partition is up.
+
+Collect these metrics:
+
+- publish and subscribe latency, overload responses and unknown outcomes
+- request load, CPU and memory per broker
+- leader and follower applied indexes
+- lag, meaning a partition's tail minus a subscription's checkpoint
+- failed backups and free space on each volume
+- clock offset between brokers
+
+Read them alongside the ALB's latency and target health and the EC2 and EBS
+I/O, network and disk metrics. Track traffic between zones when you size RF3.
+Measure performance and recovery targets for each workload, under the
+retention, replica count and failure scenarios you actually plan to run.
+
+Brokers refuse publishes with HTTP 507 when free space on the data volume drops
+below `min_free_disk_bytes` (128 MiB by default) plus the room the store keeps
+for two journal segments and one compaction. At default settings that adds up
+to 576 MiB. Checkpoints and replication keep working below that line.
+
+To size a disk, estimate the encoded bytes each partition retains from the
+payload sizes, event rate and retention time, then multiply by the number of
+replicas assigned to the broker. On top of that, measure the extra space and
+I/O used by storage compaction, journal segments, snapshot staging and replicas
+catching up. Leave enough headroom for a replacement broker to catch up while
+producers keep publishing. When a single partition leader saturates, add
+partitions for keys that can be ordered independently.

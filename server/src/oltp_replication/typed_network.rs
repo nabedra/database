@@ -3,7 +3,7 @@
 //! Current process enrollment remains a transport concern, not a Raft node ID.
 use super::{
     authority::consensus::Applied,
-    entry::{LogId, OwnedRaftEntry, Vote},
+    entry::{LogId, OwnedRaftEntry, Payload, Vote},
     hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
@@ -206,7 +206,9 @@ impl<C: TypedConfig> TypedNetwork<C> {
         }
         let group = self.factory.resident.identity();
         #[cfg(test)]
-        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id) {
+        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id)
+            || crate::oltp_growth_acceptance::data_raft_isolated(group.group_id)
+        {
             return Err(unavailable());
         }
         let (purpose, traffic) = header.route(&group.kind);
@@ -338,7 +340,7 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         rpc.entries.truncate(encoded.len());
         let previous = rpc.prev_log_id;
         let last = rpc.last_log_id();
-        let (payload, entries, target) = match encoded.len() {
+        let (payload, entries, mut target) = match encoded.len() {
             0 => (None, None, RequestTarget::from(self.node.worker_id)),
             1 => (
                 encoded.pop(),
@@ -356,6 +358,12 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 )
             }
         };
+        if rpc.entries.iter().any(|entry| match entry.payload() {
+            Payload::Normal(command) => command.payload().is_ok_and(C::requires_index_reclamation),
+            _ => false,
+        }) {
+            target = RequestTarget::Feature(self.node.worker_id, PeerFeature::IndexReclamation);
+        }
         let header = Header {
             from_node: self.factory.local.node_id,
             to_node: self.target,
@@ -658,6 +666,11 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
+            #[cfg(test)]
+            if crate::oltp_growth_acceptance::data_raft_isolated(self.resident.identity().group_id)
+            {
+                return Err(unavailable());
+            }
             if session.purpose() == Purpose::Snapshot {
                 return self.snapshot_preflight(session, bytes);
             }

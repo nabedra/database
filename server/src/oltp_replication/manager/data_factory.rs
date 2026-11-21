@@ -154,7 +154,6 @@ impl DataGroupFactory {
         if session.recovery_only()
             || session.purpose() != Purpose::GroupLifecycle
             || session.group() != self.control.identity()
-            || head.to_node != self.local.node_id
             || head.payload_bytes == 0
             || head.payload_bytes > PAYLOAD as u64
         {
@@ -175,7 +174,7 @@ impl DataGroupFactory {
         }
         Ok(current.ready.view.authority())
     }
-    fn validate(&self, request: &Request) -> Result<(), ProtocolError> {
+    fn validate(&self, request: &Request, voters: &[ReplicaMember]) -> Result<(), ProtocolError> {
         let spec = &request.spec;
         spec.group.validate().map_err(|_| invalid())?;
         spec.authority.validate().map_err(|_| invalid())?;
@@ -186,7 +185,7 @@ impl DataGroupFactory {
             || spec.transition_id.is_nil()
             || spec.schema_epoch == 0
             || spec.routing_epoch == 0
-            || request.voters != self.voters
+            || request.voters.as_ref() != voters
         {
             return Err(invalid());
         }
@@ -201,8 +200,8 @@ impl DataGroupFactory {
         }
         Ok(())
     }
-    async fn host(&self, spec: &DataGroupSpec) -> Result<(), ProtocolError> {
-        self.host_group(&spec.group, true).await
+    async fn initial_voters(&self) -> Result<Page<ReplicaMember>, ProtocolError> {
+        initial_voters(&self.control, &self.rpc, &self.voters).await
     }
     pub(crate) async fn start_retained(&self, strict: bool) -> Result<(), ProtocolError> {
         let revision = self
@@ -269,11 +268,35 @@ impl DataGroupFactory {
         group: &GroupIdentity,
         initialize: bool,
     ) -> Result<(), ProtocolError> {
+        self.host_at(group, &self.local, &self.voters, initialize).await
+    }
+
+    async fn host_at(&self, group: &GroupIdentity, local: &ReplicaMember, voters: &[ReplicaMember], initialize: bool) -> Result<(), ProtocolError> {
         let _start = self.starts.lock().await;
         let running = start_data_group(
-            &self.manager, &self.config, &self.pool, group, &self.local, &self.voters, initialize,
+            &self.manager, &self.config, &self.pool, group, local, voters, initialize,
         ).await?;
-        self.wire_participant(group, self.local.node_id, running)
+        self.wire_participant(group, local.node_id, running)
+    }
+    pub(crate) async fn host_replacement_data(
+        &self,
+        record: &crate::oltp_replication::authority::control::ReplacementRecord,
+    ) -> Result<(), ProtocolError> {
+        for plan in &record.groups {
+            let group = &plan.expected.identity;
+            if !matches!(group.kind, GroupKind::Data { .. }) {
+                continue;
+            }
+            let running = self.manager.start_data(
+                self.pool.group(group.clone()).await?,
+                plan.learner.clone(),
+                plan.old.iter().chain(std::iter::once(&plan.learner))
+                    .map(|member| (member.node_id, member.clone())).collect(),
+                self.config.clone(),
+            ).await?;
+            self.wire_participant(group, plan.learner.node_id, running)?;
+        }
+        Ok(())
     }
     fn wire_participant(
         &self,
@@ -295,14 +318,14 @@ impl DataGroupFactory {
         }
         Ok(())
     }
-    async fn activate(&self, spec: &DataGroupSpec) -> Result<Membership, ProtocolError> {
-        let running = self.manager.hosted_data(&spec.group, self.local.node_id)?;
+    async fn activate(&self, spec: &DataGroupSpec, local: &ReplicaMember, voters: &[ReplicaMember]) -> Result<Membership, ProtocolError> {
+        let running = self.manager.hosted_data(&spec.group, local.node_id)?;
         // Only the leader can produce this observation after real ReadIndex.
         let started = tokio::time::Instant::now();
         let observed = running.observe_membership().await;
         tracing::debug!(group_id = %spec.group.group_id, node = self.local.node_id, stage = "membership_read", ms = started.elapsed().as_millis(), ok = observed.is_ok(), "initial Data activation");
         let observation = observed?;
-        if observation.replicas() != self.voters.as_ref() {
+        if observation.replicas() != voters {
             return Err(invalid());
         }
         let participant = ParticipantHandle::new(
@@ -443,21 +466,24 @@ impl Endpoint for DataGroupFactory {
                         Ok((request, owner))
                     })
                     .await?;
-                self.validate(&request)?;
+                let voters = self.initial_voters().await?;
+                self.validate(&request, &voters)?;
+                let local = voters.iter().find(|member| member.worker_id == self.local.worker_id
+                    && member.pool_id == self.local.pool_id && member.node_id == header.to_node).ok_or_else(invalid)?;
                 if request.spec.authority != current {
                     return Err(unauthorized());
                 }
                 let output = match header.method {
                     Method::Host => {
-                        self.host(&request.spec).await?;
+                        self.host_at(&request.spec.group, local, &voters, true).await?;
                         self.manager.resources().encode_in(
                             ByteClass::Progress,
-                            &(&request.spec, &self.local),
+                            &(&request.spec, local),
                             PAYLOAD,
                         )?
                     }
                     Method::Activate => {
-                        let membership = self.activate(&request.spec).await?;
+                        let membership = self.activate(&request.spec, local, &voters).await?;
                         self.manager.resources().encode_in(
                             ByteClass::Progress,
                             &membership,
@@ -476,7 +502,7 @@ impl Endpoint for DataGroupFactory {
             let reply = self.manager.resources().encode_in(
                 ByteClass::Progress,
                 &ReplyHeader {
-                    node: self.local.node_id,
+                    node: header.to_node,
                     nonce: session.nonce(),
                     bytes: payload.as_ref().map_or(0, |bytes| bytes.len() as u64),
                     error,
@@ -521,15 +547,20 @@ impl DataGroupClient {
             _owner: owner,
         }))
     }
+    pub(crate) async fn initial_voters(&self, control: &ControlHandle, rpc: &ControlClient) -> Result<Page<ReplicaMember>, ProtocolError> {
+        initial_voters(control, rpc, &self.voters).await
+    }
+
     async fn call<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         member: &ReplicaMember,
         method: Method,
         spec: DataGroupSpec,
+        voters: &Page<ReplicaMember>,
     ) -> Result<(T, Arc<ScratchLease>), ProtocolError> {
         let request = Request {
             spec,
-            voters: self.voters.clone(),
+            voters: voters.clone(),
         };
         let shared = self.manager.resources().clone();
         let encode = shared.clone();
@@ -599,8 +630,9 @@ impl DataGroupClient {
         spec: DataGroupSpec,
         control: &ControlHandle,
         ready: &[WorkerIdentity],
+        voters: &Page<ReplicaMember>,
     ) -> Result<(), ProtocolError> {
-        for member in self.voters.iter() {
+        for member in voters.iter() {
             if !ready.iter().any(|worker| worker.worker_id == member.worker_id)
                 || control.pool_drain_blocks_placement(member.pool_id).await?
             {
@@ -614,7 +646,7 @@ impl DataGroupClient {
             async move {
                 let started = tokio::time::Instant::now();
                 let verified = self
-                    .call::<(DataGroupSpec, ReplicaMember)>(&member, Method::Host, spec.clone())
+                    .call::<(DataGroupSpec, ReplicaMember)>(&member, Method::Host, spec.clone(), voters)
                     .await
                     .and_then(|((observed, hosted), _)| {
                         if observed == spec && hosted == member {
@@ -642,24 +674,25 @@ impl DataGroupClient {
         };
         // The seed initializes after the follower acknowledgements. Limit
         // parallel starts independently of the number of configured voters.
-        futures_util::stream::iter(self.voters.iter().skip(1).map(&host))
+        futures_util::stream::iter(voters.iter().skip(1).map(&host))
             .buffer_unordered(2)
             .try_for_each(|()| async { Ok(()) })
             .await?;
-        host(self.voters.first().ok_or_else(invalid)?).await
+        host(voters.first().ok_or_else(invalid)?).await
     }
     pub(crate) async fn activate(
         &self,
         spec: DataGroupSpec,
+        voters: &Page<ReplicaMember>,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last = unavailable();
         loop {
-            for member in self.voters.iter() {
+            for member in voters.iter() {
                 let started = tokio::time::Instant::now();
                 let completed = tokio::time::timeout_at(
                     deadline,
-                    self.call(member, Method::Activate, spec.clone()),
+                    self.call(member, Method::Activate, spec.clone(), voters),
                 )
                 .await;
                 tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, ms = started.elapsed().as_millis(), ok = completed.as_ref().is_ok_and(Result::is_ok), "initial Data activation RPC");
@@ -683,7 +716,7 @@ impl DataGroupClient {
                     }
                 };
                 if observed.group != spec.group
-                    || observed.replicas != self.voters
+                    || &observed.replicas != voters
                     || !observed.replicas.iter().any(|replica| replica == member)
                     || observed.applied_at.index == 0
                 {
@@ -705,6 +738,21 @@ impl DataGroupClient {
         }
     }
 }
+pub(crate) async fn initial_voters(
+    control: &ControlHandle,
+    rpc: &ControlClient,
+    genesis: &Page<ReplicaMember>,
+) -> Result<Page<ReplicaMember>, ProtocolError> {
+    if control.system_placement_changed() {
+        let routes = rpc.replica_routes(control.identity()).await?;
+        Page::new(routes.members.clone()).map_err(|_| invalid())
+    } else {
+        // Preserve the node numbering of existing installations until a
+        // system replacement changes their committed placement.
+        Ok(genesis.clone())
+    }
+}
+
 fn initial_placement_unavailable() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::StorageUnavailable,

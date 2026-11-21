@@ -16,6 +16,7 @@ import time
 
 from oltp_direct_acceptance import admin_owner, d11_drop, dump
 from oltp_direct_cluster import Rf3Cluster, WORKERS, operation, uid
+from oltp_runtime_acceptance import evidence, wait_until
 from oltp_transaction_acceptance import OPERATIONS, REQUESTS, Transactions, batch, passed, rows
 from oltp_terminal_copy_acceptance import wait_for
 from nabedra.validation import schema_to_wire
@@ -299,8 +300,13 @@ def o08(fixture):
         passed('O08', 'fresh-snapshot-retry',
                'An already planned queued upsert changed the head while a direct update was paused before proposal. The stale proposal lost and the same identity recomputed against the new head.')
     else:
-        not_run('O08', 'fresh-snapshot-retry', 'No automatic retry after a stale version was forced on the queued-only path.')
-    not_run('O08', 'storage-reservations', 'The RF3 process fixture has no deterministic admission gate for competing pool-space reservations.')
+        verify_queued_stale_plan(fixture, table)
+        not_run('O08', 'fresh-snapshot-retry',
+                'The queued coordinator terminally aborts a forced stale Prepare at attempt 1, '
+                'and a retry returns that abort. No same-identity fresh snapshot path exists.')
+    not_run('O08', 'storage-reservations',
+            'The pool can report filesystem headroom and ENOSPC, but it has no owned disk-byte '
+            'reservations for competing writes. A measured race requires that admission mechanism.')
 
 
 def direct_proposal_paths(fixture, request_id):
@@ -341,6 +347,41 @@ def verify_snapshot_retry(fixture, table):
     assert fixture.data(point(table, 'get', key=1)) == dict(id=1, category=88, value=90)
     assert exchange(fixture, direct) == result
 
+
+def verify_queued_stale_plan(fixture, table):
+    stale = point(table, 'update', key=1, values={'value': 90})
+    request = stale['request_id']
+    fixture.select(request, {'participants': True, 'decision': False})
+    before = fixture.data(point(table, 'get', key=1))
+    fixture.admit(stale)
+    _, participants = fixture.reached(request, 'participants')
+    assert len(participants) == 1, participants
+    winner = dict(before, category=88, value=89)
+    try:
+        assert fixture.data(point(table, 'upsert', row=winner), 'api2') is None
+    finally:
+        fixture.release(request, 'participants')
+    _, decision = fixture.reached(request, 'decision')
+    assert decision['txn'] == {'request_id': request, 'attempt': 1}, decision
+    assert decision['request']['request_id'] == request
+
+    def terminal_failure():
+        status, reply = fixture.receipt(request)
+        if status == 200 and reply['state'] in ('failed', 'succeeded'):
+            assert reply['state'] == 'failed' and reply['result'] is None, reply
+            return reply
+        assert status in (200, 503), (status, reply)
+        return None
+
+    terminal = wait_until(terminal_failure, 'queued stale Prepare terminal abort', timeout=30)
+    error = {'code': 'conflict', 'message': 'transaction preparation conflicted with an existing version',
+             'outcome': 'not_applied'}
+    assert terminal['error'] == error, terminal
+    assert exchange(fixture, stale, 'api2') == (409, {'request_id': request, 'error': error})
+    assert fixture.data(point(table, 'get', key=1)) == winner
+    evidence('O08', 'queued-stale-prepare-terminal-abort', request_id=request,
+             snapshot=participants[0]['read_ts'], attempted_version=before, resulting_row=winner,
+             decision=decision)
 
 
 def split_table(fixture, table):

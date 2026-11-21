@@ -233,6 +233,15 @@ impl<C: TypedConfig> TypedNetwork<C> {
                 if reply.offset != offset || reply.installed_vote.is_some() {
                     return Err(invalid("snapshot chunk acknowledgement differs"));
                 }
+                #[cfg(test)]
+                if current == 0 {
+                    crate::oltp_runtime::recovery_tests::maintenance::hold_snapshot(
+                        self.factory.resident.identity().group_id,
+                        offset,
+                        file.bytes,
+                    )
+                    .await;
+                }
             }
             let checksum = Digest::from_bytes(digest.finalize().into());
             let reply = self

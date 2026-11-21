@@ -28,6 +28,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::open(None).await
+    }
+
+    async fn open(fs: Option<&nabedra_kv::fs::FaultFs>) -> Self {
         let shared = WorkerSharedResources::new(
             1,
             WorkerResources::default(),
@@ -42,7 +46,19 @@ impl Fixture {
             worker_id: Uuid::new_v4(),
             pool_id: Uuid::new_v4(),
         };
-        let pool = OltpPool::open_development(&dir.0, identity.clone(), shared.clone()).unwrap();
+        let pool = match fs {
+            Some(fs) => {
+                fs.create_dir_all_durable(&dir.0);
+                OltpPool::open_development_on(
+                    &dir.0,
+                    identity.clone(),
+                    shared.clone(),
+                    Arc::new(fs.clone()),
+                )
+            }
+            None => OltpPool::open_development(&dir.0, identity.clone(), shared.clone()),
+        }
+        .unwrap();
         let table = Uuid::new_v4();
         let group = pool
             .group(GroupIdentity {
@@ -463,6 +479,165 @@ fn aborted() -> TxnDecision {
     }
 }
 
+#[tokio::test]
+async fn o11_o12_reclaim_reopens_mid_page_sequence_and_releases_run_bytes() {
+    index_reclamation_storage_evidence().await;
+}
+
+pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
+    use nabedra_kv::fs::{FaultFs, Fs, OpenMode};
+    let fs = FaultFs::new();
+    let mut f = Fixture::open(Some(&fs)).await;
+    let retired = Uuid::from_u128(1);
+    let live = Uuid::from_u128(2);
+    let index_key = |id, primary| MvccKey::IndexEntry {
+        table_id: f.table,
+        index_id: id,
+        values: Page::new(vec![super::super::index::IndexValue::Int64(1)]).unwrap(),
+        primary_key: Key::Int64(primary),
+    };
+    let live_key = index_key(live, 0);
+    let mut writes = (0..65)
+        .map(|id| PreparedWrite {
+            key: index_key(retired, id),
+            expected_version: None,
+            change: f.put(serde_json::json!({"cover":"x".repeat(4096)})),
+        })
+        .collect::<Vec<_>>();
+    writes.push(PreparedWrite {
+        key: live_key.clone(),
+        expected_version: None,
+        change: f.put(serde_json::json!({"cover":"live"})),
+    });
+    let plan = f.plan(10, &[writes.clone()]);
+    assert!(matches!(
+        f.prepare(&plan, 0, writes).await,
+        ParticipantReply::PreparedPage { .. }
+    ));
+    f.seal(&plan).await;
+    f.resolve(&plan, committed(11), 128).await;
+    let run_bytes = |fs: &FaultFs, path: &std::path::Path| -> u64 {
+        fs.list(&path.join("kv/runs"))
+            .unwrap()
+            .iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "run"))
+            .map(|path| fs.open(path, OpenMode::Read).unwrap().len().unwrap())
+            .sum()
+    };
+    async fn flush_and_compact(f: &Fixture) {
+        let pool = f.machine.store.pool().clone();
+        tokio::task::spawn_blocking(move || {
+            pool.kv_store().flush().unwrap();
+            pool.kv_store().compact().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    flush_and_compact(&f).await;
+    let before = run_bytes(&fs, &f._dir.0);
+    assert!(
+        before >= 256 << 10,
+        "retired payload should already reside on runs"
+    );
+    let reclaim = index_reclaim::ReclaimIndex {
+        authority: f.authority,
+        catalog_group_id: f.catalog_group_id,
+        table_id: f.table,
+        index_id: retired,
+        retired_at: ts(15),
+        safe_ts: ts(16),
+        routing_version: None,
+    };
+    assert_eq!(
+        f.submit(ParticipantCommand::ReclaimIndex(
+            index_reclaim::ReclaimIndex {
+                safe_ts: reclaim.retired_at,
+                ..reclaim
+            }
+        ))
+        .await,
+        ParticipantReply::Rejected(Fault::InvalidBinding)
+    );
+    let command = ParticipantCommand::ReclaimIndex(reclaim);
+    assert_eq!(
+        f.submit(command.clone()).await,
+        ParticipantReply::IndexReclaimed {
+            deleted: 32,
+            complete: false
+        }
+    );
+    fs.halt();
+    let fs = fs.crash();
+    let identity = f.machine.store.pool().identity().clone();
+    let group = f.machine.store.identity().clone();
+    let Fixture {
+        machine,
+        shared,
+        authority,
+        index,
+        table,
+        catalog_group_id,
+        _dir,
+    } = f;
+    drop(machine);
+    let pool =
+        OltpPool::open_development_on(&_dir.0, identity, shared.clone(), Arc::new(fs.clone()))
+            .unwrap();
+    let mut f = Fixture {
+        machine: ParticipantMachine::new(pool.retained_group(group).await.unwrap()).unwrap(),
+        shared,
+        authority,
+        index,
+        table,
+        catalog_group_id,
+        _dir,
+    };
+    let mut deleted = 0;
+    for _ in 0..4 {
+        let reply = f.submit(command.clone()).await;
+        let ParticipantReply::IndexReclaimed {
+            deleted: count,
+            complete,
+        } = reply
+        else {
+            panic!("reclamation did not resume after reopening the durable cut: {reply:?}");
+        };
+        assert!(count <= 32);
+        deleted += count;
+        flush_and_compact(&f).await;
+        if complete {
+            break;
+        }
+    }
+    assert_eq!(
+        deleted, 98,
+        "the first 32 of 65 heads and 65 versions survived the crash as deleted"
+    );
+    let visible: serde_json::Value = serde_json::from_slice(
+        f.machine
+            .read_at(ts(16), live_key)
+            .await
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(visible["value"]["value"]["cover"], "live");
+    assert_eq!(
+        f.submit(command).await,
+        ParticipantReply::IndexReclaimed {
+            deleted: 0,
+            complete: true
+        }
+    );
+    let after = run_bytes(&fs, &f._dir.0);
+    assert!(
+        after <= 64 << 10,
+        "run bytes after reclamation: {after}, before: {before}"
+    );
+    (before, after)
+}
+
 /// O16/O21/O28 storage assertions. Catalog/Status authority is modeled here;
 /// distributed split publication requires its separate production oracle.
 #[tokio::test]
@@ -509,9 +684,10 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         }
     }
     let mut f = Fixture::new().await;
+    let index_id = Uuid::new_v4();
     let index_key = MvccKey::IndexEntry {
         table_id: f.table,
-        index_id: Uuid::new_v4(),
+        index_id,
         values: Page::new(vec![super::super::index::IndexValue::Int64(1)]).unwrap(),
         primary_key: Key::Int64(1),
     };
@@ -532,6 +708,16 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
             key: index_key.clone(),
             expected_version: None,
             change: f.put(serde_json::json!({"id":1})),
+        },
+        PreparedWrite {
+            key: MvccKey::IndexEntry {
+                table_id: f.table,
+                index_id,
+                values: Page::new(vec![super::super::index::IndexValue::Int64(1)]).unwrap(),
+                primary_key: Key::Int64(4),
+            },
+            expected_version: None,
+            change: f.put(serde_json::json!({"id":4})),
         },
     ];
     writes.sort_by(|a, b| super::compare_keys(&a.key, &b.key));
@@ -731,6 +917,20 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     assert_eq!(statement.split_id, bindings[0].split_id);
     assert_eq!(statement.read_ts, ts(12));
     assert_eq!(f.submit(freeze).await, frozen, "lost fence reply");
+    let reclaim = index_reclaim::ReclaimIndex {
+        authority: f.authority,
+        catalog_group_id: f.catalog_group_id,
+        table_id: f.table,
+        index_id,
+        retired_at: ts(11),
+        safe_ts: ts(12),
+        routing_version: None,
+    };
+    assert_eq!(
+        f.submit(ParticipantCommand::ReclaimIndex(reclaim)).await,
+        ParticipantReply::Rejected(Fault::Incomplete),
+        "even a post-retirement split must hold its source image stable"
+    );
     assert_eq!(
         f.submit(finish_cancelled).await,
         ParticipantReply::SplitSourceFinished(aborted),
@@ -913,7 +1113,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     assert!(page_index > 1, "source must adapt pages to byte budget");
     assert_eq!(
         totals,
-        [3, 1],
+        [3, 2],
         "row, tombstone and index must stay with primary span"
     );
     eprintln!("split storage stage=scalar_comparison");
@@ -999,6 +1199,33 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         11,
         "old pinned source survives"
     );
+    for child in &mut children {
+        let reclaim = index_reclaim::ReclaimIndex {
+            routing_version: Some(ts(15)),
+            ..reclaim
+        };
+        assert_eq!(
+            child
+                .apply(&f.shared, ParticipantCommand::ReclaimIndex(reclaim))
+                .await,
+            ParticipantReply::Rejected(Fault::Incomplete)
+        );
+        assert_eq!(
+            child
+                .apply(
+                    &f.shared,
+                    ParticipantCommand::ReclaimIndex(index_reclaim::ReclaimIndex {
+                        safe_ts: ts(15),
+                        ..reclaim
+                    })
+                )
+                .await,
+            ParticipantReply::IndexReclaimed {
+                deleted: 2,
+                complete: true
+            }
+        );
+    }
 }
 
 /// Deterministic participant-storage evidence. The Status proof is modeled;

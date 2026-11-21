@@ -217,6 +217,7 @@ pub(crate) struct ForwardedControl {
     manager: Arc<HostedGroupManager>,
     local: ManagedControl,
     pins: Arc<BTreeSet<Digest>>,
+    directory: Option<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     read_batch: read_batch::ReadBatch,
     _owner: Arc<ScratchLease>,
 }
@@ -244,10 +245,22 @@ impl ForwardedControl {
             manager,
             local,
             pins,
+            directory: None,
             read_batch: read_batch::ReadBatch::default(),
             _owner: owner,
         }))
     }
+    pub(crate) fn registered(
+        manager: Arc<HostedGroupManager>,
+        local: ManagedControl,
+        pins: BTreeSet<Digest>,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        let mut forwarding = Self::new(manager, local, pins)?;
+        Arc::get_mut(&mut forwarding).ok_or_else(invalid)?.directory = Some(directory);
+        Ok(forwarding)
+    }
+
     async fn forwarded<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         operation: Operation,
@@ -307,9 +320,9 @@ impl ForwardedControl {
             if received.group() != group
                 || received.purpose() != Purpose::ControlDelegation
                 || received.remote_identity().worker_id != member.worker_id
-                || !self
-                    .pins
-                    .contains(&received.remote_identity().certificate_sha256)
+                || !self.directory.as_ref()
+                    .and_then(|directory| directory.current_operator(received.remote_identity()))
+                    .unwrap_or_else(|| self.pins.contains(&received.remote_identity().certificate_sha256))
                 || received.sections[1].is_some()
                 || received.sections[2].is_some()
             {
@@ -454,7 +467,7 @@ pub(crate) struct HostedControlEndpoint {
     reads: Arc<ControlEndpoint>,
     local: ManagedControl,
     shared: Arc<WorkerSharedResources>,
-    pins: BTreeSet<Digest>,
+    manager: Option<Arc<HostedGroupManager>>,
     _owner: Arc<ScratchLease>,
 }
 impl HostedControlEndpoint {
@@ -475,10 +488,34 @@ impl HostedControlEndpoint {
             reads,
             local,
             shared,
-            pins,
+            manager: None,
             _owner: owner,
         }))
     }
+    pub(crate) fn registered(
+        reads: Arc<ControlEndpoint>,
+        local: ManagedControl,
+        shared: Arc<WorkerSharedResources>,
+        pins: BTreeSet<Digest>,
+        manager: Arc<HostedGroupManager>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        let mut endpoint = Self::new(reads, local, shared, pins)?;
+        Arc::get_mut(&mut endpoint).ok_or_else(invalid)?.manager = Some(manager);
+        Ok(endpoint)
+    }
+
+    async fn check_worker_capability(&self, command: &ControlCommand) -> Result<(), ProtocolError> {
+        let Some(manager) = &self.manager else { return Ok(()) };
+        let worker = match command {
+            ControlCommand::Enroll { next, .. } => WorkerIdentity::from(next),
+            ControlCommand::CompleteRestart { intent, .. } => WorkerIdentity::from(&intent.next),
+            ControlCommand::CompleteDataWorker { intent, .. } => intent.worker(),
+            ControlCommand::CompleteEksWorkerReplacement { worker, .. } => *worker,
+            _ => return Ok(()),
+        };
+        self.reads.control().check_replacement_enrollment_capability(manager, worker).await
+    }
+
     fn request(
         &self,
         session: &AuthenticatedSession,
@@ -495,10 +532,17 @@ impl HostedControlEndpoint {
             Operation::CompleteDataWorker | Operation::BeginDataWorkerJoin | Operation::CloseDataWorker
             | Operation::ReadEksWorkerReplacement | Operation::CompleteEksWorkerReplacement
         );
+        let operator = self.reads.is_operator(session.remote());
+        let authorized = if scoped_data_worker {
+            !operator
+        } else {
+            operator
+                || (session.recovery_only()
+                    && matches!(request.control_consensus, Operation::CompleteRestart))
+        };
         if session.group() != self.local.state.store().identity()
             || session.purpose() != Purpose::ControlDelegation
-            || (!scoped_data_worker && !self.pins.contains(&session.remote().certificate_sha256))
-            || (scoped_data_worker && self.pins.contains(&session.remote().certificate_sha256))
+            || !authorized
             || request.to_node != self.local.state.resident().node_id()
             || match request.control_consensus {
                 Operation::Propose | Operation::CompleteRestart | Operation::CompleteDataWorker
@@ -651,6 +695,7 @@ impl Endpoint for HostedControlEndpoint {
                                 if authorization.subject != session.remote().certificate_sha256 => return Err(invalid()),
                             _ => {}
                         }
+                        self.check_worker_capability(command.payload()?).await?;
                         let applied = self.local.propose(command).await?;
                         self.shared
                             .encode_in(ByteClass::Progress, &applied, PAYLOAD)

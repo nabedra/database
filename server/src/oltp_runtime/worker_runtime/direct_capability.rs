@@ -16,11 +16,15 @@
 //!   not passed. Such a request id may still be retried, and only the
 //!   queued path knows it, so leaders execute no new mutation directly and
 //!   gateways settle eligible mutations at their anchor and go queued.
+//! - `direct_batch()` (GC2): Control enabled the `data.direct.batch` cluster
+//!   feature, so this leader may pack several direct commits to one range
+//!   into one `DirectBatch` entry. It never turns off.
 use crate::{
     oltp::mvcc::planner::{ResolveFuture, direct_fence::DirectActivationProbe},
     oltp_replication::{
         authority::control::{
-            ControlClient, DIRECT_VERSION, DirectCapability, DirectCapabilityOperation,
+            ControlClient, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectCapability,
+            DirectCapabilityOperation,
         },
         types::WorkerIdentity,
     },
@@ -54,6 +58,8 @@ pub(crate) struct DirectSwitch {
     local: WorkerIdentity,
     direct_oltp: bool,
     active: AtomicBool,
+    /// GC2: Control enabled `data.direct.batch` (as last observed; sticky).
+    batch: AtomicBool,
     /// End (Unix ms) of the queued-history window, 0 without one (T7c).
     history_until: AtomicU64,
     /// Control recorded this owner's pre-activation queued history (T7c).
@@ -89,6 +95,7 @@ impl DirectSwitch {
             local,
             direct_oltp,
             active: AtomicBool::new(false),
+            batch: AtomicBool::new(false),
             history_until: AtomicU64::new(0),
             history_noted: AtomicBool::new(false),
             #[cfg(test)]
@@ -104,6 +111,11 @@ impl DirectSwitch {
     /// Control activated `data.direct.v1` (as last observed; never reverts).
     pub(crate) fn is_direct_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+    /// GC2: Control enabled `data.direct.batch` (as last observed; never
+    /// reverts). Only meaningful once the capability is active.
+    pub(crate) fn is_batch_enabled(&self) -> bool {
+        self.batch.load(Ordering::Acquire)
     }
     /// The `direct_oltp` configuration of this process.
     pub(crate) fn direct_oltp(&self) -> bool {
@@ -222,9 +234,42 @@ impl DirectSwitch {
             .await
     }
 
-    /// Advertises this worker's support, then watches for activation. The
-    /// task ends once the capability is active or `stop` is called. Errors
-    /// (an older Control, a leader change) are retried every `POLL`.
+    /// GC2: one round of the `data.direct.batch` watch. Advertises the
+    /// feature until Control reports the advert, asks for re-evaluation every
+    /// `reevaluate`, and records an enablement. An older Control answers an
+    /// error, which is retried. Returns whether the feature is enabled.
+    async fn watch_batch(&self, reevaluate: bool) -> bool {
+        if self.is_batch_enabled() {
+            return true;
+        }
+        let Ok(features) = self.control.direct_features().await else {
+            return false;
+        };
+        if features.batch.is_none() {
+            if !features.batch_advertised {
+                self.control
+                    .advertise_direct_feature(DIRECT_BATCH_FEATURE, self.local)
+                    .await;
+            } else if reevaluate {
+                let _ = self.change(DirectCapabilityOperation::Activate).await;
+            } else {
+                return false;
+            }
+            let Ok(features) = self.control.direct_features().await else {
+                return false;
+            };
+            if features.batch.is_none() {
+                return false;
+            }
+        }
+        self.batch.store(true, Ordering::Release);
+        true
+    }
+
+    /// Advertises this worker's support, then watches for activation and for
+    /// the `data.direct.batch` enablement (GC2). The task ends once both are
+    /// observed or `stop` is called. Errors (an older Control, a leader
+    /// change) are retried every `POLL`.
     pub(crate) fn start(self: &Arc<Self>) {
         let switch = Arc::downgrade(self);
         let mut stop = self.stop.subscribe();
@@ -245,21 +290,38 @@ impl DirectSwitch {
                 let Some(switch) = switch.upgrade() else {
                     return;
                 };
-                let result = if !advertised {
-                    switch
-                        .change(DirectCapabilityOperation::Advertise {
-                            version: DIRECT_VERSION,
-                        })
-                        .await
-                } else if polls % reevaluate_every == reevaluate_every - 1 {
-                    switch.change(DirectCapabilityOperation::Activate).await
-                } else {
-                    switch.control.direct_capability().await
-                };
-                if let Ok(capability) = result {
-                    advertised = capability.advertised;
-                    if switch.observe(capability) {
+                let reevaluate = polls % reevaluate_every == reevaluate_every - 1;
+                if switch.is_direct_active() {
+                    if switch.watch_batch(reevaluate).await {
                         return;
+                    }
+                } else {
+                    let result = if !advertised {
+                        let result = switch
+                            .change(DirectCapabilityOperation::Advertise {
+                                version: DIRECT_VERSION,
+                            })
+                            .await;
+                        // GC2: the feature advert right behind it, so the
+                        // last member's adverts enable both in two entries.
+                        switch
+                            .control
+                            .advertise_direct_feature(DIRECT_BATCH_FEATURE, switch.local)
+                            .await;
+                        result
+                    } else if reevaluate {
+                        switch.change(DirectCapabilityOperation::Activate).await
+                    } else {
+                        switch.control.direct_capability().await
+                    };
+                    if let Ok(capability) = result {
+                        advertised = capability.advertised;
+                        // An advert that reached Control before this worker
+                        // was ready could not enable the feature: ask for a
+                        // re-evaluation right away.
+                        if switch.observe(capability) && switch.watch_batch(true).await {
+                            return;
+                        }
                     }
                 }
                 polls = polls.wrapping_add(1);
@@ -358,6 +420,9 @@ impl crate::oltp_replication::authority::timestamp::DirectTimestampGate
 impl crate::oltp_runtime::direct::DirectGate for DirectSwitch {
     fn direct_active(&self) -> bool {
         self.is_direct_active()
+    }
+    fn direct_batch(&self) -> bool {
+        self.is_batch_enabled()
     }
     fn history_settling(&self) -> bool {
         DirectSwitch::history_settling(self)

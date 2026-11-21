@@ -1,8 +1,11 @@
 # Events Docker acceptance
 
-Run from the repository root with Python 3.11 or newer and the Events image
-built from the checkout under test. The `tls` case also uses OpenSSL to issue
-short-lived certificates for the fixture.
+This suite runs Events brokers in Docker and checks them against the plan's
+EV scenarios. Run it from the repository root. You need Python 3.11 or newer
+and an Events image built from the checkout you are testing. The `tls` case
+also uses OpenSSL to issue short-lived certificates for the fixture.
+
+Check how much CPU and memory Docker has free before you pick the limits:
 
 ```sh
 docker info --format '{{.NCPU}} {{.MemTotal}}'
@@ -14,12 +17,15 @@ python3.11 server/events/tests/acceptance.py \
   --output /tmp/events-acceptance.json --logs /tmp/events-acceptance-logs
 ```
 
-The suite runs cases serially, uses daemon-assigned loopback ports, and
-removes each Compose project's containers, network and volumes at case exit.
-Each broker gets a distinct named mount. Choose the aggregate CPU and RAM
-limits after checking other active Docker jobs. Use `--cases` to execute a
-subset. The JSON records successful assertions even if a later check in the
-same case fails. Failure logs are written only if requested.
+`--cpus` and `--memory-mib` cap all the brokers of a case together, so leave
+room for any other Docker jobs that are running. The suite runs one case at a
+time on loopback ports that Docker assigns. Each broker gets its own named
+volume, and when a case ends the suite removes that case's containers, network
+and volumes.
+
+To run only some cases, pass `--cases`. The JSON output lists every assertion
+that passed, even when a later check in the same case fails. Logs from failed
+cases are written only when you pass `--logs`.
 
 | Case | Observations |
 | --- | --- |
@@ -30,13 +36,13 @@ same case fails. Failure logs are written only if requested.
 | `tls` | EV10 peer mutual TLS, grant and delivery key overlap across rolling broker restarts |
 | `load-1,load-3,load-6` | EV09 warmup and three small measured repetitions per topology, balanced and skewed publishing, fast and slow subscriber lag, event conservation and Docker resource samples |
 
-The throughput numbers describe local, capped Docker runs. Peer and client
-traffic share the Docker network counters. The tests cannot establish EBS,
-inter-AZ traffic, or cloud recovery targets.
+The throughput numbers come from local Docker runs under these caps, and
+Docker's network counters mix peer and client traffic. So the results say
+nothing about EBS, traffic between Availability Zones or recovery times in the
+cloud.
 
-The optional `--fault-image` parameter to `growth` adds a Python container
-to the fixture network. Supply a local image with Python 3.11 or newer. The
-container relays the first snapshot bytes to a new voter and pauses the
-transfer while the observer confirms a partial file and kills the voter.
-The fixture reserves up to 0.15 CPU and 64 MiB for this container inside
-the supplied aggregate limits.
+For the `growth` case, `--fault-image` adds a Python container to the fixture
+network. Give it a local image with Python 3.11 or newer. The container relays
+the first bytes of a snapshot to a new voter, then pauses the transfer while
+the test confirms a partial file exists and kills the voter. Up to 0.15 CPU and
+64 MiB of the limits you pass go to this container.
