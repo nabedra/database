@@ -82,7 +82,7 @@ def assert_abandoned(reply, request):
     assert body['error']['outcome'] == 'unknown' and 'abandon' in body['error']['message'], reply
 
 
-def exact_receipt(exchange, run, request, result, timeout=60):
+def exact_receipt(exchange, run, request, result, timeout=60, *, allow_lane_overload=False):
     expected = dict(request_id=request['request_id'], run_id=run,
                     state='succeeded', result=result, error=None)
 
@@ -93,7 +93,11 @@ def exact_receipt(exchange, run, request, result, timeout=60):
             return None
         if status == 200:
             if body['state'] in ('succeeded', 'failed'):
-                assert body == expected, body
+                if allow_lane_overload and body['state'] == 'failed':
+                    error = dict(code='overloaded', message='worker outgoing lane full', outcome='not_applied')
+                    assert body == dict(expected, state='failed', result=None, error=error), body
+                else:
+                    assert body == expected, body
                 return body
             assert body['state'] in ('queued', 'running', 'committing', 'reconciling'), body
             assert body == dict(expected, state=body['state'], result=None), body
@@ -1036,11 +1040,10 @@ def load_conservation(test_executable):
             rows = [dict(id=index, value=index * 2) for index in range(256)]
             assert source.insert_many(rows) == len(rows)
             query = dict(select=None, filter=None, order_by=None, limit=None)
-            expected_rows, jobs = [], []
+            jobs = []
             for index in range(1000):
                 if index % 8 == 0:
                     row = dict(id=index, value=index * 3)
-                    expected_rows.append(row)
                     request = operation('table.insert', dict(table_id=output.id, row=row))
                     expected = None
                 elif index % 2 == 0:
@@ -1053,6 +1056,8 @@ def load_conservation(test_executable):
                 jobs.append((request, expected))
             baseline = server.stats()['queue']
             accepted = {}
+            outcomes = {}
+            connection_errors = []
             refused = 0
             lock = threading.Lock()
 
@@ -1060,24 +1065,42 @@ def load_conservation(test_executable):
                 nonlocal refused
                 with closing(Http(server.url, server.token, timeout=30)) as client:
                     for request, expected in batch:
+                        request_id = request['request_id']
+
+                        def exchange(path, body=None):
+                            try:
+                                return client.exchange(path, body)
+                            except TRANSPORT_ERRORS as error:
+                                with lock:
+                                    connection_errors.append((request_id, path, type(error).__name__))
+                                raise
+
                         deadline = time.monotonic() + 30
                         delay = .01
-                        while True:
-                            status, body = client.exchange('/v1/requests', request)
-                            if status != 429:
-                                break
-                            assert body['error']['code'] == 'overloaded', body
-                            assert body['error']['outcome'] == 'not_applied', body
-                            assert time.monotonic() < deadline, body
-                            with lock:
-                                refused += 1
-                            time.sleep(delay)
-                            delay = min(.1, delay * 2)
+                        try:
+                            while True:
+                                status, body = exchange('/v1/requests', request)
+                                if status != 429:
+                                    break
+                                assert body['error']['code'] == 'overloaded', body
+                                assert body['error']['outcome'] == 'not_applied', body
+                                assert time.monotonic() < deadline, body
+                                with lock:
+                                    refused += 1
+                                time.sleep(delay)
+                                delay = min(.1, delay * 2)
+                        except TRANSPORT_ERRORS:
+                            # Without a definitive pre-acceptance refusal the
+                            # submission could already own the original UUID.
+                            continue
                         assert_accepted((status, body), server.run_id, request)
                         with lock:
-                            assert request['request_id'] not in accepted, request
-                            accepted[request['request_id']] = expected
-                        exact_receipt(client.exchange, server.run_id, request, expected, timeout=30)
+                            assert request_id not in accepted, request
+                            accepted[request_id] = expected
+                        receipt = exact_receipt(exchange, server.run_id, request, expected,
+                                                timeout=30, allow_lane_overload=True)
+                        with lock:
+                            outcomes[request_id] = receipt['state']
 
             with ThreadPoolExecutor(max_workers=8) as clients:
                 futures = [clients.submit(consume, jobs[part::8]) for part in range(8)]
@@ -1094,18 +1117,25 @@ def load_conservation(test_executable):
                     time.sleep(.05)
                 for future in futures:
                     future.result()
-            assert accepted == {request['request_id']: expected for request, expected in jobs}
+            assert accepted == {request['request_id']: expected for request, expected in jobs}, connection_errors
+            assert set(outcomes) == set(accepted)
             queue = server.stats()['queue']
             assert queue['accepted_records'] == baseline['accepted_records'] + len(jobs), queue
             assert queue['terminal_records'] == baseline['terminal_records'] + len(jobs), queue
             assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+            succeeded = [request for request, _ in jobs if outcomes[request['request_id']] == 'succeeded']
+            assert {request['operation'] for request in succeeded} == {'table.insert', 'table.get', 'query.count'}
+            expected_rows = [request['payload']['row'] for request in succeeded
+                             if request['operation'] == 'table.insert']
             assert output.query().order_by('id').collect() == expected_rows
             rss_high_water = None
             proc_status = Path(f'/proc/{server.process.pid}/status')
             if proc_status.is_file():
                 rss_high_water = next(int(line.split()[1]) * 1024 for line in
                                       proc_status.read_text().splitlines() if line.startswith('VmHWM:'))
-            return dict(accepted=len(accepted), preaccept_refusals=refused, peak_compute=peak_compute,
+            return dict(accepted=len(accepted), succeeded=len(succeeded), preaccept_refusals=refused,
+                        accepted_terminal_overloads=len(accepted) - len(succeeded),
+                        connection_errors=connection_errors, peak_compute=peak_compute,
                         peak_charged_bytes=peak_charged, peak_queue_bytes=peak_queue, peak_rss_bytes=rss_high_water)
 
 
