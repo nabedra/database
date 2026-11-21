@@ -278,6 +278,17 @@ def o08(fixture):
     not_run('O08', 'storage-reservations', 'The RF3 process fixture has no deterministic admission gate for competing pool-space reservations.')
 
 
+def direct_proposal_paths(fixture, request_id):
+    for worker in WORKERS:
+        fixture.gate(worker, request_id, 'direct-proposing')
+    return [fixture.cluster.barrier_dir(worker) / f'reached-{request_id}' for worker in WORKERS]
+
+
+def release_direct_proposal(fixture, request_id):
+    for worker in WORKERS:
+        fixture.release_copy(worker, request_id)
+
+
 def verify_snapshot_retry(fixture, table):
     queued = point(table, 'upsert', row=dict(id=1, category=88, value=89))
     fixture.select(queued['request_id'], {'participants': True})
@@ -285,9 +296,7 @@ def verify_snapshot_retry(fixture, table):
     fixture.reached(queued['request_id'], 'participants')
     direct = point(table, 'update', key=1, values={'value': 90})
     request_id = direct['request_id']
-    for worker in WORKERS:
-        fixture.gate(worker, request_id, 'direct-proposing')
-    reached = [fixture.cluster.barrier_dir(worker) / f'reached-{request_id}' for worker in WORKERS]
+    reached = direct_proposal_paths(fixture, request_id)
     with ThreadPoolExecutor(max_workers=1) as pool:
         update = pool.submit(exchange, fixture, direct)
         try:
@@ -300,8 +309,7 @@ def verify_snapshot_retry(fixture, table):
             fixture.release(queued['request_id'], 'participants')
             fixture.terminal(queued['request_id'], None)
         finally:
-            for worker in WORKERS:
-                fixture.release_copy(worker, request_id)
+            release_direct_proposal(fixture, request_id)
         result = update.result(timeout=35)
     assert result == (200, dict(request_id=request_id, data=True)), result
     assert attempts.read_text().splitlines() == ['direct-proposing', 'direct-proposing']
@@ -479,14 +487,7 @@ def check_allocator(fixture, table, commit_ts):
         (cluster.barrier_dir(worker) / 'clock-offset-seconds').unlink()
 
     if fixture.direct:
-        body = point(table, 'insert', row=rows(12, category=7)[0])
-        rid = body['request_id']
-        fixture.select(rid, {'direct-timestamp': False})
-        assert fixture.data(body) is None
-        _, used = fixture.reached(rid, 'direct-timestamp')
-        assert used > latest['last'], (used, latest)
-        expected.append(body['payload']['row'])
-        assert snapshot(fixture, table, expected) > used
+        verify_direct_scan(fixture, table, expected, latest['last'])
     passed('O09', 'no-backdated-allocation',
            'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
     if clock_jumps:
@@ -494,6 +495,30 @@ def check_allocator(fixture, table, commit_ts):
                'RF3 Timestamp re-election during a simulated backward wall-clock jump preserved ordering. The resumed leader refused to issue, and allocation advanced through a forward jump.')
     else:
         not_run('O09', 'timestamp-order', 'Timestamp failover and old-leader resume passed. Wall-clock jumps require Linux and a C compiler.')
+
+
+def verify_direct_scan(fixture, table, prior_rows, completed_ts):
+    row = rows(12, category=7)[0]
+    body = point(table, 'insert', row=row)
+    request_id = body['request_id']
+    reached = direct_proposal_paths(fixture, request_id)
+    fixture.select(request_id, {'direct-timestamp': False})
+    scan = fixture.query(table)
+    scan_id = scan['request_id']
+    fixture.select(scan_id, {'snapshot': False})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        write = pool.submit(fixture.data, body)
+        try:
+            wait_for(reached, lambda path: path.read_text() == 'direct-proposing', timeout=15)
+            assert not write.done()
+            fixture.admit(scan, 'api2')
+            _, scan_ts = fixture.reached(scan_id, 'snapshot')
+        finally:
+            release_direct_proposal(fixture, request_id)
+        assert write.result(timeout=35) is None
+    _, used = fixture.reached(request_id, 'direct-timestamp')
+    assert completed_ts < used < scan_ts, (completed_ts, used, scan_ts)
+    fixture.terminal(scan_id, prior_rows + [row])
 
 
 def o11(fixture):
