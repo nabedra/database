@@ -16,13 +16,14 @@ mod service;
 mod system_recovery;
 mod worker_drain;
 
-pub(crate) use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, ReplicaRoutes};
 pub(crate) use data_worker::{DataWorkerGrowthProof, DataWorkerIntent};
-pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
 pub(crate) use direct::{
     DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
-    DirectCapabilityOperation, DirectFeatures, FeatureActivation, feature_operation_id,
+    DirectCapabilityOperation, DirectFeatures, FeatureActivation, QUEUED_SNAPSHOT_RETRY_FEATURE,
+    feature_operation_id,
 };
+pub(crate) use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, ReplicaRoutes};
+pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
 pub(crate) use group_damage::{
     GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,
     GroupDamageReport, PoolRefusal, DirectCapabilityDamageGate,

@@ -150,6 +150,12 @@ pub(crate) trait TimestampService: Send + Sync {
         identity: PinIdentity,
         reservation: IdentityReservation,
     ) -> ConsensusFuture<'a, StoragePin>;
+    fn retry_snapshot<'a>(
+        &'a self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: super::super::status::VerifiedSettlement,
+    ) -> ConsensusFuture<'a, StoragePin>;
     fn bind_snapshot_context<'a>(
         &'a self,
         view: AuthorityView,
@@ -347,6 +353,16 @@ impl TimestampService for TimestampHandle {
         Box::pin(
             async move { TimestampHandle::begin_snapshot(self, view, identity, reservation).await },
         )
+    }
+    fn retry_snapshot<'a>(
+        &'a self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: super::super::status::VerifiedSettlement,
+    ) -> ConsensusFuture<'a, StoragePin> {
+        Box::pin(TimestampHandle::retry_snapshot(
+            self, view, identity, previous,
+        ))
     }
     fn bind_snapshot_context<'a>(
         &'a self,

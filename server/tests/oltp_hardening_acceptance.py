@@ -303,6 +303,8 @@ def o08(fixture):
         verify_queued_snapshot_retry(fixture, table)
         passed('O08', 'fresh-snapshot-retry',
                'A queued update lost its first Prepare and committed from a fresh snapshot under the original request ID.')
+    verify_queued_retry_exhaustion(fixture, table)
+    verify_queued_batch_retry_after_owner_loss(fixture)
     not_run('O08', 'storage-reservations',
             'The pool can report filesystem headroom and ENOSPC, but it has no owned disk-byte '
             'reservations for competing writes. A measured race requires that admission mechanism.')
@@ -350,7 +352,9 @@ def verify_snapshot_retry(fixture, table):
 def verify_queued_snapshot_retry(fixture, table):
     stale = point(table, 'update', key=1, values={'value': 90})
     request = stale['request_id']
-    fixture.select(request, {'participants': True, 'decision': False})
+    fixture.watch_record(request)
+    fixture.select(request, {'participants': True, 'retry-aborted-1': True,
+                             'retry-participants-2': False, 'decision': False})
     before = fixture.data(point(table, 'get', key=1))
     fixture.admit(stale)
     _, participants = fixture.reached(request, 'participants')
@@ -360,17 +364,119 @@ def verify_queued_snapshot_retry(fixture, table):
         assert fixture.data(point(table, 'upsert', row=winner), 'api2') is None
     finally:
         fixture.release(request, 'participants')
+
+    _, abort = fixture.reached(request, 'retry-aborted-1')
+    assert_retry_abort(abort, request, 1)
+    accepted = fixture.records(request)
+    try:
+        fixture.pending(request)
+        fixture.admit(stale, 'api2')
+        changed = {**stale, 'payload': {**stale['payload'], 'values': {'value': 91}}}
+        status, refusal = fixture.api('api2', REQUESTS, changed)
+        assert status == 409 and refusal['error']['outcome'] == 'not_applied', refusal
+    finally:
+        fixture.release(request, 'retry-aborted-1')
+    _, retry = fixture.reached(request, 'retry-participants-2')
+    assert retry[0]['read_ts'] > participants[0]['read_ts'], retry
     _, decision = fixture.reached(request, 'decision')
     assert decision['txn'] == {'request_id': request, 'attempt': 2}, decision
-    assert decision['request']['request_id'] == request
+    assert decision['request'] == abort['request']
     assert 'commit' in decision['decision'], decision
     fixture.terminal(request, True)
     assert exchange(fixture, stale, 'api2') == (200, {'request_id': request, 'data': True})
+    for worker, record in fixture.records(request).items():
+        assert record['context'] == accepted[worker]['context'], record
+        assert record['terminal']['request'] == decision['request'], record
     final_row = dict(winner, value=90)
     assert fixture.data(point(table, 'get', key=1)) == final_row
     evidence('O08', 'queued-fresh-snapshot-retry', request_id=request,
-             snapshot=participants[0]['read_ts'], attempted_version=before, resulting_row=final_row,
-             decision=decision)
+             snapshot=participants[0]['read_ts'], retry_snapshot=retry[0]['read_ts'],
+             resulting_row=final_row, abort=abort, decision=decision)
+
+
+def assert_retry_abort(abort, request, attempt):
+    assert abort['txn'] == {'request_id': request, 'attempt': attempt}, abort
+    assert abort['decision'] == {'abort': {'reason': 'retry_snapshot'}}, abort
+
+
+def verify_queued_retry_exhaustion(fixture, table):
+    stale = point(table, 'update', key=1, values={'value': -1})
+    request = stale['request_id']
+    stages = ('participants', 'retry-participants-2', 'retry-participants-3')
+    fixture.select(request, dict.fromkeys(stages, True) | {'retry-aborted-1': False,
+                   'retry-aborted-2': False, 'decision': False})
+    fixture.admit(stale)
+    snapshots = []
+    for attempt, stage in enumerate(stages, 1):
+        _, plans = fixture.reached(request, stage)
+        snapshots.append(plans[0]['read_ts'])
+        winner = dict(id=1, category=100 + attempt, value=100 + attempt)
+        try:
+            assert fixture.data(point(table, 'upsert', row=winner), 'api2') is None
+        finally:
+            fixture.release(request, stage)
+    for attempt in (1, 2):
+        _, abort = fixture.reached(request, f'retry-aborted-{attempt}')
+        assert_retry_abort(abort, request, attempt)
+    _, decision = fixture.reached(request, 'decision')
+    assert decision['txn'] == {'request_id': request, 'attempt': 3}, decision
+    assert decision['decision'] == {'abort': {'reason': 'conflict'}}, decision
+    error = {'code': 'conflict', 'outcome': 'not_applied',
+             'message': 'transaction preparation conflicted after exhausting snapshot retries'}
+    assert exchange(fixture, stale, 'api2') == (409, {'request_id': request, 'error': error})
+    assert fixture.data(point(table, 'get', key=1)) == winner
+    assert snapshots[0] < snapshots[1] < snapshots[2], snapshots
+    evidence('O08', 'queued-retry-exhaustion', request_id=request, snapshots=snapshots,
+             resulting_row=winner, decision=decision, error=error)
+
+
+def verify_queued_batch_retry_after_owner_loss(fixture):
+    table = create(fixture, 'retry_cross_range')
+    children = split_table(fixture, table)
+    ids = [group['group_id'] for group in children]
+    inserted = rows(-2, 2, category=2)
+    stale = batch(table, inserted)
+    request = stale['request_id']
+    first_resolve = f'resolve-{min(ids)}'
+    first_seal = f'seal-{min(ids)}'
+    fixture.select(request, {'participants': True, 'retry-aborted-1': True,
+                             'retry-participants-2': True, 'decision': False,
+                             first_seal: False, first_resolve: False})
+    fixture.admit(stale)
+    _, plans = fixture.reached(request, 'participants')
+    assert [plan['group']['group_id'] for plan in plans] == sorted(ids), plans
+    # Change the version of the absent key on the second participant. The
+    # first participant prepares before the second notices its stale plan.
+    row = inserted[ids.index(max(ids))]
+    try:
+        assert fixture.data(point(table, 'upsert', row=row), 'api2') is None
+        assert fixture.data(point(table, 'delete', key=row['id']), 'api2') is True
+    finally:
+        fixture.release(request, 'participants')
+    _, sealed = fixture.reached(request, first_seal)
+    owner, abort = fixture.reached(request, 'retry-aborted-1')
+    assert_retry_abort(abort, request, 1)
+    assert sealed['txn'] == abort['txn'] and sealed['manifest'] == abort['manifest'], sealed
+    fixture.pending(request)
+    fixture.cluster.workers[owner].kill()
+    survivors = fixture.cluster.live()
+    _, resolved = fixture.reached(request, first_resolve, workers=survivors, timeout=90)
+    assert resolved['txn'] == abort['txn'] and resolved['decision'] == abort['decision'], resolved
+    try:
+        _, retry = fixture.reached(request, 'retry-participants-2', workers=survivors, timeout=90)
+        assert [p['group'] for p in retry] == [p['group'] for p in plans], retry
+        assert all(p['read_ts'] > plans[0]['read_ts'] for p in retry), retry
+        assert fixture.data(fixture.query(table, 2), 'api2') == []
+    finally:
+        fixture.release(request, 'retry-participants-2')
+    _, decision = fixture.reached(request, 'decision', workers=survivors, timeout=45)
+    assert decision['txn'] == {'request_id': request, 'attempt': 2}, decision
+    assert decision['request'] == abort['request'] and 'commit' in decision['decision'], decision
+    fixture.terminal(request, 2, timeout=90)
+    assert exchange(fixture, stale, 'api2') == (200, {'request_id': request, 'data': 2})
+    assert fixture.data(fixture.query(table, 2), 'api2') == inserted
+    evidence('O08', 'queued-cross-range-retry-after-owner-loss', request_id=request,
+             abort=abort, resolved=resolved, retry_snapshot=retry[0]['read_ts'], decision=decision)
 
 
 def split_table(fixture, table):

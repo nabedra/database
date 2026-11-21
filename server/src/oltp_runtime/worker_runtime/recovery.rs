@@ -522,17 +522,12 @@ impl WorkerRuntime {
             return self.release_retained(id).await;
         }
         let (input, binding) = self.binding(id).await?;
+        let mut resumed = None;
         if input.request.operation.is_mutation() {
-            let decision = self
-                .transactions
-                .recover(
-                    current.ready.view.authority(),
-                    TxnId {
-                        request_id: id,
-                        attempt: 1,
-                    },
-                )
+            let (attempt, decision) = self
+                .recover_queued_attempt(current, &input, binding)
                 .await?;
+            resumed = Some(attempt);
             let encoded = if let Some(decision) = decision {
                 if decision.statement().request != binding {
                     return Err(unknown());
@@ -569,7 +564,7 @@ impl WorkerRuntime {
         }
         drop(input);
         settlement.armed = true;
-        self.execute(id, None).await
+        self.execute(id, None, resumed).await
     }
 
     async fn release_retained(&self, id: Uuid) -> Result<(), ProtocolError> {

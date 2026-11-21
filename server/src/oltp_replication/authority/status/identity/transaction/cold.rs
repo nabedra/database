@@ -62,31 +62,55 @@ impl StatusHandle {
                         && stored.is_some();
                     return view.encode(&safe);
                 }
-                // Application execution has one durable transaction attempt per
-                // reserved UUID. Check the UUID prefix for both absence and
-                // ambiguity so an unexpected second attempt cannot release a pin.
-                let mut prefix = txn_key(
-                    b't',
-                    TxnId {
-                        request_id: reservation.request_id,
-                        attempt: 0,
+                // Check every attempt against the original pin and request.
+                // Retry aborts authorize no publication even if no later attempt started.
+                let mut transaction: Option<SettlementFields> = None;
+                let mut chain_valid = true;
+                let progress = view.scan_page(
+                    &transaction_prefix(reservation.request_id),
+                    None,
+                    MAX_QUEUED_MUTATION_ATTEMPTS as usize,
+                    |key, raw| {
+                        let fields: SettlementFields =
+                            serde_json::from_slice(raw).map_err(|_| unknown())?;
+                        if key != txn_key(b't', fields.txn, &[]) {
+                            return Err(unknown());
+                        }
+                        let follows_prior = match &transaction {
+                            None => fields.txn.attempt == 1 && fields.read_ts == pin.pin.read_ts,
+                            Some(prior) => {
+                                prior.txn.attempt.checked_add(1) == Some(fields.txn.attempt)
+                                    && prior.read_ts < fields.read_ts
+                                    && prior
+                                        .decision
+                                        .as_ref()
+                                        .is_some_and(|d| d.decision.retries_snapshot())
+                            }
+                        };
+                        chain_valid &= follows_prior
+                            && reservation.kind == RequestKind::Mutation
+                            && fields.created_authority.run_id == reservation.original_run
+                            && fields.created_authority.owner_term < authority.owner_term
+                            && Some(fields.request) == pin.request
+                            && fields
+                                .settled_at
+                                .is_some_and(|p| p.term != 0 && p.index != 0)
+                            && fields.resolved == fields.expected
+                            && fields.decision.as_ref().is_some_and(|d| {
+                                d.txn == fields.txn
+                                    && d.request == fields.request
+                                    && d.manifest.status_group_id == status_group_id
+                                    && d.manifest.participant_count == fields.expected
+                                    && (!d.decision.retries_snapshot()
+                                        || reservation.scoped.is_none())
+                            });
+                        transaction = Some(fields);
+                        Ok(())
                     },
-                    &[],
-                );
-                prefix.truncate(prefix.len() - 8);
-                let mut transaction = None;
-                view.scan_page(&prefix, None, 2, |key, raw| {
-                    if transaction.is_some() {
-                        return Err(invalid());
-                    }
-                    let fields: SettlementFields =
-                        serde_json::from_slice(raw).map_err(|_| unknown())?;
-                    if key != txn_key(b't', fields.txn, &[]) {
-                        return Err(unknown());
-                    }
-                    transaction = Some(fields);
-                    Ok(())
-                })?;
+                )?;
+                if !chain_valid || !progress.exhausted {
+                    return view.encode(&false);
+                }
                 let safe = match transaction {
                     None => match identity.terminal {
                         None => true,
@@ -111,25 +135,22 @@ impl StatusHandle {
                         Some(TerminalIdentity::Committed { .. }) => false,
                     },
                     Some(transaction) => {
-                        let Some(decision) = transaction.decision else {
-                            return view.encode(&false);
-                        };
-                        reservation.kind == RequestKind::Mutation
-                            && transaction.created_authority.run_id == reservation.original_run
-                            && transaction.created_authority.owner_term < authority.owner_term
-                            && transaction.read_ts == pin.pin.read_ts
-                            && Some(transaction.request) == pin.request
-                            && transaction
-                                .settled_at
-                                .is_some_and(|position| position.term != 0 && position.index != 0)
-                            && transaction.resolved == transaction.expected
-                            && decision.txn == transaction.txn
-                            && decision.request == transaction.request
-                            && decision.manifest.status_group_id == status_group_id
-                            && decision.manifest.participant_count == transaction.expected
-                            && matches!(identity.terminal, Some(TerminalIdentity::Committed {
-                            reservation: terminal_reservation, decision: terminal, ..
-                        }) if terminal_reservation == reservation && terminal == decision)
+                        let decision = transaction.decision.ok_or_else(unknown)?;
+                        if decision.decision.retries_snapshot() {
+                            match identity.terminal {
+                                None => true,
+                                Some(TerminalIdentity::Failed {
+                                    reservation: terminal,
+                                    request,
+                                    ..
+                                }) => terminal == reservation && Some(request) == pin.request,
+                                _ => false,
+                            }
+                        } else {
+                            matches!(identity.terminal, Some(TerminalIdentity::Committed {
+                                reservation: terminal_reservation, decision: terminal, ..
+                            }) if terminal_reservation == reservation && terminal == decision)
+                        }
                     }
                 };
                 view.encode(&safe)
