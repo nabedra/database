@@ -1133,7 +1133,7 @@ async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_followe
         applied_term_reaches(&cluster, *follower, 1).await;
     }
     let gate = cluster.workers[delayed].gate.clone().unwrap();
-    gate.hold();
+    let held_sync = gate.hold();
     let failing_pool = cluster.workers[failing].pool.clone().unwrap();
     cluster.workers[failing].fault.inject(
         Fault::on(FsOp::SyncData)
@@ -1163,7 +1163,7 @@ async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_followe
     })
     .await;
     // Always unblock the journal thread before assertions can unwind.
-    gate.release();
+    drop(held_sync);
     assert_eq!(
         held.expect("both follower syncs reached their fault"),
         (true, true, true, true)
