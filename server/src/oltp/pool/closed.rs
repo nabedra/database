@@ -184,8 +184,11 @@ impl OltpPool {
         }
     }
 
-    pub(crate) fn exclusively_owned(&mut self) -> bool {
-        Arc::get_mut(&mut self.inner).is_some()
+    pub(crate) fn exclusively_owned(&self) -> bool {
+        // Stats and the damage reporter keep Weak observers for the lifetime
+        // of an open pool. The final try_unwrap still arbitrates any racing
+        // upgrades before the close marker is written.
+        Arc::strong_count(&self.inner) == 1
     }
 
     /// Inspect retired data without opening a group or recovering a staged
