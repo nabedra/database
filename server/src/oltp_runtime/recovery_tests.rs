@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 pub(crate) mod index_faults;
 pub(crate) mod index_holds;
+pub(crate) mod pool_sync;
 
 struct Barrier {
     stage: String,

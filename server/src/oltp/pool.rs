@@ -19,6 +19,8 @@ pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSna
 mod tests;
 #[cfg(test)]
 pub(crate) use tests::acceptance_damaged_checkpoints;
+#[cfg(test)]
+pub(crate) use tests::o29_pool_recovery;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
@@ -271,14 +273,10 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_path_on(
-            path,
-            identity,
-            shared,
-            mount,
-            nabedra_kv::fs::real(),
-            &|_| {},
-        )
+        let fs = nabedra_kv::fs::real();
+        #[cfg(test)]
+        let fs = crate::oltp_runtime::recovery_tests::pool_sync::wrap(fs);
+        Self::open_path_on(path, identity, shared, mount, fs, &|_| {})
     }
     fn open_path_on(
         path: &Path,
