@@ -1,0 +1,14 @@
+NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM              STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE    VOLUMEMODE
+persistentvolume/pvc-6301ff2c-6194-4f5f-823d-6e841e7e7fe7   1Gi        RWOP           Delete           Bound    live3/w2-primary   live3-b        <unset>                          2m8s   Filesystem
+persistentvolume/pvc-e0d1b010-b17b-49f5-bb70-bff2062ef0a7   1Gi        RWOP           Delete           Bound    live3/w1-primary   live3-a        <unset>                          2m9s   Filesystem
+persistentvolume/pvc-e5e99dd6-1934-4c0a-a24b-671a0d412cd7   1Gi        RWOP           Delete           Bound    live3/w3-primary   live3-c        <unset>                          2m6s   Filesystem
+
+NAMESPACE   NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE     VOLUMEMODE
+live3       persistentvolumeclaim/w1-primary   Bound    pvc-e0d1b010-b17b-49f5-bb70-bff2062ef0a7   1Gi        RWOP           live3-a        <unset>                 2m11s   Filesystem
+live3       persistentvolumeclaim/w2-primary   Bound    pvc-6301ff2c-6194-4f5f-823d-6e841e7e7fe7   1Gi        RWOP           live3-b        <unset>                 2m9s    Filesystem
+live3       persistentvolumeclaim/w3-primary   Bound    pvc-e5e99dd6-1934-4c0a-a24b-671a0d412cd7   1Gi        RWOP           live3-c        <unset>                 2m8s    Filesystem
+
+NAMESPACE   NAME                                                                                                   ATTACHER                      PV                                         NODE                             ATTACHED   AGE
+            volumeattachment.storage.k8s.io/csi-15b0cdb2cb6f24b013991ac77b69f49990e76ac85cdc0dd837d3e85183ebccc6   hostpath-a.live3.csi.k8s.io   pvc-e0d1b010-b17b-49f5-bb70-bff2062ef0a7   nabedra-live3-43dc0734-worker    true       2m8s
+            volumeattachment.storage.k8s.io/csi-c403a2afc3dac064651fd177adb1d63f99ae17ec5b7a1d426b6291aae83145c5   hostpath-c.live3.csi.k8s.io   pvc-e5e99dd6-1934-4c0a-a24b-671a0d412cd7   nabedra-live3-43dc0734-worker3   true       2m6s
+            volumeattachment.storage.k8s.io/csi-d69f68cc5cdc65002473e713586d55ac9343cc2e3206d872e2fcf6a7f4293bc7   hostpath-b.live3.csi.k8s.io   pvc-6301ff2c-6194-4f5f-823d-6e841e7e7fe7   nabedra-live3-43dc0734-worker2   true       2m7s

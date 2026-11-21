@@ -121,7 +121,7 @@ class Kind:
         self.kube('apply', '-f', '-', input=json.dumps(dict(apiVersion='v1', kind='List',
                                                            items=definitions)))
 
-    def start(self, csi_source, node_image, archives, csi_images, *, preflight=False):
+    def start(self, csi_source, node_image, archives, csi_images, *, preflight=False, zone_fault=False):
         for archive in archives:
             self.evidence.file(archive.name + '.load.txt', run('docker', 'load', '-i', str(archive), timeout=180))
         self.evidence.record('kind-create', cluster=self.name, node_image=node_image)
@@ -139,6 +139,15 @@ class Kind:
                       if ZONE_LABEL in node['metadata']['labels']}
         assert set(self.nodes) == set(ZONES) and len(nodes) == 4, self.nodes
         self.evidence.file('kind-nodes.txt', self.kube('get', 'nodes', '-o', 'wide', '-L', ZONE_LABEL))
+        if zone_fault:
+            # A data-zone outage must leave the Kubernetes DNS service available.
+            system = ('-n', 'kube-system')
+            dns = 'deployment/coredns'
+            patch = {'spec': {'template': {'spec': {'nodeSelector': {'kubernetes.io/hostname': self.control}}}}}
+            self.kube(*system, 'patch', dns, '--type=merge', '-p', json.dumps(patch))
+            self.kube(*system, 'rollout', 'status', dns, '--timeout=145s', timeout=155)
+            self.evidence.file('coredns-placement.txt',
+                               self.kube(*system, 'get', 'pods', '-l', 'k8s-app=kube-dns', '-o', 'wide'))
         probe_node = self.nodes['a'] if self.rawfile and preflight else None
         for archive in csi_images:
             target = ('--nodes', probe_node) if probe_node else ()
@@ -439,9 +448,9 @@ class Oltp(Rf3Cluster):
         for name in names:
             self.wait_pod(name)
             self.connect(name)
-        views = {}
 
         def ready():
+            views = {}
             for name in names:
                 status, reply = self.worker(name, '/health/ready')
                 if status == 200 and reply.get('ready_workers') == reply.get('replication_factor') == 3:
@@ -839,6 +848,7 @@ def zone_loss(topology, traffic, name='w1'):
     started = time.monotonic()
     run('docker', 'stop', '--time=0', node, timeout=30)
     down = time.monotonic()
+    traffic.evidence.record('O18 zone-stopped', zone=old['zone'], node=node)
     topology.disconnect(name)
     try:
         wait_for(lambda: next((sample for sample in traffic.read_times if sample > down), None),
@@ -859,6 +869,7 @@ def zone_loss(topology, traffic, name='w1'):
         identity = topology.reprepare(name)
     finally:
         run('docker', 'start', node, timeout=40)
+        traffic.evidence.record('O18 zone-restored', zone=old['zone'], node=node)
     cluster.kube('wait', f'node/{node}', '--for=condition=Ready', '--timeout=120s', timeout=130)
     topology.wait_pod_removed(name, timeout=100)
     topology.launch_worker(name)
@@ -1106,12 +1117,14 @@ def oltp(cluster, binary, image, scenario, test_executable):
             if scenario == 'scale':
                 from oltp_scale import scale
                 scale(topology, growth_claim, run, traffic)
-            if scenario in ('all', 'lifecycle'):
+            if scenario in ('all', 'lifecycle', 'rolling', 'zone'):
                 refuse_second_writer(topology)
-                victim = topology.hold_request(traffic) if test_executable else 'w1'
-                zone_loss(topology, traffic, victim)
+            if scenario in ('all', 'lifecycle', 'rolling'):
                 for name in WORKERS:
                     topology.replace_worker(name, delete_pod=name == 'w1')
+            if scenario in ('all', 'lifecycle', 'zone'):
+                victim = topology.hold_request(traffic) if test_executable else 'w1'
+                zone_loss(topology, traffic, victim)
             if scenario in ('all', 'storage'):
                 additional_pool(topology)
                 pvc_resize(topology, traffic)
@@ -1191,7 +1204,9 @@ def main():
     driver.add_argument('--csi-source', type=Path)
     driver.add_argument('--rawfile-manifest', type=Path)
     parser.add_argument('--lane', required=True, type=Path)
-    parser.add_argument('--scenario', choices=('all', 'lifecycle', 'storage', 'scale', 'preflight'), default='all')
+    parser.add_argument('--scenario',
+                        choices=('all', 'lifecycle', 'rolling', 'zone', 'storage', 'scale', 'preflight'),
+                        default='all')
     args = parser.parse_args()
     if args.scenario != 'preflight' and not args.binary:
         parser.error('--binary is required for OLTP scenarios')
@@ -1223,7 +1238,8 @@ def main():
             try:
                 csi_images = sorted(args.csi_archive_dir.glob('*.tar')) if args.csi_archive_dir else ()
                 cluster.start(args.csi_source, args.node_image, args.load_archive, csi_images,
-                              preflight=args.scenario == 'preflight')
+                              preflight=args.scenario == 'preflight',
+                              zone_fault=args.scenario in ('all', 'lifecycle', 'zone'))
                 if args.scenario == 'preflight':
                     evidence.record('kind CSI preflight', status='passed', zones=cluster.nodes)
                     if cluster.rawfile:
