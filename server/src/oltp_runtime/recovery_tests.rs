@@ -290,7 +290,20 @@ pub(crate) async fn transaction_checkpoint(
     let checkpoint = format!("transaction-{request}-{stage}");
     let mut file = match std::fs::File::create_new(directory.join(format!("{checkpoint}.json"))) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if stage.starts_with("resolve-") {
+                let mut bytes = serde_json::to_vec(observed).unwrap();
+                bytes.push(b'\n');
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join(format!("{checkpoint}-repeated.jsonl")))
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+            return;
+        }
         Err(error) => panic!("open transaction checkpoint: {error}"),
     };
     file.write_all(&serde_json::to_vec(observed).unwrap())
@@ -326,6 +339,33 @@ pub(super) async fn lose_admission_rejection(request: Uuid) -> bool {
         return false;
     }
     pause("admission_rejection_applied", request).await;
+    true
+}
+
+pub(super) async fn lose_terminal_copy(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    if std::fs::remove_file(PathBuf::from(directory).join(format!("lose-terminal-copy-{request}")))
+        .is_err()
+    {
+        return false;
+    }
+    transaction_checkpoint("terminal-copy-lost", request, &request).await;
+    true
+}
+
+pub(crate) async fn lose_status_inspection(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    if !PathBuf::from(directory)
+        .join(format!("lose-status-inspection-{request}"))
+        .is_file()
+    {
+        return false;
+    }
+    transaction_checkpoint("status-inspect-unavailable", request, &request).await;
     true
 }
 

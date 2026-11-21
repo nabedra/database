@@ -351,6 +351,17 @@ impl TransactionCoordinator {
                 .map_err(|error| stage(error, "seal manifest"))?;
             (manifest, draft.result_digest)
         };
+        #[cfg(test)]
+        super::recovery_tests::transaction_checkpoint(
+            "participants",
+            txn.request_id,
+            &prepared
+                .participants
+                .iter()
+                .map(|part| &part.plan)
+                .collect::<Vec<_>>(),
+        )
+        .await;
         let preparation = async {
             let mut point_permit = None;
             for participant in &prepared.participants {

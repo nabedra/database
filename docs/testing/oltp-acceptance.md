@@ -4,7 +4,7 @@ Run the essential OLTP acceptance suite from the repository root:
 python3.11 scripts/acceptance_oltp.py
 ```
 
-The runner builds one cached test batch, copies the test/server executables, and reports O01–O29 as `passed`, `failed` or `not-run` in `artifacts/oltp-acceptance/results.json`. Missing production assertions, ignored tests and unavailable real provider checks cannot pass. Exit zero requires every selected scenario to pass. Exit one indicates failure; exit two indicates incomplete execution or changing source. The module and scenario implementations are still being completed.
+The runner builds one cached test batch, copies the test/server executables, and reports O01–O29 as `passed`, `failed` or `not-run` in `artifacts/oltp-acceptance/results.json`. The log reports the number of executed clauses for each selected scenario. Exit zero requires all clauses of every selected scenario to pass. Exit one indicates failure. Exit two indicates incomplete execution or changing source.
 
 | Category | Essential scenarios |
 | --- | --- |
@@ -26,6 +26,16 @@ python3.11 scripts/acceptance_oltp.py --cargo test --locked --manifest-path serv
 
 The runner reuses `CARGO_TARGET_DIR`, or the main checkout's existing cache. It sets two Cargo jobs, disables incremental/debug data and runs scenarios sequentially. `--target-dir` overrides the cache location. CPU/RAM enforcement for performance/provider assertions must be part of their actual fixture; these Cargo settings are not an operating-system memory limit.
 
-Scenario library tests end in `acceptance_oNN` and use `#[ignore = "run through scripts/acceptance_oltp.py"]`. The runner explicitly executes them. Ordinary feature/regression runs do not recursively launch the acceptance suite or provision infrastructure. They use production services and deterministic barriers, and reuse existing helpers where appropriate. A missing external prerequisite must emit `NABEDRA_OLTP_ACCEPTANCE {"scenario":"O18","status":"not-run","reason":"precise missing prerequisite"}`. A zero test-process exit alone is insufficient: the runner checks that exactly one scenario executed rather than remaining ignored. Tests must not call the locking wrapper recursively; any required Cargo subprocess is already protected by the suite's outer lock.
+Scenario library tests end in `acceptance_oNN` and use `#[ignore = "run through scripts/acceptance_oltp.py"]`. The runner explicitly executes them. Ordinary feature/regression runs do not recursively launch the acceptance suite or provision infrastructure. They use production services and deterministic barriers, and reuse existing helpers where appropriate. A missing external prerequisite must emit `NABEDRA_OLTP_ACCEPTANCE {"scenario":"O18","status":"not-run","reason":"precise missing prerequisite"}`. The runner requires exactly one executed test per scenario and a passing marker for every clause in its rubric. Tests must not call the locking wrapper recursively; any required Cargo subprocess is already protected by the suite's outer lock.
 
 `NABEDRA_OLTP_BINARY` names the copied actual server. `--olap-binary` supplies `NABEDRA_OLAP_BINARY` for parity; `--provider-config` supplies an explicit provider test configuration. Real cloud scenarios require actual configured access and approved bounded resources. Modeled provider evidence does not replace them. Unavailable external checks stay `not-run` while local implementation and integration continue.
+
+The runner owns the clause IDs, derived from the contract table. Use `--list` to look them up. After executing a clause's required variations, the scenario test emits one line in this format.
+
+```text
+NABEDRA_OLTP_ASSERT {"scenario":"O07","assertion":"private-before-commit","status":"passed","detail":"Prepared rows and secondary index entries stayed private."}
+```
+
+Use `failed` for an executed failure and `not-run` for a clause that could not execute. Give the reason in `detail`. The runner keeps the markers, required IDs and missing IDs in `results.json`. A test-process failure, a failed clause, an unknown ID or a duplicate marker fails the scenario. A missing clause keeps it `not-run` and appears by ID in the log.
+
+The direct CI job runs these scenarios with direct OLTP on and off. Both CI jobs build and supply the independent OLAP executable for O01. O07 and O10 use the registered RF3 worker test executable for deterministic pauses through the real HTTP, Raft and native storage paths. O07 covers queued batch boundaries and the D08 point-write race. O10 covers the Q05, Q06 and T04 decision and receipt cases.
