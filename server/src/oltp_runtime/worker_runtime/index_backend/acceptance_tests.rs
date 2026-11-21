@@ -309,18 +309,21 @@ impl Fixture {
         }})
     }
 
-    async fn seed(&self, size: i64) {
-        assert!(size >= 6);
+    async fn seed(&self) {
         let mut rows = original(7).as_array().unwrap().clone();
         rows.extend(original(8).as_array().unwrap().iter().cloned());
-        rows.extend((7..=size).map(|id| row(-id, 99, "another backfill row")));
+        self.insert_rows(rows).await;
+    }
+
+    async fn insert_rows(&self, rows: Vec<Value>) {
+        let count = rows.len();
         let result = tests::call(
             &self.app,
             "table.insert_many",
             json!({"table_id":self.definition.table_id,"rows":rows}),
         )
         .await;
-        assert_eq!(result, json!(size));
+        assert_eq!(result, json!(count));
     }
 
     async fn assert_status(&self, attempt: u64, state: &str, may_be_undecided: bool) {
@@ -578,15 +581,20 @@ fn assert_page_bounds(page: &index_holds::PageBuffers) {
 
 async fn backfill_and_retirement() -> (usize, usize) {
     let fixture = Fixture::new().await;
-    fixture.seed(129).await;
+    fixture.seed().await;
     let record = fixture.declare().await;
+    // These post-cut keys still occupy source scan slots. Foreground
+    // insert-many maintains their index entries without per-key refreshes.
+    fixture
+        .insert_rows((7..=129).map(|id| row(-id, 99, "post-cut row")).collect())
+        .await;
     let phase = index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Backfill);
     let actor = fixture.spawn_resume(record.clone());
     let first = reached(phase).await;
     let page = first.buffers.as_ref().unwrap();
     assert_page_bounds(page);
     assert_eq!(page.rows, 128);
-    assert_eq!(page.source_rows, 128);
+    assert_eq!(page.source_rows, 5);
     assert!(!page.exhausted);
     fixture.assert_building(&original(7)).await;
     let historical = fixture.pin_query("query.collect").await;
@@ -599,7 +607,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
     );
 
     let first = index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Backfill);
-    let actor = fixture.spawn_resume(record);
+    let mut actor = fixture.spawn_resume(record);
     let first = reached(first).await;
     let page = first.buffers.as_ref().unwrap();
     assert_page_bounds(page);
@@ -608,7 +616,10 @@ async fn backfill_and_retirement() -> (usize, usize) {
     let second =
         index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Backfill);
     first.release.send(false).unwrap();
-    let second = reached(second).await;
+    let second = tokio::select! {
+        hold = reached(second) => hold,
+        result = &mut actor => panic!("index actor stopped before the second source page: {result:?}"),
+    };
     let page = second.buffers.as_ref().unwrap();
     assert_page_bounds(page);
     // The scan can also return empty records for keys inserted after the source cut.
@@ -620,6 +631,10 @@ async fn backfill_and_retirement() -> (usize, usize) {
     second.release.send(false).unwrap();
     actor.await.unwrap().unwrap();
     fixture.assert_ready(1, changed).await;
+    assert_eq!(
+        tests::call(&fixture.app, "query.count", fixture.query(99)).await,
+        json!(123)
+    );
     assert_eq!(historical.result().await, original(7));
 
     let ready_snapshot = fixture.pin_query("query.collect").await;
@@ -662,7 +677,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
 
 async fn interrupt_refresh(cold: bool) {
     let mut fixture = Fixture::new().await;
-    fixture.seed(6).await;
+    fixture.seed().await;
     let record = fixture.declare().await;
     let phase = index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Refresh);
     let actor = fixture.spawn_resume(record.clone());
@@ -702,7 +717,7 @@ async fn interrupt_refresh(cold: bool) {
 
 async fn interrupt_validation() {
     let fixture = Fixture::new().await;
-    fixture.seed(6).await;
+    fixture.seed().await;
     let record = fixture.declare().await;
     let phase =
         index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Validation);
@@ -723,7 +738,7 @@ async fn interrupt_validation() {
 async fn interrupt_publication() {
     use index_holds::Stage;
     let fixture = Fixture::new().await;
-    fixture.seed(6).await;
+    fixture.seed().await;
     let record = fixture.declare().await;
     // The historical reader must predate the publication transaction's own
     // read timestamp so its undecided Catalog intents cannot block the read.
