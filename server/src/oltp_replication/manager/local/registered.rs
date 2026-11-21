@@ -434,6 +434,7 @@ impl RegisteredWorker {
             .mount
             .clone()
             .map(|expected| {
+                expected.refuse_legacy_format()?;
                 if expected.identity != identity
                     || expected.worker != WorkerIdentity::from(&config.enrollment)
                     || expected.mount_path != config.directory
@@ -465,9 +466,12 @@ impl RegisteredWorker {
             None => None,
         };
         let ownership = Arc::new(lock_directory(&config.directory)?);
-        if let Some(anchor) = &anchor {
+        let mounted_worker = if let Some(anchor) = &anchor {
             verify_directory_anchor(&ownership, anchor.observation())?;
-        }
+            anchor.retained_worker_if_initialized()?
+        } else {
+            None
+        };
         let (previous_process, mut retained) = inspect_identity(&ownership, &config, &identity)?;
         if restore.is_some() && previous_process.is_some() {
             return Err(invalid());
@@ -486,7 +490,7 @@ impl RegisteredWorker {
                     // The mount manifest can advance before Control is
                     // reached. Recover the last opened mount separately
                     // from the journal of eligible queue holders.
-                    let previous = anchor.retained_worker()?;
+                    let previous = mounted_worker.ok_or_else(invalid)?;
                     Some(operator.exclude_previous_before_open(
                         &OperatorPolicy {
                             policy: retained.restore_policy.unwrap_or(policy),
