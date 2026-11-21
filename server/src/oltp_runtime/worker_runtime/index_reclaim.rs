@@ -96,6 +96,10 @@ impl WorkerRuntime {
         {
             return Ok(true);
         }
+        let routing_version = match self.services.catalog.routing_root(&pin, table_id).await? {
+            CatalogRead::Value { version, .. } => version,
+            CatalogRead::Blocked(_) => return Ok(true),
+        };
         let safe_ts = self.services.timestamps.advance_floor(authority).await?;
         if safe_ts <= retired_at.get() {
             return Ok(true);
@@ -107,6 +111,7 @@ impl WorkerRuntime {
                 index_id,
                 retired_at,
                 safe_ts: ReadTs::new(safe_ts).map_err(|_| unknown())?,
+                routing_version,
             }),
             &self.services.shared,
             ByteClass::Progress,

@@ -543,6 +543,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
         index_id: retired,
         retired_at: ts(15),
         safe_ts: ts(16),
+        routing_version: None,
     };
     assert_eq!(
         f.submit(ParticipantCommand::ReclaimIndex(
@@ -916,6 +917,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         index_id,
         retired_at: ts(11),
         safe_ts: ts(12),
+        routing_version: None,
     };
     assert_eq!(
         f.submit(ParticipantCommand::ReclaimIndex(reclaim)).await,
@@ -1191,21 +1193,10 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
         "old pinned source survives"
     );
     for child in &mut children {
-        let published = child
-            .apply(
-                &f.shared,
-                ParticipantCommand::ChildPublished(direct::ChildPublished {
-                    authority: f.authority,
-                    published_at: ts(15),
-                }),
-            )
-            .await;
-        assert_eq!(
-            published,
-            ParticipantReply::ChildPublished {
-                published_at: ts(15)
-            }
-        );
+        let reclaim = index_reclaim::ReclaimIndex {
+            routing_version: Some(ts(15)),
+            ..reclaim
+        };
         assert_eq!(
             child
                 .apply(&f.shared, ParticipantCommand::ReclaimIndex(reclaim))

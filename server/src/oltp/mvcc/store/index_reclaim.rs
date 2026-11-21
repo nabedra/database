@@ -57,6 +57,7 @@ pub(crate) struct ReclaimIndex {
     pub index_id: Uuid,
     pub retired_at: CommitTs,
     pub safe_ts: ReadTs,
+    pub routing_version: Option<CommitTs>,
 }
 
 fn index_prefix(tag: u8, table_id: Uuid, index_id: Uuid) -> [u8; 34] {
@@ -106,9 +107,16 @@ pub(super) fn apply(
         .split_source
         .as_ref()
         .is_some_and(|source| !stable(source.published_at))
-        || config
-            .split_child
-            .is_some_and(|child| !child.complete || !stable(child.published_at))
+        || config.split_child.is_some_and(|child| {
+            // Split holds the table's exclusive lifecycle guard from its
+            // image cut through routing publication and source settlement.
+            // A later routing version therefore covers publication even
+            // for old children without a stored publication timestamp.
+            let publication = child.published_at.or(command
+                .routing_version
+                .filter(|&version| version > child.read_ts));
+            !child.complete || !stable(publication)
+        })
         || (config.direct_pause.is_some() && config.split_source.is_none())
         || tx
             .first_from(

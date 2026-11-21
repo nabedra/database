@@ -31,6 +31,7 @@ pub(crate) mod direct;
 mod handle;
 pub(crate) mod image_archive;
 pub(crate) mod index;
+pub(crate) mod index_reclaim;
 pub(crate) mod lifecycle;
 pub(crate) mod lineage;
 pub(crate) mod point;
