@@ -63,9 +63,6 @@ impl NativePlanner {
             )
             .await?;
         let result = async {
-            // Plan section 7: the publication replaces the table lifecycle.
-            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
-                .await?;
             let key = MvccKey::CatalogIndex {
                 table_id: maintenance.table_id,
                 index_id: maintenance.index_id,
@@ -226,7 +223,7 @@ impl NativePlanner {
                 )
                 .await;
             }
-            self.catalog_index_plan(
+            let plan = self.catalog_index_plan(
                 vec![
                     PreparedWrite {
                         key: MvccKey::CatalogTable {
@@ -254,7 +251,12 @@ impl NativePlanner {
                 guard.clone(),
                 owner,
             )
-            .await
+            .await?;
+            // Fence before publishing the new lifecycle. A rejected
+            // validation must leave Data on the current Catalog lifecycle.
+            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+                .await?;
+            Ok(plan)
         }
         .await;
         result.map_err(|cause| PlanError::Guarded {
