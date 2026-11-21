@@ -464,18 +464,17 @@ def o10(facade):
     for name, record in survivors.items():
         assert record['terminal']['request'] == binding, (name, record)
         assert record['context'] == accepted[name]['context'], (name, record)
-    observed_decisions = [
-        read_json(facade.cluster.barrier_dir(worker) / f'resolved-{request_id}.json')
-        for worker in facade.cluster.live()
-        if (facade.cluster.barrier_dir(worker) / f'resolved-{request_id}.json').exists()
-    ]
-    assert observed_decisions and all(item == durable for item in observed_decisions), observed_decisions
     changed = {**body, 'payload': {**body['payload'], 'rows': rows(2, 4, category=6)}}
     status, conflict = facade.api('api2', REQUESTS, changed)
     assert status == 409 and conflict['error']['code'] == 'conflict', conflict
     assert facade.data(facade.query(table), 'api2') == [
         {'id': 1, 'category': 0, 'value': 20}, *rows(2, 3, category=6),
     ]
+    # The retirement actor can publish the durable receipt before a reader helps
+    # resolve the intent. Observe the read before requiring resolution evidence.
+    resolved_paths = [facade.cluster.barrier_dir(worker) / f'resolved-{request_id}.json'
+                      for worker in facade.cluster.live()]
+    assert wait_for(resolved_paths, read_json) == durable
     passed('O10', 'same-decision-and-result', 'Two authorized gateways recovered the same RF3 COMMIT, request digest and exact result after the coordinator stopped.')
     passed('O10', 'uncertainty-stays-unknown', 'An injected Status inspection failure left the read pending while the COMMIT response was delayed.')
     passed('O10', 'immutable-terminal-and-context', 'A receipt raced a lost terminal copy. Replicas converged on the original terminal version and authorization context.')
