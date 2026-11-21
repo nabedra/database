@@ -190,7 +190,12 @@ def run_batch(facade, table, groups, items, category, pool, *, race=False):
         batch_reply = pool.submit(facade.api, 'api1', OPERATIONS, body)
     else:
         facade.admit(body)
-    _, participants = facade.reached(request_id, 'participants')
+    try:
+        _, participants = facade.reached(request_id, 'participants')
+    except TimeoutError as error:
+        if race and batch_reply.done():
+            raise AssertionError(f'Cross-range request never reached Prepare: {batch_reply.result()}') from error
+        raise
     actual = [part['group'] for part in participants]
     assert {item['group_id'] for item in actual} == {item['group_id'] for item in groups}, actual
     assert len(actual) == len(groups), actual

@@ -779,6 +779,10 @@ impl DirectGateway {
                 }
                 Ok(DirectResponse::Fallback { reason }) => {
                     range.leader_hint.store(voter.node_id, Ordering::Relaxed);
+                    if forward && reason == FallbackReason::SplitInProgress {
+                        // The catalog may now name the children of this frozen source.
+                        self.refresh(&table, deadline).await;
+                    }
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {

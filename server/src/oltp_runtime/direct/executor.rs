@@ -1482,16 +1482,11 @@ impl DirectExecutor {
                 };
                 match fault {
                     Fault::Conflict => return Err(failed(reused())),
-                    // The barrier or a frozen source: the marker must land
-                    // before the request goes queued, so wait within the
-                    // deadline instead of falling back.
-                    Fault::SplitInProgress | Fault::StaleAuthority => {
-                        let cause = if fault == Fault::StaleAuthority {
-                            RetryCause::Authority
-                        } else {
-                            RetryCause::Unavailable
-                        };
-                        if !self.pause(deadline, cause).await {
+                    // A frozen source will never accept a new marker. The gateway
+                    // refreshes its route and still requires settlement before queueing.
+                    Fault::SplitInProgress => return Err(fault_response(fault, &epochs)),
+                    Fault::StaleAuthority => {
+                        if !self.pause(deadline, RetryCause::Authority).await {
                             return Err(deadline_expired(uncertain));
                         }
                     }
