@@ -70,6 +70,9 @@ struct Cluster {
     /// While set, proposals never complete, like a leader partitioned after
     /// passing its read barrier.
     stalled: AtomicBool,
+    /// Barriers requested as ReadIndex and as lease reads (PERF1).
+    read_index: AtomicUsize,
+    lease_reads: AtomicUsize,
 }
 impl Cluster {
     async fn new(size: usize) -> Arc<Self> {
@@ -95,6 +98,8 @@ impl Cluster {
                 proposals: Vec::new(),
             }),
             stalled: AtomicBool::new(false),
+            read_index: AtomicUsize::new(0),
+            lease_reads: AtomicUsize::new(0),
         })
     }
     /// The handle gets its own `TimestampMachine` over the node's store, as
@@ -225,6 +230,16 @@ impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.cluster.read_index.fetch_add(1, Ordering::SeqCst);
+        self.barrier()
+    }
+    fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.cluster.lease_reads.fetch_add(1, Ordering::SeqCst);
+        self.barrier()
+    }
+}
+impl ModelConsensus {
+    fn barrier(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
             let log = self.cluster.log.lock().await;
             if log.leader != self.node || !log.connected[self.node] {
@@ -942,4 +957,26 @@ fn o09_coalescing_client_recovers_after_its_runtime_cancels_the_driver() {
     });
     assert_eq!(value.get(), 1, "the cancelled call issued nothing");
     assert_eq!(remote.calls(), vec![1, 1]);
+}
+
+/// PERF1, plan section 5: `AllocateDirect` passes a leader-lease barrier
+/// (ReadIndex only as the lease's own fallback), never a forced ReadIndex.
+#[tokio::test]
+async fn o09_d06_perf1_allocate_direct_uses_the_lease_barrier() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let before = cluster.read_index.load(Ordering::SeqCst);
+    let leases = cluster.lease_reads.load(Ordering::SeqCst);
+    let a = handle.allocate_direct(1).await.unwrap().first().get();
+    let b = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(b > a);
+    assert_eq!(cluster.read_index.load(Ordering::SeqCst), before);
+    assert_eq!(cluster.lease_reads.load(Ordering::SeqCst), leases + 2);
+    // The window rule still holds: a queued allocation in between is below
+    // the next direct value.
+    let q = queued(&handle, authority).await;
+    let c = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(c > q, "direct value {c} after queued {q} must be higher");
 }

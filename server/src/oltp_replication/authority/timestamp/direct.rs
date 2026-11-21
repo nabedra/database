@@ -382,11 +382,11 @@ impl TimestampHandle {
             ));
         }
         let _total = crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.total").timer();
-        // The plan asks for ReadPolicy::LeaseRead. The Consensus contract only
-        // exposes the stricter ReadIndex barrier today.
+        // Plan section 5: a valid leader lease, else ReadIndex (PERF1). The
+        // window rule below still compares the applied leader ID.
         let barrier = crate::oltp_runtime::stage_timing::timed(
             crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.barrier"),
-            self.consensus.ensure_linearizable(),
+            self.consensus.ensure_linearizable_lease(),
         )
         .await?;
         let leader = leader_of(barrier.applied);
