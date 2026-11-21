@@ -442,3 +442,95 @@ async fn o02_d11_t7b_rf1_activation_waits_for_the_exclusive_ddl_guard_over_mtls(
     .await
     .expect("rf1 guard watchdog");
 }
+
+/// One measurement line that libtest does not capture, so CI logs show it
+/// for a passing test too (it writes to the stderr handle, not `eprintln!`).
+fn report(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// O15/D03, RV-FINAL M3 (user decision 2026-11-21): in rollback mode
+/// (`direct_oltp: false` while `data.direct.v1` is active) a queued get has
+/// no exactly-once identity of its own. Through the gateway (declared
+/// length) and through the queue owner (no declared length) it proposes no
+/// Data entry and writes no forward marker, so no dedup record or expiry
+/// key. A mutation in the same mode is still settled (one marker). The run
+/// reports per-get Data entries, forwards, journal bytes and wall time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
+    const GETS: usize = 200;
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-m3-rollback-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, false).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let (status, inserted) = call(
+            &app,
+            body(
+                Uuid::new_v4(),
+                "table.insert",
+                json!({"table_id": table, "row": {"id": 1, "value": 10, "tag": "a"}}),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, 200, "{inserted}");
+        let snapshot = || async {
+            let reply = runtime.stats().await.unwrap();
+            let stats: Value = serde_json::from_slice(&reply.body).unwrap();
+            let count = |value: &Value| value.as_u64().unwrap_or(0);
+            (
+                count(&stats["direct"]["entries_proposed"]),
+                count(&stats["direct"]["forward_markers_written"]),
+                count(&stats["direct_gateway"]["forwards"]),
+                count(&stats["storage"]["journal_bytes"]),
+                count(&stats["storage"]["commits"]),
+            )
+        };
+        let before = snapshot().await;
+        let started = std::time::Instant::now();
+        for index in 0..GETS {
+            let (status, envelope) = call(
+                &app,
+                body(
+                    Uuid::new_v4(),
+                    "table.get",
+                    json!({"table_id": table, "key": 1}),
+                ),
+                index % 2 == 0,
+            )
+            .await;
+            assert_eq!(status, 200, "{envelope}");
+            assert_eq!(
+                envelope["data"],
+                json!({"id": 1, "value": 10, "tag": "a"}),
+                "{envelope}"
+            );
+        }
+        let elapsed = started.elapsed();
+        let after = snapshot().await;
+        let (entries, markers, forwards, journal, commits) = (
+            after.0 - before.0,
+            after.1 - before.1,
+            after.2 - before.2,
+            after.3 - before.3,
+            after.4 - before.4,
+        );
+        report(&format!(
+            "M3 rollback-mode queued gets: {GETS} gets, {:.3} ms/get, Data entries {entries} \
+             ({:.2}/get), forward markers {markers}, gateway forwards {forwards}, journal bytes \
+             {journal} ({:.0}/get), store commits {commits} ({:.2}/get)",
+            elapsed.as_secs_f64() * 1e3 / GETS as f64,
+            entries as f64 / GETS as f64,
+            journal as f64 / GETS as f64,
+            commits as f64 / GETS as f64,
+        ));
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("m3 rollback watchdog");
+}
