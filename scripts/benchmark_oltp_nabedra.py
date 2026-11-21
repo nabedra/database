@@ -1128,7 +1128,14 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         try:
             time.sleep(args.perf_delay)
             pids = {name: self.docker('inspect', '--format', '{{.State.Pid}}', f'{self.prefix}-{name}').strip()
-                    for name in (*WORKERS, 'api')}
+                    for name in WORKERS}
+            # The API container runs the Python CLI, which starts the server as a child: sample
+            # that child (host PID from `docker top`).
+            for line in self.docker('top', f'{self.prefix}-api', '-eo', 'pid,args').splitlines()[1:]:
+                pid, _, command_line = line.strip().partition(' ')
+                if 'nabedra-db' in command_line or self.binary in command_line:
+                    pids['api'] = pid
+                    break
             write_json(args.output / 'perf-pids.json', pids)
             data = args.output / 'perf.data'
             # The workers run as root in their containers: perf needs root to attach.
