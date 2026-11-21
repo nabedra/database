@@ -138,6 +138,18 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Connection<I> {
         std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
+/// Only a connection's first request still holds its header charge, so this
+/// counts requests on new and on reused connections (PERF2c).
+#[cfg(feature = "oltp")]
+fn count_request(first_on_connection: bool) {
+    use crate::oltp_runtime::stage_timing::perf_stage;
+    if first_on_connection {
+        perf_stage!("http.request.new_connection")
+    } else {
+        perf_stage!("http.request.reused_connection")
+    }
+    .record(std::time::Duration::ZERO);
+}
 #[derive(Clone)]
 struct HeaderCharge(std::sync::Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
 #[derive(Clone)]
@@ -171,12 +183,17 @@ where
             let write_deadline = StreamWriteDeadline::default();
             #[cfg(feature = "olap")]
             let service = service.layer(axum::Extension(write_deadline.clone()));
+            #[cfg(feature = "oltp")]
+            let started = std::time::Instant::now();
             let (io, service) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 inner.accept(stream, service),
             )
             .await
             .map_err(|_| io::Error::other("handshake timeout"))??;
+            // TCP accept to the end of the TLS handshake (zero without TLS).
+            #[cfg(feature = "oltp")]
+            crate::oltp_runtime::stage_timing::perf_stage!("http.accept.handshake").since(started);
             Ok((
                 Connection {
                     io,
@@ -332,7 +349,10 @@ pub(crate) async fn serve_router_with_budget(
     let app = app.layer(axum::middleware::from_fn(
         |request: axum::extract::Request, next: axum::middleware::Next| async move {
             if let Some(charge) = request.extensions().get::<HeaderCharge>() {
-                drop(charge.0.lock().unwrap().take());
+                let header = charge.0.lock().unwrap().take();
+                #[cfg(feature = "oltp")]
+                count_request(header.is_some());
+                drop(header);
             }
             next.run(request).await
         },

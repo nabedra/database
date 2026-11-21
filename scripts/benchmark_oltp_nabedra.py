@@ -93,12 +93,24 @@ def command(*args, timeout=30):
 class Http:
     """One persistent, non-retrying connection to the production HTTP API."""
 
+    # TCP (and TLS) connections opened by every Http in this process (PERF2c).
+    opened = 0
+    _opened_lock = threading.Lock()
+
     def __init__(self, url, token, timeout, ca=None):
         target = urlsplit(url)
         if target.scheme == 'https':
             self.connection = http.client.HTTPSConnection(target.hostname, target.port, timeout=timeout, context=ca)
         else:
             self.connection = http.client.HTTPConnection(target.hostname, target.port, timeout=timeout)
+        connect = self.connection.connect
+
+        def counted_connect():
+            connect()
+            with Http._opened_lock:
+                Http.opened += 1
+        # http.client opens a closed connection again through self.connect().
+        self.connection.connect = counted_connect
         self.headers = {'Authorization': f'Bearer {token}', 'X-Nabedra-Database': DATABASE,
                         'Content-Type': 'application/json'}
 
@@ -284,6 +296,8 @@ class Nabedra:
         network = Path('/proc/net/dev')
         if network.is_file():
             driver['network'] = network.read_text()
+        driver['connections_opened'] = Http.opened
+        driver['process_cpu_seconds'] = time.process_time()
         stats = {'driver_cgroup': driver}
         client = Http('https://api:8000', self.token, min(self.timeout, 3), self.ca)
         try:
@@ -823,9 +837,9 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         return sample
 
     def sample_cgroups(self, interval):
-        # Worker cgroup counters on the Docker VM's wall clock, which the driver's phases also record.
+        # Worker and API cgroup counters on the Docker VM's wall clock, which the driver's phases also record.
         while not self.sampling.wait(interval):
-            for name in WORKERS:
+            for name in (*WORKERS, 'api'):
                 try:
                     self.samples.append(self.cgroup_sample(name))
                 except (RuntimeError, ValueError, IndexError, subprocess.SubprocessError) as error:

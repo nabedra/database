@@ -879,12 +879,22 @@ impl ControlHandle {
         .await
     }
 
-    async fn read(
+    /// A linearizable read of the local machine. Each call site is counted
+    /// as `control.barrier.site.<file>:<line>` (PERF2c).
+    #[track_caller]
+    fn read(
         &self,
         read: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
-    ) -> Result<ChargedBytes, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        self.machine.store().read(BUDGET, read).await
+    ) -> impl std::future::Future<Output = Result<ChargedBytes, ProtocolError>> + Send + '_ {
+        let site = crate::oltp_runtime::stage_timing::site(
+            "control.barrier.site.",
+            std::panic::Location::caller(),
+        );
+        async move {
+            let _timer = site.timer();
+            self.consensus.ensure_linearizable().await?;
+            self.machine.store().read(BUDGET, read).await
+        }
     }
     pub(crate) async fn excluded(
         &self,
