@@ -17,6 +17,8 @@ The verdict comes first; the tables and method follow.
   controlled host costs about 10x more per thread handoff: a native-executor hop takes 0.3–0.5 ms
   there, against 0.03–0.04 ms on the runner. Most of the remaining gap is handoffs, not CPU work.
 
+PERF2c follow-up (HTTP keep-alive on the OLTP API, idle Control reads): [perf2c/README.md](perf2c/README.md).
+
 ## Fixes
 
 | Commit | Change | Effect (controlled host, serial) |
