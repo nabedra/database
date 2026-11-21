@@ -41,7 +41,10 @@
 //!   unless synced journal bytes were damaged.
 //! - **Directories.** `open` creates `dir` if needed and syncs the parent of every
 //!   directory it created and of `dir` itself, so the journal's own directory entry is
-//!   durable before any acknowledged write depends on it (RV-KV1 F2).
+//!   durable before any acknowledged write depends on it (RV-KV1 F2). It also syncs `dir`
+//!   before it publishes `durable_seq`: the names it recovered from may exist only in the
+//!   OS (a process killed between a roll's rename and its directory sync), and this run
+//!   appends to that segment and the store records it in the manifest (KVfix4).
 //! - **Background work.** Besides the `kv-journal` thread, a `kv-journal-prep` thread
 //!   prepares (creates, zero-fills, syncs) the next free segment once the active one is
 //!   half used, so commits never wait for a zero fill unless no spare exists (F8).
