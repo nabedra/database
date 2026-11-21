@@ -69,13 +69,20 @@ pub(super) fn hold_run_sync(directory: &Path, bytes: u64) -> io::Result<()> {
 }
 
 pub(crate) async fn hold_snapshot(group: Uuid, transferred: u64, total: u64) {
-    let Some(directory) = directory() else { return };
-    let stage = format!("snapshot-{group}");
-    if reached(
-        &directory,
-        &stage,
+    hold(
+        format!("snapshot-{group}"),
         &serde_json::to_vec(&(transferred, total)).unwrap(),
-    ) {
+    )
+    .await;
+}
+
+pub(crate) async fn hold_index_page(index: Uuid, rows: usize) {
+    hold(format!("index-{index}"), rows.to_string().as_bytes()).await;
+}
+
+async fn hold(stage: String, observed: &[u8]) {
+    let Some(directory) = directory() else { return };
+    if reached(&directory, &stage, observed) {
         let release = directory.join(format!("release-{stage}"));
         tokio::time::timeout(Duration::from_secs(90), async {
             while !release.is_file() {
@@ -83,7 +90,7 @@ pub(crate) async fn hold_snapshot(group: Uuid, transferred: u64, total: u64) {
             }
         })
         .await
-        .expect("snapshot chunk watchdog");
+        .expect("maintenance checkpoint watchdog");
     }
 }
 

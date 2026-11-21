@@ -364,12 +364,7 @@ class Acc6Cluster(Rf3Cluster):
         self.traced = traced
         self.queue_bytes = queue_bytes
         self.pending = pending
-        self.index_fault_dir = None
-        if maintenance:
-            self.index_fault_dir = self.root / 'index-gates'
-            self.index_fault_dir.mkdir(mode=0o700)
-            (self.index_fault_dir / 'commands').mkdir()
-            self.worker_env['NABEDRA_OLTP_TEST_INDEX_FAULT_DIR'] = str(self.index_fault_dir)
+        self.maintenance = maintenance
 
     def launch_worker(self, name):
         if self.unequal and name not in self.workers:
@@ -384,7 +379,7 @@ class Acc6Cluster(Rf3Cluster):
             directory = self.barrier_dir(name)
             directory.mkdir(parents=True, exist_ok=True)
             write_json(directory / 'identity-load-ids.json', self.traced)
-        if self.index_fault_dir is not None:
+        if self.maintenance:
             directory = self.barrier_dir(name)
             directory.mkdir(parents=True, exist_ok=True)
             (directory / 'enable-maintenance-observation').touch()
@@ -509,8 +504,7 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
         'table_id': table.id, 'query': table.query().select('id')._to_wire()})
     snapshot_stage = f"snapshot-{source['group_id']}"
     index = uid()
-    index_stage = f'{index}-backfill'
-    index_directory = cluster.index_fault_dir
+    index_stage = f'index-{index}'
     leader_directory = None
 
     def worker_stats(worker):
@@ -535,10 +529,20 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
             fixture.admit(scan)
             _, scanned_rows = fixture.reached(scan['request_id'], 'scan-page')
             assert 0 < scanned_rows < len(rows), scanned_rows
-            (index_directory / f'hold-{index_stage}').touch()
+            for worker in WORKERS:
+                (cluster.barrier_dir(worker) / f'hold-{index_stage}').touch()
             building = jobs.submit(fixture.make_index, table, owner, index_id=index)
-            wait_until(lambda: (index_directory / f'index-{index_stage}.json').is_file(),
-                       'index backfill completed its Data writes', timeout=25)
+            index_page = directory / f'reached-{index_stage}'
+
+            def check_index_page():
+                if building.done():
+                    building.result()
+                    raise AssertionError('index became ready before the backfill gate')
+                return index_page.is_file() and index_page.stat().st_size > 0
+
+            wait_until(check_index_page, 'index backfill fetched a source page', timeout=25)
+            index_rows = int(index_page.read_text())
+            assert 0 < index_rows <= len(rows), index_rows
 
             leader = data_leader(fixture, source['group_id'])
             target = next(worker for worker in WORKERS if worker != leader)
@@ -569,7 +573,8 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
                 (directory / f'release-{stage}').touch()
             if leader_directory is not None:
                 (leader_directory / f'release-{snapshot_stage}').touch()
-            (index_directory / f'release-{index_stage}').write_text('continue')
+            for worker in WORKERS:
+                (cluster.barrier_dir(worker) / f'release-{index_stage}').touch()
             fixture.release(scan['request_id'], 'scan-page')
         flushing.result(timeout=30)
         cut = sending.result(timeout=30)['test_maintenance']['snapshot_cut']
@@ -594,7 +599,7 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
     evidence('O05', 'joint-native-maintenance-cut', baseline=baseline, held=held, settled=settled,
              flush_and_compaction_worker=owner, snapshot_sender=leader, snapshot_receiver=target,
              snapshot_transferred_cut=cut, first_chunk_bytes=transferred, image_bytes=total,
-             rows_reduced_before_pause=scanned_rows)
+             rows_reduced_before_pause=scanned_rows, index_source_page_rows=index_rows)
 
 
 def o05(binary, test_executable):

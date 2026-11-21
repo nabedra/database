@@ -2,15 +2,13 @@
 """Exercise actual table creation across a selected post-sync journal error."""
 
 import argparse
-import hashlib
-import json
 from pathlib import Path
 import tempfile
 
 from oltp_direct_acceptance import dump
 from oltp_direct_cluster import Rf3Cluster, WORKERS, operation, write_json
 from oltp_hardening_acceptance import data_leader
-from oltp_runtime_acceptance import DIRECT, RuntimeServer, evidence, wait_until
+from oltp_runtime_acceptance import DIRECT, RuntimeServer, evidence, same_run_ready, wait_until
 from oltp_transaction_acceptance import OPERATIONS, REQUESTS, Transactions, assert_binding, passed
 from oltp_process import raw
 
@@ -126,16 +124,24 @@ def authoritative_after_decision(binary, test_executable):
             proof = proof['status']['terminal']['committed']
             assert proof['decision'] == decision, proof
             assert proof['reservation']['request_id'] == request, proof
-            assert proof['reservation']['digest'] == hashlib.sha256(
-                json.dumps(create, separators=(',', ':')).encode()).hexdigest() == binding['digest']
+            assert proof['reservation']['digest'] == binding['digest'], proof
+            assert proof['reservation']['original_run'] == binding['run_id'], proof
 
-            fixture.terminal(request, expected)
-            assert fixture.api('api2', OPERATIONS, create) == (200, dict(request_id=request, data=expected))
-            assert str(fixture.db.table(create['payload']['name']).id) == original
             assert plan_ids(directories, request) == [original]
             assert cluster.stats(target)['test_pool_sync']['pools_requiring_recovery'] == 1
             evidence('O29', 'durable-create-status-on-surviving-quorum', faulted_worker=target,
                      request_id=request, table_id=original, decision=decision, outcome=proof['outcome'])
+
+            # The Status proof already reconciled this identity. Receipt
+            # completion still requires every ready RAM replica, so exercise
+            # public replay after the failed worker leaves the ready set.
+            cluster.workers[target].kill()
+            survivors = tuple(worker for worker in WORKERS if worker != target)
+            same_run_ready(cluster, cluster.run_id, survivors, 2)
+            fixture.terminal(request, expected)
+            assert fixture.api('api2', OPERATIONS, create) == (200, dict(request_id=request, data=expected))
+            assert str(fixture.db.table(create['payload']['name']).id) == original
+            assert plan_ids(directories, request) == [original]
         except BaseException:
             dump(cluster)
             raise
@@ -145,7 +151,8 @@ def authoritative_after_decision(binary, test_executable):
 
     passed('O29', 'authoritative-decision-replay',
            'A Catalog voter synced a real table.create Resolve append and returned injected EIO. '
-           'With its pool still latched, Status returned the exact decision and the application replayed the original UUID.')
+           'Status returned the exact decision and UUID while the pool was latched. '
+           'The receipt and same-body replay returned that UUID after the failed worker left the ready set.')
 
 
 def main():

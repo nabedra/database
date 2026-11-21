@@ -17,16 +17,14 @@ mod storage;
 pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-pub(crate) use tests::acceptance_damaged_checkpoints;
-#[cfg(test)]
-pub(crate) use tests::o29_pool_recovery;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
 pub(crate) use resources::{GroupCapacityLease, RAFT_REPLICA_BYTES};
+#[cfg(test)]
+pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
 
 use super::{failure, recovery_unknown};
 use crate::{

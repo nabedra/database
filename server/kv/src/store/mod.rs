@@ -806,7 +806,10 @@ impl Store {
     /// journal items and bytes on this store, for maintenance acceptance.
     #[doc(hidden)]
     pub fn queued_io(&self) -> ((usize, usize), (usize, usize)) {
-        (self.inner.background.queued(), self.inner.journal().queued())
+        (
+            self.inner.background.queued(),
+            self.inner.journal().queued(),
+        )
     }
 
     /// Closes the store: waits for its background work, then closes the journal (clean

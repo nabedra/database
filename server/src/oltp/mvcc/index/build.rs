@@ -498,6 +498,11 @@ impl IndexService {
                         }
                         ScanPage::Records { records, exhausted } => {
                             #[cfg(test)]
+                            crate::oltp_runtime::recovery_tests::maintenance::hold_index_page(
+                                maintenance.index_id,
+                                records.len(),
+                            ).await;
+                            #[cfg(test)]
                             if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
                                 maintenance.index_id,
                                 crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Backfill,
