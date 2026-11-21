@@ -288,7 +288,7 @@ jobs:
             | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable' | tail -1)"
           test -x "$test_executable"
           status=0
-          for suite in rollback restart replacement-check; do
+          for suite in scale rollback restart replacement-check; do
             python3 server/tests/oltp_recovery_operations.py --binary server/target/debug/nabedra-db \
               --test-executable "$test_executable" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || status=1
           done

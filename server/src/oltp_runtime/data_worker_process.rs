@@ -447,6 +447,10 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 ControlReply::Rejected(Fault::Busy | Fault::Stale | Fault::NotReady) => {
                     wait_startup(deadline).await?
                 }
+                ControlReply::Rejected(fault) => {
+                    tracing::warn!(?fault, "Control rejected data worker queue join");
+                    return Err(refused("Control refused data worker queue join"));
+                }
                 _ => return Err(refused("Control refused data worker queue join")),
             }
         };

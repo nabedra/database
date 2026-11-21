@@ -879,11 +879,126 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
         cluster.close()
 
 
+def o17_a02_scale(binary, test_executable, root):
+    cluster = Rf3Cluster(binary, root, test_executable=test_executable, mounts=True)
+    name = 'data4'
+    try:
+        cluster.start()
+        wait_for(lambda: all(cluster.stats(w)['direct_capability']['batch'] for w in WORKERS),
+                 'sticky DirectBatch feature enabled before worker preparation')
+        api = cluster.api_urls['api1']
+        token = cluster.auth['data_token']
+        send_op = lambda body: send(api, token, body, ca=cluster.ca)
+        table = create(send_op, 'scale_retained')
+        queued = insert(table, 1, 7)
+        request_id = queued['request_id']
+        for worker_name in WORKERS:
+            write_json(cluster.barrier_dir(worker_name) / 'gates.json', {request_id: 'queued'})
+        status, receipt = send(api, token, queued, ca=cluster.ca, path='/v1/requests')
+        assert (status, receipt) == (202, dict(request_id=request_id, run_id=cluster.run_id,
+                                               state='queued')), (status, receipt)
+        wait_for(lambda: any((cluster.barrier_dir(w) / f'reached-{request_id}').exists() for w in WORKERS),
+                 'original queued request parked')
+
+        enrollment = cluster.certificate(name)
+        worker = {key: enrollment[key] for key in IDENTITY_FIELDS}
+        pool, claim, policy = uid(), uid(), uid()
+        mount = cluster.mount_pool(name, pool, enrollment)
+        private = root / 'mount.pem'
+        cluster.openssl('genpkey', '-algorithm', 'Ed25519', '-out', private)
+        seed = subprocess.check_output(['openssl', 'pkey', '-in', str(private), '-outform', 'DER'], timeout=15)[-32:]
+        public = subprocess.check_output(['openssl', 'pkey', '-in', str(private), '-pubout',
+                                          '-outform', 'DER'], timeout=15)[-32:]
+        private.unlink()
+        key_file = Path(mount['mount_path']) / '.nabedra-data-worker-key'
+        with os.fdopen(os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+            output.write(seed)
+        cluster.admin('storage.growth.configure', {'policy': dict(
+            policy_id=policy, volume_cost_per_gib=0, worker_cost=0, initial_monthly_spend=0,
+            monthly_spend_ceiling=0, max_attempts=2, cooldown_seconds=1, max_volume_bytes=1 << 40,
+            zones=['a', 'b', 'c'], initial_replica_zones={
+                cluster.enrollments[w]['worker_id']: zone for w, zone in zip(WORKERS, 'abc')})})
+        claim_intent = dict(policy_id=policy, claim_id=claim, worker=worker, pool_id=pool,
+                            pool_generation=1, quoted_monthly_cost=0, monthly_spend_ceiling=0,
+                            max_attempts=2, cooldown_seconds=1,
+                            action=dict(kind='add_worker', zone='c', bytes=512 << 20))
+        assert cluster.admin('storage.growth.claim', {'intent': claim_intent})['phase'] == 'claimed'
+        cluster.admin('storage.growth.attempt', {'claim_id': claim})
+        assert cluster.admin('storage.growth.provisioned', {
+            'claim_id': claim, 'resource_id': mount['provider_volume_id']})['phase'] == 'awaiting_mount'
+        intent = dict(claim_id=claim, run_id=cluster.run_id, enrollment=enrollment,
+                      mount=mount, mount_public_key=public.hex())
+        assert cluster.admin('storage.growth.prepare_worker', intent)['identity'] == worker
+        bind = f'127.0.0.1:{free_port()}'
+        # The native data-worker process does not use the test executable.
+        cfg = dict(version=1, bind=bind, auth_file=str(root / 'auth.json'),
+                   resources=resources(1024 << 20), execution=EXECUTION,
+                   node=dict(intent=intent, bind=enrollment['endpoint'], scheduler_node_id=4,
+                             certificate=str(root / f'{name}.pem'), private_key=str(root / f'{name}.key'),
+                             authority_ca=str(cluster.ca), control=cluster.config['w1']['node']['placements']['control'],
+                             control_enrollments=cluster.admin('cluster.connection', {})['control_peers']))
+        config = root / f'{name}.json'
+        write_json(config, cfg, 0o600)
+        log = root / f'{name}.log'
+        process = Process(name, [cluster.binary, 'data-worker', '--bootstrap', str(config)],
+                          os.environ | {'RUST_LOG': 'warn'}, log)
+        cluster.workers[name] = process
+
+        def joined():
+            assert process.alive(), log.read_text()
+            status, reply = call(f'http://{bind}', '/health/ready', token=token, timeout=3)
+            return reply if status == 200 and reply['ready_workers'] == 4 else None
+
+        ready = wait_for(joined, 'fourth worker becomes ready with a complete queue copy')
+        assert ready['run_id'] == cluster.run_id and ready['worker'] == worker, ready
+        assert ready['queue']['accepted_records'] >= 1 and ready['system_groups_hosted'] == 0, ready
+        assert cluster.admin('storage.growth.status', {'claim_id': claim})['phase'] == 'complete'
+
+        drain = dict(worker=worker, run_id=cluster.run_id, docker_container_id='a1' * 32)
+        record = cluster.admin('worker.drain', drain)
+        drain_id = record['id']
+        assert record['intent'] == drain, record
+
+        def stop_permit():
+            assert process.alive(), log.read_text()
+            status, reply = call(cluster.urls['w1'], '/v1/cluster/operations',
+                                 operation('worker.stop_permit', {}, drain_id),
+                                 token=cluster.auth['admin_token'])
+            if status == 200:
+                return success(status, reply)
+            assert status in (404, 409, 429, 503), (status, reply)
+
+        permit = wait_for(stop_permit, 'mount closure and committed queue removal')
+        assert permit['record']['intent'] == drain, permit
+        closure = permit['record']['phase']['closed']
+        assert closure['mount']['expected'] == mount and closure['ready']['run_id'] == cluster.run_id
+        cluster.wait_workers()
+        process.stop()
+        for worker_name in WORKERS:
+            (cluster.barrier_dir(worker_name) / f'release-{request_id}').touch()
+        path = f'/v1/requests/{cluster.run_id}/{request_id}'
+
+        def settled():
+            status, reply = send(api, token, None, ca=cluster.ca, path=path)
+            if status == 200 and reply['state'] not in ('queued', 'running', 'committing', 'reconciling'):
+                return reply
+
+        terminal = wait_for(settled, 'original accepted request settles across join and drain')
+        assert terminal == dict(request_id=request_id, run_id=cluster.run_id, state='succeeded',
+                                error=None, result=None), terminal
+        assert success(*send_op(get(table, 1))) == {'id': 1, 'value': 7}
+        assert len(cluster.admin('storage.replica.placement', {'group': initial_range(cluster, table)})['members']) == 3
+        report('O17/A02/Q03/R03 RF3 data worker scale and drain', ready=[3, 4, 3],
+               request_id=request_id, drain_id=drain_id, run_id=cluster.run_id)
+    finally:
+        cluster.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed'),
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed', 'scale'),
                         default='all')
     parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
@@ -897,6 +1012,9 @@ def main():
         if args.suite in ('all', 'replacement-check'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
+        if args.suite in ('all', 'scale'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o17_a02_scale(args.binary, args.test_executable, root / 'scale')
 
         if args.suite == 'replacement-mixed':
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
