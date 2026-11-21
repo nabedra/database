@@ -226,6 +226,9 @@ impl GrantCache {
     /// Records a use of a warm key, registering it (and starting the warm
     /// task) on first use. While `warm` is not empty the task runs.
     fn touch(&self, key: GrantKey, warm: impl FnOnce() -> Refresh) {
+        if warming_disabled() {
+            return;
+        }
         let now = Instant::now();
         let mut grants = self.grants();
         if let Some(entry) = grants.warm.get_mut(&key) {
@@ -314,6 +317,20 @@ fn insert(
         }
     }
     grants.entries.insert(key, expires);
+}
+
+/// Benchmark only (RD2): `NABEDRA_BENCH_NO_GRANT_WARM=1` turns warming off,
+/// so one binary measures both sides of the change in one session.
+const NO_WARM_ENV: &str = "NABEDRA_BENCH_NO_GRANT_WARM";
+fn warming_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled = std::env::var_os(NO_WARM_ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!("{NO_WARM_ENV}=1: role checks are not kept warm (benchmark only)");
+        }
+        disabled
+    })
 }
 
 /// Refreshes the warm keys whose entries are missing or close to expiry,
