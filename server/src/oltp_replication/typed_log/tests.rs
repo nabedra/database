@@ -1257,7 +1257,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
         };
         let (entries, flushed) = ack(0);
         log.append(entries, flushed).await.unwrap();
-        rig.entered().await;
+        rig.gated.wait_for_sync().await;
         for index in [1, 2] {
             let (entries, flushed) = ack(index);
             log.append(entries, flushed).await.unwrap();
