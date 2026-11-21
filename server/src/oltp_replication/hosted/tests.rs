@@ -500,6 +500,8 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
         .map(|index| OwnedRaftEntry::<Bump>::new(id(index), Payload::Blank))
         .collect();
     log.append(entries, IOFlushed::noop()).await.unwrap();
+    // `append` returns before its sync (PERF2d); a host applies only after it.
+    log.drain().await;
     let _deferred = store.defer_apply_sync(log.group()).unwrap();
     let apply = |index: u64| {
         store.transaction(
@@ -1125,6 +1127,7 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
                 log.purge(ns13_id(next - lag - 1)).await.unwrap();
             }
         }
+        log.drain().await;
         let flushed = pool.clone();
         tokio::task::spawn_blocking(move || {
             flushed.kv_store().flush().unwrap();
