@@ -191,7 +191,6 @@ struct AppendJob<C: TypedConfig> {
     epoch: u64,
     batch: Arc<Vec<OwnedRaftEntry<C::Command>>>,
     callback: IOFlushed<C>,
-    pending: PendingGuard,
     #[cfg(test)]
     hook: Option<AppendHook>,
 }
@@ -970,7 +969,6 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             epoch: 0,
             batch,
             callback,
-            pending,
             #[cfg(test)]
             hook: append_hook,
         });
@@ -983,11 +981,13 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             ],
         )
         .since(submit);
-        // KVfix4 + GC1: the job's guard (above) keeps `drain` waiting for a
-        // queued append that another task writes; this task's own guard is
-        // released only after the task has dropped everything it captured
-        // (the store, the merged jobs' entries, the worker's resource owner).
-        spawn_pending(self.pending.start(), async move {
+        // KVfix4 + GC1: one guard per append, released only after this task
+        // has dropped everything it captured (the store, the merged jobs'
+        // entries, the worker's resource owner). A queued job needs no guard
+        // of its own: it is pushed and its task spawned in this same
+        // synchronous step, and only a running task (which still holds its
+        // own guard) takes it, so `drain` waits for every job's write.
+        spawn_pending(pending, async move {
             use crate::oltp_runtime::stage_timing::by_kind;
             let kind = store.identity().kind.clone();
             let started = std::time::Instant::now();
@@ -1153,12 +1153,10 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             // before reporting, so a flushed entry is always read back stored.
             // Callbacks fire in log order.
             let mut committed = None;
-            let mut pending = Vec::with_capacity(jobs.len());
             for job in jobs {
                 let AppendJob {
                     batch: job_batch,
                     callback,
-                    pending: guard,
                     ..
                 } = job;
                 let (first, last) = (job_batch[0].index(), job_batch[job_batch.len() - 1].index());
@@ -1170,14 +1168,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                         io::Error::new(error.kind(), error.to_string())
                     }),
                 );
-                pending.push(guard);
             }
             if let Some(id) = committed
                 && let Err(error) = save_commit_marker(&store, &retry, Some(id), true).await
             {
                 tracing::warn!(group=%store.identity().group_id,code=?error.code,"deferred Raft commit marker not saved");
             }
-            drop(pending);
         });
         Ok(())
     }
