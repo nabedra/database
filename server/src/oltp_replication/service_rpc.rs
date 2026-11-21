@@ -80,6 +80,9 @@ pub(super) const INLINE_REPLY_BYTES: usize = 1024;
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
+const DIRECT_CATALOG_PEER_TIMEOUT: Duration = Duration::from_millis(500);
+const ALLOCATE_DIRECT_PEER_TIMEOUT: Duration = Duration::from_millis(750);
+const ALLOCATE_DIRECT_STALLED_PROBE: Duration = Duration::from_millis(200);
 pub(super) const SERVICE_HEADER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,12 +253,14 @@ impl Method {
                     | ServiceAction::ScopedQueueRead { .. }
                     | ServiceAction::ScopedQueueFenceReceipt { .. }
             ) || matches!(self, Self::ScopedStatusParticipant { .. })
-                || (action == ServiceAction::DirectLeader
-                    && matches!(self, Self::ParticipantRead { .. } | Self::ParticipantGuard)))
+                || self.is_direct_catalog_read(action))
     }
-    /// Calls whose small replies are decoded inline (PERF2a): only
-    /// `AllocateDirect`, whose reply is a fixed-shape range.
-    fn inline_small_reply(self) -> bool {
+    fn is_direct_catalog_read(self, action: ServiceAction) -> bool {
+        action == ServiceAction::DirectLeader
+            && matches!(self, Self::ParticipantRead { .. } | Self::ParticipantGuard)
+    }
+    /// `AllocateDirect` has a fixed-shape reply decoded inline (PERF2a).
+    fn is_allocate_direct(self) -> bool {
         matches!(
             self,
             Self::TimestampCall {
@@ -263,6 +268,24 @@ impl Method {
                 mutation: true
             }
         )
+    }
+    fn peer_timeout(self, action: ServiceAction, stalled: bool) -> Duration {
+        if self.is_allocate_direct() {
+            // Timestamp replicas can immediately refuse when they are not
+            // the leader. Probe a silent old leader briefly between rounds
+            // so a freshly elected survivor can answer in the same request.
+            if stalled {
+                ALLOCATE_DIRECT_STALLED_PROBE
+            } else {
+                ALLOCATE_DIRECT_PEER_TIMEOUT
+            }
+        } else if self.is_direct_catalog_read(action) {
+            DIRECT_CATALOG_PEER_TIMEOUT
+        } else if self.can_repeat_read() {
+            HINTED_READ_TIMEOUT
+        } else {
+            SCOPED_MUTATION_TIMEOUT
+        }
     }
     fn input_limit(self) -> usize {
         match self {
@@ -542,7 +565,7 @@ impl Client {
             .iter()
             .find(|member| member.node_id == node)?;
         let attempt = timeout_at(
-            deadline.min(Instant::now() + SCOPED_MUTATION_TIMEOUT),
+            deadline.min(Instant::now() + method.peer_timeout(action, false)),
             self.call_member(action, method, payload, node, member.worker_id.into()),
         )
         .await;
@@ -820,11 +843,7 @@ impl Client {
                 );
                 let reply = if let Some(deadline) = convergence_deadline {
                     // Leave time to reach the next leader when one peer stalls.
-                    let attempt = if method.can_repeat_read() {
-                        HINTED_READ_TIMEOUT
-                    } else {
-                        SCOPED_MUTATION_TIMEOUT
-                    };
+                    let attempt = method.peer_timeout(action, member.node_id == stalled);
                     let peer_deadline = deadline.min(Instant::now() + attempt);
                     timeout_at(peer_deadline, call).await.unwrap_or_else(|_| {
                         self.stalled.store(member.node_id, Ordering::Relaxed);
@@ -1222,7 +1241,7 @@ impl Client {
             && reply.sections[0]
                 .as_ref()
                 .is_none_or(|section| section.len() <= DIRECT_INLINE_REPLY_BYTES))
-            || (method.inline_small_reply()
+            || (method.is_allocate_direct()
                 && raw.len() <= INLINE_REPLY_BYTES
                 && reply.sections[0]
                     .as_ref()

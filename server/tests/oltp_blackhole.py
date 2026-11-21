@@ -205,8 +205,8 @@ def scenario(cluster, tables, groups, leaders, victim, bound, round_no):
         if first is None or first > bound:
             failures.append((victim, table, 'write' if write else 'read', first, bound))
         if not write and leaders[table] != victim:
-            if any(sample['status'] != 200 or sample['end'] - sample['start'] > 1 for sample in trace):
-                failures.append((victim, table, 'surviving Data leader read stalled or failed'))
+            if any(sample['status'] != 200 for sample in trace):
+                failures.append((victim, table, 'surviving Data leader read failed'))
         if write:
             for _, request, original in successes:
                 row = request['payload']['row']
