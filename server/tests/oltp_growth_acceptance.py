@@ -747,6 +747,33 @@ def archive_routes(cluster, table, expected):
                           archive_frames=manifest['frames'], index_closures=len(index_closures))), flush=True)
 
 
+def count_overflow(facade, table, last_key):
+    expression = table.where(col('id') <= last_key)
+    body = operation('query.count', dict(table_id=table.id, query=expression._to_wire()))
+    request_id = body['request_id']
+    facade.select(request_id, {'snapshot': True})
+    facade.admit(body)
+    owner, ts = facade.reached(request_id, 'snapshot')
+    control = facade.cluster.barrier_dir(owner) / f'count-overflow-{ts}'
+    control.touch()
+
+    def receipt():
+        status, response = facade.receipt(request_id)
+        if status != 200 or response['state'] in ('queued', 'running', 'committing', 'reconciling'):
+            return None
+        assert response['state'] == 'failed' and response['result'] is None, response
+        assert response['error'] == dict(code='limit_exceeded',
+                                         message='count exceeds u64 representation',
+                                         outcome='not_applied'), response
+        return response
+
+    try:
+        facade.release(request_id, 'snapshot')
+        wait_for(receipt, 'count overflow returned its checked resource error', 45)
+    finally:
+        control.unlink(missing_ok=True)
+
+
 def o28(facade):
     cluster = facade.cluster
     table = facade.db.create_table('paged_scan', {'id': str, 'category': int, 'value': int}, key='id')
@@ -836,8 +863,10 @@ def o28(facade):
                    'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. A tampered internal continuation was not exercised.')
     passed('O28', 'interruption-and-pins',
            'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
+    count_overflow(facade, table, rows[1]['id'])
+    assert query(facade, table, 'count') == len(expected)
     pending_clause('O28', 'large-counts',
-                   'This multi-page fixture does not load 100,001 rows or force checked arithmetic overflow. O21 checks counts past 100,000 separately.')
+                   'The reducer returned a checked overflow error after seeding its test accumulator near u64::MAX. Counts past 100,000 still require an executed large dataset in this paged fixture.')
 
 
 @contextmanager

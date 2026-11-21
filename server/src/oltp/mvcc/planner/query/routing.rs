@@ -208,8 +208,7 @@ impl<'a> RoutingCursor<'a> {
             };
             #[cfg(test)]
             if self.pages_read == 1 {
-                crate::oltp_runtime::recovery_tests::pause_routing_page(self.pin.read_ts.get())
-                    .await;
+                crate::oltp_growth_acceptance::pause_routing_page(self.pin.read_ts.get()).await;
             }
             self.page = None;
             let (_, page) = value(

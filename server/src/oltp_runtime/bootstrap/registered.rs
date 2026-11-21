@@ -440,7 +440,7 @@ impl LocalServices {
             )?;
             let data_raft = registered_raft_config();
             #[cfg(test)]
-            let data_raft = super::super::recovery_tests::snapshot_test_config(data_raft);
+            let data_raft = crate::oltp_growth_acceptance::snapshot_test_config(data_raft);
             let factory = DataGroupFactory::new(
                     manager.clone(),
                     worker.pool.clone(),
