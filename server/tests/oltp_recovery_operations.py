@@ -527,8 +527,12 @@ def o17_mixed_binary_retained_enrollment_refused(binary, test_executable, legacy
                     return cluster.admin('worker.system_replacement.enable', {}, worker=name)
             return None
 
-        assert wait_for(enable, 'activate system replacement', PROBE_WINDOW)['capability'] == 'control.system-replacement.v1'
+        activation = wait_for(enable, 'activate system replacement', PROBE_WINDOW)
+        assert activation['capability'] == 'control.system-replacement.v1'
         target = WORKERS[-1]
+        # The old process should reach enrollment with the on-disk activation
+        # already applied. Prove that before replacing the current process.
+        assert cluster.admin('worker.system_replacement.enable', {}, worker=target) == activation
         survivors = [name for name in WORKERS if name != target]
         original = cluster.enrollments[target]
         cluster.workers[target].kill()

@@ -632,9 +632,7 @@ async fn replacement_peer_probe(config: PathBuf) {
         config::WorkerResources,
         oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
         oltp_replication::{
-            multiplex::{
-                AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport,
-            },
+            multiplex::{AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport},
             types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},
         },
     };
@@ -655,48 +653,20 @@ async fn replacement_peer_probe(config: PathBuf) {
         &std::fs::read(config.certificate).unwrap(),
         &std::fs::read(config.private_key).unwrap(),
         &std::fs::read(config.authority_ca).unwrap(),
-    )
-    .unwrap();
-    let shared = WorkerSharedResources::new(
-        1,
-        WorkerResources::default(),
-        SharedResourceConfig::default(),
-    )
-    .unwrap();
+    ).unwrap();
+    let shared = WorkerSharedResources::new(1, WorkerResources::default(), SharedResourceConfig::default()).unwrap();
     let directory = AppliedPeerDirectory::from_bootstrap(
-        config.group.clone(),
-        config.targets.clone(),
-        shared.clone(),
-    )
-    .unwrap();
-    let client = WorkerTransport::new(
-        &config.from,
-        &tls,
-        shared.clone(),
-        directory,
-        Arc::new(EndpointRegistry::new(shared.clone())),
-        TransportConfig::default(),
-    )
-    .unwrap()
-    .client();
+        config.group.clone(), config.targets.clone(), shared.clone(),
+    ).unwrap();
+    let client = WorkerTransport::new(&config.from, &tls, shared.clone(), directory,
+        Arc::new(EndpointRegistry::new(shared.clone())), TransportConfig::default()).unwrap().client();
     let probe = |target: WorkerIdentity| {
-        let header = shared
-            .encode_in(ByteClass::Progress, &"advertise", 4096)
-            .unwrap();
+        let header = shared.encode_in(ByteClass::Progress, &"advertise", 4096).unwrap();
         let client = client.clone();
         let group = config.group.clone();
         async move {
-            client
-                .request_classified(
-                    &group,
-                    target,
-                    Purpose::SystemRecovery,
-                    header,
-                    [None, None, None],
-                    16 << 10,
-                )
-                .await
-                .is_ok()
+            client.request_classified(&group, target, Purpose::SystemRecovery, header,
+                [None, None, None], 16 << 10).await.is_ok()
         }
     };
     for phase in ["before", "after"] {
@@ -707,20 +677,14 @@ async fn replacement_peer_probe(config: PathBuf) {
                     // Keep the original sessions open until Control revokes
                     // their identity. Both sessions use the same client below.
                     for target in &config.targets {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(2),
-                            probe(WorkerIdentity::from(target)),
-                        )
-                        .await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), probe(WorkerIdentity::from(target))).await;
                     }
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 } else {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             }
-        })
-        .await
-        .unwrap();
+        }).await.unwrap();
         let mut observed = Vec::new();
         for target in &config.targets {
             observed.push(probe(WorkerIdentity::from(target)).await);

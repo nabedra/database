@@ -334,24 +334,31 @@ impl AppliedPeerDirectory {
             .map(|prepared| {
                 prepared.intent.validate()?;
                 Ok::<_, ProtocolError>(prepared.intent.next)
-            }).transpose()?;
+            })
+            .transpose()?;
         let data = control.prepared_data_worker(revision).await?;
         if restart.is_some() && data.is_some() {
             return Err(invalid());
         }
-        let candidate = restart.or(data).map(|enrollment| {
+        let candidate = restart
+            .or(data)
+            .map(|enrollment| {
                 enrollment.validate().map_err(|_| invalid())?;
-                let bytes = std::mem::size_of::<Entry>() + 256
+                let bytes = std::mem::size_of::<Entry>()
+                    + 256
                     + enrollment.endpoint.capacity_bytes()
                     + enrollment.server_name.capacity_bytes();
-                let charge = self.shared.reserve_scratch(crate::oltp::pool::ByteClass::Progress, bytes)?;
+                let charge = self
+                    .shared
+                    .reserve_scratch(crate::oltp::pool::ByteClass::Progress, bytes)?;
                 Ok::<_, ProtocolError>(Entry {
                     enrollment,
                     role: Role::PreparedControl,
                     seen: epoch,
                     _charge: Arc::new(charge),
                 })
-            }).transpose()?;
+            })
+            .transpose()?;
         *self.prepared.write().map_err(|_| unavailable())? = candidate;
         self.entries
             .write()

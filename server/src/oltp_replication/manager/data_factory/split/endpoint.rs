@@ -778,18 +778,12 @@ impl SplitEndpoint {
                         return Err(unauthorized());
                     };
                     let voters = factory.initial_voters().await?.into_inner();
-                    let local = voters
-                        .iter()
-                        .find(|member| {
-                            member.node_id == node
-                                && member.worker_id == factory.local.worker_id
-                                && member.pool_id == factory.local.pool_id
-                        })
+                    let local = voters.iter().find(|member| member.node_id == node
+                        && member.worker_id == factory.local.worker_id
+                        && member.pool_id == factory.local.pool_id)
                         .ok_or_else(unauthorized)?;
                     if operation == Operation::Host {
-                        factory
-                            .host_at(&binding.target, local, &voters, true)
-                            .await?;
+                        factory.host_at(&binding.target, local, &voters, true).await?;
                         return output!((&binding.target, local));
                     }
                     (local.clone(), voters)

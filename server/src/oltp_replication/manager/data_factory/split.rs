@@ -407,10 +407,7 @@ impl SplitClient {
                 .map(|voter| voter.member.clone())
                 .collect::<Vec<_>>()
         } else {
-            self.data
-                .initial_voters(control, &self.control)
-                .await?
-                .into_inner()
+            self.data.initial_voters(control, &self.control).await?.into_inner()
         };
         let exact_worker = |reply: &ReceivedReply, index: usize| {
             placement.is_none_or(|placement| {

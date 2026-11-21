@@ -36,18 +36,14 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 #[derive(Clone)]
 pub(crate) struct ControlMachine {
     store: GroupStore,
-    replacement_directory:
-        Option<std::sync::Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    replacement_directory: Option<std::sync::Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self {
-            store,
-            replacement_directory: None,
-        })
+        Ok(Self { store, replacement_directory: None })
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -62,11 +58,10 @@ impl ControlMachine {
         let position = meta.position;
         let digest = meta.command_digest;
         let payload = command.payload()?;
-        let refresh = matches!(
-            payload,
+        let refresh = matches!(payload,
             ControlCommand::SystemRecovery { .. }
-                | ControlCommand::Enroll { .. }
-                | ControlCommand::CompleteRestart { .. }
+            | ControlCommand::Enroll { .. }
+            | ControlCommand::CompleteRestart { .. }
         );
         if let ControlCommand::SystemRecovery { command, .. } = payload
             && matches!(command.as_ref(), super::SystemRecoveryCommand::Mount { .. })
@@ -74,8 +69,7 @@ impl ControlMachine {
         {
             directory.replace_revocation_view(true);
         }
-        let result = self
-            .store
+        let result = self.store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
@@ -411,9 +405,7 @@ fn apply_initialized(
             ..
         } => {
             if system_recovery::blocked_enrollment(tx, next)?
-                || tx
-                    .get(&key(data_worker::REGISTERED, next.worker_id))?
-                    .is_some()
+                || tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
                 || load::<super::DataWorkerIntent>(tx, data_worker::PREPARED)?
                     .is_some_and(|intent| intent.enrollment.worker_id == next.worker_id)
             {

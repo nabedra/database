@@ -101,14 +101,7 @@ impl LocalServices {
         eprintln!(
             "nabedra-db: registered consensus heartbeat_ms=500 election_min_ms=1500 election_max_ms=3000"
         );
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(if replacing {
-                240
-            } else if rolling {
-                120
-            } else {
-                60
-            });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if replacing { 240 } else if rolling { 120 } else { 60 });
         let last_error = Arc::new(Mutex::new(None::<ProtocolError>));
         let error_trace = last_error.clone();
         let scope = QueueScope {
@@ -1143,9 +1136,7 @@ impl ParticipantResolver for RegisteredParticipants {
                     return Err(unavailable());
                 }
                 let ready = ready_members(&self.control, current.ready).await?;
-                self.data
-                    .host_all(spec.clone(), &self.control, &ready, &voters)
-                    .await
+                self.data.host_all(spec.clone(), &self.control, &ready, &voters).await
             }
             .await;
             tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = started.elapsed().as_millis(), ok = hosted.is_ok(), "initial Data group");

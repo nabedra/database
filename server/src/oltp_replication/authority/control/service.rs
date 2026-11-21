@@ -263,8 +263,7 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
-    registered_directory:
-        std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    registered_directory: std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     /// NS14 mixed-version gate for the group damage commands.
     group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
@@ -286,14 +285,10 @@ impl ControlHandle {
         &self,
         directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     ) -> Result<(), ProtocolError> {
-        self.registered_directory
-            .set(directory)
-            .map_err(|_| unauthorized())
+        self.registered_directory.set(directory).map_err(|_| unauthorized())
     }
     pub(crate) fn system_placement_changed(&self) -> bool {
-        self.registered_directory
-            .get()
-            .is_some_and(|directory| directory.system_placement_changed())
+        self.registered_directory.get().is_some_and(|directory| directory.system_placement_changed())
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
         self.machine.store().resources()
@@ -343,7 +338,9 @@ impl ControlHandle {
         operation_id: Uuid,
         evidence: Digest,
     ) -> Result<AuthorizationStamp, ProtocolError> {
-        if !Arc::ptr_eq(&permit.shared, self.resources()) || !self.is_operator(&permit.local) {
+        if !Arc::ptr_eq(&permit.shared, self.resources())
+            || !self.is_operator(&permit.local)
+        {
             return Err(unauthorized());
         }
         Ok(AuthorizationStamp {
@@ -933,11 +930,8 @@ impl ControlHandle {
     ) -> Result<bool, ProtocolError> {
         let raw = self
             .read(move |view| {
-                if view
-                    .get(&machine::system_recovery::revoked_id(worker.worker_id))?
-                    .is_some()
-                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
-                        == Some(worker)
+                if view.get(&machine::system_recovery::revoked_id(worker.worker_id))?.is_some()
+                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))? == Some(worker)
                 {
                     return view.encode(&true);
                 }

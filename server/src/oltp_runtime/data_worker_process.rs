@@ -223,12 +223,10 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
     registry.reserve(group.clone())?.bind(
         Purpose::SystemRecovery,
-        Arc::new(
-            crate::oltp_replication::manager::system_recovery::ReplacementCapabilityEndpoint {
-                group: group.clone(),
-                shared: shared.clone(),
-            },
-        ),
+        Arc::new(crate::oltp_replication::manager::system_recovery::ReplacementCapabilityEndpoint {
+            group: group.clone(),
+            shared: shared.clone(),
+        }),
     )?;
     let transport = Arc::new(WorkerTransport::new(
         &node.intent.enrollment,
