@@ -545,9 +545,6 @@ pub(crate) fn batched_config(
     config.api_batch_capacity = Some(MAX_APPEND_ENTRIES as u64);
     config.api_channel_size = Some(64);
     config.api_batch_linger_ms = Some(0);
-    // PERF2d: `append` returns before its sync, so replication may read an
-    // append's entries as soon as it returns, not after the core's next pass.
-    config.broadcast_submitted_on_append = Some(true);
     config
         .validate()
         .map(Arc::new)
