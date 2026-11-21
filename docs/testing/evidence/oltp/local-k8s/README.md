@@ -43,6 +43,9 @@ host-path PVC and CSI error checks. Use `--scenario scale` for the local
 Docker data worker and drain permit check. Use `--scenario rolling` or
 `--scenario zone` for either lifecycle check on its own. The zone check
 places Kubernetes DNS on the control plane before stopping any data node.
+With the inspection executable, the lifecycle scenario finishes with the
+R02 check. It reads both a queued and a running record from the surviving
+worker's RAM after sequentially stopping the other two workers.
 To try the independent ext4
 volumes, render the pinned chart with Helm and replace `--csi-source` with
 `--rawfile-manifest "$LIVE3_WORK/rawfile.yaml"` for the storage run. Use
@@ -89,6 +92,26 @@ after deleting `w1-0`. It stopped on the fixture's full-response replay
 comparison. The fixture now repeats preparation through the same
 operator, compares the prepared identity, and records both replies.
 [Rolling attempt](rolling-attempt/trace.jsonl)
+
+The `f5a7d24` run, built after hardening advanced to `b694f75`, replaced
+all three workers and checked each retained PVC, mount and enrollment.
+The replay returned the same identity with a different Raft apply position.
+With the zone A node stopped, the two remaining zones served a verified
+read after 41.101 s and acknowledged writes. The held request was present
+on both survivors and copied to the replacement before readiness. The
+successful-read gap was 41.994 s including the stop. For requests started
+while the node was down, nearest-rank p99 across all attempts was
+7,017.585 ms for reads and 7,001.494 ms for direct writes.
+
+The same run attached a second PVC, checked its mount before publishing
+the pool, and replayed the mount receipt. A host-path resize reported 2 GiB
+without a filesystem size change. Nabedra kept its growth claim in
+`awaiting_mount`. Both the oversized resize and the oversized new claim
+returned CSI `OutOfRange` and the existing data remained readable.
+The final audit verified the acknowledged direct writes, then stopped
+when polling a same-ID queued retry yielded a terminal
+`overloaded/not_applied` receipt for an earlier HTTP 503. The exact combined row count and applied
+voter checks did not finish in this run. [Host-path request and cleanup trace](hostpath/trace.jsonl)
 
 Two early Rawfile probes stopped during infrastructure setup. A third run
 created three PVC objects, which stayed pending because the plugin rejected

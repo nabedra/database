@@ -197,3 +197,26 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.69s
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+GitHub Actions 44939201801 at f5a7d24e01bf8a2ab907f563e33625e9533ef94c after the hardening single-guard fix
+OLTP job 136952453283
+{"cut": 4099, "direct_entries": 2, "incremental": "refused with full backup alternative", "restore_build": "same", "scenario": "O19/D03 rollback", "status": "passed"}
+{"ready_workers": 2, "scenario": "O17 lost mount refusal", "status": "passed", "worker": "w1"}
+{"acknowledged": 79, "applied_after": [93, 7], "applied_before": [92, 6], "attempts_with_errors": 0, "data_voters": 3, "max_independent_read_gap_seconds": 5.549, "ranges": 2, "scenario": "O06/R01/R03/R06 retained restart", "settled_receipts": 2, "status": "passed", "worker": "w1"}
+{"aborted_split": "7e14c885-3e22-4c44-880b-071c299344f3", "children": 2, "published_split": "f0f9d3b8-b388-44a5-b4b5-890ef8647936", "scenario": "O17/D07 restart during split", "status": "passed", "voters_per_child": 3, "worker": "w1"}
+{"acknowledged_direct_writes": 9, "elapsed_loss_to_rf3_seconds": 29.085, "elapsed_queue_release_to_receipt_seconds": 0.509, "elapsed_start_to_rf3_seconds": 5.816, "groups": 6, "lost_control_leader": "w1", "probe_recovery_seconds": 16.794, "queued_gate_owner": "w3", "refused_candidate_missing_advert": true, "refused_data_quorum": true, "refused_live_worker": true, "refused_missing_advert": true, "refused_reused_certificate": true, "refused_without_quorum": true, "replayed_intent": true, "revoked_old_certificate": true, "scenario": "O06/O16/O17/NS23/R01/R03/R06/Q03 system replacement", "settled_receipts": 1, "status": "passed"}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 1.33s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.53s
+test oltp_replication::typed_log::tests::c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote ... ok
+test oltp_runtime::worker_runtime::direct_gateway::tests::d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs ... FAILED
+oltp_runtime::worker_runtime::direct_gateway::tests::d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs stdout ----
+perf2b rf1: 20 gets took 21 Query and 22 Control jobs
+thread 'oltp_runtime::worker_runtime::direct_gateway::tests::d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs' (9099) panicked at src/oltp_runtime/worker_runtime/direct_gateway/tests.rs:821:9:
+Control jobs for 20 gets: 22
+    oltp_runtime::worker_runtime::direct_gateway::tests::d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs
+test result: FAILED. 499 passed; 1 failed; 31 ignored; 0 measured; 2 filtered out; finished in 164.47s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.47s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

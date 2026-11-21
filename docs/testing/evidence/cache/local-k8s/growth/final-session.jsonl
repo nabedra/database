@@ -1,0 +1,6 @@
+{"check": "docker-checks", "elapsed_seconds": 13.369, "scenario": "cache-lifecycle", "server_source": "20c102659f058c6a512cb1b924087032ea07a44d", "sha256": "0bf5217080559f904ee1ecb9220add10664aa27061d1cb0ac0352ebd21d42d26"}
+{"check": "docker-lane", "elapsed_seconds": 283.674, "status": "acquired"}
+{"check": "cache-lifecycle", "container": "nabedra-live3-cache-lifecycle-f6720b49", "elapsed_seconds": 283.712, "image": "mirror.gcr.io/library/python:3.11-trixie", "status": "started"}
+{"check": "cache-lifecycle", "elapsed_seconds": 458.779, "exit_code": 0, "status": "passed", "vm_peak_used_bytes": 1500422144}
+{"check": "container-cleanup", "elapsed_seconds": 458.98, "name": "nabedra-live3-cache-lifecycle-f6720b49", "remaining": false}
+{"check": "docker-lane", "elapsed_seconds": 458.992, "status": "released"}

@@ -32,7 +32,8 @@ PYTHONDONTWRITEBYTECODE=1 python3.11 scripts/local-kind/docker_checks.py cache \
 | --- | --- | --- |
 | K04a local comparison | Passed the paired workload | 120,000 correct operations, zero operation errors. The fixed rate and local VM leave EC2 qualification open. |
 | K04b local zone promotion | Passed | The replica had the acknowledged prefix before both zone processes stopped. A survivor served the exact value in 5.654 s. |
-| K04b full replica readiness on resume | Failed the local watchdog | The controller view did not return to 16,384 ready primaries and 16,384 ready replicas within 60 s. The resumed worker logged a timed-out update. |
+| K04b full replica readiness on resume | Passed on rerun | The rerun restored 16,384 ready primaries and 16,384 ready replicas within the 60 s watchdog. The first attempt timed out. |
+| K05 local growth and drain | Passed on rerun | Both 3→6→3 and 3→12→3 cycles completed, with 462 exact concurrent reads, zero read errors, and the migrated values still readable after drain. |
 | Cloud K04a, K04b, K05 | Not run | LIVE3 used local Docker without AWS. |
 
 Median per-run client arrival-to-completion latency at 650 offered operations/s,
@@ -52,6 +53,23 @@ loopback counters. The small load does not establish sustainable survivor
 headroom. [Zone trace](zone-loss/trace.jsonl) ·
 [Restore assertion](zone-loss/assertion-output.txt) ·
 [Resumed worker output](zone-loss/worker-output.txt)
+
+The focused zone rerun promoted a survivor in 5.248 s, then passed the
+full readiness, cross-zone placement and exact-row checks after resume.
+All 18 sampled reads succeeded. The longest began during the pause and
+completed after 10.176 s. [Rerun trace](zone-loss/retry-trace.jsonl) ·
+[Rerun cleanup](zone-loss/retry-session.jsonl)
+
+The first K05 run migrated and drained three slots, then failed on two of
+101 concurrent reads. The follow-up ran both cycles independently of the
+zone test. Growth and drain took 18.758 s and 20.372 s for six groups, and
+47.882 s and 67.393 s for 12 groups. The six- and 12-group cycles verified
+three and nine migrated values respectively, including after each added
+worker's assignments were removed and the process stopped. Peak sampled
+VM use for the follow-up was 1,500,422,144 bytes.
+[First attempt](growth/first-lifecycle.jsonl) ·
+[Follow-up trace](growth/final-lifecycle.jsonl) ·
+[Follow-up cleanup](growth/final-session.jsonl)
 
 The Cache release binary at `20c102659f058c6a512cb1b924087032ea07a44d` had
 SHA-256 `0bf5217080559f904ee1ecb9220add10664aa27061d1cb0ac0352ebd21d42d26`.

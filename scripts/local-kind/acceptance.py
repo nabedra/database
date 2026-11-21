@@ -626,17 +626,20 @@ class Oltp(Rf3Cluster):
         self.cluster.in_namespace('exec', '-i', f'{name}-0', '-c', name, '--',
                                   'tee', f'/barrier/{file}', input=json.dumps(value))
 
-    def accepted_copy(self, name, *, at_join=False):
-        request_id = self.gated['request_id']
+    def accepted_copy(self, name, *, at_join=False, request=None):
+        request = request or self.gated
+        request_id = request['request_id']
+        path = f'/barrier/record-{request_id}.json'
         if not at_join:
-            self.stats(name)  # The test instrumentation reads the live RAM replica.
-        captured = json.loads(self.exec(name, 'cat', f'/barrier/record-{request_id}.json'))
-        assert captured['accepted'] and json.loads(captured['body']) == self.gated, captured
+            self.exec(name, 'rm', '-f', path)
+            self.stats(name)
+        captured = json.loads(self.exec(name, 'cat', path))
+        assert captured['accepted'] and json.loads(captured['body']) == request, captured
         assert captured['run_id'] == self.run_id and captured['worker']['incarnation'] == self.identity(name)['incarnation']
         return {key: captured[key] for key in ('state', 'body_hash', 'context_hash', 'worker')}
 
-    def hold_request(self, traffic):
-        self.gated = insert(traffic.table, -100000, -300000)
+    def hold_request(self, traffic, key=-100000):
+        self.gated = insert(traffic.table, key, key * 3)
         request_id = self.gated['request_id']
         for name in WORKERS:
             self.write_barrier(name, 'gates.json', {request_id: 'queued'})
@@ -823,12 +826,15 @@ class Traffic:
             assert status == 200 and retried == {'request_id': body['request_id'], 'data': None}, retried
             expected.append(row)
         accepted = 0
+        failures = []
         for body, original in self.receipts:
             identity = body['request_id']
             path = f'/v1/requests/{self.topology.run_id}/{identity}'
             if original != 202:
                 status, response = self.topology.exchange('/v1/requests', body)
                 assert status == 202 and response['run_id'] == self.topology.run_id, (status, response)
+                self.evidence.record('queued-write-replay', request_id=identity, original_status=original,
+                                     status=status, response=response)
             else:
                 accepted += 1
 
@@ -836,12 +842,16 @@ class Traffic:
                 status, reply = self.topology.exchange(path)
                 if status in RETRYABLE:
                     return None
-                assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
+                assert status == 200, (status, reply)
                 assert reply['run_id'] == self.topology.run_id and reply['request_id'] == identity, reply
-                return reply if reply['state'] == 'succeeded' else None
+                return reply if reply['state'] in ('succeeded', 'failed', 'abandoned') else None
 
-            wait_for(receipt, f'original receipt {identity}', 35)
-            expected.append(body['payload']['row'])
+            terminal = wait_for(receipt, f'original receipt {identity}', 35)
+            self.evidence.record('queued-write-terminal', original_status=original, response=terminal)
+            if terminal['state'] == 'succeeded':
+                expected.append(body['payload']['row'])
+            else:
+                failures.append(dict(original_status=original, receipt=terminal))
         query = dict(table_id=self.table, query=dict(select=None, filter=None, limit=None,
                                                      order_by=dict(column='id', desc=False)))
         rows = success(*self.op(operation('query.collect', query)))
@@ -849,7 +859,9 @@ class Traffic:
         assert success(*self.op(operation('query.count', query))) == len(expected)
         self.evidence.record('O17/O18 row and receipt oracle', exact_rows=len(rows),
                              acknowledged_direct=sum(reply is not None for _, reply, _ in self.writes),
-                             originally_accepted_receipts=accepted, retried_receipts=len(self.receipts) - accepted)
+                             originally_accepted_receipts=accepted, retried_receipts=len(self.receipts) - accepted,
+                             failed_receipts=failures)
+        return failures
 
 
 def zone_loss(topology, traffic, name='w1'):
@@ -890,6 +902,49 @@ def zone_loss(topology, traffic, name='w1'):
     topology.verify_replacement(name, old, identity)
     if topology.gated:
         topology.release_request()
+
+
+def last_queue_holder(topology, traffic):
+    cluster = topology.cluster
+    keeper = topology.hold_request(traffic, key=-100002)
+    queued = topology.gated
+    running = insert(traffic.table, -100003, -300009)
+    queued_id, running_id = queued['request_id'], running['request_id']
+    for name in WORKERS:
+        topology.write_barrier(name, 'inspect.json', [queued_id, running_id])
+        topology.write_barrier(name, 'transaction-gates.json', {running_id: {'snapshot': True}})
+    status, reply = topology.exchange('/v1/requests', running)
+    assert status == 202 and reply['run_id'] == topology.run_id, (status, reply)
+
+    def running_copy():
+        copy = topology.accepted_copy(keeper, request=running)
+        return copy if copy['state'] == 'running' else None
+
+    before = {
+        queued_id: topology.accepted_copy(keeper),
+        running_id: wait_for(running_copy, 'last-holder fixture has a running request', 35),
+    }
+    assert before[queued_id]['state'] == 'queued', before
+    cluster.evidence.record('R02 queued and running before fault', keeper=keeper, copies=before)
+    stopped = []
+    for name in WORKERS:
+        if name == keeper:
+            continue
+        node = cluster.nodes[topology.zone[name]]
+        run('docker', 'stop', '--time=0', node, timeout=30)
+        topology.disconnect(name)
+        assert run('docker', 'inspect', '--format', '{{.State.Running}}', node).strip() == 'false'
+        stopped.append(name)
+        copies = {
+            queued_id: topology.accepted_copy(keeper),
+            running_id: topology.accepted_copy(keeper, request=running),
+        }
+        for identity, copy in copies.items():
+            assert copy['state'] in ('queued', 'running', 'reconciling'), copy
+            assert (copy['body_hash'], copy['context_hash']) == (
+                before[identity]['body_hash'], before[identity]['context_hash']), (before, copies)
+        cluster.evidence.record('R02 outstanding work retained', keeper=keeper, stopped=list(stopped), copies=copies)
+    assert len(stopped) == 2
 
 
 def refuse_second_writer(topology, name='w1'):
@@ -1142,7 +1197,7 @@ def oltp(cluster, binary, image, scenario, test_executable):
                 pvc_resize(topology, traffic)
                 if not cluster.rawfile:
                     provision_failure(topology)
-        traffic.finish()
+        failures = traffic.finish()
         if test_executable:
             for name in WORKERS:
                 cluster.evidence.record('O18 Data votes applied', worker=name,
@@ -1151,6 +1206,9 @@ def oltp(cluster, binary, image, scenario, test_executable):
             after = topology.admin('storage.replica.placement', {'group': group})
             assert after == prior and len(after['members']) == after['record']['replica_count'] == 3, after
             cluster.evidence.record('O18 Data placement RF3', group=group, placement=after)
+        if scenario == 'lifecycle' and test_executable:
+            last_queue_holder(topology, traffic)
+        assert not failures, failures
 
 
 def preflight_filesystem(cluster, image):
