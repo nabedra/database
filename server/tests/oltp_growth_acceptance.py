@@ -48,7 +48,7 @@ class GrowthCluster(Rf3Cluster):
             config['resources']['task_memory_limit_bytes'] = 256 * MIB
             config['execution']['max_pending_requests'] = 16
         if self.bulk_load:
-            config['execution'].update(result_retention_ms=2_000, max_queue_bytes_per_replica=32 * MIB)
+            config['execution'].update(result_retention_ms=5_000, max_queue_bytes_per_replica=32 * MIB)
         super().launch_worker(name)
 
 
@@ -108,11 +108,17 @@ def query(facade, table, kind='collect', expression=None, api='api1'):
 
 
 def read_after_transition(facade, body, api='api2'):
+    request = body
+
     def settled():
-        status, reply = facade.api(api, OPERATIONS, body, timeout=8)
+        nonlocal request
+        status, reply = facade.api(api, OPERATIONS, request, timeout=8)
         if status in (429, 503, 504):
             return None
-        assert status == 200 and reply['request_id'] == body['request_id'], (status, reply)
+        if status == 404 and reply['error']['message'] == 'receipt unavailable or expired':
+            request = operation(body['operation'], body['payload'])
+            return None
+        assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
         # The wrapper stays truthy even for an empty result or a missing row.
         return reply
 
@@ -224,6 +230,12 @@ def snapshot_recovery(facade):
         assert read_after_transition(test, neighbor_get) == row(777)
         staged.unlink()
         control.write_text('observe')
+        local = Path(config['node']['directory']) / 'NABEDRA_REGISTERED_WORKER.json'
+        if json.loads(local.read_text())['previous'] == config['node']['mount']['worker']:
+            # A crash can happen after the rolling intent was consumed. Each
+            # completed incarnation needs its own next enrollment.
+            wait_for(lambda: two_ready(cluster, survivors), 'staged follower removed after SIGKILL', 90)
+            config = retained_config(cluster, victim, survivors)
         launch_retained(cluster, victim, config)
         second = wait_for(lambda: json.loads(activated.read_text()) if activated.exists() else None,
                           'retry activated the staged Data snapshot', 90)
@@ -324,6 +336,8 @@ def o16(facade):
     new_owner, _ = facade.reached(moving_read['request_id'], 'snapshot')
     extra = add_pool(cluster, new_owner, 'move-destination', configure_growth(cluster))
     move(cluster, parts[0], new_owner, extra)
+    moved_row = operation('table.get', dict(table_id=table.id, key=-9))
+    assert read_after_transition(facade, moved_row) == expected[0]
     facade.release(moving_read['request_id'], 'snapshot')
     facade.terminal(moving_read['request_id'], expected)
     assert facade.api('api2', OPERATIONS, original) == exact
@@ -446,13 +460,19 @@ def drain_and_detach(facade, owner, mount, target):
     assert success(*admin(cluster, owner, operation('storage.pool.drain.status', {}, drain_id)))['phase'] == 'draining'
     move(cluster, group, owner, target)
 
+    refusals = deque(maxlen=4)
+
     def close():
         status, reply = admin(cluster, owner, drain)
         if status in (409, 429, 503, 504):
+            refusals.append((status, reply))
             return None
         return success(status, reply)
 
-    closed = wait_for(close, 'same-ID pool close', 40)
+    try:
+        closed = wait_for(close, 'same-ID pool close', 40)
+    except AssertionError as error:
+        raise AssertionError(f'pool close did not settle: {list(refusals)}') from error
     assert closed['phase'] == 'closed' and closed['mount']['expected'] == mount, closed
     assert success(*admin(cluster, owner, permit)) == closed
     directory = Path(mount['mount_path'])
@@ -634,8 +654,11 @@ def o21(facade):
     assert below['sample']['observed_committed_bytes'] < below['target_bytes'], below
     extra = add_pool(cluster, owner, 'large-table-extension', configure_growth(cluster))
     move(cluster, source, owner, extra)
+    key_zero = dict(table_id=table.id, key=0)
+    assert read_after_transition(facade, operation('table.get', key_zero)) == dict(id=0, text=text, value=0)
 
     writing = threading.Event()
+    first_wave_end = 16_000
 
     def write_group(first, end):
         for offset in range(first, end, 1000):
@@ -643,10 +666,12 @@ def o21(facade):
             bulk(offset, min(offset + 1000, end))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        running = executor.submit(write_group, 500, 72_000)
+        running = executor.submit(write_group, 500, first_wave_end)
         assert writing.wait(15)
-        probe = operation('table.get', dict(table_id=table.id, key=0))
+        probe = operation('table.get', key_zero)
         assert read_after_transition(facade, probe) == dict(id=0, text=text, value=0)
+        if running.done():
+            running.result()
         assert not running.done(), 'read ran after the load ended'
 
         def split_during_load():
@@ -669,7 +694,7 @@ def o21(facade):
                        for member in placement(cluster, child)['members']) for child in parts)
         passed('O21', 'safe-split-under-same-id', 'The measured target was crossed and the worker published an RF3 split under the original table ID without a split request.')
         writing.clear()
-        writer = executor.submit(write_group, 72_000, 100_000)
+        writer = executor.submit(write_group, first_wave_end, 100_000)
         assert writing.wait(15)
         change = operation('table.update', dict(table_id=table.id, key=0, values=dict(value=-1)))
         assert facade.data(change, 'api2') is True
@@ -953,7 +978,7 @@ def main():
             args.binary, root, mounts=True, metadata_profile=paged, archive=archive,
             bulk_load=args.scenario in ('O21', 'O26'),
             worker_memory=(3584 if paged else 2048) * MIB,
-            automatic=dict(shard_target_bytes=32 * MIB, minimum_free_bytes=64 * MIB)
+            automatic=dict(shard_target_bytes=8 * MIB, minimum_free_bytes=64 * MIB)
             if args.scenario == 'O21' else None,
             test_executable=None if args.scenario == 'O21' else args.test_executable,
             test_child='oltp_growth_acceptance::registered_worker_child' if paged else CHILD,
