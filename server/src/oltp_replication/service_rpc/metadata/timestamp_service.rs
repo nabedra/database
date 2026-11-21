@@ -1344,6 +1344,17 @@ impl TimestampClient {
         // AllocateDirect repeats safely (values above every completed
         // allocation), so a stalled leader gets a per-replica deadline and
         // the call moves on to the new leader (D05/LIVE1).
+        // AllocateDirect is answered only by the Timestamp leader after its
+        // read barrier, whichever member the route names: reuse a recently
+        // confirmed member list instead of reading Control per call (PERF1).
+        if let Request::AllocateDirect { .. } = request {
+            let method = request.method();
+            let payload = encode(&self.client.shared, request).await?;
+            return self
+                .client
+                .repeat_reusing_routes_as(self.client.action, method, Some(payload))
+                .await;
+        }
         if matches!(
             request,
             Request::AllocateDirect { .. }

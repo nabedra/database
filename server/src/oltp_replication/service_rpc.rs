@@ -62,6 +62,9 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 // Registered election timeouts reach three seconds. Leave time to refresh
 // routes and reach the new leader without using the full public wait budget.
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
+/// How long a routing-independent call reuses a member list without reading
+/// the group record again (plan section 1 bounds cached grants the same way).
+const ROUTE_REUSE: Duration = Duration::from_secs(5);
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -360,7 +363,7 @@ impl Client {
             return self.repeat_as(action, method, payload).await;
         }
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied, None)
+        self.call_round(action, method, &payload, &mut possibly_applied, None, false)
             .await
             .map_err(Into::into)
     }
@@ -382,12 +385,40 @@ impl Client {
         self.converge_as(action, method, payload, true).await
     }
 
+    /// [`Self::repeat_as`] for a call whose result does not depend on which
+    /// replica answers, only on the receiver's own checks (`AllocateDirect`:
+    /// only the Timestamp leader answers, after its read barrier). It routes
+    /// with a cached member list that a strong Control read confirmed within
+    /// [`ROUTE_REUSE`] instead of reading the group record again per call
+    /// (PERF1). A failed round retries once with freshly read routes.
+    pub(super) async fn repeat_reusing_routes_as(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        self.converge_with(action, method, payload, true, true)
+            .await
+    }
+
     async fn converge_as(
         &self,
         action: ServiceAction,
         method: Method,
         payload: Option<ChargedBytes>,
         bound_mutation_attempt: bool,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        self.converge_with(action, method, payload, bound_mutation_attempt, false)
+            .await
+    }
+
+    async fn converge_with(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        bound_mutation_attempt: bool,
+        reuse_routes: bool,
     ) -> Result<ServiceResponse, ProtocolError> {
         let deadline = Instant::now() + SERVICE_CONVERGENCE;
         let peer_deadline = (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
@@ -402,6 +433,7 @@ impl Client {
                     &payload,
                     &mut possibly_applied,
                     peer_deadline,
+                    reuse_routes,
                 ),
             )
             .await
@@ -457,6 +489,7 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
         convergence_deadline: Option<Instant>,
+        reuse_routes: bool,
     ) -> Result<ServiceResponse, CallError> {
         let mut failed_read_hint = None;
         if action == ServiceAction::Owner
@@ -465,6 +498,26 @@ impl Client {
                 .await
         {
             return result;
+        }
+        if reuse_routes
+            && let Some(routes) = self.control.recent_replica_routes(&self.group, ROUTE_REUSE)
+        {
+            let result = self
+                .call_routed(
+                    action,
+                    method,
+                    payload,
+                    possibly_applied,
+                    &routes,
+                    None,
+                    convergence_deadline,
+                )
+                .await;
+            if result.is_ok() {
+                return result;
+            }
+            // The members may have changed: read them again below.
+            self.control.invalidate_replica_routes(&routes);
         }
         tracing::debug!(group=%self.group.group_id, method=?method, "service replica routes start");
         let routes = self.control.replica_routes(&self.group).await.map_err(|error| {
