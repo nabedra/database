@@ -307,7 +307,7 @@ impl ControlHandle {
                 .iter()
                 .find(|plan| plan.expected.identity == *self.identity())
                 .ok_or_else(stale)?;
-            if membership.replicas() != &plan.next(record.intent.previous.worker_id)? {
+            if membership.replicas() != plan.next(record.intent.previous.worker_id)? {
                 return Err(unauthorized());
             }
             AuthorizationStamp {

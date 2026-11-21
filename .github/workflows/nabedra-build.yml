@@ -272,6 +272,9 @@ jobs:
             python3 server/tests/oltp_recovery_operations.py --suite replacement-mixed \
               --binary "$legacy_root/current-nabedra-db" --test-executable "$test_executable" \
               --legacy-binary "$legacy_root/target/debug/nabedra-db" 2>&1 | tee oltp-rep1-replacement-mixed.log || status=1
+            CARGO_TARGET_DIR="$legacy_root/target" cargo clippy \
+              --manifest-path "$legacy_root/source/server/Cargo.toml" --locked --no-default-features \
+              --features oltp --lib 2>&1 | tee oltp-rep1-replacement-baseline-clippy.log || status=1
             rm -r "$legacy_root"
             cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --lib \
               2>&1 | tee oltp-rep1-replacement-clippy.log || status=1

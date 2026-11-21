@@ -532,12 +532,17 @@ impl HostedControlEndpoint {
             Operation::CompleteDataWorker | Operation::BeginDataWorkerJoin | Operation::CloseDataWorker
             | Operation::ReadEksWorkerReplacement | Operation::CompleteEksWorkerReplacement
         );
+        let operator = self.reads.is_operator(session.remote());
+        let authorized = if scoped_data_worker {
+            !operator
+        } else {
+            operator
+                || (session.recovery_only()
+                    && matches!(request.control_consensus, Operation::CompleteRestart))
+        };
         if session.group() != self.local.state.store().identity()
             || session.purpose() != Purpose::ControlDelegation
-            || (!scoped_data_worker && !self.reads.is_operator(session.remote())
-                && !(session.recovery_only()
-                    && matches!(request.control_consensus, Operation::CompleteRestart)))
-            || (scoped_data_worker && self.reads.is_operator(session.remote()))
+            || !authorized
             || request.to_node != self.local.state.resident().node_id()
             || match request.control_consensus {
                 Operation::Propose | Operation::CompleteRestart | Operation::CompleteDataWorker
