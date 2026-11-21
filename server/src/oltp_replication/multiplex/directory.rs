@@ -346,6 +346,10 @@ impl PeerDirectory for AppliedPeerDirectory {
     fn applied_revision(&self) -> Option<u64> {
         Some(self.revision())
     }
+    fn revoked(&self, peer: WorkerIdentity) -> bool {
+        self.system.read().map_or(true, |state| state.as_ref().is_some_and(|state|
+            Self::denied(state, peer.worker_id, Some(peer.certificate_sha256))))
+    }
     fn is_api(&self, peer: WorkerIdentity) -> bool {
         self.entries.read().is_ok_and(|entries| {
             entries.get(&peer.worker_id).is_some_and(|entry| {

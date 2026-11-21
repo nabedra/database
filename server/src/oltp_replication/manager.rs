@@ -237,7 +237,7 @@ impl HostedGroupManager {
         let metrics = metrics.borrow_watched();
         let index = metrics.last_applied.as_ref()?.index;
         metrics.running_state.as_ref().ok()?;
-        let voters = metrics.membership_config.membership().voter_ids().collect();
+        let voters = metrics.committed_membership_config.membership().voter_ids().collect();
         Some((voters, index))
     }
 

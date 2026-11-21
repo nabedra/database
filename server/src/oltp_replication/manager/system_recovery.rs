@@ -329,7 +329,11 @@ impl HostedGroupManager {
         // The candidate stays outside Control elections until the other groups
         // have their stable memberships recorded.
         let plan = record.groups.iter().filter(|plan| remaining.contains(&plan.expected.identity.group_id))
-            .min_by_key(|plan| plan.expected.identity.kind == GroupKind::Control).ok_or_else(invalid)?;
+            .min_by_key(|plan| match plan.expected.identity.kind {
+                GroupKind::Data { .. } => 0,
+                GroupKind::Control => 2,
+                _ => 1,
+            }).ok_or_else(invalid)?;
         let group = plan.expected.identity.group_id;
         let lost = record.intent.previous.worker_id;
         let local = self.client.local_identity();

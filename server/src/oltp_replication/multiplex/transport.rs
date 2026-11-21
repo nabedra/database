@@ -108,10 +108,18 @@ pub trait PeerDirectory: Send + Sync + 'static {
     fn applied_revision(&self) -> Option<u64> {
         None
     }
+    /// Revocations are checked again after asynchronous endpoint preflight.
+    fn revoked(&self, _peer: WorkerIdentity) -> bool {
+        false
+    }
     /// Whether `peer` is an enrolled API gateway (not a worker).
     fn is_api(&self, _peer: WorkerIdentity) -> bool {
         false
     }
+}
+
+fn revoked_peer() -> ProtocolError {
+    ProtocolError::new(ErrorCode::Unauthorized, "worker certificate or identity was revoked", Outcome::NotApplied)
 }
 
 /// Whether this worker is the hello's audience. Every audience names this
@@ -980,6 +988,9 @@ impl WorkerTransport {
             let sections = read_sections(&mut stream, &self.common, class, plan).await?;
             drop(preflight);
             trace.phase = RaftTransportPhase::Handle;
+            if self.common.directory.revoked(hello.from) {
+                return Err(revoked_peer());
+            }
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
             // Free the lane before the reply can reach the peer, as on a

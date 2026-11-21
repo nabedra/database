@@ -1518,6 +1518,9 @@ async fn run_stream(
         };
         drop(preflight);
         trace.phase = RaftTransportPhase::Handle;
+        if common.directory.revoked(session.remote()) {
+            return Err(super::revoked_peer());
+        }
         let reply = endpoint.handle(session, header, sections).await?;
         validate_reply(&common.config, class, &reply)?;
         Ok((reply, handler))

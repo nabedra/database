@@ -45,7 +45,9 @@ pub(super) async fn join(
             for enrollment in original.iter().filter(|peer| peer.worker_id != record.intent.previous.worker_id) {
                 match worker.manager.send_mount_proof(control.identity(), WorkerIdentity::from(enrollment), &proof).await {
                     Ok(()) => break,
-                    Err(error) if error.code == ErrorCode::Conflict => return Err(error),
+                    Err(error) if matches!(error.code, ErrorCode::Conflict | ErrorCode::UnsupportedOperation) => {
+                        return Err(error);
+                    }
                     Err(error) => tracing::debug!(code=?error.code, message=error.message, "system replacement mount waits"),
                 }
             }
