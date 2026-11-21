@@ -522,7 +522,7 @@ class Rf3Cluster:
             if process.alive():
                 process.kill()
 
-    def cold_start(self, keep_certificates=False):
+    def cold_start(self, keep_certificates=False, *, before_ready=None):
         """Restart every worker as a fresh incarnation after a complete stop (R04/D09). With
         `keep_certificates` each worker keeps its key and certificate, as a restarted container
         does; otherwise each gets a new one."""
@@ -548,6 +548,8 @@ class Rf3Cluster:
         self.run_id = profile['next_run']
         for name in WORKERS:
             self.launch_worker(name)
+        if before_ready is not None:
+            before_ready(profile)
         self.wait_workers()
         self.connection = self.admin('cluster.connection', {})
         return profile

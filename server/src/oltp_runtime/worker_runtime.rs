@@ -740,6 +740,10 @@ impl WorkerRuntime {
         id: Uuid,
         include_result: bool,
     ) -> Result<ObservedApplication, ProtocolError> {
+        #[cfg(test)]
+        if super::recovery_tests::lose_receipt_observation(id).await {
+            return Err(unknown());
+        }
         let limit = if include_result {
             INLINE_RECEIPT_BYTES
         } else {
@@ -1037,6 +1041,8 @@ impl WorkerRuntime {
         // The HTTP ingress owns this entire future independently of its socket.
         let prepared = self.admission.prepare(body, authorization, now()).await?;
         let id = prepared.request_id;
+        #[cfg(test)]
+        super::recovery_tests::count_submission(id);
         let gate = self
             .admission_cleanup
             .lock(self.gate(id)?, id, prepared.digest)

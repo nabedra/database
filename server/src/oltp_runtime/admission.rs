@@ -194,6 +194,10 @@ impl DurableAdmission {
             .reserve_identity(current.ready.view.authority(), request_id, digest, kind)
             .await?;
         let (_, reply, _decode_owner) = applied.into_parts()?;
+        #[cfg(test)]
+        if super::recovery_tests::lose_reservation_reply(request_id, &reply).await {
+            return Err(unknown("reservation reply lost after durable apply"));
+        }
         match reply {
             StatusReply::Identity(IdentityLookup::Reserved(reservation)) => {
                 if reservation.request_id != request_id

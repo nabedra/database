@@ -444,10 +444,17 @@ impl TransactionCoordinator {
         }
         .await;
         #[cfg(test)]
-        if preparation.is_ok() {
+        let preparation = if preparation.is_ok() {
             super::recovery_tests::pause("prepared", txn.request_id).await;
             super::recovery_tests::index_holds::prepared(txn).await;
-        }
+            if super::recovery_tests::refuse_prepared_commit(txn.request_id) {
+                Err(conflict())
+            } else {
+                preparation
+            }
+        } else {
+            preparation
+        };
         let decision = match preparation {
             Err(error) => {
                 if recoverable

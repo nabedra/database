@@ -523,9 +523,16 @@ impl HostedControlEndpoint {
                 | Operation::CompleteDataWorker
                 | Operation::ReadEksWorkerReplacement
                 | Operation::CompleteEksWorkerReplacement => {}
-                // The receiving voter's directory may still show a prepared
-                // incarnation just after Control commits its enrollment.
-                Operation::Propose | Operation::Barrier => return Err(unavailable()),
+                Operation::Barrier | Operation::Propose => {
+                    // A retained worker can finish enrollment through one
+                    // voter before another refreshes its prepared-only role.
+                    // Defer delegation until that voter sees the promotion.
+                    return Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "retained worker enrollment is not yet applied at this voter",
+                        Outcome::NotApplied,
+                    ));
+                }
                 _ => return Err(invalid()),
             }
         }

@@ -618,7 +618,12 @@ impl LocalServices {
                     transition_id: ticket_id,
                 },
             )?;
-            let receipt = fence.fence_ready(ticket_id, expected, next).await?;
+            // The same transition returns the original receipt if the write committed.
+            // A Timestamp election can outlast one service call during a rolling join.
+            let receipt = startup_read(deadline, &error_trace, "timestamp ready fence", || {
+                fence.fence_ready(ticket_id, expected, next)
+            })
+            .await?;
             eprintln!(
                 "nabedra-db: registered {} timestamp ready fence committed",
                 local.worker_id

@@ -290,6 +290,40 @@ pub(crate) async fn pause(stage: &str, request: Uuid) {
     }
 }
 
+/// Allow the process fixture to stop the cold-start coordinator immediately
+/// after a real group fence is recorded, before it can publish the run.
+pub(super) async fn cold_fence_checkpoint(
+    receipt: &crate::oltp_replication::types::GroupFenceReceipt,
+) {
+    use crate::oltp_replication::types::GroupKind;
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return;
+    };
+    let kind = match receipt.group.kind {
+        GroupKind::Timestamps => "allocator",
+        GroupKind::Status { .. } => "status",
+        GroupKind::Data { .. } => "shard",
+        _ => return,
+    };
+    let directory = PathBuf::from(directory);
+    let hold = directory.join(format!("cold-fence-{kind}.hold"));
+    if !hold.is_file() {
+        return;
+    }
+    let observation = directory.join(format!("cold-fence-{kind}.json"));
+    let pending = observation.with_extension("tmp");
+    std::fs::write(&pending, serde_json::to_vec(receipt).unwrap()).unwrap();
+    std::fs::rename(pending, observation).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while hold.is_file() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cold {kind} fence watchdog expired"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Each selected checkpoint belongs to the first actor that reaches it.
 /// A reader helping the same transaction must be able to pass a paused actor.
 pub(crate) async fn transaction_checkpoint(
@@ -390,6 +424,52 @@ pub(crate) async fn lose_status_inspection(request: Uuid) -> bool {
     }
     transaction_checkpoint("status-inspect-unavailable", request, &request).await;
     true
+}
+
+pub(super) async fn lose_reservation_reply(
+    request: Uuid,
+    reply: &crate::oltp_replication::authority::status::StatusReply,
+) -> bool {
+    let Some(directory) = take_fault("lose-reservation", request) else {
+        return false;
+    };
+    let path = directory.join(format!("reservation-{request}.json"));
+    std::fs::write(path, serde_json::to_vec(reply).unwrap()).unwrap();
+    pause("reservation-applied", request).await;
+    true
+}
+
+pub(super) async fn lose_receipt_observation(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    let repeated = PathBuf::from(directory).join(format!("lose-all-observations-{request}"));
+    if !repeated.is_file() && take_fault("lose-observation", request).is_none() {
+        return false;
+    }
+    pause("observation-refused", request).await;
+    true
+}
+
+pub(super) fn refuse_prepared_commit(request: Uuid) -> bool {
+    take_fault("refuse-prepared-commit", request).is_some()
+}
+
+fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;
+    Some(directory)
+}
+
+pub(super) fn count_submission(request: Uuid) {
+    use std::io::Write as _;
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return;
+    };
+    let path = PathBuf::from(directory).join(format!("submissions-{request}"));
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+        writeln!(file, "{request}").unwrap();
+    }
 }
 
 pub(super) fn observe_decision(
@@ -524,31 +604,25 @@ fn actual_runtime_child() {
 #[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o15() {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_runtime_acceptance.py");
-    let status = std::process::Command::new(
-        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
-    )
-    .arg(script)
-    .args(["--scenario", "failure-boundaries", "--test-executable"])
-    .arg(std::env::current_exe().unwrap())
-    .env("PYTHONDONTWRITEBYTECODE", "1")
-    .status()
-    .expect("launch actual process recovery assertions");
-    assert!(
-        status.success(),
-        "actual RF1 acknowledged queue/prepare/commit recovery failed"
-    );
-    eprintln!(
-        "NABEDRA_OLTP_ACCEPTANCE {{\"scenario\":\"O15\",\"status\":\"not-run\",\"reason\":\"core RF1 queue/prepare/COMMIT kill histories passed; allocator/Status/shard fence-interruption and decision-order variations remain unexecuted\"}}"
-    );
+    run_acceptance("O15", "failure-boundaries");
+}
+
+#[test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+fn acceptance_o14() {
+    run_acceptance("O14", "queue-survival");
 }
 
 #[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o13() {
+    run_acceptance("O13", "admission");
+}
+
+fn run_acceptance(scenario: &str, variation: &str) {
     let Some(binary) = std::env::var_os("NABEDRA_OLTP_BINARY") else {
         eprintln!(
-            "NABEDRA_OLTP_ACCEPTANCE {{\"scenario\":\"O13\",\"status\":\"not-run\",\"reason\":\"missing actual server executable\"}}"
+            "NABEDRA_OLTP_ACCEPTANCE {{\"scenario\":\"{scenario}\",\"status\":\"not-run\",\"reason\":\"missing actual server executable\"}}"
         );
         return;
     };
@@ -557,15 +631,12 @@ fn acceptance_o13() {
         std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
     )
     .arg(script)
-    .args(["--scenario", "admission", "--test-executable"])
+    .args(["--scenario", variation, "--test-executable"])
     .arg(std::env::current_exe().unwrap())
     .arg("--binary")
     .arg(binary)
     .env("PYTHONDONTWRITEBYTECODE", "1")
     .status()
-    .expect("launch owned admission and terminal retirement assertions");
-    assert!(
-        status.success(),
-        "actual preaccept ownership/retirement failed"
-    );
+    .expect("launch OLTP process assertions");
+    assert!(status.success(), "{scenario} process assertions failed");
 }

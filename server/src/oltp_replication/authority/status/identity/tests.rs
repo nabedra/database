@@ -697,19 +697,84 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
     )
     .unwrap();
     let result_digest = outcome.digest().unwrap();
-    assert!(matches!(
-        f.apply(StatusCommand::BeginManifest {
+    let read_ts = Timestamp::new(1).unwrap();
+    let StatusReply::Manifest(draft) = f
+        .apply(StatusCommand::BeginManifest {
             authority: old,
             txn,
             request,
-            read_ts: Timestamp::new(1).unwrap(),
+            read_ts,
             participant_count: 1,
             outcome,
-            result_digest
+            result_digest,
+        })
+        .await
+    else {
+        panic!("expected durable manifest draft")
+    };
+    let participant = ParticipantPlan {
+        group: GroupIdentity {
+            kind: GroupKind::Catalog,
+            group_id: Uuid::new_v4(),
+            ..f.machine.store().identity().clone()
+        },
+        schema_epoch: 1,
+        routing_epoch: 1,
+        read_ts,
+        write_root: Digest::from_bytes([63; 32]),
+        write_count: 1,
+        page_count: 1,
+    };
+    f.apply(StatusCommand::ManifestPage {
+        authority: old,
+        txn,
+        page_index: 0,
+        previous_root: draft.initial_root,
+        participants: Page::new(vec![participant.clone()]).unwrap(),
+    })
+    .await;
+    let StatusReply::ManifestSealed(manifest) = f
+        .apply(StatusCommand::SealManifest {
+            authority: old,
+            txn,
+        })
+        .await
+    else {
+        panic!("expected sealed manifest")
+    };
+    let position = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: 7,
+    };
+    assert_eq!(
+        f.apply(StatusCommand::RecordPrepared {
+            authority: old,
+            evidence: PreparedParticipant {
+                txn,
+                manifest,
+                participant,
+                authority: old,
+                sealed_at: position,
+                result_digest,
+            },
         })
         .await,
-        StatusReply::Manifest(_)
-    ));
+        StatusReply::Prepared {
+            count: 1,
+            complete: true,
+        }
+    );
+    let permit = f.read_handle().commit_permit(old, txn).await.unwrap();
+    let delayed = StatusCommand::DecideCommit {
+        authority: old,
+        stamp: super::super::CommitStamp {
+            permit_digest: permit.allocation_digest().unwrap(),
+            commit_ts: Timestamp::new(2).unwrap(),
+            allocated_at: position,
+        },
+        permit,
+    };
     let cold = Authority {
         run_id: Uuid::new_v4(),
         owner_term: 2,
@@ -720,6 +785,10 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
         next: cold,
     })
     .await;
+    assert_eq!(
+        f.apply(delayed).await,
+        StatusReply::Rejected(StatusFault::StaleAuthority)
+    );
     assert_eq!(
         f.apply(reserve(cold, request_id, digest)).await,
         StatusReply::Identity(IdentityLookup::Abandoned(reservation))
