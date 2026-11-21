@@ -38,6 +38,12 @@ peer, with an average `gw.direct.lane_wait` of 6.4 ms. Requests now queue there 
 In the soaks, requests now wait out the snapshot stalls instead of failing. So a 50/s phase that contains a stall has a
 p99 of about 1.5 s; before, that stall produced 429s.
 
+The final head (`3479410`, after the lane-headroom fix) repeated the API sweep in run 44907326240
+(`ci-api-factor-final.json`). That runner was noisier: p99 was 60–450 ms even before the fix at 100/s. Before the fix, the
+API refused 0.3–2.7% at 100/s, 1–15% at 200/s and 7–32% at 400/s across the four API caps. After it, the API refused
+nothing at any cap; the only refusals left were the driver's 32-client cap during stalls. The snapshot-export stall also
+falls inside these short runs, because together they write more than 5,000 entries.
+
 G1: every run has `correctness_verified: true`, 0 mismatches (5,000 rows in the factor runs; 500 sampled keys in the soaks),
 0 unresolved and 0 failed.
 
