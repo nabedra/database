@@ -67,6 +67,13 @@ pub(crate) trait Consensus<C: OwnedPayload, R>: Send + Sync {
     fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
         self.ensure_linearizable()
     }
+    /// The lease barrier's log index without its applied-position read.
+    /// The caller must read the applied position in the snapshot it serves
+    /// from and refuse to serve while it is below this index. The direct
+    /// leader merges that read with its data reads (PERF2b).
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        Box::pin(async move { Ok(self.ensure_linearizable_lease().await?.applied.index) })
+    }
     /// The node this replica last observed as leader, if any. A routing
     /// hint only, never an authority.
     fn current_leader(&self) -> Option<u64> {

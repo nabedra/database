@@ -1532,6 +1532,16 @@ impl GroupStore {
         )
         .await
     }
+    /// The applied position in `view`'s snapshot, so a read can check a
+    /// barrier index in the same snapshot as its data (PERF2b).
+    pub(crate) fn applied_position_in(
+        &self,
+        view: &mut GroupRead<'_>,
+    ) -> Result<Option<AppliedPosition>, ProtocolError> {
+        Ok(self
+            .read_applied(view.snapshot, &mut view.scratch)?
+            .map(|state| state.position))
+    }
     fn read_applied(
         &self,
         snapshot: &Snapshot,

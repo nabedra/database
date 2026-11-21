@@ -2275,3 +2275,89 @@ async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
     assert_eq!(cluster.voters[old].executor.expire_served().await, 0);
     cluster.shutdown().await;
 }
+
+/// D01 (PERF2b item 1): the leader's barrier check, epochs, dedup lookup and
+/// newest version come from one Query-class native job. Before, a get took
+/// four jobs (two Control, two Query).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d01_perf2b_leader_reads_share_one_native_job() {
+    use crate::oltp::pool::ExecutionClass;
+    const ROUNDS: u64 = 20;
+    // Background work on an idle Data leader (none is expected).
+    const SLACK: u64 = 4;
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 10, "tag": "a", "score": 2.0}}),
+            )
+            .await,
+        done("null")
+    );
+    cluster.converge(leader).await;
+    let shared = cluster.voters[leader].shared.clone();
+    let jobs = || {
+        (
+            shared.native_jobs(ExecutionClass::Query),
+            shared.native_jobs(ExecutionClass::Control),
+        )
+    };
+    let (query, control) = jobs();
+    for _ in 0..ROUNDS {
+        assert_eq!(
+            cluster
+                .op(leader, "table.get", serde_json::json!({"key": 1}))
+                .await,
+            done(r#"{"id":1,"score":2.0,"tag":"a","value":10}"#)
+        );
+    }
+    let (query_after, control_after) = jobs();
+    assert!(
+        query_after - query <= ROUNDS + SLACK,
+        "Query jobs for {ROUNDS} gets: {}",
+        query_after - query
+    );
+    assert!(
+        control_after - control <= SLACK,
+        "Control jobs for {ROUNDS} gets: {}",
+        control_after - control
+    );
+    eprintln!(
+        "perf2b: {ROUNDS} gets took {} Query and {} Control jobs",
+        query_after - query,
+        control_after - control
+    );
+    let (query, control) = jobs();
+    for round in 0..ROUNDS {
+        assert_eq!(
+            cluster
+                .op(
+                    leader,
+                    "table.update",
+                    serde_json::json!({"key": 1, "values": {"value": round}}),
+                )
+                .await,
+            done("true")
+        );
+    }
+    let (query_after, control_after) = jobs();
+    eprintln!(
+        "perf2b: {ROUNDS} updates took {} Query and {} Control jobs",
+        query_after - query,
+        control_after - control
+    );
+    // These counts include replication (AppendEntries encodes and replies),
+    // index reads and the append, so only the change is asserted. Measured
+    // on this fixture: base 139 Control jobs for 20 updates (about 7 each).
+    // Per update, the reads lose the attempt's epochs read and the
+    // barrier's applied read.
+    assert!(
+        control_after - control <= 6 * ROUNDS + SLACK,
+        "Control jobs for {ROUNDS} updates: {}",
+        control_after - control
+    );
+    cluster.shutdown().await;
+}

@@ -755,6 +755,14 @@ where
             }
         })
     }
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        Box::pin(async move {
+            match self.read_index(ReadPolicy::LeaseRead).await {
+                Ok(index) => Ok(index),
+                Err(_) => self.read_index(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
     fn current_leader(&self) -> Option<u64> {
         use openraft::type_config::async_runtime::watch::WatchReceiver;
         // A stopped core's metrics may still name a leader (RV-APPLY F4).
@@ -775,6 +783,47 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
+    /// `read_barrier`'s Raft half: the index a read must have applied. The
+    /// caller checks it against its own snapshot (`lease_read_index`).
+    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+        let lease = matches!(policy, ReadPolicy::LeaseRead);
+        let kind = self.state.store().identity().kind.clone();
+        crate::oltp_runtime::stage_timing::variant(
+            if lease {
+                "raft.lease_read_by_kind."
+            } else {
+                "raft.read_index_by_kind."
+            },
+            &kind,
+        )
+        .record(std::time::Duration::ZERO);
+        let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            &kind,
+            if lease {
+                [
+                    "raft.data.lease_index",
+                    "raft.ts.lease_index",
+                    "raft.meta.lease_index",
+                ]
+            } else {
+                [
+                    "raft.data.read_index_only",
+                    "raft.ts.read_index_only",
+                    "raft.meta.read_index_only",
+                ]
+            },
+        )
+        .timer();
+        let barrier = self
+            .raft
+            .ensure_linearizable(policy)
+            .await
+            .map_err(|error| {
+                tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
+                unavailable()
+            })?;
+        Ok(barrier.index())
+    }
     async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
         {
             let lease = matches!(policy, ReadPolicy::LeaseRead);
