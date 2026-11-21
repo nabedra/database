@@ -1004,7 +1004,7 @@ impl Client {
             call.await
         };
         let route_failure = match attempt {
-            Ok(Ok(Err(error))) if error == super::hosted::proposal_forwarded() => {
+            Ok(Err(error)) if error == super::hosted::proposal_forwarded() => {
                 self.control.invalidate_replica_routes(&routes);
                 return None;
             }

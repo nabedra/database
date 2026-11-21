@@ -217,16 +217,18 @@ async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_resul
 async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
     use crate::oltp::mvcc::store::ParticipantHandle;
     use crate::oltp::pool::{ByteClass, ChargedBuffer};
+    use crate::oltp_replication::authority::control::ServiceAction;
     use crate::oltp_replication::multiplex::EndpointFuture;
     use crate::oltp_replication::service_rpc::direct::{
-        self, DirectRequest, DirectResponse, DirectService,
+        self, DirectLink, DirectRequest, DirectResponse, DirectSendError, DirectService,
     };
+    use sha2::{Digest as _, Sha256};
     use std::sync::Mutex;
 
     struct ReplyPressure {
         service: Arc<dyn DirectService>,
         id: Uuid,
-        holds: Mutex<Vec<ChargedBuffer>>,
+        hold: Mutex<Option<ChargedBuffer>>,
     }
     impl DirectService for ReplyPressure {
         fn execute<'a>(
@@ -249,7 +251,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
                         shared.buffer_bytes_used(ByteClass::Data),
                         config.control_bytes - config.progress_bytes
                     );
-                    self.holds.lock().unwrap().push(hold);
+                    *self.hold.lock().unwrap() = Some(hold);
                 }
                 Ok(response)
             })
@@ -276,14 +278,24 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         activated(&runtime).await;
         let app = runtime.application(TOKEN.into()).unwrap();
         let table = create(&app).await;
+        let get = || {
+            body(
+                Uuid::new_v4(),
+                "table.get",
+                json!({"table_id": table, "key": 7}),
+            )
+        };
+        assert_eq!(call(&app, get(), true).await.0, 200);
+        let table_id = serde_json::from_value(table.clone()).unwrap();
+        let route = runtime
+            .direct_gateway_handle()
+            .unwrap()
+            .cache()
+            .get(table_id)
+            .unwrap();
+        let range = &route.ranges[0];
         let shared = &runtime.services.shared;
         let id = Uuid::new_v4();
-        let pressure = Arc::new(ReplyPressure {
-            service: direct::installed(shared).unwrap(),
-            id,
-            holds: Mutex::new(Vec::new()),
-        });
-        direct::install(shared, &(pressure.clone() as Arc<dyn DirectService>));
         let insert = body(
             id,
             "table.insert",
@@ -291,18 +303,46 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
                 "table_id": table, "row": {"id": 7, "value": 1, "tag": "a"},
             }),
         );
-        let (status, envelope) = call(&app, insert.clone(), true).await;
+        let request = DirectRequest {
+            database: runtime.services.scope.database.clone(),
+            table_id,
+            schema_epoch: route.schema_epoch,
+            routing_epoch: range.shard.routing_epoch,
+            group: range.group().group_id,
+            request_id: id,
+            digest: Digest::from_bytes(Sha256::digest(&insert).into()),
+            body: shared.copy_bytes(&insert).unwrap(),
+            deadline: Duration::from_secs(5),
+        };
+        let link = DirectLink::new(
+            range.group().clone(),
+            shared.clone(),
+            runtime.services.manager.client(),
+            runtime.services.control_client.clone(),
+            ServiceAction::DirectLeader,
+        )
+        .unwrap();
+        let pressure = Arc::new(ReplyPressure {
+            service: direct::installed(shared).unwrap(),
+            id,
+            hold: Mutex::new(None),
+        });
+        direct::install(shared, &(pressure.clone() as Arc<dyn DirectService>));
+        let result = link
+            .send(
+                range.leader_hint().unwrap(),
+                runtime.services.local.worker_id,
+                &request,
+                false,
+            )
+            .await;
         direct::install(shared, &pressure.service);
-        let mut holds = pressure.holds.lock().unwrap();
-        assert!(!holds.is_empty(), "post-apply hold reached");
-        holds.clear();
-        drop(holds);
-        let get = body(
-            Uuid::new_v4(),
-            "table.get",
-            json!({"table_id": table, "key": 7}),
+        assert!(
+            pressure.hold.lock().unwrap().take().is_some(),
+            "post-apply hold reached"
         );
-        assert_eq!(call(&app, get, true).await.1["data"]["value"], 1);
+        drop(request);
+        assert_eq!(call(&app, get(), true).await.1["data"]["value"], 1);
         assert_eq!(
             call(&app, insert, true).await,
             (200, json!({"request_id": id, "data": null}))
@@ -317,9 +357,13 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         let conflict = call(&app, changed, true).await;
         assert_eq!(conflict.0, 409, "{conflict:?}");
         runtime.drain().await.unwrap();
-        assert_eq!(status, 503, "{envelope}");
-        assert_eq!(envelope["error"]["code"], "outcome_unknown", "{envelope}");
-        assert_eq!(envelope["error"]["outcome"], "unknown", "{envelope}");
+        let Err(DirectSendError::Uncertain(error)) = result else {
+            panic!("{result:?}");
+        };
+        assert!(
+            error.message.contains("encode class=Data requested="),
+            "{error:?}"
+        );
     })
     .await
     .expect("reply pressure watchdog");

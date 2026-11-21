@@ -178,6 +178,8 @@ pub(crate) struct HostRetry {
     /// Test hook: the next vote saves fail with `NoSpace`.
     #[cfg(test)]
     pub(crate) fail_votes: std::sync::atomic::AtomicU32,
+    #[cfg(test)]
+    pub(crate) force_no_space: AtomicBool,
     stopped: tokio::sync::Notify,
     /// The last write of this host hit `NoSpace` and no write succeeded since.
     no_space: AtomicBool,
@@ -200,6 +202,8 @@ impl HostRetry {
             fail_applies: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             fail_votes: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            force_no_space: AtomicBool::new(false),
             stopped: tokio::sync::Notify::new(),
             no_space: AtomicBool::new(false),
             stats,
@@ -250,13 +254,12 @@ impl HostRetry {
     pub(crate) fn take_export_fault(&self) -> bool {
         take(&self.fail_exports)
     }
-    /// Test hook: as if the last write found the device full.
-    #[cfg(test)]
-    pub(crate) fn mark_no_space(&self) {
-        self.no_space.store(true, Ordering::Release);
-    }
     /// True while this host's writes find the device full.
     pub(crate) fn out_of_space(&self) -> bool {
+        #[cfg(test)]
+        if self.force_no_space.load(Ordering::Acquire) {
+            return true;
+        }
         self.no_space.load(Ordering::Acquire)
     }
     /// Runs `future` unless the host stops first.

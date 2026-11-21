@@ -1911,7 +1911,10 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
     let v = &cluster.voters[leader];
     let before = v.executor.stats();
     let refused = v.consensus.health().snapshot().proposals_refused_no_space;
-    v.consensus.retry().mark_no_space();
+    v.consensus
+        .retry()
+        .force_no_space
+        .store(true, Ordering::Release);
     let started = std::time::Instant::now();
     let response = cluster
         .op(
