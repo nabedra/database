@@ -152,6 +152,9 @@ advertised its current identity. Activation is durable and never reverts.
 - While the capability is active, incremental backups are refused. Take full
   backups instead.
 
+See [OLTP worker recovery and direct-mode rollback](../docs/oltp-recovery.md)
+for retained-mount restart, lost-volume limits, and full archive restore.
+
 Docker uses the same choices. The OLAP image retains its existing Python CLI
 entrypoint; the OLTP image invokes `nabedra-db` directly:
 
