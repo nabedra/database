@@ -300,10 +300,9 @@ def o08(fixture):
         passed('O08', 'fresh-snapshot-retry',
                'An already planned queued upsert changed the head while a direct update was paused before proposal. The stale proposal lost and the same identity recomputed against the new head.')
     else:
-        verify_queued_stale_plan(fixture, table)
-        not_run('O08', 'fresh-snapshot-retry',
-                'The queued coordinator terminally aborts a forced stale Prepare at attempt 1, '
-                'and a retry returns that abort. No same-identity fresh snapshot path exists.')
+        verify_queued_snapshot_retry(fixture, table)
+        passed('O08', 'fresh-snapshot-retry',
+               'A queued update lost its first Prepare and committed from a fresh snapshot under the original request ID.')
     not_run('O08', 'storage-reservations',
             'The pool can report filesystem headroom and ENOSPC, but it has no owned disk-byte '
             'reservations for competing writes. A measured race requires that admission mechanism.')
@@ -348,7 +347,7 @@ def verify_snapshot_retry(fixture, table):
     assert exchange(fixture, direct) == result
 
 
-def verify_queued_stale_plan(fixture, table):
+def verify_queued_snapshot_retry(fixture, table):
     stale = point(table, 'update', key=1, values={'value': 90})
     request = stale['request_id']
     fixture.select(request, {'participants': True, 'decision': False})
@@ -362,25 +361,15 @@ def verify_queued_stale_plan(fixture, table):
     finally:
         fixture.release(request, 'participants')
     _, decision = fixture.reached(request, 'decision')
-    assert decision['txn'] == {'request_id': request, 'attempt': 1}, decision
+    assert decision['txn'] == {'request_id': request, 'attempt': 2}, decision
     assert decision['request']['request_id'] == request
-
-    def terminal_failure():
-        status, reply = fixture.receipt(request)
-        if status == 200 and reply['state'] in ('failed', 'succeeded'):
-            assert reply['state'] == 'failed' and reply['result'] is None, reply
-            return reply
-        assert status in (200, 503), (status, reply)
-        return None
-
-    terminal = wait_until(terminal_failure, 'queued stale Prepare terminal abort', timeout=30)
-    error = {'code': 'conflict', 'message': 'transaction preparation conflicted with an existing version',
-             'outcome': 'not_applied'}
-    assert terminal['error'] == error, terminal
-    assert exchange(fixture, stale, 'api2') == (409, {'request_id': request, 'error': error})
-    assert fixture.data(point(table, 'get', key=1)) == winner
-    evidence('O08', 'queued-stale-prepare-terminal-abort', request_id=request,
-             snapshot=participants[0]['read_ts'], attempted_version=before, resulting_row=winner,
+    assert 'commit' in decision['decision'], decision
+    fixture.terminal(request, True)
+    assert exchange(fixture, stale, 'api2') == (200, {'request_id': request, 'data': True})
+    final_row = dict(winner, value=90)
+    assert fixture.data(point(table, 'get', key=1)) == final_row
+    evidence('O08', 'queued-fresh-snapshot-retry', request_id=request,
+             snapshot=participants[0]['read_ts'], attempted_version=before, resulting_row=final_row,
              decision=decision)
 
 
