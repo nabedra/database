@@ -109,17 +109,26 @@ class Kind:
         self.kube('apply', '-f', '-', input=json.dumps(dict(apiVersion='v1', kind='List',
                                                            items=definitions)))
 
-    def start(self, csi_source):
-        self.evidence.record('kind-create', cluster=self.name, node_image=NODE_IMAGE)
-        self.evidence.file('kind-create.txt', run('kind', 'create', 'cluster', '--name', self.name,
-            '--kubeconfig', str(self.kubeconfig), '--config', str(HERE / 'kind.yaml'),
-            '--image', NODE_IMAGE, '--wait', '150s', timeout=420))
+    def start(self, csi_source, node_image, archives, csi_images):
+        for archive in archives:
+            self.evidence.file(archive.name + '.load.txt', run('docker', 'load', '-i', str(archive), timeout=180))
+        self.evidence.record('kind-create', cluster=self.name, node_image=node_image)
+        result = run('kind', 'create', 'cluster', '--name', self.name, '--kubeconfig', str(self.kubeconfig),
+                     '--config', str(HERE / 'kind.yaml'), '--image', node_image, '--wait', '150s',
+                     timeout=420, check=False)
+        self.evidence.file('kind-create.txt', result.stdout + result.stderr)
+        assert result.returncode == 0, (result.stdout, result.stderr)
         self.kube('create', 'namespace', NS)
         nodes = self.obj('nodes', namespaced=False)['items']
         self.nodes = {node['metadata']['labels'][ZONE_LABEL]: node['metadata']['name'] for node in nodes
                       if ZONE_LABEL in node['metadata']['labels']}
         assert set(self.nodes) == set(ZONES) and len(nodes) == 4, self.nodes
         self.evidence.file('kind-nodes.txt', self.kube('get', 'nodes', '-o', 'wide', '-L', ZONE_LABEL))
+        for archive in csi_images:
+            result = run('kind', 'load', 'image-archive', str(archive), '--name', self.name,
+                         check=False, timeout=150)
+            self.evidence.file(archive.name + '.import.txt', result.stdout + result.stderr)
+            assert result.returncode == 0, (archive, result.stderr)
         if self.rawfile:
             definitions = [item for item in documents(self.rawfile) if item]
             self.apply(*definitions)
@@ -132,7 +141,7 @@ class Kind:
             self.kube('rollout', 'status', target, '--timeout=180s', timeout=200)
         self.evidence.file('csi-ready.txt', self.kube('get', 'csidriver,csinode,storageclass', '-o', 'wide'))
 
-    def load(self, engine, binary, test_executable=None):
+    def load(self, engine, binary, test_executable=None, base_image='python:3.11-slim-trixie'):
         tag = f'{self.name}-{engine}:local'
         stage = self.root / engine
         stage.mkdir()
@@ -141,7 +150,7 @@ class Kind:
             (stage / 'oltp-test').write_bytes(test_executable.read_bytes())
         self.images.append(tag)
         self.evidence.file(f'{engine}-image.txt', run('docker', 'build', '--pull=false', '-t', tag,
-            '-f', str(HERE / 'Dockerfile'), str(stage), timeout=90))
+            '--build-arg', 'RUNTIME_IMAGE=' + base_image, '-f', str(HERE / 'Dockerfile'), str(stage), timeout=120))
         run('kind', 'load', 'docker-image', '--name', self.name, tag, timeout=150)
         return tag
 
@@ -439,7 +448,10 @@ class Oltp(Rf3Cluster):
 
     def start_api(self, _name, direct=True):
         name = 'api'
-        record = dict(database=DATABASE, enrollment=self.certificate(name))
+        enrollment = self.certificate(name)
+        # The native gateway binds its enrolled peer endpoint separately from HTTP.
+        enrollment.update(endpoint='127.0.0.1:9000', server_name='localhost')
+        record = dict(database=DATABASE, enrollment=enrollment)
         self.admin('api.enroll', {'expected': None, 'next': record})
         config = dict(version=1, engine='oltp', bind=f'0.0.0.0:{PORT}', database=DATABASE,
                       auth_file='/config/auth.json', tls=dict(cert_file='/config/api.pem', key_file='/config/api.key'),
@@ -1086,6 +1098,10 @@ def main():
     parser.add_argument('--binary', type=Path)
     parser.add_argument('--test-executable', type=Path)
     parser.add_argument('--revision', help='Source SHA for the CI release binary')
+    parser.add_argument('--node-image', default=NODE_IMAGE)
+    parser.add_argument('--base-image', default='python:3.11-slim-trixie')
+    parser.add_argument('--load-archive', action='append', type=Path, default=[])
+    parser.add_argument('--csi-archive-dir', type=Path)
     parser.add_argument('--output', required=True, type=Path)
     driver = parser.add_mutually_exclusive_group(required=True)
     driver.add_argument('--csi-source', type=Path)
@@ -1121,11 +1137,12 @@ def main():
             observer = threading.Thread(target=cluster.watch_memory, args=(stop,))
             observer.start()
             try:
-                cluster.start(args.csi_source)
+                csi_images = sorted(args.csi_archive_dir.glob('*.tar')) if args.csi_archive_dir else ()
+                cluster.start(args.csi_source, args.node_image, args.load_archive, csi_images)
                 if args.scenario == 'preflight':
                     evidence.record('kind CSI preflight', status='passed', zones=cluster.nodes)
                     return
-                image = cluster.load('oltp', args.binary, args.test_executable)
+                image = cluster.load('oltp', args.binary, args.test_executable, args.base_image)
                 oltp(cluster, args.binary, image, args.scenario, args.test_executable)
             except Exception as error:
                 evidence.record('session-failed', type=type(error).__name__, message=str(error))

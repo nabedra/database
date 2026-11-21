@@ -98,7 +98,7 @@ def pair(args, evidence):
             remove(name, evidence)
         return container('cache-pair', args, evidence, [
             *wheels, *mount(reference, '/valkey-server'), '-e', 'REV=' + args.revision,
-        ], BENCH, '''
+        ], args.bench_image, '''
             export PYTHONPATH=/redis-6.4.0-py3-none-any.whl
             exec python3 /source/scripts/cache-benchmark/run.py --environment docker \
               --nabedra /nabedra-db --valkey /valkey-server --source-revision "$REV" \
@@ -116,6 +116,8 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--lane', required=True, type=Path)
     parser.add_argument('--redis-wheel', type=Path)
+    parser.add_argument('--bench-image', default=BENCH)
+    parser.add_argument('--load-archive', type=Path)
     args = parser.parse_args()
     if args.scenario.startswith('cache') and not args.redis_wheel:
         parser.error('Cache requires the redis 6.4.0 wheel')
@@ -128,6 +130,9 @@ def main():
                     sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest())
     label = 'LIVE3 BENCH' if args.scenario in ('cache-pair', 'cache') else 'LIVE3 Docker'
     with acceptance.lane(args.lane, evidence, label):
+        if args.load_archive:
+            evidence.file('image-load.txt', acceptance.run(
+                'docker', 'load', '-i', str(args.load_archive), timeout=180))
         if args.scenario == 'olap':
             return container('olap', args, evidence, [], PYTHON, '''
                 cp /nabedra-db /tmp/nabedra-db

@@ -109,6 +109,7 @@ def zone_loss(fleet, path, topology):
         fixture.wait('healthy traffic', lambda: len(times) >= 5)
         before = usage(fleet, survivor_names)
         start = time.monotonic()
+        record(path, 'K04b zone pause issued', zone='az-1')
         fleet.stop('c1')
         fleet.stop('w1')
         try:
@@ -124,6 +125,7 @@ def zone_loss(fleet, path, topology):
                    recovered_seconds=recovered - start, before=before, during=usage(fleet, survivor_names),
                    stopped=['c1', 'w1'])
         finally:
+            record(path, 'K04b zone resume issued', zone='az-1')
             fleet.resume('c1')
             fleet.resume('w1')
         fleet.wait_placement(validated, seconds=60)
@@ -181,6 +183,42 @@ def grow_and_drain(fleet, path, keys, values, count):
            seconds=time.monotonic() - drain_start)
 
 
+def repeated_growth_under_load(fleet, path, keys, values):
+    stop = threading.Event()
+    observed, failures = [], []
+
+    def load():
+        try:
+            while not stop.is_set():
+                for node, key in keys.items():
+                    started = time.monotonic()
+                    ok = read(fleet, node, key, values[node])
+                    observed.append(ok)
+                    record(path, 'K05 live read', owner=node, success=ok,
+                           latency_ms=round((time.monotonic() - started) * 1000, 3))
+                    if stop.wait(0.25):
+                        return
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=load)
+    worker.start()
+    try:
+        fixture.wait('reads before scale-out', lambda: len(observed) >= 3)
+        for count in (6, 12):
+            before = len(observed)
+            grow_and_drain(fleet, path, keys, values, count)
+            during = observed[before:]
+            assert during and all(during), (count, len(during), failures)
+            record(path, 'K05 exact live reads across growth and drain', groups=count, reads=len(during))
+    finally:
+        stop.set()
+        worker.join(timeout=12)
+    assert not worker.is_alive()
+    if failures:
+        raise failures[0]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True, type=Path)
@@ -199,8 +237,7 @@ def main():
         fleet.apply('init', '--groups', '3')
         topology = fleet.wait_placement(lambda view: validated(view, 3), seconds=70)
         keys, values = zone_loss(fleet, args.output, topology)
-        for count in (6, 12):
-            grow_and_drain(fleet, args.output, keys, values, count)
+        repeated_growth_under_load(fleet, args.output, keys, values)
 
 
 if __name__ == '__main__':
