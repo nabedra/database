@@ -321,6 +321,10 @@ fn ns11_no_space_in_flush_compaction_and_manifest_is_recoverable() {
     // cannot write anything before the fault is in place (it may hold the compaction
     // lock, waiting), so the work is still there for `compact` and meets ENOSPC. On CI
     // the background thread sometimes finished it first and `compact` returned `Ok`.
+    // Finish any earlier background compaction first: one that wrote its outputs before
+    // the gate closed would block on its gated manifest write holding the manifest lock,
+    // and the flush below would wait for that lock forever (GATEfix saw it hang).
+    store.compact().unwrap();
     gate.close();
     fill(&store, &mut model, 60);
     store.flush().unwrap();
