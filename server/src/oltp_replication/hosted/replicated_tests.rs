@@ -679,10 +679,10 @@ async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_surviv
     }
     timeout_loop(|| async { (read_count(&voters[2].store).await == 240).then_some(()) }).await;
     assert!(!directory.revoked(voters[0].identity));
-    assert!(
-        source.calls.load(Ordering::Acquire) > failed_reads,
-        "refresh kept retrying"
-    );
+    // The refresh keeps retrying once per interval (the commits above can
+    // finish within one interval).
+    timeout_loop(|| async { (source.calls.load(Ordering::Acquire) > failed_reads).then_some(()) })
+        .await;
     eprintln!(
         "REP6 Data-only follower during a Control outage (view {:?} old): commit p50 {:.3} ms \
          p99 {:.3} ms with the Data-only ack on every commit",
