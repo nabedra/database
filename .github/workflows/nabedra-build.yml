@@ -260,8 +260,8 @@ jobs:
               status=0
               timeout --kill-after=2s 8s "$exe" "$name" --exact > "$log" 2>&1 || status=$?
               echo "FLAKE2 $name round $round/$rounds exit $status"
-              if [[ $status == 0 ]] && rg -q '^test result: ok\. 1 passed;' "$log"; then
-                rg '^test result:' "$log"
+              if [[ $status == 0 ]] && grep -q '^test result: ok\. 1 passed;' "$log"; then
+                grep '^test result:' "$log"
                 ((passed+=1))
               else
                 cat "$log"
