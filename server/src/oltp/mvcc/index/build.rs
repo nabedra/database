@@ -501,7 +501,8 @@ impl IndexService {
                             crate::oltp_runtime::recovery_tests::maintenance::hold_index_page(
                                 maintenance.index_id,
                                 records.len(),
-                            ).await;
+                            )
+                            .await;
                             #[cfg(test)]
                             if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
                                 maintenance.index_id,
