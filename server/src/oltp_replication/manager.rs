@@ -31,6 +31,7 @@ use std::{
 
 mod data_factory;
 mod lifecycle;
+pub(crate) mod system_recovery;
 pub(crate) use lifecycle::{
     AppliedPlacementMembership, DamageSink, ReplicatedLearner, ReportingDamageSink,
     SettlingReplicas, spawn_settlement,
@@ -67,6 +68,10 @@ pub(crate) type ManagedCatalog = Managed<CatalogConfig, ParticipantMachine>;
 trait Running: Send + Sync {
     fn leader(&self) -> Option<u64>;
     fn members(&self) -> Vec<ReplicaMember>;
+    fn surviving_quorum<'a>(
+        &'a self,
+        request: &'a system_recovery::QuorumRequest,
+    ) -> system_recovery::QuorumFuture<'a>;
     fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ProtocolError>> + Send + '_>>;
     fn removed_applied(
         &self,
@@ -79,6 +84,12 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
+    fn surviving_quorum<'a>(
+        &'a self,
+        request: &'a system_recovery::QuorumRequest,
+    ) -> system_recovery::QuorumFuture<'a> {
+        Box::pin(self.check_surviving_quorum(request))
+    }
     fn leader(&self) -> Option<u64> {
         // A stopped core never counts as the leader (RV-APPLY F4).
         let metrics = self.raft.metrics();

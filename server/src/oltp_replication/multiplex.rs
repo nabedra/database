@@ -48,6 +48,7 @@ pub enum Purpose {
     RaftProgress = 17,
     /// NS14b: Control's damage-replacement scheduler to a worker (Control scope).
     GroupDamage = 18,
+    SystemRecovery = 19,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {

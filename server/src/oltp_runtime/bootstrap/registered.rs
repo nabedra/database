@@ -143,6 +143,13 @@ impl LocalServices {
             let registration = manager
                 .registry()
                 .reserve(placements.control.identity.clone())?;
+            registration.bind(
+                Purpose::SystemRecovery,
+                Arc::new(crate::oltp_replication::manager::system_recovery::QuorumEndpoint {
+                    manager: manager.clone(),
+                    control: control.clone(),
+                }),
+            )?;
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
             let hosted_control = HostedControlEndpoint::new(
                 control_endpoint.clone(),
@@ -816,7 +823,7 @@ pub(in crate::oltp_runtime) async fn wait_startup(deadline: tokio::time::Instant
     .await;
     Ok(())
 }
-async fn ready_members(
+pub(in crate::oltp_runtime) async fn ready_members(
     control: &ControlHandle,
     ready: ReadyMembership,
 ) -> Result<Vec<WorkerIdentity>, ProtocolError> {

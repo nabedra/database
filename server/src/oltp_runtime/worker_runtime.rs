@@ -18,6 +18,7 @@ pub(super) mod retirement;
 #[cfg(test)]
 mod shard_route;
 mod split;
+pub(super) mod system_recovery;
 mod worker_drain;
 use super::{
     admission::{DurableAdmission, ReservationResult},
