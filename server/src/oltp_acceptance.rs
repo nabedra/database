@@ -2,6 +2,8 @@
 //! in their owning modules. Run these explicitly through the central runner.
 use std::{path::PathBuf, process::Command};
 
+#[path = "oltp_acceptance/acc6.rs"]
+mod acc6;
 #[path = "oltp_acceptance/o07.rs"]
 mod o07;
 #[path = "oltp_acceptance/o10.rs"]

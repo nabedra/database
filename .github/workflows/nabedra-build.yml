@@ -73,10 +73,20 @@ env:
 jobs:
   kv:
     name: nabedra-kv
+    needs: features
+    needs: features
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: o02-engine-features
+      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: o02-engine-features
+      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
@@ -183,6 +193,15 @@ jobs:
           cargo check --locked --bin nabedra-db --no-default-features --features oltp
           cargo check --locked --bin nabedra-db --no-default-features --features oltp-backup-s3
           cargo check --locked --bin nabedra-db --no-default-features --features cache
+      - name: Build installed engine variants and check feature guards
+        if: inputs.acceptance || inputs.direct || contains(github.event.head_commit.message, '[ci acceptance]') || contains(github.event.head_commit.message, '[ci direct]')
+        run: python scripts/check_engine_features.py --dependencies-only --acceptance-evidence o02-engine-features.json
+      - uses: actions/upload-artifact@v4
+        if: inputs.acceptance || inputs.direct || contains(github.event.head_commit.message, '[ci acceptance]') || contains(github.event.head_commit.message, '[ci direct]')
+        with:
+          name: o02-engine-features
+          path: o02-engine-features.json
+          retention-days: 14
       - name: Stage Cargo cache without workspace crates
         if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -573,6 +592,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the TypeScript ORM
+        working-directory: orm/typescript
+        run: npm ci --no-audit --no-fund && npm run build
       - name: Build the OLAP server for engine parity
         run: |
           cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap \

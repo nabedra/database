@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """O02: check exact engine dependency graphs, compile guards, tests and identity."""
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -60,20 +61,57 @@ def assert_dependency_packages(name, engine, s3, tree):
     return sorted(packages)
 
 
+def check_compile_guards():
+    exclusive_engine = 'select exactly one engine: olap, oltp, or cache'
+    invalid = (
+        ('no-engine', [], exclusive_engine),
+        ('olap-oltp', ['--features', 'olap,oltp'], exclusive_engine),
+        ('olap-cache', ['--features', 'olap,cache'], exclusive_engine),
+        ('oltp-cache', ['--features', 'oltp,cache'], exclusive_engine),
+        ('all-engines', ['--features', 'olap,oltp,cache'], exclusive_engine),
+        ('cache-s3', ['--features', 'cache,s3'], 'the cache engine does not support S3'),
+    )
+    for name, features, diagnostic in invalid:
+        result = cargo('check', ['--no-default-features', *features], '--lib', check=False)
+        assert result.returncode != 0, f'O02 {name} unexpectedly compiled'
+        assert diagnostic in result.stderr, result.stderr
+        print(f'O02 {name}: explicit compile guard passed', flush=True)
+    return [name for name, _, _ in invalid]
+
+
+def installed_version(selection):
+    result = cargo('build', selection, '--bin', 'nabedra-db', '--message-format=json')
+    artifacts = (json.loads(line) for line in result.stdout.splitlines())
+    executable, = [record['executable'] for record in artifacts
+                   if record.get('reason') == 'compiler-artifact' and record.get('executable')
+                   and record['target']['name'] == 'nabedra-db']
+    return subprocess.check_output([executable, '--version'], text=True, timeout=10).strip()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dependencies-only', action='store_true',
                         help='inspect graphs without claiming builds or tests passed')
+    parser.add_argument('--acceptance-evidence', type=Path,
+                        help='build installed binaries and record O02 checks without running full engine suites')
     args = parser.parse_args()
+    if args.acceptance_evidence and not args.dependencies_only:
+        parser.error('--acceptance-evidence requires --dependencies-only to skip full suites')
     tree = ('--edges', 'normal,build', '--prefix', 'none', '--format', '{p}')
     events = package_names(cargo('tree', [], *tree, manifest=EVENTS_MANIFEST).stdout)
     assert_no_forbidden_native('events', events)
     assert 'nabedra-kv' in events, ('events', 'native storage engine')
     print('O02 events: dependency graph passed', flush=True)
+    graphs = {'events': sorted(events)}
+    versions = {}
     for name, engine, s3, selection in CASES:
         result = cargo('tree', selection, *tree)
-        assert_dependency_packages(name, engine, s3, result.stdout)
+        graphs[name] = assert_dependency_packages(name, engine, s3, result.stdout)
         print(f'O02 {name}: dependency graph passed', flush=True)
+        if args.acceptance_evidence:
+            versions[name] = installed_version(selection)
+            assert versions[name].split()[-1] == engine, (name, versions[name])
+            print(f'O02 {name}: installed {versions[name]}', flush=True)
         if args.dependencies_only:
             continue
         for command, extra in [('test', ('--lib', '--tests')),
@@ -84,20 +122,12 @@ def main():
             print(result.stdout, end='')
             print(f'O02 {name}: {command} passed', flush=True)
     if not args.dependencies_only:
-        exclusive_engine = 'select exactly one engine: olap, oltp, or cache'
-        invalid = (
-            ('no-engine', [], exclusive_engine),
-            ('olap-oltp', ['--features', 'olap,oltp'], exclusive_engine),
-            ('olap-cache', ['--features', 'olap,cache'], exclusive_engine),
-            ('oltp-cache', ['--features', 'oltp,cache'], exclusive_engine),
-            ('all-engines', ['--features', 'olap,oltp,cache'], exclusive_engine),
-            ('cache-s3', ['--features', 'cache,s3'], 'the cache engine does not support S3'),
-        )
-        for name, features, diagnostic in invalid:
-            result = cargo('check', ['--no-default-features', *features], '--lib', check=False)
-            assert result.returncode != 0, f'O02 {name} unexpectedly compiled'
-            assert diagnostic in result.stderr, result.stderr
-            print(f'O02 {name}: explicit compile guard passed', flush=True)
+        check_compile_guards()
+    if args.acceptance_evidence:
+        commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        args.acceptance_evidence.write_text(json.dumps(dict(
+            commit=commit, graphs=graphs, versions=versions, compile_guards=check_compile_guards(),
+        )) + '\n')
     return 0
 
 
