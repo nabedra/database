@@ -388,6 +388,16 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 "raft.meta.net.append",
             ]
         };
+        let data_append = header.payload_bytes != 0
+            && matches!(
+                self.factory.resident.identity().kind,
+                crate::oltp_replication::types::GroupKind::Data { .. }
+            );
+        if data_append {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_send"
+            ));
+        }
         let reply: AppendEntriesResponse<C> = crate::oltp_runtime::stage_timing::timed(
             crate::oltp_runtime::stage_timing::by_kind(
                 &self.factory.resident.identity().kind,
@@ -397,6 +407,11 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         )
         .await
         .map_err(|_| unreachable())?;
+        if data_append {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_ack"
+            ));
+        }
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
             || (header.payload_bytes == 0
                 && matches!(reply, AppendEntriesResponse::PartialSuccess(_)))
