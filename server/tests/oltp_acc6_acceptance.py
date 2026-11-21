@@ -29,6 +29,7 @@ from oltp_runtime_acceptance import (
     run_native_assertions, same_run_ready, wait_reached, wait_until,
 )
 from oltp_transaction_acceptance import Transactions
+from nabedra.errors import OverloadedError
 
 ROOT = Path(__file__).resolve().parents[2]
 MIB = 1 << 20
@@ -894,12 +895,28 @@ def o22(binary, test_executable):
             ready_replica_view(cluster, WORKERS, newer_than=removed_view['membership_revision'])
             assert cluster.stats(target)['native_thread_budget']['query_threads'] == 3
             current = db.table('o22_rows')
-            assert current.id == table.id and current.query().collect() == rows
+            assert current.id == table.id
+            overloads = 0
+
+            def restored_rows():
+                nonlocal overloads
+                try:
+                    return current.query().collect()
+                except OverloadedError as error:
+                    # The new view invalidates terminal-copy confirmations.
+                    # Recovery can briefly occupy all four owner actor slots.
+                    assert (error.status_code, error.outcome, str(error)) == (
+                        429, 'not_applied', 'executor admission capacity exhausted'), error
+                    overloads += 1
+                    return None
+
+            assert wait_until(restored_rows, 'same-run table read after queue recovery', timeout=15) == rows
             route_after = [current.where(id=key).explain().split('owning shard ', 1)[1].splitlines()[0]
                            for key in (-1, 1)]
             assert route_after == route_before, (route_before, route_after)
             evidence('O22', 'C03-same-store-reconfiguration', worker=target, old_threads=limits[WORKERS.index(target)],
-                     new_threads=3, table=current.id, shards=route_after, rows=len(rows))
+                     new_threads=3, table=current.id, shards=route_after, rows=len(rows),
+                     preadmission_overloads=overloads)
 
         with closing(gateway(cluster)) as client:
             distributed = saturated_history(db, client.exchange, cluster.all_stats, directories, cluster.run_id,

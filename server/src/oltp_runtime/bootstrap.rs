@@ -93,6 +93,15 @@ impl Drop for LocalServices {
 }
 impl LocalServices {
     #[cfg(test)]
+    pub(super) async fn stop_directory_refresh_for_test(&self) {
+        let refresh = self.refresh.lock().unwrap().take();
+        if let Some(refresh) = refresh {
+            refresh.abort();
+            assert!(refresh.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) async fn status_endpoint_for_test(
         &self,
     ) -> Result<
