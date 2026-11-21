@@ -118,7 +118,7 @@ class Transactions:
         query = table.query() if category is None else table.where(col('category') == category)
         return operation('query.collect', {'table_id': table.id, 'query': query._to_wire()})
 
-    def make_index(self, table):
+    def make_index(self, table, owner):
         index_id, build_id = uid(), uid()
         created = admin_owner(self.cluster, 'storage.index.create', {
             'table_id': table.id, 'index_id': index_id, 'name': 'by_category',
@@ -128,9 +128,19 @@ class Transactions:
         while created['state'] != 'ready':
             assert created['state'] in ('pending', 'building', 'backfilling', 'validating'), created
             assert time.monotonic() < deadline, created
-            created = admin_owner(self.cluster, 'storage.index.status', {
+            status_request = operation('storage.index.status', {
                 'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1,
             })
+            status, result = call(self.cluster.urls[owner], '/v1/cluster/operations', status_request,
+                                  token=self.cluster.auth['admin_token'], timeout=12)
+            if status == 503:
+                assert result['error'] == {
+                    'code': 'storage_unavailable', 'outcome': 'not_applied',
+                    'message': 'index publication is in progress; retry the status read',
+                }, result
+            else:
+                assert status == 200, (status, result)
+                created = result['data']
             if created['state'] != 'ready':
                 time.sleep(.1)
         assert 'by_category' in table.where(category=7).explain()
@@ -321,11 +331,11 @@ def o07(facade):
     seed = batch(table, rows(-5, 5, category=0))
     facade.select(seed['request_id'], {'participants': False})
     facade.admit(seed)
-    _, source = facade.reached(seed['request_id'], 'participants')
+    owner, source = facade.reached(seed['request_id'], 'participants')
     assert len(source) == 1, source
     facade.terminal(seed['request_id'], 2)
 
-    facade.make_index(table)
+    facade.make_index(table, owner)
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
             run_batch(facade, table, [source[0]['group']], rows(10, 11, category=7), 7, pool)
@@ -341,6 +351,7 @@ def o07(facade):
             break
         assert split['state'] == 'importing', split
     assert split['state'] == 'published' and len(split['children']) == 2, split
+    assert 'by_category' in table.where(category=8).explain()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
