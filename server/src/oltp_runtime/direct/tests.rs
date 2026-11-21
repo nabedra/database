@@ -63,6 +63,8 @@ use uuid::Uuid;
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
 
+mod gc1;
+
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {

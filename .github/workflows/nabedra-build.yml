@@ -821,3 +821,38 @@ jobs:
           name: perf-profile
           path: perf-out
           retention-days: 14
+
+  # GC1: CPU, wall time, entries, fsyncs and bytes per committed direct write on an in-process
+  # RF3 cluster (per-voter runtimes, per-thread CPU from /proc), release build, uncapped.
+  # Opt-in with [ci gc1]. Prints one `GC1 {json}` line per phase into gc1-measure.log.
+  gc1:
+    name: direct write cost per entry, append and fsync (GC1)
+    if: contains(github.event.head_commit.message, '[ci gc1]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Build release library tests
+        working-directory: server
+        run: cargo test --locked --release --no-default-features --features oltp --lib --no-run
+      - name: Measure
+        working-directory: server
+        env:
+          GC1_RATES: "100,400,1000,2000"
+          GC1_RANGES: "1,8"
+          GC1_SECONDS: "10"
+          GC1_SERIAL: "300"
+        run: |
+          set -o pipefail
+          nproc; free -m; df -h .
+          cargo test --locked --release --no-default-features --features oltp --lib gc1_measure -- --ignored --nocapture --test-threads 1 2>&1 | tee ../gc1-measure.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc1-measure
+          path: gc1-measure.log
+          retention-days: 14
