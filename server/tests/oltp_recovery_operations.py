@@ -271,6 +271,23 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         finally:
             cluster.workers[survivors[1]].resume()
 
+        def ready_to_check():
+            status, reply = observe()
+            return reply if status == 200 else None
+
+        wait_for(ready_to_check, 'Control quorum restored', PROBE_WINDOW)
+        data_group = initial_range(cluster, table)['group_id']
+        held = [cluster.barrier_dir(name) / f'hold-raft-{data_group}' for name in survivors]
+        for path in held:
+            path.touch()
+        try:
+            assert cluster.admin('cluster.connection', {}, worker=survivors[0])['run_id'] == cluster.run_id
+            status, reply = observe()
+            assert status == 503 and 'surviving RF3 quorum' in json.dumps(reply), (status, reply)
+        finally:
+            for path in held:
+                path.unlink()
+
         def checked():
             status, reply = observe()
             if status == 503:
@@ -289,6 +306,11 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
                       next=fresh, mount=fresh_mount)
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
+        borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
+        bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))
+        bad_intent = dict(intent, next=dict(fresh, certificate_sha256=borrowed_cert), mount=bad_mount)
+        status, reply = operator(leader, operation('worker.system_replacement.prepare', bad_intent, intent['id']))
+        assert status == 400, (status, reply)
         prepared = success(*operator(leader, prepare))
         assert prepared['intent'] == intent
         assert {item['expected']['identity']['group_id'] for item in prepared['groups']} == expected
@@ -322,7 +344,8 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
         report('O06/O17 system replacement preflight', lost_control_leader=victim,
                groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
-               refused_missing_advert=True, replayed_intent=True, settled_receipts=1,
+               refused_missing_advert=True, refused_data_quorum=True, refused_reused_certificate=True,
+               replayed_intent=True, settled_receipts=1,
                probe_recovery_seconds=round(first_read - stopped_at, 3))
     finally:
         cluster.close()

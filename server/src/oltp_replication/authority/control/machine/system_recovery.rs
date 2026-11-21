@@ -16,6 +16,16 @@ pub(in crate::oltp_replication::authority::control) fn by_id(id: Uuid) -> Vec<u8
     key(b"ct/system-replacement-id/", id)
 }
 
+fn by_target(worker: Uuid) -> Vec<u8> {
+    key(b"ct/system-replacement-target/", worker)
+}
+
+fn by_certificate(certificate: Digest) -> Vec<u8> {
+    let mut key = b"ct/system-replacement-certificate/".to_vec();
+    key.extend_from_slice(certificate.as_bytes());
+    key
+}
+
 pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     scope: &GroupIdentity,
@@ -113,6 +123,11 @@ pub(super) fn apply(
             if tx.get(&by_id(intent.id))?.is_some() {
                 return fault(Fault::Conflict);
             }
+            let target = by_target(intent.next.worker_id);
+            let certificate = by_certificate(intent.next.certificate_sha256);
+            if tx.get(&target)?.is_some() || tx.get(&certificate)?.is_some() {
+                return fault(Fault::Conflict);
+            }
             if *ready != state.ready
                 || *enrollment_revision != state.enrollment_revision
                 || *group_inventory_revision != state.group_inventory_revision
@@ -142,6 +157,7 @@ pub(super) fn apply(
                 || tx.get(&key(WORKERS, intent.next.worker_id))?.is_some()
                 || tx.get(&key(APIS, intent.next.worker_id))?.is_some()
                 || tx.get(&by_worker(intent.next.worker_id))?.is_some()
+                || !certificate_unused(tx, intent.next.certificate_sha256)?
             {
                 return fault(Fault::Invalid);
             }
@@ -155,9 +171,42 @@ pub(super) fn apply(
             };
             save(tx, &lookup, &intent.id)?;
             save(tx, &by_id(intent.id), &record)?;
+            save(tx, &target, &intent.id)?;
+            save(tx, &certificate, &intent.id)?;
             Ok(ControlReply::SystemReplacementPrepared(Box::new(record)))
         }
     }
+}
+
+fn certificate_unused(
+    tx: &mut GroupTransaction<'_>,
+    certificate: Digest,
+) -> Result<bool, ProtocolError> {
+    for prefix in [WORKERS, APIS] {
+        let mut after = None;
+        loop {
+            let mut found = false;
+            let mut cursor = None;
+            let progress = tx.scan_page(prefix, after.as_deref(), 128, |key, raw| {
+                let candidate = if prefix == WORKERS {
+                    decode::<WorkerRecord>(raw)?.enrollment.certificate_sha256
+                } else {
+                    decode::<ApiEnrollment>(raw)?.transport().certificate_sha256
+                };
+                found |= candidate == certificate;
+                cursor = Some(key.to_vec());
+                Ok(())
+            })?;
+            if found {
+                return Ok(false);
+            }
+            if progress.exhausted {
+                break;
+            }
+            after = cursor;
+        }
+    }
+    Ok(true)
 }
 
 fn validate_groups(
@@ -168,6 +217,10 @@ fn validate_groups(
 ) -> Result<bool, ProtocolError> {
     let mut previous_group = None;
     for group in groups {
+        let Ok(expected) = ReplacementGroup::new(group.expected.clone(), group.old.clone(), intent)
+        else {
+            return Ok(false);
+        };
         let id = group.expected.identity.group_id;
         if previous_group.is_some_and(|previous| id <= previous)
             || !same_scope(scope, &group.expected.identity)
@@ -188,8 +241,7 @@ fn validate_groups(
             || tx
                 .get(&placement::occupied(id, group.learner.node_id))?
                 .is_some()
-            || ReplacementGroup::new(group.expected.clone(), group.old.clone(), intent)?.learner
-                != group.learner
+            || expected.learner != group.learner
         {
             return Ok(false);
         }

@@ -24,7 +24,11 @@ pub(crate) struct ReplacementCheck {
 impl ReplacementCheck {
     pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
         if self.run_id.is_nil() || self.previous.validate().is_err() {
-            return Err(conflict("invalid run or lost worker identity"));
+            return Err(ProtocolError::new(
+                ErrorCode::ValidationError,
+                "invalid run or lost worker identity",
+                Outcome::NotApplied,
+            ));
         }
         Ok(())
     }
@@ -110,15 +114,18 @@ impl WorkerRuntime {
             .into_iter()
             .map(|(record, old)| ReplacementGroup::new(record, old, &intent))
             .collect::<Result<Vec<_>, _>>()?;
-        let record = control
-            .prepare_system_replacement(
+        let record = tokio::time::timeout(
+            CHECK_TIMEOUT,
+            control.prepare_system_replacement(
                 &self.services.manager,
                 &self.services.operator,
                 intent,
                 &checked.state,
                 groups,
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| unknown())??;
         Ok(response::encode_success(request_id, &record, true))
     }
 
@@ -275,6 +282,9 @@ impl WorkerRuntime {
         previous: WorkerIdentity,
         state: &State,
     ) -> Result<(), ProtocolError> {
+        if previous == self.services.local {
+            return Err(reachable());
+        }
         let peer = QueuePeerClient::new(
             self.services.manager.client(),
             self.services.shared.clone(),

@@ -82,12 +82,11 @@ identity or an empty directory from discarding its vote and log history.
 
 ## Lost mount and storage damage
 
-A permanently lost primary volume on a registered system voter has no
-supported same-run replacement procedure. Keep the surviving quorum
-running. Keep the lost worker's bootstrap file and certificate out of use.
-A blank mount cannot satisfy the retained restart proof. Reusing the old
-bootstrap identity on a newly provisioned mount would discard that voter's
-vote and log history.
+Keep the surviving quorum running after permanent loss of a registered
+system voter's primary volume. Keep the lost worker's bootstrap file and
+certificate out of use. Start a retained restart only with the original
+intact mount. Reusing the old bootstrap identity on a blank mount would
+discard that voter's vote and log history.
 
 Read `cluster.connection` on a surviving worker to check the run and ready
 worker count. Use `storage.replica.placement` to see the recorded placement.
@@ -96,6 +95,41 @@ cannot establish how many voters are available. Keep the survivors running
 while reconciling receipts in the original run. If a second failure prevents
 quorum, wait for a retained voter to return. A full backup restore creates
 a new run and recovers data through the archived cut.
+
+### Check and record a system replacement intent
+
+The registered RF3 admin endpoint can check quorum and record a replacement
+intent for a fresh Docker-profile mount. Same-run recovery still requires
+learner startup, promotion, and revocation of the lost identity. Keep using
+the surviving quorum or a full backup restore for service recovery.
+
+1. Before losing a voter, upgrade every Control voter and send
+   `worker.system_replacement.enable` with an empty payload to the Control
+   leader. Control writes the activation only after every current voter
+   advertises `control.system-replacement.v1` over its authenticated peer
+   connection. Keep binaries that decode this capability after activation.
+2. After permanent loss, wait for Control to remove the exact lost
+   incarnation from the ready set. Then send
+   `worker.system_replacement.check` to a surviving worker with the current
+   `run_id` and the lost `previous` identity. Use the same fields as the
+   retained restart request. The check refuses a worker that still answers
+   an authenticated probe or recently acknowledged a Raft heartbeat. It
+   requires the current leader and a fresh acknowledgment from the other
+   surviving voter in every affected group, including Data. A successful
+   result describes an observation of up to 64 affected groups.
+3. To record the intent, send `worker.system_replacement.prepare` to the
+   current Control leader. Include the same `run_id` and `previous`, plus
+   `id` equal to the request UUID, `next` with the fresh worker enrollment,
+   and `mount` with the exact Docker-profile mount expectation. Use a fresh
+   worker ID, incarnation, certificate, and pool ID. Set the enrollment
+   revision and mount generation to 1. The leader rechecks quorum before
+   recording the exact old voters and planned learner for each group.
+   Retry the same UUID and body to read the original committed result. A
+   different intent for the same lost worker returns a conflict.
+
+Send these operations to `POST /v1/cluster/operations` with the admin
+token. A successful preparation leaves the original voters recorded in
+Control. Continue to keep the old process fenced outside the cluster.
 
 For a quarantined Data replica or refused secondary pool, check
 `quarantined_groups` under `storage` and `refused_pools` in

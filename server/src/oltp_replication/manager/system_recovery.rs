@@ -17,6 +17,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const HEADER: usize = 4096;
+// Fixed reply fields fit in this decode allowance, including the JSON codec's
+// base allocation and structural token charges.
+const REPLY_DECODE_BYTES: usize = 16 << 10;
 const QUORUM_TIMEOUT: Duration = Duration::from_secs(3);
 const LOST_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 
@@ -209,7 +212,7 @@ impl HostedGroupManager {
                 Purpose::SystemRecovery,
                 header,
                 [None, None, None],
-                HEADER,
+                REPLY_DECODE_BYTES,
             )
             .await
             .map_err(|_| unsupported())?;
@@ -260,7 +263,7 @@ impl HostedGroupManager {
                 Purpose::SystemRecovery,
                 header,
                 [None, None, None],
-                HEADER,
+                REPLY_DECODE_BYTES,
             )
             .await?;
         if reply.remote_identity() != target

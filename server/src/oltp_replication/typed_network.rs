@@ -205,6 +205,10 @@ impl<C: TypedConfig> TypedNetwork<C> {
             return Err(invalid("target node disagrees with membership"));
         }
         let group = self.factory.resident.identity();
+        #[cfg(test)]
+        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id) {
+            return Err(unavailable());
+        }
         let (purpose, traffic) = header.route(&group.kind);
         let shared = self.factory.shared.clone();
         let byte_class = traffic.byte_class();

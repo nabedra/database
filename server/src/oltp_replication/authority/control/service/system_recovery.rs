@@ -123,7 +123,9 @@ impl ControlHandle {
         groups: Vec<ReplacementGroup>,
     ) -> Result<ReplacementRecord, ProtocolError> {
         let running = manager.local_control(self.identity())?;
-        let operation_id = intent.id;
+        // The intent owns its durable operator ID. A separate log operation
+        // ID lets concurrent identical callers reach the same intent record.
+        let operation_id = Uuid::new_v4();
         let authorization = self.local_operator(
             permit,
             operation_id,
@@ -158,6 +160,17 @@ impl ControlHandle {
             .await?;
         match reply {
             ControlReply::SystemReplacementPrepared(record) => Ok(*record),
+            ControlReply::Rejected(Fault::Conflict) => Err(ProtocolError::new(
+                ErrorCode::Conflict,
+                "another replacement intent owns this identity",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(Fault::Invalid) => Err(ProtocolError::new(
+                ErrorCode::ValidationError,
+                "replacement worker, certificate, mount or topology is invalid",
+                Outcome::NotApplied,
+            )),
+            ControlReply::Rejected(Fault::Unauthorized) => Err(unauthorized()),
             _ => Err(stale()),
         }
     }

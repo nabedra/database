@@ -13,6 +13,12 @@ struct Barrier {
 }
 static BARRIER: OnceLock<Option<Barrier>> = OnceLock::new();
 
+pub(crate) fn block_raft_for_test(group: Uuid) -> bool {
+    std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|directory| {
+        PathBuf::from(directory).join(format!("hold-raft-{group}")).exists()
+    })
+}
+
 pub(super) async fn build_archive_split_index(
     runtime: std::sync::Arc<super::worker_runtime::WorkerRuntime>,
     directory: PathBuf,
