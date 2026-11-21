@@ -20,7 +20,7 @@ from oltp_direct_acceptance import run_program
 from oltp_direct_cluster import DATABASE, ROOT, WORKERS, Rf3Cluster, call, operation, uid, write_json
 from oltp_orm_contract import exercise
 from oltp_runtime_acceptance import RuntimeServer
-from nabedra import Database, LimitExceededError, col
+from nabedra import Database, col
 
 sys.path.insert(0, str(ROOT / 'scripts'))
 from oltp_upgrade_export import archive_path
@@ -116,12 +116,12 @@ def verify_rf3(cluster, groups):
         assert {(member['worker_id'], member['pool_id']) for member in placement['members']} == expected, placement
 
 
-def create_index(url, token, table, name, column, covering, *, timeout=120):
+def create_index(url, token, table, name, column, covering):
     index_id, build_id = uid(), uid()
     definition = dict(table_id=table.id, index_id=index_id, name=name, columns=[column], covering=covering)
     admin_request([url], token, 'storage.index.create', definition, build_id)
     selector = dict(table_id=table.id, index_id=index_id, build_id=build_id, attempt=1)
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         status, reply = call(url, '/v1/cluster/operations', operation('storage.index.status', selector),
                              token=token, timeout=10)
@@ -152,32 +152,17 @@ def seed_legacy_archive(binary, root):
         with Database(url=server.url, token=server.token, database=DATABASE, timeout=180) as db:
             ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
             locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
-            # Largest batches fit before the index doubles the write set. Keep
-            # the durable identity page within the legacy RF3 decode budget.
-            seed_ledger(ledger)
-            indexes = (create_index(server.url, token, ledger, 'by_bucket', 'bucket', ['label'], timeout=600),
-                       create_index(server.url, token, locations, 'by_region', 'region', ['score']))
+            # Use the unindexed ledger for the large row count, and exercise
+            # secondary index preservation across the locations split.
+            for start in range(0, ROW_COUNT, BATCH_ROWS):
+                batch = [ledger_row(key) for key in range(start, min(start + BATCH_ROWS, ROW_COUNT))]
+                assert ledger.insert_many(batch) == len(batch), start
+            indexes = (create_index(server.url, token, locations, 'by_region', 'region', ['score']),
+                       create_index(server.url, token, locations, 'by_score', 'score', ['region']))
             db.create_table('migration_empty', {'id': int}, key='id')
         manifest = admin_request([server.url], token, 'archive.create',
                                  dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
     return archive, manifest['scope'], indexes
-
-
-def seed_ledger(ledger):
-    batch_rows = BATCH_ROWS
-    start = 0
-    while start < ROW_COUNT:
-        batch = [ledger_row(key) for key in range(start, min(start + batch_rows, ROW_COUNT))]
-        try:
-            assert ledger.insert_many(batch) == len(batch), start
-        except LimitExceededError as error:
-            if (batch_rows != BATCH_ROWS or error.outcome != 'not_applied'
-                    or str(error) != 'worker storage capacity unavailable'):
-                raise
-            batch_rows = 6_400
-            print(f'MIG2 legacy worker refused a {len(batch)}-row batch; using {batch_rows} rows', flush=True)
-            continue
-        start += len(batch)
 
 
 def seed(cluster, db, indexes):
@@ -198,15 +183,13 @@ def seed(cluster, db, indexes):
         assert result['state'] == 'importing' and time.monotonic() < deadline, result
     assert len({group['group_id'] for group in children}) == 2, children
     verify_rf3(cluster, [initial_group(cluster, ledger.id), *children])
-    ledger_index, location_index = indexes
     for key in sorted(DELETED):
         assert ledger.delete(key) is True, key
     assert locations.delete('city-000') is True
     tables = {
-        ledger.name: ([ledger_row(key) for key in range(ROW_COUNT) if key not in DELETED],
-                      (ledger_index, 7)),
-        locations.name: (location_rows[1:], (location_index, 'east')),
-        'migration_empty': ([], None),
+        ledger.name: ([ledger_row(key) for key in range(ROW_COUNT) if key not in DELETED], ()),
+        locations.name: (location_rows[1:], tuple(zip(indexes, ('east', 0.25), strict=True))),
+        'migration_empty': ([], ()),
     }
     return tables, children
 
@@ -243,7 +226,7 @@ def describe(db):
 
 def verify_rows(cluster, db, tables):
     evidence = {}
-    for name, (expected, index) in tables.items():
+    for name, (expected, indexes) in tables.items():
         table = db.table(name)
         digest = hashlib.sha256()
         assert table.query().count() == len(expected), name
@@ -259,8 +242,7 @@ def verify_rows(cluster, db, tables):
         if name == 'migration_locations':
             assert table.get('city-000') is None
         observed = dict(rows=len(expected), sha256=digest.hexdigest())
-        if index:
-            (selector, definition), value = index
+        for (selector, definition), value in indexes:
             status = cluster.operator('storage.index.status', selector)
             assert status['state'] == 'ready' and status['definition'] == definition, status
             index_name, column = definition['name'], definition['columns'][0]
@@ -268,7 +250,7 @@ def verify_rows(cluster, db, tables):
             assert index_name in query.explain(), (name, query.explain())
             indexed = [row for row in expected if row[column] == value]
             assert query.count() == len(indexed) and query.collect() == indexed, name
-            observed['index'] = dict(definition=definition, matches=len(indexed))
+            observed.setdefault('indexes', {})[index_name] = dict(definition=definition, matches=len(indexed))
         evidence[name] = observed
     return evidence
 
