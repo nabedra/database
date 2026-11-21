@@ -345,7 +345,7 @@ class Rf3Cluster:
                                   worker_id=enrollment['worker_id'], pool_id=pool_id),
                     mount_path=str(directory), provider_volume_id='docker-volume:' + volume, filesystem_uuid='')
 
-    def launch_worker(self, name):
+    def launch_worker(self, name, *, prefix=()):
         config = self.config[name]
         path = self.root / f'{name}.json'
         write_json(path, config)
@@ -360,7 +360,7 @@ class Rf3Cluster:
             command = [self.test_executable, '--exact', self.test_child, '--ignored', '--nocapture']
         else:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
-        self.workers[name] = Process(name, command, env, self.root / f'{name}.log')
+        self.workers[name] = Process(name, [*prefix, *command], env, self.root / f'{name}.log')
 
     def check_lost_port(self, name):
         """A worker that exited during startup because another process took one of its

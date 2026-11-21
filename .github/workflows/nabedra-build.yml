@@ -2,7 +2,7 @@
 # See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
 # pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
 # Opt-in checks: put [ci docker], [ci campaign], [ci acceptance], [ci direct], [ci rep1]
-# [ci migrate], [ci live3], [ci live3-fixture], or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
+# [ci migrate], [ci live3], [ci live3-fixture], [ci az1], or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
 # [ci rep1] to build the pre-execution worker and test mixed-version enrollment.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
@@ -253,6 +253,31 @@ jobs:
           cd live3-test
           sha256sum oltp-test > SHA256SUMS
           printf 'source=%s\n' "$GITHUB_SHA" > build.txt
+      - name: RF3 packet-drop failover (O06/O18)
+        id: az1
+        if: contains(github.event.head_commit.message, '[ci az1]')
+        env:
+          PYTHONPATH: orm/python/src
+          PYTHONDONTWRITEBYTECODE: "1"
+          NABEDRA_OLTP_RPC_TRACE: "1"
+        run: |
+          test_executable="$(cargo test --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable' | tail -1)"
+          test -x "$test_executable"
+          mkdir -p "$RUNNER_TEMP/az1-cluster"
+          status=0
+          python3 -u server/tests/oltp_blackhole.py --binary server/target/debug/nabedra-db \
+            --test-executable "$test_executable" --output "$RUNNER_TEMP/az1-cluster" 2>&1 | tee az1.log || status=1
+          mkdir az1-evidence
+          cp az1.log az1-evidence/
+          find "$RUNNER_TEMP/az1-cluster" -maxdepth 1 -name '*.log' -exec cp -t az1-evidence {} +
+          exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && (steps.az1.outcome == 'success' || steps.az1.outcome == 'failure') }}
+        with:
+          name: az1-failover
+          path: az1-evidence
+          retention-days: 14
       - uses: actions/upload-artifact@v4
         if: contains(github.event.head_commit.message, '[ci live3-fixture]')
         with:
