@@ -1,0 +1,327 @@
+{
+ "run": "mix-scylla",
+ "settings": {
+  "rates": [
+   1,
+   2,
+   5,
+   20,
+   50,
+   100,
+   200,
+   500,
+   1000
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true,
+  "snapshot_between_phases": false
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-21T08:29:50.315995+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.19.0.2": "batch",
+   "172.19.0.3": "batch",
+   "172.19.0.4": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "mix-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 500,
+  "stop_reason": {
+   "median_p99_ms": 113.054386,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 7.778785,
+    "median_p95_ms": 9.560016,
+    "median_p99_ms": 9.560016,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.288058,
+      "median_p99_ms": 8.423192,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 10.700438,
+      "median_p99_ms": 10.700438,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "2": {
+    "reps": 3,
+    "offered": 30,
+    "median_succeeded_rps": 2.0,
+    "median_p50_ms": 7.447378,
+    "median_p95_ms": 9.691386,
+    "median_p99_ms": 9.691386,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 30,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.447378,
+      "median_p99_ms": 9.691386,
+      "succeeded": 29,
+      "offered": 29
+     },
+     "update": {
+      "median_p50_ms": 9.326185,
+      "median_p99_ms": 9.326185,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 7.811492,
+    "median_p95_ms": 9.684029,
+    "median_p99_ms": 9.930541,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.811492,
+      "median_p99_ms": 9.684029,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 8.080109499999999,
+      "median_p99_ms": 8.080109499999999,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 7.789971,
+    "median_p95_ms": 10.203918,
+    "median_p99_ms": 10.838997,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.700694,
+      "median_p99_ms": 16.365448,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 9.087508,
+      "median_p99_ms": 10.648224,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 50.0,
+    "median_p50_ms": 7.342337,
+    "median_p95_ms": 11.078174,
+    "median_p99_ms": 17.35064,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.198614,
+      "median_p99_ms": 15.220143,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 9.394773,
+      "median_p99_ms": 16.272688,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.95282714328634,
+    "median_p50_ms": 6.673596,
+    "median_p95_ms": 12.744462,
+    "median_p99_ms": 20.900797,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 6.548347,
+      "median_p99_ms": 21.620322,
+      "succeeded": 1414,
+      "offered": 1414
+     },
+     "update": {
+      "median_p50_ms": 8.474684,
+      "median_p99_ms": 12.527771,
+      "succeeded": 86,
+      "offered": 86
+     }
+    }
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 5.71348,
+    "median_p95_ms": 14.64252,
+    "median_p99_ms": 24.2927,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.604848,
+      "median_p99_ms": 24.424782,
+      "succeeded": 2842,
+      "offered": 2842
+     },
+     "update": {
+      "median_p50_ms": 6.580244,
+      "median_p99_ms": 26.932076,
+      "succeeded": 158,
+      "offered": 158
+     }
+    }
+   },
+   "500": {
+    "reps": 3,
+    "offered": 7500,
+    "median_succeeded_rps": 465.41097145569165,
+    "median_p50_ms": 31.996357,
+    "median_p95_ms": 88.610979,
+    "median_p99_ms": 113.054386,
+    "statuses": {
+     "client_capacity": 488,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 7012,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 32.164668,
+      "median_p99_ms": 112.930644,
+      "succeeded": 6649,
+      "offered": 7113
+     },
+     "update": {
+      "median_p50_ms": 28.115603,
+      "median_p99_ms": 98.57947,
+      "succeeded": 363,
+      "offered": 387
+     }
+    }
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 32,
+  "start_unix_ns": 1795249940919615061,
+  "end_unix_ns": 1795249941365681318,
+  "seconds": 0.446066257,
+  "driver_cpu_seconds": 0.28217180100000405,
+  "final_snapshot": {
+   "rows": 5000,
+   "sha256": "170ec0458a3dde6c41c649798438b88fed83543ab1b9da01f918f5e5a2247819",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}
