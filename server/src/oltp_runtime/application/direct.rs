@@ -565,8 +565,9 @@ impl DirectGateway {
                 .settle(&anchor, &mut request, deadline, &mut uncertain)
                 .await;
         }
+        let batch = (scanned.op == Op::InsertMany).then_some((&scanned, &table));
         match self
-            .call(&first, &mut request, deadline, false, &mut uncertain)
+            .call(&first, &mut request, deadline, false, &mut uncertain, batch)
             .await
         {
             Ok(Terminal::Done(data)) => {
@@ -638,7 +639,10 @@ impl DirectGateway {
         GatewayStats::bump(&self.stats.forwards);
         let mut delay = Duration::ZERO;
         loop {
-            match self.call(anchor, request, deadline, true, uncertain).await {
+            match self
+                .call(anchor, request, deadline, true, uncertain, None)
+                .await
+            {
                 Ok(Terminal::Done(data)) => {
                     GatewayStats::bump(&self.stats.forward_replayed);
                     return Ok(Routed::Done(response::encode_success(
@@ -694,11 +698,11 @@ impl DirectGateway {
         deadline: Instant,
         forward: bool,
         uncertain: &mut bool,
+        batch: Option<(&Scanned<'_>, &Arc<TableRoute>)>,
     ) -> Result<Terminal, ProtocolError> {
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
         let mut refreshed_unknown_table = false;
-        let mut refreshed_unavailable_route = false;
         loop {
             if Instant::now() >= deadline {
                 return Err(deadline_error(*uncertain));
@@ -719,6 +723,14 @@ impl DirectGateway {
                     continue;
                 }
             };
+            // Route eligibility was checked against the original cached table.
+            // A split can change it before a retry reaches the new range leader.
+            if let Some((scanned, original)) = batch
+                && !Arc::ptr_eq(&table, original)
+                && route_keys(scanned, &table).is_some_and(|keys| !keys.one_range)
+            {
+                return Ok(Terminal::Fallback(FallbackReason::Ineligible));
+            }
             let Some(range) = table.range_for(key).cloned() else {
                 // The cached spans do not cover the key: read them again.
                 self.refresh(&table, deadline).await;
@@ -730,23 +742,12 @@ impl DirectGateway {
             let voters = match self.voters(&range, false).await {
                 Ok(voters) if !voters.is_empty() => voters,
                 _ => {
-                    if !refreshed_unavailable_route {
-                        refreshed_unavailable_route = true;
-                        self.refresh(&table, deadline).await;
-                    }
                     if !pause(deadline, &mut delay).await {
                         return Err(deadline_error(*uncertain));
                     }
                     continue;
                 }
             };
-            // A retired source may be unreachable or have no registered replicas.
-            // After trying its voters, consult Catalog even if no peer can redirect us.
-            if rotation >= voters.len() && !refreshed_unavailable_route {
-                refreshed_unavailable_route = true;
-                self.refresh(&table, deadline).await;
-                continue;
-            }
             let voter = range
                 .leader_hint()
                 .and_then(|node| voters.iter().find(|voter| voter.node_id == node))

@@ -1160,6 +1160,34 @@ async fn d04_d05_gateway_retries_on_the_new_leader_and_answers_at_the_deadline()
     cluster.shutdown().await;
 }
 
+// D07/O07: the old cached route made a batch look eligible. After a stale-route
+// reply, the gateway must settle at the anchor and queue the entire batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d07_o07_route_refresh_reclassifies_cross_range_batch() {
+    let mut cluster = Cluster::new().await;
+    let left = cluster.add_group(span(None, Some(500)), 2, &[1]).await;
+    let right = cluster.add_group(span(Some(500), None), 2, &[1]).await;
+    let mut before = cluster.fill(&[left]);
+    before.shards[0].span = span(None, None);
+    before.shards[0].routing_epoch = 1;
+    let after = cluster.fill(&[left, right]);
+    let source = Source::new(vec![before, after], cluster.voters());
+    let gateway = cluster.gateway(direct_on(), source.clone(), cluster.transport());
+    let request_id = Uuid::new_v4();
+    let body = cluster.body(
+        request_id,
+        "table.insert_many",
+        json!({"rows": [{"id": 600, "value": 60}, {"id": 100, "value": 10}]}),
+    );
+
+    assert_eq!(answer(&gateway, &body, request_id).await, Answer::Queued);
+    assert!(cluster.settled(left, 100, request_id).await);
+    assert_eq!(cluster.latest(left, 0, 100).await, (None, None));
+    assert_eq!(cluster.latest(right, 0, 600).await, (None, None));
+    assert_eq!(source.reads().0, 2);
+    cluster.shutdown().await;
+}
+
 /// D07/O16: a split is published and a range leader moves while writers
 /// run. Each request ends with one outcome (direct success or queued after
 /// its forward marker), no row is lost or doubled, and the stale route is
