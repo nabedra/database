@@ -101,6 +101,20 @@ pub(super) fn observe_data_voters(manager: &crate::oltp_replication::manager::Ho
     .unwrap();
 }
 
+pub(super) fn observe_control_leader(
+    manager: &crate::oltp_replication::manager::HostedGroupManager,
+    group: Uuid,
+) {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return;
+    };
+    if directory.join("inspect-control-leader").exists() {
+        let leading = manager.local_leads(group);
+        std::fs::write(directory.join("control-leader.json"), leading.to_string()).unwrap();
+    }
+}
+
 pub(super) fn observe_application_status_lookup(run: Uuid, id: Uuid) {
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") {
         use std::io::Write;

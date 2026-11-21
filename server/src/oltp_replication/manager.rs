@@ -170,6 +170,17 @@ impl HostedGroupManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn local_leads(&self, group: uuid::Uuid) -> bool {
+        self.routes.lock().is_ok_and(|routes| {
+            routes.get(&group).is_some_and(|route| {
+                route.replicas.values().any(|replica| {
+                    replica.running.leader() == Some(replica.member.node_id)
+                })
+            })
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn data_voter_state(
         &self,
         group: &GroupIdentity,

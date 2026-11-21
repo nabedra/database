@@ -11,9 +11,9 @@ use crate::{
         },
     },
 };
+use openraft::{Instant as _, type_config::TypeConfigExt as _};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tokio::time::Instant;
 use uuid::Uuid;
 
 const HEADER: usize = 4096;
@@ -101,7 +101,7 @@ where
             .ok_or_else(invalid)?
             .node_id;
         let follower = request.follower()?;
-        let start = Instant::now();
+        let start = C::now();
         let (generation, mut metrics) = self.raft.current_metrics();
         let matches_leader = |state: &openraft::RaftMetrics<C>| {
             state.running_state.is_ok()
@@ -109,7 +109,7 @@ where
                 && request.matches(state.membership_config.membership())
                 && state.membership_config == state.committed_membership_config
         };
-        tokio::time::timeout_at(start + QUORUM_TIMEOUT, async {
+        tokio::time::timeout(QUORUM_TIMEOUT, async {
             let term = {
                 let state = metrics.borrow_watched();
                 if !matches_leader(&state) {

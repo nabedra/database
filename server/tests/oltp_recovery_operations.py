@@ -183,7 +183,18 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
     try:
         cluster.start()
         connection = cluster.admin('cluster.connection', {})
-        victim = WORKERS[0]
+        for name in WORKERS:
+            (cluster.barrier_dir(name) / 'inspect-control-leader').touch()
+
+        def control_leader():
+            leaders = []
+            for name in WORKERS:
+                cluster.stats(name)
+                if json.loads((cluster.barrier_dir(name) / 'control-leader.json').read_text()):
+                    leaders.append(name)
+            return leaders[0] if len(leaders) == 1 else None
+
+        victim = wait_for(control_leader, 'stable Control leader', PROBE_WINDOW)
         survivors = [name for name in WORKERS if name != victim]
         enrollment = cluster.enrollments[victim]
         previous = {field: enrollment[field] for field in IDENTITY_FIELDS}
@@ -233,7 +244,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         assert set(result['groups']) == expected, result
         assert send_op(acknowledged) == original
         assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
-        report('O06/O17 system replacement preflight', lost_worker=victim,
+        report('O06/O17 system replacement preflight', lost_control_leader=victim,
                groups=len(expected), refused_live_worker=True, refused_without_quorum=True)
     finally:
         cluster.close()
