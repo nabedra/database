@@ -396,6 +396,8 @@ impl LocalServices {
                 let TimestampReply::Fenced { receipt, .. } = timestamp.reply else {
                     return Err(unavailable());
                 };
+                #[cfg(test)]
+                let observed_fence = receipt.clone();
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
@@ -404,6 +406,8 @@ impl LocalServices {
                             .reply,
                     )?;
                 }
+                #[cfg(test)]
+                super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 let status_receipt = status_raft
                     .propose(OwnedCommand::new_owned(
                         StatusCommand::Fence {
@@ -418,6 +422,8 @@ impl LocalServices {
                 let StatusReply::Fenced(receipt) = status_receipt.reply else {
                     return Err(unavailable());
                 };
+                #[cfg(test)]
+                let observed_fence = receipt.clone();
                 if control.group(receipt.group.group_id).await?.is_some() {
                     accepted(
                         control
@@ -426,6 +432,8 @@ impl LocalServices {
                             .reply,
                     )?;
                 }
+                #[cfg(test)]
+                super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                 let receipt = catalog_participant
                     .fence_current(fence.transition_id, old, next)
                     .await?;
@@ -454,12 +462,16 @@ impl LocalServices {
                         let receipt = participant
                             .fence_current(fence.transition_id, old, next)
                             .await?;
+                        #[cfg(test)]
+                        let observed_fence = receipt.clone();
                         accepted(
                             control
                                 .record_group_fence(Uuid::new_v4(), receipt)
                                 .await?
                                 .reply,
                         )?;
+                        #[cfg(test)]
+                        super::recovery_tests::cold_fence_checkpoint(&observed_fence).await;
                     }
                     if page.done {
                         break;

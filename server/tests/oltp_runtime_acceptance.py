@@ -5,8 +5,11 @@ These use the installed server path and actual Control/TSO/Status services.
 Deterministic pending/Prepare/ambiguous kill barriers are separate required O15
 variations; a completed COMMIT replay alone does not certify O15.
 """
-from contextlib import AbstractContextManager, contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, closing, contextmanager
 import argparse
+import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -26,7 +29,74 @@ from acceptance_nodes import announcement
 from acceptance_nabedra import child_pids, reaped
 from nabedra import Database
 from nabedra._cli_config import protected_write
+from oltp_direct_cluster import Http, Rf3Cluster, WORKERS, call, operation, write_json
 from oltp_process import Server, raw, terminal
+
+
+DIRECT = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
+TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
+
+
+def assertion(scenario, clause, detail, status='passed'):
+    print('NABEDRA_OLTP_ASSERT ' + json.dumps(
+        dict(scenario=scenario, assertion=clause, status=status, detail=detail)), flush=True)
+
+
+def incomplete(scenario, reason):
+    print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(
+        dict(scenario=scenario, status='not-run', reason=reason)), flush=True)
+
+
+def wait_until(observe, description, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = observe()
+        if result:
+            return result
+        time.sleep(.05)
+    raise TimeoutError(description)
+
+
+def receipt_path(run, request):
+    return f"/v1/requests/{run}/{request['request_id']}"
+
+
+def assert_accepted(reply, run, request):
+    assert reply == (202, dict(request_id=request['request_id'], run_id=run, state='queued')), reply
+
+
+def assert_unknown(reply, request):
+    status, body = reply
+    assert status == 503 and body['request_id'] == request['request_id'], reply
+    assert body['error']['outcome'] == 'unknown', reply
+
+
+def assert_abandoned(reply, request):
+    status, body = reply
+    assert status == 404 and body['request_id'] == request['request_id'], reply
+    assert body['error']['outcome'] == 'unknown' and 'abandon' in body['error']['message'], reply
+
+
+def exact_receipt(exchange, run, request, result, timeout=60):
+    expected = dict(request_id=request['request_id'], run_id=run,
+                    state='succeeded', result=result, error=None)
+
+    def observe():
+        try:
+            status, body = exchange(receipt_path(run, request))
+        except TRANSPORT_ERRORS:
+            return None
+        if status == 200:
+            if body['state'] in ('succeeded', 'failed'):
+                assert body == expected, body
+                return body
+            assert body['state'] in ('queued', 'running', 'committing', 'reconciling'), body
+            assert body == dict(expected, state=body['state'], result=None), body
+        else:
+            assert_unknown((status, body), request)
+        return None
+
+    return wait_until(observe, f"terminal receipt {request['request_id']}", timeout)
 
 
 class RuntimeServer(AbstractContextManager):
@@ -47,11 +117,12 @@ class RuntimeServer(AbstractContextManager):
         self.execution = dict(max_workers_per_request=1, max_pending_requests=4,
             max_queue_bytes_per_replica=32768 if short_retention else 64 << 20,
             max_retained_result_bytes_per_worker=1 << 20, result_retention_ms=100 if short_retention else 60000,
-            queue_replication='all_ready_workers', queue_lifetime='live_cluster', partition_size='64 MiB')
+            queue_replication='all_ready_workers', queue_lifetime='live_cluster', partition_size='64 MiB',
+            direct_oltp=DIRECT)
         self.worker_count = 1
         self.log = (self.root / 'server.log').open('a+b')
 
-    def start(self, *, cold_start=False):
+    def start(self, *, cold_start=False, wait_ready=True):
         assert self.process is None
         env = {key: value for key, value in os.environ.items()
                if not key.startswith(('AWS_', 'NABEDRA_S3_'))}
@@ -69,7 +140,8 @@ class RuntimeServer(AbstractContextManager):
             execution_file = self.root / 'execution.json'
             execution_file.write_text(json.dumps(self.execution))
             env.update(NABEDRA_OLTP_TEST_DATA_DIR=str(self.directory), NABEDRA_OLTP_TEST_PORT=str(port),
-                       NABEDRA_OLTP_TEST_EXECUTION_FILE=str(execution_file))
+                       NABEDRA_OLTP_TEST_EXECUTION_FILE=str(execution_file),
+                       NABEDRA_OLTP_TEST_BARRIER_DIR=str(self.root))
             if cold_start:
                 env['NABEDRA_OLTP_TEST_COLD'] = '1'
             else:
@@ -81,10 +153,9 @@ class RuntimeServer(AbstractContextManager):
                 env.pop('NABEDRA_OLTP_TEST_DIRECT_HOLD', None)
             if getattr(self, 'barrier_stage', None):
                 env.update(NABEDRA_OLTP_TEST_STAGE=self.barrier_stage,
-                    NABEDRA_OLTP_TEST_REQUEST=self.barrier_request,
-                    NABEDRA_OLTP_TEST_BARRIER_DIR=str(self.root))
+                    NABEDRA_OLTP_TEST_REQUEST=self.barrier_request)
             else:
-                for name in ('NABEDRA_OLTP_TEST_STAGE', 'NABEDRA_OLTP_TEST_REQUEST', 'NABEDRA_OLTP_TEST_BARRIER_DIR'):
+                for name in ('NABEDRA_OLTP_TEST_STAGE', 'NABEDRA_OLTP_TEST_REQUEST'):
                     env.pop(name, None)
             command = [self.test_executable, '--exact', 'oltp_runtime::recovery_tests::actual_runtime_child',
                        '--ignored', '--nocapture']
@@ -108,6 +179,8 @@ class RuntimeServer(AbstractContextManager):
         if cold_start and not getattr(self, 'test_executable', None):
             command += ['--cold-start']
         self.process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=self.log)
+        if not wait_ready:
+            return self
         try:
             if self.cli:
                 message = announcement(self.process)
@@ -559,6 +632,365 @@ def tentative_copy_disconnect(test_executable):
             server.log.close()
 
 
+@contextmanager
+def native_cluster(binary, test_executable, label, *, mounts=False):
+    with tempfile.TemporaryDirectory(prefix=f'nabedra-{label}-') as directory:
+        cluster = Rf3Cluster(binary, directory, test_executable=test_executable,
+            direct=dict.fromkeys(WORKERS, DIRECT), api_direct=(DIRECT, DIRECT), mounts=mounts)
+        try:
+            yield cluster.start()
+        except BaseException:
+            for name in (*cluster.workers, *cluster.apis):
+                print(f'{name}\n{cluster.tail(name)}', file=sys.stderr)
+            raise
+        finally:
+            cluster.close()
+
+
+def gateway(cluster, name='api1', timeout=30):
+    return Http(cluster.api_urls[name], cluster.auth['data_token'], timeout, cluster.ca)
+
+
+def worker(cluster, name, path, timeout=5):
+    return call(cluster.urls[name], path, token=cluster.auth['data_token'], timeout=timeout)
+
+
+def gates(directory, requests):
+    write_json(directory / 'gates.json', {req['request_id']: stage for req, stage in requests})
+    write_json(directory / 'inspect.json', [req['request_id'] for req, _ in requests])
+
+
+def wait_reached(directories, request, stage):
+    def observe():
+        for directory in directories:
+            marker = directory / f"reached-{request['request_id']}"
+            if marker.exists() and marker.read_text() == stage:
+                return directory
+        return None
+
+    return wait_until(observe, f"{request['request_id']} did not reach {stage}")
+
+
+def release(directory, request):
+    (directory / f"release-{request['request_id']}").touch()
+
+
+def read_record(cluster, name, request):
+    path = cluster.barrier_dir(name) / f"record-{request['request_id']}.json"
+    path.unlink(missing_ok=True)
+    cluster.stats(name)
+    return json.loads(path.read_text())
+
+
+def assert_record(record, run, request):
+    body = json.dumps(request, separators=(',', ':'))
+    assert record['request_id'] == request['request_id'] and record['run_id'] == run, record
+    assert record['body'] == body and record['body_hash'] == hashlib.sha256(body.encode()).hexdigest(), record
+    assert record['accepted'] is True, record
+    context = record['context']
+    assert context['read']['storage_pin']['read_ts'] > 0, context
+    assert context['read']['schema_epoch'] > 0 and context['read']['catalog_root'], context
+    assert context['authorization']['database'] == 'test', context
+    assert context['authorization']['policy_revision'] > 0, context
+    return tuple(record[field] for field in
+                 ('request_id', 'run_id', 'body', 'body_hash', 'digest', 'context', 'context_hash'))
+
+
+def same_run_ready(cluster, run, names, count):
+    def observe():
+        replies = []
+        for name in names:
+            try:
+                status, ready = worker(cluster, name, '/health/ready')
+            except TRANSPORT_ERRORS:
+                return None
+            if status != 200:
+                return None
+            assert ready['run_id'] == run, ready
+            replies.append(ready['ready_workers'])
+        return replies == [count] * len(names)
+
+    wait_until(observe, f'workers {names} did not regain same-run ready count {count}', timeout=110)
+
+
+def launch_retained(cluster, name):
+    cluster.workers[name].stop()
+    cluster.launch_worker(name)
+
+
+def queue_survival(binary, test_executable):
+    with native_cluster(binary, test_executable, 'o14') as cluster:
+        run = cluster.run_id
+        directories = [cluster.barrier_dir(name) for name in WORKERS]
+        db = Database(cluster.api_urls['api1'], cluster.auth['data_token'], database='test',
+                      ca_file=str(cluster.ca), timeout=30)
+        table = db.create_table('same_run', {'id': str, 'value': int}, key='id')
+        original_row = dict(id='seed', value=1)
+        table.insert(original_row)
+        read = operation('table.get', dict(table_id=table.id, key='seed'))
+        mutation = operation('table.insert', dict(table_id=table.id, row=dict(id='once', value=3)))
+        for directory in directories:
+            gates(directory, [(read, 'queued'), (mutation, 'committed')])
+
+        with closing(gateway(cluster)) as first, closing(gateway(cluster, 'api2')) as second:
+            assert_accepted(first.exchange('/v1/requests', read), run, read)
+            owner_dir = wait_reached(directories, read, 'queued')
+            owner = owner_dir.name
+            assert table.update('seed', {'value': 2}) is True
+            assert_accepted(first.exchange('/v1/requests', mutation), run, mutation)
+            assert wait_reached(directories, mutation, 'committed') == owner_dir
+            originals = {request['request_id']: assert_record(read_record(cluster, owner, request), run, request)
+                         for request in (read, mutation)}
+            for name in WORKERS:
+                for request in (read, mutation):
+                    record = read_record(cluster, name, request)
+                    assert assert_record(record, run, request) == originals[request['request_id']], record
+                    expected = 'queued' if request is read else 'running'
+                    assert record['state'] == expected, record
+
+            assert second.exchange(receipt_path(run, read))[1]['state'] == 'queued'
+            cluster.kill_api('api1')
+            assert second.exchange(receipt_path(run, read)) == (200, dict(
+                request_id=read['request_id'], run_id=run, state='queued', result=None, error=None))
+        cluster.kill_api('api2')
+        assertion('O14', 'api-loss', 'Both enrolled gateways stopped after 202. The second gateway observed the first gateway’s original queued receipt.')
+
+        removed, survivor = [name for name in WORKERS if name != owner]
+        cluster.workers[removed].kill()
+        same_run_ready(cluster, run, (owner, survivor), 2)
+        cluster.workers[owner].kill()
+        for request in (read, mutation):
+            record = read_record(cluster, survivor, request)
+            assert assert_record(record, run, request) == originals[request['request_id']], record
+            assert record['state'] in ('queued', 'running'), record
+            assert_unknown(worker(cluster, survivor, receipt_path(run, request), timeout=25), request)
+        assertion('O14', 'quorum-loss', 'The lone RF3 voter could not settle a receipt and retained both complete records on the original run.')
+
+        # Restore the first lost worker without the original owner. Recovery
+        # must copy from the one process that still has the accepted body.
+        launch_retained(cluster, removed)
+        same_run_ready(cluster, run, (survivor, removed), 2)
+        for name in (survivor, removed):
+            for request in (read, mutation):
+                record = read_record(cluster, name, request)
+                assert assert_record(record, run, request) == originals[request['request_id']], record
+        assertion('O14', 'original-context', 'Recovered copies matched the exact body, digest, pinned read timestamp, catalog and schema epochs, and accepted authorization.')
+        assertion('O14', 'join-with-outstanding-work', 'The restored worker had the complete pending records after it became ready.')
+
+        for directory in directories:
+            for request in (read, mutation):
+                release(directory, request)
+        cluster.apis['api2'].stop()
+        cluster.start_api('api2', DIRECT)
+        with closing(gateway(cluster, 'api2')) as restored:
+            exact_receipt(restored.exchange, run, read, original_row)
+            exact_receipt(restored.exchange, run, mutation, None)
+        recovered = Database(cluster.api_urls['api2'], cluster.auth['data_token'], database='test',
+                             ca_file=str(cluster.ca), timeout=30).table('same_run')
+        assert recovered.get('seed') == dict(id='seed', value=2)
+        assert recovered.get('once') == dict(id='once', value=3)
+        assert recovered.query().count() == 2
+        assertion('O14', 'same-run-outcomes', 'The restored gateway returned the pinned old row and the original mutation result. The newest data held exactly two rows.')
+        launch_retained(cluster, owner)
+        same_run_ready(cluster, run, WORKERS, 3)
+
+
+FENCE_STAGES = ('allocator', 'status', 'shard')
+
+
+def fence_checkpoint(directory, stage, old_run):
+    path = directory / f'cold-fence-{stage}.json'
+    wait_until(path.exists, f'cold startup did not record its {stage} fence')
+    receipt = json.loads(path.read_text())
+    assert receipt['expected']['run_id'] == old_run, receipt
+    assert receipt['next']['run_id'] != old_run, receipt
+    assert receipt['applied_at']['index'] > 0 and receipt['applied_at']['term'] > 0, receipt
+    return receipt
+
+
+def assert_fence_transition(receipts, old_run, new_run):
+    assert new_run != old_run
+    assert len({receipt['transition_id'] for receipt in receipts}) == 1, receipts
+    for receipt in receipts:
+        assert receipt['expected']['run_id'] == old_run and receipt['next']['run_id'] == new_run, receipt
+
+
+def direct_writes(table_id):
+    if not DIRECT:
+        return {}
+    return {stage: operation('table.insert', dict(table_id=table_id, row=dict(id=stage, value=4)))
+            for stage in ('direct-proposing', 'direct-applied')}
+
+
+def stop_at_direct_writes(open_client, directories, writes, stop):
+    def submit(request):
+        try:
+            with closing(open_client()) as client:
+                return client.exchange('/v1/operations', request)
+        except TRANSPORT_ERRORS:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = {stage: pool.submit(submit, request) for stage, request in writes.items()}
+        try:
+            for stage, request in writes.items():
+                wait_reached(directories, request, stage)
+                assert not pending[stage].done(), stage
+        finally:
+            stop()
+        for stage, future in pending.items():
+            reply = future.result()
+            if reply is not None:
+                assert_unknown(reply, writes[stage])
+
+
+def assert_direct_recovery(exchange, table, old_run, writes, stats):
+    if not writes:
+        assert stats() == 0, 'rollback mode proposed a direct entry'
+        return
+    for stage, request in writes.items():
+        reply = exchange(receipt_path(old_run, request))
+        assert reply[0] == 404, reply
+        if stage == 'direct-proposing':
+            assert table.get(stage) is None
+        else:
+            assert table.get(stage) == request['payload']['row']
+            before = stats()
+            assert exchange('/v1/operations', request) == (200, dict(
+                request_id=request['request_id'], data=None))
+            assert stats() == before, 'the in-flight retry proposed a second direct entry'
+
+
+def interrupt_rf1_fences(server, old_run):
+    receipts = []
+    for stage in FENCE_STAGES:
+        hold = server.root / f'cold-fence-{stage}.hold'
+        hold.touch()
+        server.start(cold_start=True, wait_ready=False)
+        try:
+            receipts.append(fence_checkpoint(server.root, stage, old_run))
+        finally:
+            server.stop(abrupt=True)
+            hold.unlink()
+    server.start(cold_start=True)
+    assert_fence_transition(receipts, old_run, server.run_id)
+    return receipts
+
+
+def rf1_direct_recovery(test_executable):
+    with tempfile.TemporaryDirectory(prefix='nabedra-o15-direct-rf1-') as directory:
+        server = RuntimeServer(test_executable, directory)
+        server.test_executable = str(Path(test_executable).resolve())
+        with server:
+            assert wait_direct_active(server)['direct_oltp'] == DIRECT
+            db = Database(server.url, server.token, database='test', timeout=30)
+            table = db.create_table('cold_direct', {'id': str, 'value': int}, key='id')
+            writes = direct_writes(table.id)
+            if not writes:
+                table.insert(dict(id='rollback', value=4))
+            gates(server.root, [(request, stage) for stage, request in writes.items()])
+            old_run = server.run_id
+            stop_at_direct_writes(lambda: Http(server.url, server.token), [server.root], writes,
+                                  lambda: server.stop(abrupt=True))
+            (server.root / 'gates.json').unlink()
+            server.start(cold_start=True)
+            assert server.run_id != old_run
+            assert wait_direct_active(server)['direct_oltp'] == DIRECT
+            table = Database(server.url, server.token, database='test', timeout=30).table('cold_direct')
+            with closing(Http(server.url, server.token)) as client:
+                assert_direct_recovery(client.exchange, table, old_run, writes,
+                                       lambda: (server.stats().get('direct') or {}).get('entries_proposed', 0))
+            assert table.query().count() == 1
+            if not writes:
+                assert table.get('rollback') == dict(id='rollback', value=4)
+
+
+def rf3_cold_recovery(binary, test_executable):
+    if not Rf3Cluster.mounts_available():
+        return False
+    with native_cluster(binary, test_executable, 'o15-rf3', mounts=True) as cluster:
+        run = cluster.run_id
+        seed_dir = cluster.barrier_dir('w1')  # The fixture assigns Control node 1 to w1.
+        directories = [cluster.barrier_dir(name) for name in WORKERS]
+        assert all(status['direct_oltp'] == DIRECT for status in cluster.wait_direct_active().values())
+        db = Database(cluster.api_urls['api1'], cluster.auth['data_token'], database='test',
+                      ca_file=str(cluster.ca), timeout=30)
+        table = db.create_table('cold_rf3', {'id': str, 'value': int}, key='id')
+        queued = {stage: operation('table.insert', dict(table_id=table.id, row=dict(id=stage, value=index)))
+                  for index, stage in enumerate(('queued', 'prepared', 'committed'), start=1)}
+        writes = direct_writes(table.id)
+        for directory in directories:
+            gates(directory, [(request, stage) for stage, request in (queued | writes).items()])
+        with closing(gateway(cluster)) as client:
+            for stage, request in queued.items():
+                assert_accepted(client.exchange('/v1/requests', request), run, request)
+                wait_reached(directories, request, stage)
+        committed = queued['committed']
+        recorded = [directory / f"decision-{committed['request_id']}.json" for directory in directories]
+        decision_path, = [path for path in recorded if path.exists()]
+        decision = json.loads(decision_path.read_text())
+        assert 'commit' in decision['decision'], decision
+
+        stop_at_direct_writes(lambda: gateway(cluster), directories, writes, cluster.kill_all)
+        for directory in directories:
+            # A retained old request would leave a second attempt record.
+            # Leave queued gates intact and remove only the direct retry gates.
+            gates(directory, [(request, stage) for stage, request in queued.items()])
+        for stage in FENCE_STAGES:
+            (seed_dir / f'cold-fence-{stage}.hold').touch()
+        receipts = []
+
+        def interrupt(profile):
+            remaining = set(FENCE_STAGES)
+            while remaining:
+                stage = wait_until(
+                    lambda: next((name for name in remaining if
+                                  (seed_dir / f'cold-fence-{name}.json').exists()), None),
+                    'cold startup did not reach the next group fence')
+                remaining.remove(stage)
+                receipt = fence_checkpoint(seed_dir, stage, run)
+                assert receipt['transition_id'] == profile['transition_id'], receipt
+                receipts.append(receipt)
+                cluster.workers['w1'].kill()
+                (seed_dir / f'cold-fence-{stage}.hold').unlink()
+                launch_retained(cluster, 'w1')
+
+        profile = cluster.cold_start(keep_certificates=True, before_ready=interrupt)
+        assert_fence_transition(receipts, run, profile['next_run'])
+        status_fence, = [receipt for receipt in receipts if 'status' in receipt['group']['kind']]
+        assert decision['decided_at']['index'] < status_fence['applied_at']['index'], (decision, status_fence)
+        for name in WORKERS:
+            queue = cluster.stats(name)['queue']
+            assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+
+        cluster.apis['api1'].stop()
+        cluster.start_api('api1', DIRECT)
+        assert all(status['direct_oltp'] == DIRECT for status in cluster.wait_direct_active().values())
+        table = Database(cluster.api_urls['api1'], cluster.auth['data_token'], database='test',
+                         ca_file=str(cluster.ca), timeout=30).table('cold_rf3')
+        with closing(gateway(cluster)) as client:
+            exact_receipt(client.exchange, run, committed, None)
+            assert client.exchange('/v1/operations', committed) == (200, dict(
+                request_id=committed['request_id'], data=None))
+            for stage in ('queued', 'prepared'):
+                request = queued[stage]
+                assert_abandoned(client.exchange(receipt_path(run, request)), request)
+                assert_abandoned(client.exchange('/v1/requests', request), request)
+            assert_direct_recovery(client.exchange, table, run, writes, lambda: sum(
+                (stats.get('direct') or {}).get('entries_proposed', 0)
+                for stats in cluster.all_stats().values()))
+        assert table.query().count() == 1 + bool(writes)
+        assert table.get('committed') == dict(id='committed', value=3)
+        assert table.get('prepared') is table.get('queued') is None
+        for stage, request in queued.items():
+            attempts = [directory / f"attempts-{request['request_id']}" for directory in directories]
+            assert [line for path in attempts if path.exists() for line in path.read_text().splitlines()] == [stage]
+        # An exclusive lifecycle operation must acquire the guard left by the
+        # interrupted prepare and use the fenced rollback to remove its intent.
+        table.drop()
+    return True
+
+
 def failure_boundaries(test_executable):
     for stage, kind in [('queued', 'mutation'), ('queued', 'read'), ('prepared', 'mutation'), ('committed', 'mutation')]:
         with tempfile.TemporaryDirectory(prefix='nabedra-o15-' + stage + '-') as directory:
@@ -588,7 +1020,10 @@ def failure_boundaries(test_executable):
                 assert before['state'] == ('queued' if stage == 'queued' else 'running'), before
                 server.stop(abrupt=True)
                 server.barrier_stage = None
-                server.start(cold_start=True)
+                if stage == 'prepared':
+                    interrupt_rf1_fences(server, old_run)
+                else:
+                    server.start(cold_start=True)
                 assert server.run_id != old_run
                 db = Database(url=server.url, token=server.token, database='test', timeout=20)
                 table = db.table('recovery')
@@ -767,11 +1202,25 @@ def activation_boundary(test_executable):
                 server.log.close()
 
 
+def run_native_assertions(test_executable, cases):
+    """Run exact production-library assertions and retain their libtest output."""
+    listed = subprocess.check_output([test_executable, '--list'], text=True, timeout=15)
+    names = [line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
+    for case in cases:
+        name, = [name for name in names if name.rsplit('::', 1)[-1] == case]
+        result = subprocess.run([test_executable, '--exact', name, '--nocapture'],
+                                capture_output=True, text=True, timeout=90)
+        print(result.stdout, end='', flush=True)
+        print(result.stderr, end='', file=sys.stderr, flush=True)
+        assert result.returncode == 0 and 'test result: ok. 1 passed; 0 failed; 0 ignored;' in result.stdout, name
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary')
     parser.add_argument('--test-executable')
-    parser.add_argument('--scenario', choices=('retirement-cold', 'cli', 'failure-boundaries', 'activation-boundary', 'admission', 'snapshot-pressure', 'gateway'), required=True)
+    parser.add_argument('--scenario', choices=('retirement-cold', 'cli', 'failure-boundaries',
+        'activation-boundary', 'admission', 'queue-survival', 'snapshot-pressure', 'gateway'), required=True)
     args = parser.parse_args()
     if args.scenario == 'gateway':
         if not args.binary:
@@ -786,17 +1235,32 @@ if __name__ == '__main__':
             parser.error('--test-executable and --binary are required')
         preaccept_disconnect(args.test_executable)
         tentative_copy_disconnect(args.test_executable)
+        assertion('O13', 'preaccept-overload', 'Queue bytes and tentative count independently refused new work with 429 not_applied and settled their charges.')
         retirement_and_committed_cold_replay(args.binary)
+        assertion('O13', 'expiry-and-retirement', 'Expired read results returned 404, the queue retired their charges, and committed DDL replayed its exact result after cold start.')
         cli_supervisor(args.binary)
-        print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(dict(scenario='O13', status='not-run',
-            reason='preaccept disconnect, definitive overload, retirement and CLI paths executed; CPU/count/disk-headroom saturation, ambiguous reservation replies and retained-reply fairness remain unexecuted in this scenario')), flush=True)
+        incomplete('O13', 'RF3 copy loss, CPU and disk headroom, lost reservation replies, and resource fault variations are pending')
+    elif args.scenario == 'queue-survival':
+        if not args.test_executable or not args.binary:
+            parser.error('--test-executable and --binary are required')
+        run_native_assertions(args.test_executable, [
+            'r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag'])
+        assertion('O14', 'bootstrap-pages', 'The native queue snapshot asserted empty, single, intermediate, final, and exhausted pages.')
+        queue_survival(args.binary, args.test_executable)
+        incomplete('O14', 'signed control saturation alongside terminal copying is pending')
     elif args.scenario == 'failure-boundaries':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
         failure_boundaries(args.test_executable)
+        assertion('O15', 'rf1-cold-queue', 'RF1 abandoned queued and prepared work, preserved a durable commit, and resumed after interruption at each group fence.')
         activation_boundary(args.test_executable)
-        print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(dict(scenario='O15', status='not-run',
-            reason='core RF1 queue/prepare/COMMIT histories passed; allocator/Status/shard fence-interruption and decision-order variations remain unexecuted')), flush=True)
+        assertion('O15', 'activation-boundary', 'The pre-activation UUID replayed its original outcome or stayed abandoned across activation.')
+        rf1_direct_recovery(args.test_executable)
+        if args.binary and rf3_cold_recovery(args.binary, args.test_executable):
+            assertion('O15', 'rf3-cold-queue', 'RF3 resumed one cold transition after a stop at each group fence. The earlier decision survived and old pending work stayed abandoned.')
+            assertion('O15', 'direct-in-flight', 'Both topologies checked the direct path’s before-proposal and after-apply cuts.' if DIRECT else
+                'Both topologies verified rollback mode proposed zero direct entries.')
+        incomplete('O15', 'late decision rejection and unavailable proof are pending')
     elif args.scenario == 'activation-boundary':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
@@ -807,4 +1271,3 @@ if __name__ == '__main__':
         cli_supervisor(args.binary)
     else:
         retirement_and_committed_cold_replay(args.binary)
-    print(json.dumps(dict(scenario=args.scenario, status='passed', scope='actual-local-rf1-subset')))
