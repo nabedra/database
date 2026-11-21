@@ -106,8 +106,7 @@ pub struct WorkerSharedResources {
     reply_apply: Arc<ByteArena>,
     queue_claim: Arc<AtomicBool>,
     _native_charge: MemoryCharge,
-    leases: Mutex<LeaseState>,
-    settled: Notify,
+    leases: Arc<NativeLeases>,
 }
 
 pub(crate) struct GroupCapacityLease {
@@ -254,11 +253,7 @@ impl WorkerSharedResources {
             reply_apply,
             queue_claim: Arc::new(AtomicBool::new(false)),
             _native_charge: native_charge,
-            leases: Mutex::new(LeaseState {
-                closed: false,
-                count: 0,
-            }),
-            settled: Notify::new(),
+            leases: Arc::new(NativeLeases::default()),
         });
         let weak = Arc::downgrade(&owner);
         let _ = owner.weak_self.set(weak.clone());
@@ -345,7 +340,7 @@ impl WorkerSharedResources {
     /// The one physical queue owner contains every database scope under shared
     /// count/byte/result ceilings. A scoped wrapper must not create another owner.
     pub fn claim_queue(self: &Arc<Self>) -> Result<QueueLease, ProtocolError> {
-        if self.worker_id().is_none() || self.leases.lock().map_err(|_| capacity())?.closed {
+        if self.worker_id().is_none() || self.leases.state.lock().map_err(|_| capacity())?.closed {
             return Err(capacity());
         }
         self.queue_claim
@@ -762,15 +757,16 @@ impl WorkerSharedResources {
         class: ExecutionClass,
     ) -> Result<PreparedNative, ProtocolError> {
         {
-            let mut state = self.leases.lock().map_err(|_| capacity())?;
+            let mut state = self.leases.state.lock().map_err(|_| capacity())?;
             if state.closed {
                 return Err(capacity());
             }
             state.count += 1;
         }
         let mut lease = NativeLease {
+            permit: None,
             owner: self.clone(),
-            _permit: None,
+            settlement: NativeSettlement(self.leases.clone()),
         };
         #[cfg(test)]
         self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
@@ -784,7 +780,7 @@ impl WorkerSharedResources {
             .acquire_owned()
             .await
             .map_err(|_| capacity())?;
-        lease._permit = Some(permit);
+        lease.permit = Some(permit);
         Ok(PreparedNative { class, lease })
     }
     /// Native jobs prepared so far in `class`.
@@ -792,11 +788,12 @@ impl WorkerSharedResources {
     pub(crate) fn native_jobs(&self, class: ExecutionClass) -> u64 {
         self.native_jobs[class as usize].load(Ordering::Relaxed)
     }
-    /// Close admission and join every prepared or dispatched native lease.
-    /// Callers must release their own prepared work before awaiting this drain.
+    /// Close admission and wait for prepared and dispatched native work.
+    /// A dispatched job settles after it returns its guards to a live caller
+    /// or drops them after cancellation. Callers must release their own guards.
     pub async fn drain(&self) {
         {
-            let mut state = self.leases.lock().expect("native lease state");
+            let mut state = self.leases.state.lock().expect("native lease state");
             state.closed = true;
             self.query.slots.close();
             self.control.slots.close();
@@ -806,8 +803,8 @@ impl WorkerSharedResources {
             self.reply_apply.close();
         }
         loop {
-            let notified = self.settled.notified();
-            if self.leases.lock().expect("native lease state").count == 0 {
+            let notified = self.leases.settled.notified();
+            if self.leases.state.lock().expect("native lease state").count == 0 {
                 return;
             }
             notified.await;
@@ -927,20 +924,27 @@ impl Drop for ScratchLease {
     }
 }
 
+#[derive(Default)]
+struct NativeLeases {
+    state: Mutex<LeaseState>,
+    settled: Notify,
+}
+#[derive(Default)]
 struct LeaseState {
     closed: bool,
     count: usize,
 }
 struct NativeLease {
+    permit: Option<OwnedSemaphorePermit>,
     owner: Arc<WorkerSharedResources>,
-    _permit: Option<OwnedSemaphorePermit>,
+    settlement: NativeSettlement,
 }
-impl Drop for NativeLease {
+/// Tracks job settlement without keeping the worker or its executor alive.
+struct NativeSettlement(Arc<NativeLeases>);
+impl Drop for NativeSettlement {
     fn drop(&mut self) {
-        // Drop physical capacity before notifying an awaiting drain.
-        self._permit.take();
-        self.owner.leases.lock().expect("native lease state").count -= 1;
-        self.owner.settled.notify_waiters();
+        self.0.state.lock().expect("native lease state").count -= 1;
+        self.0.settled.notify_waiters();
     }
 }
 pub struct NativeComputeGuard {
@@ -1036,17 +1040,28 @@ impl PreparedNative {
             ExecutionClass::Control => &owner.control,
         };
         let (tx, rx) = oneshot::channel();
+        let job = (guard, work, self.lease);
         executor.send(Box::new(move || {
-            let lease = self.lease;
+            let (guard, work, lease) = job;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
             // Release the slot and the worker owner before the caller can see
             // the result: a caller that then drops its last owner must find the
             // worker unbound, or a reopen is refused (C02, CIfix1).
-            drop(lease);
-            let _ = tx.send((result, guard));
+            let NativeLease {
+                permit,
+                owner,
+                settlement,
+            } = lease;
+            drop(permit);
+            drop(owner);
+            // Keep the job tracked until receipt or until the undelivered
+            // result and guard have both dropped.
+            let _ = tx.send((result, guard, settlement));
         }))?;
-        rx.await.map_err(|_| super::super::recovery_unknown())
+        let (result, guard, _settlement) =
+            rx.await.map_err(|_| super::super::recovery_unknown())?;
+        Ok((result, guard))
     }
 }
 

@@ -140,6 +140,13 @@ pub(crate) struct GatedSync {
     inner: nabedra_kv::fs::FaultFs,
     gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
 }
+#[must_use = "dropping the guard releases journal syncs"]
+pub(crate) struct HeldSync<'a>(&'a GatedSync);
+impl Drop for HeldSync<'_> {
+    fn drop(&mut self) {
+        self.0.state(|gate| gate.closed = false);
+    }
+}
 #[derive(Default)]
 struct GateState {
     closed: bool,
@@ -169,19 +176,27 @@ impl GatedSync {
             gate: self.gate.clone(),
         }
     }
-    /// Holds every later journal sync until [`Self::release`].
-    pub(crate) fn hold(&self) {
+    /// Holds later journal syncs until the returned guard drops.
+    pub(crate) fn hold(&self) -> HeldSync<'_> {
         self.state(|gate| {
+            assert!(!gate.closed, "journal sync gate is already held");
             gate.closed = true;
             gate.entered = 0;
         });
-    }
-    pub(crate) fn release(&self) {
-        self.state(|gate| gate.closed = false);
+        HeldSync(self)
     }
     /// Syncs that reached the closed gate since [`Self::hold`].
     pub(crate) fn entered(&self) -> usize {
         self.state(|gate| gate.entered)
+    }
+    async fn wait_for_sync(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.entered() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("pending append did not reach the journal sync gate");
     }
 }
 impl nabedra_kv::fs::Fs for GatedSync {
@@ -230,8 +245,14 @@ impl nabedra_kv::fs::FsFile for GatedFile {
         if state.closed {
             state.entered += 1;
             changed.notify_all();
-            while state.closed {
-                state = changed.wait(state).unwrap();
+            (state, _) = changed
+                .wait_timeout_while(state, Duration::from_secs(60), |state| state.closed)
+                .unwrap();
+            if state.closed {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test journal sync gate was not released",
+                ));
             }
         }
         drop(state);
@@ -330,10 +351,8 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             .await
             .unwrap();
         let baseline = shared.scheduler().usage();
-        let passed_at_close = gated.state(|gate| {
-            gate.closed = true;
-            gate.passed
-        });
+        let held = gated.hold();
+        let passed_at_close = gated.state(|gate| gate.passed);
 
         let vote = Vote::new_committed(2, 1);
         control.save_vote(&vote).await.unwrap();
@@ -348,9 +367,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             let mut log = log.clone();
             async move { log.append([blank(0)], IOFlushed::signal(sender)).await }
         });
-        while gated.state(|gate| gate.entered) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        gated.wait_for_sync().await;
         assert!(matches!(
             callback.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -409,7 +426,7 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         released.store(true, Ordering::Release);
-        gated.state(|gate| gate.closed = false);
+        drop(held);
 
         next_callback.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
@@ -941,11 +958,6 @@ impl GatedLog {
         let log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
         (pool, log)
     }
-    async fn entered(&self) {
-        while self.gated.state(|gate| gate.entered) == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
 }
 
 /// O29/NS10 (FaultFs crash and power-loss models), PERF2d: a crash between an
@@ -966,13 +978,16 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .unwrap();
         acked.await.unwrap().unwrap();
         log.save_committed(Some(id(0))).await.unwrap();
+        // The previous marker must finish its background write before the
+        // gate can hold a journal batch that would delay that write.
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
 
-        rig.gated.state(|gate| gate.closed = true);
+        let held = rig.gated.hold();
         let (sent, mut pending) = TestConfig::oneshot();
         log.append([blank(1)], IOFlushed::signal(sent))
             .await
             .unwrap();
-        rig.entered().await;
+        rig.gated.wait_for_sync().await;
         assert_eq!(
             log_ids(log.limited_get_log_entries(0, 2).await.unwrap()),
             [id(0), id(1)]
@@ -1004,7 +1019,7 @@ async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked
             .map(|seed| rig.gated.inner.power_loss(seed))
             .collect::<Vec<_>>();
         rig.gated.inner.halt();
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held);
         assert!(
             pending.await.unwrap().is_err(),
             "a sync that failed must not report a flush"
@@ -1062,41 +1077,38 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             .unwrap();
         acked.await.unwrap().unwrap();
         log.save_committed(Some(id(0))).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
 
-        rig.gated.state(|gate| gate.closed = true);
+        let held = rig.gated.hold();
         let (sent, mut pending) = TestConfig::oneshot();
         log.append([blank(1), blank(2)], IOFlushed::signal(sent))
             .await
             .unwrap();
-        rig.entered().await;
-        let apply = tokio::spawn({
-            let mut log = log.clone();
-            async move {
-                let mut stream = Box::pin(log.entries_stream(1..3).await);
-                let mut applied = Vec::new();
-                while let Some(entry) = stream.next().await {
-                    applied.push(entry.unwrap().log_id);
-                }
-                applied
-            }
-        });
+        rig.gated.wait_for_sync().await;
+        let mut reader = log.clone();
+        let mut apply = Box::pin(reader.entries_stream(1..3).await);
         log.save_committed(Some(id(2))).await.unwrap();
         assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
         assert_eq!(
             log_ids(log.limited_get_log_entries(1, 3).await.unwrap()),
             [id(1), id(2)]
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!apply.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), apply.next())
+                .await
+                .is_err(),
+            "applying the batch must wait for its local sync"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(1), &mut pending)
                 .await
                 .is_err()
         );
 
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held);
         pending.await.unwrap().unwrap();
-        assert_eq!(apply.await.unwrap(), [id(1), id(2)]);
+        let applied = apply.map(|entry| entry.unwrap().log_id).collect::<Vec<_>>();
+        assert_eq!(applied.await, [id(1), id(2)]);
         while log.read_committed().await.unwrap() != Some(id(2)) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -295,10 +295,15 @@ impl Gate {
         self.changed.notify_all();
     }
     fn wait(&self) {
-        let mut open = self.open.lock().unwrap();
-        while !*open {
-            open = self.changed.wait(open).unwrap();
-        }
+        let (open, _) = self
+            .changed
+            .wait_timeout_while(self.open.lock().unwrap(), Duration::from_secs(30), |open| {
+                !*open
+            })
+            .unwrap();
+        let released = *open;
+        drop(open);
+        assert!(released, "native test gate was not released");
     }
 }
 struct ReleaseOnDrop(Arc<Gate>);
@@ -480,49 +485,64 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
             threads.insert(
                 tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
                     .await
-                    .unwrap()
-                    .unwrap(),
+                    .expect("all seven Query jobs reached the native gate")
+                    .expect("native arrival channel remained open"),
             );
         }
     });
     assert_eq!(threads.len(), 7);
     assert_eq!(resources.scheduler().usage()[0].1, 7);
-    tasks[0].abort();
+    let cancelled = tasks.remove(0);
+    cancelled.abort();
     runtime.block_on(async {
-        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), cancelled)
+                .await
+                .expect("the Query caller observed cancellation")
+                .unwrap_err()
+                .is_cancelled()
+        );
     });
     assert_eq!(resources.scheduler().usage()[0].1, 7);
     let control = runtime
-        .block_on(resources.execute(ExecutionClass::Control, 99, 0, || {
-            Ok(std::thread::current().id())
-        }))
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                resources.execute(ExecutionClass::Control, 99, 0, || {
+                    Ok(std::thread::current().id())
+                }),
+            )
+            .await
+            .expect("Control progresses while every Query slot is held")
+        })
         .unwrap();
     assert!(!threads.contains(&control));
-    let draining = runtime.spawn({
-        let resources = resources.clone();
-        async move { resources.drain().await }
-    });
     runtime.block_on(async {
-        tokio::task::yield_now().await;
-    });
-    assert!(!draining.is_finished());
-    gate.release();
-    drop(release);
-    runtime.block_on(async {
+        let mut drain = std::pin::pin!(resources.drain());
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        drop(release);
         for task in tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(10), task)
+            tokio::time::timeout(Duration::from_secs(10), task)
                 .await
+                .expect("released Query work settled")
+                .unwrap()
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(10), draining)
+        tokio::time::timeout(Duration::from_secs(10), drain)
             .await
-            .unwrap()
-            .unwrap();
+            .expect("native drain completed after releasing Query work");
     });
     assert_eq!(resources.scheduler().usage()[0].1, 0);
     assert!(
         runtime
-            .block_on(resources.prepare(ExecutionClass::Query))
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    resources.prepare(ExecutionClass::Query),
+                )
+                .await
+                .expect("drained worker refused preparation")
+            })
             .is_err()
     );
 }
@@ -1259,6 +1279,76 @@ fn c02_o05_ns04_native_job_releases_its_worker_owner_before_its_result() {
     shared(SharedResourceConfig::default())
         .bind_worker(worker)
         .unwrap();
+}
+
+#[tokio::test]
+async fn f03_native_drain_waits_for_cancelled_guard_drop() {
+    struct HeldDrop {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        gate: Arc<Gate>,
+    }
+    impl Drop for HeldDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.take().unwrap().send(());
+            self.gate.wait();
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let resources = shared(SharedResourceConfig::default());
+        let baseline = resources.scheduler().usage();
+        let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let reservation = prepared.reserve_compute(44, 1024).await.unwrap();
+        let work_gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let drop_gate = Arc::new(Gate {
+            open: Mutex::new(false),
+            changed: Condvar::new(),
+        });
+        let release_work = ReleaseOnDrop(work_gate.clone());
+        let release_drop = ReleaseOnDrop(drop_gate.clone());
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (dropping, cleanup) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            prepared
+                .run_with_guard(
+                    (
+                        HeldDrop {
+                            entered: Some(dropping),
+                            gate: drop_gate,
+                        },
+                        reservation,
+                    ),
+                    move || {
+                        started.send(()).unwrap();
+                        work_gate.wait();
+                        Ok(())
+                    },
+                )
+                .await
+        });
+        running.await.expect("native work started");
+        task.abort();
+        assert!(task.await.err().is_some_and(|error| error.is_cancelled()));
+        drop(release_work);
+        cleanup.await.expect("cancelled guard started dropping");
+
+        let mut drain = std::pin::pin!(resources.drain());
+        assert!(
+            futures_util::poll!(&mut drain).is_pending(),
+            "native drain returned while the cancelled guard still held its scheduler permit"
+        );
+        let usage = resources.scheduler().usage();
+        assert_eq!(usage[0].1, 1);
+        assert_eq!(usage[0].2, baseline[0].2 + 1024);
+        drop(release_drop);
+        drain.await;
+        assert_eq!(resources.scheduler().usage(), baseline);
+    })
+    .await
+    .expect("native work, cancellation cleanup and drain watchdog");
 }
 
 #[tokio::test]

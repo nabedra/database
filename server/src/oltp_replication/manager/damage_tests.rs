@@ -990,7 +990,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
         let followers: Vec<usize> = (0..3).filter(|index| *index != leader).collect();
         let first = cluster.fence(leader, 1).await;
         let gate = cluster.workers[leader].gate.clone().unwrap();
-        gate.hold();
+        let held = gate.hold();
         let fence = cluster.fence_task(leader, 2);
         let next = first.index + 1;
         timeout(Duration::from_secs(20), async {
@@ -1021,7 +1021,7 @@ async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commi
 
         let disk = cluster.workers[leader].fault.crash();
         cluster.workers[leader].fault.halt();
-        gate.release();
+        drop(held);
         let outcome = timeout(Duration::from_secs(20), fence).await;
         assert!(
             !matches!(outcome, Ok(Ok(Ok(_)))),
@@ -1058,9 +1058,7 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
         let gates: Vec<_> = (0..3)
             .map(|index| cluster.workers[index].gate.clone().unwrap())
             .collect();
-        for gate in &gates {
-            gate.hold();
-        }
+        let held: Vec<_> = gates.iter().map(|gate| gate.hold()).collect();
         let fence = cluster.fence_task(leader, 2);
         timeout(Duration::from_secs(20), async {
             while gates.iter().any(|gate| gate.entered() == 0) {
@@ -1086,9 +1084,7 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
         for index in 0..3 {
             cluster.workers[index].fault.halt();
         }
-        for gate in &gates {
-            gate.release();
-        }
+        drop(held);
         let outcome = timeout(Duration::from_secs(20), fence).await;
         assert!(!matches!(outcome, Ok(Ok(Ok(_)))));
         for (index, disk) in disks.into_iter().enumerate() {
