@@ -7,20 +7,18 @@ permissions:
 env:
   CARGO_BUILD_JOBS: "2"
   CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: never
 jobs:
-  repeat:
-    name: FLAKE3 ${{ matrix.fixture }}
+  d11:
+    name: FLAKE3 D11 after
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
-    strategy:
-      fail-fast: false
-      matrix:
-        fixture: [d11]
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.94.1 --profile minimal
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -30,52 +28,38 @@ jobs:
           key: oltp-1.94.1-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
           restore-keys: oltp-1.94.1-
       - run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
-      - name: Repeat the typed-log library suite
-        if: matrix.fixture == 'typed-log'
-        working-directory: server
+      - name: Build native RF1 server
+        run: cargo build --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --bin nabedra-db
+      - name: Repeat the RF1 D11 fixture with and without a delayed create
         run: |
-          set -o pipefail
-          mkdir -p ../flake3
-          exe="$(cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json-render-diagnostics \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable' | tail -1)"
-          test -x "$exe"
-          failed=0
-          for round in $(seq 1 200); do
-            rc=0
-            NABEDRA_TEST_DIRECT_OLTP=off timeout 75s "$exe" oltp_replication::typed_log::tests:: --test-threads 4 > "../flake3/typed-$round.log" 2>&1 || rc=$?
-            printf 'round=%s exit=%s ' "$round" "$rc"
-            grep 'test result:' "../flake3/typed-$round.log" || true
-            if [ "$rc" != 0 ]; then
-              failed=$((failed + 1))
-              cat "../flake3/typed-$round.log"
-            fi
-          done
-          echo "$failed/200 rounds failed"
-          test "$failed" = 0
-      - uses: actions/setup-python@v5
-        if: matrix.fixture == 'd11'
-        with:
-          python-version: "3.11"
-      - name: Repeat D11 through the RF1 CLI
-        if: matrix.fixture == 'd11'
-        run: |
-          cargo build --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --bin nabedra-db
           mkdir -p flake3
+          fixture=server/tests/oltp_direct_acceptance.py
+          delayed=server/tests/flake3_delayed_create.py
+          python3 - "$fixture" "$delayed" <<'PY'
+          from pathlib import Path
+          import sys
+
+          source = Path(sys.argv[1]).read_text()
+          start = source.index('def d11_index(')
+          point = source.index('            index_id = uid()\n', start)
+          Path(sys.argv[2]).write_text(source[:point] + '            time.sleep(3.0)\n' + source[point:])
+          PY
           failed=0
-          for round in $(seq 1 1); do
+          for round in delayed-create 1 2 3 4 5; do
+            script="$fixture"
+            if [ "$round" = delayed-create ]; then script="$delayed"; fi
             rc=0
-            timeout 240s python3 server/tests/oltp_direct_acceptance.py --binary "$PWD/server/target/debug/nabedra-db" \
+            timeout 240s python3 "$script" --binary "$PWD/server/target/debug/nabedra-db" \
               --suite d11 --output "flake3/d11-$round" > "flake3/d11-$round.log" 2>&1 || rc=$?
             printf 'round=%s exit=%s\n' "$round" "$rc"
             cat "flake3/d11-$round.log"
-            grep -E "FLAKE3|index build stopped" "flake3/d11-$round/logs/rf1-cli-server-stderr.log" | tail -90 || true
             if [ "$rc" != 0 ]; then failed=$((failed + 1)); fi
           done
-          echo "$failed/1 rounds failed"
+          echo "$failed/6 rounds failed"
           test "$failed" = 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: flake3-${{ matrix.fixture }}
+          name: flake3-d11-after
           path: flake3
           retention-days: 14
