@@ -1957,3 +1957,4 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
 }
 
 mod kv;
+mod snap1;
