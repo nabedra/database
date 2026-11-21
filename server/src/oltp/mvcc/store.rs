@@ -1465,7 +1465,7 @@ fn ordinal_key(tag: u8, txn: TxnId, ordinal: u64) -> [u8; 33] {
     key[25..].copy_from_slice(&ordinal.to_be_bytes());
     key
 }
-fn compare_primary(a: &Key, b: &Key) -> Ordering {
+pub(crate) fn compare_primary(a: &Key, b: &Key) -> Ordering {
     match (a, b) {
         (Key::Int64(a), Key::Int64(b)) => a.cmp(b),
         (Key::Utf8(a), Key::Utf8(b)) => a.cmp(b),

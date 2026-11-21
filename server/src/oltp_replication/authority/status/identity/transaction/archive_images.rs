@@ -3,7 +3,7 @@
 use super::*;
 use crate::oltp::{
     backup::{
-        history::{HistoryFrame, MetadataImage},
+        history::{ArchivePageBudget, HistoryFrame, MetadataImage},
         restore::OfflineRestoreTarget,
     },
     pool::GroupStore,
@@ -87,7 +87,7 @@ impl StatusHandle {
                 }
                 let mut next = after;
                 let mut items = Vec::new();
-                let mut used = 4096usize;
+                let mut budget = ArchivePageBudget::new();
                 for _ in 0..64 {
                     let Some(row) = view.first_from(b"status/", &cursor)? else {
                         break;
@@ -179,27 +179,16 @@ impl StatusHandle {
                                 .map_err(|_| unknown())?
                                 .to_owned(),
                         };
-                        let cost = value
-                            .len()
-                            .checked_mul(2)
-                            .and_then(|n| n.checked_add(key.len() * 4 + 4096))
-                            .ok_or_else(unknown)?;
-                        if used
-                            .checked_add(cost)
-                            .is_none_or(|n| n > (128 << 10) - 4096)
-                        {
-                            if items.is_empty() {
-                                return Err(unknown());
-                            }
-                            break;
-                        }
-                        used += cost;
-                        items.push(MetadataImage {
+                        let item = MetadataImage {
                             group: group.clone(),
                             key: key.to_vec(),
                             commit_ts: committed_at,
                             value,
-                        });
+                        };
+                        if !budget.include(view, &item)? {
+                            break;
+                        }
+                        items.push(item);
                     }
                     next = Some(key.to_vec());
                     cursor = key.to_vec();

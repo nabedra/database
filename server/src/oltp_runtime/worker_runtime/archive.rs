@@ -71,6 +71,11 @@ pub(crate) use restore::VerifiedNativeRestore;
 mod publication;
 pub(crate) use publication::NativeBackupPublication;
 
+fn backup_error(stage: &str, mut error: ProtocolError) -> ProtocolError {
+    error.message = format!("native backup {stage}: {}", error.message);
+    error
+}
+
 struct Export {
     writer: HistoryWriter<File>,
     shared: Arc<crate::oltp::pool::WorkerSharedResources>,
@@ -291,7 +296,8 @@ impl WorkerRuntime {
             .services
             .timestamps
             .begin_backup(authority, owner)
-            .await?;
+            .await
+            .map_err(|error| backup_error("pin", error))?;
         *active_pin = Some(pin);
         // Activation may have committed since the first check. A direct
         // timestamp allocated after this cut is above it, so check Control
@@ -384,8 +390,11 @@ impl WorkerRuntime {
                 },
                 &catalog,
             )
-            .await?;
-            self.export_native_routes(&catalog, &mut export).await?;
+            .await
+            .map_err(|error| backup_error("catalog images", error))?;
+            self.export_native_routes(&catalog, &mut export)
+                .await
+                .map_err(|error| backup_error("data ranges", error))?;
         } else {
             self.export_native_split_baselines(&catalog, &scope, &mut export)
                 .await?;
@@ -400,7 +409,8 @@ impl WorkerRuntime {
                 .services
                 .control
                 .groups(control.group_inventory_revision, after)
-                .await?;
+                .await
+                .map_err(|error| backup_error("control inventory", error))?;
             let page: crate::oltp_replication::authority::control::InventoryPage<
                 crate::oltp_replication::authority::control::GroupRecord,
             > = serde_json::from_slice(raw.as_ref()).map_err(|_| unknown())?;
@@ -434,7 +444,8 @@ impl WorkerRuntime {
                     status,
                     exported.is_empty(),
                 )
-                .await?;
+                .await
+                .map_err(|error| backup_error("status history", error))?;
                 exported.insert(group.identity.group_id);
             }
             if page.done {
@@ -459,7 +470,10 @@ impl WorkerRuntime {
         let split_graph = restore_graph::RestoreGraph::new(shared.clone())?;
         let mut split_transcript = restore_graph::SplitTranscript::default();
         let mut point_transcript = point_history::PointTranscript::default();
-        while let Some(frame) = validator.next(&shared)? {
+        while let Some(frame) = validator
+            .next(&shared)
+            .map_err(|error| backup_error("history frame", error))?
+        {
             split_transcript.observe(&split_graph, &frame, scope.cut)?;
             point_transcript.observe(frame.payload()?, &shared)?;
         }
@@ -510,7 +524,8 @@ impl WorkerRuntime {
         let history = shared.encode_in(ByteClass::Data, &manifest, 64 << 10)?;
         let published = upload
             .publish(history, manifest.scope.previous_segment)
-            .await?;
+            .await
+            .map_err(|error| backup_error("repository publication", error))?;
         *active_pin = None;
         manifest.repository_root = published.root_sha256();
         // Continuous retention is established before the completed base pin is
@@ -871,13 +886,17 @@ impl WorkerRuntime {
             .services
             .timestamps
             .archive_closure(authority, owner, pin, archive_id, base, status.clone())
-            .await?;
+            .await
+            .map_err(|error| backup_error("timestamp closure", error))?;
         export
             .frame(HistoryFrame::StatusClosure(closure.statement().clone()))
             .await?;
         let mut after = None;
         loop {
-            let page = status.identity_history_page(&closure, after).await?;
+            let page = status
+                .identity_history_page(&closure, after)
+                .await
+                .map_err(|error| backup_error("identity page", error))?;
             for identity in page.items.iter() {
                 export
                     .frame(HistoryFrame::Identity {
@@ -915,7 +934,8 @@ impl WorkerRuntime {
                     .services
                     .timestamps
                     .native_archive_page(&closure, cursor.clone())
-                    .await?;
+                    .await
+                    .map_err(|error| backup_error("timestamp metadata page", error))?;
                 for image in page.items.iter() {
                     export.frame(HistoryFrame::Metadata(image.clone())).await?;
                 }
@@ -932,7 +952,8 @@ impl WorkerRuntime {
         loop {
             let page = status
                 .native_archive_page(&closure, metadata_after.clone())
-                .await?;
+                .await
+                .map_err(|error| backup_error("status metadata page", error))?;
             for image in page.items.iter() {
                 export.frame(HistoryFrame::Metadata(image.clone())).await?;
             }
@@ -946,7 +967,10 @@ impl WorkerRuntime {
         }
         let mut after = None;
         loop {
-            let page = status.committed_page(&closure, base, after).await?;
+            let page = status
+                .committed_page(&closure, base, after)
+                .await
+                .map_err(|error| backup_error("committed decisions page", error))?;
             for decision in page.items.iter() {
                 let txn = decision.statement.txn;
                 let manifest = decision.statement.manifest;
@@ -960,7 +984,10 @@ impl WorkerRuntime {
                 let mut cursor = None;
                 let mut participants = 0u64;
                 loop {
-                    let plans = status.manifest_page(txn, manifest, cursor).await?;
+                    let plans = status
+                        .manifest_page(txn, manifest, cursor)
+                        .await
+                        .map_err(|error| backup_error("participant manifest page", error))?;
                     for plan in plans.items.iter() {
                         if base.is_none() {
                             export

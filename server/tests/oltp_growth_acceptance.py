@@ -57,12 +57,6 @@ def admin(cluster, worker, request, timeout=60):
                 timeout=timeout)
 
 
-def pending_clause(scenario, clause, reason):
-    print('NABEDRA_OLTP_ASSERT ' + json.dumps({
-        'scenario': scenario, 'assertion': clause, 'status': 'not-run', 'detail': reason,
-    }), flush=True)
-
-
 def split(cluster, source, boundary, split_id=None):
     request = operation('storage.shard.split', dict(source=source, boundary=boundary, page_bytes=MIB),
                         split_id)
@@ -645,8 +639,10 @@ def check_capacity_deficit(facade):
         cluster.close()
 
 
-def insert_exact(facade, table, rows):
+def insert_exact(facade, table, rows, request_id=None):
     body = batch(table, rows)
+    if request_id is not None:
+        body['request_id'] = request_id
     deadline = time.monotonic() + 180
     last = None
     while time.monotonic() < deadline:
@@ -662,6 +658,32 @@ def insert_exact(facade, table, rows):
             last = repr(error)
         time.sleep(.2)
     raise AssertionError(f"batch {body['request_id']} did not settle: {last}")
+
+
+def assert_disjoint_mutation_plans(facade, table, parts, text, last_key):
+    # Both requests grow the table in disjoint ranges. A table-wide quota
+    # write would add a participant, a write to a participant, or stop
+    # the second plan while the first is held after sealing its manifest.
+    probes = []
+    for key in (-1, last_key):
+        body = batch(table, [dict(id=key, text=text, value=key % 7)])
+        request_id = body['request_id']
+        facade.select(request_id, {'participants': True})
+        facade.admit(body)
+        probes.append(request_id)
+    plans = []
+    try:
+        for request_id in probes:
+            _, participants = facade.reached(request_id, 'participants', timeout=30)
+            assert len(participants) == 1 and participants[0]['write_count'] == 1, participants
+            plans.append(participants[0]['group'])
+        assert sorted(group['group_id'] for group in plans) == sorted(
+            group['group_id'] for group in parts), plans
+    finally:
+        for request_id in probes:
+            facade.release(request_id, 'participants')
+    for request_id in probes:
+        facade.terminal(request_id, 1)
 
 
 def o21(facade):
@@ -733,6 +755,7 @@ def o21(facade):
     bulk(100_001, total)
     assert query(facade, table, 'count') == total
     assert total * len(text) > 64 * MIB
+    loaded_memory = {name: cluster.stats(name)['test_working_memory'] for name in cluster.live()}
     victim = next(worker for worker in reversed(WORKERS) if worker != owner)
     survivors = stop_worker(cluster, victim)
     launch_retained(cluster, victim, retained_config(cluster, victim, survivors))
@@ -757,10 +780,28 @@ def o21(facade):
     print(json.dumps(dict(scenario='O21', rows=total, text_bytes=total * len(text),
                           elapsed_seconds=round(time.monotonic() - started, 2))), flush=True)
     passed('O21', 'growth-and-exact-queries', 'The 100,001st row and later batches succeeded across RF3 ranges and independent pools. Counts, point reads and bounded projected queries agreed after retained restart.')
-    pending_clause('O21', 'no-logical-cap',
-                   'The former row and byte limits were exceeded. A serialized quota counter and whole-table buffering have no dedicated observation here.')
-    pending_clause('O21', 'bounded-work',
-                   'Request batching, exact query limits and oversized collect rejection ran. Task memory high-water and overflow arithmetic are unobserved.')
+    assert_disjoint_mutation_plans(facade, table, parts, text, total)
+    count_overflow(facade, table, 1)
+    assert query(facade, table, 'count') == total + 2
+    final_memory = {name: cluster.stats(name)['test_working_memory'] for name in cluster.live()}
+    for name in cluster.live():
+        reset = cluster.barrier_dir(name) / 'reset-growth-decode'
+        reset.touch()
+        cluster.stats(name)
+        assert not reset.exists()
+    assert query(facade, table, 'count') == total + 2
+    scan_memory = {name: cluster.stats(name)['test_working_memory'] for name in cluster.live()}
+    for memory in (loaded_memory, final_memory, scan_memory):
+        assert all(0 <= sample['decode_peak_bytes'] <= sample['task_limit_bytes']
+                   for sample in memory.values()), memory
+    scan_peak = max(sample['decode_peak_bytes'] for sample in scan_memory.values())
+    assert 0 < scan_peak < total * len(text), scan_memory
+    print(json.dumps(dict(scenario='O21', loaded_memory=loaded_memory,
+                          final_memory=final_memory, scan_memory=scan_memory)), flush=True)
+    passed('O21', 'no-logical-cap',
+           'Simultaneous disjoint mutation manifests each contained one Data write. During an isolated full count, the worker-wide charged decode high-water stayed below the raw size of the table.')
+    passed('O21', 'bounded-work',
+           'The charged decode high-water stayed below the configured task ceiling. Checked count overflow returned limit_exceeded and left later counts exact.')
     check_capacity_deficit(facade)
     passed('O21', 'capacity-errors', 'A separate RF3 table crossed its target on 2 GiB mounts with a 3 GiB free-space floor. The split reported a measured disk deficit and the existing rows stayed readable.')
 
@@ -856,8 +897,66 @@ def count_overflow(facade, table, last_key):
         control.unlink(missing_ok=True)
 
 
+def assert_forged_continuation_rejected(facade, table, first, last_key, expected_count):
+    # Only the first range has matching keys. The count spans more than one
+    # native page and uses the authenticated participant continuation.
+    expression = table.where(col('id') < last_key)
+    body = operation('query.count', dict(table_id=table.id, query=expression._to_wire()))
+    request_id = body['request_id']
+    facade.select(request_id, {'snapshot': True})
+    facade.admit(body)
+    owner, ts = facade.reached(request_id, 'snapshot')
+    group = first['group_id']
+    barrier = facade.cluster.barrier_dir(owner)
+    prefix = barrier / f'cursor-{request_id}-{group}'
+    control = prefix.with_name(f'{prefix.name}-enabled')
+    surviving_member = next(member['worker_id'] for member in placement(facade.cluster, first)['members']
+                            if member['worker_id'] != worker_identity(facade.cluster, owner)['worker_id'])
+    control.with_suffix('.target').write_text(surviving_member)
+    control.touch()
+    try:
+        facade.release(request_id, 'snapshot')
+        waiting = prefix.with_name(f'{prefix.name}-waiting.json')
+        wait_for(waiting.is_file, 'the count reached its authenticated continuation', 60)
+        input_context = json.loads(waiting.read_text())
+        assert input_context['scope']['read_ts'] == ts
+        assert input_context['scope']['request']['request_id'] == request_id
+        assert json.loads(input_context['input'])['after'] is not None
+        control.with_suffix('.release').touch()
+        rejected = prefix.with_name(f'{prefix.name}-probes.json')
+        wait_for(rejected.is_file, 'the worker rejected forged continuation bytes', 60)
+        probes = json.loads(rejected.read_text())
+        assert probes['grant']['scope'] == input_context['scope']
+        assert probes['grant']['group'] == group
+        assert probes['forged_digest'] != input_context['digest']
+        assert json.loads(probes['forged_input'])['after'] is None
+        error = dict(code='validation_error', outcome='not_applied',
+                     message='authenticated participant proof context differs')
+        assert probes['forged_error'] == probes['wrong_scope_error'] == error, probes
+        control.unlink()
+        facade.terminal(request_id, expected_count, timeout=90)
+    finally:
+        control.with_suffix('.release').touch()
+        control.unlink(missing_ok=True)
+
+
+def scan_difference(actual, expected):
+    matched = Counter(item['id'] for item in actual)
+    missing = [item['id'] for item in expected if matched[item['id']] == 0]
+    extra = [item['id'] for item in actual if matched[item['id']] > 1 or item not in expected]
+    first = next(((left, right) for left, right in zip(actual, expected) if left != right), None)
+    return dict(actual=len(actual), expected=len(expected), missing=missing[:3], extra=extra[:3], first=first)
+
+
+def gateway_stats(facade, name):
+    status, stats = facade.api(name, '/v1/runtime/stats')
+    assert status == 200, (status, stats)
+    return stats['direct_gateway']
+
+
 def o28(facade):
     cluster = facade.cluster
+    cluster.wait_direct_active()
     table = facade.db.create_table('paged_scan', {'id': str, 'category': int, 'value': int}, key='id')
 
     def key(index):
@@ -866,6 +965,19 @@ def o28(facade):
 
     rows = [row(key(index * 2), value=index) for index in range(130)]
     assert facade.data(batch(table, rows)) == len(rows)
+    # Simulate a legacy owner rejecting the unknown method in preflight.
+    # api2 has no topology entry for this table yet.
+    controls = [cluster.barrier_dir(worker) / 'reject-direct-point' for worker in WORKERS]
+    for control in controls:
+        control.touch()
+    try:
+        old_owner_update = operation('table.update', dict(table_id=table.id, key=rows[0]['id'],
+                                                          values=dict(value=rows[0]['value'])))
+        assert facade.data(old_owner_update, 'api2') is True
+        assert any(control.with_name('rejected-direct-point').is_file() for control in controls)
+    finally:
+        for control in controls:
+            control.unlink()
     facade.make_index(table, queue_owner(facade, table, rows))
 
     source = initial_range(cluster, table.id)
@@ -898,6 +1010,26 @@ def o28(facade):
     assert 'by_category' in table.where(category=7).explain()
     assert query(facade, table, expression=table.where(category=7)) == rows
 
+    # Run a mutation on the final page in both modes. Retry the identical
+    # body and prove the warmed route does not reread Catalog or placement.
+    update = operation('table.update', dict(table_id=table.id, key=rows[-1]['id'],
+                                            values=dict(value=rows[-1]['value'])))
+    def last_page_update():
+        result = facade.api('api1', OPERATIONS, update, timeout=15)
+        return None if result[0] in (429, 503, 504) else result
+
+    exact = wait_for(last_page_update, 'same-ID mutation on the second Catalog page', 90)
+    assert exact == (200, dict(request_id=update['request_id'], data=True)), exact
+    warm = gateway_stats(facade, 'api1')
+    assert facade.api('api1', OPERATIONS, update, timeout=30) == exact
+    reused = gateway_stats(facade, 'api1')
+    assert all(reused[field] == warm[field] for field in ('catalog_reads', 'placement_reads'))
+    assert 0 < reused['cached_ranges'] < len(routes), reused
+    assert 0 < reused['cached_route_bytes'] <= reused['peak_cached_route_bytes'] <= reused['cache_limit_bytes'], reused
+    print(json.dumps(dict(scenario='O28', direct_gateway=reused)), flush=True)
+    passed('O28', 'no-logical-metadata-cap',
+           'An exact mutation and retry succeeded on the final Catalog page after table metadata exceeded the observation lane. The retry made zero Catalog and placement reads.')
+
     stale_id = admit_stale_update(facade, table, rows[-1]['id'], -999)
     old = facade.query(table)
     old_id = old['request_id']
@@ -919,8 +1051,24 @@ def o28(facade):
                  'scan consumed the first Catalog page', 45)
         next_split()
         extra = row(key(1), category=8, value=-1)
-        insert_exact(facade, table, [extra])
+        insert_id = uid()
+        facade.select(insert_id, {'direct-timestamp': False, 'commit-stamp': False})
+        insert_exact(facade, table, [extra], insert_id)
         assert_stale_update_rejected(facade, stale_id)
+        expected = [rows[0], extra, *rows[1:]]
+        fresh = facade.query(table)
+        facade.select(fresh['request_id'], {'snapshot': False})
+        before_loss = read_after_transition(facade, fresh, timeout=30)
+        if before_loss != expected:
+            cuts = {}
+            for request, stage in [(insert_id, 'direct-timestamp'), (insert_id, 'commit-stamp'),
+                                   (fresh['request_id'], 'snapshot')]:
+                cuts[stage] = [json.loads(path.read_text())
+                               for path in facade.paths(request, stage) if path.is_file()]
+            point = operation('table.get', dict(table_id=table.id, key=extra['id']))
+            print(json.dumps(dict(scenario='O28', cuts=cuts, exact_get=read_after_transition(facade, point),
+                                  scan=scan_difference(before_loss, expected))), flush=True)
+            raise AssertionError('fresh scan omitted an acknowledged mutation')
         records = facade.records(old_id)
         survivors = stop_worker(cluster, owner)
         recovered_owner, recovered_ts = facade.reached(old_id, 'snapshot', workers=survivors, timeout=90)
@@ -928,8 +1076,8 @@ def o28(facade):
         assert all(records[name]['context'] == records[owner]['context'] for name in survivors), records
         unauthorized = facade.receipt(old_id, token='x' * 43)
         assert unauthorized[0] in (401, 403), unauthorized
-        expected = [rows[0], extra, *rows[1:]]
-        assert read_after_transition(facade, facade.query(table), timeout=30) == expected
+        current = read_after_transition(facade, facade.query(table), timeout=30)
+        assert current == expected, scan_difference(current, expected)
         facade.release(old_id, 'snapshot')
         facade.terminal(old_id, rows, timeout=120)
         launch_retained(cluster, owner, retained_config(cluster, owner, survivors))
@@ -945,29 +1093,39 @@ def o28(facade):
         assert get(facade, table, rows[index]['id']) == rows[index]
     passed('O28', 'interruption-and-pins',
            'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
-    archive_routes(cluster, table, routes)
-    passed('O28', 'exact-paged-coverage', 'Scans and the verified archive covered two Catalog pages in routing order. Every interval, indexed row and split boundary matched the oracle.')
-    pending_clause('O28', 'no-logical-metadata-cap',
-                   'Archived routing frames for 130 ranges exceeded 64 KiB in aggregate. The direct gateway still caps each cached table route at 1,024 ranges.')
-    pending_clause('O28', 'bounded-authenticated-pagination',
-                   'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. Cache high-water and a tampered internal continuation were not observed.')
+    prefix_rows = [dict(id=key(1) + f'.part-{index:03}', category=9, value=index) for index in range(129)]
+    insert_exact(facade, table, prefix_rows)
+    assert_forged_continuation_rejected(facade, table, routes[0]['group'], rows[1]['id'],
+                                       len(prefix_rows) + 2)
+    passed('O28', 'bounded-authenticated-pagination',
+           'The gateway retained only accessed routes within its charged high-water. The participant rejected a changed timestamp and forged continuation bytes before the original count completed exactly.')
+    archive_error = None
+    try:
+        archive_routes(cluster, table, routes)
+        passed('O28', 'exact-paged-coverage', 'Scans and the verified archive covered two Catalog pages in routing order. Every interval, indexed row and split boundary matched the oracle.')
+    except AssertionError as error:
+        # Keep the archive failure, but still exercise the independent count.
+        archive_error = error
+        print(f'O28 archive failed: {error!r}', flush=True)
     count_overflow(facade, table, rows[1]['id'])
-    assert query(facade, table, 'count') == len(expected)
+    assert query(facade, table, 'count') == len(expected) + len(prefix_rows)
 
     # Put new rows on the first and last ranges. The count must aggregate
     # matching rows from both ends of the two-page routing map.
     total = 100_001
-    needed = total - len(expected)
-    for offset in range(0, needed, 1024):
-        fields = [dict(id=f'{("0000" if index % 2 == 0 else "zzzz")}.bulk-{index:06}',
-                       category=9, value=index)
-                  for index in range(offset, min(offset + 1024, needed))]
-        insert_exact(facade, table, fields)
+    needed = total - len(expected) - len(prefix_rows)
+    for prefix, count in [('0000', needed // 2), ('zzzz', needed - needed // 2)]:
+        for offset in range(0, count, 1024):
+            fields = [dict(id=f'{prefix}.bulk-{index:06}', category=9, value=index)
+                      for index in range(offset, min(offset + 1024, count))]
+            insert_exact(facade, table, fields)
     assert query(facade, table, 'count') == total
     assert query(facade, table, 'count', table.query().limit(100_000)) == 100_000
-    assert query(facade, table, 'count', table.where(category=9)) == needed
+    assert query(facade, table, 'count', table.where(category=9)) == needed + len(prefix_rows)
     passed('O28', 'large-counts',
            'Both routing pages contributed to a count of 100,001. The explicit limit returned 100,000 and the checked overflow case returned limit_exceeded.')
+    if archive_error is not None:
+        raise archive_error
 
 
 @contextmanager
@@ -1027,7 +1185,7 @@ def main():
             worker_memory=(3584 if paged else 2048) * MIB,
             automatic=dict(shard_target_bytes=8 * MIB, minimum_free_bytes=64 * MIB)
             if args.scenario == 'O21' else None,
-            test_executable=None if args.scenario == 'O21' else args.test_executable,
+            test_executable=args.test_executable,
             test_child='oltp_growth_acceptance::registered_worker_child' if paged else CHILD,
             direct=dict.fromkeys(WORKERS, direct), api_direct=(direct, direct))
         facade = Transactions(cluster, direct)

@@ -9,6 +9,7 @@
 //! Timestamp authority is one shared counter; "the queued path" is
 //! `Routed::Queued`, whose forward marker the tests inspect.
 use super::*;
+use crate::oltp::mvcc::MvccKey;
 use crate::{
     config::WorkerResources,
     oltp::{
@@ -690,7 +691,11 @@ impl Source {
     }
 }
 impl TopologySource for Source {
-    fn table(&self, _table_id: Uuid) -> EndpointFuture<'_, Option<TableFill>> {
+    fn point<'a>(
+        &'a self,
+        _table_id: Uuid,
+        key: Option<&'a Key>,
+    ) -> EndpointFuture<'a, Option<PointFill>> {
         self.table_reads.fetch_add(1, Ordering::SeqCst);
         let mut fills = self.fills.lock().unwrap();
         let fill = if fills.len() > 1 {
@@ -698,7 +703,7 @@ impl TopologySource for Source {
         } else {
             fills.front().cloned()
         };
-        Box::pin(async move { Ok(fill) })
+        Box::pin(async move { Ok(fill.and_then(|fill| fill.select(key))) })
     }
     fn placement<'a>(
         &'a self,
@@ -1030,8 +1035,11 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
         Answer::Data(Value::Null)
     );
     assert_eq!(gateway.stats().not_leader, 1);
-    let table = gateway.cache().get(cluster.table).unwrap();
-    assert_eq!(table.ranges[0].leader_hint(), Some(2));
+    let table = gateway
+        .cache()
+        .get(cluster.table, Some(&Key::Int64(7)))
+        .unwrap();
+    assert_eq!(table.range.leader_hint(), Some(2));
     // A lost reply: the leader committed, the gateway resends the same id
     // and body and gets the original result; one version.
     transport.lose.store(1, Ordering::SeqCst);
@@ -1060,46 +1068,104 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
     cluster.shutdown().await;
 }
 
+/// O28: a point lookup must work past the former 1,024-range fill cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o28_gateway_routes_a_key_past_the_former_table_fill_cap() {
+    let mut cluster = Cluster::new().await;
+    let last = cluster.add_group(span(Some(1025), None), 1026, &[1]).await;
+    let mut fill = cluster.fill(&[last]);
+    let template = fill.shards[0].clone();
+    for end in (1..=1025).rev() {
+        let mut shard = template.clone();
+        shard.group.group_id = Uuid::new_v4();
+        let GroupKind::Data { shard_id, .. } = &mut shard.group.kind else {
+            unreachable!();
+        };
+        *shard_id = Uuid::new_v4();
+        shard.span = span((end > 1).then_some(end - 1), Some(end));
+        fill.shards.insert(0, shard);
+    }
+    let source = Source::new(vec![fill], cluster.voters());
+    let switch = direct_on();
+    let gateway = cluster.gateway(switch.clone(), source.clone(), cluster.transport());
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 1025}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    switch.set_direct_oltp(false);
+    let id = Uuid::new_v4();
+    let update = cluster.body(
+        id,
+        "table.update",
+        json!({"key": 1025, "values": {"value": 1}}),
+    );
+    assert_eq!(answer(&gateway, &update, id).await, Answer::Queued);
+    assert!(cluster.settled(last, 1025, id).await);
+    assert_eq!(source.reads(), (1, 1));
+    cluster.shutdown().await;
+}
+
 /// O28/D07: a cached parent cannot report a newer epoch after its voters
-/// retire. Settle the queued mutation at the child from a refreshed Catalog.
+/// retire. The next exact retry routes directly or settles at the child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn o28_d07_queue_settlement_refreshes_a_retired_split_parent() {
+async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
     let mut cluster = Cluster::new().await;
     let parent = cluster.add_group(span(None, None), 1, &[1]).await;
     let left = cluster.add_group(span(None, Some(5)), 2, &[1]).await;
     let right = cluster.add_group(span(Some(5), None), 2, &[1]).await;
-    let source = Source::new(
-        vec![cluster.fill(&[parent]), cluster.fill(&[left, right])],
-        cluster.voters(),
-    );
-    let transport = cluster.transport();
-    let gateway = cluster
-        .gateway(direct_on(), source.clone(), transport.clone())
-        .with_deadline(Duration::from_secs(2));
-    let id = Uuid::new_v4();
-    let get = cluster.body(id, "table.get", json!({"key": 7}));
-    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
-    assert_eq!(source.reads(), (1, 1));
-    transport
-        .retired
-        .lock()
-        .unwrap()
-        .insert(cluster.shard(parent).group.group_id);
+    for asynchronous in [true, false] {
+        let source = Source::new(
+            vec![cluster.fill(&[parent]), cluster.fill(&[left, right])],
+            cluster.voters(),
+        );
+        let transport = cluster.transport();
+        let gateway = cluster
+            .gateway(direct_on(), source.clone(), transport.clone())
+            .with_deadline(Duration::from_secs(2));
+        let id = Uuid::new_v4();
+        let get = cluster.body(id, "table.get", json!({"key": 7}));
+        assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+        assert_eq!(source.reads(), (1, 1));
+        transport
+            .retired
+            .lock()
+            .unwrap()
+            .insert(cluster.shard(parent).group.group_id);
 
-    let id = Uuid::new_v4();
-    let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
-    let error = gateway.route(&mutation, true).await.err().unwrap();
-    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
-    assert_eq!(error.outcome, Outcome::Unknown);
-    assert_eq!(source.reads(), (1, 1));
+        let id = Uuid::new_v4();
+        let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+        let error = gateway.route(&mutation, asynchronous).await.err().unwrap();
+        // The fixture's retired voters explicitly refuse leadership. A
+        // forward still needs settlement of any prior direct attempt.
+        let expected = if asynchronous {
+            (ErrorCode::OutcomeUnknown, Outcome::Unknown)
+        } else {
+            (ErrorCode::StorageUnavailable, Outcome::NotApplied)
+        };
+        assert_eq!((error.code, error.outcome), expected);
+        assert_eq!(source.reads(), (1, 1));
 
-    assert!(matches!(
-        gateway.route(&mutation, true).await,
-        Ok(Routed::Queued)
-    ));
-    assert_eq!(source.reads(), (2, 2));
-    assert_eq!(answer(&gateway, &mutation, id).await, Answer::Queued);
-    assert_eq!(cluster.latest(right, 0, 7).await.1, None);
+        if asynchronous {
+            assert!(matches!(
+                gateway.route(&mutation, true).await,
+                Ok(Routed::Queued)
+            ));
+            assert_eq!(answer(&gateway, &mutation, id).await, Answer::Queued);
+            assert_eq!(cluster.latest(right, 0, 7).await.1, None);
+        } else {
+            assert_eq!(
+                answer(&gateway, &mutation, id).await,
+                Answer::Data(Value::Null)
+            );
+            let applied = cluster.latest(right, 0, 7).await;
+            assert_eq!(applied.1, Some(json!({"id": 7, "value": 1})));
+            assert_eq!(
+                answer(&gateway, &mutation, id).await,
+                Answer::Data(Value::Null)
+            );
+            assert_eq!(cluster.latest(right, 0, 7).await, applied);
+        }
+        assert_eq!(source.reads(), (2, 2));
+    }
     cluster.shutdown().await;
 }
 
@@ -1413,9 +1479,9 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
     }
     let stats = gateway.stats();
     assert!(stats.stale_routes >= 1, "{stats:?}");
-    // One fill plus exactly one refresh, however many requests saw it.
-    assert_eq!(stats.catalog_reads, 2, "{stats:?}");
-    assert_eq!(source.reads().0, 2);
+    // The pre-split interval and its two children are each read once.
+    assert_eq!(stats.catalog_reads, 3, "{stats:?}");
+    assert_eq!(source.reads().0, 3);
     eprintln!("d07 phase 1: {stats:?}; left leader moved away from node {moved}");
 
     // Phase 2: the split barrier holds the right range. Its requests fall
@@ -1779,15 +1845,19 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
         key_column: "id".into(),
         key_type: ColumnType::Int64,
         schema_epoch: 1,
-        ranges: vec![
-            Arc::new(RangeRoute::new(group(None, Some(10)))),
-            Arc::new(RangeRoute::new(group(Some(10), None))),
-        ],
+        range: Arc::new(RangeRoute::new(group(None, Some(10)))),
+        unavailable: AtomicBool::new(false),
         _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
     };
     let keys = |bytes: &[u8]| {
         let scanned = scan(bytes).unwrap();
-        route_keys(&scanned, &route).map(|k| (k.first, k.anchor, k.one_range))
+        let keys = match scanned.op {
+            Op::Get | Op::Delete | Op::Update => point_key(&scanned)
+                .filter(|key| key.validate(route.key_type).is_ok())
+                .map(RouteKeys::single),
+            _ => row_keys(&scanned, &route),
+        }?;
+        Some((keys.anchor, keys.last))
     };
     let many = body(
         "table.insert_many",
@@ -1795,16 +1865,16 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
     );
     assert_eq!(
         keys(&many),
-        Some((Key::Int64(7), Key::Int64(3), true)),
+        Some((Key::Int64(3), Key::Int64(9))),
         "a nested `id` is not the key"
     );
     let across = body(
         "table.insert_many",
         json!({"rows": [{"id": 12}, {"id": -1}]}),
     );
-    assert_eq!(keys(&across), Some((Key::Int64(12), Key::Int64(-1), false)));
+    assert_eq!(keys(&across), Some((Key::Int64(-1), Key::Int64(12))));
     let upsert = body("table.upsert", json!({"row": {"value": 2, "id": 11}}));
-    assert_eq!(keys(&upsert), Some((Key::Int64(11), Key::Int64(11), true)));
+    assert_eq!(keys(&upsert), Some((Key::Int64(11), Key::Int64(11))));
     // Keys that cannot route: a missing or duplicate key column, the wrong
     // type, a get with values, an update without them.
     for bad in [
@@ -1840,27 +1910,46 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
 }
 
 #[test]
-fn o03_topology_cache_is_a_bounded_lru() {
+fn o28_topology_cache_is_a_byte_bounded_range_lru() {
     let shared = resources();
-    let cache = TopologyCache::new(2);
-    let route = |table_id| {
+    let cache = TopologyCache::new();
+    let table_id = Uuid::new_v4();
+    let route = |lo| {
+        let shard = ShardRoute {
+            group: GroupIdentity {
+                cluster_id: Uuid::new_v4(),
+                database: Text::try_from("t6").unwrap(),
+                group_id: Uuid::new_v4(),
+                kind: GroupKind::Data {
+                    table_id,
+                    shard_id: Uuid::new_v4(),
+                },
+                group_format_version: 1,
+            },
+            span: span(Some(lo), Some(lo + 1)),
+            schema_epoch: 1,
+            routing_epoch: 1,
+        };
         Arc::new(TableRoute {
             table_id,
             key_column: "id".into(),
             key_type: ColumnType::Int64,
             schema_epoch: 1,
-            ranges: Vec::new(),
-            _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
+            range: Arc::new(RangeRoute::new(shard)),
+            unavailable: AtomicBool::new(false),
+            _charge: shared
+                .reserve_scratch(ByteClass::Progress, CACHE_BYTES / 2)
+                .unwrap(),
         })
     };
-    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    cache.insert(route(a));
-    cache.insert(route(b));
-    assert!(cache.get(a).is_some(), "a is now the most recent");
-    cache.insert(route(c));
-    assert_eq!(cache.len(), 2);
-    assert!(cache.get(b).is_none(), "b was least recently used");
-    assert!(cache.get(a).is_some() && cache.get(c).is_some());
+    cache.insert(route(0));
+    cache.insert(route(1));
+    let get = |key| cache.get(table_id, Some(&Key::Int64(key)));
+    assert!(get(0).is_some(), "range 0 is now the most recent");
+    cache.insert(route(2));
+    assert_eq!(cache.usage(), (2, CACHE_BYTES, CACHE_BYTES));
+    assert!(get(1).is_none(), "range 1 was least recently used");
+    assert!(get(0).is_some() && get(2).is_some());
     assert_eq!(mode(false, true), DirectMode::Off);
     assert_eq!(mode(true, false), DirectMode::ForwardOnly);
     assert_eq!(mode(true, true), DirectMode::Direct);

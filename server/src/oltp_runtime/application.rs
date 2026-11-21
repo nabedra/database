@@ -11,7 +11,7 @@ use super::{
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, WorkerSharedResources},
     oltp_replication::{authority::control::ControlClient, multiplex::*, types::*},
-    protocol::{ErrorCode, Outcome, ProtocolError},
+    protocol::{ErrorCode, Key, Outcome, ProtocolError},
     request_queue::RequestRecord,
 };
 use scoped::ScopedRoutes;
@@ -70,6 +70,12 @@ enum Method {
     DirectRoute {
         table_id: Uuid,
     },
+    /// Read one owning range. Older workers reject this variant in preflight.
+    DirectPoint {
+        table_id: Uuid,
+        key_bytes: u64,
+        wide: bool,
+    },
     ScopedSubmit {
         bytes: u64,
         target: ScopedTarget,
@@ -92,7 +98,8 @@ impl Method {
             Self::Submit { .. }
             | Self::Result { .. }
             | Self::ScopedSubmit { .. }
-            | Self::ScopedResult { .. } => Purpose::ApiIngress,
+            | Self::ScopedResult { .. }
+            | Self::DirectPoint { wide: true, .. } => Purpose::ApiIngress,
             _ => Purpose::ApiObservation,
         }
     }
@@ -156,6 +163,15 @@ impl ApplicationEndpoint {
         }
         crate::protocol::json_input(bytes, MAX_HEADER_BYTES).map_err(|_| invalid())?;
         let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+        #[cfg(test)]
+        if matches!(header.method, Method::DirectPoint { .. })
+            && let Some(dir) =
+                std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(std::path::PathBuf::from)
+            && dir.join("reject-direct-point").is_file()
+        {
+            std::fs::write(dir.join("rejected-direct-point"), []).map_err(|_| unavailable())?;
+            return Err(invalid());
+        }
         if session.purpose() != header.method.purpose() {
             return Err(invalid());
         }
@@ -255,6 +271,18 @@ impl Endpoint for ApplicationEndpoint {
                         .authorize_ingress(session.remote(), target, None)
                         .await?;
                     bytes
+                }
+                Method::DirectPoint {
+                    key_bytes, wide, ..
+                } if key_bytes > 0 => {
+                    validate_body_length(key_bytes)?;
+                    if wide {
+                        let runtime = self.runtime.upgrade().ok_or_else(unavailable)?;
+                        runtime.authorize_api(session.remote()).await?;
+                    } else if key_bytes > direct::ROUTE_REPLY_BYTES as u64 {
+                        return Err(invalid());
+                    }
+                    key_bytes
                 }
                 _ => 0,
             };
@@ -416,7 +444,54 @@ impl Endpoint for ApplicationEndpoint {
                         let fill = runtime
                             .direct_table_fill(view.authority.ready.view.authority(), table_id)
                             .await?;
-                        Ok((shared.encode_in(ByteClass::Progress, &fill, 1 << 20)?, None))
+                        Ok((
+                            shared.encode_in(
+                                ByteClass::Progress,
+                                &fill,
+                                direct::ROUTE_REPLY_BYTES,
+                            )?,
+                            None,
+                        ))
+                    }
+                    Method::DirectPoint {
+                        table_id,
+                        key_bytes,
+                        wide,
+                    } => {
+                        let key = if key_bytes == 0 {
+                            ensure_empty(&sections)?;
+                            None
+                        } else {
+                            let body = request_body(key_bytes, &sections)?;
+                            let scratch = crate::oltp::mvcc::json_decode_budget(body.as_ref())?;
+                            Some(
+                                sections
+                                    .reserve_decode(&shared, scratch)?
+                                    .decode::<Key>(0)?,
+                            )
+                        };
+                        let fill = runtime
+                            .direct_point_fill(
+                                view.authority.ready.view.authority(),
+                                table_id,
+                                key.as_deref(),
+                            )
+                            .await?;
+                        let class = if wide {
+                            ByteClass::Data
+                        } else {
+                            ByteClass::Progress
+                        };
+                        let limit = if wide {
+                            WIDE_ROUTE_BYTES
+                        } else {
+                            direct::ROUTE_REPLY_BYTES
+                        };
+                        if !wide && crate::oltp::mvcc::store::encoded_length(&fill, limit).is_err()
+                        {
+                            return Err(wide_route_required());
+                        }
+                        Ok((shared.encode_in(class, &fill, limit)?, None))
                     }
                     Method::ScopedSubmit { .. }
                     | Method::ScopedObserve { .. }
@@ -465,14 +540,63 @@ impl ApplicationClient {
             _metadata: metadata,
         }))
     }
-    /// One Catalog read for the direct-path gateway, served by the owner.
-    pub(crate) async fn direct_table(
+    /// One Catalog point lookup through the ready owner. On a mixed-version
+    /// cluster only the old parser's rejection permits the legacy read.
+    pub(crate) async fn direct_point(
         &self,
         table_id: Uuid,
-    ) -> Result<Option<direct::TableFill>, ProtocolError> {
-        let reply = self.call(Method::DirectRoute { table_id }, None).await?;
-        Ok((*reply.decode_section::<Option<direct::TableFill>>(0)?).clone())
+        key: Option<&Key>,
+    ) -> Result<Option<direct::PointFill>, ProtocolError> {
+        let key_body = key
+            .map(|key| self.shared.encode(key, crate::protocol::MAX_BODY_BYTES))
+            .transpose()?;
+        let key_bytes = key_body.as_ref().map_or(0, |body| body.len() as u64);
+        let wide = key_bytes > direct::ROUTE_REPLY_BYTES as u64;
+        let reply = self
+            .call(
+                Method::DirectPoint {
+                    table_id,
+                    key_bytes,
+                    wide,
+                },
+                key_body.clone(),
+            )
+            .await;
+        let reply = match reply {
+            Err(error) if error == invalid() => {
+                let reply = self.call(Method::DirectRoute { table_id }, None).await?;
+                let fill = self.decode_route::<direct::TableFill>(reply)?;
+                return match fill {
+                    Some(fill) => fill.select(key).map(Some).ok_or_else(unavailable),
+                    None => Ok(None),
+                };
+            }
+            Err(error) if !wide && error == wide_route_required() => {
+                self.call(
+                    Method::DirectPoint {
+                        table_id,
+                        key_bytes,
+                        wide: true,
+                    },
+                    key_body,
+                )
+                .await?
+            }
+            other => other?,
+        };
+        self.decode_route(reply)
     }
+
+    fn decode_route<T: serde::de::DeserializeOwned + Clone>(
+        &self,
+        reply: ReceivedReply,
+    ) -> Result<Option<T>, ProtocolError> {
+        let body = reply.sections[0].as_ref().ok_or_else(invalid)?;
+        let scratch = crate::oltp::mvcc::json_decode_budget(body.as_ref())?;
+        let reply = reply.reserve_decode(&self.shared, scratch)?;
+        Ok((*reply.decode_section::<Option<T>>(0)?).clone())
+    }
+
     async fn call(
         &self,
         method: Method,
@@ -697,6 +821,18 @@ fn verify_response_hash(body: &ChargedBytes, expected: Digest) -> Result<(), Pro
     }
     Ok(())
 }
+// The ingress lane accepts two HTTP bodies plus transport overhead. Two
+// bounds of a range can each be as long as a key accepted at HTTP ingress.
+const WIDE_ROUTE_BYTES: usize = 2 * crate::protocol::MAX_BODY_BYTES + (8 << 10);
+
+fn wide_route_required() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::LimitExceeded,
+        "direct route needs the wide application lane",
+        Outcome::NotApplied,
+    )
+}
+
 fn invalid() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::ValidationError,

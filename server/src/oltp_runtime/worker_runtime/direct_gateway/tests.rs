@@ -291,9 +291,9 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
             .direct_gateway_handle()
             .unwrap()
             .cache()
-            .get(table_id)
+            .get(table_id, Some(&crate::protocol::Key::Int64(7)))
             .unwrap();
-        let range = &route.ranges[0];
+        let range = &route.range;
         let shared = &runtime.services.shared;
         let id = Uuid::new_v4();
         let insert = body(
@@ -796,7 +796,7 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
         // Warm the topology cache and the session.
         assert_eq!(call(&app, get(), true).await.0, 200);
         let gateway = runtime.direct_gateway_handle().unwrap().clone();
-        let done = gateway.stats().direct_done;
+        let before = gateway.stats();
         let shared = runtime.services.shared.clone();
         let jobs = || {
             (
@@ -811,7 +811,10 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
             assert_eq!(envelope["data"]["value"], json!(10), "{envelope}");
         }
         let (query_after, control_after) = jobs();
-        assert_eq!(gateway.stats().direct_done - done, GETS);
+        let after = gateway.stats();
+        assert_eq!(after.direct_done - before.direct_done, GETS);
+        assert_eq!(after.catalog_reads, before.catalog_reads);
+        assert_eq!(after.placement_reads, before.placement_reads);
         eprintln!(
             "perf2b rf1: {GETS} gets took {} Query and {} Control jobs",
             query_after - query,
