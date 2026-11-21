@@ -4,6 +4,7 @@
 # Opt-in checks: put [ci docker], [ci campaign], [ci acceptance], [ci direct], [ci rep1]
 # [ci migrate], [ci live3], [ci live3-fixture], or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
 # [ci rep1] to build the pre-execution worker and test mixed-version enrollment.
+# Add [ci o22] to [ci rep1] for focused O22 acceptance in both modes.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
 # and manifests, and saves it right after its build step, before any test runs, so a failing test
@@ -292,6 +293,15 @@ jobs:
             python3 server/tests/oltp_recovery_operations.py --binary server/target/debug/nabedra-db \
               --test-executable "$test_executable" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || status=1
           done
+          if [[ "${{ contains(github.event.head_commit.message, '[ci o22]') }}" == true ]]; then
+            for mode in on off; do
+              out="$RUNNER_TEMP/o22-$mode"
+              NABEDRA_TEST_DIRECT_OLTP="$mode" python3 scripts/acceptance_oltp.py --scenario O22 \
+                --test-binary "$test_executable" --server-binary server/target/debug/nabedra-db \
+                --output "$out" 2>&1 | tee "oltp-rep1-o22-$mode.log" || status=1
+              cp "$out/O22.log" "oltp-rep1-o22-$mode-assertions.log" || status=1
+            done
+          fi
           if [[ "${{ contains(github.event.head_commit.message, '[ci rep4-mixed]') }}" == true ]]; then
             legacy_base=3b77bced7c8d6aa5decb25e58e5f428b7dc18ce2
             legacy_root="$(mktemp -d "$RUNNER_TEMP/rep4-legacy.XXXXXX")"
