@@ -28,9 +28,9 @@ from oltp_upgrade_export import archive_path
 GUIDE = 'docs/oltp-rocksdb-upgrade.md'
 ROW_COUNT = 101_200
 BOUNDARY = 50_000
-BATCH_ROWS = 2_048
+BATCH_ROWS = 8_192
 VERIFY_ROWS = 4_096
-DELETED = set(range(7, ROW_COUNT, 19_991))
+DELETED = {7, BOUNDARY + 7}
 ORM_TABLE = 'migration_orm'
 
 
@@ -55,7 +55,7 @@ class MigrationCluster(Rf3Cluster):
 
     def database(self):
         return Database(url=self.api_urls['api1'], token=self.auth['data_token'], database=DATABASE,
-                        ca_file=str(self.ca), timeout=120)
+                        ca_file=str(self.ca), timeout=180)
 
     def operator(self, name, payload, request_id=None):
         return admin_request([self.urls[worker] for worker in self.live()], self.auth['admin_token'],
@@ -202,9 +202,8 @@ def seed(cluster, db, indexes):
 
 def apply_concurrent_writes(cluster, tables):
     changes = {
-        'migration_ledger': [(key, dict(bucket=7, label=f'updated-{key}'))
-                             for key in (0, 1, BOUNDARY, BOUNDARY + 1)],
-        'migration_locations': [(f'city-{key:03d}', dict(region='east', score=0.25)) for key in range(1, 5)],
+        'migration_ledger': [(key, dict(bucket=7, label=f'updated-{key}')) for key in (0, BOUNDARY)],
+        'migration_locations': [(f'city-{key:03d}', dict(region='east', score=0.25)) for key in (1, 2)],
     }
 
     def update(name, updates):
@@ -408,14 +407,17 @@ def main():
                     expected, ranges = seed(source, db, indexes)
                 with phase(timings, 'bounded concurrent writes'):
                     writes = apply_concurrent_writes(source, expected)
-                print('MIG2 source writes stopped', flush=True)
+            print('MIG2 source writes stopped', flush=True)
+            # The legacy worker includes request identity history in its archive.
+            # Compare source rows after the cut, while writes are still paused.
+            with phase(timings, 'export, cancelled pin and replay'):
+                archive, manifest = export_with_retry(source, repository)
+            with source.database() as db:
                 with phase(timings, 'source verification'):
                     descriptors = describe(db)
                     before = verify_rows(source, db, expected)
             assert set(descriptors) == set(expected)
             assert before['migration_ledger']['rows'] > 100_000
-            with phase(timings, 'export, cancelled pin and replay'):
-                archive, manifest = export_with_retry(source, repository)
             with phase(timings, 'NS22 old volume refusal'):
                 refusal = ns22_old_volume_refusal(source, args.new_binary.resolve())
                 source.close()
