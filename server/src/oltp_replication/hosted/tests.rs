@@ -1157,3 +1157,23 @@ mod replicated;
 
 mod kv_crash;
 mod transient;
+
+/// PERF2b: the inline digest of a small entry hashes the same bytes as the
+/// native job's `serialized_digest`, and an entry over the bound goes to the
+/// native job instead (`None`).
+#[test]
+fn d01_perf2b_inline_digest_equals_the_native_digest() {
+    let small = serde_json::json!({"id": 1, "tag": "é𝄞", "values": [1, 2, 3]});
+    assert_eq!(
+        bounded_digest(&small, INLINE_BYTES).unwrap().unwrap(),
+        serialized_digest(&small).unwrap()
+    );
+    let exact = serde_json::to_vec(&small).unwrap().len();
+    assert_eq!(
+        bounded_digest(&small, exact).unwrap().unwrap(),
+        serialized_digest(&small).unwrap()
+    );
+    assert!(bounded_digest(&small, exact - 1).is_none());
+    let large = serde_json::json!({"blob": "x".repeat(INLINE_BYTES)});
+    assert!(bounded_digest(&large, INLINE_BYTES).is_none());
+}

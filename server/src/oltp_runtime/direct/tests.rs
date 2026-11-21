@@ -2276,8 +2276,9 @@ async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
     cluster.shutdown().await;
 }
 
-/// D01 (PERF2b item 1): the leader's barrier check, epochs, dedup lookup and
-/// newest version come from one Query-class native job. Before, a get took
+/// D01 (PERF2b items 1 and 2): the leader's barrier check, epochs, dedup
+/// lookup and newest version come from one Query-class native job, and a
+/// small entry's apply takes one job instead of four. Before, a get took
 /// four jobs (two Control, two Query).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d01_perf2b_leader_reads_share_one_native_job() {
@@ -2351,9 +2352,16 @@ async fn d01_perf2b_leader_reads_share_one_native_job() {
     );
     // These counts include replication (AppendEntries encodes and replies),
     // index reads and the append, so only the change is asserted. Measured
-    // on this fixture: base 139 Control jobs for 20 updates (about 7 each).
-    // Per update, the reads lose the attempt's epochs read and the
-    // barrier's applied read.
+    // on this fixture: base 439 Query and 139 Control jobs for 20 updates
+    // (about 22 and 7 each), PERF2b 360 and 102 (18 and 5). Per update, the
+    // reads lose the dedup and latest jobs and the epochs and barrier
+    // applied reads, and gain the snapshot; the apply loses its digest,
+    // reply budget and reply decode jobs.
+    assert!(
+        query_after - query <= 20 * ROUNDS + SLACK,
+        "Query jobs for {ROUNDS} updates: {}",
+        query_after - query
+    );
     assert!(
         control_after - control <= 6 * ROUNDS + SLACK,
         "Control jobs for {ROUNDS} updates: {}",
