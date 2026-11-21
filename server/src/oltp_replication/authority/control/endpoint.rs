@@ -1440,7 +1440,11 @@ impl ControlClient {
         }
     }
 
-    fn validate_read_reply(&self, reply: &ReceivedReply, worker: Uuid) -> Result<(), ProtocolError> {
+    fn validate_read_reply(
+        &self,
+        reply: &ReceivedReply,
+        worker: Uuid,
+    ) -> Result<(), ProtocolError> {
         if reply.remote_identity().worker_id != worker
             || reply.group() != &self.group
             || reply.purpose() != Purpose::Authority
@@ -1511,7 +1515,10 @@ impl ControlClient {
             .encode_in(ByteClass::Progress, &request, HEADER_LIMIT)?;
         let mut voters = Vec::new();
         while let Some(worker) = self.routes.next(voters.last().copied())? {
-            if worker.is_nil() || voters.last().is_some_and(|after| worker <= *after) || voters.len() == 5 {
+            if worker.is_nil()
+                || voters.last().is_some_and(|after| worker <= *after)
+                || voters.len() == 5
+            {
                 return Err(invalid("invalid Control revocation voters"));
             }
             voters.push(worker);
@@ -1520,13 +1527,24 @@ impl ControlClient {
             return Err(unavailable());
         }
         let quorum = voters.len() / 2 + 1;
+        let _call = crate::oltp_runtime::stage_timing::json_variant(
+            "control.quorum_read.",
+            header.as_slice(),
+        )
+        .timer();
+        let rpc = crate::oltp_runtime::stage_timing::json_variant(
+            "control.quorum_rpc.",
+            header.as_slice(),
+        );
         let mut requests = FuturesUnordered::new();
         for voter in voters {
             let header = header.clone();
             requests.push(async move {
-                let reply = self.client.request_authority_dependency(
-                    &self.group, voter, header, 64 << 10,
-                ).await?;
+                let _rpc = rpc.timer();
+                let reply = self
+                    .client
+                    .request_authority_dependency(&self.group, voter, header, 64 << 10)
+                    .await?;
                 self.validate_read_reply(&reply, voter)?;
                 Ok::<bool, ProtocolError>(*reply.decode_section::<bool>(0)?)
             });
@@ -1542,7 +1560,9 @@ impl ControlClient {
                 }
             }
             Err(unavailable())
-        }).await.map_err(|_| unavailable())?
+        })
+        .await
+        .map_err(|_| unavailable())?
     }
 
     pub(crate) async fn group(&self, group_id: Uuid) -> Result<ReceivedReply, ProtocolError> {

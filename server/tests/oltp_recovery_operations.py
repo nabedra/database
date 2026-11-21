@@ -321,7 +321,41 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                 return json.loads(result.read_text()) if result.exists() else None
             return wait_for(observed, f'old certificate {phase} replacement', PROBE_WINDOW)
 
+        if variant == 'data-trust':
+            def quorum_rpcs():
+                stats = json.loads((data_peer_dir / 'stats.json').read_text())
+                return sum(stage['count'] for name, stage in stats.items()
+                           if name.startswith('control.quorum_rpc.'))
+            rpcs_before = quorum_rpcs()
+            window_started = time.monotonic()
         assert old_certificate_observation('before') == [True] * len(targets)
+        if variant == 'data-trust':
+            time.sleep(0.5)  # the listener rewrites stats.json every 100 ms
+            rpcs = quorum_rpcs() - rpcs_before
+            window = time.monotonic() - window_started
+            latency = json.loads((old_probe_dir / 'probe-before-latency.json').read_text())
+
+            def percentiles(samples):
+                ordered = sorted(samples)
+                return (round(ordered[len(ordered) // 2] / 1000, 3),
+                        round(ordered[min(len(ordered) - 1, len(ordered) * 99 // 100)] / 1000, 3))
+            data_only = latency[identity['worker_id']]
+            control_host = latency[targets[0]['worker_id']]
+            exchanges = sum(len(samples) + 2 for samples in latency.values())
+            # D01/O17 (REP6): the Data-only listener's Control reads follow its
+            # refresh interval (1 s, one read per Control voter), never the
+            # number of inbound exchanges.
+            budget = 3 * (int(window) + 3)
+            observations = dict(
+                exchanges=exchanges, data_only_exchanges=len(data_only) + 2,
+                control_quorum_rpcs=rpcs, budget=budget, window_seconds=round(window, 3),
+                data_only_p50_ms=percentiles(data_only)[0], data_only_p99_ms=percentiles(data_only)[1],
+                control_host_p50_ms=percentiles(control_host)[0],
+                control_host_p99_ms=percentiles(control_host)[1])
+            print(json.dumps(dict(measurement='REP6 Data-only exchange gate', **observations),
+                             sort_keys=True), flush=True)
+            assert rpcs <= budget, observations
+            report('D01/O17 Data-only listener per-exchange Control budget', **observations)
         stopped_at = time.monotonic()
         cluster.workers[victim].kill()
         mount = Path(cluster.config[victim]['node']['directory'])
