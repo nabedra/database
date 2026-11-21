@@ -86,31 +86,6 @@ impl ControlMachine {
                             )? {
                                 operators.push(worker.enrollment);
                             }
-                            revoked.push(decode::<WorkerIdentity>(bytes)?);
-                            next = Some(key.to_vec());
-                            Ok(())
-                        },
-                    )?;
-                    if page.exhausted {
-                        break;
-                    }
-                    after = next;
-                }
-                let mut operators = Vec::new();
-                let group =
-                    super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;
-                if let Some(group) = group {
-                    let mut members = Vec::new();
-                    view.scan_page(&member_prefix(group.generation), None, 16, |_, bytes| {
-                        members.push(decode::<ReplicaMember>(bytes)?);
-                        Ok(())
-                    })?;
-                    for member in members {
-                        if let Some(worker) = super::super::service::load::<WorkerRecord>(
-                            view,
-                            &key(WORKERS, member.worker_id),
-                        )? {
-                            operators.push(worker.enrollment);
                         }
                     }
                     let hardened = view.get(system_recovery::HARDENING)?.is_some();

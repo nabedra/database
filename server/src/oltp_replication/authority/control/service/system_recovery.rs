@@ -241,25 +241,33 @@ impl ControlHandle {
         manager: &HostedGroupManager,
         next: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        if !self
-            .registered_directory
-            .get()
-            .is_some_and(|directory| directory.replacement_capability_active())
-        {
+        if self.registered_directory.get().is_none() {
             return Ok(());
         }
-        if self.replacement_capability(HARDENING).await?.is_some() {
+        let raw = self
+            .read(|view| {
+                let hardening = view.get(HARDENING)?.is_some();
+                let execution = view.get(EXECUTION)?.is_some();
+                let preparation = view.get(ACTIVATION)?.is_some();
+                view.encode(&(hardening, execution, preparation))
+            })
+            .await?;
+        let (hardening, execution, preparation): (bool, bool, bool) =
+            machine::decode(raw.as_ref())?;
+        if hardening {
             manager
                 .verify_recovery_hardening(self.identity(), next)
                 .await
-        } else if self.system_replacement_execution().await?.is_some() {
+        } else if execution {
             manager
                 .verify_recovery_execution(self.identity(), next)
                 .await
-        } else {
+        } else if preparation {
             manager
                 .verify_recovery_capability(self.identity(), next)
                 .await
+        } else {
+            Ok(())
         }
     }
 
@@ -287,7 +295,7 @@ impl ControlHandle {
     pub(crate) async fn check_replacement_mount(
         &self,
         proof: &ReplacementMountProof,
-    ) -> Result<(ReplacementRecord, bool), ProtocolError> {
+    ) -> Result<bool, ProtocolError> {
         let proof = proof.clone();
         let scope = self.identity().clone();
         let raw = self
@@ -311,7 +319,7 @@ impl ControlHandle {
                 {
                     return Err(unauthorized());
                 }
-                view.encode(&(record, mounted))
+                view.encode(&mounted)
             })
             .await?;
         machine::decode(raw.as_ref())

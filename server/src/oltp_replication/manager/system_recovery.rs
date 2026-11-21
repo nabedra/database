@@ -640,12 +640,9 @@ impl QuorumEndpoint {
         retained: bool,
     ) -> Result<bool, ProtocolError> {
         let control = &self.control;
-        let (record, mounted) = control.check_replacement_mount(&proof).await?;
+        let mounted = control.check_replacement_mount(&proof).await?;
         if mounted && !retained {
             return Err(mounted_conflict());
-        }
-        if proof.worker != WorkerIdentity::from(&record.intent.next) {
-            return Err(invalid());
         }
         Ok(mounted)
     }

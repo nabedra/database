@@ -23,6 +23,7 @@ pub(crate) use direct::{DIRECT_VERSION, DirectActivation, DirectCapability, Dire
 pub(crate) use group_damage::{
     GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,
     GroupDamageReport, PoolRefusal, DirectCapabilityDamageGate,
+    MAX_ACTIVE_REPLACEMENTS as MAX_ACTIVE_DAMAGE_REPLACEMENTS,
 };
 #[allow(unused_imports)]
 pub(crate) use group_damage::{GroupDamageGate, GroupDamagePhase};
@@ -56,10 +57,6 @@ pub(crate) use system_recovery::{
     HARDENING_CAPABILITY as SYSTEM_REPLACEMENT_HARDENING,
     MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup, ReplacementIntent,
     ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
-};
-pub(crate) use worker_drain::{EksReplacementAction, EksReplacementPermit, SignedEksReplacement};
-pub(crate) use worker_drain::{
-    WorkerCloseAttestation, WorkerDrainIntent, WorkerDrainPhase, WorkerDrainRecord,
 };
 #[cfg(test)]
 mod tests;

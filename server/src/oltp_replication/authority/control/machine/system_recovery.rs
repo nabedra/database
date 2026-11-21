@@ -223,6 +223,11 @@ pub(super) fn apply(
             }
             if *hardening {
                 save(tx, HARDENING, &position)?;
+                if let Some(record) = unmounted_execution(tx)?
+                    && record.intent.run_id != state.ready.view.run_id
+                {
+                    retire(tx, &record)?;
+                }
             }
             Ok(ControlReply::SystemReplacementEnabled(position))
         }
@@ -337,12 +342,23 @@ fn retire(tx: &mut GroupTransaction<'_>, record: &ReplacementRecord) -> Result<(
     Ok(())
 }
 
-pub(super) fn retire_on_cold_fence(tx: &mut GroupTransaction<'_>) -> Result<(), ProtocolError> {
-    if tx.get(HARDENING)?.is_some()
-        && tx.get(ACTIVE)?.is_none()
+fn unmounted_execution(
+    tx: &mut GroupTransaction<'_>,
+) -> Result<Option<ReplacementRecord>, ProtocolError> {
+    if tx.get(ACTIVE)?.is_none()
         && let Some(id) = load::<Uuid>(tx, PREPARING)?
     {
-        let record = load::<ReplacementRecord>(tx, &by_id(id))?.ok_or_else(unknown)?;
+        return load::<ReplacementRecord>(tx, &by_id(id))?
+            .ok_or_else(unknown)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+pub(super) fn retire_on_cold_fence(tx: &mut GroupTransaction<'_>) -> Result<(), ProtocolError> {
+    if tx.get(HARDENING)?.is_some()
+        && let Some(record) = unmounted_execution(tx)?
+    {
         retire(tx, &record)?;
     }
     Ok(())

@@ -290,10 +290,6 @@ impl AppliedPeerDirectory {
             .is_ok_and(|revoked| !revoked.workers.is_empty())
     }
 
-    pub(crate) fn replacement_capability_active(&self) -> bool {
-        self.system.read().is_ok_and(|system| system.is_some())
-    }
-
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
         if !self.trust_available()
             || self.denied(identity.worker_id, Some(identity.certificate_sha256))
