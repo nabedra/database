@@ -126,7 +126,8 @@ def main():
     assert acceptance.run('docker', 'context', 'show').strip() == 'desktop-linux'
     evidence.record('docker-checks', scenario=args.scenario, server_source=args.revision,
                     sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest())
-    with acceptance.lane(args.lane, evidence):
+    label = 'LIVE3 BENCH' if args.scenario in ('cache-pair', 'cache') else 'LIVE3 Docker'
+    with acceptance.lane(args.lane, evidence, label):
         if args.scenario == 'olap':
             return container('olap', args, evidence, [], PYTHON, '''
                 cp /nabedra-db /tmp/nabedra-db

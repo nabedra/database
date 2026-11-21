@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from csi import CSI_LIMIT, ZONES, ZONE_LABEL, driver_for, manifests
+from csi import CSI_LIMIT, ZONES, ZONE_LABEL, documents, driver_for, manifests
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / 'server/tests'))
@@ -27,6 +27,7 @@ from oltp_recovery_operations import (TRANSPORT_ERRORS, create, get, initial_ran
 
 NODE_IMAGE = 'kindest/node:v1.34.11@sha256:44e222ee2132dab25ff87301682f89eb82c7880ea3a1bf543bfe9708fd08d67d'
 NS = 'live3'
+RAWFILE = 'rawfile.csi.openebs.io'
 PORT = 8080
 POOL = '/pool'
 EXTRA = '/extra'
@@ -59,7 +60,7 @@ class Evidence:
 
 
 @contextmanager
-def lane(lock, evidence):
+def lane(lock, evidence, label="LIVE3 kind (not BENCH)"):
     deadline = time.monotonic() + 3600
     while True:
         try:
@@ -74,7 +75,7 @@ def lane(lock, evidence):
             time.sleep(30)
     owner = lock / 'owner'
     try:
-        owner.write_text(f'LIVE3 kind (not BENCH) {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n')
+        owner.write_text(f'{label} {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n')
         evidence.record('docker-lane', status='acquired')
         yield
     finally:
@@ -84,9 +85,9 @@ def lane(lock, evidence):
 
 
 class Kind:
-    def __init__(self, root, evidence):
+    def __init__(self, root, evidence, rawfile=None):
         self.name = 'nabedra-live3-' + uid()[:8]
-        self.root, self.evidence = root, evidence
+        self.root, self.evidence, self.rawfile = root, evidence, rawfile
         self.kubeconfig = root / 'kubeconfig'
         self.kubectl = ('kubectl', '--kubeconfig', str(self.kubeconfig), '--request-timeout=20s')
         self.control = self.name + '-control-plane'
@@ -119,10 +120,16 @@ class Kind:
                       if ZONE_LABEL in node['metadata']['labels']}
         assert set(self.nodes) == set(ZONES) and len(nodes) == 4, self.nodes
         self.evidence.file('kind-nodes.txt', self.kube('get', 'nodes', '-o', 'wide', '-L', ZONE_LABEL))
-        self.apply(*manifests(csi_source))
-        for zone in ZONES:
-            self.kube('rollout', 'status', f'statefulset/csi-hostpathplugin-{zone}',
-                      '--timeout=180s', timeout=200)
+        if self.rawfile:
+            definitions = [item for item in documents(self.rawfile) if item]
+            self.apply(*definitions)
+            targets = [f"{item['kind'].lower()}/{item['metadata']['name']}" for item in definitions
+                       if item['kind'] in ('DaemonSet', 'Deployment')]
+        else:
+            self.apply(*manifests(csi_source))
+            targets = [f'statefulset/csi-hostpathplugin-{zone}' for zone in ZONES]
+        for target in targets:
+            self.kube('rollout', 'status', target, '--timeout=180s', timeout=200)
         self.evidence.file('csi-ready.txt', self.kube('get', 'csidriver,csinode,storageclass', '-o', 'wide'))
 
     def load(self, engine, binary, test_executable=None):
@@ -141,9 +148,12 @@ class Kind:
     def watch_memory(self, stop):
         while not stop.is_set():
             try:
-                memory = run('docker', 'exec', self.control, 'cat', '/proc/meminfo', timeout=10)
+                memory = run('docker', 'exec', self.control, 'cat', '/proc/meminfo', timeout=10, check=False)
+                if memory.returncode:
+                    stop.wait(3)
+                    continue
                 fields = dict((label, int(value)) for label, value in
-                              re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)', memory, re.M))
+                              re.findall(r'^(MemTotal|MemAvailable):\s+(\d+)', memory.stdout, re.M))
                 used = (fields['MemTotal'] - fields['MemAvailable']) * 1024
                 if self.peak is None or used > self.peak:
                     self.peak = used
@@ -171,8 +181,20 @@ class Kind:
             self.evidence.file(f'{name}.log', result.stdout + result.stderr)
 
     def close(self):
-        result = run('kind', 'delete', 'cluster', '--name', self.name, '--kubeconfig', str(self.kubeconfig),
-                     timeout=100, check=False)
+        if self.rawfile and self.kubeconfig.exists():
+            for spec in ('statefulset,pod', 'pvc'):
+                try:
+                    result = self.in_namespace('delete', spec, '--all', '--timeout=55s',
+                                               timeout=60, check=False)
+                    output = result.stdout + result.stderr
+                except subprocess.TimeoutExpired as error:
+                    output = str(error)
+                self.evidence.file(f'rawfile-delete-{spec}.txt', output)
+        command = ('kind', 'delete', 'cluster', '--name', self.name, '--kubeconfig', str(self.kubeconfig))
+        try:
+            result = run(*command, timeout=100, check=False)
+        except subprocess.TimeoutExpired as error:
+            result = subprocess.CompletedProcess(command, 124, '', str(error))
         remaining = run('docker', 'ps', '-aq', '--filter', f'label=io.x-k8s.kind.cluster={self.name}').split()
         if remaining:
             run('docker', 'rm', '-f', '-v', *remaining)
@@ -189,7 +211,7 @@ class Kind:
 class Forward:
     def __init__(self, cluster, pod, path):
         self.log = path.open('w+')
-        self.process = subprocess.Popen((*cluster.kubectl, '-n', NS, 'port-forward',
+        self.process = subprocess.Popen((*cluster.kubectl[:-1], '-n', NS, 'port-forward',
                                          f'pod/{pod}', f':{PORT}', '--address=127.0.0.1'),
                                         stdout=self.log, stderr=subprocess.STDOUT)
         try:
@@ -233,6 +255,7 @@ class Oltp(Rf3Cluster):
         self.zone = dict(zip(WORKERS, ZONES))
         self.pvcs = {}
         self.volume_markers = {}
+        self.growth_policy = None
 
     def certificate(self, name, node_port=None):
         # Retain REP1's pinned TLS identities. mTLS peers use StatefulSet DNS
@@ -267,7 +290,8 @@ class Oltp(Rf3Cluster):
 
     def claim(self, name, zone, capacity):
         return object_meta('PersistentVolumeClaim', name,
-                           spec=dict(accessModes=['ReadWriteOncePod'], storageClassName=f'live3-{zone}',
+                           spec=dict(accessModes=['ReadWriteOncePod'],
+                                     storageClassName='rawfile-localpv' if self.cluster.rawfile else f'live3-{zone}',
                                      resources={'requests': {'storage': capacity}}))
 
     def secret(self, name, config, *, label_primary=False, label_extra=False):
@@ -278,6 +302,11 @@ class Oltp(Rf3Cluster):
             request_id = self.gated['request_id']
             files['gates.json'] = json.dumps({request_id: 'queued'})
             files['inspect.json'] = json.dumps([request_id])
+            rolling = config['node'].get('rolling')
+            if rolling:
+                preparation = rolling['preparation_id']
+                files['rolling-test-id'] = preparation
+                files['gates.json'] = json.dumps({request_id: 'queued', preparation: 'rolling_copy_complete'})
         if name == 'api':
             files['supervised_api.py'] = (HERE / 'supervised_api.py').read_text()
         for label, active in [('primary', label_primary), ('extra', label_extra)]:
@@ -315,7 +344,8 @@ class Oltp(Rf3Cluster):
             volumes.append(dict(name='barrier', emptyDir={}))
             pod['initContainers'][0]['volumeMounts'].append(barrier)
             pod['initContainers'][0]['command'][2] += (
-                'if [ -f /config/gates.json ]; then cp /config/gates.json /config/inspect.json /barrier/; fi\n')
+                'if [ -f /config/gates.json ]; then cp /config/gates.json /config/inspect.json /barrier/; fi\n'
+                'if [ -f /config/rolling-test-id ]; then cp /config/rolling-test-id /barrier/; fi\n')
             pod['containers'][0].update(command=['oltp-test', '--exact', CHILD, '--ignored', '--nocapture'],
                 env=[dict(name='NABEDRA_OLTP_TEST_REGISTERED_CONFIG', value=f'/config/{name}.json'),
                      dict(name='NABEDRA_OLTP_TEST_BARRIER_DIR', value='/barrier')])
@@ -444,9 +474,6 @@ class Oltp(Rf3Cluster):
     def pod(self, name):
         return self.cluster.obj('pod', f'{name}-0')
 
-    def claims(self, names):
-        return {name: self.cluster.obj('pvc', name) for name in names}
-
     def attachments(self, claim):
         volume = claim['spec']['volumeName']
         return [item for item in self.cluster.obj('volumeattachment', namespaced=False)['items']
@@ -459,26 +486,36 @@ class Oltp(Rf3Cluster):
         pod = self.pod(name)
         node = self.cluster.nodes[self.zone[name]]
         assert pod['spec']['nodeName'] == node, pod['spec']['nodeName']
-        assert volume['spec']['csi']['driver'] == driver_for(self.zone[name]), volume['spec']['csi']
+        driver = RAWFILE if self.cluster.rawfile else driver_for(self.zone[name])
+        assert volume['spec']['csi']['driver'] == driver, volume['spec']['csi']
         assert volume['spec']['claimRef']['uid'] == claim['metadata']['uid'], volume['spec']['claimRef']
         attachments = self.attachments(claim)
-        assert len(attachments) == 1 and attachments[0]['status']['attached'], attachments
-        assert attachments[0]['spec']['nodeName'] == node, attachments
+        attachment = None
+        if self.cluster.rawfile:
+            assert not attachments, attachments
+        else:
+            assert len(attachments) == 1 and attachments[0]['status']['attached'], attachments
+            assert attachments[0]['spec']['nodeName'] == node, attachments
+            attachment = attachments[0]['metadata']['uid']
         endpoint = POOL if label == 'primary' else EXTRA
         mapping = next(line for line in self.exec(name, 'cat', '/proc/self/mountinfo').splitlines()
                        if line.split()[4] == endpoint)
         return dict(claim=claim_name, pvc_uid=claim['metadata']['uid'], pod_uid=pod['metadata']['uid'],
                     pv=volume['metadata']['name'], handle=volume['spec']['csi']['volumeHandle'],
                     node=node, zone=self.zone[name], mount=mapping,
-                    attachment_uid=attachments[0]['metadata']['uid'])
+                    attachment_uid=attachment, driver=driver)
 
     def exec(self, name, *args):
         return self.cluster.in_namespace('exec', f'{name}-0', '-c', name, '--', *args)
 
+    def wait_pod_removed(self, name, timeout=80):
+        wait_for(lambda: not self.cluster.in_namespace('get', f'pod/{name}-0',
+                  '--ignore-not-found').strip(), f'{name} Pod removed', timeout)
+
     def remove(self, name, claim):
         self.disconnect(name)
         self.cluster.in_namespace('scale', f'statefulset/{name}', '--replicas=0')
-        self.cluster.in_namespace('wait', f'pod/{name}-0', '--for=delete', '--timeout=75s', timeout=85)
+        self.wait_pod_removed(name)
         wait_for(lambda: not self.attachments(claim), f'{name} CSI detach', 75)
 
     def reprepare(self, name):
@@ -523,9 +560,10 @@ class Oltp(Rf3Cluster):
         self.cluster.in_namespace('exec', '-i', f'{name}-0', '-c', name, '--',
                                   'tee', f'/barrier/{file}', input=json.dumps(value))
 
-    def accepted_copy(self, name):
+    def accepted_copy(self, name, *, at_join=False):
         request_id = self.gated['request_id']
-        self.stats(name)  # The test instrumentation reads the live RAM replica.
+        if not at_join:
+            self.stats(name)  # The test instrumentation reads the live RAM replica.
         captured = json.loads(self.exec(name, 'cat', f'/barrier/record-{request_id}.json'))
         assert captured['accepted'] and json.loads(captured['body']) == self.gated, captured
         assert captured['run_id'] == self.run_id and captured['worker']['incarnation'] == self.identity(name)['incarnation']
@@ -550,6 +588,26 @@ class Oltp(Rf3Cluster):
         self.cluster.evidence.record('R03/Q03 accepted complete replicas before fault', owner=name,
                                      copies={worker: self.accepted_copy(worker) for worker in WORKERS})
         return name
+
+    def joined_before_ready(self, name):
+        preparation = self.config[name]['node']['rolling']['preparation_id']
+
+        def checkpoint():
+            return self.cluster.in_namespace('exec', f'pod/{name}-0', '-c', name, '--',
+                'test', '-f', f'/barrier/reached-{preparation}', check=False).returncode == 0
+
+        wait_for(checkpoint, 'replacement reached its complete queue copy before publishing readiness', 115)
+        copy = self.accepted_copy(name, at_join=True)
+        assert copy['state'] == 'queued', copy
+        proof = json.loads(self.exec(name, 'cat', '/barrier/rolling-copy.json'))
+        assert proof['statement']['ticket']['target'] == self.identity(name), proof
+        for survivor in WORKERS:
+            if survivor != name:
+                _, ready = self.worker(survivor, '/health/ready')
+                assert ready['ready_workers'] == 2 and ready['run_id'] == self.run_id, ready
+        self.cluster.evidence.record('R03/Q03 complete queue copy before readiness', worker=name, copy=copy,
+                                     statement=proof['statement'])
+        self.exec(name, 'touch', f'/barrier/release-{preparation}')
 
     def release_request(self):
         request_id = self.gated['request_id']
@@ -641,10 +699,11 @@ class Traffic:
             if self.stop.is_set():
                 return
             body = insert(self.table, key, key * 3)
+            started = time.monotonic()
             _, status, reply = self.invoke('write', '/v1/operations', body)
             if status == 200:
                 assert reply == {'request_id': body['request_id'], 'data': None}, reply
-            self.writes.append((body, reply if status == 200 else None))
+            self.writes.append((body, reply if status == 200 else None, started))
             self.stop.wait(0.2)
 
     def read_load(self):
@@ -681,7 +740,7 @@ class Traffic:
 
     def finish(self):
         expected = []
-        for body, reply in self.writes:
+        for body, reply, _ in self.writes:
             row = body['payload']['row']
             if reply is not None:
                 # Check persistence before retrying so replay cannot repair a lost acknowledgment.
@@ -713,8 +772,9 @@ class Traffic:
                                                      order_by=dict(column='id', desc=False)))
         rows = success(*self.op(operation('query.collect', query)))
         assert rows == sorted(expected, key=lambda row: row['id']), (len(rows), len(expected))
+        assert success(*self.op(operation('query.count', query))) == len(expected)
         self.evidence.record('O17/O18 row and receipt oracle', exact_rows=len(rows),
-                             acknowledged_direct=sum(reply is not None for _, reply in self.writes),
+                             acknowledged_direct=sum(reply is not None for _, reply, _ in self.writes),
                              originally_accepted_receipts=accepted, retried_receipts=len(self.receipts) - accepted)
 
 
@@ -724,15 +784,14 @@ def zone_loss(topology, traffic, name='w1'):
     node = old['node']
     traffic.evidence.record('O18 zone-stop-issued', zone=old['zone'], node=node)
     started = time.monotonic()
-    write_offset = len(traffic.writes) + 1  # Exclude the request already in flight.
     run('docker', 'stop', '--time=0', node, timeout=30)
     down = time.monotonic()
     topology.disconnect(name)
     try:
         wait_for(lambda: next((sample for sample in traffic.read_times if sample > down), None),
                  'verified independent read while zone down', 65)
-        wait_for(lambda: any(reply is not None and body['payload']['row']['id'] > 0
-                             for body, reply in traffic.writes[write_offset:]),
+        wait_for(lambda: any(reply is not None and attempt_started > down
+                             for _, reply, attempt_started in traffic.writes),
                  'acknowledged write while zone down', 65)
         first = next(sample for sample in traffic.read_times if sample > down)
         last = max(sample for sample in traffic.read_times if sample < started)
@@ -741,21 +800,69 @@ def zone_loss(topology, traffic, name='w1'):
                                  first_read_after_stop_seconds=round(first - down, 3),
                                  read_completion_gap_seconds=round(first - last, 3))
         if topology.gated:
-            traffic.evidence.record('R02/R03/Q03 complete copies while zone down',
+            traffic.evidence.record('R03/Q03 complete copies while zone down',
                                     copies={other: topology.accepted_copy(other) for other in WORKERS if other != name})
         cluster.in_namespace('scale', f'statefulset/{name}', '--replicas=0')
         identity = topology.reprepare(name)
     finally:
         run('docker', 'start', node, timeout=40)
     cluster.kube('wait', f'node/{node}', '--for=condition=Ready', '--timeout=120s', timeout=130)
-    cluster.in_namespace('wait', f'pod/{name}-0', '--for=delete', '--timeout=95s', timeout=105)
+    topology.wait_pod_removed(name, timeout=100)
     topology.launch_worker(name)
+    if topology.gated:
+        topology.joined_before_ready(name)
     topology.verify_replacement(name, old, identity)
     if topology.gated:
-        restored = topology.accepted_copy(name)
-        assert restored['state'] == 'queued', restored
-        traffic.evidence.record('R03/Q03 queued copy on rescheduled worker', worker=name, copy=restored)
         topology.release_request()
+
+
+def refuse_second_writer(topology, name='w1'):
+    cluster = topology.cluster
+    volume = topology.verify_volume(name)
+    claim = volume['claim']
+    probe = object_meta('Pod', 'second-writer', spec=dict(
+        restartPolicy='Never', nodeSelector={ZONE_LABEL: volume['zone']},
+        containers=[dict(name='writer', image=topology.image, command=['sh','-ec','echo exclusive > /probe/fail'],
+                         volumeMounts=[dict(name='pvc', mountPath='/probe')])],
+        volumes=[dict(name='pvc', persistentVolumeClaim={'claimName': claim})]))
+    cluster.apply(probe)
+    try:
+        pod = cluster.obj('pod', 'second-writer')
+
+        def denied():
+            events = cluster.obj('events')['items']
+            return next((item for item in events if item['reason'] == 'FailedScheduling'
+                         and item['involvedObject'].get('uid') == pod['metadata']['uid']
+                         and 'ReadWriteOncePod' in item.get('message', '')
+                         and 'in-use' in item.get('message', '')), None)
+
+        event = wait_for(denied, 'ReadWriteOncePod rejected a second writer', 25)
+        assert cluster.obj('pod', 'second-writer')['status']['phase'] == 'Pending'
+        cluster.evidence.record('O18 one-writer PVC', primary=volume, denial=event['message'])
+    finally:
+        cluster.in_namespace('delete', 'pod/second-writer', '--wait=false')
+
+
+def growth_claim(topology, name, action, pool_id, generation, provider_volume, *, worker=None):
+    identity = worker or topology.identity(name)
+    claim_id = uid()
+    if topology.growth_policy is None:
+        topology.growth_policy = dict(policy_id=uid(), volume_cost_per_gib=0, worker_cost=0,
+            initial_monthly_spend=0, monthly_spend_ceiling=0, max_attempts=2, cooldown_seconds=1,
+            max_volume_bytes=1 << 40, zones=list(ZONES),
+            initial_replica_zones={topology.enrollments[worker]['worker_id']: topology.zone[worker]
+                                   for worker in WORKERS})
+        topology.admin('storage.growth.configure', {'policy': topology.growth_policy}, worker=name)
+    intent = dict(policy_id=topology.growth_policy['policy_id'], claim_id=claim_id, worker=identity,
+                  pool_id=pool_id, pool_generation=generation, quoted_monthly_cost=0,
+                  monthly_spend_ceiling=0, max_attempts=2, cooldown_seconds=1, action=action)
+    claimed = topology.admin('storage.growth.claim', {'intent': intent}, worker=name, request_id=claim_id)
+    assert claimed['phase'] == 'claimed' and claimed['mounted_total_bytes'] is None, claimed
+    topology.admin('storage.growth.attempt', {'claim_id': claim_id}, worker=name)
+    provisioned = {'claim_id': claim_id, 'resource_id': provider_volume}
+    reported = topology.admin('storage.growth.provisioned', provisioned, worker=name)
+    assert reported['phase'] == 'awaiting_mount' and reported['mounted_total_bytes'] is None, reported
+    return claim_id
 
 
 def pvc_resize(topology, traffic, name='w2'):
@@ -776,18 +883,49 @@ def pvc_resize(topology, traffic, name='w2'):
     initial_df = df()
     initial_pod = before['pod_uid']
     assert capacity() == '1Gi'
+    primary = topology.config[name]['node']['mount']
+    pool_id = primary['identity']['pool_id']
+    worker = topology.identity(name)
+    inventory = topology.admin('storage.growth.inventory', {}, worker=name)
+    observed = next(item for item in inventory['pools'] if item['pool_id'] == pool_id)
+    requested = observed['observed_total_bytes'] + (512 << 20)
+    claim_id = growth_claim(topology, name, dict(kind='expand', worker=worker['worker_id'],
+        pool=pool_id, target_bytes=requested), pool_id, primary['generation'], primary['provider_volume_id'])
+    request = operation('storage.growth.mounted', {'claim_id': claim_id})
+    status, body = topology.worker(name, CLUSTER_ADMIN, request, admin=True)
+    assert status in (409, 503), (status, body)
+    cluster.evidence.record('O27 premature growth is refused', status=status, response=body,
+                            claim=claim_id, requested_bytes=requested,
+                            observed_total_bytes=observed['observed_total_bytes'])
     # Discard the first accepted provider reply and retry the exact mutation.
     set_size('2Gi')
     set_size('2Gi')
     wait_for(lambda: capacity() == '2Gi', 'CSI controller and node expand PVC status', 120)
     after = topology.verify_volume(name)
-    assert after == before, (before, after)
+    for key in ('pod_uid', 'pvc_uid', 'pv', 'handle', 'node', 'attachment_uid'):
+        assert after[key] == before[key], (key, before, after)
     resized_df = df()
     physical_change = int(resized_df.split()[1]) - int(initial_df.split()[1])
     cluster.evidence.record('O27 PVC resize and replay', pvc=before['claim'], pod_uid=initial_pod,
                             pvc_uid=before['pvc_uid'], initial_capacity='1Gi', resized_capacity='2Gi',
                             initial_df=initial_df, resized_df=resized_df, filesystem_delta_kib=physical_change)
 
+    if cluster.rawfile:
+        assert physical_change > 900_000, (initial_df, resized_df)
+        request_id = uid()
+        payload = {'claim_id': claim_id}
+        finished = topology.admin('storage.growth.mounted', payload, worker=name, request_id=request_id)
+        assert finished['phase'] == 'complete' and finished['mounted_total_bytes'] >= requested, finished
+        assert topology.admin('storage.growth.mounted', payload, worker=name, request_id=request_id) == finished
+        cluster.evidence.record('O27 runtime expansion completed and replayed', claim=finished)
+        return
+    assert physical_change == 0, (initial_df, resized_df)
+    refused = topology.worker(name, CLUSTER_ADMIN,
+        operation('storage.growth.mounted', {'claim_id': claim_id}), admin=True)
+    assert refused[0] in (409, 503), refused
+    record = topology.admin('storage.growth.status', {'claim_id': claim_id}, worker=name)
+    assert record['phase'] == 'awaiting_mount' and record['mounted_total_bytes'] is None, record
+    cluster.evidence.record('O27 CSI metadata did not advertise runtime growth', claim=record)
     set_size('11Gi')
 
     def failed_event():
@@ -853,36 +991,51 @@ def additional_pool(topology, name='w3'):
     assert attached['node'] == old['node']
     cluster.evidence.record('O27 secondary PVC attached', volume=attached, primary=old)
 
-    policy_id, claim_id = uid(), uid()
-    policy = dict(policy_id=policy_id, volume_cost_per_gib=0, worker_cost=0,
-                  initial_monthly_spend=0, monthly_spend_ceiling=0, max_attempts=2,
-                  cooldown_seconds=1, max_volume_bytes=10 << 30, zones=list(ZONES),
-                  initial_replica_zones={topology.enrollments[worker]['worker_id']: topology.zone[worker]
-                                         for worker in WORKERS})
-    topology.admin('storage.growth.configure', {'policy': policy}, worker=name)
-    intent = dict(policy_id=policy_id, claim_id=claim_id, worker=identity, pool_id=pool_id,
-                  pool_generation=1, quoted_monthly_cost=0, monthly_spend_ceiling=0, max_attempts=2,
-                  cooldown_seconds=1, action=dict(kind='add_pool', worker=identity['worker_id'],
-                                                  zone=topology.zone[name], bytes=1 << 30))
-    claimed = topology.admin('storage.growth.claim', {'intent': intent}, worker=name, request_id=claim_id)
-    assert claimed['phase'] == 'claimed' and claimed['mounted_total_bytes'] is None, claimed
-    topology.admin('storage.growth.attempt', {'claim_id': claim_id}, worker=name)
-    reported = topology.admin('storage.growth.provisioned',
-                              {'claim_id': claim_id, 'resource_id': mount['provider_volume_id']}, worker=name)
-    assert reported['phase'] == 'awaiting_mount' and reported['mounted_total_bytes'] is None, reported
+    wanted = 896 << 20
+    action = dict(kind='add_pool', worker=identity['worker_id'], zone=topology.zone[name], bytes=wanted)
+    claim_id = growth_claim(topology, name, action, pool_id, 1, mount['provider_volume_id'])
     before = topology.admin('storage.growth.inventory', {}, worker=name)
     assert all(pool['pool_id'] != pool_id for pool in before['pools']), before
     body = {'claim_id': claim_id, 'mount': mount}
     request_id = uid()
     ready = topology.admin('storage.growth.mounted', body, worker=name, request_id=request_id)
-    assert ready['phase'] == 'complete' and ready['mounted_total_bytes'] >= intent['action']['bytes'], ready
+    assert ready['phase'] == 'complete' and ready['mounted_total_bytes'] >= wanted, ready
     assert topology.admin('storage.growth.mounted', body, worker=name, request_id=request_id) == ready
     after = topology.admin('storage.growth.inventory', {}, worker=name)
     assert sum(pool['pool_id'] == pool_id for pool in after['pools']) == 1, after
-    assert len(after['backing_filesystems']) == len(before['backing_filesystems']) == 1, (before, after)
-    assert after['total_available_bytes'] == after['backing_filesystems'][0]['available_bytes'], after
+    assert len(before['backing_filesystems']) == 1, before
+    assert len(after['backing_filesystems']) == (2 if cluster.rawfile else 1), after
+    assert after['total_available_bytes'] == sum(item['available_bytes'] for item in after['backing_filesystems'])
     cluster.evidence.record('O27 runtime pool readiness and lost reply', pool=pool_id, claim=ready,
-                            shared_backing_filesystem=True, before_inventory=before, after_inventory=after)
+                            shared_backing_filesystem=not cluster.rawfile,
+                            before_inventory=before, after_inventory=after)
+    if cluster.rawfile:
+        exhaust_new_pool(topology, name, pool_id)
+
+
+def exhaust_new_pool(topology, name, pool_id):
+    def capacity():
+        inventory = topology.admin('storage.growth.inventory', {}, worker=name)
+        return next(pool['observed_available_bytes'] for pool in inventory['pools'] if pool['pool_id'] == pool_id)
+
+    initial = capacity()
+    # Only the isolated, newly opened pool is filled. It holds no Data replicas.
+    assert 0 < initial < 1 << 30, initial
+    path = f'{EXTRA}/live3-filler'
+    free_kib = int(topology.exec(name, 'df', '-kP', EXTRA).splitlines()[-1].split()[3])
+    try:
+        topology.exec(name, 'fallocate', '-l', str((free_kib - 64) * 1024), path)
+        remaining = capacity()
+        assert remaining < 2 << 20, remaining
+        status = topology.cluster.in_namespace('exec', f'{name}-0', '-c', name, '--',
+            'fallocate', '-l', '128MiB', path + '-overflow', check=False)
+        assert status.returncode != 0 and 'No space left on device' in status.stderr, status.stderr
+        topology.cluster.evidence.record('O27 mounted pool exhausted', pool=pool_id,
+                                         initial_bytes=initial, remaining_bytes=remaining,
+                                         write_error=status.stderr.strip())
+    finally:
+        topology.exec(name, 'rm', '-f', path, path + '-overflow')
+    assert capacity() >= initial - (2 << 20)
 
 
 def oltp(cluster, binary, image, scenario, test_executable):
@@ -897,15 +1050,20 @@ def oltp(cluster, binary, image, scenario, test_executable):
         groups = [initial_range(topology, table) for table in (traffic.table, traffic.probe_table)]
         placements = [topology.admin('storage.replica.placement', {'group': group}) for group in groups]
         with traffic.load():
+            if scenario == 'scale':
+                from oltp_scale import scale
+                scale(topology, growth_claim, run, traffic)
             if scenario in ('all', 'lifecycle'):
+                refuse_second_writer(topology)
                 victim = topology.hold_request(traffic) if test_executable else 'w1'
                 zone_loss(topology, traffic, victim)
                 for name in WORKERS:
                     topology.replace_worker(name, delete_pod=name == 'w1')
             if scenario in ('all', 'storage'):
-                pvc_resize(topology, traffic)
-                provision_failure(topology)
                 additional_pool(topology)
+                pvc_resize(topology, traffic)
+                if not cluster.rawfile:
+                    provision_failure(topology)
         traffic.finish()
         if test_executable:
             for name in WORKERS:
@@ -927,10 +1085,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path)
     parser.add_argument('--test-executable', type=Path)
+    parser.add_argument('--revision', help='Source SHA for the CI release binary')
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--csi-source', required=True, type=Path)
+    driver = parser.add_mutually_exclusive_group(required=True)
+    driver.add_argument('--csi-source', type=Path)
+    driver.add_argument('--rawfile-manifest', type=Path)
     parser.add_argument('--lane', required=True, type=Path)
-    parser.add_argument('--scenario', choices=('all', 'lifecycle', 'storage', 'preflight'), default='all')
+    parser.add_argument('--scenario', choices=('all', 'lifecycle', 'storage', 'scale', 'preflight'), default='all')
     args = parser.parse_args()
     if args.scenario != 'preflight' and not args.binary:
         parser.error('--binary is required for OLTP scenarios')
@@ -950,31 +1111,29 @@ def main():
     evidence.record('host', context='desktop-linux', docker_disk='/Volumes/ZX20/Docker/vms/0/data/Docker.raw',
                     kernel=run('uname', '-a').strip(), docker=run('docker', 'version', '--format', '{{.Server.Version}}').strip(),
                     kind=run('kind', 'version').strip(), source=run('git', 'rev-parse', 'HEAD').strip(),
-                    server_sha256=binary_sha, test_executable_sha256=test_sha,
-                    scenario=args.scenario)
+                    server_source=args.revision, server_sha256=binary_sha, test_executable_sha256=test_sha,
+                    scenario=args.scenario, csi='openebs-rawfile' if args.rawfile_manifest else 'hostpath')
     with tempfile.TemporaryDirectory(prefix='nabedra-live3-') as scratch:
-        cluster = Kind(Path(scratch), evidence)
+        cluster = Kind(Path(scratch), evidence, args.rawfile_manifest)
         with lane(args.lane, evidence):
             signal.alarm(50 * 60)
+            stop = threading.Event()
+            observer = threading.Thread(target=cluster.watch_memory, args=(stop,))
+            observer.start()
             try:
                 cluster.start(args.csi_source)
                 if args.scenario == 'preflight':
                     evidence.record('kind CSI preflight', status='passed', zones=cluster.nodes)
                     return
                 image = cluster.load('oltp', args.binary, args.test_executable)
-                stop = threading.Event()
-                observer = threading.Thread(target=cluster.watch_memory, args=(stop,))
-                observer.start()
-                try:
-                    oltp(cluster, args.binary, image, args.scenario, args.test_executable)
-                finally:
-                    stop.set()
-                    observer.join(timeout=25)
+                oltp(cluster, args.binary, image, args.scenario, args.test_executable)
             except Exception as error:
                 evidence.record('session-failed', type=type(error).__name__, message=str(error))
                 raise
             finally:
                 signal.alarm(0)
+                stop.set()
+                observer.join(timeout=25)
                 try:
                     if cluster.kubeconfig.exists():
                         cluster.diagnostics()
