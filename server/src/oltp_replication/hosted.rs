@@ -611,6 +611,10 @@ pub(crate) fn batched_config(
     config.api_batch_capacity = Some(MAX_APPEND_ENTRIES as u64);
     config.api_channel_size = Some(64);
     config.api_batch_linger_ms = Some(0);
+    // RD1: lease reads (Timestamp `AllocateDirect`, direct gets and the
+    // direct leader's reads) check the lease on the caller's task. Only
+    // `ReadPolicy::LeaseRead` uses it; ReadIndex keeps the quorum round.
+    config.enable_local_lease_read = Some(true);
     config
         .validate()
         .map(Arc::new)
@@ -829,6 +833,14 @@ where
             }
         })
     }
+    fn lease_read_position(&self) -> ConsensusFuture<'_, AppliedPosition> {
+        Box::pin(async move {
+            match self.read_position(ReadPolicy::LeaseRead).await {
+                Ok(position) => Ok(position),
+                Err(_) => self.read_position(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
     fn current_leader(&self) -> Option<u64> {
         use openraft::type_config::async_runtime::watch::WatchReceiver;
         // A stopped core's metrics may still name a leader (RV-APPLY F4).
@@ -858,13 +870,48 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    /// `read_barrier`'s Raft half: the index a read must have applied. The
-    /// caller checks it against its own snapshot (`lease_read_index`).
-    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+    /// RD1: `policy`'s linearizer once this replica applied its read index.
+    ///
+    /// A lease read checks the leader lease on the calling task, against the
+    /// leader state openraft publishes (`enable_local_lease_read`, set in
+    /// [`batched_config`]), with no round trip through the RaftCore task. The
+    /// lease and its length are the core path's: openraft publishes the
+    /// committed index before it dispatches the apply, and clears the state
+    /// before the node gives up leadership. A missing or expired lease takes
+    /// the core path, which refuses a stale lease; ReadIndex always confirms
+    /// through the core with a quorum round. Both then wait until this
+    /// replica's state machine applied the read index.
+    async fn linearized(
+        &self,
+        policy: ReadPolicy,
+    ) -> Result<openraft::raft::linearizable_read::LinearizeState<C>, ProtocolError> {
         let lease = matches!(policy, ReadPolicy::LeaseRead);
+        let failed = |error: &dyn std::fmt::Display| {
+            tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
+            unavailable()
+        };
+        let raft: &HostRaft<C, M> = &self.raft;
+        let linearizer = raft
+            .get_local_read_linearizer(policy)
+            .await
+            .map_err(|error| failed(&error))?;
+        linearizer
+            .await_ready(raft)
+            .await
+            .map_err(|error| failed(&error))
+    }
+    /// Counts one linearizable read of `policy` and times it under `lease`
+    /// or `index` (data, timestamp, metadata).
+    fn read_timer(
+        &self,
+        policy: &ReadPolicy,
+        lease: [&'static str; 3],
+        index: [&'static str; 3],
+    ) -> crate::oltp_runtime::stage_timing::Timer {
+        let leased = matches!(policy, ReadPolicy::LeaseRead);
         let kind = self.state.store().identity().kind.clone();
         crate::oltp_runtime::stage_timing::variant(
-            if lease {
+            if leased {
                 "raft.lease_read_by_kind."
             } else {
                 "raft.read_index_by_kind."
@@ -872,71 +919,72 @@ where
             &kind,
         )
         .record(std::time::Duration::ZERO);
-        let _timer = crate::oltp_runtime::stage_timing::by_kind(
-            &kind,
-            if lease {
-                [
-                    "raft.data.lease_index",
-                    "raft.ts.lease_index",
-                    "raft.meta.lease_index",
-                ]
-            } else {
-                [
-                    "raft.data.read_index_only",
-                    "raft.ts.read_index_only",
-                    "raft.meta.read_index_only",
-                ]
-            },
-        )
-        .timer();
-        let barrier = self
-            .raft
-            .ensure_linearizable(policy)
-            .await
-            .map_err(|error| {
-                tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
-                unavailable()
-            })?;
-        Ok(barrier.index())
+        crate::oltp_runtime::stage_timing::by_kind(&kind, if leased { lease } else { index })
+            .timer()
+    }
+    /// `read_barrier`'s Raft half: the index a read must have applied. The
+    /// caller checks it against its own snapshot (`lease_read_index`).
+    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+        let _timer = self.read_timer(
+            &policy,
+            [
+                "raft.data.lease_index",
+                "raft.ts.lease_index",
+                "raft.meta.lease_index",
+            ],
+            [
+                "raft.data.read_index_only",
+                "raft.ts.read_index_only",
+                "raft.meta.read_index_only",
+            ],
+        );
+        Ok(self.linearized(policy).await?.read_log_id().index())
+    }
+    /// RD1: the barrier's applied position from openraft's applied log id
+    /// instead of a store read. `await_ready` returned only once the state
+    /// machine applied the read index, and the machine applies an entry's
+    /// effects before openraft records it as applied, so every effect up to
+    /// the returned position is visible to the caller's in-memory reads.
+    async fn read_position(&self, policy: ReadPolicy) -> Result<AppliedPosition, ProtocolError> {
+        let _timer = self.read_timer(
+            &policy,
+            [
+                "raft.data.lease_position",
+                "raft.ts.lease_position",
+                "raft.meta.lease_position",
+            ],
+            [
+                "raft.data.read_position",
+                "raft.ts.read_position",
+                "raft.meta.read_position",
+            ],
+        );
+        let state = self.linearized(policy).await?;
+        let required = state.read_log_id().index();
+        match state.applied() {
+            Some(applied) if applied.index >= required => Ok(position(*applied)),
+            applied => {
+                tracing::error!(group=%self.state.store().identity().group_id,node=self.state._resident.node_id(),?applied,required,"typed lease read applied below its read index");
+                Err(unavailable())
+            }
+        }
     }
     async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
         {
-            let lease = matches!(policy, ReadPolicy::LeaseRead);
-            let kind = self.state.store().identity().kind.clone();
-            crate::oltp_runtime::stage_timing::variant(
-                if lease {
-                    "raft.lease_read_by_kind."
-                } else {
-                    "raft.read_index_by_kind."
-                },
-                &kind,
-            )
-            .record(std::time::Duration::ZERO);
-            let _timer = crate::oltp_runtime::stage_timing::by_kind(
-                &kind,
-                if lease {
-                    [
-                        "raft.data.lease_read",
-                        "raft.ts.lease_read",
-                        "raft.meta.lease_read",
-                    ]
-                } else {
-                    [
-                        "raft.data.read_index",
-                        "raft.ts.read_index",
-                        "raft.meta.read_index",
-                    ]
-                },
-            )
-            .timer();
-            let barrier = self
-                .raft
-                .ensure_linearizable(policy)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
-                    unavailable()
-                })?;
+            let _timer = self.read_timer(
+                &policy,
+                [
+                    "raft.data.lease_read",
+                    "raft.ts.lease_read",
+                    "raft.meta.lease_read",
+                ],
+                [
+                    "raft.data.read_index",
+                    "raft.ts.read_index",
+                    "raft.meta.read_index",
+                ],
+            );
+            let barrier = *self.linearized(policy).await?.read_log_id();
             let applied = self
                 .state
                 .store()
