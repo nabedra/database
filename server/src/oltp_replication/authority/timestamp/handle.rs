@@ -720,11 +720,10 @@ impl TimestampHandle {
             .map(|_| ())
     }
 
-    pub(crate) async fn verify_snapshot_policy(
+    pub(crate) async fn verify_unscoped_bind_pin(
         &self,
         identity: PinIdentity,
         pin: StoragePin,
-        scope: Option<ScopedAdmission>,
     ) -> Result<(), ProtocolError> {
         self.consensus.ensure_linearizable().await?;
         self.machine
@@ -737,8 +736,13 @@ impl TimestampHandle {
                     .ok_or_else(unknown)?;
                 if record.identity != identity
                     || record.pin != pin
-                    || record.reservation.scoped != scope
-                    || record.purpose != PinPurpose::Application
+                    || record.reservation.scoped.is_some()
+                    || !matches!(
+                        record.purpose,
+                        PinPurpose::Application
+                            | PinPurpose::IndexMetadata { .. }
+                            | PinPurpose::ImportMetadata { .. }
+                    )
                 {
                     return Err(invalid());
                 }

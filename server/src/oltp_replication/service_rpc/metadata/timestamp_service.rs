@@ -758,9 +758,9 @@ impl TimestampEndpoint {
                 pin,
                 request,
             } => {
-                // The pin's policy is immutable once allocated.
+                // Application, index and import use this unscoped bind.
                 self.handle
-                    .verify_snapshot_policy(identity.clone(), pin, None)
+                    .verify_unscoped_bind_pin(identity.clone(), pin)
                     .await?;
                 self.handle
                     .bind_snapshot_context(view, identity, pin, request)
