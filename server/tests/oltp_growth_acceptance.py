@@ -23,7 +23,7 @@ from oltp_direct_cluster import CHILD, MIB, WORKERS, Rf3Cluster, call, operation
 from oltp_recovery_operations import (
     TRANSPORT_ERRORS, initial_range, restart_during_split, retained_config, success, two_ready, wait_for,
 )
-from oltp_transaction_acceptance import OPERATIONS, Transactions, batch, passed
+from oltp_transaction_acceptance import OPERATIONS, REQUESTS, Transactions, batch, passed
 
 ADMIN = '/v1/cluster/operations'
 
@@ -166,13 +166,25 @@ def queue_owner(facade, table, expected, scan=None):
     return owner
 
 
+def admit_during_transition(facade, body):
+    def accepted():
+        status, reply = facade.api('api1', REQUESTS, body, timeout=15)
+        if status in (429, 503, 504):
+            return None
+        assert status == 202 and reply['run_id'] == facade.cluster.run_id, (status, reply)
+        assert reply['request_id'] == body['request_id'], reply
+        return reply
+
+    wait_for(accepted, 'same-ID queue admission through a route change', 90)
+
+
 def admit_stale_update(facade, table, key, value):
     body = operation('table.update', dict(table_id=table.id, key=key, values=dict(value=value)))
     request_id = body['request_id']
     for worker in WORKERS:
         facade.gate(worker, request_id, 'queued')
     facade.watch_record(request_id)
-    facade.admit(body)
+    admit_during_transition(facade, body)
     return request_id
 
 
@@ -883,7 +895,7 @@ def o28(facade):
     old_id = old['request_id']
     facade.select(old_id, {'snapshot': True})
     facade.watch_record(old_id)
-    facade.admit(old)
+    admit_during_transition(facade, old)
     owner, ts = facade.reached(old_id, 'snapshot')
     barrier = cluster.barrier_dir(owner)
     wait_for(lambda: (barrier / f'reached-{stale_id}').is_file(),
@@ -893,12 +905,13 @@ def o28(facade):
     pause.touch()
 
     try:
-        facade.release(old_id, 'snapshot')
+        reached = facade.paths(old_id, 'snapshot', workers=(owner,))[0]
+        reached.with_name(f'release-{reached.stem}').touch()
         wait_for(lambda: (barrier / f'routing-page-{ts}.reached').is_file(),
                  'scan consumed the first Catalog page', 45)
         next_split()
         extra = row(key(1), category=8, value=-1)
-        table.insert(extra)
+        insert_exact(facade, table, [extra])
         assert_stale_update_rejected(facade, stale_id)
         records = facade.records(old_id)
         survivors = stop_worker(cluster, owner)
@@ -907,25 +920,28 @@ def o28(facade):
         assert all(records[name]['context'] == records[owner]['context'] for name in survivors), records
         unauthorized = facade.receipt(old_id, token='x' * 43)
         assert unauthorized[0] in (401, 403), unauthorized
+        expected = [rows[0], extra, *rows[1:]]
+        assert read_after_transition(facade, facade.query(table), timeout=30) == expected
+        facade.release(old_id, 'snapshot')
         facade.terminal(old_id, rows, timeout=120)
         launch_retained(cluster, owner, retained_config(cluster, owner, survivors))
     finally:
         pause.unlink(missing_ok=True)
 
-    check_plan(table.query().explain(), 130, 2)
-    expected = [rows[0], extra, *rows[1:]]
+    explain = operation('query.explain', dict(table_id=table.id, query=table.query()._to_wire()))
+    check_plan(read_after_transition(facade, explain, timeout=30), 130, 2)
     assert query(facade, table) == expected
     assert query(facade, table, expression=table.where(category=7)) == rows
     assert query(facade, table, 'count') == len(expected)
     for index in (0, 1, 127, 128, 129):
         assert get(facade, table, rows[index]['id']) == rows[index]
+    passed('O28', 'interruption-and-pins',
+           'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
     archive_routes(cluster, table, routes)
     passed('O28', 'exact-paged-coverage', 'Scans and the verified archive covered two Catalog pages in routing order. Every interval, indexed row and split boundary matched the oracle.')
     passed('O28', 'no-logical-metadata-cap', 'One table retained 130 routes, and its two current routing archive frames exceeded 64 KiB in aggregate with its index and exact query results intact.')
     pending_clause('O28', 'bounded-authenticated-pagination',
                    'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. A tampered internal continuation was not exercised.')
-    passed('O28', 'interruption-and-pins',
-           'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
     count_overflow(facade, table, rows[1]['id'])
     assert query(facade, table, 'count') == len(expected)
 

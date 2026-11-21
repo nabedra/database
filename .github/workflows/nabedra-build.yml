@@ -707,16 +707,22 @@ jobs:
           retention-days: 14
 
   direct-growth:
-    name: ${{ matrix.scenario }} growth acceptance, direct_oltp on/off
+    name: ${{ matrix.scenario }} growth acceptance, direct_oltp ${{ matrix.mode || 'on/off' }}
     if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
-        scenario: [O16, O21, O26, O28]
+        scenario: [O16, O21, O26]
+        include:
+          - scenario: O28
+            mode: 'on'
+          - scenario: O28
+            mode: 'off'
     env:
       SCENARIO: ${{ matrix.scenario }}
+      MODES: ${{ matrix.mode || 'on off' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -752,12 +758,12 @@ jobs:
             cargo build --locked --no-default-features --features oltp --bin nabedra-db
             echo "NABEDRA_BIN=$PWD/target/debug/nabedra-db" >> "$GITHUB_ENV"
           fi
-      - name: Run the selected scenario in both modes
+      - name: Run the selected scenario
         run: |
           status=0
           limit=600
           if [ "$SCENARIO" = O21 ] || [ "$SCENARIO" = O28 ]; then limit=3600; fi
-          for mode in on off; do
+          for mode in $MODES; do
             echo "direct_oltp=$mode"
             rc=0
             NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
@@ -769,7 +775,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: direct-growth-${{ matrix.scenario }}
+          name: direct-growth-${{ matrix.scenario }}${{ matrix.mode && format('-{0}', matrix.mode) || '' }}
           path: artifacts/acceptance-*
           retention-days: 14
 
