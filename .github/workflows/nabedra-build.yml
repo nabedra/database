@@ -615,6 +615,41 @@ jobs:
           echo "NABEDRA_DIRECT_OFF_BINARY=$PWD/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           (cd orm/typescript && npm ci --no-audit --no-fund && npm run build)
           mkdir -p artifacts
+      - name: Build the OLAP server for engine parity
+        id: build-olap
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap \
+            --bin nabedra-db --target-dir server/target/olap
+      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
+        id: acceptance
+        if: ${{ !cancelled() && steps.build-olap.outcome == 'success' }}
+        run: |
+          python -m unittest discover -s scripts -p test_acceptance_oltp.py
+          status=0
+          for mode in on off; do
+            echo "direct_oltp=$mode"
+            rc=0
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
+              --category compatibility --category queries --category transactions --category recovery --category growth \
+              --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
+            # Exit 2 allows incomplete scenarios outside the required RF3 transaction cases.
+            if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
+            if ! jq -e '[.results[] | select(.scenario == "O07" or .scenario == "O10")]
+                        | length == 2 and all(.[]; .status == "passed")' \
+              "artifacts/acceptance-$mode/results.json" > /dev/null; then
+              echo "O07 and O10 must pass with direct_oltp=$mode"
+              status=1
+            fi
+          done
+          exit "$status"
+      - if: ${{ failure() && steps.acceptance.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-acceptance-failure
+          path: artifacts/acceptance-*
+          retention-days: 14
       - name: D01-D12 and U01 on real processes
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -641,34 +676,6 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
-      - name: Build the OLAP server for engine parity
-        id: build-olap
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap \
-            --bin nabedra-db --target-dir server/target/olap
-      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
-        if: ${{ !cancelled() && steps.build-olap.outcome == 'success' }}
-        run: |
-          python -m unittest discover -s scripts -p test_acceptance_oltp.py
-          status=0
-          for mode in on off; do
-            echo "direct_oltp=$mode"
-            rc=0
-            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
-              --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
-              --category compatibility --category queries --category transactions --category recovery --category growth \
-              --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
-            # Exit 2 allows incomplete scenarios outside the required RF3 transaction cases.
-            if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
-            if ! jq -e '[.results[] | select(.scenario == "O07" or .scenario == "O10")]
-                        | length == 2 and all(.[]; .status == "passed")' \
-              "artifacts/acceptance-$mode/results.json" > /dev/null; then
-              echo "O07 and O10 must pass with direct_oltp=$mode"
-              status=1
-            fi
-          done
-          exit "$status"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
