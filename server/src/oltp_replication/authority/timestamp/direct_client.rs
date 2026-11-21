@@ -14,7 +14,8 @@
 //! caller, as an `Unknown` outcome.
 //!
 //! A worker that hosts a Timestamp replica tries it in process first. Only the
-//! leader can answer. On any local failure, or when the local attempt misses
+//! leader can answer, so the replica is skipped while its own Raft names
+//! another leader (PERF2a). On any local failure, or when the local attempt misses
 //! `LOCAL_DEADLINE`, the client uses the remote route and skips the local
 //! replica for `LOCAL_BACKOFF`. The deadline matters when the local node
 //! passes its read barrier and is then partitioned mid-`ReserveWindow`: its
@@ -257,7 +258,7 @@ impl Inner {
     async fn call(&self, count: u64) -> Result<DirectTimestampRange, ProtocolError> {
         let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.client.call").timer();
         self.calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(local) = &self.local {
+        if let Some(local) = self.local.as_ref().filter(|local| local.may_answer()) {
             let skip = self
                 .local_skip_until
                 .lock()

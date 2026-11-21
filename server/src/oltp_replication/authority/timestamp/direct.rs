@@ -132,6 +132,12 @@ pub(crate) trait DirectTimestampGate: Send + Sync {
 /// Timestamp handle (only succeeds on the leader) or the remote client.
 pub(crate) trait DirectTimestampSource: Send + Sync {
     fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange>;
+    /// False when this source knows it cannot answer now: an in-process
+    /// replica whose Raft names another node as leader (PERF2a). A routing
+    /// hint only; a true answer still needs the leader's lease barrier.
+    fn may_answer(&self) -> bool {
+        true
+    }
 }
 
 /// The part of the durable Timestamp state whose change invalidates a window.
@@ -570,6 +576,14 @@ impl TimestampHandle {
 impl DirectTimestampSource for TimestampHandle {
     fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
         Box::pin(TimestampHandle::allocate_direct(self, count))
+    }
+    /// A follower would fail the lease read and then a ReadIndex: two Raft
+    /// core round trips per call. Skip it while it names another leader.
+    fn may_answer(&self) -> bool {
+        match (self.consensus.current_leader(), self.consensus.local_node()) {
+            (Some(leader), Some(node)) => leader == node,
+            _ => true,
+        }
     }
 }
 

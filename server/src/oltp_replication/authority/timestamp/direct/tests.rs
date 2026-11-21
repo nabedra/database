@@ -189,6 +189,14 @@ fn not_leader() -> ProtocolError {
     )
 }
 impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
+    /// The modelled leader, for the in-process leader hint (PERF2a).
+    fn current_leader(&self) -> Option<u64> {
+        let log = self.cluster.log.try_lock().ok()?;
+        Some(log.leader as u64 + 1)
+    }
+    fn local_node(&self) -> Option<u64> {
+        Some(self.node as u64 + 1)
+    }
     fn propose(
         &self,
         command: OwnedCommand<TimestampCommand>,
@@ -586,6 +594,8 @@ struct Source {
     held: AtomicBool,
     fail: AtomicBool,
     panic: AtomicBool,
+    /// What `may_answer` reports (PERF2a).
+    leads: AtomicBool,
     entered: AtomicUsize,
     /// The task each call ran on (PERF2a).
     tasks: Mutex<Vec<Option<tokio::task::Id>>>,
@@ -599,6 +609,7 @@ impl Source {
             held: AtomicBool::new(held),
             fail: AtomicBool::new(false),
             panic: AtomicBool::new(false),
+            leads: AtomicBool::new(true),
             entered: AtomicUsize::new(0),
             tasks: Mutex::new(Vec::new()),
         })
@@ -626,6 +637,49 @@ impl DirectTimestampSource for Source {
             Ok(range)
         })
     }
+    fn may_answer(&self) -> bool {
+        self.leads.load(Ordering::SeqCst)
+    }
+}
+
+/// PERF2a: an in-process replica that names another leader is not called,
+/// so a follower worker pays no failed lease read and ReadIndex per call.
+/// Once it leads again it is called first, without waiting for a backoff.
+#[tokio::test]
+async fn o09_perf2a_colocated_follower_is_skipped_by_its_leader_hint() {
+    let local = Source::new(false);
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::new(Some(local.clone()), remote.clone());
+    local.leads.store(false, Ordering::SeqCst);
+    for _ in 0..3 {
+        client.commit_ts().await.unwrap();
+    }
+    assert_eq!(local.entered.load(Ordering::SeqCst), 0);
+    assert_eq!(remote.calls().len(), 3);
+    local.leads.store(true, Ordering::SeqCst);
+    client.commit_ts().await.unwrap();
+    assert_eq!(client.local_calls(), 1);
+    assert_eq!(remote.calls().len(), 3);
+}
+
+/// PERF2a: the real handle's hint follows its Raft leader.
+#[tokio::test]
+async fn o09_d06_perf2a_handle_leader_hint_follows_elections() {
+    let cluster = Cluster::new(2).await;
+    let handles: Vec<_> = (0..2).map(|node| cluster.handle(node)).collect();
+    initialize(&handles[0]).await;
+    assert!(handles[0].may_answer());
+    cluster.elect(1).await;
+    let watch = || async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handles[0].may_answer() || !handles[1].may_answer() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader hints follow the election")
+    };
+    watch().await;
 }
 async fn until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
