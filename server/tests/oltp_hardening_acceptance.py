@@ -131,8 +131,15 @@ def run_concurrently(fixture, requests):
     def call(api, body):
         start.wait(timeout=10)
         invoked = time.monotonic_ns()
-        response = exchange(fixture, body, api)
-        return invoked, time.monotonic_ns(), body, response
+        for attempt in range(5):
+            response = exchange(fixture, body, api)
+            status, reply = response
+            if status != 429:
+                return invoked, time.monotonic_ns(), body, response
+            assert reply['request_id'] == body['request_id'], response
+            assert reply['error']['code'] == 'overloaded' and reply['error']['outcome'] == 'not_applied', response
+            time.sleep(.05 * (attempt + 1))
+        raise AssertionError(f'pre-admission retries exhausted for {body}: {response}')
 
     with ThreadPoolExecutor(max_workers=len(requests)) as pool:
         replies = [pool.submit(call, api, body) for api, body in requests]
@@ -454,6 +461,8 @@ def check_allocator(fixture, table, commit_ts):
     if clock_jumps:
         assert abs(forward - (time.time() + 60)) < 5, forward
     assert latest['first'] > new['last'], (latest, new)
+    for worker in WORKERS:
+        (cluster.barrier_dir(worker) / 'clock-offset-seconds').unlink()
 
     if fixture.direct:
         body = point(table, 'insert', row=rows(12, category=7)[0])
@@ -504,8 +513,14 @@ def o11(fixture):
         code, result = fixture.api('api2', f"{REQUESTS}/{old_run}/{written['request_id']}")
         assert code == 200 and result['state'] == 'succeeded' and result['result'] is None, (code, result)
     status, abandoned = fixture.api('api2', f"{REQUESTS}/{old_run}/{held['request_id']}")
-    assert status == 200 and abandoned['state'] == 'abandoned', (status, abandoned)
-    assert abandoned['result'] is None, abandoned
+    assert (status, abandoned) == (404, {
+        'request_id': held['request_id'],
+        'error': {
+            'code': 'not_found',
+            'message': 'old-run request abandoned; check durable mutation decision',
+            'outcome': 'unknown',
+        },
+    }), (status, abandoned)
     assert fixture.data(fixture.query(table), 'api2') == rows(1, 2, 3, category=5)
     assert fixture.data(fixture.query(table, 5), 'api2') == rows(1, 2, 3, category=5)
     passed('O11', 'committed-state-replay',
