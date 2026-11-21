@@ -510,6 +510,28 @@ impl TimestampEndpoint {
         Ok(transfer)
     }
 
+    /// `AllocateDirect` without native-executor hops (PERF2a): the request
+    /// and the range are a few bytes of fixed-shape JSON, decoded and
+    /// encoded on this task under the same charges as [`decode`] and
+    /// [`encode`]. The handle still passes its lease barrier first.
+    async fn serve_allocate_direct(
+        &self,
+        sections: &ChargedSections,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let shared = self.handle.resources();
+        let raw = sections.section(0).ok_or_else(invalid)?.as_slice();
+        let budget = crate::oltp::mvcc::json_decode_budget(raw)?;
+        let owner = shared
+            .reserve_scratch_wait(ByteClass::Progress, budget, 0)
+            .await?;
+        let request: Request = serde_json::from_slice(raw).map_err(|_| invalid())?;
+        drop(owner);
+        let Request::AllocateDirect { count } = request else {
+            return Err(invalid());
+        };
+        let range = self.handle.allocate_direct(count).await?;
+        shared.encode_in(ByteClass::Progress, &range, LIMIT)
+    }
     async fn dispatch(
         &self,
         session: &AuthenticatedSession,
@@ -1197,6 +1219,15 @@ impl Endpoint for TimestampEndpoint {
                 ).await;
                 return reply(self.handle.resources(), &session, self.node, result).await;
             }
+            if head.method.inline_small_reply()
+                && sections
+                    .section(0)
+                    .is_some_and(|section| section.len() <= INLINE_REPLY_BYTES)
+            {
+                let result = Box::pin(self.serve_allocate_direct(&sections)).await;
+                drop(sections);
+                return reply_inline(self.handle.resources(), &session, self.node, result);
+            }
             let result = async {
                 let (request, owner) = decode::<Request>(self.handle.resources(), sections).await?;
                 if request.method() != head.method {
@@ -1387,17 +1418,27 @@ impl TimestampClient {
     ) -> Result<ServiceResponse, ProtocolError> {
         use crate::oltp_runtime::stage_timing::{perf_stage, timed};
         let method = request.method();
-        let payload = timed(
-            perf_stage!("ts.rpc.encode"),
-            encode(&self.client.shared, request),
-        )
-        .await?;
+        // PERF2a: the request is a few bytes of fixed-shape JSON (the same
+        // bytes as before, so every peer decodes it): encode it on this task.
+        let payload = {
+            let _timer = perf_stage!("ts.rpc.encode").timer();
+            self.client
+                .shared
+                .encode_in(ByteClass::Progress, &request, LIMIT)?
+        };
         timed(
             perf_stage!("ts.rpc.converge"),
             self.client
-                .repeat_reusing_routes_as(self.client.action, method, Some(payload)),
+                .allocate_direct_as(self.client.action, method, payload),
         )
         .await
+    }
+    /// `AllocateDirect` routing counters (PERF2a, tests).
+    #[cfg(test)]
+    pub(crate) fn direct_routing_stats(
+        &self,
+    ) -> crate::oltp_replication::service_rpc::DirectRoutingStats {
+        self.client.direct_routing_stats()
     }
     async fn value<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
@@ -1655,11 +1696,15 @@ impl TimestampClient {
             return Err(invalid());
         }
         let response = self.response(Request::AllocateDirect { count }).await?;
-        let (range, _): (DirectTimestampRange, _) = crate::oltp_runtime::stage_timing::timed(
-            crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode"),
-            response.decoded(&self.client.shared),
-        )
-        .await?;
+        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode").timer();
+        // PERF2a: a range is about 60 bytes; decode it on this task. Its
+        // decode charge was reserved with the reply (`member_reply`).
+        let section = response.reply.sections[0].as_ref().ok_or_else(invalid)?;
+        let range: DirectTimestampRange = if section.len() <= INLINE_REPLY_BYTES {
+            serde_json::from_slice(section.as_slice()).map_err(|_| invalid())?
+        } else {
+            response.decoded(&self.client.shared).await?.0
+        };
         range.expect_len(count)
     }
     pub(crate) async fn confirmed_allocation(
