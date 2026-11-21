@@ -1236,3 +1236,92 @@ fn g7_zero_fill_drops_its_pages_as_it_goes() {
     }
     assert!(next < segment_bytes, "{drops:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// KVfix4: directory entries a killed process left unsynced
+
+/// NS01 1e6 (CI seed 4242, step 49509): a Kill landed inside a roll, after the new
+/// segment's rename and header sync but before the directory sync. The process's view
+/// (the kill image) holds the new name; the device does not. The first open used that
+/// segment as its active one and acknowledged synced records in it, the store recorded it
+/// in the manifest, and a crash right after lost the name: "a journal segment the
+/// manifest records is missing", with the synced records gone. Open must make the
+/// directory it recovered from durable before anything relies on it.
+///
+/// The failed directory sync stands for the Kill point deterministically: an injected
+/// EIO leaves the rename pending exactly as a stop right before the sync would.
+#[test]
+fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced_records() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let dir = Path::new("/db/journal");
+    let (j, _, _) = open(Arc::new(fs.clone()), dir).unwrap();
+    let free = |j: &Journal| lock(&j.shared.table).free.len();
+    let put = |j: &Journal, tag: String| {
+        j.submit(sized(tag.as_bytes(), 1500), Durability::Sync, Box::new(()))
+            .and_then(|c| c.wait())
+    };
+    // Past half of the first segment, then wait for the preparer's spare: the roll then
+    // takes it and creates nothing, and the preparer stays idle.
+    let mut synced = 0;
+    for i in 0..22 {
+        put(&j, format!("a{i:03}")).unwrap();
+        synced += 1;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while free(&j) == 0 {
+        assert!(std::time::Instant::now() < deadline, "no spare prepared");
+        std::thread::yield_now();
+    }
+    let newest = j.segments().iter().map(|s| s.segment).max().unwrap();
+    // The next directory sync of the journal is the roll's (activate: rename, header,
+    // sync_dir). It fails, and the journal latches with the rename still pending.
+    fs.inject(Fault::on(FsOp::SyncDir).path_prefix(dir));
+    let mut i = 0;
+    loop {
+        match put(&j, format!("b{i:03}")) {
+            Ok(_) => synced += 1,
+            Err(_) => break,
+        }
+        i += 1;
+        assert!(i < 100, "the journal never rolled");
+    }
+    j.crash();
+    drop(j);
+
+    // The kill image: the process's view, with the rename not yet durable.
+    let killed = fs.kill();
+    let (j, _, sink) = open(Arc::new(killed.clone()), dir).unwrap();
+    assert_eq!(
+        sink.records().len(),
+        synced,
+        "the first open lost synced records"
+    );
+    // A few synced records in the active segment (under half of it, so the preparer does
+    // not run and sync the directory by chance).
+    for i in 0..3 {
+        put(&j, format!("c{i:03}")).unwrap();
+        synced += 1;
+    }
+    let active = j.segments().into_iter().find(|s| s.active).unwrap();
+    assert!(
+        active.segment > newest,
+        "the first open writes to the segment the roll activated: {active:?}"
+    );
+    j.crash();
+    drop(j);
+
+    // A crash right after: only durable state.
+    let (j, _, sink) = open(Arc::new(killed.crash()), dir).unwrap();
+    let got = sink.records().len();
+    let still = j
+        .segments()
+        .into_iter()
+        .any(|s| s.segment == active.segment && s.epoch == active.epoch);
+    j.crash();
+    assert!(
+        still,
+        "the active segment {active:?} of the first open is gone"
+    );
+    assert_eq!(got, synced, "records synced after the first open were lost");
+}
