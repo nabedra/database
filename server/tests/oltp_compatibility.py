@@ -24,9 +24,10 @@ from oltp_orm_contract import exercise, rejected
 
 
 class OlapServer(AbstractContextManager):
-    def __init__(self, binary, namespace="orm-parity/"):
+    def __init__(self, binary, namespace="orm-parity/", storage=None):
         self.binary = str(Path(binary).resolve())
         self.namespace = namespace
+        self.storage = storage
         self.temporary = tempfile.TemporaryDirectory(prefix='nabedra-olap-parity-')
         self.root = Path(self.temporary.name)
         self.diagnostics = (self.root / 'server.log').open('w+b')
@@ -41,21 +42,23 @@ class OlapServer(AbstractContextManager):
             assert 'olap' in version.split(), version
             self.env = dict(os.environ, PYTHONPATH=str(ROOT / 'orm/python/src'),
                             PYTHONDONTWRITEBYTECODE='1', NABEDRA_SERVER_BINARY=self.binary,
-                            NABEDRA_TOKEN=self.token)
-            store_token = secrets.token_urlsafe(32)
-            self.store = subprocess.Popen([sys.executable, str(ROOT / 'scripts/local_store.py'),
-                '--database', str(self.root / 'objects.sqlite'), '--port', '0'],
-                env=dict(self.env, NABEDRA_STORE_TOKEN=store_token), stdout=subprocess.PIPE, stderr=self.diagnostics)
-            address = announcement(self.store)
-            protected_write(self.root / 'store-token', (store_token + '\n').encode())
+                            NABEDRA_TOKEN=self.token, TMPDIR=str(self.root))
+            if self.storage is None:
+                store_token = secrets.token_urlsafe(32)
+                self.store = subprocess.Popen([sys.executable, str(ROOT / 'scripts/local_store.py'),
+                    '--database', str(self.root / 'objects.sqlite'), '--port', '0'],
+                    env=dict(self.env, NABEDRA_STORE_TOKEN=store_token), stdout=subprocess.PIPE, stderr=self.diagnostics)
+                address = announcement(self.store)
+                protected_write(self.root / 'store-token', (store_token + '\n').encode())
+                self.storage = dict(driver='http', options=dict(base_url=f"http://127.0.0.1:{address['port']}",
+                    token_file=str(self.root / 'store-token'), ca_file=None))
             protected_write(self.root / 'auth.json', dict(admin_token=secrets.token_urlsafe(32),
                 data_token=self.token, enrollment_token=secrets.token_urlsafe(32)))
             with socket.socket() as reserve:
                 reserve.bind(('127.0.0.1', 0))
                 port = reserve.getsockname()[1]
             self.url = f'http://127.0.0.1:{port}'
-            storage = dict(driver='http', options=dict(base_url=f"http://127.0.0.1:{address['port']}",
-                namespace=self.namespace, token_file=str(self.root / 'store-token'), ca_file=None))
+            storage = {**self.storage, 'options': {**self.storage['options'], 'namespace': self.namespace}}
             config = example('fixed', storage, self.root / 'auth.json', threads=2, bind=f'127.0.0.1:{port}')
             protected_write(self.root / 'config.json', config)
             self.process = subprocess.Popen([sys.executable, '-m', 'nabedra.cli', 'database', 'serve',
@@ -173,7 +176,7 @@ def main():
     with OlapServer(args.olap_binary) as server:
         observed = exercise(server.url, server.token, server.database)
         if args.oltp_binary and clients_available:
-            with OlapServer(args.olap_binary, 'orm-other/') as other:
+            with OlapServer(args.olap_binary, 'orm-other/', server.storage) as other:
                 olap_scope(server, other)
             large_count(server.url, server.token, None, 100000, 99999)
     if args.oltp_binary:

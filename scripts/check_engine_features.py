@@ -90,13 +90,12 @@ def installed_version(selection):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--dependencies-only', action='store_true',
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dependencies-only', action='store_true',
                         help='inspect graphs without claiming builds or tests passed')
-    parser.add_argument('--acceptance-evidence', type=Path,
+    mode.add_argument('--acceptance-evidence', type=Path,
                         help='build installed binaries and record O02 checks without running full engine suites')
     args = parser.parse_args()
-    if args.acceptance_evidence and not args.dependencies_only:
-        parser.error('--acceptance-evidence requires --dependencies-only to skip full suites')
     tree = ('--edges', 'normal,build', '--prefix', 'none', '--format', '{p}')
     events = package_names(cargo('tree', [], *tree, manifest=EVENTS_MANIFEST).stdout)
     assert_no_forbidden_native('events', events)
@@ -112,7 +111,7 @@ def main():
             versions[name] = installed_version(selection)
             assert versions[name].split()[-1] == engine, (name, versions[name])
             print(f'O02 {name}: installed {versions[name]}', flush=True)
-        if args.dependencies_only:
+        if args.dependencies_only or args.acceptance_evidence:
             continue
         for command, extra in [('test', ('--lib', '--tests')),
                                ('run', ('--bin', 'nabedra-db', '--', '--version'))]:
@@ -121,12 +120,11 @@ def main():
                 assert engine in result.stdout.split(), (name, result.stdout)
             print(result.stdout, end='')
             print(f'O02 {name}: {command} passed', flush=True)
-    if not args.dependencies_only:
-        check_compile_guards()
+    guards = check_compile_guards() if not args.dependencies_only else []
     if args.acceptance_evidence:
         commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         args.acceptance_evidence.write_text(json.dumps(dict(
-            commit=commit, graphs=graphs, versions=versions, compile_guards=check_compile_guards(),
+            commit=commit, graphs=graphs, versions=versions, compile_guards=guards,
         )) + '\n')
     return 0
 

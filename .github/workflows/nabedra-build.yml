@@ -185,7 +185,7 @@ jobs:
           cargo check --locked --bin nabedra-db --no-default-features --features cache
       - name: Build installed engine variants and check feature guards
         if: inputs.acceptance || inputs.direct || contains(github.event.head_commit.message, '[ci acceptance]') || contains(github.event.head_commit.message, '[ci direct]')
-        run: python scripts/check_engine_features.py --dependencies-only --acceptance-evidence o02-engine-features.json
+        run: python scripts/check_engine_features.py --acceptance-evidence o02-engine-features.json
       - uses: actions/upload-artifact@v4
         if: inputs.acceptance || inputs.direct || contains(github.event.head_commit.message, '[ci acceptance]') || contains(github.event.head_commit.message, '[ci direct]')
         with:

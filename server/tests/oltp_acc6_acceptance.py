@@ -4,16 +4,21 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
+import ctypes
 import json
 import math
+import mmap
 import operator
 import os
 from pathlib import Path
 import random
+import stat
 import subprocess
+import sys
 import tempfile
 import time
 
+from oltp_compatibility import OlapServer
 from oltp_direct_acceptance import Database, admin_owner, col, dump
 from oltp_direct_cluster import (DATABASE, Rf1Serve, Rf3Cluster, WORKERS, call, operation,
                                  resources, uid, write_json)
@@ -86,9 +91,25 @@ def o02(binary, test_executable):
         'o02_pool_refuses_foreign_engine_and_identity_and_reopens_its_own',
         'ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched',
     ])
+    olap_binary = os.environ.get('NABEDRA_OLAP_BINARY')
+    if not olap_binary:
+        assertion('O02', 'mixed-engine-and-disk-rejection',
+                  'Manifest checks ran. Cross-engine worker startup needs the installed OLAP binary.', 'not-run')
+        return
+    with OlapServer(olap_binary) as olap, cluster_process(binary, test_executable, 'o02-enrollment') as cluster:
+        olap_bootstrap, = [path for path in olap.root.glob('nabedra-*/*.json') if path.name != 'api.json']
+        oltp_bootstrap = cluster.root / f'{WORKERS[0]}.json'
+        for engine_binary, foreign_bootstrap, diagnostic in (
+                (binary, olap_bootstrap, 'registered worker configuration invalid'),
+                (olap_binary, oltp_bootstrap, 'worker runtime failed')):
+            refused = subprocess.run([engine_binary, 'worker', '--bootstrap', str(foreign_bootstrap)],
+                                     capture_output=True, text=True, timeout=15)
+            assert refused.returncode != 0 and diagnostic in refused.stderr, refused.stderr
+        same_run_ready(cluster, cluster.run_id, WORKERS, 3)
+        with closing(Database(url=olap.url, token=olap.token)) as db:
+            assert db.tables() == []
     assertion('O02', 'mixed-engine-and-disk-rejection',
-              'Installed OLTP refused the foreign engine and old disk version. Mixed-engine enrollment remains unexercised.',
-              'not-run')
+              'Each engine rejected the other engine’s live worker bootstrap. OLTP rejected foreign and format-1 pool manifests and reopened the restored format-2 pool.')
 
 
 @contextmanager
@@ -149,13 +170,29 @@ def o03(binary, test_executable):
         rows = [{'id': key, 'number': -0.0 if key < 0 else 0.0} for key in keys]
         cluster = fixture.cluster
         _, source = seed_and_source(fixture, table, rows)
-        # Prime the gateway before publishing the new routing epoch.
+        # Hold a read pinned to the old epoch while the cached direct route
+        # still points to the old range. The post-split key belongs to the right child.
         assert table.get(keys[-1]) == rows[-1]
-        split_at_zero(fixture, source)
-        assert table.get(keys[-1]) == rows[-1]
+        pending = fixture.query(table)
+        fixture.select(pending['request_id'], {'snapshot': True})
+        fixture.admit(pending)
+        fixture.reached(pending['request_id'], 'snapshot')
+        try:
+            status, warm = fixture.api('api1', '/v1/runtime/stats')
+            assert status == 200, warm
+            split_at_zero(fixture, source)
+            assert table.get(keys[-1]) == rows[-1]
+            status, refreshed = fixture.api('api1', '/v1/runtime/stats')
+            assert status == 200, refreshed
+            if DIRECT:
+                old, new = (stats['direct_gateway'] for stats in (warm, refreshed))
+                assert new['catalog_reads'] > old['catalog_reads'], (old, new)
+                assert any(new[field] > old[field] for field in ('stale_routes', 'fallbacks')), (old, new)
+        finally:
+            fixture.release(pending['request_id'], 'snapshot')
+        fixture.terminal(pending['request_id'], rows)
         error(fixture.api('api1', OPERATIONS, operation('table.get', {
             'table_id': uid(), 'key': 0})), 'not_found')
-        assertion('O03', 'stale-epochs', 'A warm gateway returned the exact row after a split. An unknown handle failed without data.')
         before = cluster.all_stats()
         for key, expected in ((keys[0], rows[0]), (keys[-1], rows[-1]), (3, None)):
             assert table.get(key) == expected
@@ -163,9 +200,12 @@ def o03(binary, test_executable):
         point = 'leader.get.read' if DIRECT else 'test.data.point'
         assert stage_delta(before, after, point) == 3, (point, before, after)
         assert stage_delta(before, after, 'test.data.scan') == 0
+        ranges = set()
         for key in (keys[0], keys[-1]):
             explanation = table.where(id=key).explain()
             assert 'access primary point seek on id' in explanation and 'scope shards 1; owning shard ' in explanation, explanation
+            ranges.add(explanation.split('scope shards 1; owning shard ', 1)[1].splitlines()[0])
+        assert len(ranges) == 2, ranges
         assert table.where(col('id') >= 0).collect() == rows[-2:]
         assertion('O03', 'owning-shard-point-lookup', {'point_reads': 3, 'scan_pages': 0, 'data_ranges': 2})
         copies = {name: after[name]['queue']['accepted_records'] - before[name]['queue']['accepted_records']
@@ -175,6 +215,7 @@ def o03(binary, test_executable):
         assert table.query().collect() == rows
         for key, sign in ((-1, -1), (0, 1)):
             assert math.copysign(1, table.get(key)['number']) == sign
+        assert table.where(number=-0.0).collect() == table.where(number=0.0).collect() == rows
         words = fixture.db.create_table('o03_strings', {'id': str}, key='id')
         strings = ['', '\x00', '\x00a', 'a', 'a\x00', 'é', '😀', '\U0010ffff']
         assert words.insert_many([{'id': key} for key in reversed(strings)]) == len(strings)
@@ -199,6 +240,8 @@ def o03(binary, test_executable):
         'o07_o08_direct_rejects_a_stale_schema_epoch',
         'o07_direct_rejects_a_stale_routing_epoch',
     ])
+    assertion('O03', 'stale-epochs',
+              'A pinned read retained its complete old snapshot across split. New reads found the new owner and stale handles returned typed errors. Native tests refused stale schema and routing epochs.')
 
 
 COMPARISONS = {'eq': operator.eq, 'ne': operator.ne, 'lt': operator.lt, 'le': operator.le,
@@ -331,7 +374,43 @@ def database(cluster, api='api1'):
                     database=DATABASE, ca_file=str(cluster.ca), timeout=30)
 
 
-def storage_observation(cluster):
+def physical_storage(directory, measure_cache):
+    """Sample allocated file blocks and resident pool pages without faulting them in."""
+    disk_bytes = 0
+    cached_bytes = 0
+    page = mmap.PAGESIZE
+    if measure_cache:
+        mincore = ctypes.CDLL(None, use_errno=True).mincore
+        mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        mincore.restype = ctypes.c_int
+    for path in directory.rglob('*'):
+        try:
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            disk_bytes += info.st_blocks * 512
+            if measure_cache and info.st_size:
+                with path.open('rb') as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_COPY) as view:
+                    size = len(view)
+                    pages = (size + page - 1) // page
+                    residency = (ctypes.c_ubyte * pages)()
+                    anchor = ctypes.c_char.from_buffer(view)
+                    address = ctypes.addressof(anchor)
+                    del anchor
+                    if mincore(address, size, residency):
+                        raise OSError(ctypes.get_errno(), 'mincore of pool file')
+                    cached_bytes += sum(value & 1 for value in residency) * page
+        except FileNotFoundError:
+            # A successful maintenance replacement may unlink a sampled run.
+            continue
+        except ValueError:
+            # Between stat and mmap, a staging file can become empty.
+            if path.exists() and path.stat().st_size:
+                raise
+    return disk_bytes, cached_bytes if measure_cache else None
+
+
+def storage_observation(cluster, *, measure_cache=False):
     observations = {}
     for name, stats in cluster.all_stats().items():
         budget = stats['native_thread_budget']
@@ -340,16 +419,23 @@ def storage_observation(cluster):
         slots = stats['scheduler']
         assert sum(slot[1] for slot in slots) <= budget['query_threads'], slots
         assert sum(slot[2] for slot in slots) <= limits['memory_limit_bytes'], slots
-        assert 0 <= cache['pinned_bytes'] <= cache['usage_bytes'] <= cache['configured_bytes'], cache
+        assert 0 <= cache['pinned_bytes'] <= cache['usage_bytes']
+        assert cache['usage_bytes'] <= cache['configured_bytes'] + cache['pinned_bytes'], cache
         storage = cluster.root / name / 'data'
+        allocated, cached = physical_storage(storage, measure_cache and sys.platform == 'linux')
         proc = Path(f'/proc/{cluster.workers[name].pid}')
         rss = None
         if (proc / 'status').is_file():
             rss = next(int(line.split()[1]) * 1024 for line in (proc / 'status').read_text().splitlines()
                        if line.startswith('VmHWM:'))
+            names = [file.read_text().strip() for file in proc.glob('task/*/comm')]
+            assert names.count('kv-flush') == budget['flush_threads'], names
+            assert names.count('kv-compact') == budget['compaction_threads'], names
+            assert names.count('kv-journal') == names.count('kv-journal-prep') == stats['storage']['pools'], names
+            assert rss + (cached or 0) <= limits['memory_limit_bytes'], (rss, cached, limits)
         observations[name] = dict(
             cache=cache, native=budget, storage=stats['storage'], scheduler=slots, peak_rss_bytes=rss,
-            allocated_disk_bytes=sum(path.stat().st_blocks * 512 for path in storage.rglob('*') if path.is_file()))
+            allocated_disk_bytes=allocated, resident_pool_file_bytes=cached)
     return observations
 
 
@@ -371,7 +457,7 @@ def o05(binary, test_executable):
         rows = [dict(id=index, category=index % 4, value=index, blob='p' * (32 << 10))
                 for index in range(96)]
         owner, _ = seed_and_source(fixture, table, rows[:32])
-        baseline = storage_observation(fixture.cluster)
+        baseline = storage_observation(fixture.cluster, measure_cache=True)
         for start in (32, 64):
             assert table.insert_many(rows[start:start + 32]) == 32
         scan = operation('query.collect', {
@@ -381,7 +467,7 @@ def o05(binary, test_executable):
         fixture.reached(scan['request_id'], 'snapshot')
         try:
             fixture.make_index(table, owner)
-            concurrent = storage_observation(fixture.cluster)
+            concurrent = storage_observation(fixture.cluster, measure_cache=True)
         finally:
             fixture.release(scan['request_id'], 'snapshot')
         fixture.terminal(scan['request_id'], [{'id': row['id']} for row in rows])
@@ -389,9 +475,13 @@ def o05(binary, test_executable):
         evidence('O05', 'scan-pin-index-build', baseline=baseline, measured=concurrent)
     assertion('O05', 'allocation-failure-isolation',
               'Exhausted Data buffers rejected allocation while Progress stayed usable. Native apply, cancelled jobs, and Raft lane exhaustion preserved independent work.')
-    assertion('O05', 'aggregate-native-budgets',
-              'Two-pool native cache, write-buffer and physical thread assertions executed. The hosted process sample has RSS and disk blocks but lacks page-cache attribution during combined maintenance.',
-              'not-run')
+    if sys.platform == 'linux':
+        assertion('O05', 'aggregate-native-budgets',
+                  'Two-pool cache and write-buffer pressure plus physical thread assertions executed. RF3 samples included pinned cache, charged bytes, VmHWM, actual KV threads and mincore-resident pool file pages.')
+    else:
+        assertion('O05', 'aggregate-native-budgets',
+                  'Native two-pool assertions executed. Physical thread attribution, VmHWM and resident pool file sampling require Linux.',
+                  'not-run')
     assertion('O05', 'maintenance-bounds',
               'Snapshot transfer with a full Data lane, wide-key paging, and a pinned scan during index build executed. No fixture yet proves flush, compaction, scan, index build and snapshot transfer overlap at one bounded cut.',
               'not-run')
@@ -490,7 +580,7 @@ def o22(binary, test_executable):
               'not-run')
 
 
-def copy_metrics(cluster, request):
+def copy_metrics(cluster, request, ready_count):
     # A replica records the exact serialized queue frame and the elapsed time
     # of each authenticated installation acknowledgement at the coordinator.
     traces = []
@@ -500,12 +590,73 @@ def copy_metrics(cluster, request):
             traces.extend(json.loads(line) for line in trace.read_text().splitlines())
     staged = [row for row in traces if not row['accepted'] and row['target'] and row['target'] != row['owner']]
     assert staged and len({row['ready']['view']['run_id'] for row in staged}) == 1, traces
-    assert all(row['elapsed_ns'] > 0 and sum(row['section_bytes']) > 0 for row in staged), staged
+    assert all(row['elapsed_ns'] > 0 and sum(row['section_bytes']) > 0
+               and row['ready']['ready_count'] == ready_count for row in staged), staged
+    assert len({row['target']['worker_id'] for row in staged}) == ready_count - 1, staged
     return dict(
         fanout_record_bytes=sum(row['record_header_bytes'] + sum(row['section_bytes']) for row in staged),
         slowest_replica_install_ns=max(row['elapsed_ns'] for row in staged),
         remote_installations=len(staged),
     )
+
+
+def quantiles(values):
+    ordered = sorted(values)
+    return {f'p{p}': ordered[(len(ordered) - 1) * p // 100] for p in (50, 95, 99)}
+
+
+def queue_workload(cluster, ready, source, target, identities):
+    """Compare finite read-heavy and write-heavy bursts at one ready count."""
+    sample = iter(identities)
+    phases = []
+    for writes_per_batch in (1, 3):
+        for repetition in range(4):
+            jobs = []
+            for offset in range(4):
+                identity = next(sample)
+                if offset < writes_per_batch:
+                    rows = [dict(id=f'{identity}_{index}', payload='b' * 8192) for index in range(8)]
+                    request = operation('table.insert_many', {'table_id': target.id, 'rows': rows}, identity)
+                    expected = len(rows)
+                else:
+                    request = operation('query.count', {'table_id': source.id, 'query': source.query()._to_wire()}, identity)
+                    expected = 128
+                jobs.append((request, expected))
+
+            def complete(job):
+                request, expected = job
+                start = time.monotonic_ns()
+                with closing(gateway(cluster, 'api2', timeout=40)) as client:
+                    assert_accepted(client.exchange(REQUESTS, request), cluster.run_id, request)
+                    accepted = time.monotonic_ns()
+                    exact_receipt(client.exchange, cluster.run_id, request, expected)
+                return dict(request_id=request['request_id'],
+                            acceptance_ns=accepted-start, terminal_ns=time.monotonic_ns()-start,
+                            **copy_metrics(cluster, request, len(ready)))
+
+            peak = dict.fromkeys(ready, 0)
+            begin = time.monotonic_ns()
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [workers.submit(complete, job) for job in jobs]
+                while not all(future.done() for future in futures):
+                    for name, stats in cluster.all_stats(ready).items():
+                        active = sum(slot[1] for slot in stats['scheduler'])
+                        assert active <= stats['native_thread_budget']['query_threads'], stats['scheduler']
+                        peak[name] = max(peak[name], active)
+                    time.sleep(.01)
+                measurements = [future.result() for future in futures]
+            duration = (time.monotonic_ns()-begin) / 1e9
+            assert len({row['request_id'] for row in measurements}) == len(jobs)
+            written = {row['id'] for req, _ in jobs if req['operation'] == 'table.insert_many'
+                       for row in req['payload']['rows']}
+            if repetition:
+                phases.append(dict(
+                    writes_per_batch=writes_per_batch, repetition=repetition, peak_slots=peak,
+                    terminal_rate=len(jobs) / duration, recorded_write_keys=len(written),
+                    acceptance_ns=quantiles([row['acceptance_ns'] for row in measurements]),
+                    terminal_ns=quantiles([row['terminal_ns'] for row in measurements]), samples=measurements))
+    assert next(sample, None) is None
+    return phases
 
 
 def o23(binary, test_executable):
@@ -516,13 +667,16 @@ def o23(binary, test_executable):
         'c07_f03_o23_read_grant_copy_keeps_transport_outcomes_distinct',
         'q06_o14_o23_terminal_confirmation_requires_the_exact_ready_view_and_version',
     ])
-    traced = [uid() for _ in range(32)]
+    traced = [uid() for _ in range(66)]
     mounts = Rf3Cluster.mounts_available()
     with cluster_process(binary, test_executable, 'o23', mounts=mounts, traced=traced) as cluster, closing(database(cluster)) as db:
         table = db.create_table('o23_data', {'id': int, 'payload': str}, key='id')
         source_rows = [dict(id=i, payload='x' * 8192) for i in range(128)]
         assert table.insert_many(source_rows) == len(source_rows)
         out = db.create_table('o23_output', {'id': int, 'payload': str}, key='id')
+        workload_out = db.create_table('o23_workload_output', {'id': str, 'payload': str}, key='id')
+        three = queue_workload(cluster, WORKERS, table, workload_out, traced[2:34])
+        two = None
         read = operation('query.collect', {'table_id': table.id, 'query': table.query().select('id')._to_wire()}, traced[0])
         write_rows = [dict(id=i, payload='y' * 8192) for i in range(16)]
         write = operation('table.insert_many', {'table_id': out.id, 'rows': write_rows}, traced[1])
@@ -554,12 +708,20 @@ def o23(binary, test_executable):
                 copies = [assert_record(read_record(cluster, name, request), run, request) for name in WORKERS]
                 assert all(copy == copies[0] for copy in copies)
                 identities[request['request_id']] = copies[0]
-            metrics = [copy_metrics(cluster, request) for request in (read, write)]
+            metrics = [copy_metrics(cluster, request, 3) for request in (read, write)]
             assert all(sample['remote_installations'] == 2 for sample in metrics), metrics
+            assert_accepted(observer.exchange(REQUESTS, write), run, write)
+            changed = {**write, 'payload': {**write['payload'], 'rows': [{'id': -1, 'payload': 'wrong'}]}}
+            error(observer.exchange(REQUESTS, changed), 'conflict')
+            cluster.kill_api('api1')
+            for request in (read, write):
+                status, pending = observer.exchange(receipt_path(run, request))
+                assert status == 200 and pending['state'] in ('queued', 'running', 'committing'), pending
             try:
                 if mounts:
                     cluster.workers[target].kill()
                     same_run_ready(cluster, run, (owner, other), 2)
+                    two = queue_workload(cluster, (owner, other), table, workload_out, traced[34:])
                     for name in (owner, other):
                         for request in (read, write):
                             assert assert_record(read_record(cluster, name, request), run, request) == identities[request['request_id']]
@@ -574,7 +736,18 @@ def o23(binary, test_executable):
                         release(directory, request)
             exact_receipt(observer.exchange, run, read, [dict(id=row['id']) for row in source_rows])
             exact_receipt(observer.exchange, run, write, len(write_rows))
-        assert out.query().collect() == write_rows
+        cluster.connection = cluster.admin('cluster.connection', {})
+        cluster.start_api('api1', DIRECT)
+        with closing(database(cluster)) as recovered:
+            settled = recovered.table('o23_output')
+            assert settled.id == out.id and settled.query().collect() == write_rows
+            updated = recovered.table('o23_workload_output').query().select('id').collect()
+        assert len(updated) == 128 * (2 if mounts else 1), len(updated)
+        assert len({row['id'] for row in updated}) == len(updated)
+        evidence('O23', 'mixed-load', ready_three=three, ready_two=two,
+                 cpu_max=(Path('/sys/fs/cgroup/cpu.max').read_text().strip()
+                          if Path('/sys/fs/cgroup/cpu.max').is_file() else None),
+                 worker_limits={name: cluster.config[name]['resources'] for name in WORKERS})
         evidence('O23', 'held-admission', read=metrics[0], write=metrics[1], same_run=run,
                  ready_sizes=[3, 2, 3] if mounts else [3])
         assertion('O23', 'required-queue-and-receipts',
@@ -586,9 +759,13 @@ def o23(binary, test_executable):
             assertion('O23', 'all-ready-and-retention',
                       'Staged copy cut passed. Same-run retained replacement requires Linux loopback pool mounts with passwordless sudo.',
                       'not-run')
-    assertion('O23', 'queue-cost-and-throughput',
-              'Authenticated fan-out bytes and slowest installation measured for a scan and a batched write. Missing repeated load sweeps and occupancy samples at both ready counts.',
-              'not-run')
+    if mounts:
+        assertion('O23', 'queue-cost-and-throughput',
+                  'One warm-up and three measured read-heavy and write-heavy bursts per ready size recorded exact accepted identities, frame bytes, slowest installation, slot occupancy and terminal throughput.')
+    else:
+        assertion('O23', 'queue-cost-and-throughput',
+                  'Three-worker measurements ran. Two-worker measurements with retained requests require Linux loopback pool mounts with passwordless sudo.',
+                  'not-run')
 
 
 def main():
