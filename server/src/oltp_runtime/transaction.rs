@@ -435,6 +435,7 @@ impl TransactionCoordinator {
         #[cfg(test)]
         if preparation.is_ok() {
             super::recovery_tests::pause("prepared", txn.request_id).await;
+            super::recovery_tests::index_holds::prepared(txn).await;
         }
         let decision = match preparation {
             Err(error) => {
@@ -511,6 +512,8 @@ impl TransactionCoordinator {
             super::recovery_tests::observe_decision("decision", decision.statement());
             super::recovery_tests::pause("committed", txn.request_id).await;
         }
+        #[cfg(test)]
+        super::recovery_tests::index_holds::decided(txn).await;
         // An acknowledged decision survives a stopped participant. Its fixed
         // intents and durable lifecycle guards remain discoverable for helpers.
         // A failed Resolve never changes COMMIT into an application failure.
