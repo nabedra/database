@@ -507,7 +507,7 @@ pub(super) fn refuse_prepared_commit(request: Uuid) -> bool {
     take_fault("refuse-prepared-commit", request).is_some()
 }
 
-fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
+pub(super) fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
     std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;
     Some(directory)
@@ -593,6 +593,10 @@ fn actual_runtime_child() {
                         )
                         .with_target(
                             "nabedra_database_server::oltp_runtime::authority_fence",
+                            tracing::Level::DEBUG,
+                        )
+                        .with_target(
+                            "nabedra_database_server::oltp_runtime::data_worker_process",
                             tracing::Level::DEBUG,
                         )
                         .with_target(

@@ -646,7 +646,7 @@ class Oltp(Rf3Cluster):
             self.write_barrier(name, 'inspect.json', [request_id])
         status, reply = self.exchange('/v1/requests', self.gated)
         assert status == 202 and reply['run_id'] == self.run_id, (status, reply)
-        traffic.receipts.append((self.gated, status))
+        traffic.receipts.append((self.gated, status, reply))
 
         def owner():
             return next((name for name in WORKERS if
@@ -791,7 +791,7 @@ class Traffic:
             _, status, reply = self.invoke(client, 'queued-write', '/v1/requests', body)
             if status == 202:
                 assert reply == dict(request_id=body['request_id'], run_id=self.topology.run_id, state='queued'), reply
-            self.receipts.append((body, status))
+            self.receipts.append((body, status, reply))
             self.stop.wait(0.8)
 
     @contextmanager
@@ -807,7 +807,7 @@ class Traffic:
         with ThreadPoolExecutor(3) as pool:
             tasks = [pool.submit(persistent, action) for action in (self.write_load, self.read_load, self.queue_load)]
             try:
-                wait_for(lambda: self.writes and self.read_times and any(status == 202 for _, status in self.receipts),
+                wait_for(lambda: self.writes and self.read_times and any(status == 202 for _, status, _ in self.receipts),
                          'write, independent read and receipt before lifecycle fault', 30)
                 yield
             finally:
@@ -827,7 +827,7 @@ class Traffic:
             expected.append(row)
         accepted = 0
         failures = []
-        for body, original in self.receipts:
+        for body, original, initial in self.receipts:
             identity = body['request_id']
             path = f'/v1/requests/{self.topology.run_id}/{identity}'
             if original != 202:
@@ -850,6 +850,17 @@ class Traffic:
             self.evidence.record('queued-write-terminal', original_status=original, response=terminal)
             if terminal['state'] == 'succeeded':
                 expected.append(body['payload']['row'])
+            elif terminal['state'] == 'failed' and terminal['result'] is None and (
+                    (original == 202 and terminal['error'] == dict(
+                        code='conflict', message='original execution authority was fenced', outcome='not_applied'))
+                    or (original == 503 and isinstance(initial, dict)
+                        and (initial.get('error') or {}).get('outcome') == 'unknown'
+                        and terminal['error'] == dict(
+                            code='overloaded', message='worker handler lane full', outcome='not_applied'))):
+                # The exact table oracle below also checks that neither
+                # reconciled failure published a row.
+                self.evidence.record('queued-write-reconciled-not-applied',
+                                     original_status=original, initial=initial, response=terminal)
             else:
                 failures.append(dict(original_status=original, receipt=terminal))
         query = dict(table_id=self.table, query=dict(select=None, filter=None, limit=None,
