@@ -20,9 +20,11 @@ import weakref
 from urllib.request import Request
 
 MAX_IDLE_CONNECTIONS = 4
-# Below the 5 s HTTP/1.1 header read timeout that also ends idle server
-# connections, so a reused connection is unlikely to race the server's close.
-MAX_IDLE_SECONDS = 2.0
+# Below the server's 30 s idle bound for kept-alive API connections, so a reused
+# connection is unlikely to race the server's idle close. A connection the
+# server closed earlier (a full listener evicts its oldest idle connection)
+# shows EOF and is replaced before any byte is written.
+MAX_IDLE_SECONDS = 25.0
 
 
 def _idle_socket_quiet(sock) -> bool:
