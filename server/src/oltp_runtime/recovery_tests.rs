@@ -740,23 +740,23 @@ async fn replacement_peer_probe(config: PathBuf) {
             .unwrap();
         let mut voters: Vec<_> = config.targets.iter().map(|peer| peer.worker_id).collect();
         voters.sort_unstable();
+        let authority_resources = WorkerSharedResources::new(
+            2, WorkerResources::default(), SharedResourceConfig::default(),
+        ).unwrap();
         let authority = WorkerTransport::new(
             &actor,
             &tls,
-            shared.clone(),
+            authority_resources.clone(),
             directory.clone(),
-            registry,
+            Arc::new(EndpointRegistry::new(authority_resources.clone())),
             TransportConfig::default(),
-        )
-        .unwrap()
-        .client();
+        ).unwrap().client();
         let control = ControlClient::new(
             authority,
-            shared,
+            authority_resources,
             config.group.clone(),
             Arc::new(Routes(voters)),
-        )
-        .unwrap();
+        ).unwrap();
         if std::env::var_os("NABEDRA_REP5_REFRESH_BOOTSTRAP").is_some() {
             let peers: Vec<_> = config.targets.iter().map(WorkerIdentity::from).collect();
             directory

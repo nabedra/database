@@ -297,8 +297,13 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                     env['NABEDRA_REP5_REFRESH_BOOTSTRAP'] = '1'
                 proc = Process('data-trust', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
                                env, data_peer_dir / 'peer.log')
+                def listening():
+                    if not proc.alive():
+                        raise AssertionError((data_peer_dir / 'peer.log').read_text())
+                    return ready.exists()
+
                 try:
-                    wait_for(ready.exists, 'Data-only trust listener started', PROBE_WINDOW)
+                    wait_for(listening, 'Data-only trust listener started', PROBE_WINDOW)
                 except Exception:
                     proc.stop()
                     raise

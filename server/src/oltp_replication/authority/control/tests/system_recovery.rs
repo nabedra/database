@@ -8,7 +8,7 @@ use crate::{
         authority::control::{
             ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord,
             RestartMountKey, SystemRecoveryCommand,
-            machine::system_recovery::{DEFERRED_DATA, abandoned, by_worker, revoked_id},
+            machine::system_recovery::{ACTIVE, DEFERRED_DATA, abandoned, by_worker, revoked_id},
         },
         multiplex::{AppliedPeerDirectory, PeerDirectory},
     },
@@ -374,6 +374,19 @@ async fn o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount() 
         ControlReply::Rejected(Fault::Busy)
     );
     assert_eq!(recovery.fixture.state().await.enrollment_revision, before);
+    assert!(
+        recovery
+            .get::<WorkerRecord>(super::key(WORKERS, record.intent.previous.worker_id))
+            .await
+            .is_some()
+    );
+    assert!(
+        recovery
+            .get::<WorkerRecord>(super::key(WORKERS, record.intent.next.worker_id))
+            .await
+            .is_none()
+    );
+    assert_eq!(recovery.get::<Uuid>(ACTIVE.to_vec()).await, None);
     assert!(!directory_view.revoked(recovery.voters[1]));
     assert!(!directory_view.has_mounted_replacement());
 }
@@ -382,6 +395,8 @@ async fn o17_revocation_limit_and_failed_refresh_preserve_the_committed_mount() 
 async fn o17_ns14_system_mount_hands_more_than_64_data_groups_to_the_damage_path() {
     let directory = Directory::new();
     let mut recovery = Recovery::open(&directory).await;
+    let lost = recovery.members[2].clone();
+    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
     let mut groups = Vec::new();
     for _ in 0..65 {
         groups.push(
@@ -396,9 +411,13 @@ async fn o17_ns14_system_mount_hands_more_than_64_data_groups_to_the_damage_path
                 )
                 .await,
         );
+        if groups.len() == 63 {
+            assert_eq!(
+                recovery.mount(&record, &key).await,
+                ControlReply::Rejected(Fault::Stale)
+            );
+        }
     }
-    let lost = recovery.members[2].clone();
-    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
     assert_eq!(
         recovery.mount(&record, &key).await,
         ControlReply::SystemReplacementMounted

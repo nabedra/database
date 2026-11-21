@@ -353,7 +353,7 @@ impl LocalServices {
                 loop {
                     let progress = async {
                     if raw_control.ensure_linearizable().await.is_ok() {
-                        register(&control, &operator, &raw_control, authority).await?;
+                        register(&control, operator, &raw_control, authority).await?;
                     }
                     if let (Some(raw_timestamps), Some(native_timestamps)) = (&raw_timestamps, &native_timestamps)
                         && raw_timestamps.ensure_linearizable().await.is_ok()
@@ -379,7 +379,7 @@ impl LocalServices {
                                     authority,
                                 ).await?;
                             }
-                            register(&control, &operator, running, authority).await?;
+                            register(&control, operator, running, authority).await?;
                         }
                     }
                     if let (Some(raw_catalog), Some(native_catalog)) = (&raw_catalog, &native_catalog)

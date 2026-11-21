@@ -182,8 +182,8 @@ Send the admin operations to `POST /v1/cluster/operations` with the admin
 token. A prepared intent authorizes only its exact candidate. Workers check
 each peer request against applied Control revocations, including on an
 existing connection. Control hosts check their local view. A Data-only
-worker reads Control before dispatch and refuses the request if the read
-fails. Update Data workers' Control placements and enrollments before their
+worker requires agreement from a majority of its configured Control peers
+before dispatch and refuses the request if it cannot establish agreement. Update Data workers' Control placements and enrollments before their
 next restart. A confirmed revocation removes the stale bootstrap trust.
 
 Control retains up to 1,024 committed worker revocations. It refuses the

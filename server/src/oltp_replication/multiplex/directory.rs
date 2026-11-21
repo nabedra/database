@@ -135,7 +135,7 @@ impl AppliedPeerDirectory {
         peers: &[WorkerIdentity],
     ) -> Result<(), ProtocolError> {
         for &peer in peers {
-            if control.worker_replaced(peer).await? {
+            if control.worker_exclusion_quorum(peer).await? {
                 self.remove_replaced(peer)?;
             }
         }
@@ -534,7 +534,7 @@ impl PeerDirectory for AppliedPeerDirectory {
         let control = self.remote_revocations.get()?;
         Some(Box::pin(async move {
             let control = control.upgrade().ok_or_else(unavailable)?;
-            if control.worker_replaced(peer).await? {
+            if control.worker_exclusion_quorum(peer).await? {
                 self.remove_replaced(peer)?;
                 return Err(invalid());
             }
@@ -556,15 +556,14 @@ impl PeerDirectory for AppliedPeerDirectory {
         if self.denied(worker, None) {
             return Err(unavailable());
         }
-        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if let Some((record, _)) = &state.candidate
-                && record.intent.next.worker_id == worker
-            {
-                return Ok(record.intent.next.clone());
-            }
-            // During a retained restart the prepared entry must override the
-            // previous operator, so applied operators are a later fallback.
+        if let Some((record, _)) = self.system.read().map_err(|_| unavailable())?.as_ref()
+            .and_then(|state| state.candidate.as_ref())
+            && record.intent.next.worker_id == worker
+        {
+            return Ok(record.intent.next.clone());
         }
+        // During a retained restart the prepared entry must override the
+        // previous operator, so applied operators are a later fallback.
         if let Some(candidate) = self
             .prepared
             .read()
@@ -607,36 +606,35 @@ impl PeerDirectory for AppliedPeerDirectory {
         if self.denied(peer.worker_id, Some(peer.certificate_sha256)) {
             return Err(invalid());
         }
-        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if let Some((record, mounted)) = &state.candidate
-                && record.intent.next.worker_id == peer.worker_id
-            {
-                if WorkerIdentity::from(&record.intent.next) != peer {
-                    return Err(invalid());
-                }
-                let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
-                    || (*mounted
-                        && matches!(
-                            purpose,
-                            Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress
-                        )
-                        && record
-                            .groups
-                            .iter()
-                            .any(|plan| plan.expected.identity == *group))
-                    || (*mounted
-                        && state
-                            .operators
-                            .get(&peer.worker_id)
-                            .is_some_and(|entry| WorkerIdentity::from(entry) == peer)
-                        && group == &self.control
-                        && matches!(purpose, Purpose::Authority | Purpose::ControlDelegation));
-                return if admitted {
-                    Ok(TransportTrust::AppliedEnrollment)
-                } else {
-                    Err(unavailable())
-                };
+        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref()
+            && let Some((record, mounted)) = &state.candidate
+            && record.intent.next.worker_id == peer.worker_id
+        {
+            if WorkerIdentity::from(&record.intent.next) != peer {
+                return Err(invalid());
             }
+            let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
+                || (*mounted
+                    && matches!(
+                        purpose,
+                        Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress
+                    )
+                    && record
+                        .groups
+                        .iter()
+                        .any(|plan| plan.expected.identity == *group))
+                || (*mounted
+                    && state
+                        .operators
+                        .get(&peer.worker_id)
+                        .is_some_and(|entry| WorkerIdentity::from(entry) == peer)
+                    && group == &self.control
+                    && matches!(purpose, Purpose::Authority | Purpose::ControlDelegation));
+            return if admitted {
+                Ok(TransportTrust::AppliedEnrollment)
+            } else {
+                Err(unavailable())
+            };
         }
         if let Some(candidate) = self
             .prepared

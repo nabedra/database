@@ -359,7 +359,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 directory
                     .refresh(&control)
                     .await
-                    .map_err(|error| limited_enrollment_retry(error))
+                    .map_err(limited_enrollment_retry)
             },
         )
         .await?;

@@ -25,6 +25,7 @@ use crate::{
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use std::{
     mem::size_of,
@@ -1415,23 +1416,7 @@ impl ControlClient {
                         continue;
                     }
                 };
-                if reply.remote_identity().worker_id != worker
-                    || reply.group() != &self.group
-                    || reply.purpose() != Purpose::Authority
-                    || reply.sections[1].is_some()
-                    || reply.sections[2].is_some()
-                {
-                    return Err(invalid("Control response transport binding differs"));
-                }
-                {
-                    let decoded = reply.decode_header::<ReadReply>()?;
-                    if decoded.nonce != reply.nonce()
-                        || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64)
-                            != Some(decoded.bytes)
-                    {
-                        return Err(invalid("Control response payload differs"));
-                    }
-                }
+                self.validate_read_reply(&reply, worker)?;
                 if use_route_hint
                     && configured_preferred.is_none()
                     && !preferred_attempt
@@ -1453,6 +1438,24 @@ impl ControlClient {
             // A new election may make a peer usable after the first round.
             time::sleep_until(deadline.min(TokioInstant::now() + READ_RETRY_DELAY)).await;
         }
+    }
+
+    fn validate_read_reply(&self, reply: &ReceivedReply, worker: Uuid) -> Result<(), ProtocolError> {
+        if reply.remote_identity().worker_id != worker
+            || reply.group() != &self.group
+            || reply.purpose() != Purpose::Authority
+            || reply.sections[1].is_some()
+            || reply.sections[2].is_some()
+        {
+            return Err(invalid("Control response transport binding differs"));
+        }
+        let decoded = reply.decode_header::<ReadReply>()?;
+        if decoded.nonce != reply.nonce()
+            || reply.sections[0].as_ref().map(|bytes| bytes.len() as u64) != Some(decoded.bytes)
+        {
+            return Err(invalid("Control response payload differs"));
+        }
+        Ok(())
     }
 
     fn preferred_read_route(&self) -> Result<Option<Uuid>, ProtocolError> {
@@ -1495,6 +1498,53 @@ impl ControlClient {
         let reply = self.read(&ReadRequest::WorkerExcluded { worker }).await?;
         Ok(*reply.decode_section::<bool>(0)?)
     }
+    /// An identity pinned in old bootstrap configuration must not vouch
+    /// for itself. A Data-only receiver requires agreement from a majority
+    /// of the distinct Control pins before it dispatches a peer request.
+    pub(crate) async fn worker_exclusion_quorum(
+        &self,
+        identity: WorkerIdentity,
+    ) -> Result<bool, ProtocolError> {
+        let request = ReadRequest::WorkerExcluded { worker: identity };
+        let header = self
+            .shared
+            .encode_in(ByteClass::Progress, &request, HEADER_LIMIT)?;
+        let mut voters = Vec::new();
+        while let Some(worker) = self.routes.next(voters.last().copied())? {
+            if worker.is_nil() || voters.last().is_some_and(|after| worker <= *after) || voters.len() == 5 {
+                return Err(invalid("invalid Control revocation voters"));
+            }
+            voters.push(worker);
+        }
+        if !matches!(voters.len(), 1 | 3 | 5) {
+            return Err(unavailable());
+        }
+        let quorum = voters.len() / 2 + 1;
+        let mut requests = FuturesUnordered::new();
+        for voter in voters {
+            let header = header.clone();
+            requests.push(async move {
+                let reply = self.client.request_authority_dependency(
+                    &self.group, voter, header, 64 << 10,
+                ).await?;
+                self.validate_read_reply(&reply, voter)?;
+                Ok::<bool, ProtocolError>(*reply.decode_section::<bool>(0)?)
+            });
+        }
+        time::timeout(READ_FAILOVER_TIMEOUT, async move {
+            let mut agreement = [0; 2];
+            while let Some(result) = requests.next().await {
+                if let Ok(revoked) = result {
+                    agreement[usize::from(revoked)] += 1;
+                    if agreement[usize::from(revoked)] == quorum {
+                        return Ok(revoked);
+                    }
+                }
+            }
+            Err(unavailable())
+        }).await.map_err(|_| unavailable())?
+    }
+
     pub(crate) async fn group(&self, group_id: Uuid) -> Result<ReceivedReply, ProtocolError> {
         self.read(&ReadRequest::Group { group_id }).await
     }
