@@ -648,7 +648,8 @@ jobs:
         id: acceptance
         if: ${{ !cancelled() && steps.build-olap.outcome == 'success' }}
         run: |
-          cargo build --locked --release --manifest-path server/Cargo.toml --no-default-features --features oltp --bin nabedra-db
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo build --locked --release --manifest-path server/Cargo.toml \
+            --no-default-features --features oltp --bin nabedra-db
           export NABEDRA_OLTP_GROWTH_BINARY="$PWD/server/target/release/nabedra-db"
           python -m unittest discover -s scripts -p test_acceptance_oltp.py
           status=0

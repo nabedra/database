@@ -2,6 +2,7 @@
 """Registered RF3 shard, storage growth and metadata acceptance."""
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
@@ -13,6 +14,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 import time
 from uuid import UUID
 
@@ -27,11 +29,13 @@ ADMIN = '/v1/cluster/operations'
 
 
 class GrowthCluster(Rf3Cluster):
-    def __init__(self, *args, automatic=None, archive=None, metadata_profile=False, **kwargs):
+    def __init__(self, *args, automatic=None, archive=None, metadata_profile=False,
+                 bulk_load=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.automatic = automatic
         self.archive = archive
         self.metadata_profile = metadata_profile
+        self.bulk_load = bulk_load
 
     def launch_worker(self, name):
         config = self.config[name]
@@ -42,6 +46,9 @@ class GrowthCluster(Rf3Cluster):
         if self.metadata_profile:
             config['native_group_capacity'] = 'retained_split_history'
             config['resources']['task_memory_limit_bytes'] = 256 * MIB
+            config['execution']['max_pending_requests'] = 16
+        if self.bulk_load:
+            config['execution'].update(result_retention_ms=2_000, max_queue_bytes_per_replica=32 * MIB)
         super().launch_worker(name)
 
 
@@ -84,6 +91,18 @@ def query(facade, table, kind='collect', expression=None, api='api1'):
     return facade.data(operation(f'query.{kind}', dict(table_id=table.id, query=query._to_wire())), api)
 
 
+def read_after_transition(facade, body, api='api2'):
+    def settled():
+        status, reply = facade.api(api, OPERATIONS, body, timeout=8)
+        if status in (429, 503, 504):
+            return None
+        assert status == 200 and reply['request_id'] == body['request_id'], (status, reply)
+        # The wrapper stays truthy even for an empty result or a missing row.
+        return reply
+
+    return wait_for(settled, 'read through a published membership change', 45)['data']
+
+
 def create(facade, name):
     return facade.db.create_table(name, {'id': int, 'category': int, 'value': int}, key='id')
 
@@ -121,6 +140,30 @@ def queue_owner(facade, table, expected, scan=None):
     owner, _ = facade.reached(request_id, 'snapshot')
     facade.terminal(request_id, expected)
     return owner
+
+
+def admit_stale_update(facade, table, key, value):
+    body = operation('table.update', dict(table_id=table.id, key=key, values=dict(value=value)))
+    request_id = body['request_id']
+    for worker in WORKERS:
+        facade.gate(worker, request_id, 'queued')
+    facade.watch_record(request_id)
+    facade.admit(body)
+    return request_id
+
+
+def assert_stale_update_rejected(facade, request_id):
+    for worker in WORKERS:
+        facade.release_copy(worker, request_id)
+
+    def rejected():
+        status, reply = facade.receipt(request_id)
+        if status != 200 or reply['state'] in ('queued', 'running', 'committing', 'reconciling'):
+            return None
+        assert reply['state'] == 'failed' and reply['error']['outcome'] == 'not_applied', reply
+        return reply
+
+    wait_for(rejected, 'old queued mutation rejected after split', 45)
 
 
 def snapshot_recovery(facade):
@@ -194,12 +237,7 @@ def o16(facade):
     exact = facade.api('api1', OPERATIONS, original)
     assert exact[0] == 200, exact
 
-    stale = operation('table.update', dict(table_id=table.id, key=-9, values=dict(value=999)))
-    stale_id = stale['request_id']
-    for worker in WORKERS:
-        facade.gate(worker, stale_id, 'queued')
-    facade.watch_record(stale_id)
-    facade.admit(stale)
+    stale_id = admit_stale_update(facade, table, -9, 999)
 
     before = [row(-9, value=90), row(-1), row(0), row(8)]
     snapshots = [facade.query(table), facade.query(table, 7)]
@@ -218,17 +256,7 @@ def o16(facade):
     # These rows must be visible on current routes and absent from both old pins.
     table.insert(row(-2))
     parts = split(cluster, source, 0)['children']
-    for worker in WORKERS:
-        facade.release_copy(worker, stale_id)
-
-    def stale_rejected():
-        status, reply = facade.receipt(stale_id)
-        if status != 200 or reply['state'] in ('queued', 'running', 'committing', 'reconciling'):
-            return None
-        assert reply['state'] == 'failed' and reply['error']['outcome'] == 'not_applied', reply
-        return reply
-
-    wait_for(stale_rejected, 'old queued mutation rejected after split', 45)
+    assert_stale_update_rejected(facade, stale_id)
     late = batch(table, [row(-3), row(3)])
     facade.admit(late)
     facade.terminal(late['request_id'], 2)
@@ -253,7 +281,8 @@ def o16(facade):
 
     records = {body['request_id']: facade.records(body['request_id']) for body in snapshots}
     survivors = stop_worker(cluster, owner)
-    assert get(facade, independent, 9, api='api2') == row(9)
+    neighbor_get = operation('table.get', dict(table_id=independent.id, key=9))
+    assert read_after_transition(facade, neighbor_get) == row(9)
     for body, (_, timestamp) in zip(snapshots, observations, strict=True):
         request_id = body['request_id']
         copies = records[request_id]
@@ -264,8 +293,8 @@ def o16(facade):
         facade.release(request_id, 'snapshot')
         facade.terminal(request_id, before)
     launch_retained(cluster, owner, retained_config(cluster, owner, survivors))
-    assert query(facade, table, expression=table.where(category=7)) == expected
-    assert get(facade, independent, 9) == row(9)
+    assert read_after_transition(facade, facade.query(table, 7), api='api1') == expected
+    assert read_after_transition(facade, neighbor_get) == row(9)
     assert facade.api('api2', OPERATIONS, original) == exact
     assert [placement(cluster, child) for child in parts] == route_views
     passed('O16', 'unrelated-shard-isolation', 'The independent shard on the same primary pools served its exact row during owner loss and after retained restart.')
@@ -374,7 +403,7 @@ def move(cluster, group, worker, mount):
     after = placement(cluster, group)
     phase = result['phase']
     assert after['record'] == phase['placement'], (after, result)
-    assert phase['activated_generation'] > 0
+    assert before['record']['identity'] == after['record']['identity'] == group
     assert phase['activated_at']['index'] >= after['record']['membership_position']['index']
     assert after['record']['generation'] != before['record']['generation']
     assert sorted(after['members'], key=lambda member: member['node_id']) == sorted(
@@ -399,7 +428,14 @@ def drain_and_detach(facade, owner, mount, target):
     assert admin(cluster, owner, permit)[0] != 200
     assert success(*admin(cluster, owner, operation('storage.pool.drain.status', {}, drain_id)))['phase'] == 'draining'
     move(cluster, group, owner, target)
-    closed = success(*admin(cluster, owner, drain))
+
+    def close():
+        status, reply = admin(cluster, owner, drain)
+        if status in (409, 429, 503, 504):
+            return None
+        return success(status, reply)
+
+    closed = wait_for(close, 'same-ID pool close', 40)
     assert closed['phase'] == 'closed' and closed['mount']['expected'] == mount, closed
     assert success(*admin(cluster, owner, permit)) == closed
     directory = Path(mount['mount_path'])
@@ -410,6 +446,22 @@ def drain_and_detach(facade, owner, mount, target):
     assert not list(directory.iterdir()), list(directory.iterdir())
     assert query(facade, table) == expected
     assert query(facade, table, 'count') == len(expected)
+
+
+def native_threads(process):
+    counts = Counter()
+    for path in Path(f'/proc/{process.pid}/task').glob('*/comm'):
+        try:
+            name = path.read_text().strip()
+        except FileNotFoundError:
+            continue
+        if name.startswith(('oltp-query-', 'oltp-control-')):
+            name = name.rsplit('-', 1)[0]
+        if name in ('oltp-query', 'oltp-control', 'kv-flush', 'kv-compact',
+                    'kv-journal', 'kv-journal-prep'):
+            counts[name] += 1
+    assert counts['oltp-query'] and counts['oltp-control'], counts
+    return counts
 
 
 def o26(facade):
@@ -429,6 +481,7 @@ def o26(facade):
     # replicas share the same worker and failure domain during the move.
     owner = queue_owner(facade, table, rows, scan)
     before = cluster.admin('storage.growth.inventory', {}, owner)
+    before_threads = native_threads(cluster.workers[owner])
     extra = add_pool(cluster, owner, 'extension', policy, check_identity=True)
     after = cluster.admin('storage.growth.inventory', {}, owner)
     assert after['worker'] == before['worker'] and after['scheduler_node_id'] == before['scheduler_node_id']
@@ -441,7 +494,14 @@ def o26(facade):
     for field in ('thread_budget', 'cache_bytes', 'write_buffer_bytes', 'native_baseline_bytes'):
         assert before[field] == after[field], (field, before[field], after[field])
     assert after['charged_memory_bytes'] <= cluster.worker_memory, after
-    passed('O26', 'aggregate-budgets', 'Pool addition preserved the worker-wide native thread, cache and write buffer budgets within its memory charge.')
+    after_threads = native_threads(cluster.workers[owner])
+    assert after_threads == before_threads + Counter({'kv-journal': 1, 'kv-journal-prep': 1}), (
+        before_threads, after_threads)
+    print(json.dumps(dict(scenario='O26', thread_counts_before=before_threads,
+                          thread_counts_after=after_threads, cache_bytes=after['cache_bytes'],
+                          write_buffer_bytes=after['write_buffer_bytes'],
+                          charged_memory_bytes=after['charged_memory_bytes'])), flush=True)
+    passed('O26', 'aggregate-budgets', 'The open added two pool journal threads from the existing budget. The observed compute and shared maintenance counts, cache and write buffer budgets stayed constant.')
 
     pinned = operation('query.collect', dict(table_id=table.id, query=scan._to_wire()))
     facade.select(pinned['request_id'], {'snapshot': True})
@@ -553,13 +613,18 @@ def o21(facade):
     extra = add_pool(cluster, owner, 'large-table-extension', configure_growth(cluster))
     move(cluster, source, owner, extra)
 
+    writing = threading.Event()
+
     def write_group(first, end):
         for offset in range(first, end, 1000):
+            writing.set()
             bulk(offset, min(offset + 1000, end))
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         running = executor.submit(write_group, 500, 72_000)
+        assert writing.wait(15)
         assert get(facade, table, 0, api='api2') == dict(id=0, text=text, value=0)
+        assert not running.done(), 'read ran after the load ended'
         _, publication = wait_for(lambda: automatic_view(cluster, source, 'published'),
                                   'automatic split publication', 240)
         running.result()
@@ -569,10 +634,13 @@ def o21(facade):
         assert all(any(member['pool_id'] == extra['identity']['pool_id']
                        for member in placement(cluster, child)['members']) for child in parts)
         passed('O21', 'safe-split-under-same-id', 'The measured target was crossed and the worker published an RF3 split under the original table ID without a split request.')
+        writing.clear()
         writer = executor.submit(write_group, 72_000, 100_000)
+        assert writing.wait(15)
         change = operation('table.update', dict(table_id=table.id, key=0, values=dict(value=-1)))
         assert facade.data(change, 'api2') is True
         assert get(facade, table, 0, api='api2') == dict(id=0, text=text, value=-1)
+        assert not writer.done(), 'concurrent mutation ran after the load ended'
         writer.result()
 
     bulk(100_000, 100_001)
@@ -595,6 +663,10 @@ def o21(facade):
     assert len(shard_ids) == 2 and all(len(placement(cluster, part)['members']) == 3 for part in parts)
     status, reply = facade.api('api2', OPERATIONS, facade.query(table))
     assert status == 413 and reply['error']['code'] == 'limit_exceeded', (status, reply)
+    oversized = batch(table, [dict(id=total + key, value=0, text='') for key in range(10_001)])
+    status, reply = facade.api('api2', OPERATIONS, oversized)
+    assert status == 413 and reply['error']['outcome'] == 'not_applied', (status, reply)
+    assert query(facade, table, 'count') == total
     print(json.dumps(dict(scenario='O21', rows=total, text_bytes=total * len(text),
                           elapsed_seconds=round(time.monotonic() - started, 2))), flush=True)
     passed('O21', 'growth-and-exact-queries', 'The 100,001st row and later batches succeeded across RF3 ranges and independent pools. Counts, point reads and bounded projected queries agreed after retained restart.')
@@ -711,6 +783,7 @@ def o28(facade):
     assert 'by_category' in table.where(category=7).explain()
     assert query(facade, table, expression=table.where(category=7)) == rows
 
+    stale_id = admit_stale_update(facade, table, rows[-1]['id'], -999)
     old = facade.query(table)
     old_id = old['request_id']
     facade.select(old_id, {'snapshot': True})
@@ -718,6 +791,9 @@ def o28(facade):
     facade.admit(old)
     owner, ts = facade.reached(old_id, 'snapshot')
     barrier = cluster.barrier_dir(owner)
+    wait_for(lambda: (barrier / f'reached-{stale_id}').is_file(),
+             'held mutation has the pre-split route', 25)
+    assert facade.records(stale_id)[owner]['context']['read']['routing_epoch'] == 129
     pause = barrier / f'routing-page-{ts}.pause'
     pause.touch()
 
@@ -728,6 +804,7 @@ def o28(facade):
         next_split()
         extra = row(key(1), category=8, value=-1)
         table.insert(extra)
+        assert_stale_update_rejected(facade, stale_id)
         records = facade.records(old_id)
         survivors = stop_worker(cluster, owner)
         recovered_owner, recovered_ts = facade.reached(old_id, 'snapshot', workers=survivors, timeout=90)
@@ -752,8 +829,8 @@ def o28(facade):
     passed('O28', 'no-logical-metadata-cap', 'One table retained 130 routes, and its two current routing archive frames exceeded 64 KiB in aggregate with its index and exact query results intact.')
     pending_clause('O28', 'bounded-authenticated-pagination',
                    'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. A tampered internal continuation was not exercised.')
-    pending_clause('O28', 'interruption-and-pins',
-                   'The owner was killed after page one, and the survivor recovered the exact original pin and rows across a split. This history does not inject a stale writer.')
+    passed('O28', 'interruption-and-pins',
+           'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
     pending_clause('O28', 'large-counts',
                    'This multi-page fixture does not load 100,001 rows or force checked arithmetic overflow. O21 checks counts past 100,000 separately.')
 
@@ -801,6 +878,9 @@ def main():
         )), flush=True)
         return
     direct = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
+    if args.scenario == 'O21':
+        with args.binary.open('rb') as binary:
+            print(f'O21 server SHA-256 {hashlib.file_digest(binary, "sha256").hexdigest()}', flush=True)
     paged = args.scenario == 'O28'
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{args.scenario.lower()}-') as root, metadata_cgroup(paged):
         archive = Path(root) / 'archives' if paged else None
@@ -808,7 +888,8 @@ def main():
             archive.mkdir(mode=0o700)
         cluster = GrowthCluster(
             args.binary, root, mounts=True, metadata_profile=paged, archive=archive,
-            worker_memory=(3 if paged else 2) << 30,
+            bulk_load=args.scenario in ('O21', 'O26'),
+            worker_memory=(3584 if paged else 2048) * MIB,
             automatic=dict(shard_target_bytes=32 * MIB, minimum_free_bytes=64 * MIB)
             if args.scenario == 'O21' else None,
             test_executable=None if args.scenario == 'O21' else args.test_executable,
