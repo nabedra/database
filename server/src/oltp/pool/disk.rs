@@ -186,9 +186,9 @@ mod tests {
 
     #[test]
     fn o08_o13_o21_same_filesystem_reserves_once_and_releases() {
-        let directory = tempfile::tempdir().unwrap();
-        let first = PoolDisk::open(directory.path(), 4096).unwrap();
-        let second = PoolDisk::open(directory.path(), 4096).unwrap();
+        let directory = std::env::temp_dir();
+        let first = PoolDisk::open(&directory, 4096).unwrap();
+        let second = PoolDisk::open(&directory, 4096).unwrap();
         assert!(Arc::ptr_eq(&first.budget, &second.budget));
         let charge = first.stats().proposal_bytes;
         let protected = 2 * charge;

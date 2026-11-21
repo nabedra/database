@@ -302,6 +302,7 @@ impl OltpPool {
         tune(&mut options);
         let store_path = path.join(storage::STORE_DIR);
         let journal_path = store_path.join(nabedra_kv::manifest::JOURNAL_DIR);
+        let journal_path = journal_path.as_path();
         let segment_bytes = options.journal.segment_bytes;
         let opened = Store::open(&store_path, options).map_err(|error| {
             tracing::error!(path = %path.display(), %error, "OLTP pool refused at open");
@@ -312,11 +313,11 @@ impl OltpPool {
         // disk. Real stores measure the device of the journal itself.
         #[cfg(test)]
         let journal_path = if journal_path.exists() {
-            &journal_path
+            journal_path
         } else {
             path
         };
-        let disk = disk::PoolDisk::open(journal_path.as_ref(), segment_bytes)?;
+        let disk = disk::PoolDisk::open(journal_path, segment_bytes)?;
         // R6 at pool level, sticky (NS14, `damage.rs`): new damage of more than 8
         // groups, or more than 10% of the pool's groups (always allowing one), is
         // more likely systemic than local, so the pool is refused instead (plan
