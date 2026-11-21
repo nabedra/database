@@ -256,6 +256,27 @@ as a cold restart of all three workers onto a new run (R04, D09). Both builds ha
 | `data.direct.v1` active again | 7.5 s | 8.1 s | |
 | First point get through the running API | none in 180 s (503 `storage_unavailable`, "direct request deadline exceeded before execution") | same | not probed (no table) |
 
+GATEfix follow-up (2026-11-21). The running API did not recover because every worker came back as a new
+incarnation and, in this driver, with a new certificate. A receiver refused any request addressed to another
+incarnation, so the API could not read the new enrollments from Control. A receiver now accepts a Control
+authority call from an enrolled API that names an older incarnation of the same worker and certificate. The
+`[ci direct]` harness scenario G6 (in the D09 cluster) kills every worker, keeps both gateways running and
+cold-starts the workers:
+
+- Same certificates (a restarted container): both running gateways served a point get 4.3 s after the
+  cold start began, as the workers became ready. With the receiver check of `1ea4622`, the same scenario
+  failed: no point get within 60 s (503 `outcome_unknown`).
+- New certificates (this driver): no peer pinned in a running gateway remains, so it needs the new cluster
+  connection. It answers 503 `storage_unavailable` "direct request deadline exceeded before execution"
+  (`outcome: not_applied`) until it is restarted with the new `control_peers`; then it serves at once.
+
+A plain restart of one SIGKILLed registered worker with its previous configuration is refused by design:
+`registered startup ValidationError: invalid hosted group placement or identity` comes from the retained
+identity check (`NABEDRA_REGISTERED_WORKER.json`), which requires a higher enrollment revision and a new
+incarnation. The restart path after a crash is `worker.restart.prepare`, sent to a live worker once Control has
+removed the crashed worker from the ready set, followed by a start with the prepared (rolling) enrollment; or
+a replacement. NS11 and GATEfix did not run that path.
+
 ### Memory (G7)
 
 The largest worker `memory.peak` over the serial, update, get, mix and fsync runs is 108.6 MB for the baseline and
