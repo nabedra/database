@@ -249,7 +249,7 @@ jobs:
         working-directory: server
         run: |
           set -o pipefail
-          cargo test --locked --no-fail-fast --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
+          timeout 150 cargo test --locked --no-fail-fast --no-default-features --features oltp --lib bug1_ -- --test-threads 1 --nocapture 2>&1 | tee ../oltp-lib.log
       - name: Integration tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server

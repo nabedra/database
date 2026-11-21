@@ -361,21 +361,11 @@ pub(super) async fn serve(
         Some(service) if forward => service.forward(handle, request).await?,
         Some(service) => service.execute(handle, request).await?,
     };
-    handle
-        .resources()
-        .encode_in(
-            crate::oltp::pool::ByteClass::Data,
-            &response,
-            crate::protocol::MAX_BODY_BYTES,
-        )
-        .map_err(|error| match response {
-            DirectResponse::Done(_)
-            | DirectResponse::Failed(ProtocolError {
-                outcome: Outcome::Unknown,
-                ..
-            }) => super::mutation_uncertain(error),
-            _ => error,
-        })
+    handle.resources().encode_in(
+        crate::oltp::pool::ByteClass::Data,
+        &response,
+        crate::protocol::MAX_BODY_BYTES,
+    )
 }
 
 /// Why a gateway's send produced no `DirectResponse`.

@@ -546,24 +546,20 @@ impl DirectExecutor {
         true
     }
 
-    /// A pre-append refusal can retry locally. If Raft may have appended, the
-    /// gateway must know that before following another leader or route.
+    /// Counts a proposal that produced no reply, by why (T7b): the
+    /// deadline, a leadership change since `token`, or a stable leader whose
+    /// proposal still failed.
     fn proposal_failed(
         &self,
         handle: &ParticipantHandle,
         clock: &RangeClock,
-        token: LeaderToken,
+        token: Option<LeaderToken>,
         deadline: Instant,
-        error: ProtocolError,
-    ) -> Result<(), DirectResponse> {
-        // RV-FINAL M1: a full device refuses new work before proposing it.
-        if error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(&error) {
-            return Err(failed(error));
-        }
-        let expired = Instant::now() >= deadline;
-        let reason = if expired {
+        error: &ProtocolError,
+    ) {
+        let reason = if Instant::now() >= deadline {
             ProposalFailure::Deadline
-        } else if clock.leader_token() != Some(token) {
+        } else if token.is_none() || clock.leader_token() != token {
             ProposalFailure::Leadership
         } else {
             ProposalFailure::Stalled
@@ -577,17 +573,6 @@ impl DirectExecutor {
             message = %error.message,
             "direct proposal produced no reply"
         );
-        if error.outcome == Outcome::NotApplied {
-            Ok(())
-        } else if expired {
-            Err(failed(ProtocolError::new(
-                ErrorCode::OutcomeUnknown,
-                "direct request deadline expired after a proposal of unknown outcome",
-                Outcome::Unknown,
-            )))
-        } else {
-            Err(failed(error))
-        }
     }
 
     async fn get(
@@ -618,7 +603,7 @@ impl DirectExecutor {
                 .await
                 else {
                     if !self.pause(deadline, RetryCause::Leadership).await {
-                        return Err(not_leader_or(handle));
+                        return Err(not_leader_or(handle, false));
                     }
                     continue;
                 };
@@ -639,7 +624,7 @@ impl DirectExecutor {
                     Ok(Some(snapshot)) => snapshot,
                     Ok(None) => {
                         if !self.pause(deadline, RetryCause::Leadership).await {
-                            return Err(not_leader_or(handle));
+                            return Err(not_leader_or(handle, false));
                         }
                         continue;
                     }
@@ -819,9 +804,10 @@ impl DirectExecutor {
                 self.stats.latch_wait(waited);
             }
             self.served(handle);
+            let mut uncertain = false;
             loop {
                 if Instant::now() >= deadline {
-                    return Err(failed(unavailable_not_applied()));
+                    return Err(deadline_expired(uncertain));
                 }
                 match self
                     .attempt(
@@ -832,13 +818,14 @@ impl DirectExecutor {
                         &parsed.operation,
                         &keys,
                         deadline,
+                        &mut uncertain,
                     )
                     .await?
                 {
                     Attempt::Done(response) => return Ok(response),
                     Attempt::Retry(cause) => {
                         if !self.pause(deadline, cause).await {
-                            return Err(failed(unavailable_not_applied()));
+                            return Err(deadline_expired(uncertain));
                         }
                     }
                 }
@@ -859,6 +846,7 @@ impl DirectExecutor {
         operation: &Operation,
         keys: &[MvccKey],
         deadline: Instant,
+        uncertain: &mut bool,
     ) -> Result<Attempt<DirectResponse>, DirectResponse> {
         // T4fix F4: the token is taken before the timestamp is fetched.
         let token = timed(
@@ -875,7 +863,9 @@ impl DirectExecutor {
             perf_stage!("leader.attempt.timestamp_fetch"),
             by(deadline, self.timestamps.commit_ts()),
         );
-        let prepare = self.prepare(handle, clock, request, table, operation, keys, deadline);
+        let prepare = self.prepare(
+            handle, clock, request, table, operation, keys, deadline, *uncertain,
+        );
         tokio::pin!(fetch, prepare);
         let mut fetched = None;
         let prepared = loop {
@@ -967,10 +957,24 @@ impl DirectExecutor {
         {
             Ok(applied) => applied,
             Err(error) => {
-                // T4: the proposal no longer holds its local pending slot.
+                // T4: settle on any proposal error.
                 clock.settle(commit_ts);
-                self.proposal_failed(handle, clock, token, deadline, error)?;
-                return Ok(Attempt::Retry(RetryCause::Unavailable));
+                // RV-FINAL M1: a refusal before Raft (a full device, a
+                // refused reservation) commits nothing. A full device
+                // answers at once, as the queued path does (U01).
+                if full_device_refusal(&error, *uncertain) {
+                    return Err(failed(error));
+                }
+                // Otherwise the entry may still commit; the dedup record
+                // decides on the next attempt.
+                let cause = if error.outcome == Outcome::NotApplied {
+                    RetryCause::Unavailable
+                } else {
+                    *uncertain = true;
+                    RetryCause::Leadership
+                };
+                self.proposal_failed(handle, clock, Some(token), deadline, &error);
+                return Ok(Attempt::Retry(cause));
             }
         };
         let fault = match applied.reply {
@@ -1020,6 +1024,7 @@ impl DirectExecutor {
         operation: &Operation,
         keys: &[MvccKey],
         deadline: Instant,
+        uncertain: bool,
     ) -> Result<Prepared, DirectResponse> {
         let MvccKey::Row {
             primary_key: anchor,
@@ -1030,7 +1035,7 @@ impl DirectExecutor {
         };
         let leadership = || {
             if Instant::now() + RETRY_PAUSE >= deadline {
-                return Err(not_leader_or(handle));
+                return Err(not_leader_or(handle, uncertain));
             }
             Ok(Prepared::Exit(Attempt::Retry(RetryCause::Leadership)))
         };
@@ -1340,7 +1345,7 @@ impl DirectExecutor {
     ) -> ForwardResponse {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            let token = self.token(handle, clock, deadline).await?;
+            let token = Some(self.token(handle, clock, deadline).await?);
             let epochs = handle.direct_epochs().await.map_err(failed)?;
             // A forward marker is gated like Direct: activate the group.
             let epochs = self
@@ -1391,14 +1396,15 @@ impl DirectExecutor {
                 .await
                 .map_err(|_| failed(unavailable_not_applied()))?;
             self.served(handle);
+            let mut uncertain = false;
             loop {
                 if Instant::now() >= deadline {
-                    return Err(failed(unavailable_not_applied()));
+                    return Err(deadline_expired(uncertain));
                 }
                 let epochs = handle.direct_epochs().await.map_err(failed)?;
                 if by(deadline, handle.direct_barrier()).await.is_err() {
                     if !self.pause(deadline, RetryCause::Leadership).await {
-                        return Err(failed(unavailable_not_applied()));
+                        return Err(deadline_expired(uncertain));
                     }
                     continue;
                 }
@@ -1440,9 +1446,19 @@ impl DirectExecutor {
                 let applied = match by(deadline, handle.propose(command)).await {
                     Ok(applied) => applied,
                     Err(error) => {
-                        self.proposal_failed(handle, clock, token, deadline, error)?;
-                        if !self.pause(deadline, RetryCause::Unavailable).await {
-                            return Err(failed(unavailable_not_applied()));
+                        // RV-FINAL M1, as for a direct commit.
+                        if full_device_refusal(&error, uncertain) {
+                            return Err(failed(error));
+                        }
+                        let cause = if error.outcome == Outcome::NotApplied {
+                            RetryCause::Unavailable
+                        } else {
+                            uncertain = true;
+                            RetryCause::Leadership
+                        };
+                        self.proposal_failed(handle, clock, token, deadline, &error);
+                        if !self.pause(deadline, cause).await {
+                            return Err(deadline_expired(uncertain));
                         }
                         continue;
                     }
@@ -1476,7 +1492,7 @@ impl DirectExecutor {
                             RetryCause::Unavailable
                         };
                         if !self.pause(deadline, cause).await {
-                            return Err(failed(unavailable_not_applied()));
+                            return Err(deadline_expired(uncertain));
                         }
                     }
                     other => return Err(fault_response(other, &epochs)),
@@ -1641,14 +1657,17 @@ fn stale_route(epochs: Option<&ParticipantEpochs>) -> DirectResponse {
 }
 /// After a failed barrier: redirect when another node leads, else report
 /// the deadline.
-fn not_leader_or(handle: &ParticipantHandle) -> DirectResponse {
+fn not_leader_or(handle: &ParticipantHandle, uncertain: bool) -> DirectResponse {
     let (leader, local) = handle.direct_leadership();
     if leader.is_some() && leader != local {
         DirectResponse::NotLeader { hint: leader }
     } else {
-        failed(unavailable_not_applied())
+        deadline_expired(uncertain)
     }
 }
+/// `future`, or an unknown-outcome `StorageUnavailable` at `deadline`.
+/// Dropping a proposal at the deadline leaves its outcome to the dedup
+/// record, as for any proposal error.
 /// A key's newest version as `DirectExecutor::latest` reads it. `None` asks
 /// for a retry: a waiter was failed by a leadership change, or storage was
 /// briefly unavailable.
@@ -1687,7 +1706,6 @@ fn above_read_versions(commit_ts: CommitTs, writes: &[DirectWrite]) -> bool {
     })
 }
 
-/// A deadline can cut a submitted proposal before its response is known.
 async fn by<T>(
     deadline: Instant,
     future: impl std::future::Future<Output = Result<T, ProtocolError>>,
@@ -1701,6 +1719,12 @@ async fn by<T>(
                 Outcome::Unknown,
             ))
         })
+}
+/// RV-FINAL M1: a proposal refused with a full device before Raft saw it
+/// is the request's answer, unless an earlier proposal of the request may
+/// have committed (then the dedup record decides on the next attempt).
+fn full_device_refusal(error: &ProtocolError, uncertain: bool) -> bool {
+    !uncertain && error.outcome == Outcome::NotApplied && crate::oltp::pool::is_no_space(error)
 }
 /// RV-FINAL L3: a Catalog read bounded by the request deadline. Nothing was
 /// proposed yet, so running out of time is `not_applied`, never a call the
@@ -1716,6 +1740,17 @@ async fn catalog_read<T>(
 }
 fn failed(error: ProtocolError) -> DirectResponse {
     DirectResponse::Failed(error)
+}
+fn deadline_expired(uncertain: bool) -> DirectResponse {
+    failed(if uncertain {
+        ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "direct request deadline expired after a proposal of unknown outcome",
+            Outcome::Unknown,
+        )
+    } else {
+        unavailable_not_applied()
+    })
 }
 fn unavailable_not_applied() -> ProtocolError {
     ProtocolError::new(
