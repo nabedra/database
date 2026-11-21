@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fixture: [d11]
+        fixture: [vote-order]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.94.1 --profile minimal
@@ -30,6 +30,10 @@ jobs:
           key: oltp-1.94.1-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
           restore-keys: oltp-1.94.1-
       - run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Reproduce GC1 vote ordering
+        if: matrix.fixture == 'vote-order'
+        working-directory: server
+        run: cargo test --locked --no-default-features --features oltp --lib o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote
       - name: Repeat the typed-log library suite
         if: matrix.fixture == 'typed-log'
         working-directory: server

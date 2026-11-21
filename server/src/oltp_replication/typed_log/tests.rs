@@ -1259,6 +1259,8 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
 /// No callback fires while the first sync is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     tokio::time::timeout(Duration::from_secs(30), async {
         let rig = GatedLog::new();
         let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
@@ -1280,35 +1282,40 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
         }
         // The vote takes its writer place behind appends 0 to 2.
         let mut voter = log.clone();
-        let mut vote = tokio::spawn(async move {
-            voter.save_vote(&Vote::new_committed(2, 1)).await.unwrap();
-            voter
-        });
+        let new_vote = Vote::new_committed(2, 1);
+        let mut vote = Box::pin(voter.save_vote(&new_vote));
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut vote)
-                .await
-                .is_err(),
+            std::future::poll_fn(|cx| std::task::Poll::Ready(vote.as_mut().poll(cx).is_pending()))
+                .await,
             "the vote waits for the held append"
         );
+        let syncs_at_post_vote_append = Arc::new(AtomicU64::new(0));
+        *log.append_hook.lock().unwrap() = Some(Arc::new({
+            let pool = pool.clone();
+            let observed = syncs_at_post_vote_append.clone();
+            move || observed.store(pool.kv_store().stats().journal_syncs, Ordering::Release)
+        }));
         for index in [3, 4] {
             let (entries, flushed) = ack(index);
             log.append(entries, flushed).await.unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
         for acked in &mut acks {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(1), acked)
-                    .await
-                    .is_err(),
-                "no append reports a flush before its sync"
-            );
+            assert!(matches!(
+                acked.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
         }
         drop(held_sync);
-        let mut voter = vote.await.unwrap();
+        vote.await.unwrap();
         for acked in acks {
             acked.await.unwrap().unwrap();
         }
         log.drain().await;
+        assert_eq!(
+            syncs_at_post_vote_append.load(Ordering::Acquire),
+            before + 3,
+            "the vote must sync before the post-vote batch starts"
+        );
         assert_eq!(
             syncs() - before,
             4,
