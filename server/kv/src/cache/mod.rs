@@ -54,6 +54,13 @@ pub enum CacheKey {
 }
 
 impl CacheKey {
+    /// The store namespace the key belongs to.
+    pub fn namespace(&self) -> u64 {
+        match *self {
+            CacheKey::Run { store, .. } | CacheKey::Journal { store, .. } => store,
+        }
+    }
+
     /// A well mixed 64-bit hash. Cache keys come from the engine, never from clients, so
     /// a fast non-keyed hash is enough.
     pub fn hash64(&self) -> u64 {
@@ -252,6 +259,30 @@ impl BlockCache {
         }
     }
 
+    /// Drops every entry of `namespace` (one store's run blocks and journal values).
+    /// Entries a reader still holds stay alive in that reader only. Returns how many
+    /// entries were dropped.
+    pub fn erase_namespace(&self, namespace: u64) -> usize {
+        let mut erased = 0;
+        for shard in self.shards.iter() {
+            let mut shard = lock(shard);
+            let keys: Vec<CacheKey> = shard
+                .lru
+                .entries()
+                .map(|(key, _, _)| *key)
+                .filter(|key| key.namespace() == namespace)
+                .collect();
+            for key in keys {
+                if let Some(value) = shard.lru.remove(&key) {
+                    self.usage
+                        .fetch_sub(value.len() + ENTRY_OVERHEAD, Ordering::Relaxed);
+                    erased += 1;
+                }
+            }
+        }
+        erased
+    }
+
     pub fn capacity_bytes(&self) -> usize {
         self.capacity
     }
@@ -347,6 +378,36 @@ mod tests {
             run,
             offset,
         }
+    }
+
+    #[test]
+    fn erase_namespace_drops_only_that_stores_entries() {
+        let cache = BlockCache::new(1 << 20);
+        let journal = |store| CacheKey::Journal {
+            store,
+            segment: 1,
+            epoch: 1,
+            offset: 0,
+        };
+        let other = CacheKey::Run {
+            store: 2,
+            run: 1,
+            offset: 0,
+        };
+        drop(cache.insert(run_key(1, 0), Bytes::from_static(b"a")));
+        let held = cache.insert(run_key(1, 4096), Bytes::from_static(b"b"));
+        drop(cache.insert(journal(1), Bytes::from_static(b"c")));
+        drop(cache.insert(other, Bytes::from_static(b"d")));
+        drop(cache.insert(journal(2), Bytes::from_static(b"e")));
+        assert_eq!(cache.erase_namespace(1), 3);
+        assert!(cache.get(&run_key(1, 0)).is_none());
+        assert!(cache.get(&run_key(1, 4096)).is_none());
+        assert!(cache.get(&journal(1)).is_none());
+        assert!(cache.get(&other).is_some());
+        assert!(cache.get(&journal(2)).is_some());
+        assert_eq!(cache.usage_bytes(), 2 * (1 + ENTRY_OVERHEAD));
+        assert_eq!(held.as_ref(), b"b", "a reader's copy outlives the eviction");
+        assert_eq!(cache.erase_namespace(1), 0);
     }
 
     #[test]
