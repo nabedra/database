@@ -659,8 +659,14 @@ jobs:
               --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
               --category compatibility --category queries --category transactions --category recovery --category growth \
               --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
-            # Exit 2 means some scenarios still lack full coverage.
+            # Exit 2 allows incomplete scenarios outside the required RF3 transaction cases.
             if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
+            if ! jq -e '[.results[] | select(.scenario == "O07" or .scenario == "O10")]
+                        | length == 2 and all(.[]; .status == "passed")' \
+              "artifacts/acceptance-$mode/results.json" > /dev/null; then
+              echo "O07 and O10 must pass with direct_oltp=$mode"
+              status=1
+            fi
           done
           exit "$status"
       - if: always()

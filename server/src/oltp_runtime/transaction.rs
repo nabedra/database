@@ -355,7 +355,11 @@ impl TransactionCoordinator {
         super::recovery_tests::transaction_checkpoint(
             "participants",
             txn.request_id,
-            &prepared.participants.iter().map(|part| &part.plan).collect::<Vec<_>>(),
+            &prepared
+                .participants
+                .iter()
+                .map(|part| &part.plan)
+                .collect::<Vec<_>>(),
         )
         .await;
         let preparation = async {

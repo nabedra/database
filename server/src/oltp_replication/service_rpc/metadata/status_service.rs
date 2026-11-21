@@ -1308,7 +1308,8 @@ impl StatusEndpoint {
             }
             Request::Inspect { txn } => {
                 #[cfg(test)]
-                if crate::oltp_runtime::recovery_tests::lose_status_inspection(txn.request_id).await {
+                if crate::oltp_runtime::recovery_tests::lose_status_inspection(txn.request_id).await
+                {
                     return Err(unavailable());
                 }
                 encode(shared, handle.inspect_transaction(txn).await?).await

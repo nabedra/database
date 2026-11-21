@@ -286,7 +286,20 @@ pub(crate) async fn transaction_checkpoint(
     let checkpoint = format!("transaction-{request}-{stage}");
     let mut file = match std::fs::File::create_new(directory.join(format!("{checkpoint}.json"))) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if stage.starts_with("resolve-") {
+                let mut bytes = serde_json::to_vec(observed).unwrap();
+                bytes.push(b'\n');
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join(format!("{checkpoint}-repeated.jsonl")))
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+            }
+            return;
+        }
         Err(error) => panic!("open transaction checkpoint: {error}"),
     };
     file.write_all(&serde_json::to_vec(observed).unwrap())

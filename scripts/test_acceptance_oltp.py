@@ -31,6 +31,9 @@ class EssentialRunnerTests(unittest.TestCase):
     def test_rubric_preserves_all_scenarios_scheduler_ids_and_regressions(self):
         self.assertEqual(sorted(s.number for s in acceptance.SCENARIOS), list(range(1, 30)))
         self.assertEqual(len(acceptance.CATEGORIES), 7)
+        for scenario in acceptance.SCENARIOS:
+            self.assertTrue(scenario.clauses)
+            self.assertEqual(len(scenario.clauses), len(set(scenario.clauses)))
         contract = (acceptance.ROOT / 'docs/testing/scheduler-contract.md').read_text()
         required = set(re.findall(r'^\| ([CMQFRTUAB]\d\d) \|', contract, re.MULTILINE))
         mapped = set(' '.join(acceptance.SCHEDULER.values()).split())

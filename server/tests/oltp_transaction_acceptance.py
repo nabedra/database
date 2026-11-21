@@ -10,7 +10,7 @@ from pathlib import Path
 import tempfile
 import time
 
-from oltp_direct_acceptance import Database, admin_owner, col, direct_map, dump
+from oltp_direct_acceptance import Database, admin_owner, col, dump
 from oltp_direct_cluster import DATABASE, WORKERS, Rf3Cluster, call, operation, uid, write_json
 from oltp_terminal_copy_acceptance import read_json, wait_for
 
@@ -50,6 +50,12 @@ class Transactions:
 
     def receipt(self, request_id, api='api2', **kwargs):
         return self.api(api, f'{REQUESTS}/{self.cluster.run_id}/{request_id}', **kwargs)
+
+    def pending(self, request_id):
+        status, response = self.receipt(request_id)
+        assert status == 200 and response['state'] in ('running', 'committing', 'reconciling'), (status, response)
+        assert response['result'] is None and response['error'] is None, response
+        return response
 
     def terminal(self, request_id, result, api='api2', timeout=45):
         deadline = time.monotonic() + timeout
@@ -157,13 +163,23 @@ def assert_binding(statement, facade, body):
     return request
 
 
-def run_batch(facade, table, groups, items, category, *, race=False):
+def run_batch(facade, table, groups, items, category, pool, *, race=False):
     """Delay the acknowledgement at each transaction boundary in the real services."""
     body = batch(table, items)
     request_id = body['request_id']
     facade.select(request_id, {'participants': True, 'commit-stamp': True,
                                'commit-reply': True, 'decision': True})
-    facade.admit(body)
+    old_snapshots = []
+    for query in [facade.query(table), facade.query(table, category)]:
+        query_id = query['request_id']
+        facade.select(query_id, {'snapshot': True})
+        facade.admit(query, 'api2')
+        facade.reached(query_id, 'snapshot')
+        old_snapshots.append(query_id)
+    if race:
+        batch_reply = pool.submit(facade.api, 'api1', OPERATIONS, body)
+    else:
+        facade.admit(body)
     _, participants = facade.reached(request_id, 'participants')
     actual = [part['group'] for part in participants]
     assert {item['group_id'] for item in actual} == {item['group_id'] for item in groups}, actual
@@ -182,94 +198,122 @@ def run_batch(facade, table, groups, items, category, *, race=False):
     assert facade.data(facade.query(table, category)) == []
     facade.release(request_id, 'participants')
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        try:
-            last_seal = next(reversed(stages))
-            for stage in stages:
-                _, proof = facade.reached(request_id, stage)
-                assert proof, (stage, proof)
-                assert not any(path.exists() for path in facade.paths(request_id, 'commit-reply'))
-                if stage != last_seal:
-                    facade.release(request_id, stage)
+    last_seal = next(reversed(stages))
+    for stage in stages:
+        _, proof = facade.reached(request_id, stage)
+        assert proof, (stage, proof)
+        assert not any(path.exists() for path in facade.paths(request_id, 'commit-reply'))
+        facade.pending(request_id)
+        if stage != last_seal:
+            facade.release(request_id, stage)
 
-            older = []
-            for query, expected in [(facade.query(table), old_rows), (facade.query(table, category), [])]:
-                query_id = query['request_id']
-                facade.select(query_id, {'snapshot': True})
-                facade.admit(query, 'api2')
-                _, read_ts = facade.reached(query_id, 'snapshot')
-                older.append((query_id, expected, read_ts))
+    for query_id, expected in zip(old_snapshots, [old_rows, []], strict=True):
+        facade.release(query_id, 'snapshot')
+        facade.terminal(query_id, expected)
 
-            # D08. The point writer reaches the queued planner while the batch still holds its intent.
-            if race:
-                key = items[0]['id']
-                point = operation('table.insert', {'table_id': table.id, 'row': rows(key, category=99)[0]})
-                point_id = point['request_id']
-                facade.select(point_id, {'blocked': True})
-                before = facade.cluster.all_stats()
-                point_reply = pool.submit(facade.api, 'api1', OPERATIONS, point)
-                _, intent = facade.reached(point_id, 'blocked')
-                assert intent['txn']['request_id'] == request_id, intent
-                after = facade.cluster.all_stats()
-                if facade.direct:
-                    assert direct_map(after, 'fallbacks') > direct_map(before, 'fallbacks')
-                assert not point_reply.done()
+    older = []
+    for query, expected in [(facade.query(table), old_rows), (facade.query(table, category), [])]:
+        query_id = query['request_id']
+        facade.select(query_id, {'snapshot': True, 'blocked': race})
+        facade.admit(query, 'api2')
+        _, read_ts = facade.reached(query_id, 'snapshot')
+        older.append((query_id, expected, read_ts))
 
-            facade.release(request_id, last_seal)
-            _, stamp = facade.reached(request_id, 'commit-stamp')
-            assert stamp['commit_ts'] > max(plan['read_ts'] for plan in participants)
-            assert all(read_ts < stamp['commit_ts'] for _, _, read_ts in older)
-            facade.release(request_id, 'commit-stamp')
-            _, durable = facade.reached(request_id, 'commit-reply')
-            assert_binding(durable, facade, body)
-            assert durable['decision'] == {'commit': {'commit_ts': stamp['commit_ts']}}
-            assert not any(path.exists() for path in facade.paths(request_id, 'decision'))
-            facade.release(request_id, 'commit-reply')
-            _, decision = facade.reached(request_id, 'decision')
-            assert decision == durable
-            facade.release(request_id, 'decision')
-            _, first = facade.reached(request_id, resolutions[0])
-            assert first['decision'] == decision['decision']
-            assert first['completed_at']['index'] > 0
-            if len(resolutions) > 1:
-                assert not any(path.exists() for path in facade.paths(request_id, resolutions[1]))
-                # The reader may help finish the second participant while the writer is stopped.
-                # Run both forms on independent snapshots.
-            newer = sorted(old_rows + items, key=lambda row: row['id'])
-            for query, expected in [(facade.query(table), newer),
-                                    (facade.query(table, category), items)]:
-                facade.select(query['request_id'], {'snapshot': False, 'blocked': False})
-                # A helper can take the second resolve checkpoint, so let that phase proceed.
-                for stage in resolutions[1:]:
-                    facade.release(request_id, stage)
-                assert facade.data(query, 'api2') == expected
-                _, read_ts = facade.reached(query['request_id'], 'snapshot')
-                assert read_ts >= stamp['commit_ts']
-            for query_id, expected, _ in older:
-                facade.release(query_id, 'snapshot')
-                facade.terminal(query_id, expected)
-            facade.release(request_id, resolutions[0])
-            for stage in resolutions[1:]:
-                _, evidence = facade.reached(request_id, stage)
-                assert evidence['txn'] == decision['txn']
-                assert evidence['decision'] == decision['decision']
-            original = facade.terminal(request_id, len(items))
-            facade.admit(body, 'api2')
-            assert facade.terminal(request_id, len(items), api='api1') == original
-            for stage in resolutions:
-                _, evidence = facade.reached(request_id, stage)
-                assert evidence['request'] == decision['request'], evidence
-                assert evidence['manifest'] == decision['manifest'], evidence
-            if race:
-                facade.release(point_id, 'blocked')
-                status, response = point_reply.result(timeout=35)
-                assert status == 409 and response['error']['code'] == 'conflict', (status, response)
-                assert response['error']['outcome'] == 'not_applied', response
-        finally:
-            facade.release_all()
+    # D08. The point writer reaches the queued planner while the batch still holds its intent.
+    if race:
+        key = items[0]['id']
+        point = operation('table.insert', {'table_id': table.id, 'row': rows(key, category=99)[0]})
+        point_id = point['request_id']
+        facade.select(point_id, {'blocked': True})
+        before = facade.cluster.all_stats()
+        point_reply = pool.submit(facade.api, 'api1', OPERATIONS, point)
+        _, intent = facade.reached(point_id, 'blocked')
+        assert intent['txn']['request_id'] == request_id, intent
+        after = facade.cluster.all_stats()
+        if facade.direct:
+            def intent_fallbacks(stats):
+                return sum((worker.get('direct') or {}).get('fallbacks', {}).get('intent', 0)
+                           for worker in stats.values())
+
+            assert intent_fallbacks(after) > intent_fallbacks(before)
+        assert not point_reply.done()
+
+    facade.release(request_id, last_seal)
+    _, stamp = facade.reached(request_id, 'commit-stamp')
+    assert stamp['commit_ts'] > max(plan['read_ts'] for plan in participants)
+    assert all(read_ts < stamp['commit_ts'] for _, _, read_ts in older)
+    facade.release(request_id, 'commit-stamp')
+    _, durable = facade.reached(request_id, 'commit-reply')
+    assert_binding(durable, facade, body)
+    assert durable['decision'] == {'commit': {'commit_ts': stamp['commit_ts']}}
+    assert not any(path.exists() for path in facade.paths(request_id, 'decision'))
+    facade.pending(request_id)
+    facade.release(request_id, 'commit-reply')
+    _, decision = facade.reached(request_id, 'decision')
+    assert decision == durable
+    facade.release(request_id, 'decision')
+    _, first = facade.reached(request_id, resolutions[0])
+    assert first['decision'] == decision['decision']
+    assert first['completed_at']['index'] > 0
+    if race:
+        assert not any(path.exists() for path in facade.paths(request_id, resolutions[1]))
+    newer = sorted(old_rows + items, key=lambda row: row['id'])
+    newer_reads = []
+    for query, expected in [(facade.query(table), newer), (facade.query(table, category), items)]:
+        query_id = query['request_id']
+        facade.select(query_id, {'snapshot': False, 'blocked': race})
+        facade.admit(query, 'api2')
+        _, read_ts = facade.reached(query_id, 'snapshot')
+        assert read_ts >= stamp['commit_ts']
+        if race:
+            _, intent = facade.reached(query_id, 'blocked')
+            assert intent == {'txn': decision['txn'], 'manifest': decision['manifest']}, intent
+        newer_reads.append((query_id, expected))
+    for query_id, _, _ in older:
+        facade.release(query_id, 'snapshot')
+        if race:
+            _, intent = facade.reached(query_id, 'blocked')
+            assert intent == {'txn': decision['txn'], 'manifest': decision['manifest']}, intent
+    for query_id, _ in newer_reads:
+        facade.release(query_id, 'blocked')
+    for query_id, _, _ in older:
+        facade.release(query_id, 'blocked')
+    if race:
+        # The scans saw the intent while the original coordinator was held at the first participant.
+        _, last = facade.reached(request_id, resolutions[1])
+        assert last['decision'] == decision['decision']
+        facade.pending(request_id)
+        facade.release(request_id, resolutions[1])
+    for query_id, expected in newer_reads:
+        facade.terminal(query_id, expected)
+    for query_id, expected, _ in older:
+        facade.terminal(query_id, expected)
+    facade.release(request_id, resolutions[0])
+    for stage in resolutions[1:]:
+        _, evidence = facade.reached(request_id, stage)
+        assert evidence['txn'] == decision['txn']
+        assert evidence['decision'] == decision['decision']
+    original = facade.terminal(request_id, len(items))
+    facade.admit(body, 'api2')
+    assert facade.terminal(request_id, len(items), api='api1') == original
+    for stage in resolutions:
+        _, evidence = facade.reached(request_id, stage)
+        assert evidence['request'] == decision['request'], evidence
+        assert evidence['manifest'] == decision['manifest'], evidence
+    if race:
+        assert batch_reply.result(timeout=35) == (200, {'request_id': request_id, 'data': len(items)})
+        repeated = []
+        for path in facade.paths(request_id, resolutions[1]):
+            replay = path.with_name(f'{path.stem}-repeated.jsonl')
+            if replay.exists():
+                repeated.extend(json.loads(line) for line in replay.read_text().splitlines())
+        assert repeated and all(item == evidence for item in repeated), repeated
+        facade.release(point_id, 'blocked')
+        status, response = point_reply.result(timeout=35)
+        assert status == 409 and response['error']['code'] == 'conflict', (status, response)
+        assert response['error']['outcome'] == 'not_applied', response
     assert facade.data(facade.query(table)) == newer
     assert facade.data(facade.query(table, category)) == items
-    return stamp['commit_ts']
 
 
 def o07(facade):
@@ -282,7 +326,11 @@ def o07(facade):
     facade.terminal(seed['request_id'], 2)
 
     facade.make_index(table)
-    run_batch(facade, table, [source[0]['group']], rows(10, 11, category=7), 7)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            run_batch(facade, table, [source[0]['group']], rows(10, 11, category=7), 7, pool)
+        finally:
+            facade.release_all()
 
     split_id = uid()
     for _ in range(16):
@@ -294,7 +342,15 @@ def o07(facade):
         assert split['state'] == 'importing', split
     assert split['state'] == 'published' and len(split['children']) == 2, split
 
-    run_batch(facade, table, split['children'], rows(-20, 20, category=8), 8, race=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        try:
+            run_batch(facade, table, split['children'], rows(-20, 20, category=8), 8, pool, race=True)
+        finally:
+            facade.release_all()
+    passed('O07', 'private-before-commit', 'Base and indexed snapshots excluded prepared rows and index entries before COMMIT.')
+    passed('O07', 'atomic-snapshots', 'RF3 single-range and split batches, including a paused finalizer.')
+    passed('O07', 'single-decision-and-application', 'Durable participant evidence bound the original decision. Same-body receipt replay returned the original result.')
+
     expected = rows(-20, category=8) + rows(-5, 5, category=0) + rows(10, 11, category=7) + rows(20, category=8)
     for new_key, duplicate in [(-21, 20), (21, -20)]:
         conflicting = batch(table, rows(new_key, duplicate, category=99))
@@ -306,9 +362,6 @@ def o07(facade):
         assert response['error']['outcome'] == 'not_applied', first
         assert facade.data(facade.query(table)) == expected
         assert facade.data(facade.query(table, 99)) == []
-    passed('O07', 'private-before-commit', 'Base and indexed snapshots pinned after preparation excluded the new rows and index entries.')
-    passed('O07', 'atomic-snapshots', 'RF3 single-range and split batches, including a paused finalizer.')
-    passed('O07', 'single-decision-and-application', 'Durable participant evidence bound the original decision. Same-body receipt replay returned the original result.')
     passed('O07', 'duplicate-key-aborts-batch', 'Both cross-range conflict directions left rows and indexes intact.')
 
 
@@ -373,21 +426,18 @@ def o10(facade):
         _, intent = facade.reached(query['request_id'], 'blocked')
         assert intent['txn'] == durable['txn'], intent
         facade.reached(request_id, 'status-inspect-unavailable')
-        status, observed = facade.receipt(query['request_id'])
-        assert status == 200 and observed['state'] in ('running', 'reconciling', 'committing'), observed
-        assert observed['result'] is None and observed['error'] is None, observed
+        facade.pending(query['request_id'])
+        facade.release(request_id, 'commit-reply')
+        owner, decided = facade.reached(request_id, 'decision')
+        assert decided == durable, (decided, durable)
+        accepted = facade.records(request_id)
+        assert all(record['accepted'] and record['body_hash'] == binding['digest']
+                   and record['context_hash'] == binding['accepted_context']
+                   for record in accepted.values()), accepted
+        facade.cluster.workers[owner].kill()
     finally:
         for fault in faults:
             fault.unlink(missing_ok=True)
-
-    facade.release(request_id, 'commit-reply')
-    owner, decided = facade.reached(request_id, 'decision')
-    assert decided == durable, (decided, durable)
-    accepted = facade.records(request_id)
-    assert all(record['accepted'] and record['body_hash'] == binding['digest']
-               and record['context_hash'] == binding['accepted_context']
-               for record in accepted.values()), accepted
-    facade.cluster.workers[owner].kill()
     terminal = facade.terminal(request_id, 2, timeout=120)
     assert facade.terminal(request_id, 2, api='api1') == terminal
     facade.admit(body, 'api2')

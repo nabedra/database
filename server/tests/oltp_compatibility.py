@@ -141,9 +141,19 @@ def main():
                 counterpart = exercise(server.url, 'test-token', None, unauthorized_database='other')
             finally:
                 server.stop()
-        # Database scope is asserted separately for each deployment's policy.
-        counterpart.pop('database_scope', None)
+        assert counterpart.pop('database_scope') == 'unauthorized'
         assert observed == counterpart, 'engine-independent ORM observations differ'
+        checks = {
+            'operations-and-descriptors': ('passed', observed['operations']),
+            'results-types-and-ordering': ('passed', 'Both engines matched the public decoder and row-order assertions.'),
+            'errors-and-table-identity': ('passed', 'Conflict, stale-handle and recreated-table assertions ran on both engines.'),
+            'advisory-mode-and-parquet': ('passed', 'Both modes opened the same descriptor with format parquet on both engines.'),
+            'authentication-and-scope': ('not-run', 'Both engines rejected invalid credentials. Only the OLTP fixture checked database scope.'),
+            'large-counts': ('not-run', 'The parity workload stops at 1,000 rows. Clients with the legacy 100,000 limit need an upgrade.'),
+        }
+        for assertion, (status, detail) in checks.items():
+            marker = dict(scenario='O01', assertion=assertion, status=status, detail=detail)
+            print('NABEDRA_OLTP_ASSERT ' + json.dumps(marker), flush=True)
     print(json.dumps(dict(result='passed', engines=['olap', 'oltp'] if args.oltp_binary else ['olap'],
                           operations=observed['operations'], scales=observed['scales']), sort_keys=True))
 
