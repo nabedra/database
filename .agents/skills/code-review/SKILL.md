@@ -34,6 +34,13 @@ users run the system. For remote builds, heavy Docker and Kubernetes checks,
 and authorized S3 testing, follow the
 [Nabedra builds skill](../nabedra-builds/SKILL.md).
 
+Run full suites, acceptance, campaigns and image checks on GitHub Actions by
+deliberate dispatch pinned to the reviewed commit, following
+[GitHub Actions for checks](references/gh-actions.md). Pushes start nothing.
+A check passes only when its run URL, tested SHA and executed assertions are
+recorded. List not-run and quarantined checks separately; never count them as
+passing.
+
 # Number of tests
 Aim for 3-10 big essential tests/categories max per functionality/use case category and then do some variations of each, 3-5 per category. Each essential test should amount to a big use or edge case that needs to be tested. Use `references/example.md` as a reference: there we have 5 big use case categories, 2-3 essential tests/categories, then in the implementation YOU should make variations of each of those bulleted-points essential tests. E.g., to check that the queue doesn't break under scaling (one possible essential test for the scaling use case) you'd check with 3-5 different configurations (request size, number of parallel requests, when they burst...) 
 
@@ -41,6 +48,6 @@ Aim for 3-10 big essential tests/categories max per functionality/use case categ
 
 When you are asked to make a code/QA review/testing, start by listing in the form of tasks or a TODO table in markdown all tests you are going to make according to the guidelines above. Then, spawn one agent per testing task. You should expect the user to specify to you the model they wanna use; if not, assume you shall use the latest GPT Sol model on high or the latest Claude Opus model on high, depending on whether you're Codex/GPT or Claude Code. Each subagent shouldn't have to do TOO much but not TOO little either: the goal is to keep mid-size tasks done by subagents to limit context window usage of the orchestration agent (you).
 
-Try to spawn as many subagents as possible without interfering with the tests of each other. E.g., if Test 2a has to wait for Test 1a to be done, then don't run a subagent for Test 2a until Test 1a is done; but if Test 1a and Test 1b, and 1c and 1d... can be done in parallel, spawn a subagent for each.
+Each test subagent dispatches its own GitHub Actions run with its own request ID, and cancels or reruns only runs it dispatched. Try to spawn as many subagents as possible without interfering with the tests of each other. E.g., if Test 2a has to wait for Test 1a to be done, then don't run a subagent for Test 2a until Test 1a is done; but if Test 1a and Test 1b, and 1c and 1d... can be done in parallel, spawn a subagent for each.
 
 On `references/example.md` you shall find developer test prompts as example lists of relevant tests grouped by use case. Consult the matching use case when choosing tests for a review

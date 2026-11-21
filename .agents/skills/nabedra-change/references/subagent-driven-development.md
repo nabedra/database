@@ -22,6 +22,25 @@ runners, and integration changes as tasks where the plan calls for them.
    can use them. Resolve routine ambiguities against the spec and record decisions
    that affect other tasks. Keep work that depends on an unresolved requirement
    queued while independent tasks proceed.
+4. Assign hot files. Before each wave of parallel tasks, list its hot files:
+   files that two or more tasks in the wave will likely edit, plus any file that
+   caused a merge conflict or a cross-branch break in the last wave. CI files
+   (`.github/workflows/*`, `.github/quarantine.tsv`) are always hot. Give each
+   hot file one owner for the wave in the ledger's ownership column: the task
+   with the largest change there, or the lead for CI files. Only the owner
+   commits to a hot file. A task that needs a change in a hot file it does not
+   own stops editing that file. It sends the exact change (a diff or a precise
+   description) and the reason to the lead, in its report or a message, and
+   continues with work that does not depend on it. The lead forwards the
+   change to the owner, or schedules it after the owner's branch is
+   integrated. Ownership ends when the owner's branch is integrated. Put the
+   hot-file list and owners in every brief of the wave.
+5. Review the CI quarantine (`.github/quarantine.tsv`) at the start of each
+   wave. Assign an owner task to every `unassigned` row and decide every
+   expired row, following
+   [the quarantine protocol](../../code-review/references/gh-actions.md#quarantine).
+   Brief agents that CI runs only on deliberate dispatch, as described in
+   [GitHub Actions for checks](../../code-review/references/gh-actions.md).
 
 For worker execution or recovery changes, follow [AGENTS.md](../../../../AGENTS.md).
 Use the [scheduling plan](../../../../plans/resource-aware-scheduling.md) and
