@@ -712,8 +712,8 @@ jobs:
             name=$(basename "$profile" | sed -E 's/\.(gz|zst)$//')
             heaptrack_print -f "$profile" --print-peaks 1 --print-allocators 1 --print-temporary 1 --print-leaks 0 \
               -n 25 > "artifacts/heaptrack/$name.txt" 2>&1 || true
-            echo "===== $profile"; awk '/^PEAK MEMORY CONSUMERS/{p=1} p' "artifacts/heaptrack/$name.txt" | head -220
-            tail -12 "artifacts/heaptrack/$name.txt"
+            echo "===== $profile"; { awk '/^PEAK MEMORY CONSUMERS/{p=1} p' "artifacts/heaptrack/$name.txt" | grep -E 'peak memory consumed over|/server/(src|kv)/' | head -120; } || true
+            tail -6 "artifacts/heaptrack/$name.txt" || true
           done
           rm -rf artifacts/heaptrack/cluster
       - if: always()
