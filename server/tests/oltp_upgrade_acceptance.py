@@ -28,7 +28,7 @@ from oltp_upgrade_export import archive_path
 GUIDE = 'docs/oltp-rocksdb-upgrade.md'
 ROW_COUNT = 101_200
 BOUNDARY = 50_000
-BATCH_ROWS = 4_096
+BATCH_ROWS = 8_192
 VERIFY_ROWS = 4_096
 DELETED = {7, BOUNDARY + 7}
 ORM_TABLE = 'migration_orm'
@@ -116,12 +116,12 @@ def verify_rf3(cluster, groups):
         assert {(member['worker_id'], member['pool_id']) for member in placement['members']} == expected, placement
 
 
-def create_index(url, token, table, name, column, covering):
+def create_index(url, token, table, name, column, covering, *, timeout=120):
     index_id, build_id = uid(), uid()
     definition = dict(table_id=table.id, index_id=index_id, name=name, columns=[column], covering=covering)
     admin_request([url], token, 'storage.index.create', definition, build_id)
     selector = dict(table_id=table.id, index_id=index_id, build_id=build_id, attempt=1)
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status, reply = call(url, '/v1/cluster/operations', operation('storage.index.status', selector),
                              token=token, timeout=10)
@@ -138,7 +138,7 @@ def create_index(url, token, table, name, column, covering):
     raise AssertionError(f'legacy index {name} did not become ready')
 
 
-def seed_legacy_indexes(binary, root):
+def seed_legacy_archive(binary, root):
     # b29a178's remote Timestamp endpoint rejects index metadata pin binding.
     # Its local admin API can create the indexes. Move those pre-existing
     # tables into the RF3 source using the same unmodified legacy binary.
@@ -152,15 +152,12 @@ def seed_legacy_indexes(binary, root):
         with Database(url=server.url, token=server.token, database=DATABASE, timeout=180) as db:
             ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
             locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
-            indexes = (create_index(server.url, token, ledger, 'by_bucket', 'bucket', ['label']),
-                       create_index(server.url, token, locations, 'by_region', 'region', ['score']))
-            # A single-node legacy backup can export this bulk-load history
-            # locally. RF3 re-exports it as restored identity history, without
-            # the original per-request point projections in its RPC pages.
+            # Largest batches fit before the index doubles the write set. Keep
+            # the durable identity page within the legacy RF3 decode budget.
             seed_ledger(ledger)
+            indexes = (create_index(server.url, token, ledger, 'by_bucket', 'bucket', ['label'], timeout=600),
+                       create_index(server.url, token, locations, 'by_region', 'region', ['score']))
             db.create_table('migration_empty', {'id': int}, key='id')
-            for orm in ('python', 'typescript'):
-                db.create_table(f'{ORM_TABLE}_{orm}', {'id': int, 'name': str, 'score': float, 'active': bool}, key='id')
         manifest = admin_request([server.url], token, 'archive.create',
                                  dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
     return archive, manifest['scope'], indexes
@@ -177,7 +174,7 @@ def seed_ledger(ledger):
             if (batch_rows != BATCH_ROWS or error.outcome != 'not_applied'
                     or str(error) != 'worker storage capacity unavailable'):
                 raise
-            batch_rows //= 2
+            batch_rows = 6_400
             print(f'MIG2 legacy worker refused a {len(batch)}-row batch; using {batch_rows} rows', flush=True)
             continue
         start += len(batch)
@@ -210,8 +207,6 @@ def seed(cluster, db, indexes):
                       (ledger_index, 7)),
         locations.name: (location_rows[1:], (location_index, 'east')),
         'migration_empty': ([], None),
-        f'{ORM_TABLE}_python': ([], None),
-        f'{ORM_TABLE}_typescript': ([], None),
     }
     return tables, children
 
@@ -283,7 +278,7 @@ def o01_programs(cluster, db):
                       ca_file=str(cluster.ca), unauthorized_database='other')
     outcomes = {}
     for orm in ('python', 'typescript'):
-        table = db.table(f'{ORM_TABLE}_{orm}')
+        table = db.create_table(f'{ORM_TABLE}_{orm}', {'id': int, 'name': str, 'score': float, 'active': bool}, key='id')
         outcomes[orm] = run_program(orm, cluster.api_urls['api1'], table.name,
                                     token=cluster.auth['data_token'], ca=cluster.ca,
                                     snapshot=table.query().collect)
@@ -412,7 +407,7 @@ def main():
         timings = {}
         try:
             with phase(timings, 'legacy bulk seed and index setup'):
-                seed_archive, seed_scope, indexes = seed_legacy_indexes(args.old_binary, root)
+                seed_archive, seed_scope, indexes = seed_legacy_archive(args.old_binary, root)
             source = MigrationCluster(args.old_binary, root / 'old', repository=repository,
                                       archive=seed_archive, scope=seed_scope)
             source.worker_env['NABEDRA_OLTP_RPC_TRACE'] = '1'
