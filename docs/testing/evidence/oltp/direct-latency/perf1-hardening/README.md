@@ -41,12 +41,26 @@ p99 of about 1.5 s; before, that stall produced 429s.
 G1: every run has `correctness_verified: true`, 0 mismatches (5,000 rows in the factor runs; 500 sampled keys in the soaks),
 0 unresolved and 0 failed.
 
-## Per-update CPU (runner, 150 updates/s, frame-pointer build; `stacks.py`)
+## Per-update CPU (runner, 150 updates/s, frame-pointer build; `stacks.py`, `ci-stacks-150.txt`)
 
-- **Leader w1:** 2.04 ms of CPU per update. Tokio scheduling and wakeups take 44%, of which 30 points are in the kernel
-  (futex, epoll). Native-executor hops take 14%, Raft 9%, the RPC transport 7%, JSON 5%, nabedra-kv 6% and TLS 2%.
-- **API:** 0.29 ms of CPU per update, from cgroup `cpu.stat` (0.063 CPU at 150/s). That run's stack profile sampled the CLI
-  wrapper, not the server; the driver now samples the server's child process (commit 2e081a6).
+Run 44904328496 (`c813dae`) is the first run in which perf sampled the API's server process; earlier runs sampled the CLI wrapper.
+
+| Stage | API (0.34 ms per update) | Leader w1 (2.61 ms per update) |
+| --- | ---: | ---: |
+| Tokio scheduling and wakeups (user + kernel futex/epoll) | 39% | 33% |
+| HTTP (hyper, axum, dispatch) | 20% | – |
+| Gateway RPC / transport | 10% | 6% |
+| TLS | 6% | 3% |
+| JSON | 6% | 6% |
+| Routing / topology cache | 3% | 0% |
+| Raft | – | 10% |
+| nabedra-kv | – | 12% |
+| Native-executor hops | 2% | 9% |
+| Leader execution (direct / MVCC) | 1% | 5% |
+| Allocator, other kernel, other | 14% | 16% |
+
+On the runner the API's CPU per update is about an eighth of the leader's. On the controlled host BENCH2 measured 0.8 ms
+(API) and 5.7 ms (leader) per update. The leader's CPU is the next throughput limit, and batching (GC1) is the lever for it.
 
 ## Files
 
