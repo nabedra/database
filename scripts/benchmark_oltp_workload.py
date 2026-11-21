@@ -11,6 +11,8 @@ import platform
 import random
 import statistics
 import time
+# Not through `time`: the unit tests replace that module's clocks.
+from time import process_time
 from time import time_ns as wall_ns
 from uuid import uuid4
 
@@ -120,6 +122,7 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
             for index, (key, op) in enumerate(zip(keys, ops, strict=True))]
     start_wall = wall_ns()
     start = time.monotonic_ns()
+    cpu_start = process_time()
     pending, samples = set(), []
     for operation, offset in zip(work, offsets, strict=True):
         due = start + offset
@@ -140,6 +143,7 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
     sleep_ns = end - time.monotonic_ns()
     if sleep_ns > 0:
         time.sleep(sleep_ns / 1e9)
+    driver_cpu_seconds = process_time() - cpu_start
     successful = [sample for sample in samples if sample['status'] == 'succeeded']
     terminal = [sample for sample in samples if sample['status'] in ('succeeded', 'failed')]
     drain_end = max(end, *(sample['settled_ns'] for sample in samples))
@@ -160,6 +164,8 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
         'phase_seed': phase_seed, 'start_ns': start, 'offer_end_ns': end, 'drain_end_ns': drain_end,
         'start_unix_ns': start_wall, 'drain_end_unix_ns': start_wall + (drain_end - start),
         'by_operation': by_operation,
+        # CPU of the whole driver process (every client thread) over the phase.
+        'driver_cpu_seconds': driver_cpu_seconds,
         'offered': count, 'offered_rps': count / seconds, 'statuses': {s: status_counts[s] for s in sorted(STATUSES)},
         'admitted_or_completed': sum(sample.get('accepted', sample['status'] == 'succeeded') for sample in samples),
         'submitted': count - status_counts['client_capacity'],

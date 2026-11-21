@@ -138,6 +138,18 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Connection<I> {
         std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
+/// Only a connection's first request still holds its header charge, so this
+/// counts requests on new and on reused connections (PERF2c).
+#[cfg(feature = "oltp")]
+fn count_request(first_on_connection: bool) {
+    use crate::oltp_runtime::stage_timing::perf_stage;
+    if first_on_connection {
+        perf_stage!("http.request.new_connection")
+    } else {
+        perf_stage!("http.request.reused_connection")
+    }
+    .record(std::time::Duration::ZERO);
+}
 #[derive(Clone)]
 struct HeaderCharge(std::sync::Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>);
 #[derive(Clone)]
@@ -158,6 +170,9 @@ where
     type Future =
         std::pin::Pin<Box<dyn Future<Output = io::Result<(Self::Stream, Self::Service)>> + Send>>;
     fn accept(&self, stream: tokio::net::TcpStream, service: axum::Router) -> Self::Future {
+        // A response is one write, but the TLS handshake flight and a reused
+        // connection's next exchange must not wait on Nagle's algorithm.
+        let _ = stream.set_nodelay(true);
         let total = self.total.clone().try_acquire_owned();
         let header = self.headers.clone().try_acquire_owned();
         let inner = self.inner.clone();
@@ -171,12 +186,17 @@ where
             let write_deadline = StreamWriteDeadline::default();
             #[cfg(feature = "olap")]
             let service = service.layer(axum::Extension(write_deadline.clone()));
+            #[cfg(feature = "oltp")]
+            let started = std::time::Instant::now();
             let (io, service) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 inner.accept(stream, service),
             )
             .await
             .map_err(|_| io::Error::other("handshake timeout"))??;
+            // TCP accept to the end of the TLS handshake (zero without TLS).
+            #[cfg(feature = "oltp")]
+            crate::oltp_runtime::stage_timing::perf_stage!("http.accept.handshake").since(started);
             Ok((
                 Connection {
                     io,
@@ -219,11 +239,38 @@ pub(crate) async fn serve_router(
     serve_router_with_budget(listener, app, tls, 64, shutdown).await
 }
 
+/// The client-facing OLTP API listener: like [`serve_router`], but a
+/// connection stays open after a successful (2xx) response so ORM pools can
+/// reuse it (plan `oltp-direct-path.md` section 8). An idle connection ends
+/// when the 5 s header read timeout expires, and every other response still
+/// closes its connection, so a failed or unauthenticated caller cannot hold
+/// an idle slot of the connection budget.
+#[cfg(feature = "oltp")]
+pub(crate) async fn serve_router_keep_alive(
+    listener: TcpListener,
+    app: axum::Router,
+    tls: Option<RustlsConfig>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    serve_bounded(listener, app, tls, 64, true, shutdown).await
+}
+
 pub(crate) async fn serve_router_with_budget(
     listener: TcpListener,
     app: axum::Router,
     tls: Option<RustlsConfig>,
     data_connections: usize,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    serve_bounded(listener, app, tls, data_connections, false, shutdown).await
+}
+
+async fn serve_bounded(
+    listener: TcpListener,
+    app: axum::Router,
+    tls: Option<RustlsConfig>,
+    data_connections: usize,
+    keep_alive: bool,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
     if data_connections == 0 || data_connections > 8192 {
@@ -288,7 +335,7 @@ pub(crate) async fn serve_router_with_budget(
                 match permit {
                     Ok(permit) => {
                         let mut response = next.run(request).await;
-                        if !stream_transport {
+                        if !stream_transport && !(keep_alive && response.status().is_success()) {
                             response.headers_mut().insert(
                                 axum::http::header::CONNECTION,
                                 axum::http::HeaderValue::from_static("close"),
@@ -332,7 +379,10 @@ pub(crate) async fn serve_router_with_budget(
     let app = app.layer(axum::middleware::from_fn(
         |request: axum::extract::Request, next: axum::middleware::Next| async move {
             if let Some(charge) = request.extensions().get::<HeaderCharge>() {
-                drop(charge.0.lock().unwrap().take());
+                let header = charge.0.lock().unwrap().take();
+                #[cfg(feature = "oltp")]
+                count_request(header.is_some());
+                drop(header);
             }
             next.run(request).await
         },
@@ -345,7 +395,7 @@ pub(crate) async fn serve_router_with_budget(
     server
         .http_builder()
         .http1()
-        .keep_alive(cfg!(feature = "olap"))
+        .keep_alive(keep_alive || cfg!(feature = "olap"))
         .max_headers(32)
         .max_buf_size(32768)
         .timer(hyper_util::rt::TokioTimer::new())
@@ -491,5 +541,92 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         connection.write_all(b"next response").await.unwrap();
         connection.flush().await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "oltp"))]
+mod keep_alive_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn exchange(stream: &mut tokio::net::TcpStream, path: &str) -> String {
+        let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let mut buffer = [0; 1024];
+        // Every test response is "ok" or "no": read until its body arrives.
+        while !(response.ends_with(b"ok") || response.ends_with(b"no")) {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(read, 0, "connection closed before the response");
+            response.extend_from_slice(&buffer[..read]);
+        }
+        String::from_utf8(response).unwrap().to_ascii_lowercase()
+    }
+
+    async fn closed(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
+        let mut buffer = [0; 64];
+        matches!(
+            tokio::time::timeout(within, stream.read(&mut buffer)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        )
+    }
+
+    async fn listener(keep_alive: bool) -> std::net::SocketAddr {
+        let app = axum::Router::new()
+            .route("/ok", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/no",
+                axum::routing::get(|| async { (axum::http::StatusCode::UNAUTHORIZED, "no") }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let shutdown = std::future::pending::<()>();
+            if keep_alive {
+                serve_router_keep_alive(listener, app, None, shutdown).await
+            } else {
+                serve_router(listener, app, None, shutdown).await
+            }
+        });
+        address
+    }
+
+    /// PERF2c / O01: the OLTP API listener keeps a connection open after a
+    /// successful response, so ORM pools reuse it, and closes it after an
+    /// error response and after 5 s idle.
+    #[tokio::test]
+    async fn o01_perf2c_api_listener_keeps_alive_after_success_only() {
+        let address = listener(true).await;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        for _ in 0..3 {
+            let response = exchange(&mut stream, "/ok").await;
+            assert!(response.starts_with("http/1.1 200"), "{response}");
+            assert!(!response.contains("connection: close"), "{response}");
+        }
+        let response = exchange(&mut stream, "/no").await;
+        assert!(response.starts_with("http/1.1 401"), "{response}");
+        assert!(response.contains("connection: close"), "{response}");
+        assert!(closed(&mut stream, Duration::from_secs(2)).await);
+
+        // An idle kept-alive connection ends at the header read timeout.
+        let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+        exchange(&mut idle, "/ok").await;
+        assert!(!closed(&mut idle, Duration::from_secs(3)).await);
+        assert!(closed(&mut idle, Duration::from_secs(4)).await);
+    }
+
+    /// The other listeners (workers' admin and stats endpoints) still close
+    /// every connection after its response.
+    #[tokio::test]
+    async fn o01_perf2c_other_listeners_close_after_each_response() {
+        let address = listener(false).await;
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let response = exchange(&mut stream, "/ok").await;
+        assert!(response.contains("connection: close"), "{response}");
+        assert!(closed(&mut stream, Duration::from_secs(2)).await);
     }
 }

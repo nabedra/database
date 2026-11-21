@@ -769,6 +769,15 @@ where
     fn local_node(&self) -> Option<u64> {
         Some(self.state._resident.node_id())
     }
+    fn applied_index(&self) -> Option<u64> {
+        use openraft::type_config::async_runtime::watch::WatchReceiver;
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        if metrics.running_state.is_err() {
+            return None;
+        }
+        metrics.last_applied.as_ref().map(|id| id.index)
+    }
 }
 impl<C, M> RaftConsensus<C, M>
 where

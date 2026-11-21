@@ -3,6 +3,7 @@
 //! are executed by the actual leader and the caller waits for local application
 //! before any ControlHandle reads its local machine.
 use super::{ControlCommand, ControlEndpoint, ControlReply, DataWorkerIntent, RestartMountKey};
+use crate::oltp_runtime::stage_timing::perf_stage;
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
     oltp_replication::{
@@ -386,6 +387,7 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
             let deadline = Instant::now() + READ_TIMEOUT;
+            perf_stage!("control.barrier.request").record(Duration::ZERO);
             if let Some(batch) = self.read_batch.join(self.manager.resources(), || {
                 let forwarding = self.clone();
                 async move { forwarding.read_barrier(Instant::now() + READ_TIMEOUT).await }
@@ -401,6 +403,9 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
             self.read_barrier(deadline).await
         })
     }
+    fn applied_index(&self) -> Option<u64> {
+        self.local.applied_index()
+    }
 }
 impl ForwardedControl {
     async fn read_barrier(&self, deadline: Instant) -> Result<ReadBarrier, ProtocolError> {
@@ -411,8 +416,10 @@ impl ForwardedControl {
             }
             let read = async {
                 if self.local.raft.current_leader().await == Some(local_id) {
+                    perf_stage!("control.barrier.local").record(Duration::ZERO);
                     return self.local.ensure_linearizable().await;
                 }
+                perf_stage!("control.barrier.forwarded").record(Duration::ZERO);
                 let (applied, _): (AppliedPosition, _) =
                     self.forwarded(Operation::Barrier, None, Some(deadline)).await?;
                 self.local
@@ -556,6 +563,7 @@ impl Endpoint for HostedControlEndpoint {
                 match request.control_consensus {
                     Operation::ReadEksWorkerReplacement => self.reads.read_eks_replacement(session.remote(), token.ok_or_else(invalid)?).await,
                     Operation::Barrier => {
+                        perf_stage!("control.barrier.served").record(Duration::ZERO);
                         let barrier = self.local.ensure_linearizable().await?;
                         self.shared
                             .encode_in(ByteClass::Progress, &barrier.applied, PAYLOAD)

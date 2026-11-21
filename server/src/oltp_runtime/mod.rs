@@ -237,7 +237,7 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
         }
         runtime.stop_accepting();
     };
-    let result = crate::network::serve_router(listener, app, tls, shutdown)
+    let result = crate::network::serve_router_keep_alive(listener, app, tls, shutdown)
         .await
         .map_err(|_| "listener failed");
     runtime

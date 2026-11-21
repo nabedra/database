@@ -76,4 +76,9 @@ pub(crate) trait Consensus<C: OwnedPayload, R>: Send + Sync {
     fn local_node(&self) -> Option<u64> {
         None
     }
+    /// The log index this replica has applied, from memory. A change hint
+    /// for polling loops only, never a read barrier.
+    fn applied_index(&self) -> Option<u64> {
+        None
+    }
 }

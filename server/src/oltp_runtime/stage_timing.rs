@@ -116,6 +116,19 @@ pub(crate) fn json_variant(prefix: &'static str, json: &[u8]) -> &'static Stage 
     named(prefix, name)
 }
 
+/// The stage `prefix` + `dir/file:line` of a call site (the last two path
+/// components). Call sites are finite, so their leaked names are bounded.
+pub(crate) fn site(
+    prefix: &'static str,
+    location: &'static std::panic::Location<'static>,
+) -> &'static Stage {
+    let path = location.file();
+    let mut parts = path.rsplitn(3, ['/', '\\']);
+    let file = parts.next().unwrap_or(path);
+    let dir = parts.next().unwrap_or("");
+    named(prefix, &format!("{dir}/{file}:{}", location.line()))
+}
+
 fn named(prefix: &'static str, suffix: &str) -> &'static Stage {
     static NAMES: OnceLock<Mutex<Vec<(String, &'static Stage)>>> = OnceLock::new();
     let name = format!("{prefix}{suffix}");
@@ -207,5 +220,17 @@ mod tests {
         assert_eq!(entry["le_us"]["4"], 1);
         assert_eq!(entry["le_us"]["65536"], 1);
         assert!(std::ptr::eq(stage, super::stage("test.perf1.buckets")));
+    }
+
+    #[test]
+    fn perf2c_site_stage_names_the_call_site() {
+        let here = std::panic::Location::caller();
+        let stage = site("test.perf2c.site.", here);
+        let expected = format!(
+            "test.perf2c.site.oltp_runtime/stage_timing.rs:{}",
+            here.line()
+        );
+        assert_eq!(stage.name, expected);
+        assert!(std::ptr::eq(stage, site("test.perf2c.site.", here)));
     }
 }
