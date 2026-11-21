@@ -283,15 +283,14 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
     .expect("typed snapshot fixture watchdog");
 }
 
-/// O06/O16 component evidence: actual independent native stores and mTLS Raft
-/// hosts, with a nonvoting learner and removal of an old replica. This is not
-/// the separate-process Docker topology or a full placement/split scenario.
+/// O06/O16/O17 component evidence for RF3 replacement of a lost Timestamp
+/// voter. The fourth store starts empty and receives the committed snapshot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_from_routes() {
+async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
     timeout(Duration::from_secs(60), async {
         let dir = Temporary(std::env::temp_dir().join(format!("typed-move-{}", Uuid::new_v4())));
         std::fs::create_dir(&dir.0).unwrap();
-        let certificates = tls::certificates(&dir.0, 3);
+        let certificates = tls::certificates(&dir.0, 4);
         let cluster = Uuid::new_v4();
         let group = GroupIdentity {
             cluster_id: cluster,
@@ -404,22 +403,24 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
         }
         let voters = peers
             .iter()
-            .filter(|(node, _)| **node <= 2)
+            .filter(|(node, _)| **node <= 3)
             .map(|(node, member)| (*node, member.clone()))
             .collect::<BTreeMap<_, _>>();
         hosts[0].raft.initialize(voters).await.unwrap();
-        let leader = loop {
-            if hosts[0].ensure_linearizable().await.is_ok() {
-                break 0;
+        let elected = |excluded| {
+            let hosts = &hosts;
+            async move {
+                loop {
+                    for (index, host) in hosts[..3].iter().enumerate() {
+                        if Some(index) != excluded && host.ensure_linearizable().await.is_ok() {
+                            return index;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
             }
-            if hosts[1].ensure_linearizable().await.is_ok() {
-                break 1;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        let old = hosts[leader].observe_membership().await.unwrap();
-        let expected = Page::new(old.replicas().to_vec()).unwrap();
-        assert_eq!(expected.len(), 2);
+        let lost = elected(None).await;
         let ready = ReadyMembership {
             view: AuthorityView {
                 run_id: Uuid::new_v4(),
@@ -431,18 +432,47 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
         };
         let authority = ready.view.authority();
         let handle = TimestampHandle::new(
-            TimestampMachine::new(hosts[leader].state.store().clone()).unwrap(),
-            hosts[leader].clone(),
+            TimestampMachine::new(hosts[lost].state.store().clone()).unwrap(),
+            hosts[lost].clone(),
         );
         let before = handle
             .fence(Uuid::new_v4(), None, authority, ready)
             .await
             .unwrap();
-        let learner = hosts[leader]
-            .replicate_learner(old, peers[&3].clone())
+        drop(handle);
+        managers[lost].shutdown().await.unwrap();
+        let _ = stops[lost].take().unwrap().send(());
+        let leader = elected(Some(lost)).await;
+        let old = hosts[leader].observe_membership().await.unwrap();
+        let expected = Page::new(old.replicas().to_vec()).unwrap();
+        assert_eq!(expected.len(), 3);
+        hosts[leader].raft.trigger().snapshot().await.unwrap();
+        let snapshot = hosts[leader]
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| metrics.snapshot.is_some_and(|entry| entry.index >= before.position.index),
+                "snapshot includes the acknowledged Timestamp fence",
+            )
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        hosts[leader].raft.trigger().purge_log(snapshot.index).await.unwrap();
+        hosts[leader]
+            .raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| metrics.purged == Some(snapshot),
+                "older logs are unavailable to the fresh replica",
+            )
             .await
             .unwrap();
-        assert_eq!(learner.target(), &peers[&3]);
+        let learner = hosts[leader]
+            .replicate_learner(old, peers[&4].clone())
+            .await
+            .unwrap();
+        assert_eq!(learner.target(), &peers[&4]);
         assert!(learner.caught_up_through().index >= before.position.index);
         let still_old = hosts[leader].observe_membership().await.unwrap();
         assert_eq!(still_old.replicas(), expected.as_ref());
@@ -450,25 +480,26 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
             !still_old
                 .replicas()
                 .iter()
-                .any(|member| member.node_id == 3)
+                .any(|member| member.node_id == 4)
         );
-        let removed = if leader == 0 { 2 } else { 1 };
+        let removed = lost as u64 + 1;
         let next = hosts[leader].replace_voter(learner, removed).await.unwrap();
         let final_members = Page::new(next.replicas().to_vec()).unwrap();
-        assert_eq!(final_members.len(), 2);
-        assert!(final_members.iter().any(|member| member.node_id == 3));
+        assert_eq!(final_members.len(), 3);
+        assert!(final_members.iter().any(|member| member.node_id == 4));
         assert!(!final_members.iter().any(|member| member.node_id == removed));
-        hosts[2]
+        let target_metrics = hosts[3]
             .raft
             .wait(Some(Duration::from_secs(10)))
             .applied_index_at_least(Some(next.applied_at().index), "target membership applied")
             .await
             .unwrap();
-        let target = hosts[2].state.store();
+        assert!(target_metrics.snapshot.is_some_and(|entry| entry.index >= snapshot.index));
+        let target = hosts[3].state.store();
         let activation = target.replica_activation(&next).await.unwrap();
         let statement = activation.statement();
         assert_eq!(statement.group, group);
-        assert_eq!(statement.pool.pool_id, peers[&3].pool_id);
+        assert_eq!(statement.pool.pool_id, peers[&4].pool_id);
         assert_eq!(statement.minimum, next.applied_at());
         assert!(statement.applied.index >= statement.minimum.index);
         let active_generation = statement.active_generation;
@@ -495,7 +526,7 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
         let activated = target.replica_activation(&next).await.unwrap();
         assert!(activated.statement().active_generation > active_generation);
         drop(activated);
-        let saved = hosts[2]
+        let saved = hosts[3]
             .state
             .store()
             .read_metadata(
@@ -514,12 +545,19 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
         let saved: serde_json::Value = serde_json::from_slice(saved.as_slice()).unwrap();
         assert_eq!(saved["authority"], serde_json::to_value(authority).unwrap());
         let replay = hosts[leader]
-            .resume_voter_replacement(expected, final_members.clone(), peers[&3].clone())
+            .reconcile_voter_replacement(&expected, &final_members, &peers[&4], removed, None)
             .await
             .unwrap();
         assert_eq!(replay.replicas(), final_members.as_ref());
-        managers[removed as usize - 1].shutdown().await.unwrap();
-        let _ = stops[removed as usize - 1].take().unwrap().send(());
+        assert!(
+            hosts[leader]
+                .reconcile_voter_replacement(
+                    &expected, &final_members, &peers[&4], leader as u64 + 1, None
+                )
+                .await
+                .is_err(),
+            "stable membership must not certify a different removal"
+        );
         let next_authority = Authority {
             run_id: authority.run_id,
             owner_term: 2,
@@ -531,6 +569,10 @@ async fn o06_o16_actual_learner_replacement_keeps_state_and_excludes_learners_fr
             },
             ..ready
         };
+        let handle = TimestampHandle::new(
+            TimestampMachine::new(hosts[leader].state.store().clone()).unwrap(),
+            hosts[leader].clone(),
+        );
         handle
             .fence(Uuid::new_v4(), Some(authority), next_authority, next_ready)
             .await
