@@ -253,7 +253,9 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
             use super::application::direct::Routed;
             match super::stage_timing::timed(
                 super::stage_timing::perf_stage!("gw.route"),
-                gateway.route(&bytes, asynchronous),
+                // A streamed body takes the queued path, but the gateway
+                // must first replay a result already committed at the anchor.
+                gateway.route(&bytes, asynchronous || length.is_none()),
             )
             .await
             {

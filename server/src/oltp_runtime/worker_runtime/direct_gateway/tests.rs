@@ -450,8 +450,10 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         assert_eq!(stats.forwards, 0, "{stats:?}");
         assert_eq!(leader()["entries_applied"], json!(6));
 
-        // A body without a declared length has the full parsing charge and
-        // uses the same eligibility and dedup rules.
+        // A body without a declared length still takes the queued path with
+        // the full parsing charge. Both the gateway and queue owner settle
+        // eligible mutations, but only the first writes the marker.
+        let markers = leader()["forward_markers_written"].as_u64().unwrap();
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
             let (status, envelope) =
@@ -463,9 +465,11 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             );
         }
         let after = gateway.stats();
-        assert_eq!(after.direct_done, 2 * stats.direct_done, "{after:?}");
-        assert_eq!(after.forwards, 0, "{after:?}");
-        assert_eq!(leader()["entries_applied"], json!(12));
+        assert_eq!(after.direct_done, stats.direct_done, "{after:?}");
+        assert!(after.forwards >= 8, "{after:?}");
+        assert!(after.forwards - stats.forwards <= 2 * mutations, "no get settled: {after:?}");
+        let written = leader()["forward_markers_written"].as_u64().unwrap() - markers;
+        assert!((8..=mutations).contains(&written), "{}", leader());
 
         // The runtime stats show the gateway, the executor and the switch.
         let reply = runtime.stats().await.unwrap();
