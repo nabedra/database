@@ -445,13 +445,17 @@ impl TimestampHandle {
         }
         let _total = crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.total").timer();
         // Plan section 5: a valid leader lease, else ReadIndex (PERF1). The
-        // window rule below still compares the applied leader ID.
-        let barrier = crate::oltp_runtime::stage_timing::timed(
+        // window rule below still compares the applied leader ID. RD1: the
+        // lease is checked on this task and the applied position comes from
+        // consensus memory: the window is in-memory state, which the machine
+        // updates before an entry counts as applied, so a store read of the
+        // applied position adds nothing to it.
+        let applied = crate::oltp_runtime::stage_timing::timed(
             crate::oltp_runtime::stage_timing::perf_stage!("ts.allocate.barrier"),
-            self.consensus.ensure_linearizable_lease(),
+            self.consensus.lease_read_position(),
         )
         .await?;
-        let leader = leader_of(barrier.applied);
+        let leader = leader_of(applied);
         let direct = &self.machine.direct;
         direct.served();
         if let Some(range) = direct.take(leader, count) {

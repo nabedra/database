@@ -100,6 +100,10 @@ pub(crate) struct DirectExecutor {
     stats: DirectStats,
     /// Ranges this worker served as leader, for the expiry task.
     served: Mutex<HashMap<Uuid, Weak<ParticipantHandle>>>,
+    /// RD1: each group's epochs from its newest direct snapshot on this
+    /// executor, keyed by group and bound to the handle that read them. The
+    /// key for a mutation's table lookup before it latches; never a check.
+    known_epochs: Mutex<HashMap<Uuid, (Weak<ParticipantHandle>, ParticipantEpochs)>>,
 }
 
 /// A request that passed validation.
@@ -159,6 +163,7 @@ impl DirectExecutor {
             timestamps,
             stats: DirectStats::default(),
             served: Mutex::default(),
+            known_epochs: Mutex::default(),
         })
     }
 
@@ -331,6 +336,30 @@ impl DirectExecutor {
             .or_insert_with(|| Arc::downgrade(handle));
     }
 
+    /// RD1: the epochs of `handle`'s group from its newest direct snapshot
+    /// here, if `handle` read them.
+    fn known_epochs(&self, handle: &Arc<ParticipantHandle>) -> Option<ParticipantEpochs> {
+        let known = self.known_epochs.lock().unwrap_or_else(|p| p.into_inner());
+        known
+            .get(&handle.identity().group_id)
+            .filter(|(owner, _)| std::ptr::eq(owner.as_ptr(), Arc::as_ptr(handle)))
+            .map(|(_, epochs)| *epochs)
+    }
+    /// RD1: records the epochs a checked snapshot of `handle`'s group read.
+    fn learn_epochs(&self, handle: &Arc<ParticipantHandle>, epochs: ParticipantEpochs) {
+        let mut known = self.known_epochs.lock().unwrap_or_else(|p| p.into_inner());
+        let group = handle.identity().group_id;
+        match known.get_mut(&group) {
+            Some((owner, known)) if std::ptr::eq(owner.as_ptr(), Arc::as_ptr(handle)) => {
+                *known = epochs;
+            }
+            _ => {
+                known.retain(|_, (owner, _)| owner.strong_count() > 0);
+                known.insert(group, (Arc::downgrade(handle), epochs));
+            }
+        }
+    }
+
     /// The leader token, waiting while this node leads but has not applied
     /// an entry of its term yet (rule 3).
     async fn token(
@@ -497,6 +526,41 @@ impl DirectExecutor {
         Ok(true)
     }
 
+    /// The descriptor a mutation latches its keys with, and the group's
+    /// direct schema it was looked up for.
+    ///
+    /// RD1: when this executor already holds the group's epochs from an
+    /// earlier snapshot, no store read precedes the latch. They only pick the
+    /// cached descriptor: `prepare` checks the request (route epochs,
+    /// activation, the drop fence) against the epochs of the attempt's own
+    /// barrier-checked snapshot, and restarts the mutation when that
+    /// snapshot's direct schema differs from the one returned here. Apply
+    /// checks the epochs and the fence again. Without known epochs, or when
+    /// the table lookup with them does not find the table, the mutation
+    /// reads the epochs from the store and decides from them as before.
+    async fn mutation_table(
+        &self,
+        handle: &Arc<ParticipantHandle>,
+        clock: &RangeClock,
+        request: &DirectRequest,
+        operation: &Operation,
+        deadline: Instant,
+    ) -> Result<(Option<GroupSchema>, Arc<DirectTable>), DirectResponse> {
+        if let Some(epochs) = self.known_epochs(handle)
+            && let Ok(table) = self.table(request, &epochs, operation, deadline).await
+        {
+            return Ok((epochs.direct_schema, table));
+        }
+        self.stats.epoch_read();
+        let epochs = timed(
+            perf_stage!("leader.mutation.epochs"),
+            self.epochs(handle, clock, request, deadline),
+        )
+        .await?;
+        let table = self.table(request, &epochs, operation, deadline).await?;
+        Ok((epochs.direct_schema, table))
+    }
+
     async fn table(
         &self,
         request: &DirectRequest,
@@ -656,6 +720,7 @@ impl DirectExecutor {
                     self.checked_epochs(handle, clock, request, snapshot.epochs, deadline),
                 )
                 .await?;
+                self.learn_epochs(handle, epochs);
                 timed(
                     perf_stage!("leader.get.table"),
                     self.table(request, &epochs, &parsed.operation, deadline),
@@ -787,60 +852,68 @@ impl DirectExecutor {
                 self.token(handle, clock, deadline),
             )
             .await?;
-            let epochs = timed(
-                perf_stage!("leader.mutation.epochs"),
-                self.epochs(handle, clock, request, deadline),
-            )
-            .await?;
-            let table = timed(
-                perf_stage!("leader.mutation.table"),
-                self.table(request, &epochs, &parsed.operation, deadline),
-            )
-            .await?;
-            let keys = self.row_keys(&table, &parsed.operation)?;
-            let encoded: Vec<Vec<u8>> = keys
-                .iter()
-                .map(|key| serde_json::to_vec(key).map_err(|_| failed(corrupt())))
-                .collect::<Result<_, _>>()?;
-            let latched = timed(
-                perf_stage!("leader.mutation.latch"),
-                self.latches
-                    .lock(encoded.iter().map(Vec::as_slice), deadline),
-            )
-            .await
-            .map_err(|_| {
-                failed(ProtocolError::new(
-                    ErrorCode::StorageUnavailable,
-                    "deadline expired waiting for a key latch",
-                    Outcome::NotApplied,
-                ))
-            })?;
-            if let Some(waited) = latched.waited {
-                self.stats.latch_wait(waited);
-            }
-            self.served(handle);
+            // RD1: a `Schema` retry looks the table up again with the epochs
+            // its snapshot read, and latches the keys it derives.
             loop {
-                if Instant::now() >= deadline {
-                    return Err(failed(unavailable_not_applied()));
+                let (table_schema, table) = timed(
+                    perf_stage!("leader.mutation.table"),
+                    self.mutation_table(handle, clock, request, &parsed.operation, deadline),
+                )
+                .await?;
+                let keys = self.row_keys(&table, &parsed.operation)?;
+                let encoded: Vec<Vec<u8>> = keys
+                    .iter()
+                    .map(|key| serde_json::to_vec(key).map_err(|_| failed(corrupt())))
+                    .collect::<Result<_, _>>()?;
+                let latched = timed(
+                    perf_stage!("leader.mutation.latch"),
+                    self.latches
+                        .lock(encoded.iter().map(Vec::as_slice), deadline),
+                )
+                .await
+                .map_err(|_| {
+                    failed(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "deadline expired waiting for a key latch",
+                        Outcome::NotApplied,
+                    ))
+                })?;
+                if let Some(waited) = latched.waited {
+                    self.stats.latch_wait(waited);
                 }
-                match self
-                    .attempt(
-                        handle,
-                        clock,
-                        request,
-                        &table,
-                        &parsed.operation,
-                        &keys,
-                        deadline,
-                    )
-                    .await?
-                {
-                    Attempt::Done(response) => return Ok(response),
-                    Attempt::Retry(cause) => {
-                        if !self.pause(deadline, cause).await {
-                            return Err(failed(unavailable_not_applied()));
+                self.served(handle);
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(failed(unavailable_not_applied()));
+                    }
+                    match self
+                        .attempt(
+                            handle,
+                            clock,
+                            request,
+                            &table,
+                            table_schema,
+                            &parsed.operation,
+                            &keys,
+                            deadline,
+                        )
+                        .await?
+                    {
+                        Attempt::Done(response) => return Ok(response),
+                        Attempt::Retry(RetryCause::Schema) => {
+                            self.stats.retry(RetryCause::Schema);
+                            break;
+                        }
+                        Attempt::Retry(cause) => {
+                            if !self.pause(deadline, cause).await {
+                                return Err(failed(unavailable_not_applied()));
+                            }
                         }
                     }
+                }
+                drop(latched);
+                if Instant::now() >= deadline {
+                    return Err(failed(unavailable_not_applied()));
                 }
             }
         }
@@ -856,6 +929,7 @@ impl DirectExecutor {
         clock: &RangeClock,
         request: &DirectRequest,
         table: &DirectTable,
+        table_schema: Option<GroupSchema>,
         operation: &Operation,
         keys: &[MvccKey],
         deadline: Instant,
@@ -875,7 +949,16 @@ impl DirectExecutor {
             perf_stage!("leader.attempt.timestamp_fetch"),
             by(deadline, self.timestamps.commit_ts()),
         );
-        let prepare = self.prepare(handle, clock, request, table, operation, keys, deadline);
+        let prepare = self.prepare(
+            handle,
+            clock,
+            request,
+            table,
+            table_schema,
+            operation,
+            keys,
+            deadline,
+        );
         tokio::pin!(fetch, prepare);
         let mut fetched = None;
         let prepared = loop {
@@ -1024,6 +1107,7 @@ impl DirectExecutor {
         clock: &RangeClock,
         request: &DirectRequest,
         table: &DirectTable,
+        table_schema: Option<GroupSchema>,
         operation: &Operation,
         keys: &[MvccKey],
         deadline: Instant,
@@ -1119,6 +1203,14 @@ impl DirectExecutor {
                 });
             }
             Ok(None) => {}
+        }
+        // RD1: the descriptor must come from the direct schema this snapshot
+        // holds. A DDL fence that applied after the lookup (an index
+        // publication) bumped it; a commit computed from the older
+        // descriptor would carry the new epoch past apply's check.
+        self.learn_epochs(handle, epochs);
+        if epochs.direct_schema != table_schema {
+            return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Schema)));
         }
         let read = std::time::Instant::now();
         let mut current = Vec::with_capacity(keys.len());
