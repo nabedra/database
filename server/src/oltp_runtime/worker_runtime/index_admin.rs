@@ -298,18 +298,14 @@ impl WorkerRuntime {
             if source.authority.run_id == authority.run_id {
                 let actor = match self.index_builds.try_admit() {
                     Ok(actor) => actor,
-                    Err(error) if creating => {
-                        tracing::warn!(?error, "FLAKE3 build actor admission");
-                        return Ok(reply);
-                    }
+                    Err(_) if creating => return Ok(reply),
                     Err(error) => return Err(error),
                 };
                 let handle = actor.spawn(move || async move {
                     let _gate = gate;
-                    tracing::info!(index=%selector.index_id, "FLAKE3 build actor started");
                     if let Err(error) = service.resume(&record).await {
                         tracing::warn!(index=%selector.index_id, build=%selector.build_id, attempt=selector.attempt,
-                            code=?error.code, outcome=?error.outcome, message=%error.message, "index build stopped before completion");
+                            code=?error.code, "index build stopped before completion");
                     }
                     Ok(())
                 })?;
