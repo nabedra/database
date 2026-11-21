@@ -60,6 +60,10 @@ const WARM_TICK: Duration = Duration::from_secs(1);
 const WARM_AHEAD: Duration = Duration::from_millis(1500);
 /// At most this many keys are kept warm.
 pub(crate) const MAX_WARM: usize = 64;
+/// A background read that takes longer is abandoned. Refreshes run one at a
+/// time, so the warm task holds at most one Control read (one outgoing lane
+/// slot and one native Control job) for at most this long.
+const WARM_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One background role check: the applied revision read before the Control
 /// read starts, and the read itself.
@@ -129,6 +133,8 @@ fn observed(grant: &ServiceAuthorization) -> Observed {
 struct Warm {
     refresh: Refresh,
     used: Instant,
+    /// No refresh before this: the last one failed transiently.
+    backoff: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -257,6 +263,7 @@ impl GrantCache {
             Warm {
                 refresh: warm(),
                 used: now,
+                backoff: None,
             },
         );
     }
@@ -356,6 +363,7 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
             }
             let Grants { entries, warm, .. } = &*grants;
             warm.iter()
+                .filter(|(_, entry)| entry.backoff.is_none_or(|until| now >= until))
                 .filter(|(key, _)| {
                     entries
                         .get(key)
@@ -364,21 +372,22 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
                 .map(|(key, entry)| (*key, entry.refresh.clone()))
                 .collect()
         };
-        let reads = due.into_iter().filter_map(|(key, refresh)| {
-            let (revision, read) = refresh()?;
-            Some(async move {
+        // One read at a time: a slow or unavailable Control (recovery, a
+        // partition) costs the foreground at most one lane slot and one
+        // native Control job, for at most WARM_READ_TIMEOUT per tick.
+        for (key, refresh) in due {
+            let Some((revision, read)) = refresh() else {
+                continue;
+            };
+            let started = Instant::now();
+            let result = {
                 let _timer = perf_stage!("grant.warm.refresh").timer();
-                let started = Instant::now();
-                let result = tokio::time::timeout(GRANT_TTL, read).await;
-                (key, revision, started, result)
-            })
-        });
-        let results = futures_util::future::join_all(reads).await;
-        let Some(shared) = cache.upgrade() else {
-            return;
-        };
-        let mut grants = lock(&shared);
-        for (key, revision, started, result) in results {
+                tokio::time::timeout(WARM_READ_TIMEOUT, read).await
+            };
+            let Some(shared) = cache.upgrade() else {
+                return;
+            };
+            let mut grants = lock(&shared);
             match result {
                 Ok(Ok(grant)) => insert(
                     &mut grants,
@@ -394,9 +403,16 @@ async fn warm_loop(cache: Weak<Mutex<Grants>>) {
                     grants.entries.remove(&key);
                     grants.warm.remove(&key);
                 }
-                // A transient failure: the entry expires on its own bound and
-                // the next tick tries again.
-                _ => {}
+                // A transient failure or a timeout: the entry expires on its
+                // own bound, this key waits one TTL, and the rest of this
+                // tick is skipped so a struggling Control is not read again.
+                _ => {
+                    perf_stage!("grant.warm.failed").record(Duration::ZERO);
+                    if let Some(entry) = grants.warm.get_mut(&key) {
+                        entry.backoff = Some(Instant::now() + GRANT_TTL);
+                    }
+                    break;
+                }
             }
         }
     }
@@ -791,9 +807,10 @@ mod tests {
         tokio::time::sleep_until(last + GRANT_TTL).await;
         assert!(!cache.allowed(key.unwrap(), Some(4)), "outlived its bound");
 
-        // Control answers again and the key is re-warmed within a tick.
+        // Control answers again: after its backoff (one TTL) the key is
+        // re-warmed within a tick.
         mode.store(OK, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(GRANT_TTL + Duration::from_millis(1100)).await;
         assert!(cache.allowed(key.unwrap(), Some(4)));
 
         // A refusal drops the role at the next refresh, before it expires.
@@ -841,5 +858,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache.warm_len(), 1);
+    }
+
+    /// RD2: while Control hangs (recovery, a partition) the warm task holds at
+    /// most one background read, abandons it after `WARM_READ_TIMEOUT`, skips
+    /// the rest of that tick and backs the key off for one TTL, so it never
+    /// piles reads onto the Control lane that foreground calls need.
+    #[tokio::test(start_paused = true)]
+    async fn c07_rd2_warm_refreshes_hold_at_most_one_read_while_control_hangs() {
+        let cache = GrantCache::default();
+        let target = group();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let refresh: Refresh = {
+            let (in_flight, peak, started) = (in_flight.clone(), peak.clone(), started.clone());
+            Arc::new(move || {
+                let (in_flight, peak, started) = (in_flight.clone(), peak.clone(), started.clone());
+                Some((
+                    Some(1),
+                    Box::pin(async move {
+                        started.fetch_add(1, Ordering::Relaxed);
+                        let now = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                        peak.fetch_max(now, Ordering::Relaxed);
+                        struct Leave(Arc<AtomicUsize>);
+                        impl Drop for Leave {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        let _leave = Leave(in_flight);
+                        std::future::pending::<()>().await;
+                        Ok(None)
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>,
+                ))
+            })
+        };
+        for _ in 0..8 {
+            let key = GrantKey::new(worker(), ServiceAction::DirectLeader, &target, None);
+            cache
+                .role_warm(key, Some(1), || async { Ok(None) }, || refresh.clone())
+                .await
+                .unwrap();
+        }
+        // 8 warm keys, every read hangs. Over 20 s each tick starts at most
+        // one read, and each key is retried at most once per TTL.
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(in_flight.load(Ordering::Relaxed) <= 1);
+        }
+        assert_eq!(peak.load(Ordering::Relaxed), 1);
+        let reads = started.load(Ordering::Relaxed);
+        assert!(
+            (2..=12).contains(&reads),
+            "{reads} background reads in 20 s"
+        );
     }
 }
