@@ -146,7 +146,8 @@ pub(super) fn apply(
             if *enrollment_revision != state.enrollment_revision
                 || group.identity != *scope
                 || group.replica_count != 3
-                || load::<GroupRecord>(tx, &key(GROUPS, scope.group_id))?.as_ref() != Some(group)
+                || load::<GroupRecord>(tx, &key(GROUPS, scope.group_id))?.as_ref()
+                    != Some(group.as_ref())
             {
                 return fault(Fault::Stale);
             }
@@ -184,7 +185,7 @@ pub(super) fn apply(
             let lookup = by_worker(intent.previous.worker_id);
             if let Some(id) = load::<Uuid>(tx, &lookup)? {
                 let record: ReplacementRecord = load(tx, &by_id(id))?.ok_or_else(unknown)?;
-                return if record.intent == *intent {
+                return if record.intent == **intent {
                     Ok(ControlReply::SystemReplacementPrepared(Box::new(record)))
                 } else {
                     fault(Fault::Conflict)
@@ -242,7 +243,7 @@ pub(super) fn apply(
                 return fault(Fault::Stale);
             }
             let record = ReplacementRecord {
-                intent: intent.clone(),
+                intent: intent.as_ref().clone(),
                 groups: groups.to_vec(),
                 applied_at: position,
             };

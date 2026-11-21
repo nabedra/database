@@ -152,7 +152,7 @@ impl ReplacementMountProof {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum SystemRecoveryCommand {
     Enable {
-        group: GroupRecord,
+        group: Box<GroupRecord>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         execution: bool,
         voters: [WorkerIdentity; 3],
@@ -172,7 +172,7 @@ pub(crate) enum SystemRecoveryCommand {
         authorization: AuthorizationStamp,
     },
     Prepare {
-        intent: ReplacementIntent,
+        intent: Box<ReplacementIntent>,
         ready: ReadyMembership,
         enrollment_revision: u64,
         group_inventory_revision: u64,
@@ -185,9 +185,12 @@ impl SystemRecoveryCommand {
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
             Self::Mount { .. } | Self::Publish { .. } => 0,
-            Self::Enable { group, .. } => group.identity.database.capacity_bytes(),
+            Self::Enable { group, .. } => {
+                size_of::<GroupRecord>() + group.identity.database.capacity_bytes()
+            }
             Self::Prepare { intent, groups, .. } => {
-                intent.next.endpoint.capacity_bytes()
+                size_of::<ReplacementIntent>()
+                    + intent.next.endpoint.capacity_bytes()
                     + intent.next.server_name.capacity_bytes()
                     + intent.mount.mount_path.capacity()
                     + intent.mount.provider_volume_id.capacity()

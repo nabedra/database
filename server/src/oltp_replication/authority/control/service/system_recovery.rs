@@ -87,7 +87,7 @@ impl ControlHandle {
                 &running,
                 operation_id,
                 SystemRecoveryCommand::Enable {
-                    group,
+                    group: Box::new(group),
                     execution: true,
                     voters,
                     enrollment_revision: state.enrollment_revision,
@@ -156,7 +156,7 @@ impl ControlHandle {
                 &running,
                 operation_id,
                 SystemRecoveryCommand::Prepare {
-                    intent,
+                    intent: Box::new(intent),
                     ready: state.ready,
                     enrollment_revision: state.enrollment_revision,
                     group_inventory_revision: state.group_inventory_revision,
