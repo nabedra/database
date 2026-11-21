@@ -449,6 +449,27 @@ def d11_index(url, token, ca, admin, stats):
     acknowledged, errors, counter = {}, [], [64]
     lock = threading.Lock()
 
+    # The final check reads every row with one `query.collect` (at most 10,000 rows). Writers
+    # insert up to INSERTS keys; after that they keep racing the build with direct updates, each
+    # writer on its own keys (key % 4) well below the cap, so every key has one writer and its
+    # last acknowledged category is its committed one. Without the cap, a faster direct path
+    # (PERF1: no two-worker API gate) writes more rows than one collect returns.
+    INSERTS = 8000
+    updates = [0] * 4
+
+    def update_only(client, index):
+        span = (INSERTS - 128) // 4
+        key = 64 + 4 * (updates[index] % span) + index
+        updates[index] += 1
+        new = (key + updates[index]) % 8
+        status, reply = client.exchange('/v1/operations', operation('table.update', {
+            'table_id': table.id, 'key': key, 'values': {'category': new}}))
+        if status == 200 and reply['data'] is True:
+            with lock:
+                acknowledged[key] = new
+        elif status != 200:
+            errors.append((status, reply))
+
     def writer(index):
         client = Http(url, token, 30, ca)
         try:
@@ -456,6 +477,9 @@ def d11_index(url, token, ca, admin, stats):
                 with lock:
                     key = counter[0]
                     counter[0] += 1
+                if key >= INSERTS:
+                    update_only(client, index)
+                    continue
                 category = key % 8
                 body = operation('table.insert', {'table_id': table.id, 'row': {'id': key, 'category': category,
                                                                                   'label': f'w{index}-{key}'}})
