@@ -1,0 +1,80 @@
+name: FLAKE3 probe
+on:
+  push:
+    branches: [nabedra/hd-flake3]
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+jobs:
+  repeat:
+    name: FLAKE3 ${{ matrix.fixture }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [typed-log, d11]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.94.1 --profile minimal
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-1.94.1-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-1.94.1-
+      - run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Repeat the typed-log library suite
+        if: matrix.fixture == 'typed-log'
+        working-directory: server
+        run: |
+          set -o pipefail
+          mkdir -p ../flake3
+          exe="$(cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable' | tail -1)"
+          test -x "$exe"
+          failed=0
+          for round in $(seq 1 200); do
+            rc=0
+            NABEDRA_TEST_DIRECT_OLTP=off timeout 75s "$exe" oltp_replication::typed_log::tests:: --test-threads 4 > "../flake3/typed-$round.log" 2>&1 || rc=$?
+            printf 'round=%s exit=%s ' "$round" "$rc"
+            grep 'test result:' "../flake3/typed-$round.log" || true
+            if [ "$rc" != 0 ]; then
+              failed=$((failed + 1))
+              cat "../flake3/typed-$round.log"
+            fi
+          done
+          echo "$failed/200 rounds failed"
+          test "$failed" = 0
+      - uses: actions/setup-python@v5
+        if: matrix.fixture == 'd11'
+        with:
+          python-version: "3.11"
+      - name: Repeat D11 through the RF1 CLI
+        if: matrix.fixture == 'd11'
+        run: |
+          cargo build --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --bin nabedra-db
+          mkdir -p flake3
+          failed=0
+          for round in $(seq 1 8); do
+            rc=0
+            timeout 240s python3 server/tests/oltp_direct_acceptance.py --binary "$PWD/server/target/debug/nabedra-db" \
+              --suite d11 --output "flake3/d11-$round" > "flake3/d11-$round.log" 2>&1 || rc=$?
+            printf 'round=%s exit=%s\n' "$round" "$rc"
+            cat "flake3/d11-$round.log"
+            if [ "$rc" != 0 ]; then failed=$((failed + 1)); fi
+          done
+          echo "$failed/8 rounds failed"
+          test "$failed" = 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flake3-${{ matrix.fixture }}
+          path: flake3
+          retention-days: 14
