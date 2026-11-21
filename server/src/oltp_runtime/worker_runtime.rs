@@ -1898,6 +1898,8 @@ impl HttpRuntime for WorkerRuntime {
                     "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
                         "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
                         "history_settling":switch.history_settling(),
+                        // GC2: `data.direct.batch` enabled (DirectBatch entries).
+                        "batch":switch.is_batch_enabled(),
                     })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
                     // Local lane refusals (NS11 finding 8).

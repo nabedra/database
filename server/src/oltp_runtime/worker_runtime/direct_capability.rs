@@ -316,7 +316,10 @@ impl DirectSwitch {
                     };
                     if let Ok(capability) = result {
                         advertised = capability.advertised;
-                        if switch.observe(capability) && switch.watch_batch(false).await {
+                        // An advert that reached Control before this worker
+                        // was ready could not enable the feature: ask for a
+                        // re-evaluation right away.
+                        if switch.observe(capability) && switch.watch_batch(true).await {
                             return;
                         }
                     }
