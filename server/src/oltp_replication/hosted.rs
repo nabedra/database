@@ -67,11 +67,7 @@ pub(crate) trait TypedMachine<C: TypedConfig>: Clone + Send + Sync + 'static {
     where
         C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     {
-        async move {
-            raft.client_write(command)
-                .await
-                .map_err(client_write_error)
-        }
+        async move { raft.client_write(command).await.map_err(client_write_error) }
     }
 }
 impl TypedMachine<super::authority::config::DataConfig>

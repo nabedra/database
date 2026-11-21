@@ -2,8 +2,7 @@
 //! options, key scopes, error mapping and a raw iterator with the shape the pool's
 //! readers use. It replaces the storage helpers the pool used to import from the
 //! deleted standalone `oltp` engine (plan section 5).
-use super::{PoolInner, failure, recovery_unknown};
-use super::disk::DiskReservationStats;
+use super::{PoolInner, disk::DiskReservationStats, failure, recovery_unknown};
 use crate::protocol::{ErrorCode, ProtocolError};
 use bytes::Bytes;
 use nabedra_kv::{
