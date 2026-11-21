@@ -297,7 +297,7 @@ async fn process(
         crate::supervisor::send(channel,&serde_json::json!({"version":1,"type":"ready","cluster_id":cluster_id,"bound_url":bound_url}),deadline).await.map_err(|_|unavailable())?;
         let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|_|unavailable())?;
         let mut interrupt=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map_err(|_|unavailable())?;
-        crate::network::serve_router(listener,application,tls,async {
+        crate::network::serve_router_keep_alive(listener,application,tls,async {
             tokio::select!{_ = crate::supervisor::frame(channel,None)=>{},_ = terminate.recv()=>{},_ = interrupt.recv()=>{}}
             runtime.stop_accepting();
         }).await.map_err(|_|unavailable())

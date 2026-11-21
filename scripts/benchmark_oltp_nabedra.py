@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import ssl
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
@@ -90,6 +91,23 @@ def command(*args, timeout=30):
     return completed.stdout.strip()
 
 
+MAX_IDLE_SECONDS = 2.0
+
+
+def idle_socket_quiet(sock):
+    """True when an idle socket has no buffered data, EOF or error pending (as in the Python ORM)."""
+    try:
+        if isinstance(sock, ssl.SSLSocket) and sock.pending():
+            return False
+        if hasattr(select, 'poll'):
+            poller = select.poll()
+            poller.register(sock, select.POLLIN | select.POLLPRI)
+            return not poller.poll(0)
+        return not select.select([sock], [], [], 0)[0]
+    except (OSError, ValueError):
+        return False
+
+
 class Http:
     """One persistent, non-retrying connection to the production HTTP API."""
 
@@ -111,12 +129,21 @@ class Http:
                 Http.opened += 1
         # http.client opens a closed connection again through self.connect().
         self.connection.connect = counted_connect
+        self.released = None
         self.headers = {'Authorization': f'Bearer {token}', 'X-Nabedra-Database': DATABASE,
                         'Content-Type': 'application/json'}
 
     def exchange(self, path, body=None):
         payload = None if body is None else json.dumps(body, separators=(',', ':'), allow_nan=False).encode()
         self.sizes = {'request_body_bytes': len(payload) if payload else 0}
+        # The ORMs' reuse rule (orm/python/src/nabedra/_http_pool.py): reuse a kept-alive
+        # connection only while it has been idle under 2 s and its socket is quiet, so a
+        # request never races the server's 5 s idle close. Closing before the first byte
+        # is written opens a new connection; nothing is ever sent twice.
+        if self.connection.sock is not None and (
+                self.released is None or time.monotonic() - self.released >= MAX_IDLE_SECONDS
+                or not idle_socket_quiet(self.connection.sock)):
+            self.connection.close()
         try:
             self.connection.request('GET' if body is None else 'POST', path, payload, self.headers)
             response = self.connection.getresponse()
@@ -126,6 +153,7 @@ class Http:
                 raise ValueError('HTTP response exceeds the operation body limit')
             if response.headers.get_content_type() != 'application/json':
                 raise ValueError(f'HTTP {response.status} did not return JSON')
+            self.released = time.monotonic()
             return response.status, json.loads(raw)
         except (OSError, http.client.HTTPException, ValueError):
             self.close()
