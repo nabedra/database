@@ -9,6 +9,7 @@ use crate::oltp::mvcc::{
     index::{IndexClosedKind, IndexDefinition, IndexNameRecord, IndexPhase, IndexRecord},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,26 @@ enum Operation {
     Resume(Selector),
     Retire(Selector),
 }
+
+/// How an index admin read treats a Catalog intent that covers the record.
+/// A metadata transaction holds one between its Prepare and its Resolve, so a
+/// read racing the build actor's Ready publication can find it (IDX1).
+#[derive(Clone, Copy)]
+enum OnBlocked<'a> {
+    /// Status, or a repeat that found the job's gate busy. Help a decided
+    /// intent resolve, wait a bounded time for an undecided one, then answer
+    /// `exhausted`. Status applies nothing, so it answers a typed retryable
+    /// error. A repeated mutation keeps its unknown outcome.
+    Help { exhausted: fn() -> ProtocolError },
+    /// The caller holds the job's gate and reconciles its own operation once.
+    Reconcile(&'a Operation),
+    /// The caller has just applied a mutation: an intent is an unknown outcome.
+    Unknown,
+}
+
+/// Help attempts before a blocked read gives up. The waits between them sum
+/// to 355 ms, longer than an undecided metadata transaction's decision takes.
+const BLOCKED_READ_ATTEMPTS: u32 = 8;
 
 impl Operation {
     fn parse(operation: &str, payload: &str) -> Result<Option<Self>, ProtocolError> {
@@ -112,7 +133,15 @@ impl WorkerRuntime {
         let selector = operation.selector(request_id);
         let authority = self.index_authority(None).await?;
         if matches!(operation, Operation::Status(_)) {
-            let record = self.read_index_admin(authority, selector, None).await?;
+            let record = self
+                .read_index_admin(
+                    authority,
+                    selector,
+                    OnBlocked::Help {
+                        exhausted: publication_pending,
+                    },
+                )
+                .await?;
             self.index_authority(Some(authority)).await?;
             return Ok(report(
                 request_id,
@@ -135,7 +164,9 @@ impl WorkerRuntime {
             Err(_) => {
                 // A repeated create/resume can observe the exact durable job
                 // while its actor owns the gate. Retire must wait for that actor.
-                let record = self.read_index_admin(authority, selector, None).await?;
+                let record = self
+                    .read_index_admin(authority, selector, OnBlocked::Help { exhausted: unknown })
+                    .await?;
                 if let Some(record) = record.as_deref() {
                     match &operation {
                         Operation::Create(definition) if *definition == record.definition => {
@@ -156,7 +187,7 @@ impl WorkerRuntime {
         };
         self.index_authority(Some(authority)).await?;
         let mut record = self
-            .read_index_admin(authority, selector, Some(&operation))
+            .read_index_admin(authority, selector, OnBlocked::Reconcile(&operation))
             .await?;
         if let (Operation::Create(definition), Some(existing)) = (&operation, record.as_deref()) {
             if existing.definition != *definition {
@@ -226,7 +257,7 @@ impl WorkerRuntime {
                         )
                         .await?;
                     record = Some(
-                        self.read_index_admin(authority, selector, None)
+                        self.read_index_admin(authority, selector, OnBlocked::Unknown)
                             .await?
                             .ok_or_else(unknown)?,
                     );
@@ -252,7 +283,7 @@ impl WorkerRuntime {
                 }
                 service.retire(record).await?;
                 let retired = self
-                    .read_index_admin(authority, selector, None)
+                    .read_index_admin(authority, selector, OnBlocked::Unknown)
                     .await?
                     .ok_or_else(unknown)?;
                 if !matches!(retired.phase, IndexPhase::Retired { .. }) {
@@ -294,34 +325,62 @@ impl WorkerRuntime {
         &self,
         authority: Authority,
         selector: Selector,
-        operation: Option<&Operation>,
+        blocked: OnBlocked<'_>,
     ) -> Result<Option<OwnedRecord<IndexRecord>>, ProtocolError> {
         let pin = self.index_observation(authority)?;
         let key = MvccKey::CatalogIndex {
             table_id: selector.table_id,
             index_id: selector.index_id,
         };
-        let mut read = self
-            .services
-            .catalog
-            .read::<IndexRecord>(&pin, key.clone())
-            .await?;
-        if let (CatalogRead::Blocked(intent), Some(operation)) = (&read, operation) {
-            let owner = selector.owner(pin.catalog.group_id);
-            if let Operation::Create(definition) = operation {
-                if intent.txn.request_id != self.index_declaration_identity(selector.build_id)? {
-                    return Err(unknown());
+        let mut attempts = 0;
+        let record = loop {
+            let intent = match self
+                .services
+                .catalog
+                .read::<IndexRecord>(&pin, key.clone())
+                .await?
+            {
+                CatalogRead::Value { record, .. } => break record,
+                CatalogRead::Blocked(intent) => intent,
+            };
+            match blocked {
+                OnBlocked::Unknown => return Err(unknown()),
+                OnBlocked::Reconcile(_) if attempts > 0 => return Err(unknown()),
+                OnBlocked::Reconcile(operation) => {
+                    let owner = selector.owner(pin.catalog.group_id);
+                    if let Operation::Create(definition) = operation {
+                        if intent.txn.request_id
+                            != self.index_declaration_identity(selector.build_id)?
+                        {
+                            return Err(unknown());
+                        }
+                        self.reconcile_index_declaration(authority, owner, intent, definition)
+                            .await?;
+                    } else {
+                        self.reconcile_ready_index(authority, owner, intent.txn, intent.manifest)
+                            .await?;
+                    }
                 }
-                self.reconcile_index_declaration(authority, owner, *intent, definition)
-                    .await?;
-            } else {
-                self.reconcile_ready_index(authority, owner, intent.txn, intent.manifest)
-                    .await?;
+                OnBlocked::Help { exhausted } => {
+                    if attempts == BLOCKED_READ_ATTEMPTS {
+                        return Err(exhausted());
+                    }
+                    if attempts > 0 {
+                        let backoff = Duration::from_millis(5 << (attempts - 1));
+                        tokio::time::sleep(backoff.min(Duration::from_millis(100))).await;
+                    }
+                    // Help resolves a decided intent and leaves an undecided
+                    // one to its actor. A failed observation is not an outcome.
+                    self.help_intent(intent).await.map_err(|error| {
+                        if error.outcome == Outcome::Unknown {
+                            exhausted()
+                        } else {
+                            error
+                        }
+                    })?;
+                }
             }
-            read = self.services.catalog.read::<IndexRecord>(&pin, key).await?;
-        }
-        let CatalogRead::Value { record, .. } = read else {
-            return Err(unknown());
+            attempts += 1;
         };
         if let Some(index) = &record {
             if index.definition.table_id != selector.table_id
@@ -418,6 +477,14 @@ fn not_found() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::NotFound,
         "index or table does not exist",
+        Outcome::NotApplied,
+    )
+}
+
+fn publication_pending() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "index publication is in progress; retry the status read",
         Outcome::NotApplied,
     )
 }

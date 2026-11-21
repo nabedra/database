@@ -411,8 +411,7 @@ async fn exercise_case(case: &str) {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "run through scripts/acceptance_oltp.py"]
-async fn acceptance_o12() {
+async fn o12_resume_cold_and_tombstone_cleanup() {
     tokio::time::timeout(std::time::Duration::from_secs(240), async {
         for case in ["resume", "cold", "drop"] {
             exercise_case(case).await;
@@ -420,8 +419,4 @@ async fn acceptance_o12() {
     })
     .await
     .expect("index lifecycle watchdog");
-    eprintln!(
-        "NABEDRA_OLTP_ACCEPTANCE {}",
-        serde_json::json!({"scenario":"O12","status":"not-run","reason":"local backfill/resume/cold/drop executed; failure while validation/epoch publication and distributed leader failure remain required"})
-    );
 }

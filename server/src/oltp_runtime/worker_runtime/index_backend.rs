@@ -444,6 +444,11 @@ impl IndexBackend for RuntimeIndexes {
                 return Err(unknown());
             }
             let guards = plan.lifecycle.clone();
+            #[cfg(test)]
+            super::super::recovery_tests::index_holds::bind(
+                attempt.pin.catalog.group_id,
+                attempt.txn,
+            );
             let decision = self
                 .runtime
                 .transactions
@@ -784,6 +789,8 @@ impl WorkerRuntime {
     }
 }
 
+#[cfg(test)]
+mod acceptance_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
