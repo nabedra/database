@@ -151,6 +151,10 @@ impl Fixture {
             SharedResourceConfig::default(),
         )
         .unwrap();
+        // Another worker's replica: its own worker and pool identity.
+        let mut pool = pool;
+        pool.worker_id = Uuid::new_v4();
+        pool.pool_id = Uuid::new_v4();
         let pool = OltpPool::open_development(&directory.0, pool, shared).unwrap();
         let store = pool.group(scope).await.unwrap();
         self.mirror = Some(ControlMachine::new(store).unwrap().legacy_v1_for_test());
