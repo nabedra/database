@@ -313,14 +313,25 @@ def verify_storage_reservations(fixture, table):
     if not cluster.mounts:
         not_run('O08', 'storage-reservations', 'The disk budget fixture needs a Linux tmpfs mount and passwordless sudo.')
         return
-    # Locate the same primary range on both paths with an ordinary queued batch.
-    seed = batch(table, rows(100, category=1))
-    fixture.select(seed['request_id'], {'participants': False})
-    assert fixture.data(seed) == 1
-    _, plans = fixture.reached(seed['request_id'], 'participants')
-    assert len(plans) == 1, plans
-    group = plans[0]['group']['group_id']
-    owner = data_leader(fixture, group)
+    # Direct batching serializes proposals within one range. Choose two
+    # different ranges led on one filesystem. Four ranges suffice at RF3.
+    ranges = {}
+    for index in range(len(WORKERS) + 1):
+        candidate = table if index == 0 else create(fixture, f'disk_race_{index}')
+        seed = batch(candidate, rows(100, category=1))
+        fixture.select(seed['request_id'], {'participants': False})
+        fixture.admit(seed)
+        _, plans = fixture.reached(seed['request_id'], 'participants')
+        assert len(plans) == 1, plans
+        fixture.terminal(seed['request_id'], 1)
+        group = plans[0]['group']['group_id']
+        owner = data_leader(fixture, group)
+        if owner in ranges:
+            contenders = [ranges[owner], (candidate, group)]
+            break
+        ranges[owner] = candidate, group
+    else:
+        raise AssertionError(f'no two Data ranges share a leader: {ranges}')
     directory = Path(cluster.config[owner]['node']['directory'])
 
     def disk_stats():
@@ -331,7 +342,9 @@ def verify_storage_reservations(fixture, table):
     charge = before['proposal_bytes']
     assert charge > 0 and before['reserved_bytes'] == before['reservations'] == 0, before
     keep = before['protected_bytes'] + charge + charge // 2
-    requests = [point(table, 'insert', row=row) for row in rows(101, 102, category=1)]
+    requests = [point(target, 'insert', row=row)
+                for (target, _), row in zip(contenders, rows(101, 102, category=1), strict=True)]
+    by_table = {body['payload']['table_id']: target for body, target in zip(requests, contenders, strict=True)}
     for body in requests:
         fixture.select(body['request_id'], {'storage-admission': True, 'storage-reserved': True})
     filler = directory / 'o08-reservation-pressure'
@@ -345,7 +358,8 @@ def verify_storage_reservations(fixture, table):
             calls = {pool.submit(exchange, fixture, body): body for body in requests}
             try:
                 for body in requests:
-                    assert fixture.reached(body['request_id'], 'storage-admission') == (owner, group)
+                    _, expected_group = by_table[body['payload']['table_id']]
+                    assert fixture.reached(body['request_id'], 'storage-admission') == (owner, expected_group)
                 ready = disk_stats()
                 budget = ready['available_bytes'] - ready['protected_bytes']
                 assert charge <= budget < 2 * charge and ready['reserved_bytes'] == 0, ready
@@ -355,7 +369,8 @@ def verify_storage_reservations(fixture, table):
                 assert len(done) == len(held) == 1, (done, held)
                 loser = calls[next(iter(done))]
                 winner = calls[next(iter(held))]
-                assert fixture.reached(winner['request_id'], 'storage-reserved') == (owner, group)
+                _, expected_group = by_table[winner['payload']['table_id']]
+                assert fixture.reached(winner['request_id'], 'storage-reserved') == (owner, expected_group)
                 refusal = next(iter(done)).result()
                 assert refusal == (503, dict(request_id=loser['request_id'], error=dict(
                     code='storage_unavailable',
@@ -365,7 +380,8 @@ def verify_storage_reservations(fixture, table):
                 charged = disk_stats()
                 assert charged['reservations'] == 1 and charged['reserved_bytes'] == charge, charged
                 assert charge <= charged['available_bytes'] - charged['protected_bytes'] < 2 * charge, charged
-                assert fixture.data(point(table, 'get', key=loser['payload']['row']['id'])) is None
+                losing_table, _ = by_table[loser['payload']['table_id']]
+                assert fixture.data(point(losing_table, 'get', key=loser['payload']['row']['id'])) is None
             finally:
                 for body in requests:
                     fixture.release(body['request_id'], 'storage-admission')
@@ -381,7 +397,8 @@ def verify_storage_reservations(fixture, table):
         assert fixture.data(replacement) is None
         for body in (winner, replacement):
             row = body['payload']['row']
-            assert fixture.data(point(table, 'get', key=row['id'])) == row
+            target, _ = by_table[body['payload']['table_id']]
+            assert fixture.data(point(target, 'get', key=row['id'])) == row
         assert disk_stats()['reservations'] == 0
         print('O08 filesystem accounting', json.dumps(dict(ready=ready, charged=charged, settled=settled)), flush=True)
     finally:

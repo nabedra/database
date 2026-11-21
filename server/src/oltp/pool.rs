@@ -300,12 +300,23 @@ impl OltpPool {
         let mut options =
             storage::store_options(&shared.storage, fs, shared.config.write_buffer_bytes);
         tune(&mut options);
-        let disk = disk::PoolDisk::open(path, options.journal.segment_bytes)?;
-        let opened = Store::open(&path.join(storage::STORE_DIR), options).map_err(|error| {
+        let store_path = path.join(storage::STORE_DIR);
+        let journal_path = store_path.join(nabedra_kv::manifest::JOURNAL_DIR);
+        let segment_bytes = options.journal.segment_bytes;
+        let opened = Store::open(&store_path, options).map_err(|error| {
             tracing::error!(path = %path.display(), %error, "OLTP pool refused at open");
             damage::open_refused(error)
         })?;
         let store = OwnedStore(Some(opened.store));
+        // FaultFs keeps the journal in memory, with only the pool manifest on
+        // disk. Real stores measure the device of the journal itself.
+        #[cfg(test)]
+        let journal_path = if journal_path.exists() {
+            &journal_path
+        } else {
+            path
+        };
+        let disk = disk::PoolDisk::open(journal_path.as_ref(), segment_bytes)?;
         // R6 at pool level, sticky (NS14, `damage.rs`): new damage of more than 8
         // groups, or more than 10% of the pool's groups (always allowing one), is
         // more likely systemic than local, so the pool is refused instead (plan
