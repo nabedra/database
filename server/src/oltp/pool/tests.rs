@@ -1957,3 +1957,61 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
 }
 
 mod kv;
+
+#[tokio::test]
+async fn o22_c07_dependent_pool_writers_wait_without_compute() {
+    use std::{future::Future as _, task::Poll};
+    let resources = shared(SharedResourceConfig::default());
+    let dir = Dir::new();
+    let pool = OltpPool::open_development(&dir.0, pool_identity(), resources.clone()).unwrap();
+    let data = pool.group(group_identity(&pool)).await.unwrap();
+    let baseline = resources.scheduler().usage();
+    let order = data.inner.order.lock().await;
+    let first = data.transaction(meta(0), budget(), |tx| {
+        tx.put(b"first", b"1")?;
+        Ok(Transition::Commit(tx.copy_output(b"1")?))
+    });
+    let second = data.transaction(meta(1), budget(), |tx| {
+        tx.put(b"second", b"2")?;
+        Ok(Transition::Commit(tx.copy_output(b"2")?))
+    });
+    tokio::pin!(first, second);
+    std::future::poll_fn(|cx| {
+        assert!(first.as_mut().poll(cx).is_pending());
+        assert!(second.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert_eq!(resources.scheduler().usage(), baseline);
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        data.read(budget(), |view| {
+            assert!(view.get(b"first")?.is_none());
+            view.copy_output(b"available")
+        }),
+    )
+    .await
+    .expect("read blocked behind writer ownership")
+    .unwrap();
+    assert_eq!(read.as_slice(), b"available");
+    drop(read);
+    drop(order);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .expect("waiting writers did not settle");
+    assert_eq!(first.unwrap().as_slice(), b"1");
+    assert_eq!(second.unwrap().as_slice(), b"2");
+    let result = data
+        .read(budget(), |view| {
+            assert_eq!(view.get(b"first")?.unwrap().as_slice(), b"1");
+            assert_eq!(view.get(b"second")?.unwrap().as_slice(), b"2");
+            view.copy_output(b"done")
+        })
+        .await
+        .unwrap();
+    drop(result);
+    resources.drain().await;
+    assert_eq!(resources.scheduler().usage(), baseline);
+}
