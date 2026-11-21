@@ -402,9 +402,11 @@ impl HttpRuntime for RemoteRuntime {
                 .client
                 .has_scoped_receipt(record.run_id, record.request_id);
             let mut copy_deadline = None;
+            let mut observation_deadline = None;
             loop {
                 let observe = self.client.observe(record.run_id, record.request_id);
-                let observed = match copy_deadline {
+                let deadline = copy_deadline.into_iter().chain(observation_deadline).min();
+                let observed = match deadline {
                     Some(deadline) => tokio::time::timeout_at(deadline, observe)
                         .await
                         .map_err(|_| unavailable())?,
@@ -412,6 +414,9 @@ impl HttpRuntime for RemoteRuntime {
                 };
                 let state = match observed {
                     Ok(observed) => {
+                        // A healthy observation ends the transient failure
+                        // streak. The original request may still be queued.
+                        observation_deadline = None;
                         let metadata = &observed.metadata.record;
                         if metadata.digest != record.digest
                             || metadata.state == RequestState::Reconciling && !scoped
@@ -442,10 +447,20 @@ impl HttpRuntime for RemoteRuntime {
                         state
                     }
                     Err(error) if scoped && receipt_retryable(&error) => RequestState::Reconciling,
+                    Err(error) if receipt_retryable(&error) => {
+                        observation_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + super::RECEIPT_OBSERVATION_TIMEOUT
+                        });
+                        RequestState::Reconciling
+                    }
                     Err(error) => return Err(error),
                 };
                 let now = tokio::time::Instant::now();
-                if copy_deadline.is_some_and(|end| now >= end) {
+                if copy_deadline
+                    .into_iter()
+                    .chain(observation_deadline)
+                    .any(|end| now >= end)
+                {
                     return Err(unavailable());
                 }
                 if (state == RequestState::Committing
@@ -462,8 +477,11 @@ impl HttpRuntime for RemoteRuntime {
                     copy_deadline = Some(now + timeout);
                 }
                 let next_poll = now + interval;
-                tokio::time::sleep_until(copy_deadline.map_or(next_poll, |end| end.min(next_poll)))
-                    .await;
+                let wake = copy_deadline
+                    .into_iter()
+                    .chain(observation_deadline)
+                    .fold(next_poll, std::cmp::min);
+                tokio::time::sleep_until(wake).await;
                 interval = (interval * 2).min(std::time::Duration::from_millis(500));
             }
         })
