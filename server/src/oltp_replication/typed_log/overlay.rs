@@ -11,6 +11,11 @@
 //! overlay at that point is either already durable or not appended yet.
 //! Applying an entry waits until it is durable here, so the state machine
 //! never runs ahead of this replica's own synced log.
+//!
+//! The commit marker is a recovery hint. `save_committed` queues it for a
+//! background writer, so the Raft core hands a commit to the apply worker
+//! without waiting for a store write; reads of the marker and the next vote
+//! wait for that writer.
 use super::super::entry::{CommandData, LogId, OwnedRaftEntry};
 use std::{
     collections::BTreeMap,
@@ -21,12 +26,18 @@ pub(super) struct Overlay<D: CommandData> {
     state: Mutex<State<D>>,
     /// Woken whenever entries leave the overlay.
     pub(super) settled: tokio::sync::Notify,
+    /// Woken when the commit-marker writer goes idle.
+    marker_idle: tokio::sync::Notify,
 }
 struct State<D: CommandData> {
     entries: BTreeMap<u64, OwnedRaftEntry<D>>,
     /// A commit marker for a pending entry, written after that entry syncs.
     committed: Option<LogId>,
     failed: bool,
+    /// The newest commit marker of a durable entry not written yet.
+    unsaved: Option<LogId>,
+    /// A background marker writer runs.
+    writing: bool,
 }
 impl<D: CommandData> Default for Overlay<D> {
     fn default() -> Self {
@@ -35,8 +46,11 @@ impl<D: CommandData> Default for Overlay<D> {
                 entries: BTreeMap::new(),
                 committed: None,
                 failed: false,
+                unsaved: None,
+                writing: false,
             }),
             settled: tokio::sync::Notify::new(),
+            marker_idle: tokio::sync::Notify::new(),
         }
     }
 }
@@ -105,6 +119,40 @@ impl<D: CommandData> Overlay<D> {
             state.committed = Some(id);
         }
         true
+    }
+    /// Queues the commit marker `id` of a durable entry. True when the
+    /// caller must start the writer; a running writer picks up the newest.
+    pub(super) fn queue_marker(&self, id: LogId) -> bool {
+        let mut state = self.lock();
+        if state.unsaved.is_none_or(|old| old.index < id.index) {
+            state.unsaved = Some(id);
+        }
+        !std::mem::replace(&mut state.writing, true)
+    }
+    /// The writer's next marker, or `None` when it goes idle.
+    pub(super) fn next_marker(&self) -> Option<LogId> {
+        let next = {
+            let mut state = self.lock();
+            let next = state.unsaved.take();
+            state.writing = next.is_some();
+            next
+        };
+        if next.is_none() {
+            self.marker_idle.notify_waiters();
+        }
+        next
+    }
+    /// Waits until every queued commit marker is written.
+    pub(super) async fn markers_written(&self) {
+        loop {
+            let idle = self.marker_idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if !self.lock().writing {
+                return;
+            }
+            idle.await;
+        }
     }
     /// A new core starts on the durable log: forget an earlier failure.
     pub(super) fn reset(&self) {

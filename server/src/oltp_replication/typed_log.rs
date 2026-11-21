@@ -666,7 +666,9 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         let vote = *vote;
         // OpenRaft requires vote and log IO in submission order: a newer
         // vote's flush marks every earlier IO flushed, so it waits for the
-        // appends still syncing (PERF2d).
+        // appends still syncing (PERF2d). A queued commit marker lands
+        // first, so this synced write persists it too.
+        self.overlay.markers_written().await;
         let _order = self.writes.lock().await;
         let (store, retry) = (&self.store, &self.retry);
         retry
@@ -712,6 +714,27 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         if id.is_some_and(|id| self.overlay.defer_commit(id)) {
             return Ok(());
         }
+        // A durable entry's marker goes to the background writer, so the
+        // core hands this commit to the apply worker at once (PERF2d item 2).
+        if let Some(id) = id {
+            if self.overlay.queue_marker(id) {
+                let (store, retry, overlay) =
+                    (self.store.clone(), self.retry.clone(), self.overlay.clone());
+                let pending = self.pending.start();
+                tokio::spawn(async move {
+                    let _pending = pending;
+                    while let Some(id) = overlay.next_marker() {
+                        match save_commit_marker(&store, &retry, Some(id), true).await {
+                            Ok(()) => tracing::debug!(group=%store.identity().group_id,
+                                index=id.index, "typed Raft durable commit saved"),
+                            Err(error) => tracing::warn!(group=%store.identity().group_id,
+                                code=?error.code, index=id.index, "Raft commit marker not saved"),
+                        }
+                    }
+                });
+            }
+            return Ok(());
+        }
         save_commit_marker(&self.store, &self.retry, id, false)
             .await
             .map_err(disk)?;
@@ -725,6 +748,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         Ok(())
     }
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
+        self.overlay.markers_written().await;
         Ok(self
             .metadata::<Option<LogId>>(b"committed")
             .await?

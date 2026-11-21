@@ -1179,3 +1179,45 @@ async fn o29_perf2d_failed_append_fails_queued_appends_until_the_log_state_is_re
     .await
     .expect("PERF2d failed append watchdog");
 }
+
+/// O11/C07, PERF2d item 2: the commit marker of a durable entry is written in
+/// the background, so the Raft core hands a commit to the apply worker without
+/// a native write. With the only Control slot held, `save_committed` returns at
+/// once; reading the marker and draining the replica wait for the writer.
+#[tokio::test]
+async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let mut log = f.log.clone();
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(0)], IOFlushed::signal(sent)).await.unwrap();
+        acked.await.unwrap().unwrap();
+        let control = f
+            .log
+            .group()
+            .resources()
+            .prepare(ExecutionClass::Control)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), log.save_committed(Some(id(0))))
+            .await
+            .expect("save_committed waited for a native write")
+            .unwrap();
+        let read = tokio::spawn({
+            let mut log = log.clone();
+            async move { log.read_committed().await.unwrap() }
+        });
+        let drain = tokio::spawn({
+            let log = log.clone();
+            async move { log.drain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!read.is_finished());
+        assert!(!drain.is_finished());
+        drop(control);
+        assert_eq!(read.await.unwrap(), Some(id(0)));
+        drain.await.unwrap();
+    })
+    .await
+    .expect("PERF2d marker watchdog");
+}
