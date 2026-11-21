@@ -995,6 +995,21 @@ enum RunTime {
 /// Damages g on worker 2 while it runs and makes worker 2 read the damaged
 /// bytes, so kv quarantines g and the manager stops and reports the replica.
 async fn damage_at_run_time(cluster: &mut Cluster, kind: RunTime) {
+    // FLAKE1: a fence is acknowledged once a quorum applied it, so worker 2
+    // may apply the last one later. Applied after the flush, it writes g's
+    // next config to the memtable (the read below is then served from there)
+    // and caches the run block it read. Wait until worker 2 applied every
+    // acknowledged write: after that nothing writes g's config.
+    let host = cluster.running(DAMAGED).data.clone().unwrap();
+    let term = cluster.term;
+    timeout(Duration::from_secs(60), async {
+        while Cluster::applied_term(&host).await != term {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("worker 2 applied every acknowledged write");
+    drop(host);
     let flushing = cluster.running(DAMAGED).pool.clone();
     tokio::task::spawn_blocking(move || flushing.kv_store().flush().unwrap())
         .await
@@ -1003,11 +1018,19 @@ async fn damage_at_run_time(cluster: &mut Cluster, kind: RunTime) {
     match kind {
         RunTime::RunBlock => {
             let host = cluster.running(DAMAGED).data.clone().unwrap();
+            let pool = cluster.running(DAMAGED).pool.clone();
+            // A read after the flush caches g's config block, as any read or
+            // late apply could. The block was checked when it was read, so
+            // serving it from the cache is correct; the test evicts it below
+            // so that its read meets the damage on disk.
+            assert_eq!(Cluster::applied_term(&host).await, term);
             let fault = &cluster.workers[DAMAGED].fault;
             assert!(
                 damage_runs(fault, &path, &cluster.needle()) > 0,
                 "g's config in a run"
             );
+            assert!(pool.kv_store().evict_cached_blocks() > 0);
+            let before = pool.kv_store().stats();
             let read = host
                 .state
                 .store()
@@ -1016,7 +1039,16 @@ async fn damage_at_run_time(cluster: &mut Cluster, kind: RunTime) {
                     view.copy_output(raw.as_ref())
                 })
                 .await;
-            assert!(read.is_err(), "a damaged block was served");
+            let after = pool.kv_store().stats();
+            assert!(
+                read.is_err(),
+                "a damaged block was served: commits {} -> {}, corruption {} -> {}, levels {:?}",
+                before.commits,
+                after.commits,
+                before.corruption_detected,
+                after.corruption_detected,
+                pool.kv_store().level_runs(),
+            );
         }
         RunTime::JournalValue => {
             // Every Raft entry body of g is a journal value (NS7), a JSON

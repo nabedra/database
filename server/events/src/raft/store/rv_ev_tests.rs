@@ -434,9 +434,17 @@ fn big_entry(index: u64) -> Entry<TypeConfig> {
     }
 }
 
+/// The ten entries (about 19 MB) stay below half of one segment, so the append never
+/// wakes the journal's spare preparer (`kv-journal-prep`). Its create, zero fill and
+/// syncs would run beside the append, and how many of them land before the append's last
+/// sync depends on timing, so a crash point count taken from one run would not reach the
+/// end of the append in another (FLAKE1: with 20 MiB segments, no crash point up to the
+/// reference count completed the second batch).
+const SPLIT_SEGMENT_BYTES: u64 = 48 << 20;
+
 fn split_options(fs: &FaultFs) -> nabedra_kv::Options {
     let mut options = Database::options(Arc::new(fs.clone()));
-    options.journal.segment_bytes = 20 << 20;
+    options.journal.segment_bytes = SPLIT_SEGMENT_BYTES;
     options
 }
 
@@ -467,7 +475,17 @@ fn ns27_rv_ev_split_append_leaves_a_prefix_at_every_crash_point() -> Result<()> 
             db.store().stats().journal_syncs >= journal + 2,
             "the append took more than one synced batch"
         );
+        let journal_bytes = db.store().stats().journal_bytes;
+        assert!(
+            journal_bytes < SPLIT_SEGMENT_BYTES / 2,
+            "{journal_bytes} journal bytes: the spare preparer would run beside the append"
+        );
         drop(db);
+        assert_eq!(
+            fs.list(&journal_dir(root))?.len(),
+            1,
+            "only the active segment: no spare was prepared"
+        );
         fs.mutating_ops()
     };
     let mut prefixes = BTreeSet::new();

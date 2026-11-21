@@ -1831,6 +1831,12 @@ impl<'a> GroupRead<'a> {
         Ok(progress)
     }
 }
+/// A transaction's batch starts this small and grows as it is filled; `batch_limit`
+/// still bounds it. Reserving the whole budget up front made every mvcc apply
+/// (budget 32 MiB + 128 KiB, above glibc's mmap threshold) map and unmap 32 MiB
+/// for a point write of a few KiB, a 2 MiB huge page under THP `always` (FLAKE1).
+const INITIAL_BATCH_CAPACITY: usize = 4 << 10;
+
 pub struct GroupTransaction<'a> {
     read: GroupRead<'a>,
     batch: WriteBatch,
@@ -1853,7 +1859,7 @@ impl<'a> GroupTransaction<'a> {
                 output,
                 key_buffer: KeyBuffer::default(),
             },
-            batch: WriteBatch::with_capacity_bytes(budget.batch_bytes),
+            batch: WriteBatch::with_capacity_bytes(budget.batch_bytes.min(INITIAL_BATCH_CAPACITY)),
             batch_used: 12,
             batch_limit: budget.batch_bytes,
             _batch_charge: batch,
