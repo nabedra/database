@@ -1936,6 +1936,10 @@ impl HttpRuntime for WorkerRuntime {
             });
             #[cfg(test)]
             {
+                stats["test_working_memory"] = serde_json::json!({
+                    "decode_peak_bytes": self.services.shared.peak_working_decode_bytes(),
+                    "task_limit_bytes": self.services.shared.task_memory_limit_bytes(),
+                });
                 if let Some(source) = &self.services.direct_timestamps
                     && let Some(probe) =
                         super::recovery_tests::timestamp_probe(source.as_ref()).await
