@@ -394,6 +394,20 @@ def cluster_process(binary, test_executable, label, **options):
             cluster.close()
 
 
+def ready_replica_view(cluster, names, *, newer_than=0):
+    # The ready health endpoint reads Control. The local queue may still be
+    # installing the published membership when that health check returns.
+    def installed():
+        views = [stats['accept_to_dispatch']['view'] for stats in cluster.all_stats(names).values()]
+        first = views[0]
+        assert first['run_id'] == cluster.run_id, first
+        if first['membership_revision'] > newer_than and all(view == first for view in views):
+            return first
+        return None
+
+    return wait_until(installed, f'queue replicas {names} did not install one newer ready view', timeout=20)
+
+
 def database(cluster, api='api1'):
     return Database(url=cluster.api_urls[api], token=cluster.auth['data_token'],
                     database=DATABASE, ca_file=str(cluster.ca), timeout=30)
@@ -655,6 +669,12 @@ def o22(binary, test_executable):
                    and not stats['queue']['reconciling_records'] for stats in final.values())
         evidence('O22', 'unequal-registered-workers', limits={
             name: cluster.config[name]['resources'] for name in WORKERS}, resources=observed)
+        assertion('O22', 'protected-progress',
+                  'Authenticated receipts and a small query progressed while two broad scans held remote Data tickets. Native mTLS assertions exercised reserved Raft progress with occupied Data lanes and query executors.')
+        assertion('O22', 'dependent-waits-release-compute',
+                  'Both live remote page waits and two native writes blocked on asynchronous ordering reached zero compute use. Exact reads, ordered writes, cancellation and settlement executed.')
+        assertion('O22', 'caps-fairness-and-conservation',
+                  'Two broad scans used one in-flight Data page per request under a cap of two, visited both shards and returned exact rows. The 100-partition scheduler assertions included reductions, caps 1/2/3, deterministic fairness, refill and conservation.')
         if mounts:
             owner_id = final[WORKERS[0]]['accept_to_dispatch']['owner']['worker_id']
             owner = next(name for name in WORKERS if cluster.enrollments[name]['worker_id'] == owner_id)
@@ -662,12 +682,15 @@ def o22(binary, test_executable):
             survivors = tuple(name for name in WORKERS if name != target)
             route_before = [table.where(id=key).explain().split('owning shard ', 1)[1].splitlines()[0]
                             for key in (-1, 1)]
+            original_view = ready_replica_view(cluster, WORKERS)
             cluster.workers[target].kill()
             same_run_ready(cluster, cluster.run_id, survivors, 2)
+            removed_view = ready_replica_view(cluster, survivors, newer_than=original_view['membership_revision'])
             prepare_rolling_restart(cluster, target, owner)
             cluster.config[target]['resources']['max_threads'] = 3
             launch_retained(cluster, target)
             same_run_ready(cluster, cluster.run_id, WORKERS, 3)
+            ready_replica_view(cluster, WORKERS, newer_than=removed_view['membership_revision'])
             assert cluster.stats(target)['native_thread_budget']['query_threads'] == 3
             current = db.table('o22_rows')
             assert current.id == table.id and current.query().collect() == rows
@@ -698,12 +721,6 @@ def o22(binary, test_executable):
                     exact_receipt(client.exchange, ready['run_id'], count, len(rows))
         finally:
             local.close()
-    assertion('O22', 'protected-progress',
-              'Authenticated receipts and a small query progressed while two broad scans held remote Data tickets. Native mTLS assertions exercised reserved Raft progress with occupied Data lanes and query executors.')
-    assertion('O22', 'dependent-waits-release-compute',
-              'Both live remote page waits and two native writes blocked on asynchronous ordering reached zero compute use. Exact reads, ordered writes, cancellation and settlement executed.')
-    assertion('O22', 'caps-fairness-and-conservation',
-              'Two broad scans used one in-flight Data page per request under a cap of two, visited both shards and returned exact rows. The 100-partition scheduler assertions included reductions, caps 1/2/3, deterministic fairness, refill and conservation.')
     assertion('O22', 'scheduler-contract',
               'Native and process C01–C07/F01–F03/U01–U03 assertions ran in part. Missing matching local/distributed saturation histories and forged capacity or stale incarnation during live C02 admission.'
               + ('' if mounts else ' C03 retained reconfiguration requires Linux loopback pool mounts with passwordless sudo.'),
@@ -878,6 +895,9 @@ def o23(binary, test_executable):
             assert_accepted(observer.exchange(REQUESTS, write), run, write)
             changed = {**write, 'payload': {**write['payload'], 'rows': [{'id': -1, 'payload': 'wrong'}]}}
             error(observer.exchange(REQUESTS, changed), 'conflict')
+            assertion('O23', 'required-queue-and-receipts',
+                      'Measured explicit /v1/requests reads and writes returned exact terminal receipts. A duplicate kept its original UUID and a conflicting body was refused.')
+            original_view = ready_replica_view(cluster, WORKERS)
             cluster.kill_api('api1')
             for request in (read, write):
                 status, pending = observer.exchange(receipt_path(run, request))
@@ -886,6 +906,7 @@ def o23(binary, test_executable):
                 if mounts:
                     cluster.workers[target].kill()
                     same_run_ready(cluster, run, (owner, other), 2)
+                    removed_view = ready_replica_view(cluster, (owner, other), newer_than=original_view['membership_revision'])
                     two, extra_keys = queue_workload(cluster, (owner, other), table, workload_out, traced[34:])
                     assert not write_keys.intersection(extra_keys)
                     write_keys.update(extra_keys)
@@ -895,6 +916,7 @@ def o23(binary, test_executable):
                     prepare_rolling_restart(cluster, target, owner)
                     launch_retained(cluster, target)
                     same_run_ready(cluster, run, WORKERS, 3)
+                    ready_replica_view(cluster, WORKERS, newer_than=removed_view['membership_revision'])
                     for request in (read, write):
                         assert assert_record(read_record(cluster, target, request), run, request) == identities[request['request_id']]
             finally:
@@ -916,8 +938,6 @@ def o23(binary, test_executable):
                  worker_limits={name: cluster.config[name]['resources'] for name in WORKERS})
         evidence('O23', 'held-admission', read=metrics[0], write=metrics[1], same_run=run,
                  ready_sizes=[3, 2, 3] if mounts else [3])
-        assertion('O23', 'required-queue-and-receipts',
-                  'An explicit /v1/requests scan and batched write created exact all-ready queue records and observer receipts in the original run.')
         if mounts:
             assertion('O23', 'all-ready-and-retention',
                       'An unacknowledged installation blocked 202. Both exact requests survived a 3 to 2 to 3 ready transition with the original pinned context and exact terminal values.')
