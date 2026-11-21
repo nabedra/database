@@ -282,7 +282,7 @@ def o16(facade):
     records = {body['request_id']: facade.records(body['request_id']) for body in snapshots}
     survivors = stop_worker(cluster, owner)
     neighbor_get = operation('table.get', dict(table_id=independent.id, key=9))
-    assert read_after_transition(facade, neighbor_get) == row(9)
+    assert read_after_transition(facade, operation('table.get', neighbor_get['payload'])) == row(9)
     for body, (_, timestamp) in zip(snapshots, observations, strict=True):
         request_id = body['request_id']
         copies = records[request_id]
@@ -509,11 +509,16 @@ def o26(facade):
     facade.reached(pinned['request_id'], 'snapshot')
     move(cluster, parent, owner, extra)
     parts = split(cluster, parent, 1024)['children']
+    # Manual splits place children on the fixed Catalog voters. The parent
+    # was on the extension, so this split copies its data back to the primary.
+    primary = cluster.config[owner]['node']['pool_id']
+    owner_id = worker_identity(cluster, owner)['worker_id']
     for child in parts:
         route = placement(cluster, child)
         assert len({member['worker_id'] for member in route['members']}) == 3, route
-        assert any(member['pool_id'] == extra['identity']['pool_id']
-                   for member in route['members']), route
+        assert [member['pool_id'] for member in route['members']
+                if member['worker_id'] == owner_id] == [primary], route
+    move(cluster, parts[0], owner, extra)
     added = [row(-1), row(len(rows))]
     assert facade.data(batch(table, [item | {'payload': payload} for item in added])) == 2
     facade.release(pinned['request_id'], 'snapshot')
@@ -521,7 +526,7 @@ def o26(facade):
     assert query(facade, table, expression=scan) == [added[0], *rows, added[1]]
     assert get(facade, table, 1024) == rows[1024] | {'payload': payload}
     assert query(facade, table, 'count') == len(rows) + len(added)
-    passed('O26', 'identities-and-atomicity', 'The parent moved under the same identity, then produced RF3 children on the new pool. The pinned scan excluded the later cross-range batch, and a fresh scan included it in full.')
+    passed('O26', 'identities-and-atomicity', 'The parent moved to the extension. The split copied its data back to the primary, and one child moved to the extension. The old pin excluded the later cross-range batch and a fresh scan included it in full.')
 
     passed('O26', 'mount-identity-and-exclusion',
            'Wrong worker, provider and filesystem marker, a root-disk path, and a real mount held by a foreign volume lock were refused before any pool data or manifest was created.')
