@@ -1221,3 +1221,41 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
     .await
     .expect("PERF2d marker watchdog");
 }
+
+/// KVfix4, NS13/O05: once `drain` returns, no append task still holds what it
+/// captured (the group store, charged entries, the worker's resource owner).
+/// The hosted NS13 test drops its pool after a drain and reopens the worker at
+/// once; an append task that released its pending guard before dropping its
+/// captured store let `bind_worker` meet the old owner ("worker storage
+/// capacity unavailable"). The task's last copy of the hook drops slowly, so a
+/// guard released first is caught every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct SlowDrop(Arc<AtomicBool>);
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let mut f = Fixture::new().await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let slow = SlowDrop(dropped.clone());
+    *f.log.append_hook.lock().unwrap() = Some(Arc::new(move || {
+        let _ = &slow;
+    }));
+    let (sender, callback) = TestConfig::oneshot();
+    f.log
+        .append([blank(0)], IOFlushed::signal(sender))
+        .await
+        .unwrap();
+    callback.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.log.drain())
+        .await
+        .expect("drain");
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "drain returned while the append task still held its captured state"
+    );
+}
