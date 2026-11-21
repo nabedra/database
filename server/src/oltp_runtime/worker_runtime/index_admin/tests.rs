@@ -154,7 +154,9 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
             if code == StatusCode::OK && observed["data"]["state"] == "ready" {
                 break;
             }
-            assert!(code == StatusCode::SERVICE_UNAVAILABLE || (code == StatusCode::OK && observed["data"]["state"] == "building"), "{code} {observed}");
+            // A status read answers its state or a typed retryable error (IDX1).
+            assert!((code == StatusCode::SERVICE_UNAVAILABLE && observed["error"]["outcome"] == "not_applied")
+                || (code == StatusCode::OK && observed["data"]["state"] == "building"), "{code} {observed}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
