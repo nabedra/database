@@ -671,7 +671,24 @@ async fn backfill_and_retirement() -> (usize, usize) {
         .stored_index_rows(ReadTs::new(u64::MAX).unwrap(), 7)
         .await
         .len();
+    let reclaimed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if fixture
+                .stored_index_rows(ReadTs::new(u64::MAX).unwrap(), 7)
+                .await
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
     fixture.close().await;
+    assert!(
+        reclaimed.is_ok(),
+        "retired Data entries remained after the snapshot readers released their pins"
+    );
     (page_peak, retained)
 }
 
