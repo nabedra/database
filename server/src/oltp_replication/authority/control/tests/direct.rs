@@ -77,6 +77,109 @@ fn replica(node_id: u64, worker: WorkerIdentity) -> ReplicaMember {
 }
 
 #[tokio::test]
+async fn o06_o18_direct_api_grant_survives_queue_membership_change() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool).await;
+    let owner = fixture.ready_cluster(1).await[0];
+    let joiner = fixture.enroll(2).await;
+    let api = ApiEnrollment {
+        database: scope.database.clone(),
+        enrollment: worker(800),
+    };
+    let caller = WorkerIdentity::from(api.transport());
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::EnrollApi {
+                operation_id: Uuid::new_v4(),
+                expected: None,
+                next: api,
+                authorization: authorization(),
+            })
+            .await,
+        ControlReply::Enrolled(caller)
+    );
+    fixture.advertise(owner).await;
+    fixture.advertise(joiner).await;
+    assert!(fixture.advertise(caller).await.activation.is_some());
+    let ready = fixture.state().await.ready;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: ready.view,
+                target: joiner,
+            })
+            .await,
+        ControlReply::JoinBegun { .. }
+    ));
+    assert!(fixture.state().await.pending.is_some());
+    let model = Arc::new(NativeModelConsensus {
+        machine: fixture.machine.clone(),
+        next: AtomicU64::new(fixture.next),
+        reads: AtomicU64::new(0),
+    });
+    let handle = ControlHandle::new(
+        fixture.machine.clone(),
+        model,
+        OperatorPolicy {
+            policy: authorization().policy,
+            certificate_pins: Default::default(),
+        },
+    );
+    let queue = QueueScope {
+        cluster_id: scope.cluster_id,
+        database: scope.database.clone(),
+    };
+    let data = GroupIdentity {
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Data {
+            table_id: Uuid::new_v4(),
+            shard_id: Uuid::new_v4(),
+        },
+        ..scope.clone()
+    };
+    let action = ServiceAction::ApiIngress;
+    assert!(
+        handle
+            .service_role(&queue, caller, action, scope)
+            .await
+            .is_err()
+    );
+    let grant = handle
+        .service_role(&queue, caller, action, data.clone())
+        .await
+        .unwrap();
+    assert_eq!(grant.ready, ready);
+    let stale = WorkerIdentity {
+        incarnation: Uuid::new_v4(),
+        ..caller
+    };
+    assert!(
+        handle
+            .service_role(&queue, stale, action, data.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        handle
+            .service_role(&queue, owner, action, data.clone())
+            .await
+            .is_err()
+    );
+    let foreign = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        ..data
+    };
+    assert!(
+        handle
+            .service_role(&queue, caller, action, foreign)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn o02_t7_direct_capability_activates_on_unanimous_advertisement_and_is_durable() {
     let directory = Directory::new();
     let (scope, pool) = identities();

@@ -329,17 +329,26 @@ pub(super) async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
-    let target = control.control_group().clone();
+    let control_group = control.control_group();
     // Cached like the stable roles (T6 concern 4): one Control read per
     // API process per `GRANT_TTL`, not per request.
-    let key = super::GrantKey::direct_ingress(session.remote(), &target);
+    let key = super::GrantKey::direct_ingress(session.remote(), control_group);
     control
         .service_grants()
         .role(key, control.applied_revision(), || async {
-            control
-                .service_role(&scope, session.remote(), header.action, target.clone())
-                .await
-                .map(Some)
+            let caller = session.remote();
+            let grant = control
+                .service_role(&scope, caller, header.action, session.group().clone())
+                .await;
+            match grant {
+                // Previous Control builds decode the same ServiceRole but
+                // only accept the Control group as the ApiIngress target.
+                Err(error) if error.code == ErrorCode::Unauthorized => control
+                    .service_role(&scope, caller, header.action, control_group.clone())
+                    .await
+                    .map(Some),
+                grant => grant.map(Some),
+            }
         })
         .await
 }
