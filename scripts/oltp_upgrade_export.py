@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -13,10 +14,10 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_ope
 from uuid import UUID, uuid4
 
 
-def archive_path(repository, cluster_id, backup_id):
+def archive_path(repository, cluster_id, backup_id, attempt=1):
     # The old archive.create endpoint requires this exact destination. Match
     # native_archive_id's SHA-256 over the compact serde JSON tuple.
-    identity = [list(b'nabedra/native-backup-id/v1'), cluster_id, {'backup_id': backup_id, 'attempt': 1}]
+    identity = [list(b'nabedra/native-backup-id/v1'), cluster_id, {'backup_id': backup_id, 'attempt': attempt}]
     digest = hashlib.sha256(json.dumps(identity, separators=(',', ':')).encode()).digest()
     return repository / str(UUID(bytes=digest[:16]))
 
@@ -26,14 +27,26 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def export(workers, database, token, destination, backup_id, *, ca_file=None, timeout=3600):
+def export(workers, database, token, repository, cluster_id, backup_id, *, ca_file=None, timeout=3600):
     context = ssl.create_default_context(cafile=ca_file)
     opener = build_opener(NoRedirect(), HTTPSHandler(context=context))
+    for attempt in range(1, 6):
+        owner = {'backup_id': backup_id, 'attempt': attempt}
+        destination = archive_path(repository, cluster_id, backup_id, attempt)
+        print(f'Export attempt {attempt} on the workers: {destination}', file=sys.stderr, flush=True)
+        manifest = export_attempt(opener, workers, database, token, destination, owner, timeout)
+        if manifest is not None:
+            return manifest
+        print(f'PinExpired for {destination}; ignore this cancelled archive.', file=sys.stderr, flush=True)
+    raise RuntimeError('Five export attempts lost their pins. Check source cluster health before retrying.')
+
+
+def export_attempt(opener, workers, database, token, destination, owner, timeout):
     request_id = str(uuid4())
     payload = {
         'request_id': request_id,
         'operation': 'archive.create',
-        'payload': {'output': str(destination), 'owner': {'backup_id': backup_id, 'attempt': 1}},
+        'payload': {'output': str(destination), 'owner': owner},
     }
     headers = {'Authorization': f'Bearer {token}', 'X-Nabedra-Database': database,
                'Content-Type': 'application/json'}
@@ -46,14 +59,27 @@ def export(workers, database, token, destination, backup_id, *, ca_file=None, ti
                 reply = json.load(response)
             manifest = reply['data']
             if (reply.get('request_id') != request_id
-                    or manifest['owner'] != payload['payload']['owner']
+                    or manifest['owner'] != owner
                     or manifest['key']['archive_id'] != destination.name):
                 raise ValueError('unexpected archive manifest')
             return manifest
         except HTTPError as error:
             with error:
-                errors.append(f'{worker}: HTTP {error.code}: {error.read(4096).decode(errors="replace")}')
-        except (URLError, OSError, ValueError, KeyError) as error:
+                body = error.read(4096).decode(errors='replace')
+            errors.append(f'{worker}: HTTP {error.code}: {body}')
+            if error.code == 409:
+                try:
+                    rejection = json.loads(body)
+                except ValueError:
+                    continue
+                if rejection == {'request_id': request_id, 'error': {
+                    'code': 'conflict', 'message': 'timestamp transition rejected: Rejected(PinExpired)',
+                    'outcome': 'not_applied',
+                }}:
+                    return None
+            # The old archive endpoint returns 503 "not accepting requests"
+            # on non-owners. Try another worker with the same archive identity.
+        except (URLError, OSError, HTTPException, ValueError, KeyError) as error:
             errors.append(f'{worker}: {error}')
     raise RuntimeError('\n'.join(errors))
 
@@ -77,10 +103,9 @@ def main():
     token = os.environ.get('NABEDRA_ADMIN_TOKEN')
     if not token or not args.repository.is_absolute():
         parser.error('set NABEDRA_ADMIN_TOKEN and supply the canonical absolute --repository path')
-    destination = archive_path(args.repository, args.cluster_id, args.backup_id)
-    print(f'Export destination on the workers: {destination}', file=sys.stderr, flush=True)
     try:
-        manifest = export(args.worker, args.database, token, destination, args.backup_id, ca_file=args.ca_file)
+        manifest = export(args.worker, args.database, token, args.repository, args.cluster_id, args.backup_id,
+                          ca_file=args.ca_file)
     except RuntimeError as error:
         parser.exit(1, f'{error}\n')
     print(json.dumps(manifest))

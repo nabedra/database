@@ -43,7 +43,7 @@ on:
         type: boolean
         default: false
       migrate:
-        description: RocksDB-era RF3 archive export and RF3 restore (MIG1)
+        description: RocksDB-era RF3 archive export and RF3 restore (MIG2)
         type: boolean
         default: false
 
@@ -598,7 +598,7 @@ jobs:
           retention-days: 14
 
   migrate:
-    name: RocksDB-era OLTP archive upgrade (MIG1)
+    name: RocksDB-era OLTP archive upgrade (MIG2)
     if: inputs.migrate || contains(github.event.head_commit.message, '[ci migrate]')
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -617,6 +617,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Legacy export retry regression
+        run: python server/tests/test_oltp_upgrade_export.py -v
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -636,6 +638,7 @@ jobs:
           npm ci --no-audit --no-fund
           npm run build
       - name: Export and restore the RF3 cluster
+        timeout-minutes: 80
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
@@ -647,7 +650,7 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mig1-evidence
+          name: mig2-evidence
           path: artifacts/migration
           retention-days: 14
 

@@ -20,11 +20,25 @@ available until you finish verification.
      --worker "$WORKER_1" --worker "$WORKER_2" --worker "$WORKER_3"
    ```
 
-   The exporter prints the archive path on the workers and returns the full
-   manifest on success. If the connection drops, rerun the same command with
-   the same backup UUID. Preserve the whole archive directory, including
-   `manifest.json` and its subdirectories. Make it readable by each new worker
-   under the same private-directory rules.
+   If the client is interrupted or the connection drops, rerun the same
+   command with the same backup UUID. The old release accepts archive requests
+   on the current coordinator. Other workers may answer `503 worker runtime
+   is not accepting requests` even while healthy. The exporter tries the
+   supplied workers using the same attempt. If none accepts it, check cluster
+   readiness and retry with the original UUID.
+
+   If the coordinator reports `PinExpired`, the exporter advances to the next
+   attempt under the same backup UUID. The new attempt takes a new snapshot
+   pin and uses a different archive directory. Keep writes and schema changes
+   paused across retries. If five attempts lose their pins, check the source
+   cluster and repository before starting a new export.
+
+   The exporter prints each attempt's path on stderr and returns the completed
+   manifest on stdout. Use the directory named by `key.archive_id` in that
+   manifest. Leave cancelled attempt directories alone during the upgrade.
+   Preserve the complete archive directory, including `manifest.json` and its
+   subdirectories, and make it readable by each new worker under the same
+   private-directory rules.
 3. Prepare three new mounted pools and a registered bootstrap configuration.
    Use a new cluster ID, run ID, bootstrap ID, worker IDs and pool IDs, and
    `pool_format_version: 2`. Keep the same database name. In `node.placements`,
