@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { execFile, spawn } from "node:child_process"
 import { once } from "node:events"
 import { mkdtemp, rm } from "node:fs/promises"
-import { createServer } from "node:net"
+import { connect, createServer } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
@@ -24,9 +24,8 @@ async function ephemeralPort() {
   return port
 }
 
-async function startServer(t) {
+async function launchServer(t, port) {
   const data = await mkdtemp(join(tmpdir(), "nabedra-typescript-"))
-  const port = await ephemeralPort()
   const token = randomUUID() + randomUUID()
   const database = "typescript_test"
   const url = `http://127.0.0.1:${port}`
@@ -57,6 +56,9 @@ async function startServer(t) {
   const deadline = performance.now() + 30_000
   while (performance.now() < deadline) {
     if (startupError || child.exitCode !== null) {
+      await stop()
+      // `serve` does not report its port: another process took the picked one before the child bound it.
+      if (!startupError && diagnostic.includes("listener failed")) return { lostPort: true }
       throw new Error(`OLTP fixture stopped during startup. ${startupError?.message ?? diagnostic}`)
     }
     try {
@@ -69,6 +71,18 @@ async function startServer(t) {
     await sleep(50)
   }
   throw new Error(`OLTP fixture was never ready. ${diagnostic}`)
+}
+
+// The port is picked before launch and released, so another process can take it first (PERF2e):
+// launch again on a fresh port when that happens.
+async function startServer(t) {
+  for (let attempt = 1; ; attempt++) {
+    const port = await ephemeralPort()
+    const server = await launchServer(t, port)
+    if (!server.lostPort) return server
+    if (attempt === 5) throw new Error("OLTP fixture lost its port 5 times")
+    t.diagnostic(`port ${port} was taken before the fixture bound it; retrying`)
+  }
 }
 
 test("O01/T06 live ORM and Q04–Q06 receipt identity", { skip: !binary, timeout: 180_000 }, async t => {
@@ -154,4 +168,58 @@ test("O01/T06 live ORM and Q04–Q06 receipt identity", { skip: !binary, timeout
     assert.deepEqual(observation.scales, [1, 100, 1_000])
     assert.equal(observation.stale_handle, "not_found")
   }
+})
+
+// serve_router_keep_alive's connection budget in server/src/network.rs: 64 data plus 68 others.
+const listenerSlots = 64 + 16 + 8 + 8 + 4 + 8 + 24
+
+// A raw connection that made one successful request and is now idle on the server.
+async function idleConnection(host, port) {
+  const socket = connect({ host, port })
+  await once(socket, "connect")
+  socket.setEncoding("latin1")
+  const state = { ended: false, error: null }
+  socket.on("end", () => { state.ended = true })
+  socket.on("error", error => { state.error = error })
+  const response = new Promise((resolve, reject) => {
+    let data = ""
+    socket.on("data", chunk => {
+      data += chunk
+      const head = data.indexOf("\r\n\r\n")
+      if (head < 0) return
+      const length = Number(/content-length: *(\d+)/i.exec(data.slice(0, head))?.[1] ?? 0)
+      if (data.length - head - 4 >= length) resolve(data)
+    })
+    socket.once("end", () => reject(new Error("closed before its response")))
+  })
+  socket.write(`GET /health/ready HTTP/1.1\r\nHost: ${host}\r\n\r\n`)
+  const data = await response
+  assert.match(data, /^HTTP\/1\.1 200/)
+  assert.doesNotMatch(data, /connection: close/i)
+  socket.state = state
+  return socket
+}
+
+test("O01 PERF2e a full listener evicts the oldest idle connection and the ORM replaces it", { skip: !binary, timeout: 120_000 }, async t => {
+  const { stop, ...connection } = await startServer(t)
+  const db = new Database({ ...connection, timeout: 15 })
+  const table = await db.createTable("typescript_evicted", { id: String, n: BigInt }, "id")
+  // The ORM's pooled connection is idle now. Fill every slot with newer idle connections: each one
+  // past the budget evicts the oldest idle connection, so the ORM's is evicted and every filler stays.
+  const fillers = []
+  t.after(() => { for (const socket of fillers) socket.destroy() })
+  const { hostname, port } = new URL(connection.url)
+  for (let index = 0; index < listenerSlots; index++) fillers.push(await idleConnection(hostname, Number(port)))
+  await sleep(200)   // the evicted connection's FIN crosses loopback
+  assert.deepEqual(fillers.filter(socket => socket.state.ended || socket.state.error), [])
+  // The ORM sees its pooled connection closed and opens a new one before sending; that connection
+  // evicts the oldest filler, which closes cleanly. The mutation is applied once.
+  assert.equal(await table.insert({ id: "evicted", n: 1n }), undefined)
+  while (!fillers[0].state.ended) await sleep(10)
+  assert.equal(fillers[0].state.error, null)
+  assert.equal(fillers[1].state.ended, false)
+  assert.equal(await table.where(col("id").eq("evicted")).count(), 1)
+  assert.deepEqual(await table.get("evicted"), { id: "evicted", n: 1n })
+  await table.drop()
+  await stop()
 })

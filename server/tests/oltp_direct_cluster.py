@@ -17,13 +17,15 @@ import os
 from pathlib import Path
 import secrets
 import signal
-import socket
+import shutil
 import ssl
 import subprocess
 import sys
 import time
 from urllib.parse import urlsplit
 from uuid import uuid4
+
+import harness_ports
 
 ROOT = Path(__file__).resolve().parents[2]
 DATABASE = 'test'
@@ -48,10 +50,28 @@ def write_json(path, value, mode=None):
     pending.replace(path)
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        return sock.getsockname()[1]
+free_port = harness_ports.pick_port
+
+
+class PortLost(AssertionError):
+    """A worker lost a port before binding it. Outside the first start this fails the
+    scenario as before."""
+
+
+def log_since(path, offset, size=8192):
+    try:
+        with open(path, 'rb') as log:
+            log.seek(offset)
+            return log.read()[-size:].decode(errors='replace')
+    except OSError:
+        return ''
+
+
+def log_size(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def resources(memory, threads=2):
@@ -198,6 +218,7 @@ class Rf3Cluster:
         self.workers, self.apis = {}, {}
         self.config, self.urls, self.api_urls = {}, {}, {}
         self.enrollments = {}
+        self.log_offsets = {}
         self.ca = self.root / 'ca.pem'
 
     # Certificates -----------------------------------------------------------------------
@@ -218,6 +239,31 @@ class Rf3Cluster:
 
     # Workers ----------------------------------------------------------------------------
     def start(self):
+        # A lost worker port cannot be replaced in place, so the whole first start
+        # runs again with fresh ports (harness_ports).
+        for attempt in range(1, harness_ports.ATTEMPTS + 1):
+            try:
+                return self._start()
+            except PortLost as lost:
+                if attempt == harness_ports.ATTEMPTS:
+                    raise
+                print(f'direct cluster: {lost}; starting again with fresh ports', file=sys.stderr, flush=True)
+                self._discard_start()
+
+    def _discard_start(self):
+        for process in self.workers.values():
+            process.stop()
+        for directory in self.mounted:
+            subprocess.run(['sudo', '-n', 'umount', str(directory)], capture_output=True, timeout=60)
+        self.mounted.clear()
+        for name in WORKERS:
+            shutil.rmtree(self.root / name, ignore_errors=True)
+        self.workers.clear()
+        self.config.clear()
+        self.urls.clear()
+        self.enrollments.clear()
+
+    def _start(self):
         self.openssl('req', '-x509', '-newkey', self.key_spec, '-nodes', '-days', '1', '-keyout',
                      self.root / 'ca.key', '-out', self.ca, '-subj', '/CN=Nabedra T9 direct fixture')
         write_json(self.root / 'auth.json', self.auth, 0o600)
@@ -286,6 +332,7 @@ class Rf3Cluster:
         path = self.root / f'{name}.json'
         write_json(path, config)
         self.urls[name] = 'http://' + config['bind']
+        self.log_offsets[name] = log_size(self.root / f'{name}.log')
         env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'NABEDRA_S3_'))}
         env.update(self.worker_env)
         if self.test_executable:
@@ -297,6 +344,18 @@ class Rf3Cluster:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
         self.workers[name] = Process(name, command, env, self.root / f'{name}.log')
 
+    def check_lost_port(self, name):
+        """A worker that exited during startup because another process took one of its
+        ports raises PortLost: the first start then runs again with fresh ports. A
+        registered worker cannot simply be relaunched on another port once it has
+        opened its store, and every peer names its node port."""
+        output = log_since(self.root / f'{name}.log', self.log_offsets.get(name, 0))
+        config = self.config[name]
+        ports = [int(config['bind'].rsplit(':', 1)[1]), int(config['node']['bind'].rsplit(':', 1)[1])]
+        if harness_ports.lost_bind(output, ports):
+            raise PortLost(f'{name} lost one of its ports {ports}:\n{output}')
+        raise AssertionError(f'{name} exited during startup:\n{output}')
+
     def barrier_dir(self, name):
         return self.root / 'barriers' / name
 
@@ -306,7 +365,8 @@ class Rf3Cluster:
         last = {}
         while pending:
             for name in sorted(pending):
-                assert self.workers[name].alive(), f'{name} exited during startup:\n{self.tail(name)}'
+                if not self.workers[name].alive():
+                    self.check_lost_port(name)
                 try:
                     status, ready = call(self.urls[name], '/health/ready', token=self.auth['data_token'], timeout=3)
                     last[name] = ready
@@ -339,9 +399,10 @@ class Rf3Cluster:
     def start_api(self, name, direct=True):
         if name not in self.apis or not hasattr(self, f'_{name}_config'):
             record = dict(database=DATABASE, enrollment=self.certificate(name))
-            self.admin('api.enroll', {'expected': None, 'next': record})
-            port = free_port()
-            config = dict(version=1, engine='oltp', bind=f'127.0.0.1:{port}', database=DATABASE,
+            enrolled = self.admin('api.enroll', {'expected': None, 'next': record})
+            setattr(self, f'_{name}_identity', enrolled['identity'])
+            # The gateway binds port 0 and reports its port in `bound_url` (harness_ports).
+            config = dict(version=1, engine='oltp', bind='127.0.0.1:0', database=DATABASE,
                           auth_file=str(self.root / 'auth.json'),
                           tls=dict(cert_file=str(self.root / f'{name}.pem'), key_file=str(self.root / f'{name}.key')),
                           topology=dict(mode='remote', cluster_id=self.cluster_id,
@@ -355,13 +416,30 @@ class Rf3Cluster:
         config = getattr(self, f'_{name}_config')
         config['topology']['control_peers'] = self.connection['control_peers']
         path = self.root / f'{name}.json'
-        write_json(path, config)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'NABEDRA_S3_'))}
         env.update(PYTHONPATH=str(ROOT / 'orm/python/src'), PYTHONDONTWRITEBYTECODE='1', NABEDRA_SERVER_BINARY=self.binary)
-        process = Process(name, [sys.executable, '-m', 'nabedra.cli', 'database', 'serve', '--config', str(path)],
-                          env, self.root / f'{name}.log')
-        self.apis[name] = process
-        message = announcement(process)
+        for attempt in range(1, harness_ports.ATTEMPTS + 1):
+            write_json(path, config)
+            offset = log_size(self.root / f'{name}.log')
+            process = Process(name, [sys.executable, '-m', 'nabedra.cli', 'database', 'serve', '--config', str(path)],
+                              env, self.root / f'{name}.log')
+            self.apis[name] = process
+            try:
+                message = announcement(process)
+                break
+            except AssertionError:
+                if process.alive():
+                    raise
+                # The enrollment endpoint must be known before launch: when another
+                # process took its port, enroll a fresh endpoint and launch again.
+                output = log_since(self.root / f'{name}.log', offset)
+                endpoint = int(config['topology']['enrollment']['enrollment']['endpoint'].rsplit(':', 1)[1])
+                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [endpoint]):
+                    raise
+                print(f'direct cluster: {name} lost enrollment port {endpoint}; enrolling a fresh one',
+                      file=sys.stderr, flush=True)
+                process.stop()
+                self.reenroll_api(name, config)
         assert message.get('event') == 'nabedra.serve.launched', message
         port = urlsplit(message['bound_url']).port
         self.api_urls[name] = f'https://localhost:{port}'
@@ -378,6 +456,16 @@ class Rf3Cluster:
             assert time.monotonic() < deadline, f'{name} never became ready'
             time.sleep(0.25)
         return self.api_urls[name]
+
+    def reenroll_api(self, name, config):
+        record = config['topology']['enrollment']
+        previous = record['enrollment']
+        fresh = dict(previous, endpoint=f'127.0.0.1:{free_port()}', incarnation=uid(),
+                     enrollment_revision=previous['enrollment_revision'] + 1)
+        next_record = dict(record, enrollment=fresh)
+        enrolled = self.admin('api.enroll', {'expected': getattr(self, f'_{name}_identity'), 'next': next_record})
+        setattr(self, f'_{name}_identity', enrolled['identity'])
+        config['topology']['enrollment'] = next_record
 
     def kill_api(self, name):
         """SIGKILL the gateway's native process (the CLI supervisor then exits)."""
@@ -489,7 +577,25 @@ class Rf1Serve:
         self.process = None
 
     def start(self, cold_start=False):
-        port = free_port()
+        # `serve` does not report its port: relaunch on a fresh one when another
+        # process took the picked port before the child bound it (harness_ports).
+        for attempt in range(1, harness_ports.ATTEMPTS + 1):
+            port = free_port()
+            offset = log_size(self.root / 'serve.log')
+            try:
+                return self._start(port, cold_start)
+            except AssertionError:
+                if self.process.alive():
+                    raise
+                output = log_since(self.root / 'serve.log', offset)
+                if attempt == harness_ports.ATTEMPTS or not harness_ports.lost_bind(output, [port]):
+                    raise
+                print(f'direct cluster: serve lost port {port}; relaunching on a fresh one', file=sys.stderr, flush=True)
+                self.process.stop()
+                # The runtime opened its store before the listener bind failed.
+                cold_start = cold_start or (self.root / 'data' / 'NABEDRA_TYPED_WORKER.json').exists()
+
+    def _start(self, port, cold_start):
         (self.root / 'data').mkdir(exist_ok=True)
         execution = self.root / 'execution.json'
         write_json(execution, EXECUTION | dict(direct_oltp=self.direct))

@@ -5,6 +5,7 @@ Does not claim multi-shard/quorum, power-loss, AZ, or provider evidence.
 """
 import argparse
 import hashlib
+import http.client
 from datetime import datetime, timezone
 import platform
 import random
@@ -24,6 +25,11 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "orm/python/src"))
 from nabedra import Database, col
+from nabedra import _http_pool
+import harness_ports
+
+# serve_router_keep_alive's connection budget in server/src/network.rs: 64 data plus 68 others.
+LISTENER_SLOTS = 64 + 16 + 8 + 8 + 4 + 8 + 24
 
 
 def raw(url, path, body=None, *, token="test-token", database="test", headers=None, timeout=10):
@@ -59,6 +65,10 @@ def direct_mode(url, deadline_seconds=60):
         time.sleep(0.5)
 
 
+class PortLost(Exception):
+    pass
+
+
 class Server:
     def __init__(self, binary, directory, diagnostics=None):
         self.binary, self.directory = binary, directory
@@ -67,9 +77,18 @@ class Server:
         self.diagnostics_stream = None
 
     def start(self, tls=False):
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
+        # `serve` does not report its port: relaunch on a fresh one when another
+        # process took the picked port before the child bound it (harness_ports).
+        for attempt in range(1, harness_ports.ATTEMPTS + 1):
+            port = harness_ports.pick_port()
+            try:
+                return self._start(port, tls)
+            except PortLost:
+                if attempt == harness_ports.ATTEMPTS:
+                    raise AssertionError(f"server lost its port {attempt} times")
+                print(f"oltp_process: port {port} was taken before the server bound it; retrying", file=sys.stderr, flush=True)
+
+    def _start(self, port, tls):
         self.url = f"{'https' if tls else 'http'}://127.0.0.1:{port}"
         env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "NABEDRA_S3_"))}
         env["NABEDRA_TOKEN"] = "test-token"
@@ -82,11 +101,21 @@ class Server:
         if tls:
             command += ["--tls-cert", self.directory + "/cert.pem", "--tls-key", self.directory + "/key.pem"]
         self.diagnostics_stream = open(self.diagnostics, "ab", buffering=0) if self.diagnostics else None
+        logged = self.diagnostics_stream.tell() if self.diagnostics_stream else 0
         self.process = subprocess.Popen(command, env=env, stdout=self.diagnostics_stream or subprocess.DEVNULL, stderr=self.diagnostics_stream or subprocess.PIPE)
         until = time.monotonic() + 30
         while time.monotonic() < until:
             if self.process.poll() is not None:
-                raise AssertionError(f"server exited; diagnostics: {self.diagnostics}" if self.diagnostics else f"server exited: {self.process.stderr.read().decode()}")
+                if self.diagnostics:
+                    self.diagnostics_stream.close()
+                    output = Path(self.diagnostics).read_bytes()[logged:][-8192:].decode(errors="replace")
+                else:
+                    output = self.process.stderr.read().decode(errors="replace")
+                    self.process.stderr.close()
+                self.process = None
+                if harness_ports.lost_bind(output, [port]):
+                    raise PortLost(port)
+                raise AssertionError(f"server exited; diagnostics: {self.diagnostics}" if self.diagnostics else f"server exited: {output}")
             try:
                 with urllib.request.urlopen(self.url + "/health/ready", timeout=0.5, context=ssl.create_default_context(cafile=self.directory + "/cert.pem") if tls else None) as response:
                     value = json.load(response)
@@ -111,6 +140,48 @@ class Server:
         if self.diagnostics_stream:
             self.diagnostics_stream.close()
             self.diagnostics_stream = None
+
+
+def evicted_idle_connection(url, db, table_name, ca_file):
+    """PERF2e: a full listener evicts its oldest idle connection, here the ORM's pooled
+    one; the ORM replaces it before sending and the mutation is applied once."""
+    pool = db._transport._opener
+    assert len(pool._idle) == 1, pool._idle
+    pooled = pool._idle[0][0]
+    assert _http_pool._idle_socket_quiet(pooled.sock)
+    context = ssl.create_default_context(cafile=ca_file)
+    host, port = url.removeprefix("https://").rsplit(":", 1)
+    fillers = []
+    try:
+        # Every filler past the budget evicts the oldest idle connection, so the ORM's
+        # is evicted and every filler stays open.
+        for _ in range(LISTENER_SLOTS):
+            filler = http.client.HTTPSConnection(host, int(port), timeout=10, context=context)
+            filler.request("GET", "/health/ready", headers={"Authorization": "Bearer test-token"})
+            response = filler.getresponse()
+            response.read()
+            assert response.status == 200 and not response.will_close, response.status
+            fillers.append(filler)
+        deadline = time.monotonic() + 5
+        while _http_pool._idle_socket_quiet(pooled.sock):
+            assert time.monotonic() < deadline, "the full listener did not evict the oldest idle connection"
+            time.sleep(0.01)
+        assert all(_http_pool._idle_socket_quiet(filler.sock) for filler in fillers)
+        table = db.table(table_name)
+        # That request's new connection evicted the oldest filler, which closed cleanly.
+        deadline = time.monotonic() + 5
+        while _http_pool._idle_socket_quiet(fillers[0].sock):
+            assert time.monotonic() < deadline, "the ORM's new connection was not served by an eviction"
+            time.sleep(0.01)
+        assert fillers[0].sock.recv(1) == b""
+        assert _http_pool._idle_socket_quiet(fillers[1].sock)
+        assert pool._idle and pool._idle[0][0] is not pooled
+        assert table.insert({"id": "evicted", "age": 7}) is None
+        assert table.where(col("id") == "evicted").count() == 1
+        assert table.delete("evicted") is True
+    finally:
+        for filler in fillers:
+            filler.close()
 
 
 def terminal(url, run, identity):
@@ -299,6 +370,7 @@ def main(binary, evidence_dir, condition, build_profile):
             server.start(tls=True)
             secure = Database(url=server.url, token="test-token", database="test", ca_file=directory + "/cert.pem")
             assert secure.table("users").id == recreated.id
+            evicted_idle_connection(server.url, secure, "users", directory + "/cert.pem")
         finally:
             server.stop()
     assert source_digest() == tested_source, "server or ORM source changed during the process fixture"
@@ -312,12 +384,12 @@ def main(binary, evidence_dir, condition, build_profile):
         "cpu_quota": "no CPU quota configured or measured by this fixture", "storage": "host temporary filesystem directory; no EBS/provider assertion",
         "clock": "perf_counter_ns monotonic client clock", "features": ["oltp"],
         "config": {"workers": 4, "foreground_threads": 1, "control_threads": 1, "storage_background_threads": 2, "network_threads": 2, "queue_size": 8, "max_pending_requests": 9, "memory_limit_bytes": 8589934592, "task_memory_limit_bytes": 536870912, "result_retention_ms": 300000, "memory_limit_kind": "logical scheduler budget; this fixture does not measure peak RSS or enforce an OS memory limit", "topology": "typed_groups_rf1", "S3_credentials": "absent"},
-        "benchmark": measurement, "accepted_identity_assertions": {"durable_mutations": 1, "query_receipts": 1, "TLS_verified": True, "database_scope_rebind_rejected": True, "resources_override_257_rejected_before_storage_or_readiness": True, "ORM_growth_count_before_and_after_SIGKILL": 110001, "ORM_count_with_limit_above_100000": 100001, "duplicate_logical_mutations": 0, "missing_acknowledged_mutations_after_SIGKILL": 0}}
+        "benchmark": measurement, "accepted_identity_assertions": {"durable_mutations": 1, "query_receipts": 1, "TLS_verified": True, "idle_connection_evicted_and_replaced_before_sending": True, "database_scope_rebind_rejected": True, "resources_override_257_rejected_before_storage_or_readiness": True, "ORM_growth_count_before_and_after_SIGKILL": 110001, "ORM_count_with_limit_above_100000": 100001, "duplicate_logical_mutations": 0, "missing_acknowledged_mutations_after_SIGKILL": 0}}
     if evidence_dir:
         path = Path(evidence_dir)
         path.mkdir(parents=True, exist_ok=True)
         (path / "rf1-process.json").write_text(json.dumps(evidence, indent=2) + "\n")
-    print(json.dumps({"result": "passed", "engine": "oltp", "topology": "typed_groups_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": True, "ORM_growth_rows": 110001, "elapsed_seconds": round(time.monotonic() - started, 3)}))
+    print(json.dumps({"result": "passed", "engine": "oltp", "topology": "typed_groups_rf1", "operations": 13, "process_restarts": 2, "TLS_roundtrip": True, "idle_eviction": True, "ORM_growth_rows": 110001, "elapsed_seconds": round(time.monotonic() - started, 3)}))
 
 
 if __name__ == "__main__":
