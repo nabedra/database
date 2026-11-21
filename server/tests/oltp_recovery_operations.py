@@ -474,8 +474,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                                  if member['worker_id'] != previous['worker_id']] + [control_plan['learner']],
                                 key=lambda member: member['node_id'])
 
-        live_workers = {enrollment['worker_id']: name for name, enrollment in cluster.enrollments.items()
-                        if name in survivors}
+        live_workers = {cluster.enrollments[name]['worker_id']: name for name in survivors}
         live_workers[fresh['worker_id']] = 'replacement'
 
         def parked_queue_owner():
@@ -491,10 +490,12 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             assert record['accepted'] and record['state'] == 'queued', record
             return name
 
+        # A parked executor waits for its release file even after gates.json changes.
         queue_owner = wait_for(parked_queue_owner, 'current queue owner parked before release', PROBE_WINDOW)
         print(f'Accepted request {queued_id} parked at queued gate on {queue_owner}', flush=True)
+        released_at = time.monotonic()
         for name in live_workers.values():
-            write_json(cluster.barrier_dir(name) / 'gates.json', {})
+            (cluster.barrier_dir(name) / f'release-{queued_id}').touch()
         for body, acknowledged_result in acknowledged_writes:
             row = body['payload']['row']
             assert send_op(body) == acknowledged_result
@@ -515,7 +516,8 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         try:
             settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
         except AssertionError as error:
-            raise AssertionError(f'{error}; last receipt on parked owner {queue_owner}: {last_receipt!r}') from error
+            raise AssertionError(f'{error}. Parked on {queue_owner}. Last receipt response {last_receipt!r}') from error
+        release_to_receipt = time.monotonic() - released_at
         assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
                                result=None, error=None), settled
         assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
@@ -528,6 +530,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                refused_missing_advert=True, refused_candidate_missing_advert=True,
                refused_data_quorum=True, refused_reused_certificate=True,
                replayed_intent=True, settled_receipts=1, revoked_old_certificate=True,
+               queued_gate_owner=queue_owner, elapsed_queue_release_to_receipt_seconds=round(release_to_receipt, 3),
                acknowledged_direct_writes=len(acknowledged_writes),
                probe_recovery_seconds=round(first_read - stopped_at, 3),
                elapsed_loss_to_rf3_seconds=round(rf3_restored - stopped_at, 3),
