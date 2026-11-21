@@ -11,6 +11,8 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 pub(super) mod data_worker;
+pub(super) mod direct;
+pub(super) mod group_damage;
 pub(super) mod replacement;
 pub(super) mod restart;
 pub(super) mod placement;
@@ -220,6 +222,8 @@ fn apply_initialized(
                 | PublishReplicaMove { .. }
                 | ArmReplicaMove { .. }
                 | CancelReplicaMove { .. }
+                | GroupDamageReplacementBegin { .. }
+                | GroupDamageReplaced { .. }
         )
     {
         return fault(Fault::Busy);
@@ -232,6 +236,12 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        DirectCapability {
+            actor,
+            action,
+            unix_ms,
+            ..
+        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }
@@ -276,6 +286,12 @@ fn apply_initialized(
             placement::cancel(tx, state, *transition_id, *worker, authorization),
         PublishReplicaMove { proof, authorization, .. } =>
             placement::publish(tx, scope, state, proof, authorization),
+        GroupDamaged { worker, report, .. } =>
+            group_damage::report(tx, scope, position, *worker, report),
+        GroupDamageReplacementBegin { authorization, plan, .. } =>
+            group_damage::begin(tx, scope, state, position, authorization, plan),
+        GroupDamageReplaced { authorization, proof, .. } =>
+            group_damage::replaced(tx, scope, state, authorization, proof),
         ReplicaRetired {
             authorization,
             proof,
@@ -607,6 +623,9 @@ fn apply_initialized(
             for member in replicas.iter() {
                 if pool_drain::blocks_pool(tx, member.pool_id)? || worker_drain::blocks_worker(tx, member.worker_id)? {
                     return fault(Fault::Busy);
+                }
+                if !direct::admits_worker_id(tx, member.worker_id)? {
+                    return fault(Fault::DirectCapabilityRequired);
                 }
                 if member.validate().is_err()
                     || build.last_node.is_some_and(|old| member.node_id <= old)
@@ -1058,6 +1077,9 @@ fn begin_ready(
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
     }
+    if change == ReadyChange::Join && !direct::admits(tx, target)? {
+        return fault(Fault::DirectCapabilityRequired);
+    }
     if change == ReadyChange::Join && worker_drain::blocks_worker(tx, target.worker_id)?
         && !replacement::can_join(tx, target)?
     {
@@ -1425,6 +1447,11 @@ fn register_initial_data(
         || proof.replica_root != group_root(count, chain)
     {
         return fault(Fault::Invalid);
+    }
+    for member in replicas {
+        if !direct::admits_worker_id(tx, member.worker_id)? {
+            return fault(Fault::DirectCapabilityRequired);
+        }
     }
     let reply = ControlReply::GroupRegistered {
         group_id: proof.group.group_id,

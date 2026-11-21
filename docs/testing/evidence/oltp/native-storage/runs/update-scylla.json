@@ -1,0 +1,191 @@
+{
+ "run": "update-scylla",
+ "settings": {
+  "rates": [
+   1,
+   2,
+   5,
+   20,
+   50,
+   100,
+   200,
+   500,
+   1000
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true
+ },
+ "workload": "existing bigint primary-key updates to a bigint value",
+ "started_utc": "2026-11-20T20:12:30.369383+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.19.0.2": "batch",
+   "172.19.0.3": "batch",
+   "172.19.0.4": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "update-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 500,
+  "stop_reason": {
+   "median_p99_ms": 131.607723,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 7.365555,
+    "median_p95_ms": 10.726531,
+    "median_p99_ms": 10.726531,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "2": {
+    "reps": 3,
+    "offered": 30,
+    "median_succeeded_rps": 2.0,
+    "median_p50_ms": 4.885019,
+    "median_p95_ms": 10.409478,
+    "median_p99_ms": 10.409478,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 30,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 6.104749,
+    "median_p95_ms": 10.305522,
+    "median_p99_ms": 11.044892,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 5.306055,
+    "median_p95_ms": 7.858487,
+    "median_p99_ms": 15.087378,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 50.0,
+    "median_p50_ms": 5.077915,
+    "median_p95_ms": 33.827449,
+    "median_p99_ms": 50.593835,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.9588678255196,
+    "median_p50_ms": 5.21002,
+    "median_p95_ms": 30.898517,
+    "median_p99_ms": 39.828678,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 5.15687,
+    "median_p95_ms": 15.096805,
+    "median_p99_ms": 33.875764,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   },
+   "500": {
+    "reps": 3,
+    "offered": 7500,
+    "median_succeeded_rps": 480.10441381452955,
+    "median_p50_ms": 24.947205,
+    "median_p95_ms": 63.676104,
+    "median_p99_ms": 131.607723,
+    "statuses": {
+     "client_capacity": 453,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 7047,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0
+   }
+  }
+ }
+}

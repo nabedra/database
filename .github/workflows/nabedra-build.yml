@@ -1,0 +1,676 @@
+# Heavy builds and verification for the remove-RocksDB track, on free standard runners.
+# See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
+# pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
+# Opt-in jobs: put [ci docker], [ci campaign], [ci acceptance] or [ci direct] in the pushed head
+# commit message, or use workflow_dispatch once this file is on the default branch.
+#
+# Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
+# and manifests, and saves it right after its build step, before any test runs, so a failing test
+# still leaves a cache. It saves only on a key miss and only from the integration branch (and main
+# once the workflow is there). Task branches restore and never save: a run can restore only from its
+# own branch and the default branch, so per-task copies of identical keys would just fill the 10 GB.
+# The saved copy is a hard-linked clone of the target with the workspace crates cleaned out, because
+# their outputs are stale on the next commit. Docker jobs follow the same rule for `type=gha` layers.
+name: nabedra build
+
+on:
+  push:
+    branches:
+      - main
+      - nabedra/remove-rocksdb
+      - "nabedra/rr-*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      docker:
+        description: Build both images and run Events acceptance
+        type: boolean
+        default: false
+      campaign:
+        description: Release crash campaign (long modes) and kv_crash
+        type: boolean
+        default: false
+      acceptance:
+        description: Linux OLTP acceptance (no AWS, no benchmarks)
+        type: boolean
+        default: false
+      direct:
+        description: Direct point path D01-D12 and suites with direct_oltp on/off (T9)
+        type: boolean
+        default: false
+
+concurrency:
+  group: nabedra-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# An explicit `bash` runs steps with `-eo pipefail`, so a failing `cargo test | tee` fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Must match rust-toolchain.toml; every Toolchain step checks that they agree.
+  RUST_TOOLCHAIN: "1.94.1"
+  SAVE_CACHE: ${{ github.ref == 'refs/heads/nabedra/remove-rocksdb' || github.ref == 'refs/heads/main' }}
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_BUILD_JOBS: "4"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  # Known failures on main (docs/testing/evidence/oltp/scoped-queues/README.md).
+  OLTP_BASELINE_SKIPS: >-
+    --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory
+    --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+
+jobs:
+  kv:
+    name: nabedra-kv
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: kv-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: kv-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build
+        working-directory: server
+        run: |
+          cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings
+          cargo test --locked -p nabedra-kv --no-run
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Test
+        working-directory: server
+        run: cargo test --locked --no-fail-fast -p nabedra-kv 2>&1 | tee ../kv-test.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-test-log
+          path: kv-test.log
+          retention-days: 14
+
+  features:
+    name: feature builds (O02, NS26)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: features-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: features-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: No RocksDB or C toolchain crates
+        run: python scripts/check_engine_features.py --dependencies-only
+      - name: Check every engine build
+        working-directory: server
+        run: |
+          set -eux
+          cargo check --locked --bin nabedra-db
+          cargo check --locked --bin nabedra-db --no-default-features --features oltp
+          cargo check --locked --bin nabedra-db --no-default-features --features oltp-backup-s3
+          cargo check --locked --bin nabedra-db --no-default-features --features cache
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  oltp:
+    name: OLTP library and integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build tests
+        id: build
+        working-directory: server
+        run: cargo test --locked --no-default-features --features oltp --lib --tests --no-run --timings
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oltp-build-timings
+          path: server/target/cargo-timings/cargo-timing.html
+          retention-days: 14
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Library suite
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --no-default-features --features oltp --lib -- --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../oltp-lib.log
+      - name: Integration tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --no-default-features --features oltp \
+            --test oltp_multiplex --test oltp_worker_queue --test worker_pool --test executor --test protocol \
+            2>&1 | tee ../oltp-integration.log
+      - if: always()
+        run: df -h . && du -sh server/target || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-test-logs
+          path: oltp-*.log
+          retention-days: 14
+
+  events:
+    name: Events tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: events-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/events/Cargo.lock', 'server/events/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: events-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/events/target; fi
+      - name: Build tests
+        working-directory: server/events
+        run: cargo test --locked --no-run
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/events/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/events/Cargo.toml -p nabedra-events -p nabedra-kv
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Test
+        working-directory: server/events
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast 2>&1 | tee ../../events-test.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: events-test-log
+          path: events-test.log
+          retention-days: 14
+
+  campaign:
+    name: crash campaign (release, long)
+    if: inputs.campaign || contains(github.event.head_commit.message, '[ci campaign]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: campaign-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: campaign-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build release tests
+        id: build
+        working-directory: server
+        run: |
+          cargo test --locked --release -p nabedra-kv --test campaign --test store_model --test store_crash --test store_gc --no-run
+          cargo test --locked --release --no-default-features --features oltp --test kv_crash --no-run
+      - name: Stage Cargo cache without workspace crates
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --release --manifest-path server/Cargo.toml -p nabedra-database -p nabedra-kv
+          rm -rf ~/cargo-cache/target/cargo-timings && du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: kv campaign, long modes (NS01, NS04, NS05, NS07, NS09, NS11, NS17)
+        working-directory: server
+        run: |
+          set -o pipefail
+          # NS01 at 1e6 steps (~2.5 h) runs in its own job, campaign-ns01.
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test campaign -- --ignored --nocapture --test-threads 2 \
+            --skip ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign.log
+      - name: kv store long models (NS01 1e6, NS05 seeds, relocation crash points)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --release -p nabedra-kv --test store_model --test store_crash --test store_gc -- --ignored --nocapture 2>&1 | tee ../store-long.log
+      - name: SIGKILL and cold start (NS16, D09, R04, O11)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release --no-default-features --features oltp --test kv_crash -- --nocapture 2>&1 | tee ../kv-crash.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-logs
+          path: |
+            campaign.log
+            store-long.log
+            kv-crash.log
+          retention-days: 14
+
+  campaign-ns01:
+    name: crash campaign NS01 1e6 (release, long)
+    if: inputs.campaign || contains(github.event.head_commit.message, '[ci campaign]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: campaign-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: campaign-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: NS01 differential, 1e6 steps with cuts and faults
+        working-directory: server
+        run: |
+          set -o pipefail
+          cargo test --locked --release -p nabedra-kv --test campaign -- --ignored --nocapture --exact \
+            ns01_ns10_differential_1e6_with_cuts_and_faults 2>&1 | tee ../campaign-ns01.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-ns01-log
+          path: campaign-ns01.log
+          retention-days: 14
+
+  docker-oltp:
+    name: OLTP image
+    if: inputs.docker || contains(github.event.head_commit.message, '[ci docker]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Start clock
+        run: echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            NABEDRA_ENGINE=oltp
+            BUILD_JOBS=4
+          tags: nabedra-oltp:ci
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=oltp-image
+          cache-to: ${{ env.SAVE_CACHE == 'true' && 'type=gha,mode=max,scope=oltp-image' || '' }}
+      - name: Build time and size
+        run: |
+          echo "build_seconds=$(( $(date +%s) - BUILD_START ))"
+          docker image ls nabedra-oltp:ci
+      - name: Runtime libraries (only libc, libm, libgcc_s)
+        run: |
+          libraries=$(docker run --rm --entrypoint ldd nabedra-oltp:ci /usr/local/bin/nabedra-db)
+          echo "$libraries"
+          unexpected=$(echo "$libraries" | grep -vE '^\s*(linux-vdso\.so\.1|libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|/lib64/ld-linux-x86-64\.so\.2)[ (]' || true)
+          if [ -n "$unexpected" ]; then echo "unexpected runtime libraries: $unexpected" >&2; exit 1; fi
+      - name: Export Cargo timings
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: |
+            NABEDRA_ENGINE=oltp
+            BUILD_JOBS=4
+          target: timings
+          outputs: type=local,dest=image-timings
+          provenance: false
+          cache-from: type=gha,scope=oltp-image
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oltp-image-timings
+          path: image-timings
+          retention-days: 14
+
+  docker-events:
+    name: Events image and acceptance
+    if: inputs.docker || contains(github.event.head_commit.message, '[ci docker]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: docker/setup-buildx-action@v3
+      - name: Start clock
+        run: echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+      - name: Build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/events/deploy/Dockerfile
+          build-args: BUILD_JOBS=4
+          tags: nabedra-events:ci
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=events-image
+          cache-to: ${{ env.SAVE_CACHE == 'true' && 'type=gha,mode=max,scope=events-image' || '' }}
+      - name: Build time, size and runtime libraries
+        run: |
+          echo "build_seconds=$(( $(date +%s) - BUILD_START ))"
+          docker image ls nabedra-events:ci
+          docker run --rm --entrypoint ldd nabedra-events:ci /usr/local/bin/nabedra-events
+      - name: Acceptance (NS27)
+        run: |
+          docker pull python:3.11-slim-bookworm
+          mkdir -p events-acceptance
+          python server/events/tests/acceptance.py --image nabedra-events:ci --cpus 2 --memory-mib 1536 \
+            --fault-image python:3.11-slim-bookworm --output events-acceptance/result.json --logs events-acceptance/logs
+      - name: Acceptance summary
+        if: always()
+        run: |
+          python -c 'import json, sys; cases = json.load(open(sys.argv[1]))["cases"]; passed = sum(c["pass"] for c in cases.values()); print(f"events acceptance: {passed}/{len(cases)} cases passed"); [print(name, case) for name, case in cases.items()]' events-acceptance/result.json || true
+      - name: Export Cargo timings
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: server
+          file: server/events/deploy/Dockerfile
+          build-args: BUILD_JOBS=4
+          target: timings
+          outputs: type=local,dest=image-timings
+          provenance: false
+          cache-from: type=gha,scope=events-image
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: events-acceptance
+          path: |
+            events-acceptance
+            image-timings
+          retention-days: 14
+
+  acceptance:
+    name: Linux OLTP acceptance
+    if: inputs.acceptance || contains(github.event.head_commit.message, '[ci acceptance]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Acceptance (no AWS, no comparative benchmarks)
+        run: |
+          # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
+          rc=0; python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
+            --category recovery --category growth --output artifacts/oltp-acceptance || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 2 ]
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oltp-acceptance
+          path: artifacts/oltp-acceptance
+          retention-days: 14
+
+  # T9: direct point path scenarios D01-D12 on real processes, and the existing suites with
+  # direct_oltp on and off. Opt-in: put [ci direct] in the pushed head commit message.
+  direct:
+    name: direct point path D01-D12, suites with direct_oltp on/off (T9)
+    if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Restore only: the OLTP job's cache (saved from the integration branch).
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build the OLTP server, the library test executable and the TypeScript ORM
+        id: build
+        run: |
+          set -o pipefail
+          (cd server && cargo build --locked --no-default-features --features oltp --bin nabedra-db)
+          (cd server && cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json-render-diagnostics) \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and (.target.kind | index("lib"))) | .executable' \
+            | tail -1 > test-executable.txt
+          test -x "$(cat test-executable.txt)"
+          echo "NABEDRA_BIN=$PWD/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          echo "NABEDRA_TEST_EXE=$(cat test-executable.txt)" >> "$GITHUB_ENV"
+          echo "NABEDRA_DIRECT_OFF_BINARY=$PWD/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          (cd orm/typescript && npm ci --no-audit --no-fund && npm run build)
+          mkdir -p artifacts
+      - name: D01-D12 and U01 on real processes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          python server/tests/oltp_direct_acceptance.py --binary "$NABEDRA_BIN" --test-executable "$NABEDRA_TEST_EXE" \
+            --output artifacts/direct 2>&1 | tee artifacts/direct.log
+      - name: ORM suites, direct_oltp on and off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          python -m pip install --quiet "httpx>=0.27,<1"
+          status=0
+          (cd orm/python && PYTHONPATH=src python -m unittest discover -s tests) 2>&1 | tee artifacts/orm-python-unit.log || status=1
+          off="$GITHUB_WORKSPACE/server/tests/direct_off_server.sh"
+          for mode in on off; do
+            binary="$NABEDRA_BIN"; [ "$mode" = off ] && binary="$off"
+            (cd orm/typescript && NABEDRA_TEST_SERVER_BINARY="$binary" npm test) 2>&1 | tee "artifacts/orm-typescript-$mode.log" || status=1
+            python server/tests/oltp_process.py --binary "$binary" 2>&1 | tee "artifacts/orm-python-process-$mode.log" || status=1
+          done
+          exit $status
+      - name: OLTP library suite, direct_oltp off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        working-directory: server
+        run: |
+          set -o pipefail
+          NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
+      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          status=0
+          for mode in on off; do
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
+              --category recovery --category growth --output "artifacts/acceptance-$mode" > "artifacts/acceptance-$mode.log" 2>&1 || rc=$?
+            # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
+            if [ "${rc:-0}" != 0 ] && [ "$rc" != 2 ]; then status=1; fi; rc=0
+            tail -40 "artifacts/acceptance-$mode.log"
+          done
+          exit $status
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-evidence
+          path: artifacts
+          retention-days: 14
+
+  # NS11/T10: the release OLTP server for the comparative benchmark, built in the same
+  # Debian bookworm base as the Dockerfile's build stage (glibc of the benchmark images),
+  # plus the NS18 engine microbench in release. Opt-in: put [ci bench] in the pushed
+  # head commit message. The comparative benchmark itself runs on the controlled host.
+  bench:
+    name: release benchmark binary and NS18 microbench (NS11)
+    if: contains(github.event.head_commit.message, '[ci bench]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container: rust:1.94.1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          start=$(date +%s)
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          echo "build_seconds=$(( $(date +%s) - start ))" | tee ../bench-build.txt
+          mkdir -p ../bench-bin
+          cp target/release/nabedra-db "../bench-bin/nabedra-db-${GITHUB_SHA::7}"
+          cd ../bench-bin
+          sha256sum nabedra-db-* | tee -a ../bench-build.txt
+          ./nabedra-db-* --version | tee -a ../bench-build.txt
+          ldd nabedra-db-* | tee -a ../bench-build.txt
+          { ldd --version || true; } | sed -n 1p | tee -a ../bench-build.txt
+          cp ../bench-build.txt .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-binary
+          path: bench-bin
+          retention-days: 14
+      - name: NS18 microbench (release, ignored tests)
+        working-directory: server
+        run: |
+          set -o pipefail
+          nproc; free -m; df -h .
+          cargo test --locked --release -p nabedra-kv --test store_bench -- --ignored --nocapture --test-threads 1 2>&1 | tee ../ns18-bench.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ns18-bench-log
+          path: ns18-bench.log
+          retention-days: 14

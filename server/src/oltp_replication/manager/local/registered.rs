@@ -186,6 +186,8 @@ pub(crate) struct RegisteredWorker {
 /// by one deterministic bootstrap voter. Starting them grants neither queue
 /// readiness nor authority to execute application work.
 pub(crate) struct RegisteredSystemGroups {
+    /// Reports run-time damage of any hosted replica once connected to Control.
+    pub damage: Arc<crate::oltp_replication::manager::ReportingDamageSink>,
     pub control: Option<ManagedControl>,
     pub timestamps: Option<ManagedTimestamps>,
     pub status: Vec<ManagedStatus>,
@@ -243,6 +245,10 @@ impl RegisteredWorker {
         config: openraft::Config,
     ) -> Result<RegisteredSystemGroups, ProtocolError> {
         let worker = self.enrollment.worker_id;
+        // NS14b: the reporter exists before any system group starts, so a
+        // run-time stop of one is reported once Control is reachable.
+        let damage = crate::oltp_replication::manager::ReportingDamageSink::new(Default::default());
+        self.manager.install_damage_sink(damage.clone());
         let control = if let Some(local) = self.placements.control.local(worker) {
             let group = &self.placements.control;
             let running = self
@@ -305,6 +311,7 @@ impl RegisteredWorker {
             None
         };
         Ok(RegisteredSystemGroups {
+            damage,
             control,
             timestamps,
             status,
@@ -416,7 +423,7 @@ impl RegisteredWorker {
         }
         let identity = PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: control.identity.cluster_id,
             worker_id: config.enrollment.worker_id,
             pool_id: config.pool_id,
@@ -549,9 +556,11 @@ impl RegisteredWorker {
             shared: shared.clone(),
             client: transport.client(),
             registry,
-            routes: Mutex::new(BTreeMap::new()),
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
             ownership: Some(ownership.clone()),
             starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
+            health: Arc::default(),
         });
         Ok(Self {
             manager,
@@ -636,7 +645,12 @@ fn inspect_identity(
                     old.lock_dev,
                     old.lock_inode,
                 ) != (directory_dev, directory_inode, lock_dev, lock_inode)
-                || !owner.path.join("pool/CURRENT").is_file()
+                // The pool's store exists: `pool/kv/CURRENT` (format 2). A format 1
+                // `pool/CURRENT` passes here so the pool open refuses it with
+                // `UnsupportedFormat` (as `local.rs` does). T9 finding: requiring only
+                // `pool/CURRENT` refused every registered worker restart on `nabedra-kv`.
+                || !(owner.path.join("pool/kv/CURRENT").is_file()
+                    || owner.path.join("pool/CURRENT").is_file())
                 || config.enrollment.enrollment_revision <= old.previous.enrollment_revision
                 || config.enrollment.incarnation == old.previous.incarnation
             {

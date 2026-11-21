@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::{Result, anyhow, ensure};
+use nabedra_kv::WriteBatch;
 use openraft::{
     ErrorSubject, ErrorVerb, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError,
 };
-use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempPath};
@@ -17,8 +17,8 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use uuid::Uuid;
 
 use super::store::{
-    Database, GroupStore, MAX_RECORD_VALUE_BYTES, StateHeader, StoredSnapshot, prefix_end,
-    sync_write, validate_record,
+    Database, GroupStore, MAX_RECORD_VALUE_BYTES, StateHeader, StoredSnapshot, entries, prefix_end,
+    validate_record,
 };
 use super::{Node, TypeConfig, storage_error};
 
@@ -184,13 +184,7 @@ impl Snapshots {
         emit(&(header_json.len() as u32).to_be_bytes())?;
         emit(&header_json)?;
 
-        let mut options = ReadOptions::default();
-        options.fill_cache(false);
-        options.set_iterate_upper_bound(prefix_end(&prefix));
-        for entry in tx
-            .view
-            .iterator_opt(IteratorMode::From(&prefix, Direction::Forward), options)
-        {
+        for entry in entries(&tx.view, &prefix, &prefix_end(&prefix), false) {
             let (key, value) = entry?;
             let key = &key[prefix.len()..];
             validate_record(key, &value)?;
@@ -299,16 +293,16 @@ impl Snapshots {
         }
 
         let generation = Uuid::new_v4();
-        let db = &self.store.db.db;
+        let db = &self.store.db;
         self.store.cleanup_interrupted_stage()?;
-        let mut stage = WriteBatch::default();
+        let mut stage = WriteBatch::new();
         let stage_key = self.store.key(b"staged-generation");
-        stage.put(&stage_key, serde_json::to_vec(&generation)?);
-        sync_write(db, stage)?;
+        stage.put(&stage_key, &serde_json::to_vec(&generation)?);
+        db.write(stage)?;
 
         let prefix = self.store.state_prefix(generation);
         let mut records = 0_u64;
-        let mut stage = WriteBatch::default();
+        let mut stage = WriteBatch::new();
         let mut staged_bytes = 0_usize;
         let mut previous = Vec::new();
         let digest = loop {
@@ -336,17 +330,17 @@ impl Snapshots {
             read_hash(&mut input, &mut hash, &mut key)?;
             read_hash(&mut input, &mut hash, &mut value)?;
             ensure!(key > previous, "snapshot record keys must be increasing");
-            stage.put([prefix.as_slice(), &key].concat(), &value);
+            stage.put(&[prefix.as_slice(), &key].concat(), &value);
             previous = key;
             records += 1;
             staged_bytes += key_bytes + value_bytes + prefix.len();
             if staged_bytes >= STAGE_BYTES {
-                sync_write(db, std::mem::take(&mut stage))?;
+                db.write(std::mem::take(&mut stage))?;
                 staged_bytes = 0;
             }
         };
         if !stage.is_empty() {
-            sync_write(db, stage)?;
+            db.write(stage)?;
         }
         let cut = image.cut(bytes, records, format!("{digest:x}"));
         let old_generation = self.store.header()?.generation;
@@ -368,7 +362,7 @@ impl Snapshots {
             .lock()
             .map_err(|_| anyhow!("snapshot catalog lock poisoned"))?;
         let old_snapshot: Option<StoredSnapshot> = self.store.read(b"snapshot")?;
-        let mut publish = WriteBatch::default();
+        let mut publish = WriteBatch::new();
         let header = if replication {
             StateHeader {
                 generation,
@@ -383,18 +377,18 @@ impl Snapshots {
         };
         if let Some(descriptor) = descriptor {
             publish.put(
-                self.store.key(b"snapshot"),
-                serde_json::to_vec(&descriptor)?,
+                &self.store.key(b"snapshot"),
+                &serde_json::to_vec(&descriptor)?,
             );
         }
         if !replication {
-            publish.put(self.store.key(b"restore-cut"), serde_json::to_vec(&cut)?);
+            publish.put(&self.store.key(b"restore-cut"), &serde_json::to_vec(&cut)?);
         }
         self.store.write_header(&mut publish, &header)?;
         self.store.remove_generation(old_generation, &mut publish);
-        publish.put(Database::hosted_key(&self.store.id), b"");
-        publish.delete(stage_key);
-        sync_write(db, publish)?;
+        publish.put(&Database::hosted_key(&self.store.id), b"");
+        publish.delete(&stage_key);
+        db.write(publish)?;
         if let Some(old_snapshot) = old_snapshot {
             self.remove_file(old_snapshot.file_id);
         }
@@ -419,7 +413,7 @@ impl Snapshots {
         let file = file.io.into_std().await;
         let manager = self.clone();
         self.store
-            .run_bulk(move |_| {
+            .run_bulk_as("install_snapshot", move |_| {
                 manager.stage_image(file, Some(expected), Some(temporary))?;
                 Ok(())
             })
@@ -466,16 +460,16 @@ impl Snapshots {
             .lock()
             .map_err(|_| anyhow!("snapshot catalog lock poisoned"))?;
         let old: Option<StoredSnapshot> = self.store.read(b"snapshot")?;
-        let mut update = WriteBatch::default();
+        let mut update = WriteBatch::new();
         let descriptor = StoredSnapshot {
             file_id,
             meta: header.meta.clone(),
         };
         update.put(
-            self.store.key(b"snapshot"),
-            serde_json::to_vec(&descriptor)?,
+            &self.store.key(b"snapshot"),
+            &serde_json::to_vec(&descriptor)?,
         );
-        sync_write(&self.store.db.db, update)?;
+        self.store.db.write(update)?;
         if let Some(old) = old {
             self.remove_file(old.file_id);
         }
@@ -490,7 +484,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Snapshots {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
         let manager = self.clone();
         self.store
-            .run_bulk(move |_| manager.build())
+            .run_bulk_as("build_snapshot", move |_| manager.build())
             .await
             .map_err(|error| storage_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, error))
     }

@@ -19,9 +19,9 @@ use std::time::Duration;
 use std::{fmt, io};
 
 use anyhow::{Result, anyhow, ensure};
+use nabedra_kv::WriteBatch;
 use openraft::error::{Fatal, InitializeError, RaftError};
 use openraft::{Config, ErrorSubject, ErrorVerb, Raft, SnapshotPolicy, StorageError};
-use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
@@ -30,13 +30,15 @@ use uuid::Uuid;
 pub use network::PeerTransport;
 pub use snapshot::SnapshotCut;
 pub use state_machine::StateMachine;
-pub use store::Transaction;
+pub use store::{QuarantinedGroup, StorageHealth, Transaction};
 
 use batch::PublishBatcher;
 use log::LogStore;
 use network::NetworkFactory;
 use snapshot::{CHUNK_BYTES, MAX_SNAPSHOT_BYTES, SnapshotFile, Snapshots};
 use state_machine::AppliedState;
+#[cfg(test)]
+pub(crate) use store::test_options;
 use store::{Database, GroupStore};
 
 pub(super) type Node = openraft::BasicNode;
@@ -162,7 +164,32 @@ impl Broker {
             config.allow_plaintext,
         )?;
         let database = Database::open(&config.data_dir, config.cluster_id, config.id)?;
-        Ok(Arc::new(Self {
+        Ok(Self::with_database(config, peers, database))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with(
+        config: BrokerConfig,
+        options: nabedra_kv::Options,
+    ) -> Result<Arc<Self>> {
+        let peers = PeerTransport::new(
+            config.cluster_id,
+            &config.peer_token,
+            None,
+            None,
+            config.allow_plaintext,
+        )?;
+        let database =
+            Database::open_with(&config.data_dir, config.cluster_id, config.id, options)?;
+        Ok(Self::with_database(config, peers, database))
+    }
+
+    fn with_database(
+        config: BrokerConfig,
+        peers: PeerTransport,
+        database: Arc<Database>,
+    ) -> Arc<Self> {
+        let broker = Arc::new(Self {
             id: config.id,
             cluster_id: config.cluster_id,
             database,
@@ -171,7 +198,26 @@ impl Broker {
             change_groups: Arc::default(),
             publish_budget: Arc::new(Semaphore::new(PUBLISH_BUDGET_BYTES)),
             control_slots: Arc::new(Semaphore::new(64)),
-        }))
+        });
+        // Damage found while serving quarantines a group: stop its Raft node so it neither
+        // votes nor acknowledges appends (section 3, rule 1).
+        if let (Ok(runtime), Some(mut damaged)) = (
+            tokio::runtime::Handle::try_current(),
+            broker.database.take_damage_events(),
+        ) {
+            let weak = Arc::downgrade(&broker);
+            runtime.spawn(async move {
+                while let Some(id) = damaged.recv().await {
+                    let Some(broker) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Err(error) = broker.close_group(&id).await {
+                        tracing::error!(group = %id, %error, "could not stop a damaged group");
+                    }
+                }
+            });
+        }
+        broker
     }
 
     pub fn id(&self) -> u64 {
@@ -201,12 +247,103 @@ impl Broker {
             .unwrap_or_default()
     }
 
+    /// Hosted groups that can start. Groups whose storage is quarantined are left out:
+    /// they stay stopped and are listed by [`Broker::quarantined_groups`].
     pub fn stored_group_ids(&self) -> Result<Vec<String>> {
+        let quarantined = self.database.quarantined_groups();
+        Ok(self
+            .database
+            .stored_group_ids()?
+            .into_iter()
+            .filter(|id| quarantined.iter().all(|group| &group.group != id))
+            .collect())
+    }
+
+    /// A raw synced write, for tests that damage or seed records.
+    #[cfg(test)]
+    pub(crate) async fn test_write(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let (key, value) = (key.to_vec(), value.to_vec());
+        self.database
+            .run(move |db| {
+                let mut write = WriteBatch::new();
+                write.put(&key, &value);
+                db.write(write)
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_read(&self, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        self.database.get(key)
+    }
+
+    pub fn is_quarantined(&self, id: &str) -> bool {
+        self.database.is_quarantined(id)
+    }
+
+    /// Every hosted group, including the quarantined ones (RV-EV L5).
+    pub fn hosted_group_ids(&self) -> Result<Vec<String>> {
         self.database.stored_group_ids()
+    }
+
+    /// Hosted groups whose storage is damaged. They are not started; an operator re-adds
+    /// this replica through the membership and backup tools.
+    pub fn quarantined_groups(&self) -> Vec<QuarantinedGroup> {
+        self.database.quarantined_groups()
     }
 
     pub fn disk_available_bytes(&self) -> Result<u64> {
         Ok(fs2::available_space(&self.database.root)?)
+    }
+
+    /// Free space the store keeps for Raft progress beyond the configured reserve: two
+    /// journal segments and one compaction's output (RV-EV M1).
+    pub fn disk_headroom_bytes(&self) -> u64 {
+        Database::disk_headroom_bytes()
+    }
+
+    /// The store latched `RecoveryRequired`: every write fails until the process reopens
+    /// it, which applies the recovery rules R1-R3 (RV-EV M2).
+    pub fn requires_recovery(&self) -> bool {
+        self.database.requires_recovery()
+    }
+
+    /// Resolves once the store requires recovery.
+    pub async fn recovery_required(&self) {
+        self.database.recovery_required().await
+    }
+
+    pub fn storage_health(&self) -> StorageHealth {
+        self.database.health()
+    }
+
+    /// Graceful stop: close every group, then close the store and wait for it, so the next
+    /// open finds a clean close instead of a crash (RV-EV L4). Other owners of the broker
+    /// must have dropped it; the store closes once the last reference is gone, and this
+    /// waits up to `wait` for that.
+    pub async fn shutdown(self: Arc<Self>, wait: Duration) -> Result<()> {
+        let mut result = Ok(());
+        for id in self.group_ids() {
+            if let Err(error) = self.close_group(&id).await {
+                tracing::error!(group = %id, %error, "could not close an Events group");
+                result = Err(error.into());
+            }
+        }
+        let database = Arc::downgrade(&self.database);
+        let dir = self.database.kv_dir().to_path_buf();
+        drop(self);
+        let deadline = tokio::time::Instant::now() + wait;
+        while database.strong_count() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "the Events store is still in use; it closes when its last user stops"
+                );
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::task::spawn_blocking(move || store::wait_for_close(&dir)).await?;
+        result
     }
 
     pub async fn open_group(
@@ -238,6 +375,15 @@ impl Broker {
         machine: Arc<dyn StateMachine>,
         election_after: Option<u64>,
     ) -> GroupResult<Arc<Group>> {
+        if self.database.is_quarantined(id) {
+            tracing::warn!(
+                group = id,
+                "not starting a group whose storage is quarantined"
+            );
+            return Err(GroupError::Other(anyhow!(
+                "group {id} storage is quarantined; replace this replica"
+            )));
+        }
         if let Some(group) = self.group(id) {
             if election_after.is_none_or(|cut| group.election_after >= Some(cut)) {
                 return if group.status().running {
@@ -274,7 +420,7 @@ impl Broker {
                                     vote.is_committed() && vote.leader_id().node_id == local_id
                                 });
                         if obsolete_leader || floor != prior {
-                            let mut batch = WriteBatch::default();
+                            let mut batch = WriteBatch::new();
                             if obsolete_leader {
                                 // OpenRaft can resume a persisted self-vote before its
                                 // election timer runs. The committed placement has
@@ -282,8 +428,8 @@ impl Broker {
                                 let root = staged.key(b"");
                                 batch.delete_range(&root, &store::prefix_end(&root));
                             }
-                            batch.put(staged.key(ELECTION_FLOOR), serde_json::to_vec(&cut)?);
-                            store::sync_write(&db.db, batch)?;
+                            batch.put(&staged.key(ELECTION_FLOOR), &serde_json::to_vec(&cut)?);
+                            db.write(batch)?;
                         }
                         voting
                     }
@@ -385,6 +531,8 @@ impl Broker {
             .map_err(|_| anyhow!("group registry lock poisoned"))?
             .remove(id);
         if let Some(group) = group {
+            // A storage write parked on a full device would hold the core's shutdown.
+            group.snapshots.store.begin_close();
             let shutdown = group.raft.shutdown().await;
             group.snapshots.store.seal().await;
             shutdown.map_err(anyhow::Error::from)?;
@@ -412,7 +560,13 @@ impl Broker {
                 .run(move |_| retirement_matches(&inspect, local_id, removed_at))
                 .await?
             {
-                return Ok(false);
+                // A durable retirement of a damaged replica whose release failed (for
+                // example on a full device) finishes here, without a restart (RV-EV L1).
+                let pending = store.clone();
+                return Ok(broker
+                    .database
+                    .run_bulk(move |_| pending.finish_release())
+                    .await?);
             }
             broker.close_group_locked(&store.id).await?;
             Ok(broker
@@ -896,6 +1050,11 @@ fn voter_after(store: &GroupStore, id: u64, cut: u64) -> Result<bool> {
 }
 
 fn retirement_matches(store: &GroupStore, id: u64, removed_at: u64) -> Result<bool> {
+    if store.db.is_quarantined(&store.id) {
+        // The damaged group's records cannot be read, so only the store-wide retirement
+        // marker fences a stale request. The replica never restarts on these bytes.
+        return Ok(store.retired_at()?.is_none_or(|cut| cut < removed_at));
+    }
     if store
         .read::<u64>(ELECTION_FLOOR)?
         .is_some_and(|floor| floor >= removed_at)
@@ -911,9 +1070,7 @@ fn retirement_matches(store: &GroupStore, id: u64, removed_at: u64) -> Result<bo
 }
 
 fn validate_hosting_capacity(database: &Database, id: &str) -> Result<()> {
-    if !database.db.key_may_exist(Database::hosted_key(id))
-        || database.db.get(Database::hosted_key(id))?.is_none()
-    {
+    if !database.is_hosted(id)? {
         ensure!(
             database.stored_group_ids()?.len() < MAX_HOSTED_GROUPS,
             "broker has reached its hosted group limit"

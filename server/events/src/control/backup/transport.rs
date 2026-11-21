@@ -251,7 +251,7 @@ async fn start(
         return Err(StatusCode::BAD_REQUEST);
     }
     // Retain the slot and temporary directory until the disk job settles even if
-    // the client's connection disappears while RocksDB is exporting the image.
+    // the client's connection disappears while the store is exporting the image.
     tokio::spawn(async move { prepare(&server, request).await })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -295,7 +295,7 @@ async fn prepare(server: &Server, request: Start) -> Result<SnapshotCut, StatusC
         .broker
         .disk_available_bytes()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .saturating_sub(server.control.config.min_free_disk_bytes);
+        .saturating_sub(server.control.disk_reserve_bytes());
     if limit < CHUNK_BYTES as u64 {
         return Err(StatusCode::INSUFFICIENT_STORAGE);
     }

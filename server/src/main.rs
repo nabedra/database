@@ -69,7 +69,9 @@ async fn run_cli() -> ExitCode {
                         )
                         .with_target("nabedra_database_server::oltp_runtime", rpc_trace)
                         .with_target("nabedra_database_server::oltp_replication::manager::data_factory", rpc_trace)
-                        .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace),
+                        .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::typed_network", rpc_trace)
+                        .with_target("nabedra_database_server::oltp_replication::multiplex", rpc_trace),
                 ),
         )
         .try_init()
@@ -254,7 +256,7 @@ async fn run(options: nabedra_database_server::config::ServeOptions) -> Result<(
     // Select the provider explicitly even if dependencies also enable ring.
     let tls = match (&config.options().tls_cert, &config.options().tls_key) {
         (Some(cert), Some(key)) => {
-            rustls::crypto::aws_lc_rs::default_provider()
+            rustls::crypto::ring::default_provider()
                 .install_default()
                 .map_err(|_| "TLS configuration invalid")?;
             Some(

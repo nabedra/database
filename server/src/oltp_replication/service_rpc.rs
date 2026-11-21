@@ -11,6 +11,10 @@ use crate::{
 };
 use serde::Serialize;
 use std::sync::Arc;
+pub(crate) mod direct;
+mod grant_cache;
+pub(crate) use grant_cache::GrantCache;
+use grant_cache::GrantKey;
 mod metadata;
 mod participant;
 mod participant_full;
@@ -167,6 +171,18 @@ enum Method {
     ParticipantPropose {
         progress: bool,
     },
+    /// A point operation for the range leader (plan section 6). The body is
+    /// the first payload section.
+    Direct(direct::DirectHeader),
+    /// Settle a request id at its anchor before the queued path (addendum
+    /// 2026-11-19). The body is the first payload section.
+    DirectForward(direct::DirectHeader),
+    /// The table's exclusive lifecycle guard on the Catalog, read by a
+    /// direct range leader before it activates a Data group (T7b). Sent
+    /// only while `data.direct.v1` is active, when every peer decodes it.
+    ParticipantExclusive {
+        table_id: uuid::Uuid,
+    },
 }
 impl Method {
     fn purpose(self) -> Purpose {
@@ -185,6 +201,7 @@ impl Method {
             | Self::ParticipantFence { .. }
             | Self::ParticipantResolveTimestampPoint
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
+            Self::Direct(_) | Self::DirectForward(_) => Purpose::ApiIngress,
             _ => Purpose::Authority,
         }
     }
@@ -193,6 +210,7 @@ impl Method {
             Purpose::Storage => TrafficClass::Storage,
             Purpose::Settlement => TrafficClass::Settlement,
             Purpose::ServiceMutation => TrafficClass::ServiceMutation,
+            Purpose::ApiIngress => TrafficClass::ApiIngress,
             _ => TrafficClass::ServiceAuthority,
         }
     }
@@ -231,6 +249,7 @@ impl Method {
             | Self::ParticipantTimestampPointRejection { .. }
             | Self::ParticipantTimestampPointResolution { .. }
             | Self::ParticipantResolveTimestampPoint => 8 << 10,
+            Self::Direct(_) | Self::DirectForward(_) => crate::protocol::MAX_BODY_BYTES,
             _ => 0,
         }
     }
@@ -291,6 +310,10 @@ struct Client {
     control: Arc<ControlClient>,
     action: ServiceAction,
     leader: AtomicU64,
+    /// The last replica whose bounded attempt timed out (0: none). It is
+    /// tried last until it answers again, so a paused leader costs one
+    /// attempt deadline, not one per call (D05/LIVE1).
+    stalled: AtomicU64,
     _metadata: Arc<ScratchLease>,
 }
 impl Client {
@@ -313,6 +336,7 @@ impl Client {
             control,
             action,
             leader: AtomicU64::new(0),
+            stalled: AtomicU64::new(0),
             _metadata: metadata,
         })
     }
@@ -473,6 +497,7 @@ impl Client {
         retry_last: Option<u64>,
         convergence_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, CallError> {
+        let stalled = self.stalled.load(Ordering::Relaxed);
         let preferred = match self.leader.load(Ordering::Relaxed) {
             0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
             node => node,
@@ -481,7 +506,9 @@ impl Client {
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
             for member in routes.members.iter().filter(|member| {
-                let priority = if Some(member.node_id) == retry_last {
+                let priority = if Some(member.node_id) == retry_last
+                    || (stalled != 0 && member.node_id == stalled)
+                {
                     2
                 } else {
                     u8::from(member.node_id != preferred)
@@ -503,14 +530,21 @@ impl Client {
                         SCOPED_MUTATION_TIMEOUT
                     };
                     let peer_deadline = deadline.min(Instant::now() + attempt);
-                    timeout_at(peer_deadline, call)
-                        .await
-                        .unwrap_or(Err(CallError::Transport(RequestError::Unreachable)))
+                    timeout_at(peer_deadline, call).await.unwrap_or_else(|_| {
+                        self.stalled.store(member.node_id, Ordering::Relaxed);
+                        Err(CallError::Transport(RequestError::Unreachable))
+                    })
                 } else {
                     call.await
                 };
                 match reply {
                     Ok(Ok(response)) => {
+                        let _ = self.stalled.compare_exchange(
+                            member.node_id,
+                            0,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         if action == ServiceAction::Owner || convergence_deadline.is_some() {
                             routes.record_successful_node(member.node_id);
                         }
@@ -775,7 +809,10 @@ impl Client {
                 64 << 10,
             )
             .await
-            .map_err(CallError::Transport)?;
+            .map_err(|error| {
+                tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
+                CallError::Transport(error)
+            })?;
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport completed");
         if reply.remote_identity().worker_id != worker.worker_id()
             || reply.group() != &self.group
@@ -970,7 +1007,11 @@ fn parse(
         || session.group() != group
         || !matches!(
             session.purpose(),
-            Purpose::Authority | Purpose::Storage | Purpose::Settlement | Purpose::ServiceMutation
+            Purpose::Authority
+                | Purpose::Storage
+                | Purpose::Settlement
+                | Purpose::ServiceMutation
+                | Purpose::ApiIngress
         )
     {
         return Err(invalid());
@@ -1000,25 +1041,35 @@ fn scoped_admission_read(scope: super::authority::control::ScopedCatalogRead) ->
     // accepted context to hash. Only the queue owner gets this read privilege.
     scope.request.accepted_context == Digest::from_bytes([0; 32])
 }
+/// The caller's full grant, always read fresh from Control: callers compare
+/// its owner and authority with the request's fences. The passed role check
+/// warms the receiver's cache for [`authorize`]. See `grant_cache`.
 async fn service_grant(
     control: &ControlClient,
     session: &AuthenticatedSession,
     header: &Header,
 ) -> Result<ServiceAuthorization, ProtocolError> {
+    let key = GrantKey::new(session.remote(), header.action, session.group(), None);
     let scope = crate::oltp_runtime::replica::QueueScope {
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
     control
-        .service_role(
-            &scope,
-            session.remote(),
-            header.action,
-            session.group().clone(),
-        )
+        .service_grants()
+        .grant(key, control.applied_revision(), || {
+            control.service_role(
+                &scope,
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+        })
         .await
 }
 
+/// The caller's role only. A passed check is cached per caller incarnation
+/// and role while the locally applied Control revision is unchanged and the
+/// Control read started under 5 s ago.
 async fn authorize(
     control: &ControlClient,
     session: &AuthenticatedSession,
@@ -1028,18 +1079,45 @@ async fn authorize(
         cluster_id: session.group().cluster_id,
         database: session.group().database.clone(),
     };
+    let revision = control.applied_revision();
     if let Some(generation) = header.placement_generation {
+        let key = GrantKey::new(
+            session.remote(),
+            header.action,
+            session.group(),
+            Some((header.to_node, generation)),
+        );
         return control
-            .service_role_at_replica(
-                &scope,
-                session.remote(),
-                session.group().clone(),
-                header.to_node,
-                generation,
-            )
+            .service_grants()
+            .role(key, revision, || async {
+                control
+                    .service_role_at_replica(
+                        &scope,
+                        session.remote(),
+                        session.group().clone(),
+                        header.to_node,
+                        generation,
+                    )
+                    .await
+                    .map(|_| None)
+            })
             .await;
     }
-    service_grant(control, session, header).await.map(|_| ())
+    let key = GrantKey::new(session.remote(), header.action, session.group(), None);
+    control
+        .service_grants()
+        .role(key, revision, || async {
+            control
+                .service_role(
+                    &scope,
+                    session.remote(),
+                    header.action,
+                    session.group().clone(),
+                )
+                .await
+                .map(Some)
+        })
+        .await
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,

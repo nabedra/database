@@ -10,8 +10,6 @@ mkdir -p "$work"/{benchmark,orm-artifacts-final,orm-docker-final}
 
 docker run --rm -v "$PWD:/source:ro" -v nabedra-native-cache-target:/target \
   -e CARGO_TARGET_DIR=/target -w /source rust:1.94.1-bookworm sh -ec '
-    apt-get update
-    apt-get install -y --no-install-recommends cmake
     cargo build --locked --release --manifest-path server/Cargo.toml \
       --no-default-features --features cache --bin nabedra-db
   '

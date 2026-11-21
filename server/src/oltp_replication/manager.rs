@@ -8,7 +8,7 @@ use super::{
         status::StatusMachine,
         timestamp::TimestampMachine,
     },
-    hosted::{HostedState, RaftConsensus, TypedMachine, single_entry_config},
+    hosted::{HostedState, RaftConsensus, TypedMachine, batched_config},
     multiplex::{EndpointRegistry, Purpose, WorkerClient},
     typed_log::{TypedConfig, TypedLogStore},
     typed_network::{ReplicaDispatcher, ReplicaEndpoint, TypedNetworkFactory},
@@ -31,13 +31,28 @@ use std::{
 
 mod data_factory;
 mod lifecycle;
-pub(crate) use lifecycle::{AppliedPlacementMembership, ReplicatedLearner};
+pub(crate) use lifecycle::{
+    AppliedPlacementMembership, DamageSink, ReplicatedLearner, ReportingDamageSink,
+    SettlingReplicas, spawn_settlement,
+};
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
+#[cfg(test)]
+mod damage_tests;
+#[cfg(test)]
+mod damage_scheduler_tests;
 mod retirement;
+mod supervision;
 pub(crate) use retirement::{ReplicaRetired, ReplicaRetirementPermit};
 pub(crate) mod local;
-pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
+pub(crate) use data_factory::placement::{
+    PlacementCatalog, RemotePlacementTarget, ReplicaPlacement,
+};
 pub(crate) use data_factory::split as shard_split;
-pub(crate) use data_factory::placement::{PlacementCatalog, RemotePlacementTarget, ReplicaPlacement};
+pub(crate) use data_factory::damage_replacement::{
+    DamageHost, DamageReplacementEndpoint, DamageScheduler, FactoryDamageHost,
+};
+pub(crate) use data_factory::{DataGroupClient, DataGroupFactory, DataGroupSpec};
 pub(crate) use local::{
     GroupPlacement, LocalOperatorPermit, LocalWorker, RegisteredConfig, RegisteredSystemGroups,
     RegisteredWorker, SystemPlacement,
@@ -65,7 +80,14 @@ where
     M: TypedMachine<C>,
 {
     fn leader(&self) -> Option<u64> {
-        self.raft.metrics().borrow_watched().current_leader
+        // A stopped core never counts as the leader (RV-APPLY F4).
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics
+            .running_state
+            .is_ok()
+            .then_some(metrics.current_leader)
+            .flatten()
     }
     fn members(&self) -> Vec<ReplicaMember> {
         self.raft
@@ -105,9 +127,14 @@ pub(crate) struct HostedGroupManager {
     shared: Arc<WorkerSharedResources>,
     client: WorkerClient,
     registry: Arc<EndpointRegistry>,
-    routes: Mutex<BTreeMap<uuid::Uuid, GroupRoutes>>,
+    /// Shared with the run-time damage watchers (NS14), which hold it weakly.
+    routes: Arc<Mutex<BTreeMap<uuid::Uuid, GroupRoutes>>>,
     ownership: Option<Arc<dyn Send + Sync>>,
     starts: tokio::sync::Mutex<()>,
+    /// Where a replica stopped by run-time damage is reported (NS14 rule 2).
+    damage_sink: Arc<Mutex<Option<Arc<dyn DamageSink>>>>,
+    /// Retry, restart and stop counters of every core (`/v1/runtime/stats`).
+    health: Arc<super::hosted::transient::RaftHealthStats>,
 }
 impl HostedGroupManager {
     fn hosted_data(
@@ -139,9 +166,11 @@ impl HostedGroupManager {
             shared,
             client,
             registry,
-            routes: Mutex::new(BTreeMap::new()),
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
             ownership: None,
             starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
+            health: Arc::default(),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
@@ -244,7 +273,17 @@ impl HostedGroupManager {
         {
             return Err(invalid());
         }
-        let config = single_entry_config(config)?;
+        // Section 3 rule 1: a quarantined group never starts under its old
+        // identity: no vote, append acknowledgment, ReadIndex, snapshot export
+        // or route.
+        if machine
+            .store()
+            .pool()
+            .is_group_quarantined(machine.store().identity().group_id)
+        {
+            return Err(crate::oltp::pool::quarantined_group());
+        }
+        let config = batched_config(config)?;
         let config_digest = super::owned::serialized_digest(config.as_ref())?;
         if let Some(existing) =
             self.existing::<C, M>(machine.store(), &local, &bootstrap, config_digest)?
@@ -258,6 +297,7 @@ impl HostedGroupManager {
             return Ok(existing);
         }
         let identity = machine.store().identity().clone();
+        let node_id = local.node_id;
         let (group, resident) = self
             .registry
             .reserve_replica(identity.clone(), local.node_id)?;
@@ -283,6 +323,10 @@ impl HostedGroupManager {
                     if matches!(identity.kind, GroupKind::Data { .. } | GroupKind::Catalog) {
                         group.bind(Purpose::Storage, services.clone())?;
                         group.bind(Purpose::Settlement, services.clone())?;
+                        if matches!(identity.kind, GroupKind::Data { .. }) {
+                            // The ingress lane for `Method::Direct` (T5).
+                            group.bind(Purpose::ApiIngress, services.clone())?;
+                        }
                     } else {
                         group.bind(Purpose::ServiceMutation, services.clone())?;
                     }
@@ -310,7 +354,8 @@ impl HostedGroupManager {
             .map_err(|_| unavailable())?
             .with_resident(resident.clone())?;
         let state = HostedState::new(machine, resident.clone())?;
-        let running = RaftConsensus::start(config, network, log, state).await?;
+        let running =
+            RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),
@@ -339,7 +384,22 @@ impl HostedGroupManager {
                     retiring: false,
                 },
             );
+        self.stop_on_damage(&running, node_id);
+        self.supervise(&running, node_id);
         Ok(running)
+    }
+    /// Node IDs of the replicas of `group` this worker currently hosts.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn hosted_replicas(&self, group: uuid::Uuid) -> Vec<u64> {
+        self.routes
+            .lock()
+            .map(|routes| {
+                routes
+                    .get(&group)
+                    .map(|group| group.replicas.keys().copied().collect())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
     fn existing<C, M>(
         &self,
@@ -417,8 +477,11 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedData, ProtocolError> {
-        self.start(ParticipantMachine::new(store)?, local, peers, config)
-            .await
+        let running = self
+            .start(ParticipantMachine::new(store)?, local, peers, config)
+            .await?;
+        super::hosted::direct_leadership::watch(&running);
+        Ok(running)
     }
     pub(crate) async fn start_catalog(
         &self,

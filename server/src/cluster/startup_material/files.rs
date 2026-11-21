@@ -392,7 +392,7 @@ impl Reader {
         };
         complete_der_sequence(key.secret_der())?;
         self.check()?;
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let provider = rustls::crypto::ring::default_provider();
         let certified_key = CertifiedKey::from_der(certs, key, &provider).map_err(|_| INVALID)?;
         certified_key.keys_match().map_err(|_| INVALID)?;
         self.check()?;

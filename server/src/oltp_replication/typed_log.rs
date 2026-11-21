@@ -2,6 +2,11 @@
 //! bounded metadata, leave native/CPU capacity, reserve decode ownership, then
 //! verify the same bytes before decoding. Streaming recovery owns one entry at
 //! a time; a full-range API fails explicitly rather than allocating without bound.
+//!
+//! Entry bodies (`e‖index`) are journal values: the journal record holds the bytes
+//! and the LSM a locator, so an entry is written to disk once and journal GC
+//! recycles its segment after the purge. IDs, the tail and the purge marker stay
+//! small keys; truncation and purge are range deletes.
 use super::{
     entry::{CommandData, LeaderId, LogId, Membership, OwnedRaftEntry, Payload, Vote},
     owned::OwnedCommand,
@@ -32,6 +37,8 @@ use std::{
     sync::{Arc, OnceLock, Weak},
 };
 use tokio::sync::Mutex;
+
+use super::hosted::transient::{HostRetry, RaftWrite};
 
 pub trait TypedConfig:
     RaftTypeConfig<
@@ -65,6 +72,34 @@ const META: TransactionBudget = TransactionBudget {
 };
 const MAX_COLLECTED: usize = 128;
 const MAX_COLLECTED_BYTES: usize = 32 << 20;
+/// One synced append and one replication read hold at most this many entries.
+pub(crate) const MAX_APPEND_ENTRIES: usize = 64;
+/// ... and at most this many encoded bytes, unless a single entry is larger.
+pub(crate) const MAX_APPEND_BYTES: usize = 1 << 20;
+
+/// Splits consecutive encoded entry sizes into synced write batches of at most
+/// `MAX_APPEND_ENTRIES` entries and `MAX_APPEND_BYTES` bytes. An entry larger
+/// than the byte bound forms its own batch.
+pub(crate) fn append_chunks(sizes: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0usize;
+    for (index, size) in sizes.iter().enumerate() {
+        if index > start
+            && (index - start == MAX_APPEND_ENTRIES
+                || bytes.saturating_add(*size) > MAX_APPEND_BYTES)
+        {
+            chunks.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(*size);
+    }
+    if start < sizes.len() {
+        chunks.push(start..sizes.len());
+    }
+    chunks
+}
 
 #[derive(Clone)]
 pub struct TypedLogStore<C: TypedConfig> {
@@ -75,6 +110,8 @@ pub struct TypedLogStore<C: TypedConfig> {
     resident: Option<super::multiplex::ReplicaLease>,
     node_id: u64,
     _writer: Arc<WriterState>,
+    /// Shared with the host's state machine (RV-APPLY F1).
+    retry: Arc<HostRetry>,
     #[cfg(test)]
     append_hook: Arc<std::sync::Mutex<Option<AppendHook>>>,
 }
@@ -163,6 +200,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
             resident: None,
             node_id,
             _writer: writer,
+            retry: Arc::default(),
             #[cfg(test)]
             append_hook: Arc::new(std::sync::Mutex::new(None)),
         })
@@ -185,6 +223,9 @@ impl<C: TypedConfig> TypedLogStore<C> {
     }
     pub(crate) fn has_resident(&self) -> bool {
         self.resident.is_some()
+    }
+    pub(in crate::oltp_replication) fn set_retry(&mut self, retry: Arc<HostRetry>) {
+        self.retry = retry;
     }
     pub async fn drain(&self) {
         loop {
@@ -346,15 +387,19 @@ impl<C: TypedConfig> TypedLogStore<C> {
         end: Option<u64>,
         limited: bool,
     ) -> io::Result<Vec<OwnedRaftEntry<C::Command>>> {
-        let mut out = Vec::with_capacity(MAX_COLLECTED);
+        // A limited read feeds one replication payload, bounded like a synced
+        // append. A full-range read keeps the larger recovery collection bound.
+        let (max_entries, max_bytes) = if limited {
+            (MAX_APPEND_ENTRIES, MAX_APPEND_BYTES)
+        } else {
+            (MAX_COLLECTED, MAX_COLLECTED_BYTES)
+        };
+        let mut out = Vec::with_capacity(max_entries);
         let mut cursor = start;
         let mut bytes = 0usize;
         while let Some((entry, size)) = self.next(cursor, end).await? {
-            if out.len() == MAX_COLLECTED
-                || (!out.is_empty()
-                    && bytes
-                        .checked_add(size)
-                        .is_none_or(|n| n > MAX_COLLECTED_BYTES))
+            if out.len() == max_entries
+                || (!out.is_empty() && bytes.checked_add(size).is_none_or(|n| n > max_bytes))
             {
                 if limited {
                     break;
@@ -387,7 +432,13 @@ impl<C: TypedConfig> TypedLogStore<C> {
                 let Some((entry, _)) = reader.next(cursor, end).await? else {
                     return Ok(None);
                 };
-                let next = entry.index().checked_add(1);
+                // Stop at the exclusive end without another read: OpenRaft
+                // answers proposers while it consumes this stream, and the
+                // apply must not need a native slot after the last answer.
+                let next = entry
+                    .index()
+                    .checked_add(1)
+                    .filter(|next| end.is_none_or(|end| *next < end));
                 Ok(Some((entry, (reader, next))))
             },
         ))
@@ -503,51 +554,69 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     }
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
         let vote = *vote;
-        self.store
-            .log_transaction_metadata(META, move |tx| {
-                if let Some(old) = tx.get(b"vote")? {
-                    let old: Vote = serde_json::from_slice(old.as_slice())
-                        .map_err(|_| protocol("corrupt durable vote"))?;
-                    if vote < old {
-                        return Err(protocol("Raft vote moves backwards"));
-                    }
+        let (store, retry) = (&self.store, &self.retry);
+        retry
+            .retry(RaftWrite::Vote, move || async move {
+                #[cfg(test)]
+                if retry.take_vote_fault() {
+                    return Err(crate::oltp::pool::no_space());
                 }
-                let bytes = tx.encode_value(&vote)?;
-                tx.put(b"vote", bytes.as_slice())?;
-                Ok(Transition::Commit(tx.copy_output(b"")?))
+                store
+                    .log_transaction_metadata(META, move |tx| {
+                        if let Some(old) = tx.get(b"vote")? {
+                            let old: Vote = serde_json::from_slice(old.as_slice())
+                                .map_err(|_| protocol("corrupt durable vote"))?;
+                            if vote < old {
+                                return Err(protocol("Raft vote moves backwards"));
+                            }
+                        }
+                        let bytes = tx.encode_value(&vote)?;
+                        tx.put(b"vote", bytes.as_slice())?;
+                        Ok(Transition::Commit(tx.copy_output(b"")?))
+                    })
+                    .await
             })
             .await
             .map_err(disk)?;
         Ok(())
     }
+    /// Unsynced: OpenRaft treats the commit marker as a recovery hint and
+    /// raises it to the applied index on startup. The next synced write of
+    /// this pool's WAL persists it.
     async fn save_committed(&mut self, id: Option<LogId>) -> io::Result<()> {
-        self.store
-            .log_transaction_metadata(META, move |tx| {
-                if let Some(raw) = tx.get(b"committed")? {
-                    let old: Option<LogId> = serde_json::from_slice(raw.as_slice())
-                        .map_err(|_| protocol("corrupt durable commit marker"))?;
-                    if old.is_some_and(|old| id.is_none_or(|next| next.index < old.index)) {
-                        return Err(protocol("commit marker moves backwards"));
-                    }
-                }
-                if let Some(id) = id {
-                    let exact = tx
-                        .get(&index_key(ID, id.index))?
-                        .or(tx.get(PURGED)?)
-                        .ok_or_else(|| protocol("commit marker is not durably retained"))?;
-                    let retained: LogId = serde_json::from_slice(exact.as_slice())
-                        .map_err(|_| protocol("corrupt retained commit boundary"))?;
-                    if retained != id {
-                        return Err(protocol("commit marker does not match retained log"));
-                    }
-                }
-                let bytes = tx.encode_value(&id)?;
-                tx.put(b"committed", bytes.as_slice())?;
-                Ok(Transition::Commit(tx.copy_output(b"")?))
+        self.retry
+            .retry(RaftWrite::Committed, || {
+                self.store
+                    .log_transaction_metadata_unsynced(META, move |tx| {
+                        if let Some(raw) = tx.get(b"committed")? {
+                            let old: Option<LogId> = serde_json::from_slice(raw.as_slice())
+                                .map_err(|_| protocol("corrupt durable commit marker"))?;
+                            if old.is_some_and(|old| id.is_none_or(|next| next.index < old.index)) {
+                                return Err(protocol("commit marker moves backwards"));
+                            }
+                        }
+                        if let Some(id) = id {
+                            let exact = tx
+                                .get(&index_key(ID, id.index))?
+                                .or(tx.get(PURGED)?)
+                                .ok_or_else(|| protocol("commit marker is not durably retained"))?;
+                            let retained: LogId = serde_json::from_slice(exact.as_slice())
+                                .map_err(|_| protocol("corrupt retained commit boundary"))?;
+                            if retained != id {
+                                return Err(protocol("commit marker does not match retained log"));
+                            }
+                        }
+                        let bytes = tx.encode_value(&id)?;
+                        tx.put(b"committed", bytes.as_slice())?;
+                        Ok(Transition::Commit(tx.copy_output(b"")?))
+                    })
             })
             .await
             .map_err(disk)?;
-        if matches!(self.store.identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+        if matches!(
+            self.store.identity().kind,
+            GroupKind::Data { .. } | GroupKind::Catalog
+        ) {
             tracing::debug!(group=%self.store.identity().group_id, node=self.node_id,
                 index=id.map(|id| id.index), "typed Raft durable commit saved");
         }
@@ -565,7 +634,8 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         I::IntoIter: Send,
     {
         // Own a bounded append before the first write. The typed host config
-        // admits one client write per batch and one replicated payload per RPC.
+        // admits at most `MAX_APPEND_ENTRIES` entries per append; the writer
+        // splits them into synced batches of at most `MAX_APPEND_BYTES`.
         // This is a transaction/frame bound, never a total log-size bound.
         let mut batch = Vec::new();
         let mut previous: Option<u64> = None;
@@ -579,7 +649,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             }
             previous = Some(entry.index());
             let charged = match &self.resident {
-                Some(resident) => entry.charge_resident(resident),
+                Some(resident) => {
+                    self.retry
+                        .or_stopped(entry.charge_resident_wait(resident))
+                        .await
+                }
                 None => entry.charge_leader(self.store.resources(), self.byte_class()),
             };
             let entry = match charged {
@@ -607,6 +681,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         let store = self.store.clone();
         let writer = self._writer.clone();
         let writes = self.writes.clone();
+        let retry = self.retry.clone();
         // Dropping this method's awaiter cannot cancel the owned sync operation
         // or discard its completion callback. The host joins pending operations
         // before releasing replica residency and stopping its runtime.
@@ -626,7 +701,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     _ => ExecutionClass::Query,
                 };
                 let request = batch[0].index();
-                let (batch, wire_bytes) = store
+                let (batch, sizes) = store
                     .resources()
                     .execute(class, request, 0, move || {
                         struct Counter(usize);
@@ -636,48 +711,65 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                                     .0
                                     .checked_add(bytes.len())
                                     .filter(|n| *n <= MAX_FIXED_COMMAND_BYTES)
-                                    .ok_or_else(|| invalid("oversized Raft append batch"))?;
+                                    .ok_or_else(|| invalid("oversized Raft append entry"))?;
                                 Ok(bytes.len())
                             }
                             fn flush(&mut self) -> io::Result<()> {
                                 Ok(())
                             }
                         }
-                        let mut counter = Counter(0);
+                        let mut sizes = Vec::with_capacity(batch.len());
                         for entry in batch.iter() {
+                            let mut counter = Counter(0);
                             serde_json::to_writer(&mut counter, entry)
-                                .map_err(|_| protocol("oversized or invalid Raft append batch"))?;
+                                .map_err(|_| protocol("oversized or invalid Raft append entry"))?;
+                            sizes.push(counter.0);
                         }
-                        Ok((batch, counter.0))
+                        Ok((batch, sizes))
                     })
                     .await
                     .map_err(disk)?;
-                store
-                    .log_transaction(
-                        TransactionBudget {
-                            scratch_bytes: wire_bytes + (64 << 10),
-                            batch_bytes: wire_bytes + (64 << 10),
-                            output_bytes: 0,
-                        },
-                        move |tx| {
-                            #[cfg(test)]
-                            if let Some(hook) = append_hook {
-                                hook();
-                            }
-                            for entry in batch.iter() {
-                                entry.ensure_charged()?;
-                                let index = entry.index();
-                                let bytes = tx.encode_value(&entry)?;
-                                let id = tx.encode_value(&entry.log_id)?;
-                                tx.put(&index_key(ENTRY, index), bytes.as_slice())?;
-                                tx.put(&index_key(ID, index), id.as_slice())?;
-                                tx.put(TAIL, id.as_slice())?;
-                            }
-                            Ok(Transition::Commit(tx.copy_output(b"")?))
-                        },
-                    )
-                    .await
-                    .map_err(disk)?;
+                // One synced WriteBatch per bounded chunk, in log order. A
+                // crash between chunks leaves a consecutive durable prefix.
+                for chunk in append_chunks(&sizes) {
+                    let wire_bytes: usize = sizes[chunk.clone()].iter().sum();
+                    // A full device voids the chunk: put the same entries again.
+                    retry
+                        .retry(RaftWrite::Append, || {
+                    let batch = batch.clone();
+                    let chunk = chunk.clone();
+                    #[cfg(test)]
+                    let append_hook = append_hook.clone();
+                    store
+                        .log_transaction(
+                            TransactionBudget {
+                                scratch_bytes: wire_bytes + (64 << 10),
+                                batch_bytes: wire_bytes + (64 << 10),
+                                output_bytes: 0,
+                            },
+                            move |tx| {
+                                #[cfg(test)]
+                                if let Some(hook) = append_hook {
+                                    hook();
+                                }
+                                for entry in &batch[chunk] {
+                                    entry.ensure_charged()?;
+                                    let index = entry.index();
+                                    let bytes = tx.encode_value(&entry)?;
+                                    let id = tx.encode_value(&entry.log_id)?;
+                                    // The entry body lives once, in the journal; the
+                                    // LSM keeps a 32-byte locator (NS7).
+                                    tx.put_journal(&index_key(ENTRY, index), bytes.as_slice())?;
+                                    tx.put(&index_key(ID, index), id.as_slice())?;
+                                    tx.put(TAIL, id.as_slice())?;
+                                }
+                                Ok(Transition::Commit(tx.copy_output(b"")?))
+                            },
+                        )
+                        })
+                        .await
+                        .map_err(disk)?;
+                }
                 Ok(())
             }
             .await;
@@ -698,36 +790,38 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> io::Result<()> {
         let _order = self.writes.lock().await;
-        self.store
-            .log_transaction(META, move |tx| {
-                let purged: Option<LogId> = tx
-                    .get(PURGED)?
-                    .map(|v| {
-                        serde_json::from_slice(v.as_slice())
-                            .map_err(|_| protocol("corrupt purge marker"))
-                    })
-                    .transpose()?;
-                if let Some(last) = last {
-                    if Some(last) != purged {
-                        let retained = tx
-                            .get(&index_key(ID, last.index))?
-                            .ok_or_else(|| protocol("truncate boundary not retained"))?;
-                        let id: LogId = serde_json::from_slice(retained.as_slice())
-                            .map_err(|_| protocol("invalid truncate boundary"))?;
-                        if id != last {
-                            return Err(protocol("conflicting truncate boundary"));
+        self.retry
+            .retry(RaftWrite::Truncate, || {
+                self.store.log_transaction(META, move |tx| {
+                    let purged: Option<LogId> = tx
+                        .get(PURGED)?
+                        .map(|v| {
+                            serde_json::from_slice(v.as_slice())
+                                .map_err(|_| protocol("corrupt purge marker"))
+                        })
+                        .transpose()?;
+                    if let Some(last) = last {
+                        if Some(last) != purged {
+                            let retained = tx
+                                .get(&index_key(ID, last.index))?
+                                .ok_or_else(|| protocol("truncate boundary not retained"))?;
+                            let id: LogId = serde_json::from_slice(retained.as_slice())
+                                .map_err(|_| protocol("invalid truncate boundary"))?;
+                            if id != last {
+                                return Err(protocol("conflicting truncate boundary"));
+                            }
                         }
+                    } else if purged.is_some() {
+                        return Err(protocol("truncate cannot erase purged committed prefix"));
                     }
-                } else if purged.is_some() {
-                    return Err(protocol("truncate cannot erase purged committed prefix"));
-                }
-                if let Some(start) = last.map_or(Some(0), |id| id.index.checked_add(1)) {
-                    tx.delete_range(&index_key(ENTRY, start), &[ENTRY + 1])?;
-                    tx.delete_range(&index_key(ID, start), &[ID + 1])?;
-                }
-                let tail = tx.encode_value(&last)?;
-                tx.put(TAIL, tail.as_slice())?;
-                Ok(Transition::Commit(tx.copy_output(b"")?))
+                    if let Some(start) = last.map_or(Some(0), |id| id.index.checked_add(1)) {
+                        tx.delete_range(&index_key(ENTRY, start), &[ENTRY + 1])?;
+                        tx.delete_range(&index_key(ID, start), &[ID + 1])?;
+                    }
+                    let tail = tx.encode_value(&last)?;
+                    tx.put(TAIL, tail.as_slice())?;
+                    Ok(Transition::Commit(tx.copy_output(b"")?))
+                })
             })
             .await
             .map_err(disk)?;
@@ -735,33 +829,45 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     }
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
         let _order = self.writes.lock().await;
-        self.store
-            .log_transaction(META, move |tx| {
-                let previous: Option<LogId> = tx
-                    .get(PURGED)?
-                    .map(|v| {
-                        serde_json::from_slice(v.as_slice())
-                            .map_err(|_| protocol("corrupt purge marker"))
+        // Application state may be unsynced. Never purge entries whose applied
+        // state a crash could still lose: they are its only replay source.
+        let store = &self.store;
+        self.retry
+            .retry(RaftWrite::Purge, move || async move {
+                store.ensure_applied_durable(id.index).await?;
+                store
+                    .log_transaction(META, move |tx| {
+                        let previous: Option<LogId> = tx
+                            .get(PURGED)?
+                            .map(|v| {
+                                serde_json::from_slice(v.as_slice())
+                                    .map_err(|_| protocol("corrupt purge marker"))
+                            })
+                            .transpose()?;
+                        if previous.is_some_and(|previous| previous.index > id.index) {
+                            return Err(protocol("purge moves backwards"));
+                        }
+                        // Delete only `(previous, id]`: the prefix up to `previous` is already
+                        // gone, and re-covering it would stack ever longer range tombstones.
+                        let start = match previous {
+                            None => Some(0),
+                            Some(previous) => previous.index.checked_add(1),
+                        };
+                        if let Some(start) = start.filter(|start| *start <= id.index) {
+                            for prefix in [ENTRY, ID] {
+                                let end = id
+                                    .index
+                                    .checked_add(1)
+                                    .map(|n| index_key(prefix, n).to_vec())
+                                    .unwrap_or_else(|| vec![prefix + 1]);
+                                tx.delete_range(&index_key(prefix, start), &end)?;
+                            }
+                        }
+                        let bytes = tx.encode_value(&id)?;
+                        tx.put(PURGED, bytes.as_slice())?;
+                        Ok(Transition::Commit(tx.copy_output(b"")?))
                     })
-                    .transpose()?;
-                if previous.is_some_and(|previous| previous.index > id.index) {
-                    return Err(protocol("purge moves backwards"));
-                }
-                let entry_end = id
-                    .index
-                    .checked_add(1)
-                    .map(|n| index_key(ENTRY, n).to_vec())
-                    .unwrap_or_else(|| vec![ENTRY + 1]);
-                let id_end = id
-                    .index
-                    .checked_add(1)
-                    .map(|n| index_key(ID, n).to_vec())
-                    .unwrap_or_else(|| vec![ID + 1]);
-                tx.delete_range(&[ENTRY], &entry_end)?;
-                tx.delete_range(&[ID], &id_end)?;
-                let bytes = tx.encode_value(&id)?;
-                tx.put(PURGED, bytes.as_slice())?;
-                Ok(Transition::Commit(tx.copy_output(b"")?))
+                    .await
             })
             .await
             .map_err(disk)?;

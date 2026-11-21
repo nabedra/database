@@ -1,0 +1,303 @@
+{
+ "run": "mix-scylla",
+ "settings": {
+  "rates": [
+   1,
+   2,
+   5,
+   20,
+   50,
+   100,
+   200,
+   500,
+   1000
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-20T20:43:44.974354+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "ScyllaDB",
+  "engine_version": "6.2.3-0.20250119.bff9ddde1283",
+  "consistency": "QUORUM",
+  "commitlog_sync_by_node": {
+   "172.19.0.2": "batch",
+   "172.19.0.3": "batch",
+   "172.19.0.4": "batch"
+  },
+  "measurement": "persistent native CQL, prepared UPDATE and SELECT at QUORUM, no application retries",
+  "driver_version": "3.29.13"
+ },
+ "summary": {
+  "run": "mix-scylla",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 500,
+  "stop_reason": {
+   "median_p99_ms": 114.792415,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 8.348364,
+    "median_p95_ms": 8.728222,
+    "median_p99_ms": 8.728222,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 8.348364,
+      "median_p99_ms": 8.503229,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 9.350139,
+      "median_p99_ms": 9.350139,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "2": {
+    "reps": 3,
+    "offered": 30,
+    "median_succeeded_rps": 2.0,
+    "median_p50_ms": 6.978643,
+    "median_p95_ms": 9.336109,
+    "median_p99_ms": 9.336109,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 30,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 6.978643,
+      "median_p99_ms": 8.888987,
+      "succeeded": 29,
+      "offered": 29
+     },
+     "update": {
+      "median_p50_ms": 9.336109,
+      "median_p99_ms": 9.336109,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 8.199984,
+    "median_p95_ms": 9.786329,
+    "median_p99_ms": 10.211872,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 8.123015,
+      "median_p99_ms": 9.971093,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 9.9991005,
+      "median_p99_ms": 9.9991005,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 7.605904,
+    "median_p95_ms": 10.233286,
+    "median_p99_ms": 16.378089,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.431394,
+      "median_p99_ms": 16.614595,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 9.733527,
+      "median_p99_ms": 11.29942,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 49.987190652428616,
+    "median_p50_ms": 7.382405,
+    "median_p95_ms": 10.810181,
+    "median_p99_ms": 12.215163,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 7.211888,
+      "median_p99_ms": 11.833412,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 9.66157,
+      "median_p99_ms": 12.178646,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   },
+   "100": {
+    "reps": 3,
+    "offered": 1500,
+    "median_succeeded_rps": 99.97703427545659,
+    "median_p50_ms": 6.863743,
+    "median_p95_ms": 12.569916,
+    "median_p99_ms": 40.362282,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 1500,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 6.69497,
+      "median_p99_ms": 40.362282,
+      "succeeded": 1414,
+      "offered": 1414
+     },
+     "update": {
+      "median_p50_ms": 9.347153,
+      "median_p99_ms": 41.545941,
+      "succeeded": 86,
+      "offered": 86
+     }
+    }
+   },
+   "200": {
+    "reps": 3,
+    "offered": 3000,
+    "median_succeeded_rps": 200.0,
+    "median_p50_ms": 5.375947,
+    "median_p95_ms": 10.14909,
+    "median_p99_ms": 16.387779,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 3000,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 5.300801,
+      "median_p99_ms": 15.465752,
+      "succeeded": 2842,
+      "offered": 2842
+     },
+     "update": {
+      "median_p50_ms": 6.549013,
+      "median_p99_ms": 16.223035,
+      "succeeded": 158,
+      "offered": 158
+     }
+    }
+   },
+   "500": {
+    "reps": 3,
+    "offered": 7500,
+    "median_succeeded_rps": 471.3756823411567,
+    "median_p50_ms": 25.768607,
+    "median_p95_ms": 71.806992,
+    "median_p99_ms": 114.792415,
+    "statuses": {
+     "client_capacity": 399,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 7101,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 26.19074,
+      "median_p99_ms": 108.75932,
+      "succeeded": 6735,
+      "offered": 7113
+     },
+     "update": {
+      "median_p50_ms": 27.709716,
+      "median_p99_ms": 96.593598,
+      "succeeded": 366,
+      "offered": 387
+     }
+    }
+   }
+  }
+ }
+}

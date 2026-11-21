@@ -70,6 +70,9 @@ pub(crate) struct WorkerPools {
     entries: Mutex<BTreeMap<Uuid, Entry>>,
     registration: Mutex<()>,
     closing: Mutex<BTreeMap<Uuid, Uuid>>,
+    /// Secondary pools refused at open (plan section 3 rule 6, O26): the worker
+    /// keeps serving its other pools and reports these pools' replicas lost.
+    refused: Mutex<BTreeMap<Uuid, ProtocolError>>,
     drain_actor: tokio::sync::Mutex<()>,
     _owner: ScratchLease,
 }
@@ -108,6 +111,7 @@ impl WorkerPools {
             )])),
             registration: Mutex::new(()),
             closing: Mutex::new(BTreeMap::new()),
+            refused: Mutex::new(BTreeMap::new()),
             drain_actor: tokio::sync::Mutex::new(()),
             _owner: owner,
         }))
@@ -115,6 +119,47 @@ impl WorkerPools {
 
     pub(crate) fn worker_identity(&self) -> WorkerIdentity {
         self.worker
+    }
+
+    /// Rule 6: records a secondary pool that could not be opened. Its replicas
+    /// are reported lost; the worker keeps serving every other pool.
+    pub(crate) fn mark_refused(&self, id: Uuid, error: ProtocolError) {
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.insert(id, error);
+        }
+    }
+    /// The open error of a refused secondary pool.
+    pub(crate) fn refused(&self, id: Uuid) -> Option<ProtocolError> {
+        self.refused.lock().ok()?.get(&id).cloned()
+    }
+
+    /// Every open pool of this worker, primary first.
+    pub(crate) fn pool_ids(&self) -> Result<Vec<Uuid>, ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| unavailable("worker pool inventory unavailable"))?;
+        let mut ids = vec![self.primary];
+        ids.extend(entries.keys().copied().filter(|id| *id != self.primary));
+        Ok(ids)
+    }
+    /// Rule 6 in `/v1/runtime/stats`: every refused secondary pool, with the
+    /// error class and message that refused it.
+    pub(crate) fn refused_report(&self) -> Vec<serde_json::Value> {
+        let Ok(refused) = self.refused.lock() else {
+            return Vec::new();
+        };
+        refused
+            .iter()
+            .map(|(id, error)| {
+                serde_json::json!({
+                    "pool_id": id,
+                    "class": crate::oltp_replication::authority::control::PoolRefusal::classify(error),
+                    "code": error.code,
+                    "message": error.message,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn get(&self, id: Uuid) -> Result<Option<OltpPool>, ProtocolError> {

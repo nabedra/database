@@ -46,6 +46,10 @@ pub(crate) struct RemoteConfig {
     pub control_peers: Vec<WorkerEnrollment>,
     #[serde(default)]
     pub scoped_oltp: bool,
+    /// `topology.direct_oltp`: route eligible point operations directly once
+    /// `data.direct.v1` is active (default `true`).
+    #[serde(default = "crate::config::direct_oltp_default")]
+    pub direct_oltp: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,11 +72,14 @@ pub(crate) struct RemoteRuntime {
     shared: Arc<WorkerSharedResources>,
     control: Arc<ControlClient>,
     client: Arc<ApplicationClient>,
+    gateway: Arc<super::application::direct::DirectGateway>,
     scope: QueueScope,
     ingress: Executor,
     accepting: AtomicBool,
     stop: watch::Sender<bool>,
     tasks: Mutex<Option<(JoinHandle<Result<(), ProtocolError>>, JoinHandle<()>)>>,
+    /// `data.direct.v1` and `direct_oltp` for the gateway; stopped on shutdown.
+    direct: Arc<super::worker_runtime::direct_capability::DirectSwitch>,
 }
 impl RemoteRuntime {
     pub(crate) async fn open(
@@ -219,15 +226,40 @@ impl RemoteRuntime {
             }
         };
         let refresh = tokio::spawn(directory.run_refresh(control.clone(), stop.subscribe()));
+        // Gateways advertise too: one that cannot settle request ids at the
+        // anchor before going queued must keep the capability inactive.
+        let direct = super::worker_runtime::direct_capability::DirectSwitch::new(
+            control.clone(),
+            WorkerIdentity::from(config.enrollment.transport()),
+            config.direct_oltp,
+        );
+        direct.start();
+        let gateway = super::application::direct::DirectGateway::new(
+            shared.clone(),
+            scope.database.clone(),
+            direct.clone(),
+            Arc::new(super::application::direct::ApiTopology {
+                client: client.clone(),
+                control: control.clone(),
+            }),
+            Arc::new(super::application::direct::WireTransport::new(
+                shared.clone(),
+                transport.client(),
+                control.clone(),
+                crate::oltp_replication::authority::control::ServiceAction::ApiIngress,
+            )),
+        );
         Ok(Arc::new(Self {
             shared,
             control,
             client,
+            gateway,
             scope,
             ingress: Executor::new(2, 16)?,
             accepting: AtomicBool::new(true),
             stop,
             tasks: Mutex::new(Some((task, refresh))),
+            direct,
         }))
     }
     pub(crate) fn cluster_id(&self) -> Uuid {
@@ -248,6 +280,7 @@ impl RemoteRuntime {
     pub(crate) async fn drain(&self) -> Result<(), ProtocolError> {
         self.stop_accepting();
         self.ingress.drain().await;
+        self.direct.stop().await;
         let _ = self.stop.send(true);
         let tasks = self.tasks.lock().map_err(|_| unavailable())?.take();
         if let Some((transport, refresh)) = tasks {
@@ -316,6 +349,9 @@ impl Drop for RemoteRuntime {
 impl HttpRuntime for RemoteRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
+    }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        Some(self.gateway.clone())
     }
     fn scheduler(&self) -> ResourceScheduler {
         self.shared.scheduler()

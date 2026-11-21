@@ -84,6 +84,90 @@ cuts were exercised on a specific build.
 | O31 | Lose the owner after payload quorum, after marker quorum, and during membership change. Restart a voter with empty RAM and retry the UUID against another range. | Retain the exact request and pin. Fence the old owner, validate state transfer before counting the restarted voter and recover the original admission and decision home. Reject a conflicting digest even when the proposed range differs. Keep uncertainty when only one complete copy survives without a safe quorum. Run Q05, R01–R03 and O16. |
 | O32 | Isolate a last complete holder, then prove holder loss while other workers stay live. Repeat after stopping all workers. | Distinguish a partition from proven loss. Reconcile the durable decision at its recorded home before declaring abandonment. Recover any committed exact receipt and data. Begin a new run with an empty queue after full stop and preserve abandonment of pending requests. Run Q06, R04–R06 and O10/O15/O29. |
 
+## Native storage engine
+
+OLTP pools and Events store data in `nabedra-kv`, specified in [the native storage engine plan](../../plans/native-storage-engine.md). Every crash and fault scenario runs on `FaultFs`, and where noted also with real processes and SIGKILL. Label power-loss evidence from `FaultFs` as a fault model, not as physical power-loss evidence (O29 wording). The plan's Tests section lists the existing scenarios each change must also rerun.
+
+| ID | Scenario | Required assertions |
+| --- | --- | --- |
+| NS01 | Differential model: 10⁶ seeded operations (put, journal put, delete, `delete_range`, multi-op batches, snapshots held across flushes and compactions, iterators forward and reverse with bounds, `seek_for_prev`) against a `BTreeMap` oracle | Every get, scan and iteration matches the oracle at the snapshot's sequence. Failing seeds are shrunk and kept as regressions. |
+| NS02 | Atomic batches under 16 readers and 8 writers, with flush and compaction forced every N operations | No reader sees part of a batch. Once `submit` completes, a later read sees the whole batch. |
+| NS03 | A snapshot held during flush, compaction, journal GC and relocation | Reads stay identical. Runs and segments are released only after the snapshot is dropped. |
+| NS04 | Crash at every boundary: each `pwrite`, `fdatasync`, run write, run fsync, manifest append, manifest fsync, `CURRENT` rename, directory fsync, segment preallocation, recycle and relocation, enumerated one by one | After reopening, the state equals the oracle at some prefix p with last synced ack ≤ p ≤ last submit. Every write acknowledged as synced is present. Reopening again changes nothing. |
+| NS05 | Power loss: drop any subset of the unsynced sectors, reorder them, keep the synced ones | Same as NS04. A torn tail becomes an exact prefix (L2). A record named durable by a later one is never dropped silently: it ends in G1 or R1. |
+| NS06 | Torn final record: a partial write of the last group before its sync completed | The store opens with an exact prefix. `recovery_ms` and `tail_truncations` are reported. |
+| NS07 | Bit flips in a synced journal record that a later record names durable (group scope, store-wide scope, header and payload), and in a data block, index block, bloom block, footer, `MANIFEST` record, `CURRENT` and a journal value | Each case gets the section 3 outcome: G1, G2 or G3 quarantine exactly the overlapping scopes, and R1 or R3 refuse the pool. No wrong value is ever returned. `corruption_detected` counts each detection. Store-wide damage found at run time latches `RecoveryRequired` (R5). |
+| NS08 | Group commit: 64 groups × 4 lanes of concurrent synced and unsynced writers on one pool, with 1 query thread and 1 control thread | `journal_syncs < synced_commits`, with the ratio reported. A synced write makes every earlier unsynced write durable under the NS05 model. No waiter holds an executor slot. `/v1/runtime/stats` shows the counters. |
+| NS09 | EIO on `fdatasync` and on `pwrite` (fsyncgate) | The store latches `RecoveryRequired` and never retries. Pending commits return ambiguous. Every alias of the pool shares the latch. Reopening recovers from disk only. |
+| NS10 | Memory: load 4× the worker memory budget into 2 pools at 2.15 GB, then mixed reads and writes | Charges stay within `cache + wb + pool overhead`. cgroup `memory.peak` stays under the limit with no OOM. Writers stall instead of overrunning. |
+| NS11 | ENOSPC during a journal write, a flush, a compaction and a manifest write | An explicit `NoSpace` error with no corruption. Background work resumes after space frees up. Committed data stays intact. |
+| NS12 | Recovery time with a full replay window and a full `max_journal_bytes` | `recovery_ms` is recorded on the evidence host, and G6 holds. |
+| NS13 | Raft log on journal values: append, `truncate_after`, purge, a lagging group that pins the oldest segment, crashes during relocation | Log reads match the oracle. Segments are recycled. Relocated bytes are counted. No locator dangles after any crash point. |
+| NS14 | Snapshot install (staged and ingest), crashing at each step | The old generation stays active until activation. The new generation and the applied position activate atomically. Orphaned runs and stages are cleaned up. |
+| NS15 | Platform sync | On Linux, journal syncs are `fdatasync` and file and directory syncs are `fsync`; on macOS every sync is `F_FULLFSYNC`. Asserted through the `FaultFs` call log, and on Linux confirmed with `strace -f -e trace=fdatasync,fsync`. |
+| NS16 | SIGKILL of a real worker under write load, 50 iterations | Every acknowledged write is present and recovery succeeds every time. |
+| NS17 | Stress: random sleeps in flush, compaction, GC and the journal thread, with cancelled callers | No deadlock, no order guard released before visibility, no leaked charge. The Raft-append cancellation regression passes. |
+| NS18 | Native microbench and the section 8 gate | Microbench: synced and unsynced 100 B and 1 KiB puts with 1 to 64 writers, hot and cold gets, scans of 10 and 128, Raft appends of 64 × 1 KiB, purges, a 256 MiB snapshot install, recovery. Report p50, p95, p99, throughput, fsyncs per commit, write amplification, `stall_ms` and RSS. End to end: G1 to G7 with the ScyllaDB numbers alongside. |
+| NS19 | Retired (mixed RocksDB and native replicas). The ID is not reused. | none |
+| NS20 | Backups native to native: back up a native cluster with `oltp-backup-s3`, restore it into a fresh native cluster | Checksums, schema and per-range hashes match (O19). |
+| NS21 | Iterator edges: empty ranges, bounds at both ends, direction switches, `seek_for_prev` on a tombstoned key, a range tombstone straddling runs | Matches the oracle. |
+| NS22 | Clean break: open a format 1 pool, a raw RocksDB directory, a legacy `OltpEngine` store and an Events root with `rocksdb/` | Each fails with `UnsupportedFormat` naming the path. The directory is byte-identical afterwards. |
+| NS23 | Group re-sync from peers, RF3 with real workers: damage a synced record of group g (G1), then separately a run block holding only g's keys (G2) and a journal value of g (G3) | The worker stays up and every other group serves. g's damaged replica never votes, acknowledges or serves after restart, checked in Raft RPC logs and stats. Control replaces it under a new identity, the new replica catches up from a snapshot, and every acknowledged write of g is present. The damaged bytes are deleted only after the membership change commits. With a second voter of g stopped, g stays quarantined and nothing is deleted. At RF1, g is unavailable with `StorageCorrupt` and nothing is deleted. |
+| NS24 | Refused pool: R1, R2 (EIO on a recovery read), R3 and R6 on one of two pools | That pool is refused with the matching error. The worker stays up and the other pool serves. Control treats the refused pool's replicas as lost (O26). An EIO region is never truncated as a torn tail. |
+| NS25 | Tail classification with the ScyllaDB parity cases: all-zero header, older-epoch record, short segment end, torn header, torn payload, each without evidence | Local recovery to an exact prefix (L1, L2), correct counters, and a second open identical to the first. |
+| NS26 | No RocksDB anywhere | `cargo tree -e normal` for every O02 build and for `server/events` lists none of `rocksdb`, `librocksdb-sys`, `bindgen`, `clang-sys`, `libz-sys`, `bzip2-sys`. Both Dockerfiles install no clang, libclang or cmake, and both images build. `scripts/check_engine_features.py` passes. The section 7 `rg` check returns nothing. |
+| NS27 | Events on `nabedra-kv` | The Events unit tests, `server/events/tests/acceptance.py` and `snapshot_gate.py` pass. Under `FaultFs`, every synced Events write survives a crash at each boundary. The last log id matches the oracle after truncate and purge. A quarantined Events group is not started and is reported. |
+| NS28 | Coverage after deleting the legacy engine | Each scenario the deleted tests named (O01, O02, O03, O04, O06, O07, O08, O10, O11, O15, O21, F03) has a named pool-path test that passes: `server/src/oltp_runtime/ns28_tests.rs` or an existing pool, MVCC or runtime test. Keep the scenario-to-test mapping with the evidence. |
+
+## Direct point protocol
+
+Eligible point operations commit with one Data entry at the key range's leader once
+`data.direct.v1` is active ([the direct path plan](../../plans/oltp-direct-path.md)).
+Use real workers over mTLS for every row except D06. `direct_oltp: false` restores the
+queued path. Run the existing OLTP library suite, the OLTP integration tests,
+`scripts/acceptance_oltp.py`, both ORM suites and the scoped acceptance runners with
+`direct_oltp` on and off. The process runner is `server/tests/oltp_direct_acceptance.py`
+(host processes: three registered workers and enrolled API gateways, or `nabedra-db serve`).
+
+| ID | Scenario | Required assertions |
+| --- | --- | --- |
+| D01 | All eligible operations through both ORMs at RF1 and RF3 | Results, errors and types equal the queued path for the same program. Stats show zero queue copies and one Data entry per mutation. |
+| D02 | Kill the gateway after the leader proposes, then retry the same ID and body through another gateway | One committed version, the original result, one dedup record. |
+| D03 | Same ID with a different body on the same key, then on a different key | The first is a conflict. The second executes. |
+| D04 | Kill the leader before quorum and after quorum | No acknowledged write is lost and none applies twice. The retry completes on the new leader. |
+| D05 | Pause one follower, then two | One paused: writes succeed within the deadline. Two paused: no success response and the row is unchanged. |
+| D06 | A snapshot scan at `s` races direct commits, including across a Timestamp leader change | The scan sees every commit at or below `s` and none above. No commit appears below a snapshot that already read the range. |
+| D07 | Split a range and move its leader during a write load | Each request gets one outcome, with no lost or duplicate rows. Stale routes refresh once. |
+| D08 | Direct and queued writers on the same keys, including an intent held open | Histories match a serial order. Direct requests fall back while the intent exists. |
+| D09 | Kill all workers under write load, then cold start | Every acknowledged write is present. Dedup records replay acknowledged IDs. |
+| D10 | Drop sessions mid-stream, exhaust a lane, offer an old one-shot peer | Callers see unknown-outcome or overload errors, Raft progress continues, and the old peer still interoperates. |
+| D11 | Drop a table and publish an index during direct writes | No row lands in a dropped table and no write uses a retired schema epoch. |
+| D12 | Offer more load than the leader's in-flight budget | Explicit `429` before execution, bounded memory, and every acknowledged ID verified afterwards. |
+
+D05 "row unchanged" applies to a `not_applied` answer. When the gateway answers
+`outcome_unknown`, the proposed entry may still commit once the followers return. A
+retry of the same ID and body then returns the one result, and the row holds either the
+old or the new value, never both and never twice.
+
+The activation boundary is part of O15 and D03. A queued eligible request, a get
+included, reserved before `data.direct.v1` activated has no forward marker. Two cases
+are required. In the first, the request is in flight at activation and is retried with
+the same ID after it: it runs once and returns the original result, and the same ID with
+another body is a conflict. In the second, a cold start abandons the request before
+activation and it is retried after: the answer is `404` abandoned, and the retry never
+runs. Run both with `direct_oltp` on and off: `server/tests/oltp_runtime_acceptance.py
+--scenario activation-boundary`, which `failure-boundaries` (O15) also runs.
+
+A paused follower is TCP-alive but answers nothing, unlike a killed one. D05 regressions
+(LIVE1) also require these:
+- Raft progress and the Timestamp leader change continue with one follower paused. The
+  paused peer fills only its own outgoing lanes.
+- Queued writes commit once the owner has removed the paused holder.
+- After resuming, the worker joins the ready set again without a restart.
+
+D09 at RF3 needs each pool on a Docker-profile mount, because a cold start refuses a pool
+without one. Host processes get tmpfs mounts through `sudo -n` (Linux CI).
+
 ## Mapping to existing requirements
 
 | Scheduler IDs | OLTP evidence |

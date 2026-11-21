@@ -126,5 +126,62 @@ class SnapshotOracleTest(unittest.TestCase):
             verify(rows, before, [{'key': 0, 'value': 2, 'status': 'unresolved'}], pending)
 
 
+
+class GetAndMixTest(unittest.TestCase):
+    def test_gets_must_return_the_previous_snapshot_or_an_unresolved_value(self):
+        rows = Rows({0: 5, 1: 6})
+        pending = {1: {9}}
+        reads = [{'op': 'get', 'key': 0, 'value': 1, 'status': 'succeeded', 'read_value': 5},
+                 {'op': 'get', 'key': 1, 'value': 2, 'status': 'succeeded', 'read_value': 9},
+                 {'op': 'get', 'key': 0, 'value': 3, 'status': 'rejected'}]
+        result, _ = verify(rows, rows.values, reads, pending)
+        self.assertEqual(result['read_mismatches'], 0)
+        self.assertEqual(result['mismatches'], 0)
+        stale = [{'op': 'get', 'key': 0, 'value': 4, 'status': 'succeeded', 'read_value': 4}]
+        result, _ = verify(rows, rows.values, stale, {})
+        self.assertEqual(result['first_read_mismatches'], [{'key': 0, 'expected': 5, 'actual': 4}])
+        self.assertEqual(result['mismatches'], 1)
+
+    def test_mix_dispatches_gets_and_updates_and_stops_on_p99(self):
+        rows = {key: 0 for key in range(100)}
+        clock_ns = 0
+
+        def sleep(seconds):
+            nonlocal clock_ns
+            clock_ns += round(seconds * 1e9)
+
+        def update(key, value, _request_id):
+            sleep(0.001)
+            rows[key] = value
+            return {'status': 'succeeded'}
+
+        def get(key, _request_id):
+            sleep(0.001)
+            return {'status': 'succeeded', 'read_value': rows[key]}
+
+        adapter = Mock(spec=['seed', 'read', 'update', 'get', 'close'])
+        adapter.seed.return_value = None
+        adapter.read.side_effect = lambda _keys: dict(rows)
+        adapter.update.side_effect = update
+        adapter.get.side_effect = get
+        args = SimpleNamespace(rates=parse_rates('2,4'), seconds=5.0, warmup_seconds=5.0, repetitions=1,
+                               clients=32, rows=100, seed=3, timeout=10, operation='mix', read_fraction=0.5,
+                               stop_p99_ms=0.5, stop_on_rejection=False)
+        clock = SimpleNamespace(monotonic_ns=lambda: clock_ns, sleep=sleep)
+        with TemporaryDirectory() as directory, patch('benchmark_oltp_workload.time', clock):
+            result = run_workload(args, adapter, Path(directory), {})
+        self.assertTrue(result['correctness_verified'])
+        self.assertEqual(result['stopped_after_rate'], 2)
+        self.assertEqual([phase['label'] for phase in result['phases']], ['2-warmup', '2-rep1'])
+        operations = result['phases'][1]['by_operation']
+        self.assertEqual(set(operations), {'get', 'update'})
+        self.assertEqual(sum(op['offered'] for op in operations.values()), 10)
+        self.assertEqual(sum(phase['offered'] for phase in result['phases']), 20)
+        self.assertEqual(adapter.get.call_count + adapter.update.call_count, 20)
+        self.assertGreater(adapter.get.call_count, 0)
+        self.assertGreater(adapter.update.call_count, 0)
+        self.assertEqual(list(result['median_succeeded_rps']), ['2'])
+
+
 if __name__ == '__main__':
     unittest.main()

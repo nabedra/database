@@ -1,11 +1,13 @@
 //! Actual typed OpenRaft application over shared pool groups. Application
-//! effects, applied position, membership and last response use one sync batch.
+//! effects, applied position, membership and last response use one batch per
+//! entry. That batch is unsynced when the group's synced log shares its WAL:
+//! a crash loses only a WAL suffix, and the surviving log replays it.
 use super::{
     authority::consensus::{Applied, Consensus, ConsensusFuture, ReadBarrier},
     entry::{CommittedLeaderId, LogId, Payload, stored_membership},
     multiplex::{ReplicaLease, ReplicaMetadata},
     owned::{OwnedCommand, serialized_digest},
-    typed_log::{TypedConfig, TypedLogStore},
+    typed_log::{MAX_APPEND_ENTRIES, TypedConfig, TypedLogStore},
     types::{AppliedPosition, Digest, GroupKind},
 };
 use crate::{
@@ -23,7 +25,17 @@ use openraft::{
     vote::RaftLeaderId,
 };
 use sha2::{Digest as _, Sha256};
-use std::{future::Future, io, sync::Arc};
+use std::{
+    future::Future,
+    io,
+    pin::Pin,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use transient::{HostRetry, RaftHealthStats, RaftWrite, transient};
 
 const META: TransactionBudget = TransactionBudget {
     scratch_bytes: 256 << 10,
@@ -71,6 +83,8 @@ impl TypedMachine<super::authority::config::CatalogConfig>
 pub(crate) struct HostedState<C: TypedConfig, M: TypedMachine<C>> {
     machine: M,
     _resident: ReplicaLease,
+    /// Shared with the host's log store (RV-APPLY F1).
+    retry: Arc<HostRetry>,
     _config: std::marker::PhantomData<C>,
 }
 impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
@@ -85,6 +99,7 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
         Ok(Self {
             machine,
             _resident: resident,
+            retry: Arc::default(),
             _config: std::marker::PhantomData,
         })
     }
@@ -103,7 +118,14 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
             .snapshot_membership(file.clone(), META)
             .await
             .map_err(disk)?;
-        let owner = Arc::new(self._resident.metadata(256 << 10).map_err(disk)?);
+        // Waits for room: a refusal here would stop the core (RV-APPLY F3).
+        // Every other holder releases on drop.
+        let owner = Arc::new(
+            self.retry
+                .or_stopped(self._resident.metadata_wait(256 << 10))
+                .await
+                .map_err(disk)?,
+        );
         let membership = match raw {
             Some(raw) => stored_membership(raw.as_slice()).map_err(disk)?,
             None => StoredMembershipOf::<C>::default(),
@@ -123,11 +145,18 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     async fn builder(&self) -> TypedSnapshotBuilder<C, M> {
         // Capture the cut when OpenRaft asks for a builder, not when a later
         // background build polls it after application has advanced.
-        let cut = self.store().export_snapshot(META).await.map_err(disk);
+        let cut = self.export().await.map_err(disk);
         TypedSnapshotBuilder {
             owner: self.clone(),
             cut: Some(cut),
         }
+    }
+    async fn export(&self) -> Result<GroupSnapshot, ProtocolError> {
+        #[cfg(test)]
+        if self.retry.take_export_fault() {
+            return Err(crate::oltp::pool::no_space());
+        }
+        self.store().export_snapshot(META).await
     }
 }
 #[derive(Clone)]
@@ -178,6 +207,14 @@ where
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
             entry.ensure_charged().map_err(disk)?;
+            #[cfg(test)]
+            if self.retry.take_apply_fault() {
+                return Err(disk(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "test: injected apply failure",
+                    Outcome::Unknown,
+                )));
+            }
             let position = position(entry.log_id);
             let class = execution_class(self.store());
             let shared = self.store().resources().clone();
@@ -205,9 +242,13 @@ where
                 membership: None,
             };
             let raw = match entry.payload() {
+                // A transient failure voided the write; the replay check in
+                // `GroupStore::mutate` makes a repeated entry idempotent (F1).
                 Payload::Normal(command) => Some(
-                    self.machine
-                        .apply(meta, command.clone())
+                    self.retry
+                        .retry(RaftWrite::Apply, || {
+                            self.machine.apply(meta.clone(), command.clone())
+                        })
                         .await
                         .map_err(|error| {
                             tracing::error!(group=%self.store().identity().group_id,kind=?self.store().identity().kind,node=self._resident.node_id(),index=position.index,code=?error.code,outcome=?error.outcome,"typed state application failed");
@@ -215,31 +256,40 @@ where
                         })?,
                 ),
                 Payload::Membership(membership) => {
-                    self.store()
-                        .transaction_with_membership(
-                            meta,
-                            META,
-                            Some(StoredMembershipOf::<C>::new(
-                                Some(entry.log_id),
-                                membership.clone(),
-                            )),
-                            |tx| Ok(Transition::Commit(tx.copy_output(b"null")?)),
-                        )
+                    let store = self.store();
+                    self.retry
+                        .retry(RaftWrite::Apply, || {
+                            store.transaction_with_membership(
+                                meta.clone(),
+                                META,
+                                Some(StoredMembershipOf::<C>::new(
+                                    Some(entry.log_id),
+                                    membership.clone(),
+                                )),
+                                |tx| Ok(Transition::Commit(tx.copy_output(b"null")?)),
+                            )
+                        })
                         .await
                         .map_err(disk)?;
                     None
                 }
                 Payload::Blank => {
-                    self.store()
-                        .transaction(meta, META, |tx| {
-                            Ok(Transition::Commit(tx.copy_output(b"null")?))
+                    let store = self.store();
+                    self.retry
+                        .retry(RaftWrite::Apply, || {
+                            store.transaction(meta.clone(), META, |tx| {
+                                Ok(Transition::Commit(tx.copy_output(b"null")?))
+                            })
                         })
                         .await
                         .map_err(disk)?;
                     None
                 }
             };
-            if matches!(self.store().identity().kind, GroupKind::Data { .. } | GroupKind::Catalog) {
+            if matches!(
+                self.store().identity().kind,
+                GroupKind::Data { .. } | GroupKind::Catalog
+            ) {
                 tracing::debug!(group=%self.store().identity().group_id, node=self._resident.node_id(),
                     index=position.index, "typed Raft state applied");
             }
@@ -248,19 +298,25 @@ where
                     let input = raw.clone();
                     shared
                         .execute(class, position.index, 0, move || {
-                            let bytes = crate::oltp::mvcc::json_decode_budget(input.as_slice())?;
-                            if bytes > C::MAX_REPLY_DECODE_BYTES {
-                                return Err(invalid(
-                                    "typed durable response exceeds validated decode budget",
-                                ));
-                            }
-                            Ok(bytes)
+                            crate::oltp::mvcc::json_decode_budget(input.as_slice())
                         })
                         .await
                         .map_err(disk)?
                 } else {
                     1
                 };
+                // The entry applied durably on every replica; only this
+                // proposer's answer cannot be decoded within its budget. Drop
+                // the responder (the caller sees an unknown outcome) and keep
+                // applying instead of stopping the core (RV-APPLY F6).
+                if required > C::MAX_REPLY_DECODE_BYTES {
+                    tracing::error!(group=%self.store().identity().group_id, node=self._resident.node_id(),
+                        index=position.index, required, limit=C::MAX_REPLY_DECODE_BYTES,
+                        "typed durable response exceeds the validated decode budget; dropping the proposer's reply");
+                    RaftHealthStats::bump(&self.retry.stats().replies_dropped);
+                    drop(responder);
+                    continue;
+                }
                 // Independent precharged reply-decode capacity is acquired
                 // before native/CPU. Neither transport wire arena is needed.
                 let owner = Arc::new(shared.reserve_reply_decode(required).await.map_err(disk)?);
@@ -281,6 +337,38 @@ where
         }
         Ok(())
     }
+    /// RV-APPLY F2. OpenRaft builds policy snapshots with `force == false`;
+    /// a transient export failure (a full device, capacity) defers the build
+    /// instead of stopping the core, and builds pause for
+    /// [`SNAPSHOT_DEFERRAL`]. Any other failure (corruption, a latched pool,
+    /// quarantine) still reaches OpenRaft and stops the core. A forced build
+    /// retries transient failures.
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
+        if !force && self.retry.snapshots_deferred() {
+            RaftHealthStats::bump(&self.retry.stats().snapshot_builds_deferred);
+            return None;
+        }
+        let cut = if force {
+            self.retry
+                .retry(RaftWrite::BuildSnapshot, || self.export())
+                .await
+        } else {
+            self.export().await
+        };
+        match cut {
+            Err(error) if !force && transient(&error).is_some() && !self.retry.is_stopping() => {
+                tracing::warn!(group=%self.store().identity().group_id, node=self._resident.node_id(),
+                    code=?error.code, %error, "typed snapshot build deferred after a transient error");
+                RaftHealthStats::bump(&self.retry.stats().snapshot_builds_deferred);
+                self.retry.defer_snapshots(SNAPSHOT_DEFERRAL);
+                None
+            }
+            cut => Some(TypedSnapshotBuilder {
+                owner: self.clone(),
+                cut: Some(cut.map_err(disk)),
+            }),
+        }
+    }
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.builder().await
     }
@@ -295,8 +383,11 @@ where
                 "snapshot bytes differ from typed Raft metadata",
             ));
         }
-        self.store()
-            .install_snapshot(snapshot.file, META)
+        let store = self.store();
+        self.retry
+            .retry(RaftWrite::InstallSnapshot, || {
+                store.install_snapshot(snapshot.file.clone(), META)
+            })
             .await
             .map_err(disk)
     }
@@ -308,6 +399,99 @@ where
     }
 }
 
+/// How long policy snapshot builds pause after a transient failure (F2).
+const SNAPSHOT_DEFERRAL: Duration = Duration::from_secs(1);
+/// Cores one host can run over its lifetime: the first and the supervisor's
+/// restarts (RV-APPLY F4).
+pub(crate) const MAX_CORES: usize = 8;
+type HostRaft<C, M> = Raft<C, HostedState<C, M>>;
+type Respawn<C, M> = Box<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<HostRaft<C, M>, ProtocolError>> + Send>>
+        + Send
+        + Sync,
+>;
+/// The current OpenRaft core of a host. It dereferences to that core, so
+/// callers and the replica's network endpoint follow a supervisor restart
+/// (F4) without holding a stale handle. Earlier cores stay allocated (stopped)
+/// until the host drops; there are at most [`MAX_CORES`].
+pub(crate) struct RaftCores<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    cores: [OnceLock<HostRaft<C, M>>; MAX_CORES],
+    current: AtomicUsize,
+    /// The current core's index, published after each replacement so
+    /// watchers of a core's metrics follow a restart (RV-FINAL H1).
+    generation: tokio::sync::watch::Sender<usize>,
+}
+impl<C, M> RaftCores<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    fn new(raft: HostRaft<C, M>) -> Self {
+        let cores: [OnceLock<HostRaft<C, M>>; MAX_CORES] = std::array::from_fn(|_| OnceLock::new());
+        let _ = cores[0].set(raft);
+        Self {
+            cores,
+            current: AtomicUsize::new(0),
+            generation: tokio::sync::watch::Sender::new(0),
+        }
+    }
+    /// How many times this host's core was replaced.
+    pub(crate) fn restarts(&self) -> usize {
+        self.current.load(Ordering::Acquire)
+    }
+    fn exhausted(&self) -> bool {
+        self.restarts() + 1 >= MAX_CORES
+    }
+    fn replace(&self, raft: HostRaft<C, M>) -> Result<(), HostRaft<C, M>> {
+        let next = self.restarts() + 1;
+        let Some(slot) = self.cores.get(next) else {
+            return Err(raft);
+        };
+        slot.set(raft)?;
+        self.current.store(next, Ordering::Release);
+        self.generation.send_replace(next);
+        Ok(())
+    }
+    /// The current core's index and that same core's metrics.
+    pub(crate) fn current_metrics(
+        &self,
+    ) -> (
+        usize,
+        openraft::type_config::alias::WatchReceiverOf<C, openraft::RaftMetrics<C>>,
+    ) {
+        let index = self.current.load(Ordering::Acquire);
+        let core = self.cores[index]
+            .get()
+            .expect("the current Raft core is set before it is published");
+        (index, core.metrics())
+    }
+    /// Changes to the current core's index. Closes when the host drops.
+    pub(crate) fn subscribe_restarts(&self) -> tokio::sync::watch::Receiver<usize> {
+        self.generation.subscribe()
+    }
+    /// The current core has not stopped (`RaftMetrics::running_state`).
+    pub(crate) fn is_running(&self) -> bool {
+        use openraft::type_config::async_runtime::watch::WatchReceiver;
+        self.metrics().borrow_watched().running_state.is_ok()
+    }
+}
+impl<C, M> std::ops::Deref for RaftCores<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    type Target = HostRaft<C, M>;
+    fn deref(&self) -> &Self::Target {
+        self.cores[self.current.load(Ordering::Acquire)]
+            .get()
+            .expect("the current Raft core is set before it is published")
+    }
+}
+
 /// Constructed only by the hosted-replica manager after validating placement,
 /// permanent node identity, membership and the matching resident lease.
 pub(crate) struct RaftConsensus<C, M>
@@ -315,19 +499,36 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    pub(crate) raft: Raft<C, HostedState<C, M>>,
+    pub(crate) raft: Arc<RaftCores<C, M>>,
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
+    /// Guards the single direct-leadership watcher of a Data replica. The
+    /// watcher follows every core of the host (RV-FINAL H1).
+    pub(in crate::oltp_replication) direct_watch: std::sync::Once,
+    /// This host's claim on deferred application sync. Released on shutdown,
+    /// or when the host drops (RV-T2 Q5); clears only this host's claim.
+    deferred_applies: std::sync::Mutex<Option<crate::oltp::pool::DeferredApplies>>,
+    retry: Arc<HostRetry>,
+    respawn: Respawn<C, M>,
+    restarts: tokio::sync::Mutex<()>,
+    closed: AtomicBool,
 }
-/// Single-entry batching is the initial typed storage/transport contract. It
-/// bounds transient batches independently of total retained log/table size.
-pub(crate) fn single_entry_config(
+/// Entries per AppendEntries RPC. A peer whose `nabedra-otp/2` session
+/// negotiated multi-entry appends receives up to this many entries (and about
+/// 1 MiB) per RPC, which its log writes as synced batches. The typed network
+/// sends one entry per RPC to an older one-shot peer.
+pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = MAX_APPEND_ENTRIES as u64;
+/// Byte-bounded batching. Client writes coalesce into one log append of at
+/// most `MAX_APPEND_ENTRIES` entries without lingering, and the log writes
+/// each append as synced batches of at most 1 MiB. Bounds transient batches
+/// independently of total retained log/table size.
+pub(crate) fn batched_config(
     mut config: openraft::Config,
 ) -> Result<Arc<openraft::Config>, ProtocolError> {
-    config.max_payload_entries = 1;
-    config.max_append_entries = Some(1);
-    config.api_batch_capacity = Some(1);
+    config.max_payload_entries = REPLICATION_PAYLOAD_ENTRIES;
+    config.max_append_entries = Some(MAX_APPEND_ENTRIES as u64);
+    config.api_batch_capacity = Some(MAX_APPEND_ENTRIES as u64);
     config.api_channel_size = Some(64);
     config.api_batch_linger_ms = Some(0);
     config
@@ -340,42 +541,144 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
-    pub(crate) async fn start(
+    /// Production passes the authenticated `TypedNetworkFactory`; a
+    /// single-voter test may pass a network that is never called.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn start<N>(
         config: Arc<openraft::Config>,
-        network: super::typed_network::TypedNetworkFactory<C>,
+        network: N,
         log: TypedLogStore<C>,
         state: HostedState<C, M>,
-    ) -> Result<Arc<Self>, ProtocolError> {
-        if config.max_payload_entries != 1
-            || config.max_append_entries != Some(1)
-            || config.api_batch_capacity != Some(1)
+    ) -> Result<Arc<Self>, ProtocolError>
+    where
+        N: openraft::network::RaftNetworkFactory<C> + Clone + Send + Sync + 'static,
+        N::Network: openraft::network::NetSnapshot<C, SnapshotData = TypedSnapshot>,
+    {
+        Self::start_with(config, network, log, state, Arc::default()).await
+    }
+    /// [`Self::start`] counting into the worker's `stats` (`/v1/runtime/stats`).
+    pub(crate) async fn start_with<N>(
+        config: Arc<openraft::Config>,
+        network: N,
+        mut log: TypedLogStore<C>,
+        mut state: HostedState<C, M>,
+        stats: Arc<RaftHealthStats>,
+    ) -> Result<Arc<Self>, ProtocolError>
+    where
+        N: openraft::network::RaftNetworkFactory<C> + Clone + Send + Sync + 'static,
+        N::Network: openraft::network::NetSnapshot<C, SnapshotData = TypedSnapshot>,
+    {
+        if config.max_payload_entries != REPLICATION_PAYLOAD_ENTRIES
+            || config.max_append_entries != Some(MAX_APPEND_ENTRIES as u64)
+            || config.api_batch_capacity != Some(MAX_APPEND_ENTRIES as u64)
+            || config.api_batch_linger_ms != Some(0)
             || !log.has_resident()
             || state.store().identity() != log.group().identity()
             || !Arc::ptr_eq(state.store().resources(), log.group().resources())
         {
             return Err(invalid(
-                "typed host requires matching group/pool and validated single-entry batching",
+                "typed host requires matching group/pool and validated bounded batching",
             ));
         }
-        let raft = Raft::new(
-            state._resident.node_id(),
-            config,
-            network,
-            log.clone(),
-            state.clone(),
-        )
-        .await
-        .map_err(|_| unavailable())?;
+        // Before Raft can replay or apply anything: unsynced application is
+        // safe only when the log shares this state's WAL. Otherwise every
+        // application write stays synced.
+        // The token lives in the host. If `Raft::new` fails it drops here, so no
+        // host that never started leaves deferral on (RV-NS6 F6).
+        let deferred_applies = state.store().defer_apply_sync(log.group());
+        if deferred_applies.is_none() {
+            tracing::warn!(group=%state.store().identity().group_id,
+                "typed Raft log and state use different pools; application stays synced");
+        }
+        let retry = Arc::new(HostRetry::new(stats));
+        log.set_retry(retry.clone());
+        state.retry = retry.clone();
+        // Every core of this host runs on this same log and state (F4).
+        let respawn: Respawn<C, M> = {
+            let node = state._resident.node_id();
+            let (log, state) = (log.clone(), state.clone());
+            Box::new(move || {
+                let (config, network) = (config.clone(), network.clone());
+                let (log, state) = (log.clone(), state.clone());
+                Box::pin(async move {
+                    Raft::new(node, config, network, log, state)
+                        .await
+                        .map_err(|_| unavailable())
+                })
+            })
+        };
+        let raft = respawn().await?;
         Ok(Arc::new(Self {
-            raft,
+            raft: Arc::new(RaftCores::new(raft)),
             log,
             state,
             membership_changes: tokio::sync::Mutex::new(()),
+            direct_watch: std::sync::Once::new(),
+            deferred_applies: std::sync::Mutex::new(deferred_applies),
+            retry,
+            respawn,
+            restarts: tokio::sync::Mutex::new(()),
+            closed: AtomicBool::new(false),
         }))
     }
+    /// This host's retry and health counters.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn health(&self) -> &Arc<RaftHealthStats> {
+        self.retry.stats()
+    }
+    #[cfg(test)]
+    pub(crate) fn retry(&self) -> &Arc<HostRetry> {
+        &self.retry
+    }
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+    /// RV-APPLY F4: runs a stopped core again on the same log and state. The
+    /// old core's storage loops end first, so it never writes beside the new
+    /// one. No-op while the current core runs; fails after shutdown or once
+    /// the host used all [`MAX_CORES`].
+    pub(crate) async fn restart(&self) -> Result<(), ProtocolError> {
+        let _restart = self.restarts.lock().await;
+        if self.is_closed() || self.raft.exhausted() {
+            return Err(unavailable());
+        }
+        if self.raft.is_running() {
+            return Ok(());
+        }
+        self.retry.stop();
+        let _ = self.raft.shutdown().await;
+        self.log.drain().await;
+        if self.is_closed() {
+            return Err(unavailable());
+        }
+        self.retry.resume();
+        let raft = (self.respawn)().await?;
+        if let Err(raft) = self.raft.replace(raft) {
+            self.retry.stop();
+            let _ = raft.shutdown().await;
+            return Err(unavailable());
+        }
+        tracing::warn!(group=%self.state.store().identity().group_id, node=self.state._resident.node_id(),
+            restarts=self.raft.restarts(), "typed Raft core restarted on its log and state");
+        Ok(())
+    }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {
+        // Storage retries and waits end before OpenRaft is asked to stop, so a
+        // core blocked in storage never holds shutdown up (F1). A restart in
+        // progress finishes first; the second stop covers what it resumed.
+        self.closed.store(true, Ordering::Release);
+        self.retry.stop();
+        let _restart = self.restarts.lock().await;
+        self.retry.stop();
         let stopped = self.raft.shutdown().await;
         self.log.drain().await;
+        // No running log replays unsynced application any more (RV-T2 Q5).
+        drop(
+            self.deferred_applies
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
         stopped.map_err(|_| unavailable())
     }
 }
@@ -387,6 +690,12 @@ where
     fn propose(&self, command: OwnedCommand<C::Command>) -> ConsensusFuture<'_, Applied<C::Reply>> {
         Box::pin(async move {
             command.ensure_charged()?;
+            // A full device: nothing would commit until space frees up, so
+            // the leader says so before proposing (RV-APPLY F1).
+            if self.retry.out_of_space() {
+                RaftHealthStats::bump(&self.retry.stats().proposals_refused_no_space);
+                return Err(crate::oltp::pool::no_space());
+            }
             // Reserve before client_write: saturation is a typed pre-proposal
             // outcome, never a fatal WriteLogs error after Raft accepts it.
             command.reserve_raft_metadata(
@@ -410,13 +719,47 @@ where
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        Box::pin(self.read_barrier(ReadPolicy::ReadIndex))
+    }
+    fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
+            match self.read_barrier(ReadPolicy::LeaseRead).await {
+                Ok(barrier) => Ok(barrier),
+                // A stale lease (or any lease failure) falls back to a
+                // quorum round trip.
+                Err(_) => self.read_barrier(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
+    fn current_leader(&self) -> Option<u64> {
+        use openraft::type_config::async_runtime::watch::WatchReceiver;
+        // A stopped core's metrics may still name a leader (RV-APPLY F4).
+        let metrics = self.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        metrics
+            .running_state
+            .is_ok()
+            .then_some(metrics.current_leader)
+            .flatten()
+    }
+    fn local_node(&self) -> Option<u64> {
+        Some(self.state._resident.node_id())
+    }
+}
+impl<C, M> RaftConsensus<C, M>
+where
+    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    M: TypedMachine<C>,
+{
+    async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
+        {
+            let lease = matches!(policy, ReadPolicy::LeaseRead);
             let barrier = self
                 .raft
-                .ensure_linearizable(ReadPolicy::ReadIndex)
+                .ensure_linearizable(policy)
                 .await
                 .map_err(|error| {
-                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed ReadIndex failed");
+                    tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
                     unavailable()
                 })?;
             let applied = self
@@ -432,7 +775,7 @@ where
             Ok(ReadBarrier {
                 applied: applied.position,
             })
-        })
+        }
     }
 }
 pub(crate) fn position(id: LogId) -> AppliedPosition {
@@ -470,3 +813,8 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
         _ => ExecutionClass::Query,
     }
 }
+
+pub(crate) mod direct_leadership;
+#[cfg(test)]
+mod tests;
+pub(crate) mod transient;

@@ -2,6 +2,7 @@ import { randomUUID, X509Certificate } from "node:crypto"
 import { readFileSync } from "node:fs"
 import * as http from "node:http"
 import * as https from "node:https"
+import type * as net from "node:net"
 import * as tls from "node:tls"
 import {
   AuthenticationError,
@@ -53,6 +54,8 @@ interface ConnectionOptions {
   timeout?: number
   caFile?: string | null
   database?: string | null
+  /** Agent for exchanges that pass none. Default: a keep-alive agent; false opens one connection per call. */
+  agent?: http.Agent | false
 }
 
 interface ExchangeOptions {
@@ -67,6 +70,9 @@ interface ExchangeOptions {
 }
 
 const maxBody = 8 * 1024 * 1024
+const maxIdleSockets = 4
+// Below the server's 5 s HTTP/1.1 header read timeout, which also ends idle connections.
+const idleSocketMs = 2_000
 const maxTimerMs = 2_147_483_647
 const mutations = new Set([
   "table.create", "table.drop", "table.insert", "table.insert_many", "table.update",
@@ -402,6 +408,7 @@ export class Transport {
   readonly #token: string | null
   readonly #database: string | null
   readonly #tls?: tls.SecureContext
+  readonly #agent: http.Agent | false
 
   constructor(url: string | null | undefined, token: string | null | undefined, options: ConnectionOptions = {}) {
     try {
@@ -418,7 +425,7 @@ export class Transport {
     if (token != null && (typeof token !== "string" || !/^[A-Za-z0-9._~+/\-]+=*(?![\s\S])/.test(token))) {
       throw new ValidationError("Token must be a nonempty safe bearer token")
     }
-    const { timeout = 30, caFile = null, database = null } = options
+    const { timeout = 30, caFile = null, database = null, agent } = options
     if (!validDuration(timeout)) throw new ValidationError("Timeout must be positive and finite")
     if (caFile !== null) {
       if (typeof caFile !== "string" || !caFile || caFile.includes("\0")) {
@@ -441,16 +448,34 @@ export class Transport {
         && (typeof database !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}(?![\s\S])/.test(database))) {
       throw new ValidationError("Invalid database selector")
     }
+    if (agent !== undefined && agent !== false && !(agent instanceof http.Agent)) {
+      throw new ValidationError("Agent must be an HTTP agent or false")
+    }
     this.#token = token ?? null
     this.#database = database
     this.timeout = timeout
+    // Reused sockets never carry a retry: a failed exchange destroys its socket and surfaces as before.
+    this.#agent = agent ?? this.createAgent({ maxFreeSockets: maxIdleSockets }, idleSocketMs)
   }
 
-  createAgent(): http.Agent {
-    const options = { keepAlive: true, maxSockets: 1, maxFreeSockets: 1 }
-    return this.#url.protocol === "https:"
+  // `idleMs` limits only sockets waiting in the free pool. Node's agent `timeout` option would also
+  // arm during DNS lookup and connect, cutting the caller's request timeout short.
+  createAgent(limits: http.AgentOptions = { maxSockets: 1, maxFreeSockets: 1 }, idleMs?: number): http.Agent {
+    const options = { ...limits, keepAlive: true }
+    const agent = this.#url.protocol === "https:"
       ? new https.Agent({ ...options, secureContext: this.#tls, rejectUnauthorized: true })
       : new http.Agent(options)
+    if (idleMs !== undefined) {
+      const keepSocketAlive = agent.keepSocketAlive.bind(agent)
+      agent.keepSocketAlive = (socket) => {
+        // Node returns whether the socket stays pooled, although the typings declare void.
+        const kept = (keepSocketAlive(socket) as unknown) !== false
+        // The agent destroys a free socket when it times out; reuse replaces this with the request timeout.
+        if (kept) (socket as net.Socket).setTimeout(idleMs)
+        return kept
+      }
+    }
+    return agent
   }
 
   async exchange(method: string, route: string, options: ExchangeOptions = {}): Promise<HttpResponse> {
@@ -491,7 +516,7 @@ export class Transport {
         if (mayHaveSent) sentFailures.add(error)
         reject(error)
       }
-      const req = request(this.#url, { method, path, headers, agent: agent ?? false, ...security }, (response) => {
+      const req = request(this.#url, { method, path, headers, agent: agent ?? this.#agent, ...security }, (response) => {
         mayHaveSent = true
         statusCode = response.statusCode ?? null
         const read = readResponse ?? ((message) => readBoundedResponse(message, maxBytes))
@@ -589,6 +614,14 @@ export class Transport {
     }
     if (!isJsonObject(value)) throw failure("Invalid response envelope", status)
     return { status, value }
+  }
+
+  /** Destroys idle pooled sockets. In-flight exchanges finish, and later ones reconnect as needed. */
+  close(): void {
+    if (this.#agent === false) return
+    for (const sockets of Object.values(this.#agent.freeSockets)) {
+      for (const socket of sockets ?? []) socket.destroy()
+    }
   }
 
   async request<T = unknown>(

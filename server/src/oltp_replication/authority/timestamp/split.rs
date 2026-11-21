@@ -389,7 +389,7 @@ pub(super) fn apply(
                 closed: None,
             },
         )?;
-        put(tx, STATE, &state)?;
+        put_state(tx, &state)?;
         return commit(tx, &TimestampReply::Snapshot(snapshot));
     }
     let Some(mut attempt) = current else {
@@ -423,7 +423,7 @@ pub(super) fn apply(
             });
             tx.put(&maintenance_active_key(pin), &key)?;
             put(tx, &key, &attempt)?;
-            put(tx, STATE, &state)?;
+            put_state(tx, &state)?;
             commit(tx, &TimestampReply::Snapshot(pin))
         }
         SplitTimestampCommand::Bind {

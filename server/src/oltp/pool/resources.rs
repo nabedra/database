@@ -4,7 +4,6 @@ use crate::{
     protocol::{ErrorCode, Outcome, ProtocolError},
     scheduling::{MemoryCharge, ResourceScheduler},
 };
-use rocksdb::{Cache, Env, WriteBufferManager};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -72,9 +71,8 @@ impl Default for SharedResourceConfig {
 /// One owner per worker, shared by all volumes, groups and RAM queue accounting.
 /// The scheduler ID is not a permanent Raft node ID or worker enrollment UUID.
 pub struct WorkerSharedResources {
-    pub(super) cache: Cache,
-    pub(super) write_buffers: WriteBufferManager,
-    pub(super) env: Env,
+    /// Block cache, memtable budget and flush/compaction threads of every pool.
+    pub(super) storage: super::storage::NativeStorage,
     pub(super) config: SharedResourceConfig,
     pub(super) pool_slots: Arc<Semaphore>,
     handle_slots: Arc<Semaphore>,
@@ -166,10 +164,11 @@ impl WorkerSharedResources {
         )])?;
         // Stack reservation and native overhead are conservative logical charges.
         // The OS page cache and allocator RSS still require measured deployment limits.
-        let thread_budget = super::super::NativeThreadBudget::new(
+        let thread_budget = super::super::NativeThreadBudget::with_pools(
             config.query_threads,
             config.control_threads,
             config.background_threads,
+            config.max_open_pools,
         )?;
         let native_bytes = config
             .cache_bytes
@@ -214,14 +213,12 @@ impl WorkerSharedResources {
         } else {
             None
         };
-        let env = super::super::native_environment(config.background_threads)?;
         let owner = Arc::new(Self {
-            cache: Cache::new_lru_cache(config.cache_bytes),
-            write_buffers: WriteBufferManager::new_write_buffer_manager(
+            storage: super::storage::NativeStorage::new(
+                config.cache_bytes,
                 config.write_buffer_bytes,
-                true,
-            ),
-            env,
+                config.background_threads as usize,
+            )?,
             config,
             pool_slots: Arc::new(Semaphore::new(config.max_open_pools)),
             handle_slots: Arc::new(Semaphore::new(config.max_group_handles)),
@@ -715,9 +712,13 @@ impl WorkerSharedResources {
     pub(crate) fn block_cache_usage(&self) -> BlockCacheUsage {
         BlockCacheUsage {
             configured_bytes: self.config.cache_bytes,
-            usage_bytes: self.cache.get_usage(),
-            pinned_bytes: self.cache.get_pinned_usage(),
+            usage_bytes: self.storage.cache.usage_bytes(),
+            pinned_bytes: self.storage.cache.pinned_bytes(),
         }
+    }
+    /// Store counters of every open pool on this worker (`/v1/runtime/stats`).
+    pub(crate) fn storage_stats(&self) -> super::StorageStats {
+        self.storage.stats()
     }
     pub(crate) fn resident_group_usage(&self) -> (usize, usize) {
         let limit = self.config.max_resident_groups;
@@ -923,7 +924,7 @@ pub struct PreparedNative {
     lease: NativeLease,
 }
 impl PreparedNative {
-    pub(super) fn buffers(
+    pub(super) async fn buffers(
         &self,
         budget: super::TransactionBudget,
         output: ByteReservation,
@@ -941,8 +942,12 @@ impl PreparedNative {
             ExecutionClass::Control => &owner.apply_control,
         };
         // Reply capacity was acquired without a physical or CPU permit. Every
-        // active native slot now owns this bounded working maximum already.
-        let mut all = apply.reserve(working)?;
+        // active native slot owns this bounded working maximum, but a finished
+        // write hands its batch charge to the journal, which drops it only once
+        // the write is visible, after this slot was released. Wait for it: a
+        // failed reservation here would fail a committed Raft apply, which is
+        // fatal to the replica (T7b, D07).
+        let mut all = apply.reserve_wait(working).await?;
         let scratch = all.split(budget.scratch_bytes)?;
         let batch = all.split(budget.batch_bytes)?;
         Ok((scratch, batch, output))
@@ -1005,9 +1010,13 @@ impl PreparedNative {
         };
         let (tx, rx) = oneshot::channel();
         executor.send(Box::new(move || {
-            let _lease = self.lease;
+            let lease = self.lease;
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                 .unwrap_or_else(|_| Err(super::super::recovery_unknown()));
+            // Release the slot and the worker owner before the caller can see
+            // the result: a caller that then drops its last owner must find the
+            // worker unbound, or a reopen is refused (C02, CIfix1).
+            drop(lease);
             let _ = tx.send((result, guard));
         }))?;
         rx.await.map_err(|_| super::super::recovery_unknown())
@@ -1492,6 +1501,57 @@ fn capacity_context(context: String) -> ProtocolError {
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    /// T7b (D07, T5 concern 4, T6 concern 1): a write's batch charge
+    /// outlives its native slot (the journal drops it once the write is
+    /// visible). The next apply on that slot, for another group, used to fail
+    /// at once with "byte arena insufficient bytes", which openraft treats as
+    /// a fatal apply error: the replica's Raft core stopped and its group lost
+    /// a voter. It now waits for the charge and then proceeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn o06_d07_t7b_an_apply_waits_for_the_previous_writes_batch_charge() {
+        let resources = WorkerSharedResources::new(
+            1,
+            WorkerResources::default(),
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let budget = super::super::TransactionBudget {
+            scratch_bytes: (32 << 20) + (128 << 10),
+            batch_bytes: (32 << 20) + (128 << 10),
+            output_bytes: 0,
+        };
+        let first = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let (scratch, batch, _) = first.buffers(budget, output).await.unwrap();
+        // The write is submitted: its slot and scratch go, its batch charge
+        // stays with the journal.
+        drop(scratch);
+        drop(first);
+        let second = resources.prepare(ExecutionClass::Query).await.unwrap();
+        let output = resources
+            .reply_budget(ExecutionClass::Query, 0)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(second.buffers(budget, output));
+        std::future::poll_fn(|cx| {
+            assert!(
+                waiting.as_mut().poll(cx).is_pending(),
+                "waits for the in-flight batch instead of failing"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        // The journal makes the write visible and drops the charge.
+        drop(batch);
+        let granted = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("granted once the batch charge drops");
+        assert!(granted.is_ok());
+    }
 
     #[test]
     fn o05_c02_m02_registered_group_capacity_precharges_and_recovers_each_lease() {

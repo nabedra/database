@@ -80,11 +80,12 @@ cargo build --locked --manifest-path server/Cargo.toml --no-default-features --f
 cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features oltp
 ```
 
-OLTP uses RocksDB on an attached filesystem and does not need an S3 bucket or
-AWS credentials. Native compilation needs a C++ compiler, CMake and libclang.
-On Debian, install `build-essential cmake clang libclang-dev`; on macOS, install
-the Xcode command line tools and make libclang available to bindgen. The lockfile
-pins RocksDB's Rust binding to 0.25.0 and its native library to 11.8.1.
+OLTP stores data on an attached filesystem with `nabedra-kv`, the in-tree storage
+engine in [`kv/`](kv) (design: [native storage engine plan](../plans/native-storage-engine.md)).
+It does not need an S3 bucket or AWS credentials. The build needs Rust and a C
+compiler for `ring`, the only TLS crypto provider; no C++ compiler, CMake or
+libclang. OLTP data directories from releases before `nabedra-kv` are refused with an
+error that names the path; start those workers on empty volumes.
 `nabedra-db --version` identifies the compiled engine.
 
 The standalone topology uses one worker and one data directory. Registered
@@ -126,6 +127,30 @@ Primary-key `Get` and `Update` use the owning Data range's RF3 queue when
 eligible. Other operations and preexisting all-ready identities retain their
 original execution paths. The [OLTP contract](../docs/testing/oltp-contract.md)
 specifies the acceptance, recovery, and receipt boundaries.
+
+### Direct point operations (`data.direct.v1`)
+
+Every worker and gateway advertises the `data.direct.v1` Control capability
+at startup. Control activates it once every enrolled worker and API ingress has
+advertised its current identity. Activation is durable and never reverts.
+
+- Upgrade all Control voters first. An older Control replica cannot decode the
+  advertisement, as with the scoped-queue capability.
+- Before activation, no node proposes a direct-family Data entry, and a Data
+  group rejects any that arrives.
+- After activation, a worker that has not advertised (an older build, or a
+  re-enrolled process that has not advertised yet) cannot join the ready set
+  or become a voter or learner of a group. Control returns
+  `DirectCapabilityRequired`.
+- Downgrade is unsupported once the capability is active. Data groups then
+  hold direct entries, dedup records and forward markers, and the activated
+  group configuration cannot be read by an older build.
+- `execution.direct_oltp` (workers) and `topology.direct_oltp` (remote
+  gateways) default to `true`. Setting `false` keeps the capability but routes
+  eligible operations through the queue. Each request ID is still settled at
+  its anchor range before it is queued.
+- While the capability is active, incremental backups are refused. Take full
+  backups instead.
 
 Docker uses the same choices. The OLAP image retains its existing Python CLI
 entrypoint; the OLTP image invokes `nabedra-db` directly:

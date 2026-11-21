@@ -1,0 +1,16 @@
+[package]
+name = "nabedra-kv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Nabedra's in-tree storage engine: an LSM with a group-committed journal"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[dependencies]
+bytes = "=1.12.1"
+tokio = { version = "=1.54.1", default-features = false, features = ["sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"

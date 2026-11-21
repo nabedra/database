@@ -67,7 +67,7 @@ pub(crate) fn validate_archive_image(
     scope: &GroupImageScope,
     key: &MvccKey,
 ) -> Result<(), ProtocolError> {
-    if !owns(&scope.group, &scope.span, key) {
+    if !owns_image(&scope.group, &scope.span, key) {
         return Err(invalid());
     }
     key_length(key)?;
@@ -145,63 +145,75 @@ pub(crate) async fn install_images(
                     if image.commit_ts > historical.cut {
                         continue;
                     }
-                    if !owns(&group, &historical.span, &image.key) {
-                        return Err(invalid());
-                    }
-                    let length = key_length(&image.key)?;
-                    tx.with_scratch_buffer(length + 9, |tx, buffer| {
-                        encode_key(&image.key, &mut buffer[1..length + 1]);
-                        let end = length + 1;
-                        buffer[0] = HEAD;
-                        let head = load::<Head>(tx, &buffer[..end])?.unwrap_or_default();
-                        if head.intent.is_some() {
-                            return Err(recovery_unknown());
-                        }
-                        buffer[0] = VALUE;
-                        buffer[end..].copy_from_slice(&(!image.commit_ts.get()).to_be_bytes());
-                        let raw = image
-                            .value
-                            .as_ref()
-                            .map(|value| {
-                                serde_json::from_str::<&RawValue>(value.as_str())
-                                    .map_err(|_| invalid())
-                            })
-                            .transpose()?;
-                        #[derive(Serialize, Deserialize)]
-                        #[serde(deny_unknown_fields)]
-                        struct Version<'a> {
-                            #[serde(borrow)]
-                            value: Option<&'a RawValue>,
-                        }
-                        if let Some(previous) = tx.pinned(buffer)? {
-                            let previous: Version<'_> = serde_json::from_slice(&previous)
-                                .map_err(|_| recovery_unknown())?;
-                            if previous.value.map(RawValue::get) != raw.map(RawValue::get) {
-                                return Err(recovery_unknown());
-                            }
-                        } else {
-                            tx.put_serialized(buffer, &Version { value: raw })?;
-                        }
-                        if head
-                            .version
-                            .is_none_or(|version| version <= image.commit_ts)
-                        {
-                            buffer[0] = HEAD;
-                            tx.put_serialized(
-                                &buffer[..end],
-                                &Head {
-                                    version: Some(image.commit_ts),
-                                    intent: None,
-                                },
-                            )?;
-                        }
-                        Ok(())
-                    })?;
+                    install_image(tx, &group, &historical.span, image)?;
                 }
                 Ok(())
             },
         )
         .await
+}
+
+/// Write one committed image into a restore target, idempotently. Dedup
+/// images go to the `'D'` namespace; every other key becomes a version.
+pub(super) fn install_image(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    span: &KeySpan,
+    image: &CommittedImage,
+) -> Result<(), ProtocolError> {
+    if !owns_image(group, span, &image.key) {
+        return Err(invalid());
+    }
+    if matches!(image.key, MvccKey::DirectDedup { .. }) {
+        return super::direct::import_image(tx, image);
+    }
+    let length = key_length(&image.key)?;
+    tx.with_scratch_buffer(length + 9, |tx, buffer| {
+        encode_key(&image.key, &mut buffer[1..length + 1]);
+        let end = length + 1;
+        buffer[0] = HEAD;
+        let head = load::<Head>(tx, &buffer[..end])?.unwrap_or_default();
+        if head.intent.is_some() {
+            return Err(recovery_unknown());
+        }
+        buffer[0] = VALUE;
+        buffer[end..].copy_from_slice(&(!image.commit_ts.get()).to_be_bytes());
+        let raw = image
+            .value
+            .as_ref()
+            .map(|value| serde_json::from_str::<&RawValue>(value.as_str()).map_err(|_| invalid()))
+            .transpose()?;
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Version<'a> {
+            #[serde(borrow)]
+            value: Option<&'a RawValue>,
+        }
+        if let Some(previous) = tx.pinned(buffer)? {
+            let previous: Version<'_> =
+                serde_json::from_slice(&previous).map_err(|_| recovery_unknown())?;
+            if previous.value.map(RawValue::get) != raw.map(RawValue::get) {
+                return Err(recovery_unknown());
+            }
+        } else {
+            tx.put_serialized(buffer, &Version { value: raw })?;
+        }
+        if head
+            .version
+            .is_none_or(|version| version <= image.commit_ts)
+        {
+            buffer[0] = HEAD;
+            tx.put_serialized(
+                &buffer[..end],
+                &Head {
+                    version: Some(image.commit_ts),
+                    intent: None,
+                },
+            )?;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// An imported seed may only supply the exact first-fence fields. Ordinary

@@ -8,7 +8,10 @@ use crate::{
         pool::{ByteClass, ChargedBytes, ExecutionClass, OltpPool, ScratchLease},
     },
     oltp_replication::{
-        authority::control::{ControlClient, ControlHandle, GroupRecord, InventoryPage},
+        authority::control::{
+            ControlClient, ControlHandle, GroupDamageReason, GroupDamageReport, GroupRecord,
+            InventoryPage,
+        },
         multiplex::*,
     },
     oltp_runtime::{replica::QueueScope, worker_endpoint::AuthorityReader},
@@ -19,6 +22,7 @@ use std::sync::Mutex;
 use uuid::Uuid;
 pub(crate) mod split;
 pub(crate) mod placement;
+pub(crate) mod damage_replacement;
 mod restart;
 
 const HEADER: usize = 4096;
@@ -81,6 +85,8 @@ pub(crate) struct DataGroupFactory {
     status_topology: crate::oltp_replication::authority::status::StatusTopology,
     starts: tokio::sync::Mutex<()>,
     wired: Mutex<std::collections::BTreeSet<(Uuid, u64)>>,
+    /// Replicas whose damage report is already being settled (NS14).
+    damaged: super::SettlingReplicas,
     _owner: Arc<ScratchLease>,
 }
 impl DataGroupFactory {
@@ -113,6 +119,14 @@ impl DataGroupFactory {
                 + voters.capacity() * std::mem::size_of::<ReplicaMember>()
                 + 4096,
         )?);
+        let damaged: super::SettlingReplicas = Arc::new(Mutex::new(Default::default()));
+        // A registered worker installed its reporter before its system groups
+        // started (NS14b); other workers report through this factory's client.
+        if !manager.has_damage_sink() {
+            let sink = super::ReportingDamageSink::new(damaged.clone());
+            sink.connect(&rpc);
+            manager.install_damage_sink(sink);
+        }
         Ok(Arc::new(Self {
             manager,
             pool,
@@ -125,8 +139,14 @@ impl DataGroupFactory {
             status_topology,
             starts: tokio::sync::Mutex::new(()),
             wired: Mutex::new(Default::default()),
+            damaged,
             _owner: owner,
         }))
+    }
+    /// NS14 rules 2 and 4: report a replica this worker cannot serve and
+    /// release its bytes once Control records its replacement.
+    fn settle_damage(&self, report: GroupDamageReport, pool: Option<OltpPool>) {
+        super::spawn_settlement(self.rpc.clone(), self.damaged.clone(), report, pool);
     }
     fn parse(&self, session: &AuthenticatedSession, bytes: &[u8]) -> Result<Header, ProtocolError> {
         crate::protocol::json_input(bytes, HEADER).map_err(|_| invalid())?;
@@ -214,6 +234,21 @@ impl DataGroupFactory {
                     return Err(unavailable());
                 }
                 if routes.members.as_slice() == self.voters.as_ref() {
+                    // Section 3 rules 1 and 2: a quarantined group is reported,
+                    // not started; the worker keeps hosting the others.
+                    if let Some(damage) = self.pool.group_damage(record.identity.group_id) {
+                        self.settle_damage(
+                            GroupDamageReport {
+                                group: record.identity.clone(),
+                                replica: self.local.clone(),
+                                reason: damage.cause.into(),
+                                first_bad_seq: damage.first_bad_seq,
+                                refusal: None,
+                            },
+                            Some(self.pool.clone()),
+                        );
+                        continue;
+                    }
                     self.host_group(&record.identity, false).await?;
                 } else if strict {
                     return Err(ProtocolError::new(

@@ -54,6 +54,9 @@ impl ParticipantEndpoint {
         transport: WorkerClient,
         status_topology: Option<StatusTopology>,
     ) -> Result<Arc<Self>, ProtocolError> {
+        // Every served local Data replica is visible to the direct expiry
+        // task, which proposes only where this node leads (T7b).
+        super::direct::register_replica(&handle);
         Ok(Arc::new(Self {
             proof: ParticipantProofEndpoint::new(handle, node, control)?,
             transport,
@@ -82,6 +85,10 @@ impl ParticipantEndpoint {
         let allowed = match head.method {
             Method::ParticipantRead { read_ts } => match head.action {
                 ServiceAction::Owner => true,
+                // A direct range leader reads its table schema (T7).
+                ServiceAction::DirectLeader => {
+                    self.proof.handle.identity().kind == GroupKind::Catalog
+                }
                 ServiceAction::ScopedCatalogRead(scope) => {
                     self.proof.handle.identity().kind == GroupKind::Catalog
                         && scope.read_ts == read_ts
@@ -101,7 +108,9 @@ impl ParticipantEndpoint {
                 matches!(
                     head.action,
                     ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
-                )
+                ) || matches!(head.method, Method::ParticipantActivation)
+                    && head.action == ServiceAction::DirectLeader
+                    && self.proof.handle.identity().kind == GroupKind::Catalog
             }
             Method::ParticipantImages
             | Method::ParticipantArchiveEffects { .. }
@@ -109,6 +118,15 @@ impl ParticipantEndpoint {
             | Method::ParticipantScanOpen { .. }
             | Method::ParticipantScanRun { .. }
             | Method::ParticipantHolder { .. } => head.action == ServiceAction::Owner,
+            // A direct range leader checks for a DDL before it activates a
+            // Data group (T7b).
+            Method::ParticipantExclusive { .. } => {
+                self.proof.handle.identity().kind == GroupKind::Catalog
+                    && matches!(
+                        head.action,
+                        ServiceAction::Owner | ServiceAction::DirectLeader
+                    )
+            }
             Method::ParticipantResolveTimestampPoint => {
                 matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
                     && matches!(head.action, ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_))
@@ -118,6 +136,10 @@ impl ParticipantEndpoint {
                     head.action,
                     ServiceAction::Owner | ServiceAction::ScopedQueueExecute(_)
                 ) || matches!(head.action,ServiceAction::ParticipantProof{source_group} if source_group==self.proof.handle.identity().group_id)
+            }
+            Method::Direct(_) | Method::DirectForward(_) => {
+                matches!(self.proof.handle.identity().kind, GroupKind::Data { .. })
+                    && direct::allowed(&head)
             }
             Method::ParticipantFence { transition_id, .. } => match head.action {
                 ServiceAction::ControlFence { transition_id: actual }
@@ -608,7 +630,9 @@ impl Endpoint for ParticipantEndpoint {
             let head = self.parse(session, bytes)?;
             // Unused tickets reserve bounded metadata. Only the owner can
             // Run, after the exact grant reaches the ready queue replicas.
-            if !matches!(head.method, Method::ParticipantScanOpen { .. }) {
+            if matches!(head.method, Method::Direct(_) | Method::DirectForward(_)) {
+                direct::authorize(&self.proof.control, session, &head).await?;
+            } else if !matches!(head.method, Method::ParticipantScanOpen { .. }) {
                 authorize(&self.proof.control, session, &head).await?;
             }
             Ok(ReceivePlan {
@@ -904,6 +928,16 @@ impl Endpoint for ParticipantEndpoint {
                             })
                             .await
                     }
+                    Method::ParticipantExclusive { table_id } => {
+                        let value = self.proof.handle.lifecycle_exclusive(table_id).await?;
+                        let shared = self.proof.shared.clone();
+                        self.proof
+                            .shared
+                            .execute(ExecutionClass::Control, self.proof.node, 0, move || {
+                                shared.encode_in(ByteClass::Progress, &value, 128 << 10)
+                            })
+                            .await
+                    }
                     Method::ParticipantScopedGuard { txn } => {
                         let ServiceAction::ScopedQueueExecute(scope) = head.action else {
                             return Err(invalid());
@@ -1033,6 +1067,11 @@ impl Endpoint for ParticipantEndpoint {
                     }
                     Method::ParticipantResolveTimestampPoint => {
                         self.resolve_timestamp_point(&session, &head, sections).await
+                    }
+                    Method::Direct(header) | Method::DirectForward(header) => {
+                        let forward = matches!(head.method, Method::DirectForward(_));
+                        direct::serve(&self.proof.handle, &session, header, forward, &sections)
+                            .await
                     }
                     Method::ParticipantPropose { progress } => {
                         let shared = self.proof.shared.clone();
@@ -1769,6 +1808,16 @@ impl RemoteParticipant for ParticipantClient {
     ) -> ParticipantFuture<'_, Option<LifecycleBinding>> {
         Box::pin(async move {
             self.decoded(Method::ParticipantHolder { table_id }, None)
+                .await
+                .map(|(value, _)| value)
+        })
+    }
+    fn lifecycle_exclusive(
+        &self,
+        table_id: uuid::Uuid,
+    ) -> ParticipantFuture<'_, Option<LifecycleBinding>> {
+        Box::pin(async move {
+            self.decoded(Method::ParticipantExclusive { table_id }, None)
                 .await
                 .map(|(value, _)| value)
         })

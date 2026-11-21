@@ -1,5 +1,5 @@
 //! A registered pool opens only on its expected mounted block device. The
-//! directory descriptor and exclusive ownership lock live as long as RocksDB.
+//! directory descriptor and exclusive ownership lock live as long as the store.
 //! The caller obtains expectations from authenticated operator inventory.
 use super::{PoolIdentity, ProtocolError};
 use crate::{
@@ -54,7 +54,7 @@ pub struct VerifiedPoolMount {
     #[cfg(target_os = "linux")]
     directory: File,
     #[cfg(target_os = "linux")]
-    _lock: File,
+    _lock: linux::VolumeLock,
 }
 /// Nonwriting physical verification, retained while the manager acquires its
 /// directory/process lock and obtains the previous-incarnation exclusion.
@@ -579,9 +579,27 @@ mod linux {
         Ok(VerifiedPoolMount {
             observation,
             directory,
-            _lock: lock,
+            _lock: VolumeLock(lock),
         })
     }
+    /// The volume lock of a verified mount. A child forked by any thread shares
+    /// the lock's open file description until it execs or exits, so dropping
+    /// only our descriptor could keep the volume locked after the mount is
+    /// gone and fail the close proof or the next open. Drop unlocks it first.
+    pub(super) struct VolumeLock(File);
+    impl Drop for VolumeLock {
+        fn drop(&mut self) {
+            // SAFETY: flock on a valid, owned descriptor.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+    impl std::ops::Deref for VolumeLock {
+        type Target = File;
+        fn deref(&self) -> &File {
+            &self.0
+        }
+    }
+
     fn lock_mount(base: &Path, create: bool) -> Result<File, ProtocolError> {
         let lock = OpenOptions::new()
             .read(true)
@@ -626,7 +644,7 @@ mod linux {
         }
         let base = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
         let lock = lock_mount(&base, false)?;
-        let mount = VerifiedPoolMount { observation, directory, _lock: lock };
+        let mount = VerifiedPoolMount { observation, directory, _lock: VolumeLock(lock) };
         revalidate(&mount.directory, &mount.observation)?;
         if read_data_worker_key(&mount)?.public_key() != permit.next.mount_public_key {
             return Err(invalid());
@@ -805,7 +823,7 @@ mod tests {
             profile: PoolMountProfile::Ebs,
             identity: PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: uuid::Uuid::new_v4(),
                 worker_id,
                 pool_id: uuid::Uuid::new_v4(),
@@ -825,7 +843,7 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&path).unwrap().count(),
             0,
-            "a missing mount must not receive identity or RocksDB files"
+            "a missing mount must not receive identity or store files"
         );
         let mut root = expected;
         root.mount_path = PathBuf::from("/");

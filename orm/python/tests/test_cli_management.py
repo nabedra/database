@@ -1,6 +1,7 @@
 """Focused CLI01/CLI02 checks; runtime acceptance is separate."""
 import contextlib
 import copy
+import uuid
 import io
 import json
 import os
@@ -92,6 +93,34 @@ class ManagementTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate(invalid)
 
+    def test_d01_t9_oltp_config_accepts_the_direct_oltp_switch(self):
+        """T9 finding: `direct_oltp` (plan "Rollout") must reach the server through the CLI."""
+        execution = dict(max_workers_per_request=1, max_pending_requests=8, max_queue_bytes_per_replica=1 << 20,
+                         max_retained_result_bytes_per_worker=1 << 20, result_retention_ms=1000,
+                         queue_replication='all_ready_workers', queue_lifetime='live_cluster',
+                         partition_size='64 MiB')
+        local = dict(version=1, engine='oltp', bind='127.0.0.1:0', database='application', auth_file='auth.json',
+                     topology=dict(mode='local', data_dir='volume'),
+                     worker=dict(execution=dict(execution, direct_oltp=False)))
+        validate(local)
+        peer = dict(worker_id=str(uuid.uuid4()), incarnation=str(uuid.uuid4()), certificate_sha256='a' * 64,
+                    endpoint='127.0.0.1:9000', server_name='localhost', enrollment_revision=1)
+        remote = dict(version=1, engine='oltp', bind='127.0.0.1:0', database='application', auth_file='auth.json',
+                      topology=dict(mode='remote', cluster_id=str(uuid.uuid4()), control_group_id=str(uuid.uuid4()),
+                                    enrollment=dict(database='application', enrollment=peer),
+                                    worker_tls=dict(cert_file='c.pem', key_file='k.pem', ca_file='ca.pem'),
+                                    control_peers=[peer], direct_oltp=False))
+        validate(remote)
+        for mutate in (lambda c: c['topology'].update(direct_oltp='false'),
+                       lambda c: c.update(worker=dict(execution=dict(execution, direct_oltp=0)))):
+            invalid = copy.deepcopy(remote)
+            mutate(invalid)
+            with self.assertRaises(ValueError):
+                validate(invalid)
+        local['topology']['direct_oltp'] = False
+        with self.assertRaises(ValueError):
+            validate(local)
+
     def test_doctor_read_only_and_secret_permissions(self):
         self.init()
         before = self.config.read_bytes()
@@ -148,7 +177,7 @@ class ManagementTests(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()) as output:
                         self.assertEqual(cli.main(['--version', '--json']), 0)
                     versions = json.loads(output.getvalue())
-                    self.assertEqual(versions['cli'], '0.2.0')
+                    self.assertEqual(versions['cli'], '0.2.1')
                     self.assertEqual(versions['binary'], '0.1.1')
             with patch.dict(os.environ, {'NABEDRA_SERVER_BINARY': 'absent'}):
                 with self.assertRaises(RuntimeError):

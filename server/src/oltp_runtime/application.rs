@@ -1,5 +1,6 @@
 //! API ingress is a Control-enrolled service, never a queue holder or voter.
 //! The receiving owner authenticates the original bearer and database again.
+pub(crate) mod direct;
 mod scoped;
 use super::scoped_worker::ScopedWorker;
 use super::{
@@ -63,6 +64,11 @@ enum Method {
     RouteReceipt {
         run_id: Uuid,
         request_id: Uuid,
+    },
+    /// The direct-path topology of a table (`direct::TableFill`). Sent only
+    /// while `data.direct.v1` is active.
+    DirectRoute {
+        table_id: Uuid,
     },
     ScopedSubmit {
         bytes: u64,
@@ -257,6 +263,13 @@ impl Endpoint for ApplicationEndpoint {
                     match request.method {
                         Method::ScopedSubmit { bytes, .. } => {
                             let body = request_body(bytes, &sections)?;
+                            // T7c: settled at its anchor before any queue
+                            // reserves it, as on the ready-set queue.
+                            self.runtime
+                                .upgrade()
+                                .ok_or_else(unavailable)?
+                                .settle_before_reserve(body.as_ref())
+                                .await?;
                             let record = worker.submit(placement, body, session.remote()).await?;
                             Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
                         }
@@ -370,6 +383,13 @@ impl Endpoint for ApplicationEndpoint {
                             None,
                         ))
                     }
+                    Method::DirectRoute { table_id } => {
+                        ensure_empty(&sections)?;
+                        let fill = runtime
+                            .direct_table_fill(view.authority.ready.view.authority(), table_id)
+                            .await?;
+                        Ok((shared.encode_in(ByteClass::Progress, &fill, 1 << 20)?, None))
+                    }
                     Method::ScopedSubmit { .. }
                     | Method::ScopedObserve { .. }
                     | Method::ScopedResult { .. } => Err(invalid()),
@@ -416,6 +436,14 @@ impl ApplicationClient {
             scoped,
             _metadata: metadata,
         }))
+    }
+    /// One Catalog read for the direct-path gateway, served by the owner.
+    pub(crate) async fn direct_table(
+        &self,
+        table_id: Uuid,
+    ) -> Result<Option<direct::TableFill>, ProtocolError> {
+        let reply = self.call(Method::DirectRoute { table_id }, None).await?;
+        Ok((*reply.decode_section::<Option<direct::TableFill>>(0)?).clone())
     }
     async fn call(
         &self,

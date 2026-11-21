@@ -6,17 +6,21 @@ use std::ops::{
 };
 
 use anyhow::Result;
+use nabedra_kv::WriteBatch;
 use openraft::{
     Entry, ErrorSubject, ErrorVerb, LogId, LogState, RaftLogReader, StorageError, Vote,
     storage::{LogFlushed, RaftLogStorage},
 };
-use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
 use serde::Serialize;
 
-use super::store::{GroupStore, prefix_end, sync_write};
+use super::store::{GroupStore, decode, entries, prefix_end};
 use super::{TypeConfig, storage_error};
 
 const REPLICATION_PAGE_BYTES: usize = 4 * 1024 * 1024;
+/// One append is split into synced batches of about this size, well below a journal
+/// segment. A crash between them leaves a prefix of the entries, which Raft allows: the
+/// append is acknowledged only after the last one.
+const APPEND_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const VOTE_KEY: &[u8] = b"vote";
 
 #[derive(Clone)]
@@ -31,7 +35,7 @@ impl LogStore {
         [self.prefix().as_slice(), &index.to_be_bytes()].concat()
     }
 
-    fn entries(
+    pub(super) fn entries(
         &self,
         (start, end): (std::ops::Bound<u64>, std::ops::Bound<u64>),
         byte_limit: usize,
@@ -53,18 +57,10 @@ impl LogStore {
             return Ok(Vec::new());
         }
         let from = self.key(from);
-        let mut opts = ReadOptions::default();
-        opts.set_iterate_upper_bound(
-            to.map_or_else(|| prefix_end(&self.prefix()), |n| self.key(n)),
-        );
+        let to = to.map_or_else(|| prefix_end(&self.prefix()), |n| self.key(n));
         let mut bytes = 0_usize;
         let mut result = Vec::new();
-        for entry in self
-            .0
-            .db
-            .db
-            .iterator_opt(IteratorMode::From(&from, Direction::Forward), opts)
-        {
+        for entry in entries(&self.0.db.snapshot(), &from, &to, true) {
             let (_, value) = entry?;
             bytes = bytes.saturating_add(value.len());
             if bytes > byte_limit && !result.is_empty() {
@@ -73,6 +69,69 @@ impl LogStore {
             result.push(serde_json::from_slice(&value)?);
         }
         Ok(result)
+    }
+
+    /// The last log id: the highest entry, else the last purged id. Blocking.
+    pub(super) fn log_state(&self) -> Result<LogState<TypeConfig>> {
+        let prefix = self.prefix();
+        let snapshot = self.0.db.snapshot();
+        let last_purged_log_id: Option<LogId<u64>> = decode(snapshot.get(&self.0.key(b"purged"))?)?;
+        let end = prefix_end(&prefix);
+        let mut last = snapshot.iter(Included(prefix.as_slice()), Excluded(end.as_slice()), true);
+        last.seek_for_prev(&self.key(u64::MAX));
+        last.status()?;
+        let last_log_id = if last.valid() && last.key().starts_with(&prefix) {
+            Some(serde_json::from_slice::<Entry<TypeConfig>>(&last.value()?)?.log_id)
+        } else {
+            None
+        };
+        Ok(LogState {
+            last_purged_log_id,
+            last_log_id: last_log_id.or(last_purged_log_id),
+        })
+    }
+
+    /// Durably store `entries`. Blocking.
+    pub(super) fn append_entries(&self, entries: Vec<Entry<TypeConfig>>) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        for entry in entries {
+            let value = serde_json::to_vec(&entry)?;
+            if !batch.is_empty() && batch.encoded_bytes() + value.len() > APPEND_BATCH_BYTES {
+                self.0.db.write(std::mem::take(&mut batch))?;
+            }
+            batch.put_journal(&self.key(entry.log_id.index), &value);
+        }
+        if !batch.is_empty() {
+            self.0.db.write(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Durably delete the entries from `index` on. Blocking.
+    pub(super) fn truncate_from(&self, index: u64) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(&self.key(index), &prefix_end(&self.prefix()));
+        self.0.db.write(batch)
+    }
+
+    /// Durably delete the entries up to `log_id` and record it as purged. Blocking.
+    pub(super) fn purge_through(&self, log_id: LogId<u64>) -> Result<()> {
+        let from = self.prefix();
+        let to = log_id
+            .index
+            .checked_add(1)
+            .map_or_else(|| prefix_end(&from), |next| self.key(next));
+        let mut batch = WriteBatch::new();
+        batch.put(&self.0.key(b"purged"), &serde_json::to_vec(&log_id)?);
+        batch.delete_range(&from, &to);
+        self.0.db.write(batch)
+    }
+
+    /// Durably store one small record such as the vote. Blocking.
+    pub(super) fn put_record(&self, key: &[u8], value: &impl Serialize) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(&self.0.key(key), &serde_json::to_vec(value)?);
+        self.0.db.write(batch)
     }
 
     async fn read_entries(
@@ -89,17 +148,14 @@ impl LogStore {
 
     async fn persist(
         &self,
+        label: &'static str,
         key: &'static [u8],
         value: impl Serialize + Send + 'static,
         subject: ErrorSubject<u64>,
     ) -> Result<(), StorageError<u64>> {
-        let key = self.0.key(key);
+        let store = self.clone();
         self.0
-            .run(move |db| {
-                let mut batch = WriteBatch::default();
-                batch.put(key, serde_json::to_vec(&value)?);
-                sync_write(&db.db, batch)
-            })
+            .run_as(label, move |_| store.put_record(key, &value))
             .await
             .map_err(|error| storage_error(subject, ErrorVerb::Write, error))
     }
@@ -133,30 +189,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
         let store = self.clone();
         self.0
-            .run(move |db| {
-                let prefix = store.prefix();
-                let snapshot = db.db.snapshot();
-                let last_purged_log_id =
-                    super::store::decode(snapshot.get(store.0.key(b"purged"))?)?;
-                let mut opts = ReadOptions::default();
-                opts.set_iterate_lower_bound(prefix);
-                let mut entries = snapshot.iterator_opt(
-                    IteratorMode::From(&store.key(u64::MAX), Direction::Reverse),
-                    opts,
-                );
-                let last_log_id = entries
-                    .next()
-                    .transpose()?
-                    .map(|(_, value)| -> Result<_> {
-                        Ok(serde_json::from_slice::<Entry<TypeConfig>>(&value)?.log_id)
-                    })
-                    .transpose()?
-                    .or(last_purged_log_id);
-                Ok(LogState {
-                    last_purged_log_id,
-                    last_log_id,
-                })
-            })
+            .run(move |_| store.log_state())
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Read, error))
     }
@@ -166,7 +199,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        self.persist(VOTE_KEY, *vote, ErrorSubject::Vote).await
+        self.persist("vote", VOTE_KEY, *vote, ErrorSubject::Vote)
+            .await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
@@ -181,7 +215,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
-        self.persist(b"committed", committed, ErrorSubject::Logs)
+        self.persist("committed", b"committed", committed, ErrorSubject::Logs)
             .await
     }
 
@@ -204,15 +238,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     {
         let store = self.clone();
         let entries: Vec<_> = entries.into_iter().collect();
+        // A full device is retried per sub-batch inside the job, so the callback reports
+        // success only after the last one is durable (RV-EV M1).
         let result = self
             .0
-            .run(move |db| {
-                let mut batch = WriteBatch::default();
-                for entry in entries {
-                    batch.put(store.key(entry.log_id.index), serde_json::to_vec(&entry)?);
-                }
-                sync_write(&db.db, batch)
-            })
+            .run_as("append", move |_| store.append_entries(entries))
             .await;
         callback.log_io_completed(
             result
@@ -224,32 +254,17 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let from = self.key(log_id.index);
-        let to = prefix_end(&self.prefix());
+        let store = self.clone();
         self.0
-            .run(move |db| {
-                let mut batch = WriteBatch::default();
-                batch.delete_range(from, to);
-                sync_write(&db.db, batch)
-            })
+            .run_as("truncate", move |_| store.truncate_from(log_id.index))
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let from = self.prefix();
-        let to = log_id
-            .index
-            .checked_add(1)
-            .map_or_else(|| prefix_end(&from), |next| self.key(next));
-        let purged = self.0.key(b"purged");
+        let store = self.clone();
         self.0
-            .run(move |db| {
-                let mut batch = WriteBatch::default();
-                batch.put(purged, serde_json::to_vec(&log_id)?);
-                batch.delete_range(from, to);
-                sync_write(&db.db, batch)
-            })
+            .run_as("purge", move |_| store.purge_through(log_id))
             .await
             .map_err(|error| storage_error(ErrorSubject::Logs, ErrorVerb::Delete, error))
     }

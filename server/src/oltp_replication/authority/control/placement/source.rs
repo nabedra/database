@@ -312,7 +312,7 @@ mod tests {
             mount: PoolMountExpectation {
                 profile: PoolMountProfile::default(),
                 identity: PoolIdentity {
-                    engine: "oltp".into(), pool_format_version: 1,
+                    engine: "oltp".into(), pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                     cluster_id: cluster, worker_id: worker.worker_id, pool_id,
                 },
                 worker,

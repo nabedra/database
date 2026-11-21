@@ -1,6 +1,6 @@
 {
   "name": "nabedra",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Asynchronous TypeScript client for Nabedra Database and Cache",
   "license": "MIT",
   "type": "module",

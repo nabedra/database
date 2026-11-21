@@ -508,7 +508,7 @@ pub async fn run(config: Config) {
         !config.fixture_cold_authorization.is_nil(),
         "fixture bootstrap requires explicit authorization"
     );
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut resources = WorkerResources::default();
     if let Some(memory) = config.memory_limit_bytes {
         resources.memory_limit_bytes = memory;

@@ -62,9 +62,11 @@ pub(super) struct Incoming {
 }
 pub(super) fn target_node(bytes: &[u8], purpose: Purpose) -> Result<u64, ProtocolError> {
     let max_bytes = match purpose {
-        Purpose::Authority | Purpose::Storage | Purpose::Settlement | Purpose::ServiceMutation => {
-            super::super::service_rpc::SERVICE_HEADER_BYTES
-        }
+        Purpose::Authority
+        | Purpose::Storage
+        | Purpose::Settlement
+        | Purpose::ServiceMutation
+        | Purpose::ApiIngress => super::super::service_rpc::SERVICE_HEADER_BYTES,
         _ => 1024,
     };
     crate::protocol::json_input(bytes, max_bytes)

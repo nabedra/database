@@ -137,8 +137,7 @@ class _ControlTransport(_Transport):
             raise ValidationError('Token must be a nonempty safe bearer token')
         super().__init__(api_url, admin_token, timeout=timeout, ca_file=ca_file)
         self._url = self._url[:-len('/v1/operations')] + '/v1/cluster/operations'
-        self._context = next(h._context for h in self._opener.handlers
-                             if hasattr(h, '_context'))
+        self._context = self._tls_context
 
     def request(self, operation: str, payload: dict, *, request_id: str | None = None,
                 deadline: float | None = None) -> tuple[str, object]:

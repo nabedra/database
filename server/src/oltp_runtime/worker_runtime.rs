@@ -4,7 +4,9 @@ mod admission_cleanup;
 pub(crate) mod archive;
 mod automatic_split;
 pub(super) mod cold_history;
+pub(crate) mod direct_capability;
 mod deployment;
+mod direct_gateway;
 mod index_admin;
 mod index_backend;
 mod migration;
@@ -82,6 +84,13 @@ pub(crate) struct WorkerRuntime {
     changed: Notify,
     admission_cleanup: admission_cleanup::AdmissionCleanup,
     accepting: AtomicBool,
+    /// Set while `data.direct.v1` is active (T7). Direct commits have no
+    /// Status decision, so incremental backups would miss them.
+    direct_commits_active: AtomicBool,
+    /// The direct-path gateway of this worker's HTTP API (T6).
+    direct_gateway: std::sync::OnceLock<Arc<super::application::direct::DirectGateway>>,
+    /// This worker's `data.direct.v1` view and `direct_oltp` switch (T7).
+    direct: std::sync::OnceLock<Arc<direct_capability::DirectSwitch>>,
     authorization: OriginalAuthorization,
     _actor_memory: MemoryCharge,
     retirement: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -219,12 +228,16 @@ impl WorkerRuntime {
             changed: Notify::new(),
             admission_cleanup,
             accepting: AtomicBool::new(true),
+            direct_commits_active: AtomicBool::new(false),
+            direct_gateway: std::sync::OnceLock::new(),
+            direct: std::sync::OnceLock::new(),
             authorization,
             _actor_memory: actor_memory,
             retirement: Mutex::new(None),
             cold_cleanup: Mutex::new(None),
             automatic_split: Mutex::new(automatic_split::Observation::default()),
         });
+        runtime.install_direct_gateway();
         let weak = Arc::downgrade(&runtime);
         if let Some(issuer) = &runtime.services.admission_issuer {
             for client in &runtime.services.remote_status {
@@ -279,6 +292,32 @@ impl WorkerRuntime {
                 .advertise_scoped_queue(operation)
                 .await?;
             scoped.start_maintenance()?;
+        }
+        {
+            let direct = direct_capability::DirectSwitch::new(
+                runtime.services.control_client.clone(),
+                runtime.services.local,
+                execution.direct_oltp,
+            );
+            runtime.planner.set_direct_probe(direct.clone())?;
+            // T4fix F2: direct commits have no Status decision, so incremental
+            // backups are refused from activation on.
+            let weak = Arc::downgrade(&runtime);
+            direct.on_active(move || {
+                if let Some(runtime) = weak.upgrade() {
+                    runtime.set_direct_commits_active(true);
+                }
+            });
+            // T5's executor serves `Method::Direct` once active (T7).
+            direct.serve_direct_when_active(direct_capability::DirectLeaderServices {
+                shared: runtime.services.shared.clone(),
+                transport: runtime.services.manager.client(),
+                catalog: runtime.services.catalog.participant().identity().clone(),
+                timestamps: runtime.services.timestamps.identity().clone(),
+                local_timestamps: runtime.services.direct_timestamps.clone(),
+            });
+            direct.start();
+            runtime.direct.set(direct).map_err(|_| unknown())?;
         }
         if runtime.services.cold_history.is_some() {
             *runtime.cold_cleanup.lock().map_err(|_| unknown())? =
@@ -914,6 +953,9 @@ impl WorkerRuntime {
         self.index_builds.drain().await;
         self.supervision.drain().await;
         self.admission_cleanup.join().await?;
+        if let Some(direct) = self.direct.get() {
+            direct.stop().await;
+        }
         let retirement = self.retirement.lock().map_err(|_| unknown())?.take();
         if let Some(retirement) = retirement {
             retirement.await.map_err(|_| unknown())?;
@@ -930,6 +972,44 @@ impl WorkerRuntime {
     ) -> Result<RequestRecord, ProtocolError> {
         let authorization = self.authorization.clone();
         self.submit_original(body, authorization, None).await
+    }
+    /// T7c: the exactly-once rule across the `data.direct.v1` activation
+    /// boundary, enforced where the queued path reserves a request id.
+    ///
+    /// While the capability is active an eligible mutation is settled at
+    /// its anchor (`DirectForward`) before Status reserves it, whatever the
+    /// sending gateway did: a gateway that has not yet observed activation
+    /// routes queued without a marker. A replayed direct result means the
+    /// id already committed directly, so it must not be queued.
+    ///
+    /// Before this switch observes activation, Control is asked first
+    /// (`QueuedHistory`): it either is or becomes active (settle as above),
+    /// or durably records pre-activation queued history before this
+    /// reservation. Any later activation then opens the queued-history
+    /// window, in which no leader executes an unknown id directly (see
+    /// `DirectSwitch::history_settling`), so a request reserved here
+    /// without a marker can only be answered by the queued path: its
+    /// original result, a conflict, or 404 abandoned after a cold start.
+    /// The scoped queue's admission calls this too.
+    pub(super) async fn settle_before_reserve(&self, body: &[u8]) -> Result<(), ProtocolError> {
+        if !super::application::direct::eligible(body) {
+            return Ok(());
+        }
+        let (Some(switch), Some(gateway)) = (self.direct_switch(), self.direct_gateway_handle())
+        else {
+            return Ok(());
+        };
+        if !switch.note_queued_history().await? {
+            return Ok(());
+        }
+        match gateway.route(body, true).await? {
+            super::application::direct::Routed::Queued => Ok(()),
+            super::application::direct::Routed::Done(_) => Err(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "request id already committed on the direct path; retry it to read the result",
+                Outcome::Unknown,
+            )),
+        }
     }
     async fn submit_original(
         self: Arc<Self>,
@@ -962,6 +1042,7 @@ impl WorkerRuntime {
         // Acquire the UUID gate before Reserve, so a retry observes a rejection
         // that landed while the previous admission held that gate.
         let actor = self.actors.try_admit()?;
+        self.settle_before_reserve(prepared.body()).await?;
         let reserved = match self.admission.reserve(prepared, expected).await? {
             ReservationResult::Reserved(reserved) => reserved,
             ReservationResult::Abandoned(_) => return Err(QueueError::Abandoned.protocol()),
@@ -1686,6 +1767,9 @@ impl HttpRuntime for WorkerRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
     }
+    fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
+        self.direct_gateway_handle().cloned()
+    }
     fn scheduler(&self) -> ResourceScheduler {
         self.services.shared.scheduler()
     }
@@ -1789,8 +1873,25 @@ impl HttpRuntime for WorkerRuntime {
                     "engine":"oltp", "queue":queue, "scheduler":scheduler,
                     "accept_to_dispatch":accept_to_dispatch,
                     "block_cache":self.services.shared.block_cache_usage(),
+                    "storage":self.services.shared.storage_stats(),
+                    // Rule 6: secondary pools refused at open, with the error class.
+                    "refused_pools":self.services.pools.refused_report(),
                     "working_decode_bytes":self.services.shared.working_decode_bytes(),
-                    "native_thread_budget":self.services.shared.thread_budget()
+                    "native_thread_budget":self.services.shared.thread_budget(),
+                    // `null` until `data.direct.v1` activates the executor.
+                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                            .map(|service| service.stats())
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                        "history_settling":switch.history_settling(),
+                    })),
+                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                    // RV-APPLY: transient retries and stopped cores.
+                    "raft":self.services.manager.raft_health(),
                 }))
                 .map_err(|_| unknown())?,
             })

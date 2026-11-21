@@ -23,7 +23,9 @@ use sha2::{Digest as _, Sha256};
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use uuid::Uuid;
 mod backup;
+pub(crate) mod direct_fence;
 mod index;
+pub(crate) use index::index_entry_changes;
 mod index_build;
 mod migration;
 #[cfg(test)]
@@ -127,6 +129,7 @@ pub(crate) struct NativePlanner {
     resolver: Arc<dyn ParticipantResolver>,
     query_metrics: Arc<query_metrics::QueryMetrics>,
     query_scheduler: QueryScheduler,
+    direct: direct_fence::DirectProbeSlot,
 }
 /// Retain only one charged route page and its selected participant during a
 /// mutation plan. The cache cannot outlive or be reused with another pin.
@@ -154,6 +157,7 @@ impl NativePlanner {
             resolver,
             query_metrics,
             query_scheduler,
+            direct: Default::default(),
         })
     }
     pub(crate) fn with_scoped_execution(
@@ -170,6 +174,7 @@ impl NativePlanner {
             }),
             query_metrics: self.query_metrics.clone(),
             query_scheduler: self.query_scheduler.clone(),
+            direct: self.direct.clone(),
         })
     }
 
@@ -346,10 +351,7 @@ impl NativePlanner {
                         let values = p.values;
                         let canonical = self
                             .cpu(owner.clone(), move || {
-                                let mut candidate = (*row).clone();
-                                for (k, v) in values {
-                                    candidate.insert(k, v);
-                                }
+                                let candidate = updated_row(&row, values);
                                 CanonicalJson::from_serializable(
                                     &shared,
                                     &candidate,
@@ -452,7 +454,7 @@ impl NativePlanner {
                 let shared = self.catalog.resources().clone();
                 let (key, key_order, canonical) = self
                     .cpu(owner.clone(), move || {
-                        let key = crate::oltp::codec::scalar_key(&row[&column]);
+                        let key = primary_key_of(&column, &row);
                         let order = key_sort(&key);
                         let canonical = CanonicalJson::from_serializable(
                             &shared,
@@ -697,6 +699,9 @@ impl NativePlanner {
                     .read::<RoutingRoot>(pin, MvccKey::CatalogRoutingRoot { table_id: id })
                     .await?,
             )?;
+            // Plan section 7: stop direct writers in the Data log before the
+            // Catalog publishes the drop. The exclusive guard is held.
+            self.fence_direct_writers(pin, id, None).await?;
             let writes = vec![
                 PreparedWrite {
                     key: MvccKey::CatalogName { name },
@@ -1086,6 +1091,20 @@ fn value<T>(
         CatalogRead::Value { version, record } => Ok((version, record)),
         CatalogRead::Blocked(i) => Err(PlanError::Blocked(i)),
     }
+}
+/// The primary key of `row`, whose key column is `column`. Shared by the
+/// queued planner and the direct executor.
+pub(crate) fn primary_key_of(column: &str, row: &Row) -> Key {
+    crate::oltp::codec::scalar_key(&row[column])
+}
+/// `table.update`: `values` written over `row`. Shared by the queued
+/// planner and the direct executor.
+pub(crate) fn updated_row(row: &Row, values: Row) -> Row {
+    let mut candidate = row.clone();
+    for (k, v) in values {
+        candidate.insert(k, v);
+    }
+    candidate
 }
 fn table_id(op: &Operation) -> Option<Uuid> {
     match op {

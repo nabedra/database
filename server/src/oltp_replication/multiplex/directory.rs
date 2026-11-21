@@ -272,6 +272,9 @@ impl AppliedPeerDirectory {
     }
 }
 impl PeerDirectory for AppliedPeerDirectory {
+    fn applied_revision(&self) -> Option<u64> {
+        Some(self.revision())
+    }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
         if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
             .as_ref().filter(|candidate| candidate.enrollment.worker_id == worker)
@@ -320,6 +323,17 @@ impl PeerDirectory for AppliedPeerDirectory {
                         purpose,
                         Purpose::Authority | Purpose::ApiIngress | Purpose::ApiObservation
                     ) =>
+            {
+                Ok(TransportTrust::AppliedEnrollment)
+            }
+            // An API gateway sends `Method::Direct` / `DirectForward` to the range
+            // leader of its own database's Data groups (T5/T6). Only `ApiIngress`;
+            // the receiver still checks the method and the Control grant (T9 finding:
+            // without this arm every API gateway point operation ended unknown).
+            Role::Api(database)
+                if matches!(group.kind, GroupKind::Data { .. })
+                    && group.database == *database
+                    && purpose == Purpose::ApiIngress =>
             {
                 Ok(TransportTrust::AppliedEnrollment)
             }
@@ -456,6 +470,35 @@ mod tests {
                 TransportTrust::AppliedEnrollment
             );
         }
+        // T9: an API reaches its database's Data groups with `ApiIngress` only.
+        assert_eq!(
+            directory.verify(old, &data, Purpose::ApiIngress).unwrap(),
+            TransportTrust::AppliedEnrollment
+        );
+        for purpose in [
+            Purpose::Raft,
+            Purpose::Snapshot,
+            Purpose::Storage,
+            Purpose::Authority,
+            Purpose::ApiObservation,
+            Purpose::Settlement,
+        ] {
+            assert!(directory.verify(old, &data, purpose).is_err());
+        }
+        let mut foreign_data = data.clone();
+        foreign_data.database = Text::try_from("other").unwrap();
+        assert!(
+            directory
+                .verify(old, &foreign_data, Purpose::ApiIngress)
+                .is_err()
+        );
+        let mut catalog = data.clone();
+        catalog.kind = GroupKind::Catalog;
+        assert!(
+            directory
+                .verify(old, &catalog, Purpose::ApiIngress)
+                .is_err()
+        );
         let mut foreign = control.clone();
         foreign.database = Text::try_from("other").unwrap();
         assert!(

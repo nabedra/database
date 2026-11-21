@@ -87,6 +87,14 @@ enum ReadRequest {
         group_id: Uuid,
     },
     ScopedQueueCapability,
+    /// `data.direct.v1`: activation and the caller's advert. An older
+    /// Control leader rejects the unknown request; callers treat that as
+    /// "not active".
+    DirectCapability,
+    ChangeDirectCapability {
+        operation_id: Uuid,
+        action: super::DirectCapabilityOperation,
+    },
     ScopedQueueTransition {
         group_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +158,15 @@ enum ReadRequest {
         expected: Box<GroupRecord>,
         after: Option<u64>,
     },
+    /// NS14 rule 2: the caller cannot serve this replica. An older Control
+    /// rejects the variant; the worker keeps retrying.
+    GroupDamaged {
+        report: Box<super::GroupDamageReport>,
+    },
+    GroupDamage {
+        group_id: Uuid,
+        node_id: u64,
+    },
 }
 
 impl ReadRequest {
@@ -164,6 +181,7 @@ impl ReadRequest {
                 | Self::GroupMembers { .. }
                 | Self::ScopedQueue { .. }
                 | Self::ScopedQueueCapability
+                | Self::DirectCapability
                 | Self::ScopedQueueTransition { .. }
                 | Self::ScopedQueuePredecessor { .. }
                 | Self::ScopedQueueEpochRetired { .. }
@@ -410,6 +428,22 @@ impl ControlEndpoint {
                     self.shared
                         .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
                 }
+                ReadRequest::DirectCapability => {
+                    let state = self.handle.direct_capability(session.remote()).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::ChangeDirectCapability {
+                    operation_id,
+                    action,
+                } => {
+                    let reply = self
+                        .handle
+                        .apply_direct_capability_rpc(&session, operation_id, action, leader)
+                        .await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &reply, HEADER_LIMIT)?
+                }
                 ReadRequest::ScopedQueueTransition {
                     group_id,
                     source_group,
@@ -467,6 +501,23 @@ impl ControlEndpoint {
                     expected,
                     authority,
                 } => self.handle.split_source(*expected, authority).await?,
+                ReadRequest::GroupDamaged { report } => {
+                    // The transport identity is the reporter (rule 2).
+                    let record = self
+                        .handle
+                        .report_group_damage(session.remote(), *report)
+                        .await?;
+                    self.shared.encode_in(
+                        ByteClass::Progress,
+                        &ControlReply::GroupDamage(Box::new(record)),
+                        HEADER_LIMIT,
+                    )?
+                }
+                ReadRequest::GroupDamage { group_id, node_id } => {
+                    let record = self.handle.group_damage(group_id, node_id).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &record, HEADER_LIMIT)?
+                }
                 ReadRequest::ServiceRole {
                     remote,
                     action,
@@ -653,8 +704,22 @@ pub(crate) struct ControlClient {
     routes: Arc<dyn ControlRoutes>,
     last_read_route: Mutex<Option<(Option<Uuid>, Uuid)>>,
     replica_routes: Option<Box<Mutex<ReplicaRouteCache>>>,
+    service_grants: crate::oltp_replication::service_rpc::GrantCache,
 }
 impl ControlClient {
+    /// The Control group this client reads (API ingress enrollments live
+    /// there; `Method::Direct` authorizes them against it).
+    pub(crate) fn control_group(&self) -> &GroupIdentity {
+        &self.group
+    }
+    /// Receiver-side service-role grants for callers of this worker.
+    pub(crate) fn service_grants(&self) -> &crate::oltp_replication::service_rpc::GrantCache {
+        &self.service_grants
+    }
+    /// The locally applied Control enrollment revision, when known.
+    pub(crate) fn applied_revision(&self) -> Option<u64> {
+        self.client.applied_revision()
+    }
     pub(crate) async fn scoped_queue_capability(
         &self,
     ) -> Result<ScopedQueueCapability, ProtocolError> {
@@ -668,6 +733,44 @@ impl ControlClient {
             return Err(invalid("invalid Control scoped queue capability"));
         }
         Ok(capability)
+    }
+
+    /// The strong Control view of `data.direct.v1` for this caller.
+    pub(crate) async fn direct_capability(&self) -> Result<super::DirectCapability, ProtocolError> {
+        let reply = self.read(&ReadRequest::DirectCapability).await?;
+        let capability = *reply.decode_section::<super::DirectCapability>(0)?;
+        if capability.version != super::DIRECT_VERSION {
+            return Err(invalid("invalid Control direct capability"));
+        }
+        Ok(capability)
+    }
+
+    /// Advertises `data.direct.v1` for this caller's enrolled identity, or
+    /// (`Activate`) asks Control to re-evaluate activation.
+    pub(crate) async fn change_direct_capability(
+        &self,
+        operation_id: Uuid,
+        action: super::DirectCapabilityOperation,
+    ) -> Result<super::DirectCapability, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ChangeDirectCapability {
+                operation_id,
+                action,
+            })
+            .await?;
+        match &*reply.decode_section::<ControlReply>(0)? {
+            ControlReply::DirectCapability(capability)
+                if capability.version == super::DIRECT_VERSION =>
+            {
+                Ok(*capability)
+            }
+            ControlReply::Rejected(Fault::Unauthorized) => Err(ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "Control rejected the direct capability caller",
+                Outcome::NotApplied,
+            )),
+            _ => Err(invalid("unexpected Control direct capability reply")),
+        }
     }
 
     pub(crate) async fn advertise_scoped_queue(
@@ -894,6 +997,34 @@ impl ControlClient {
             ControlReply::ScopedQueueUpdated => Ok(()),
             _ => Err(invalid("unexpected Control scoped queue update reply")),
         }
+    }
+
+    /// NS14 rule 2 from a worker that does not host Control. Idempotent.
+    pub(crate) async fn report_group_damage(
+        &self,
+        report: super::GroupDamageReport,
+    ) -> Result<super::GroupDamageRecord, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::GroupDamaged {
+                report: Box::new(report),
+            })
+            .await?;
+        let reply = reply.decode_section::<ControlReply>(0)?;
+        match &*reply {
+            ControlReply::GroupDamage(record) => Ok((**record).clone()),
+            _ => Err(invalid("unexpected Control reply to a damage report")),
+        }
+    }
+    /// NS14: Control's record of one replica's damage.
+    pub(crate) async fn group_damage(
+        &self,
+        group_id: Uuid,
+        node_id: u64,
+    ) -> Result<Option<super::GroupDamageRecord>, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::GroupDamage { group_id, node_id })
+            .await?;
+        Ok((*reply.decode_section::<Option<super::GroupDamageRecord>>(0)?).clone())
     }
 
     async fn change_scoped_queue(
@@ -1137,6 +1268,7 @@ impl ControlClient {
             routes,
             last_read_route: Mutex::new(None),
             replica_routes,
+            service_grants: Default::default(),
         }))
     }
     async fn read(&self, request: &ReadRequest) -> Result<ReceivedReply, ProtocolError> {
@@ -1149,7 +1281,11 @@ impl ControlClient {
         let deadline = request
             .supports_bounded_failover()
             .then(|| TokioInstant::now() + READ_FAILOVER_TIMEOUT);
-        let use_route_hint = deadline.is_some() || matches!(request, ReadRequest::ChangeScopedQueue { .. });
+        let use_route_hint = deadline.is_some()
+            || matches!(
+                request,
+                ReadRequest::ChangeScopedQueue { .. } | ReadRequest::GroupDamaged { .. }
+            );
         let mut last = unavailable();
         loop {
             let configured_preferred = self.routes.preferred();

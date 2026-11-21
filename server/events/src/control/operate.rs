@@ -159,25 +159,39 @@ async fn broker_status(
         .admin_slots
         .try_acquire()
         .map_err(|_| api_error(Error::Capacity))?;
-    let groups = control.broker.group_ids();
-    let leaders = groups
-        .iter()
-        .filter(|id| {
-            control
-                .broker
-                .group(id)
-                .is_some_and(|group| group.leader() == Some(control.config.broker_id))
+    Ok(Json(control.broker_report()))
+}
+
+impl Control {
+    pub(super) fn broker_report(&self) -> serde_json::Value {
+        let groups = self.broker.group_ids();
+        let leaders = groups
+            .iter()
+            .filter(|id| {
+                self.broker
+                    .group(id)
+                    .is_some_and(|group| group.leader() == Some(self.config.broker_id))
+            })
+            .count();
+        let storage = self.broker.storage_health();
+        serde_json::json!({
+            "broker_id": self.config.broker_id,
+            "ready": self.ready(),
+            "groups": groups.len(),
+            "leaders": leaders,
+            "disk_available_bytes": self.disk_available.load(Ordering::Relaxed),
+            "disk_reserve_bytes": self.disk_reserve_bytes(),
+            // Groups with damaged storage stay stopped until an operator re-adds them.
+            "quarantined_groups": self.broker.quarantined_groups(),
+            // The store refuses all work; the broker exits so the next open recovers it.
+            "store_recovery_required": storage.recovery_required,
+            // A full device: Raft writes retry until space frees up.
+            "no_space": storage.no_space,
+            "storage": storage,
+            "publish": self.publish_metrics.report(),
+            "poll": self.poll_metrics.report(),
         })
-        .count();
-    Ok(Json(serde_json::json!({
-        "broker_id": control.config.broker_id,
-        "ready": control.ready(),
-        "groups": groups.len(),
-        "leaders": leaders,
-        "disk_available_bytes": control.disk_available.load(Ordering::Relaxed),
-        "publish": control.publish_metrics.report(),
-        "poll": control.poll_metrics.report(),
-    })))
+    }
 }
 
 async fn group_status(
@@ -759,15 +773,34 @@ impl Control {
         Ok(())
     }
 
+    /// Start every stored group. A group whose storage is quarantined, before or while it
+    /// opens, stays stopped and reported; the rest of the broker starts (section 3, rule 1;
+    /// RV-EV M3).
     pub(super) async fn reopen(&self, restoring: bool) -> Result<()> {
         for id in self.broker.stored_group_ids()? {
-            self.open_group(&id)
-                .await
-                .with_context(|| format!("open stored group {id}"))?;
+            if let Err(error) = self.open_group(&id).await {
+                if self.broker.is_quarantined(&id) {
+                    tracing::error!(group = %id, %error, "a damaged Events group stays stopped");
+                    continue;
+                }
+                return Err(error).with_context(|| format!("open stored group {id}"));
+            }
         }
         let initial = &self.config.bootstrap.metadata_voters;
-        if initial.contains(&self.config.broker_id) && !self.broker.was_retired(METADATA)? {
-            let group = self.open_group(METADATA).await?;
+        if self.broker.is_quarantined(METADATA) {
+            tracing::error!(
+                "the metadata group's storage on this broker is damaged; it stays stopped \
+                 until an operator re-adds this replica"
+            );
+        } else if initial.contains(&self.config.broker_id) && !self.broker.was_retired(METADATA)? {
+            let group = match self.open_group(METADATA).await {
+                Ok(group) => group,
+                Err(error) if self.broker.is_quarantined(METADATA) => {
+                    tracing::error!(%error, "the damaged metadata group stays stopped");
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
             if initial.first() == Some(&self.config.broker_id)
                 && !group.is_initialized()
                 && (restoring

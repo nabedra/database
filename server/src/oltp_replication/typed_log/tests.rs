@@ -17,10 +17,6 @@ use openraft::vote::RaftLeaderId;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[cfg(target_os = "linux")]
-#[path = "../../../tests/oltp_native_durability/fixture.rs"]
-mod native_durability;
-
 #[derive(Serialize, Deserialize)]
 struct Command(PreparedWrite);
 impl std::fmt::Display for Command {
@@ -103,7 +99,7 @@ impl Fixture {
             &dir.0,
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id: Uuid::new_v4(),
                 worker_id: Uuid::new_v4(),
                 pool_id: Uuid::new_v4(),
@@ -136,20 +132,130 @@ fn blank(index: u64) -> OwnedRaftEntry<Command> {
     OwnedRaftEntry::new(id(index), Payload::Blank)
 }
 
-/// O06/O11, C07/F03: hold the actual WAL sync and observe the typed callback.
-#[cfg(target_os = "linux")]
+/// A `FaultFs` whose `sync_data` (the journal's fdatasync) waits while a gate is
+/// closed. It counts the syncs that entered and passed the gate, so a test can
+/// hold a commit inside the actual journal sync and observe what waits for it.
+#[derive(Clone)]
+struct GatedSync {
+    inner: nabedra_kv::fs::FaultFs,
+    gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
+}
+#[derive(Default)]
+struct GateState {
+    closed: bool,
+    entered: usize,
+    passed: usize,
+}
+struct GatedFile {
+    inner: Arc<dyn nabedra_kv::fs::FsFile>,
+    gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
+}
+impl GatedSync {
+    fn new() -> Self {
+        Self {
+            inner: nabedra_kv::fs::FaultFs::new(),
+            gate: Default::default(),
+        }
+    }
+    fn state<T>(&self, read: impl FnOnce(&mut GateState) -> T) -> T {
+        let result = read(&mut self.gate.0.lock().unwrap());
+        self.gate.1.notify_all();
+        result
+    }
+}
+impl nabedra_kv::fs::Fs for GatedSync {
+    fn open(
+        &self,
+        path: &std::path::Path,
+        mode: nabedra_kv::fs::OpenMode,
+    ) -> io::Result<Arc<dyn nabedra_kv::fs::FsFile>> {
+        Ok(Arc::new(GatedFile {
+            inner: self.inner.open(path, mode)?,
+            gate: self.gate.clone(),
+        }))
+    }
+    fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove(&self, path: &std::path::Path) -> io::Result<()> {
+        self.inner.remove(path)
+    }
+    fn exists(&self, path: &std::path::Path) -> io::Result<bool> {
+        self.inner.exists(path)
+    }
+    fn create_dir_all(&self, dir: &std::path::Path) -> io::Result<()> {
+        self.inner.create_dir_all(dir)
+    }
+    fn list(&self, dir: &std::path::Path) -> io::Result<Vec<std::path::PathBuf>> {
+        self.inner.list(dir)
+    }
+    fn sync_dir(&self, dir: &std::path::Path) -> io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+    fn lock(&self, path: &std::path::Path) -> io::Result<nabedra_kv::fs::FsLock> {
+        self.inner.lock(path)
+    }
+}
+impl nabedra_kv::fs::FsFile for GatedFile {
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        self.inner.write_all_at(buf, offset)
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.inner.read_exact_at(buf, offset)
+    }
+    fn sync_data(&self) -> io::Result<()> {
+        let (lock, changed) = &*self.gate;
+        let mut state = lock.lock().unwrap();
+        if state.closed {
+            state.entered += 1;
+            changed.notify_all();
+            while state.closed {
+                state = changed.wait(state).unwrap();
+            }
+        }
+        drop(state);
+        let result = self.inner.sync_data();
+        if result.is_ok() {
+            lock.lock().unwrap().passed += 1;
+            changed.notify_all();
+        }
+        result
+    }
+    fn sync_all(&self) -> io::Result<()> {
+        self.inner.sync_all()
+    }
+    fn preallocate(&self, len: u64) -> io::Result<()> {
+        self.inner.preallocate(len)
+    }
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+}
+
+/// O06/O11, C07/F03: hold the actual journal sync of a typed append (a gated
+/// `FaultFs` under the pool's store) and observe the typed callback. Formerly a
+/// Linux-only test driven by a Python harness that gated the previous engine's WAL;
+/// it now runs everywhere. While the sync is held: the callback has not fired,
+/// a cancelled append keeps its owned write and order, the next append waits
+/// behind it, no executor thread waits for the fsync, and an unrelated pool's
+/// vote writes progress. After release both acks arrive in order, and only the
+/// bytes a completed sync covered survive a crash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "run with server/tests/oltp_native_durability.py on Linux"]
-async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        use self::native_durability::{arm, publish, root};
+async fn o06_o11_journal_sync_precedes_typed_append_ack() {
+    tokio::time::timeout(Duration::from_secs(30), async {
         use std::sync::{
             Mutex,
             atomic::{AtomicBool, Ordering},
         };
 
-        let root = root();
-        let path = root.join("pool");
+        let dir = Dir(std::env::temp_dir().join(format!("typed-log-gate-{}", Uuid::new_v4())));
+        let path = dir.0.join("pool");
+        std::fs::create_dir_all(&path).unwrap();
+        let gated = GatedSync::new();
+        gated.inner.create_dir_all_durable(&path);
         let shared = WorkerSharedResources::new(
             2,
             WorkerResources {
@@ -161,7 +267,7 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
         .unwrap();
         let identity = PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: Uuid::new_v4(),
             worker_id: Uuid::new_v4(),
             pool_id: Uuid::new_v4(),
@@ -173,11 +279,17 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
             kind: GroupKind::Catalog,
             group_format_version: 1,
         };
-        let pool = OltpPool::open_development(&path, identity.clone(), shared.clone()).unwrap();
+        let pool = OltpPool::open_development_on(
+            &path,
+            identity.clone(),
+            shared.clone(),
+            Arc::new(gated.clone()),
+        )
+        .unwrap();
         let target = pool.group(group_id.clone()).await.unwrap();
         let log = TypedLogStore::<TestConfig>::new(target, 1).await.unwrap();
         let healthy = OltpPool::open_development(
-            root.join("healthy"),
+            dir.0.join("healthy"),
             PoolIdentity {
                 pool_id: Uuid::new_v4(),
                 ..identity.clone()
@@ -197,25 +309,31 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
             .await
             .unwrap();
         let baseline = shared.scheduler().usage();
-        arm(&root, "gate");
+        let passed_at_close = gated.state(|gate| {
+            gate.closed = true;
+            gate.passed
+        });
 
         let vote = Vote::new_committed(2, 1);
         control.save_vote(&vote).await.unwrap();
-        assert!(!root.join("entered").exists(), "matched an unrelated WAL");
+        assert_eq!(
+            gated.state(|gate| gate.entered),
+            0,
+            "an unrelated pool's write entered the gated journal"
+        );
 
         let (sender, mut callback) = TestConfig::oneshot();
         let first = tokio::spawn({
             let mut log = log.clone();
             async move { log.append([blank(0)], IOFlushed::signal(sender)).await }
         });
-        while !root.join("entered").is_file() {
+        while gated.state(|gate| gate.entered) == 0 {
             assert!(
                 !first.is_finished(),
-                "append finished without matching its WAL"
+                "append finished without reaching its journal sync"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(!root.join("synced").exists());
         assert!(matches!(
             callback.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -224,13 +342,14 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
         let callback = Arc::new(Mutex::new(callback));
+        let released = Arc::new(AtomicBool::new(false));
         let first_ack_observed = Arc::new(AtomicBool::new(false));
         *log.append_hook.lock().unwrap() = Some(Arc::new({
-            let root = root.clone();
             let callback = callback.clone();
+            let released = released.clone();
             let observed = first_ack_observed.clone();
             move || {
-                assert!(root.join("synced").is_file());
+                assert!(released.load(Ordering::Acquire));
                 assert!(matches!(callback.lock().unwrap().try_recv(), Ok(Ok(()))));
                 observed.store(true, Ordering::Release);
             }
@@ -245,13 +364,15 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
             tokio::task::yield_now().await;
         }
         assert!(log.writes.try_lock().is_err());
+        // The batch charge stays held until the journal thread drops it.
         assert!(shared.apply_bytes_used() > 0);
-        assert_eq!(shared.scheduler().usage()[0].1, 1);
+        // Waiting for the journal sync holds no executor thread (NS6).
+        assert_eq!(shared.scheduler().usage()[0].1, baseline[0].1);
         assert_eq!(control.read_vote().await.unwrap(), Some(vote));
         let vote = Vote::new_committed(3, 1);
         control.save_vote(&vote).await.unwrap();
         assert_eq!(control.read_vote().await.unwrap(), Some(vote));
-        assert!(!root.join("synced").exists());
+        assert_eq!(gated.state(|gate| gate.passed), passed_at_close);
         let mut drain = Box::pin(log.drain());
         assert!(
             std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx).is_pending()))
@@ -265,7 +386,8 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
             next_callback.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        publish(&root, "release", b"");
+        released.store(true, Ordering::Release);
+        gated.state(|gate| gate.closed = false);
 
         next_callback.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
@@ -278,10 +400,15 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
         assert_eq!(shared.scheduler().usage(), baseline);
         let mut log = log;
         log.save_committed(Some(id(0))).await.unwrap();
+        // A synced metadata write makes the unsynced commit hint durable too.
+        log.save_vote(&Vote::new_committed(1, 1)).await.unwrap();
         drop(log);
         drop(pool);
 
-        let pool = OltpPool::open_development(path, identity, shared).unwrap();
+        // Only what a completed sync covered: both acknowledged appends.
+        let crashed = gated.inner.crash();
+        let pool =
+            OltpPool::open_development_on(&path, identity, shared, Arc::new(crashed)).unwrap();
         let group = pool.retained_group(group_id).await.unwrap();
         let mut log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
         let entries = log.try_get_log_entries(..).await.unwrap();
@@ -291,10 +418,43 @@ async fn o06_o11_actual_wal_sync_precedes_typed_append_ack() {
         );
         assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
         assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(1)));
-        publish(&root, "ordering-verified", b"");
     })
     .await
-    .expect("typed actual WAL sync watchdog");
+    .expect("typed journal sync watchdog");
+}
+
+/// C07/O05: a bounded entry stream ends at its exclusive end without another
+/// native read. OpenRaft applies `since..end` through this stream and answers
+/// each proposer inside the apply. A trailing read for index `end` needed a
+/// Query slot after the last reply was already visible, so a caller that took
+/// the worker's only Query slot on that reply stalled the leader's applied
+/// index, and every linearizable read waiting for it, until it let go (CIfix2:
+/// the C07 progress test hung on Linux CI).
+#[tokio::test]
+async fn c07_o05_bounded_entry_stream_ends_without_reading_past_its_end() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut f = Fixture::new().await;
+        for index in 0..3 {
+            f.log
+                .append([blank(index)], IOFlushed::noop())
+                .await
+                .unwrap();
+        }
+        let shared = f.log.group().resources().clone();
+        let mut stream = Box::pin(f.log.entries_stream(0..3).await);
+        for index in 0..3 {
+            assert_eq!(stream.next().await.unwrap().unwrap().index(), index);
+        }
+        let query = shared.prepare(ExecutionClass::Query).await.unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+        drop(query);
+        assert!(
+            matches!(end, Ok(None)),
+            "the stream needed a Query slot after its last entry"
+        );
+    })
+    .await
+    .expect("bounded entry stream watchdog");
 }
 
 /// O05/O11: range truncation and metadata are one native batch, while an
@@ -310,7 +470,7 @@ async fn o05_o11_typed_wal_streams_beyond_collection_bound_and_atomically_trunca
     }
     assert!(f.log.try_get_log_entries(..).await.is_err());
     let limited = f.log.limited_get_log_entries(0, 140).await.unwrap();
-    assert_eq!(limited.len(), 128);
+    assert_eq!(limited.len(), MAX_APPEND_ENTRIES);
     drop(limited);
     let mut stream = Box::pin(f.log.entries_stream(..).await);
     let mut count = 0;
@@ -338,6 +498,45 @@ async fn o05_o11_typed_wal_streams_beyond_collection_bound_and_atomically_trunca
             .await
             .is_err()
     );
+}
+
+/// O11, NS7: each purge deletes only `(previous purge, id]`. A repeated purge
+/// deletes nothing, consecutive purges leave exactly the suffix, a purge past
+/// the tail empties the log, and a backwards purge is refused. Entry bodies
+/// are journal values; every read resolves their locators.
+#[tokio::test]
+async fn o11_ns07_purge_deletes_only_the_range_after_the_previous_purge() {
+    let mut f = Fixture::new().await;
+    for index in 0..40 {
+        f.log
+            .append([blank(index)], IOFlushed::noop())
+            .await
+            .unwrap();
+    }
+    let retained = |entries: Vec<OwnedRaftEntry<Command>>| {
+        entries
+            .iter()
+            .map(|entry| entry.index())
+            .collect::<Vec<_>>()
+    };
+    for (upto, again) in [(5, false), (5, true), (6, false), (20, false)] {
+        f.log.purge(id(upto)).await.unwrap();
+        let state = f.log.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(id(upto)), "again {again}");
+        assert_eq!(state.last_log_id, Some(id(39)));
+        assert_eq!(
+            retained(f.log.try_get_log_entries(..).await.unwrap()),
+            (upto + 1..40).collect::<Vec<_>>()
+        );
+    }
+    assert!(f.log.purge(id(19)).await.is_err(), "purge moves backwards");
+    f.log.purge(id(60)).await.unwrap();
+    let state = f.log.get_log_state().await.unwrap();
+    assert_eq!(state.last_purged_log_id, Some(id(60)));
+    assert_eq!(state.last_log_id, Some(id(60)));
+    assert!(f.log.try_get_log_entries(..).await.unwrap().is_empty());
+    f.log.append([blank(61)], IOFlushed::noop()).await.unwrap();
+    assert_eq!(retained(f.log.try_get_log_entries(..).await.unwrap()), [61]);
 }
 
 /// O05/M01/F03: actual14MiB fixed bytes survive native log decode and retain

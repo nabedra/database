@@ -411,7 +411,7 @@ class EksGrowthAdapter:
     def _mount(self, template, worker, volume_id, filesystem_uuid):
         return dict(profile='ebs', worker=worker, generation=1, mount_path=template.mount_path,
                     provider_volume_id=volume_id, filesystem_uuid=filesystem_uuid,
-                    identity=dict(engine='oltp', pool_format_version=1, cluster_id=self.cluster_id,
+                    identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
                                   worker_id=worker['worker_id'], pool_id=template.pool_id))
 
     def register_worker(self, intent, target, record, *, controller, pin, deadline):

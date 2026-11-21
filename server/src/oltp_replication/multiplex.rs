@@ -17,7 +17,9 @@ pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,
 };
-pub(crate) use transport::{ReplicaLease, ReplicaMetadata, RequestError, RequestTarget};
+pub(crate) use transport::{
+    PeerFeature, ReplicaLease, ReplicaMetadata, RequestError, RequestTarget,
+};
 
 pub const MAX_SECTIONS: usize = 3;
 pub const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -44,6 +46,8 @@ pub enum Purpose {
     ShardSplitImage = 15,
     ReplicaPlacement = 16,
     RaftProgress = 17,
+    /// NS14b: Control's damage-replacement scheduler to a worker (Control scope).
+    GroupDamage = 18,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrafficClass {

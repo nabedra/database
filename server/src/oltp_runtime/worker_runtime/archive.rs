@@ -99,6 +99,15 @@ impl WorkerRuntime {
         if owner.backup_id.is_nil() || owner.attempt == 0 {
             return Err(unknown());
         }
+        // Incremental segments export only Status-decided transactions, so
+        // they would lose every direct commit and its dedup record (RV-T4 F2).
+        if previous.is_some() && self.direct_commits_active() {
+            return Err(crate::oltp::failure(
+                ErrorCode::UnsupportedOperation,
+                "incremental backups are unavailable while direct commits (data.direct.v1) \
+                 are active: take a full backup",
+            ));
+        }
         if let Some(repository) = &self.services.archive_repository {
             repository.require_write()?;
             if repository.directory(self.native_archive_id(owner)?) != destination {
@@ -148,6 +157,32 @@ impl WorkerRuntime {
         })
         .await
         .map_err(|_| unknown())?
+    }
+    /// Whether direct commits are active, which refuses incremental backups.
+    /// The `data.direct.v1` switch: `is_direct_active()`, `direct_oltp()`
+    /// and `routes_direct()` for the leader executor (T5) and gateway (T6).
+    pub(crate) fn direct_switch(&self) -> Option<&Arc<super::direct_capability::DirectSwitch>> {
+        self.direct.get()
+    }
+    /// Incremental backups exist only while `data.direct.v1` is inactive (a
+    /// cluster with an older member). A single test worker activates it on
+    /// startup, so tests of incremental export stop the watcher first.
+    #[cfg(test)]
+    pub(crate) async fn without_direct_for_test(&self) {
+        if let Some(direct) = self.direct.get() {
+            direct.disable_for_test();
+            direct.stop().await;
+        }
+        self.set_direct_commits_active(false);
+    }
+    pub(crate) fn direct_commits_active(&self) -> bool {
+        self.direct_commits_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Set by the `data.direct.v1` activation (T7). Off by default.
+    pub(crate) fn set_direct_commits_active(&self, active: bool) {
+        self.direct_commits_active
+            .store(active, std::sync::atomic::Ordering::Release);
     }
     async fn reconcile_native_cancellation(
         &self,

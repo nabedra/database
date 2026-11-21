@@ -65,7 +65,7 @@ for container, cpus, memory in [*((node, 1_000_000_000, 2_150_000_000) for node 
 PY
 for node in "${nodes[@]}"; do
     "${compose[@]}" exec -T "$node" sh -c '
-        for name in cpu.stat memory.current memory.peak memory.events; do
+        for name in cpu.stat io.stat memory.current memory.peak memory.events; do
             if [ -r "/sys/fs/cgroup/$name" ]; then
                 echo "$name"
                 cat "/sys/fs/cgroup/$name"

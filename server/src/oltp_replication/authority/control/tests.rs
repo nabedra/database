@@ -32,6 +32,8 @@ use std::{
     },
 };
 use uuid::Uuid;
+mod direct;
+mod group_damage;
 mod growth;
 mod pool_drain;
 mod restart;
@@ -388,7 +390,7 @@ fn identities() -> (GroupIdentity, PoolIdentity) {
         },
         PoolIdentity {
             engine: "oltp".into(),
-            pool_format_version: 1,
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
             cluster_id: cluster,
             worker_id: Uuid::new_v4(),
             pool_id: Uuid::new_v4(),

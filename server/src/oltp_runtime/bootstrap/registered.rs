@@ -8,8 +8,8 @@ use crate::oltp_replication::{
         status::PartitionedStatus,
     },
     manager::{
-        DataGroupClient, DataGroupFactory, DataGroupSpec, RegisteredConfig, RegisteredWorker,
-        ReplicaPlacement,
+        DamageReplacementEndpoint, DamageScheduler, DataGroupClient, DataGroupFactory,
+        DataGroupSpec, FactoryDamageHost, RegisteredConfig, RegisteredWorker, ReplicaPlacement,
         shard_split::{SplitClient, SplitEndpoint},
     },
     service_rpc::{
@@ -162,6 +162,15 @@ impl LocalServices {
                 placements.control.identity.clone(),
                 routes,
             )?;
+            groups.damage.connect(&rpc);
+            // NS14b: GroupDamaged and the replacement commands are proposed only
+            // once every Control member decodes them (`data.direct.v1` active).
+            control.install_group_damage_gate(
+                crate::oltp_replication::authority::control::DirectCapabilityDamageGate::watch(
+                    rpc.clone(),
+                    std::time::Duration::from_secs(5),
+                ),
+            );
             let native_timestamps = TimestampHandle::new(
                 TimestampMachine::new(raw_timestamps.state.store().clone())?,
                 raw_timestamps.clone(),
@@ -176,6 +185,12 @@ impl LocalServices {
                 placements.control.identity.clone(),
             )?);
             native_timestamps.install_release_reader(rpc.clone(), peer.clone())?;
+            // T3's ReserveWindow predicate (T7): data.direct.v1 is active.
+            native_timestamps.install_direct_gate(
+                super::super::worker_runtime::direct_capability::ControlReserveWindowGate::new(
+                    rpc.clone(),
+                ),
+            );
             for (running, handle) in &status_groups {
                 let node = running.state.resident().node_id();
                 let endpoint = StatusEndpoint::new(
@@ -272,16 +287,19 @@ impl LocalServices {
             };
             worker.open_secondary_pools(&control, pins).await?;
             let operator = &worker.operator;
-            while !rolling {
-                let mut complete = true;
-                for enrollment in &enrollments {
-                    complete &=
-                        startup_read(deadline, &error_trace, "peer enrollment", || control.worker(enrollment.worker_id)).await?.as_ref() == Some(enrollment);
+            // A rolling restart reads the directory below instead of waiting for every enrollment.
+            if !rolling {
+                loop {
+                    let mut complete = true;
+                    for enrollment in &enrollments {
+                        complete &=
+                            startup_read(deadline, &error_trace, "peer enrollment", || control.worker(enrollment.worker_id)).await?.as_ref() == Some(enrollment);
+                    }
+                    if complete {
+                        break;
+                    }
+                    wait_startup(deadline).await?;
                 }
-                if complete {
-                    break;
-                }
-                wait_startup(deadline).await?;
             }
             startup_read(deadline, &error_trace, "peer directory", || async {
                 worker.directory.refresh(&rpc).await.map_err(|error| {
@@ -443,7 +461,7 @@ impl LocalServices {
             }
             registration.bind(Purpose::GroupLifecycle, factory.clone())?;
             let split = SplitClient::new(data.clone(), rpc.clone(), placements.timestamps.identity.clone());
-            let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps, native_catalog.clone(), status_topology.clone())?;
+            let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps.clone(), native_catalog.clone(), status_topology.clone())?;
             registration.bind(Purpose::ShardSplit, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitProof, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitImage, split_endpoint)?;
@@ -458,6 +476,11 @@ impl LocalServices {
                 .restart_mount
                 .take()
                 .map(|mount| (mount.generation, mount.key));
+            let damage_endpoint = DamageReplacementEndpoint::new(
+                FactoryDamageHost::new(factory.clone(), pools.clone()),
+                placements.control.identity.clone(),
+            );
+            registration.bind(Purpose::GroupDamage, damage_endpoint.clone())?;
             let placement = ReplicaPlacement::new(factory, pools.clone(), restart_mount);
             registration.bind(Purpose::ReplicaPlacement, placement.clone())?;
             #[cfg(test)]
@@ -465,6 +488,16 @@ impl LocalServices {
                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
             }
             let operator = Arc::new(worker.operator);
+            // NS14b: Control replaces damaged Data replicas on its own, from the
+            // process whose Control replica leads.
+            DamageScheduler::new(
+                control.clone(),
+                raw_control.clone(),
+                operator.clone(),
+                damage_endpoint,
+                std::time::Duration::from_secs(2),
+            )
+            .spawn(stop.subscribe());
             let resolver = Arc::new(RegisteredParticipants {
                 shared: shared.clone(),
                 manager: manager.clone(),
@@ -643,6 +676,9 @@ impl LocalServices {
                     manager: manager.clone(),
                     rpc: rpc.clone(),
                 },
+                Rejoin {
+                    limits: legacy_limits,
+                },
                 stop.subscribe(),
             );
             if let Some(genesis) = worker.restored.take() {
@@ -662,7 +698,7 @@ impl LocalServices {
             }
             Ok((
                 control, operator, timestamps, status, routed_status, catalog, resolver, replica, queue, rpc,
-                issuer, membership, split, placement, scoped,
+                issuer, membership, split, placement, scoped, native_timestamps,
             ))
         }).await.unwrap_or_else(|_| {
             let mut error=last_error.lock().ok().and_then(|error|error.clone()).unwrap_or_else(unavailable);
@@ -686,6 +722,7 @@ impl LocalServices {
                 split,
                 placement,
                 scoped,
+                native_timestamps,
             )) => {
                 let refresh = tokio::spawn(
                     directory
@@ -698,6 +735,13 @@ impl LocalServices {
                     scope,
                     local,
                     replication_factor,
+                    // Every registered worker hosts a Timestamp replica:
+                    // `AllocateDirect` tries it in process first (it only
+                    // answers on the leader), then the service lane.
+                    direct_timestamps: Some(native_timestamps
+                        as Arc<
+                            dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+                        >),
                     cold_history: Some(
                         super::super::worker_runtime::cold_history::Sources::Registered {
                             timestamps: timestamps.clone(),
@@ -787,6 +831,82 @@ async fn ready_members(
         after = page.after;
     }
 }
+/// What a live worker needs to join the ready set again after the owner
+/// removed it (it was paused or partitioned, and is back with the same
+/// incarnation and its RAM queue now stale).
+struct Rejoin {
+    limits: QueueLimits,
+}
+impl Rejoin {
+    /// Begins (or adopts) this worker's own Join of the current ready set and
+    /// replaces its stale replica with an empty joining one for that ticket.
+    /// Returns the ticket once the replica waits for the owner's queue copy.
+    #[allow(clippy::too_many_arguments)]
+    async fn begin(
+        &self,
+        control: &ControlHandle,
+        operator: &LocalOperatorPermit,
+        local: WorkerIdentity,
+        replica: &Mutex<WorkerReplica>,
+        current: QueueAuthority,
+        members: Vec<WorkerIdentity>,
+    ) -> Result<Option<Uuid>, ProtocolError> {
+        // A positively excluded process never serves the queue again; only a
+        // new incarnation may join.
+        if control.worker_replaced(local).await? {
+            return Ok(None);
+        }
+        let state = control.inspect().await?.ok_or_else(unavailable)?;
+        if state.ready != current.ready {
+            return Ok(None);
+        }
+        let ticket = match &state.pending {
+            None => {
+                let operation = crate::oltp_runtime::authority_fence::transition_id(
+                    "registered-queue-rejoin",
+                    &(local, state.ready),
+                )?;
+                match control
+                    .begin_join_local(operator, operation, state.ready.view, local)
+                    .await?
+                    .reply
+                {
+                    ControlReply::JoinBegun { ticket, .. } => ticket,
+                    _ => return Ok(None),
+                }
+            }
+            // The Join applied but its reply was lost: adopt it before any page.
+            Some(Pending::Ready(pending))
+                if pending.change
+                    == crate::oltp_replication::authority::control::ReadyChange::Join
+                    && pending.target == local
+                    && pending.expected == current.ready
+                    && pending.phase == ReadyPhase::Building
+                    && pending.source_after.is_none()
+                    && !pending.target_seen =>
+            {
+                JoinTicket {
+                    ticket_id: pending.transition_id,
+                    target: local,
+                    source_ready: pending.expected,
+                }
+            }
+            _ => return Ok(None),
+        };
+        replica
+            .lock()
+            .map_err(|_| unavailable())?
+            .rejoin(current, members, self.limits, ticket)
+            .map_err(QueueError::protocol)?;
+        eprintln!(
+            "nabedra-db: registered {} queue rejoin begun",
+            local.worker_id
+        );
+        Ok(Some(ticket.ticket_id))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_membership(
     control: Arc<ControlHandle>,
     scope: QueueScope,
@@ -795,9 +915,12 @@ fn spawn_membership(
     queue: Arc<QueueCoordinator>,
     peer: Arc<QueuePeerClient>,
     join_owner: data_worker::JoinOwner,
+    rejoin: Rejoin,
     mut stop: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // The ticket of this worker's own Join while it rejoins the ready set.
+        let mut rejoining: Option<Uuid> = None;
         loop {
             if *stop.borrow_and_update() {
                 break;
@@ -807,30 +930,59 @@ fn spawn_membership(
                 let previous = replica.lock().map_err(|_| unavailable())?.authority();
                 if current != previous {
                     let members = ready_members(&control, current.ready).await?;
-                    replica
-                        .lock()
-                        .map_err(|_| unavailable())?
-                        .fenced_takeover(previous, current, members)
-                        .map_err(QueueError::protocol)?;
+                    if members.contains(&local) {
+                        replica
+                            .lock()
+                            .map_err(|_| unavailable())?
+                            .fenced_takeover(previous, current, members)
+                            .map_err(QueueError::protocol)?;
+                        if rejoining.take().is_some() {
+                            eprintln!("nabedra-db: registered {} queue rejoined", local.worker_id);
+                        }
+                    } else {
+                        // Removed while unresponsive (D05/LIVE1): join again.
+                        rejoining = rejoin
+                            .begin(
+                                &control,
+                                &join_owner.operator,
+                                local,
+                                &replica,
+                                current,
+                                members,
+                            )
+                            .await?;
+                        return Ok(());
+                    }
                 }
-                if current.owner == local {
-                    if let Some(Pending::Ready(pending)) =
-                        control.inspect().await?.ok_or_else(unavailable)?.pending
-                    {
-                        if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
-                            return Ok(());
-                        }
-                        if pending.phase == ReadyPhase::AwaitingQueueProof {
-                            let ticket = JoinTicket {
-                                ticket_id: pending.transition_id,
-                                target: pending.target,
-                                source_ready: pending.expected,
-                            };
-                            let proof = queue.copy_join(ticket, &peer).await?;
-                            accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
-                        } else if control.data_worker(pending.target).await?.is_some() {
-                            join_owner.advance(&control, &pending).await?;
-                        }
+                if rejoining.is_none() && current.owner != local {
+                    return Ok(());
+                }
+                let state = control.inspect().await?.ok_or_else(unavailable)?;
+                if let (Some(ticket), Some(Pending::Ready(pending))) = (rejoining, &state.pending)
+                    && pending.transition_id == ticket
+                    && pending.target == local
+                    && pending.phase != ReadyPhase::AwaitingQueueProof
+                {
+                    // The Building pages and the Timestamp fence of its own Join;
+                    // the owner copies the queue and publishes.
+                    join_owner.advance(&control, pending).await?;
+                }
+                if current.owner == local
+                    && let Some(Pending::Ready(pending)) = state.pending
+                {
+                    if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
+                        return Ok(());
+                    }
+                    if pending.phase == ReadyPhase::AwaitingQueueProof {
+                        let ticket = JoinTicket {
+                            ticket_id: pending.transition_id,
+                            target: pending.target,
+                            source_ready: pending.expected,
+                        };
+                        let proof = queue.copy_join(ticket, &peer).await?;
+                        accepted(control.publish_ready(Uuid::new_v4(), proof).await?.reply)?;
+                    } else if control.data_worker(pending.target).await?.is_some() {
+                        join_owner.advance(&control, &pending).await?;
                     }
                 }
                 Ok::<_, ProtocolError>(())

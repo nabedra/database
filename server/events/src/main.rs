@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use nabedra_events::control::{Config, run_backup, run_restore, serve};
+use nabedra_events::control::{
+    Config, RECOVERY_EXIT_CODE, StoreRecoveryRequired, run_backup, run_restore, serve,
+};
 
 #[derive(Parser)]
 #[command(version, about = "Run and operate Nabedra Events brokers")]
@@ -45,7 +47,15 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     match command {
-        Command::Serve { config } => serve(Config::load(&config)?).await,
+        Command::Serve { config } => match serve(Config::load(&config)?).await {
+            // A distinct code tells the supervisor to restart the broker: the next open
+            // recovers the store or refuses it (RV-EV M2).
+            Err(error) if error.is::<StoreRecoveryRequired>() => {
+                tracing::error!(%error, code = RECOVERY_EXIT_CODE, "exiting for store recovery");
+                std::process::exit(RECOVERY_EXIT_CODE)
+            }
+            result => result,
+        },
         Command::IssueGrant { config, grant } => {
             println!("{}", Config::load(&config)?.issue_grant(&grant)?);
             Ok(())

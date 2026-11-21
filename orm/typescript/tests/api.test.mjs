@@ -41,7 +41,7 @@ test("package has the Python ORM and Events exports with camelCase public member
   assert.deepEqual(classMembers(Cache.prototype), ["close", "delete", "expire", "get", "increment", "persist", "set", "ttlMs"])
   assert.equal(new orm.Database("http://localhost", "test", { mode: "olap" }).mode, "olap")
   assert.deepEqual(classMembers(orm.Database.prototype),
-    ["createTable", "mode", "receipt", "submit", "table", "tables"])
+    ["close", "createTable", "mode", "receipt", "submit", "table", "tables"])
   assert.deepEqual(classMembers(orm.Table.prototype),
     ["delete", "drop", "get", "insert", "insertMany", "query", "schema", "update", "upsert", "where"])
   assert.deepEqual(classMembers(orm.Query.prototype),

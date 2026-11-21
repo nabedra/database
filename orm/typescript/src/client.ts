@@ -210,6 +210,15 @@ export class Database {
       return tables
     })
   }
+
+  /** Closes idle pooled connections. The database stays usable and reconnects as needed. */
+  close(): void {
+    this.#transport.close()
+  }
+
+  [Symbol.dispose](): void {
+    this.close()
+  }
 }
 
 export const DB = Database

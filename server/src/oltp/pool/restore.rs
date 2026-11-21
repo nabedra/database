@@ -23,33 +23,45 @@ impl GroupStore {
     ) -> Result<(), ProtocolError> {
         target.authorize_pool(self.pool().identity(), &self.pool().inner.path)?;
         let group = self.clone();
-        self.mutate(None, None::<()>, MutationLane::Restore, budget, move |tx| {
-            target.authorize_pool(group.pool().identity(), &group.pool().inner.path)?;
-            // No Raft metadata/log can already refer to this genesis. A valid
-            // online install continues to use strict snapshot activation.
-            if group
-                .read_applied(tx.read.snapshot, &mut tx.read.scratch)?
-                .is_some()
-                || tx
-                    .read
-                    .snapshot
-                    .get_pinned(group_key(group.identity().group_id, b'm', &[]))
-                    .map_err(storage_error)?
+        self.mutate(
+            None,
+            None::<()>,
+            MutationLane::Restore,
+            WriteSync::Synced,
+            budget,
+            move |tx| {
+                target.authorize_pool(group.pool().identity(), &group.pool().inner.path)?;
+                // No Raft metadata/log can already refer to this genesis. A valid
+                // online install continues to use strict snapshot activation.
+                if group
+                    .read_applied(tx.read.snapshot, &mut tx.read.scratch)?
                     .is_some()
-            {
-                return Err(recovery_unknown());
-            }
-            let log_prefix = group_key(group.identity().group_id, b'l', &[]);
-            let mut log = tx.read.snapshot.raw_iterator();
-            log.seek(&log_prefix);
-            if log.key().is_some_and(|key| key.starts_with(&log_prefix)) {
-                return Err(recovery_unknown());
-            }
-            log.status().map_err(storage_error)?;
-            drop(log);
-            work(tx)?;
-            Ok(Transition::Commit(tx.encode(&())?))
-        })
+                    || tx
+                        .read
+                        .snapshot
+                        .get(&group_key(group.identity().group_id, b'm', &[]))
+                        .map_err(storage_error)?
+                        .is_some()
+                {
+                    return Err(recovery_unknown());
+                }
+                let log_prefix = group_key(group.identity().group_id, b'l', &[]);
+                let mut log = RawIter::bounded(
+                    tx.read.snapshot,
+                    &log_prefix,
+                    &prefix_end(&log_prefix),
+                    true,
+                );
+                log.seek(&log_prefix);
+                if log.key().is_some_and(|key| key.starts_with(&log_prefix)) {
+                    return Err(recovery_unknown());
+                }
+                log.status()?;
+                drop(log);
+                work(tx)?;
+                Ok(Transition::Commit(tx.encode(&())?))
+            },
+        )
         .await?;
         Ok(())
     }
@@ -69,16 +81,19 @@ impl OltpPool {
         target: Arc<OfflineRestoreTarget>,
     ) -> Result<VerifiedRestoreFlush, ProtocolError> {
         target.authorize_pool(self.identity(), &self.inner.path)?;
+        // Durable before verification: sync the journal, then flush every
+        // memtable to runs. `Store::flush` blocks, so it runs off the runtime.
+        self.sync_wal().await?;
         let pool = self.clone();
-        self.resources()
-            .execute(ExecutionClass::Query, 0, 0, move || {
-                target.authorize_pool(pool.identity(), &pool.inner.path)?;
-                pool.inner.db.flush_wal(true).map_err(storage_error)?;
-                pool.inner.db.flush().map_err(storage_error)?;
-                Ok(VerifiedRestoreFlush {
-                    identity: pool.identity().clone(),
-                })
+        tokio::task::spawn_blocking(move || {
+            target.authorize_pool(pool.identity(), &pool.inner.path)?;
+            pool.healthy()?;
+            pool.inner.store.flush().map_err(storage_error)?;
+            Ok(VerifiedRestoreFlush {
+                identity: pool.identity().clone(),
             })
-            .await
+        })
+        .await
+        .map_err(|_| recovery_unknown())?
     }
 }

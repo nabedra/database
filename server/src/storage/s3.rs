@@ -39,7 +39,8 @@ impl S3Store {
         {
             return Err(StorageError::Configuration);
         }
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(crate::aws_http::https_client());
         if let Some(region) = region {
             if !super::context::valid_region(region) {
                 return Err(StorageError::Configuration);
@@ -93,6 +94,7 @@ impl S3Store {
         // identity, profile/process resolution and endpoint environment settings.
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
+            .http_client(crate::aws_http::https_client())
             .region(aws_sdk_s3::config::Region::new(context.region().to_owned()))
             .credentials_provider(credentials.clone())
             .timeout_config(

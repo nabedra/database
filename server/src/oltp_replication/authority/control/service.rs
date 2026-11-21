@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 use uuid::Uuid;
 mod data_worker;
+mod direct;
+mod group_damage;
 mod growth;
 mod placement;
 mod pool_drain;
@@ -260,6 +262,8 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
+    /// NS14 mixed-version gate for the group damage commands.
+    group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
 impl ControlHandle {
     pub(crate) fn new(
@@ -271,6 +275,7 @@ impl ControlHandle {
             machine,
             consensus,
             policy,
+            group_damage_gate: std::sync::RwLock::new(None),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
@@ -520,6 +525,21 @@ impl ControlHandle {
             operation_id,
             machine::hash(target.worker_id.as_bytes()),
         )?;
+        // Every caller joins its own process, which runs this build and so
+        // decodes every direct entry: advertise `data.direct.v1` first, or an
+        // active capability refuses the join. Control answers `Unauthorized`
+        // (and records nothing) when the identity is not enrolled yet.
+        if target == permit.local {
+            self.submit(ControlCommand::DirectCapability {
+                operation_id: Uuid::new_v4(),
+                actor: target,
+                action: super::DirectCapabilityOperation::Advertise {
+                    version: super::DIRECT_VERSION,
+                },
+                unix_ms: super::direct::wall_ms(),
+            })
+            .await?;
+        }
         self.submit(ControlCommand::BeginJoin {
             operation_id,
             expected,
@@ -1401,6 +1421,22 @@ impl ControlHandle {
                 let source = match action {
                     ServiceAction::ApiIngress | ServiceAction::ScopedQueueIngress { .. } => {
                         return Err(unauthorized());
+                    }
+                    ServiceAction::DirectLeader => {
+                        let advertised = load::<WorkerIdentity>(
+                            view,
+                            &machine::direct::reader_key(remote),
+                        )?;
+                        if view.get(machine::direct::activation_key())?.is_none()
+                            || advertised != Some(remote)
+                            || !matches!(
+                                target.kind,
+                                GroupKind::Catalog | GroupKind::Timestamps | GroupKind::Data { .. }
+                            )
+                        {
+                            return Err(unauthorized());
+                        }
+                        None
                     }
                     ServiceAction::Owner => {
                         if state.owner != Some(remote) {

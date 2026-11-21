@@ -585,6 +585,8 @@ pub(super) fn validate_guards(
     }
     for write in writes {
         let (table, exclusive) = match &write.key {
+            // Dedup records are written only by direct commits.
+            MvccKey::DirectDedup { .. } => return Ok(false),
             MvccKey::Row { table_id, .. } | MvccKey::IndexEntry { table_id, .. } => {
                 (*table_id, false)
             }
@@ -788,6 +790,47 @@ impl ParticipantHandle {
             .await?;
         serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
+    /// The table's exclusive lifecycle guard, granted or pending, read
+    /// linearizably. A direct range leader binds a table lifecycle to its
+    /// group only while none exists (T7b).
+    pub(crate) async fn lifecycle_exclusive(
+        &self,
+        table_id: Uuid,
+    ) -> Result<Option<LifecycleBinding>, ProtocolError> {
+        if !matches!(self.identity().kind, GroupKind::Catalog) {
+            return Err(invalid());
+        }
+        if let Some(remote) = &self.remote {
+            return remote.lifecycle_exclusive(table_id).await;
+        }
+        self.local_consensus().ensure_linearizable().await?;
+        let raw = self
+            .local_machine()
+            .store
+            .read_metadata(
+                TransactionBudget {
+                    scratch_bytes: 64 << 10,
+                    batch_bytes: 0,
+                    output_bytes: 16 << 10,
+                },
+                move |view| {
+                    let holder = match view.pinned(&exclusive_key(table_id))? {
+                        None => None,
+                        Some(bytes) => {
+                            if bytes.len() > METADATA_BYTES {
+                                return Err(recovery_unknown());
+                            }
+                            let record: GuardRecord =
+                                serde_json::from_slice(&bytes).map_err(|_| recovery_unknown())?;
+                            Some(record.binding)
+                        }
+                    };
+                    view.encode(&holder)
+                },
+            )
+            .await?;
+        serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
+    }
     /// Read an already granted holder without adopting its authority. Recovery
     /// may settle an earlier run, but only Status settlement can release it.
     pub(crate) async fn lifecycle_guard(
@@ -966,7 +1009,7 @@ mod index_recovery_tests {
             &path,
             PoolIdentity {
                 engine: "oltp".into(),
-                pool_format_version: 1,
+                pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
                 cluster_id,
                 worker_id: Uuid::new_v4(),
                 pool_id: Uuid::new_v4(),
@@ -1112,6 +1155,8 @@ mod index_recovery_tests {
             gc_floor: 0,
             split_source: None,
             split_child: None,
+            direct_pause: None,
+            direct_schema: None,
         };
         let recover = |binding: LifecycleBinding, authority: Authority| {
             let catalog = catalog.clone();

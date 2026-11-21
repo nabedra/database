@@ -172,6 +172,18 @@ impl ApiEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlCommand {
+    /// `data.direct.v1` adverts and activation. New in this build: see
+    /// `control::direct` for the upgrade order.
+    DirectCapability {
+        operation_id: Uuid,
+        actor: WorkerIdentity,
+        action: super::DirectCapabilityOperation,
+        /// The proposer's wall clock (Unix ms). An activation records it, so
+        /// every process measures the queued-history window (T7c) from the
+        /// same instant.
+        #[serde(default)]
+        unix_ms: u64,
+    },
     ScopedQueue {
         operation_id: Uuid,
         actor: WorkerIdentity,
@@ -402,11 +414,34 @@ pub(crate) enum ControlCommand {
         operation_id: Uuid,
         transition_id: Uuid,
     },
+    /// NS14 rule 2: a worker cannot serve this replica (storage damage or a
+    /// refused pool). Proposed only behind `GroupDamageGate`.
+    GroupDamaged {
+        operation_id: Uuid,
+        worker: WorkerIdentity,
+        report: Box<super::GroupDamageReport>,
+    },
+    /// NS14b rule 3: Control's scheduler claims a damaged replica's group for
+    /// one fresh identity and placement. Proposed only behind `GroupDamageGate`.
+    GroupDamageReplacementBegin {
+        operation_id: Uuid,
+        authorization: AuthorizationStamp,
+        plan: Box<super::group_damage::GroupDamageReplacementPlan>,
+    },
+    /// NS14 rule 3: the membership change that removed the damaged replica
+    /// committed; NS14b publishes the new placement with it. Proposed only
+    /// behind `GroupDamageGate`.
+    GroupDamageReplaced {
+        operation_id: Uuid,
+        authorization: AuthorizationStamp,
+        proof: Box<super::GroupDamageReplacement>,
+    },
 }
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::ScopedQueue { operation_id, .. }
+            Self::DirectCapability { operation_id, .. }
+            | Self::ScopedQueue { operation_id, .. }
             | Self::EnsureScopedQueue { operation_id, .. }
             | Self::PoolDrain { operation_id, .. }
             | Self::BeginWorkerDrain { operation_id, .. }
@@ -445,7 +480,10 @@ impl ControlCommand {
             | Self::BeginColdFence { operation_id, .. }
             | Self::ExcludedPage { operation_id, .. }
             | Self::GroupFenced { operation_id, .. }
-            | Self::PublishFence { operation_id, .. } => *operation_id,
+            | Self::PublishFence { operation_id, .. }
+            | Self::GroupDamaged { operation_id, .. }
+            | Self::GroupDamageReplacementBegin { operation_id, .. }
+            | Self::GroupDamageReplaced { operation_id, .. } => *operation_id,
         }
     }
 }
@@ -511,6 +549,17 @@ impl OwnedPayload for ControlCommand {
             Self::ExcludedPage { workers, .. } => workers.len() * size_of::<ExclusionStamp>(),
             Self::GroupFenced { receipt, .. } => receipt.group.database.len(),
             Self::SealGroup { proof, .. } => proof.group.database.len(),
+            Self::GroupDamaged { report, .. } => {
+                size_of::<super::GroupDamageReport>() + report.group.database.capacity_bytes()
+            }
+            Self::GroupDamageReplaced { proof, .. } => {
+                size_of::<super::GroupDamageReplacement>() + proof.group.database.capacity_bytes()
+            }
+            Self::GroupDamageReplacementBegin { plan, .. } => {
+                size_of::<super::group_damage::GroupDamageReplacementPlan>()
+                    + 2 * plan.group.database.capacity_bytes()
+                    + plan.members.capacity() * size_of::<ReplicaMember>()
+            }
             _ => 0,
         })
     }
@@ -533,10 +582,14 @@ pub(crate) enum Fault {
     NotFound,
     Incomplete,
     NotReady,
+    /// `data.direct.v1` is active and the worker did not advertise it, so it
+    /// cannot become a voter or learner. Emitted only after activation.
+    DirectCapabilityRequired,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
+    DirectCapability(super::DirectCapability),
     ScopedQueueUpdated,
     ScopedQueueTransfer(Box<super::ScopedQueueTransition>),
     ScopedQueue(Box<super::ScopedQueuePlacement>),
@@ -552,6 +605,8 @@ pub(crate) enum ControlReply {
         remaining: u64,
     },
     ReplicaMove(Box<super::placement::ReplicaMove>),
+    /// NS14: one replica's damage record.
+    GroupDamage(Box<super::GroupDamageRecord>),
     Growth(crate::oltp_deployment::controller::GrowthRecord),
     Initialized {
         ready: ReadyMembership,
@@ -662,6 +717,13 @@ pub(crate) enum ServiceAction {
     ParticipantProof { source_group: Uuid },
     ControlFence { transition_id: Uuid },
     Operator,
+    /// A Data range leader executing direct commits (T7): Catalog reads for
+    /// its table schema and `AllocateDirect` on the Timestamp group. A worker
+    /// acting as gateway (T6) also uses it for `Method::Direct` and
+    /// `DirectForward` on Data groups. Granted only while `data.direct.v1`
+    /// is active, to a worker that advertised it, so no older peer receives
+    /// this tag.
+    DirectLeader,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
