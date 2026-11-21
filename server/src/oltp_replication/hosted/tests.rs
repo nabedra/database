@@ -1189,3 +1189,35 @@ fn d01_perf2b_inline_digest_equals_the_native_digest() {
     let large = serde_json::json!({"blob": "x".repeat(INLINE_BYTES)});
     assert!(bounded_digest(&large, INLINE_BYTES).is_none());
 }
+
+pub(crate) fn acceptance_o11_storage() {
+    use crate::oltp_acceptance::clause;
+
+    d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log();
+    o11_purge_and_snapshot_never_pass_the_durable_applied_index();
+    kv_crash::o11_d09_ns10_raft_writes_survive_cuts_at_sampled_operations();
+    clause(
+        "O11",
+        "idempotent-apply",
+        "passed",
+        "FaultFs restarted production Raft after a lost applied suffix and sampled checkpoint and purge cuts. Every recovered command changed the counter once.",
+    );
+    clause(
+        "O11",
+        "optimization-durability",
+        "not-run",
+        "FaultFs exercised synced append, deferred apply and durable snapshot/purge. PERF2d overlapping append/sync needs its own crash evidence in this scenario.",
+    );
+    clause(
+        "O11",
+        "data-index-result-position",
+        "not-run",
+        "Raft replay checked counters and applied positions. A single recovered native cut still needs an exact comparison of row, index, result and position.",
+    );
+    clause(
+        "O11",
+        "damaged-state-rejection",
+        "not-run",
+        "No damaged-state variant ran inside this scenario.",
+    );
+}

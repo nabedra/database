@@ -1111,3 +1111,21 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
     .await
     .unwrap();
 }
+
+pub(crate) fn acceptance_o06_storage() {
+    o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry();
+    o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commit();
+    crate::oltp_acceptance::clause(
+        "O06",
+        "stable-storage-before-ack",
+        "not-run",
+        "RF3 FaultFs verified absent quorum and a delayed leader sync. A delayed follower and a second fsync-failing follower still need a combined RF3 history.",
+    );
+    ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released();
+    crate::oltp_acceptance::clause(
+        "O06",
+        "corrupt-and-foreign-rejection",
+        "not-run",
+        "RF3 FaultFs injected a corrupt journal and verified quarantine and replacement. Foreign replica and corrupt checkpoint refusal still need coverage.",
+    );
+}

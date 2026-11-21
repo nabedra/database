@@ -1867,3 +1867,4 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
 }
 
 mod kv;
+pub(crate) use kv::acceptance_o29_storage;

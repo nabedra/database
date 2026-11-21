@@ -40,6 +40,8 @@ pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
 #[cfg(test)]
 mod damage_tests;
 #[cfg(test)]
+pub(crate) use damage_tests::acceptance_o06_storage;
+#[cfg(test)]
 mod damage_scheduler_tests;
 mod retirement;
 mod supervision;

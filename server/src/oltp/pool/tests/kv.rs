@@ -1236,3 +1236,21 @@ async fn o05_m02_a_returned_write_has_released_its_guards_and_charges() {
 mod rv_ns6;
 
 mod ns14;
+
+pub(crate) fn acceptance_o29_storage() {
+    use crate::oltp_acceptance::clause;
+
+    o29_ns09_journal_sync_eio_latches_every_alias_and_reopen_recovers_from_disk();
+    clause("O29", "shared-recovery-state", "passed",
+        "A modeled journal sync EIO latched both handles and refused existing and newly opened group aliases.");
+    clause("O29", "healthy-pool-isolation", "passed",
+        "An independent pool sharing the worker resources committed and read a new value while the other pool required recovery.");
+    clause("O29", "fault-model-label", "passed",
+        "These checks use FaultFs, including its fsyncgate model. They provide deterministic fault evidence.");
+    clause("O29", "unreadable-is-uncertain", "not-run",
+        "The checks reject read and recomputation after a pre-persistence sync error. The clause requires an error after WAL persistence and actual identity/UUID checks.");
+    clause("O29", "authoritative-decision-replay", "not-run",
+        "No independently authoritative decision was reconciled while the pool was uncertain.");
+    clause("O29", "recovery-without-pending-replay", "not-run",
+        "The pool recovers its original applied position after sync EIO. Post-persistence recovery of the ambiguous exact decision is still required.");
+}
