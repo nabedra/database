@@ -957,7 +957,8 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         candidate refuse a plain restart); the supported recovery after an unplanned stop of the
         whole worker set is the cold start onto a new run. Timed from the first process start
         until every worker serves the new run, then until a point get through the API succeeds."""
-        record = {'mode': 'cold restart of all workers after SIGKILL', 'previous_run': self.run_id}
+        record = {'mode': 'cold restart of all workers after SIGKILL', 'previous_run': self.run_id,
+                  'certificates': self.args.cold_restart_certificates}
         record['before_kill'] = {name: self.cgroup_sample(name) for name in WORKERS}
         for name in WORKERS:
             self.docker('kill', '--signal', 'KILL', f'{self.prefix}-{name}')
@@ -967,8 +968,12 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         nexts = {}
         for name in WORKERS:
             previous = self.worker_configs[name]['node']['enrollment']
-            nexts[name] = self.certificate(name) | dict(worker_id=previous['worker_id'],
-                                                        enrollment_revision=previous['enrollment_revision'] + 1)
+            # GATEfix: a restarted container keeps its key and certificate; a running API follows
+            # only that case (new certificates need an API restart with the new peers).
+            fresh = (dict(previous, incarnation=uid()) if self.args.cold_restart_certificates == 'keep'
+                     else self.certificate(name))
+            nexts[name] = fresh | dict(worker_id=previous['worker_id'],
+                                       enrollment_revision=previous['enrollment_revision'] + 1)
         peers = sorted(nexts.values(), key=lambda item: item['worker_id'])
         pins = sorted(item['certificate_sha256'] for item in peers)
         for name in WORKERS:
@@ -1275,6 +1280,8 @@ def main():
     parser.add_argument('--kill-worker', choices=WORKERS, help='after the workload, SIGKILL this worker and time its restart')
     parser.add_argument('--cold-restart', action='store_true',
                         help='after the workload, SIGKILL every worker and time the cold start onto a new run')
+    parser.add_argument('--cold-restart-certificates', choices=('keep', 'new'), default='keep',
+                        help='with --cold-restart: workers keep their certificates (default) or get new ones')
     parser.add_argument('--cgroup-interval', type=float, default=5, help='seconds between worker cgroup samples')
     parser.add_argument('--perf-record', type=float, default=0,
                         help='Linux host only: perf-sample the workers for this many seconds during the workload')
