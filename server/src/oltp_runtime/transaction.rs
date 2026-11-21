@@ -49,7 +49,7 @@ struct PreparedMutation {
 enum CommitMode<'a> {
     Standard,
     Recoverable,
-    Scoped(PointAdmission<'a>),
+    Scoped(&'a PointAdmission<'a>),
     Queued(Option<&'a DirectSwitch>),
 }
 
@@ -119,6 +119,11 @@ impl TransactionCoordinator {
             return Err(scope_mismatch());
         }
         participant.participant = Arc::new(participant.participant.with_scoped_execution(scope)?);
+        let admission = PointAdmission {
+            reservation,
+            read,
+            epoch,
+        };
         coordinator
             .commit_inner(
                 authority,
@@ -126,11 +131,7 @@ impl TransactionCoordinator {
                 scope.request,
                 scope.read_ts,
                 operation,
-                CommitMode::Scoped(PointAdmission {
-                    reservation,
-                    read,
-                    epoch,
-                }),
+                CommitMode::Scoped(&admission),
             )
             .await
     }

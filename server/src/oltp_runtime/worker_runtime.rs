@@ -1222,12 +1222,11 @@ impl WorkerRuntime {
                 runtime
                     .execute(id, captured_point, None)
                     .await
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         eprintln!(
                             "nabedra-db: request {id} execution failed: {:?}: {}",
                             error.code, error.message
                         );
-                        error
                     })?;
                 settlement.armed = false;
                 Ok(())
@@ -1356,11 +1355,11 @@ impl WorkerRuntime {
             if txn.attempt == 1 {
                 super::recovery_tests::transaction_checkpoint("snapshot", id, &pin.read_ts).await;
             }
-            if txn == initial_txn {
-                // The pinned Running copy barrier has finished.
-                if let Ok(mut replica) = self.services.replica.lock() {
-                    replica.observe_dispatch(current, running);
-                }
+            // The pinned Running copy barrier has finished.
+            if txn == initial_txn
+                && let Ok(mut replica) = self.services.replica.lock()
+            {
+                replica.observe_dispatch(current, running);
             }
             let point = captured_point
                 .as_ref()

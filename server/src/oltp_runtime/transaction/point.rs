@@ -22,7 +22,7 @@ impl TransactionCoordinator {
         authority: Authority,
         scope: ScopedCatalogRead,
         txn: TxnId,
-        admission: PointAdmission<'_>,
+        admission: &PointAdmission<'_>,
         prepared: &PreparedMutation,
     ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
         let home = self.timestamp_point_home(authority, scope, txn).await?;
