@@ -518,7 +518,7 @@ def d11_index(url, token, ca, admin, stats):
     with ThreadPoolExecutor(4) as pool:
         futures = [pool.submit(writer, index) for index in range(4)]
         try:
-            time.sleep(1.0)
+            time.sleep(3.0)
             index_id = uid()
             definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
                           'covering': ['label']}
