@@ -644,6 +644,9 @@ async fn ns23_o06_run_time_damage_stops_the_running_host_and_reports_it() {
             }
         }
         assert!(flipped > 0, "the group's state in a run");
+        // A block cached before the damage was checked when it was read;
+        // evict it so the read below meets the damage on disk (FLAKE1).
+        pool.kv_store().evict_cached_blocks();
         let store = cluster.host(0).state.store().clone();
         let read = store
             .read_metadata(
