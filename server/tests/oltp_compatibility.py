@@ -18,14 +18,16 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 sys.path.insert(0, str(ROOT / 'orm/python/src'))
 from acceptance_nodes import announcement
 from acceptance_nabedra import child_pids, reaped
-from nabedra import Database, StorageError, TransportError, UnknownOutcomeError
+from nabedra import AuthenticationError, Database, NotFoundError, StorageError, TransportError, UnknownOutcomeError
 from nabedra._cli_config import example, protected_write
-from oltp_orm_contract import exercise
+from oltp_orm_contract import exercise, rejected
 
 
 class OlapServer(AbstractContextManager):
-    def __init__(self, binary):
+    def __init__(self, binary, namespace="orm-parity/", storage=None):
         self.binary = str(Path(binary).resolve())
+        self.namespace = namespace
+        self.storage = storage
         self.temporary = tempfile.TemporaryDirectory(prefix='nabedra-olap-parity-')
         self.root = Path(self.temporary.name)
         self.diagnostics = (self.root / 'server.log').open('w+b')
@@ -40,21 +42,23 @@ class OlapServer(AbstractContextManager):
             assert 'olap' in version.split(), version
             self.env = dict(os.environ, PYTHONPATH=str(ROOT / 'orm/python/src'),
                             PYTHONDONTWRITEBYTECODE='1', NABEDRA_SERVER_BINARY=self.binary,
-                            NABEDRA_TOKEN=self.token)
-            store_token = secrets.token_urlsafe(32)
-            self.store = subprocess.Popen([sys.executable, str(ROOT / 'scripts/local_store.py'),
-                '--database', str(self.root / 'objects.sqlite'), '--port', '0'],
-                env=dict(self.env, NABEDRA_STORE_TOKEN=store_token), stdout=subprocess.PIPE, stderr=self.diagnostics)
-            address = announcement(self.store)
-            protected_write(self.root / 'store-token', (store_token + '\n').encode())
+                            NABEDRA_TOKEN=self.token, TMPDIR=str(self.root))
+            if self.storage is None:
+                store_token = secrets.token_urlsafe(32)
+                self.store = subprocess.Popen([sys.executable, str(ROOT / 'scripts/local_store.py'),
+                    '--database', str(self.root / 'objects.sqlite'), '--port', '0'],
+                    env=dict(self.env, NABEDRA_STORE_TOKEN=store_token), stdout=subprocess.PIPE, stderr=self.diagnostics)
+                address = announcement(self.store)
+                protected_write(self.root / 'store-token', (store_token + '\n').encode())
+                self.storage = dict(driver='http', options=dict(base_url=f"http://127.0.0.1:{address['port']}",
+                    token_file=str(self.root / 'store-token'), ca_file=None))
             protected_write(self.root / 'auth.json', dict(admin_token=secrets.token_urlsafe(32),
                 data_token=self.token, enrollment_token=secrets.token_urlsafe(32)))
             with socket.socket() as reserve:
                 reserve.bind(('127.0.0.1', 0))
                 port = reserve.getsockname()[1]
             self.url = f'http://127.0.0.1:{port}'
-            storage = dict(driver='http', options=dict(base_url=f"http://127.0.0.1:{address['port']}",
-                namespace='orm-parity/', token_file=str(self.root / 'store-token'), ca_file=None))
+            storage = {**self.storage, 'options': {**self.storage['options'], 'namespace': self.namespace}}
             config = example('fixed', storage, self.root / 'auth.json', threads=2, bind=f'127.0.0.1:{port}')
             protected_write(self.root / 'config.json', config)
             self.process = subprocess.Popen([sys.executable, '-m', 'nabedra.cli', 'database', 'serve',
@@ -118,13 +122,68 @@ class OlapServer(AbstractContextManager):
         self.close()
 
 
+def typescript(**options):
+    script = Path(__file__).with_name('oltp_compatibility_clients.mjs')
+    subprocess.run(['node', str(script)], input=json.dumps(options), text=True,
+                   timeout=240, check=True)
+
+
+def large_count(url, token, database, total, limit):
+    db = Database(url=url, token=token, database=database, timeout=120)
+    table = db.create_table('o01_count', {'id': int}, key='id')
+    try:
+        for start in range(0, total, 10000):
+            rows = [{'id': i} for i in range(start, min(total, start + 10000))]
+            assert table.insert_many(rows) == len(rows)
+        assert table.query().count() == total
+        assert table.query().limit(limit).count() == limit
+        assert table.get(total - 1) == {'id': total - 1}
+        typescript(url=url, token=token, database=database, name=table.name,
+                   id=table.id, total=total, limit=limit,
+                   forbiddenDatabase='other' if database else None)
+    finally:
+        table.drop()
+        db.close()
+
+
+def olap_scope(first, other):
+    db = Database(url=first.url, token=first.token, timeout=20)
+    table = db.create_table('o01_scope', {'id': int}, key='id')
+    table.insert({'id': 1})
+    foreign = Database(url=other.url, token=other.token, timeout=20)
+    try:
+        rejected(AuthenticationError, lambda: Database(url=other.url, token=first.token).tables())
+        rejected(AuthenticationError, lambda: Database(url=first.url, token=other.token).tables())
+        assert all(item.id != table.id and item.name != table.name for item in foreign.tables())
+        rejected(NotFoundError, lambda: foreign.table(table.name))
+        denied = foreign.submit('table.get', {'table_id': table.id, 'key': 1}).wait(timeout=20)
+        assert denied.state == 'failed' and denied.error["code"] == 'not_found', denied
+        assert table.get(1) == {'id': 1}
+        typescript(url=other.url, token=other.token, foreignToken=first.token,
+                   name=table.name, id=table.id)
+    finally:
+        table.drop()
+        foreign.close()
+        db.close()
+
+
+def interrupt_fixture(signum, _frame):
+    raise KeyboardInterrupt(f'fixture interrupted by signal {signum}')
+
+
 def main():
+    signal.signal(signal.SIGTERM, interrupt_fixture)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--olap-binary', type=Path, required=True)
     parser.add_argument('--oltp-binary', type=Path)
     args = parser.parse_args()
+    clients_available = (ROOT / 'orm/typescript/dist/index.js').is_file()
     with OlapServer(args.olap_binary) as server:
         observed = exercise(server.url, server.token, server.database)
+        if args.oltp_binary and clients_available:
+            with OlapServer(args.olap_binary, 'orm-other/', server.storage) as other:
+                olap_scope(server, other)
+            large_count(server.url, server.token, None, 100000, 99999)
     if args.oltp_binary:
         from oltp_process import Server
         with tempfile.TemporaryDirectory(prefix='nabedra-oltp-parity-') as directory:
@@ -138,7 +197,9 @@ def main():
             server = Server(str(binary), directory, diagnostics=output / 'oltp-parity-server.log')
             try:
                 server.start()
-                counterpart = exercise(server.url, 'test-token', None, unauthorized_database='other')
+                counterpart = exercise(server.url, 'test-token', 'test', unauthorized_database='other')
+                if clients_available:
+                    large_count(server.url, 'test-token', 'test', 100001, 100001)
             finally:
                 server.stop()
         assert counterpart.pop('database_scope') == 'unauthorized'
@@ -148,8 +209,10 @@ def main():
             'results-types-and-ordering': ('passed', 'Both engines matched the public decoder and row-order assertions.'),
             'errors-and-table-identity': ('passed', 'Conflict, stale-handle and recreated-table assertions ran on both engines.'),
             'advisory-mode-and-parquet': ('passed', 'Both modes opened the same descriptor with format parquet on both engines.'),
-            'authentication-and-scope': ('not-run', 'Both engines rejected invalid credentials. Only the OLTP fixture checked database scope.'),
-            'large-counts': ('not-run', 'The parity workload stops at 1,000 rows. Clients with the legacy 100,000 limit need an upgrade.'),
+            'authentication-and-scope': ('passed', 'Both ORMs checked invalid credentials and scope. OLAP isolates authenticated endpoints and catalogs. OLTP rejects another database selector.')
+                if clients_available else ('not-run', 'Build orm/typescript/dist before running shared scope assertions.'),
+            'large-counts': ('passed', 'Both ORMs counted 100000 rows on OLAP and 100001 rows on OLTP through unchanged query().count() calls. Clients with the legacy 100000 decoder limit need an upgrade.')
+                if clients_available else ('not-run', 'Build orm/typescript/dist before running shared production large-count assertions.'),
         }
         for assertion, (status, detail) in checks.items():
             marker = dict(scenario='O01', assertion=assertion, status=status, detail=detail)

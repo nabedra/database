@@ -876,6 +876,8 @@ impl NativePlanner {
         ),
         PlanError,
     > {
+        #[cfg(test)]
+        let _point = crate::oltp_runtime::stage_timing::perf_stage!("test.data.point").timer();
         value(
             decode_record(
                 self.catalog.resources(),

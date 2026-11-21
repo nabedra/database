@@ -65,6 +65,12 @@ impl ParticipantMachine {
         request: ScanRequest,
         scheduled: bool,
     ) -> Result<OwnedCommand<ScanPage>, ProtocolError> {
+        #[cfg(test)]
+        let _scan = matches!(
+            &request.domain,
+            ScanDomain::Rows { .. } | ScanDomain::Index { .. }
+        )
+        .then(|| crate::oltp_runtime::stage_timing::perf_stage!("test.data.scan").timer());
         if request.max_items == 0
             || request.max_items > 128
             || request.max_bytes == 0
