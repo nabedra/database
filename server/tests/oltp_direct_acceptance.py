@@ -26,6 +26,7 @@ import http.client
 import json
 import math
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -456,6 +457,17 @@ def suite_cluster(args, output, rf1_reference):
 def dump(cluster):
     for name in [*cluster.workers, *cluster.apis]:
         print(f'===== {name} log tail =====\n{cluster.tail(name)}', file=sys.stderr, flush=True)
+    # Raft snapshot, membership and placement lines from the whole log (SNAP1): the tail is
+    # usually DEBUG noise from the last second.
+    pattern = re.compile(r'snapshot|learner|membership|placement|replica move|WARN|ERROR')
+    for name in cluster.workers:
+        try:
+            lines = (cluster.root / f'{name}.log').read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        matched = [line[:400] for line in lines if pattern.search(line)][-300:]
+        print(f'===== {name} snapshot/membership lines ({len(matched)}) =====', file=sys.stderr, flush=True)
+        print('\n'.join(matched), file=sys.stderr, flush=True)
 
 
 def d11_index(url, token, ca, admin, stats):

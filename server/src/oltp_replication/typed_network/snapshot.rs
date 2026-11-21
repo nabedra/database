@@ -168,7 +168,14 @@ impl<C: TypedConfig> TypedNetwork<C> {
             let shared = self.factory.shared.clone();
             let class = traffic(&self.factory.resident.identity().kind);
             // SNAP1: a cut writes its file here, on this replication task.
-            let file = snapshot.snapshot.file().await?;
+            let started = std::time::Instant::now();
+            let file = snapshot.snapshot.file().await.inspect_err(|error| {
+                tracing::warn!(group=%self.factory.resident.identity().group_id, target=self.target,
+                    code=?error.code, %error, "typed snapshot file could not be written");
+            })?;
+            tracing::info!(group=%self.factory.resident.identity().group_id, target=self.target,
+                bytes=file.bytes, applied=?file.header.applied, elapsed_ms=started.elapsed().as_millis() as u64,
+                "typed snapshot file ready to stream");
             let description_owner = self.factory.resident.metadata(METADATA)?;
             let description = Description {
                 header: file.header.clone(),
@@ -267,7 +274,11 @@ impl<C: TypedConfig> TypedNetwork<C> {
             ))
         };
         tokio::pin!(cancel);
-        let result = tokio::select! { closed = &mut cancel => Err(StreamingError::Closed(closed)), result = send => result.map_err(|_| StreamingError::Unreachable(Unreachable::from_string("typed snapshot transfer unavailable"))) };
+        let result = tokio::select! { closed = &mut cancel => Err(StreamingError::Closed(closed)), result = send => result.map_err(|error| {
+            tracing::warn!(group=%self.factory.resident.identity().group_id, target=self.target,
+                code=?error.code, %error, "typed snapshot transfer failed");
+            StreamingError::Unreachable(Unreachable::from_string("typed snapshot transfer unavailable"))
+        }) };
         if result.is_err() {
             // Cleanup has a finite deadline. Receiver ownership also expires on
             // the next transfer, and pool reopen removes orphan receive files.
