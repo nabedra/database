@@ -34,13 +34,26 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 #[derive(Clone)]
 pub(crate) struct ControlMachine {
     store: GroupStore,
+    /// GC2 mixed-version tests: apply as the build before cluster features.
+    #[cfg(test)]
+    legacy_v1: bool,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            #[cfg(test)]
+            legacy_v1: false,
+        })
+    }
+    /// GC2: this replica applies every entry as a pre-feature build would.
+    #[cfg(test)]
+    pub(crate) fn legacy_v1_for_test(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -54,12 +67,19 @@ impl ControlMachine {
         let scope = self.store.identity().clone();
         let position = meta.position;
         let digest = meta.command_digest;
+        #[cfg(test)]
+        let legacy_v1 = self.legacy_v1;
         self.store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
                 }
-                apply(tx, &scope, position, digest, command.payload()?)
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(legacy_v1));
+                let result = apply(tx, &scope, position, digest, command.payload()?);
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(false));
+                result
             })
             .await
     }
@@ -237,11 +257,11 @@ fn apply_initialized(
     }
     match command {
         DirectCapability {
+            operation_id,
             actor,
             action,
             unix_ms,
-            ..
-        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
+        } => direct::apply(tx, state, position, *operation_id, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }

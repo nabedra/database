@@ -162,6 +162,10 @@ pub(crate) enum ParticipantCommand {
     /// One-entry direct commit. Proposed only after `data.direct.v1` is
     /// active: an older replica fails to decode this variant (fail closed).
     Direct(direct::DirectCommit),
+    /// GC2: several requests' direct commits to one range in one entry.
+    /// Proposed only while Control's `data.direct.batch` cluster feature is
+    /// enabled: a replica of an older build cannot decode the variant.
+    DirectBatch(direct::DirectBatch),
     /// Deletes dedup records older than a cutoff the proposer computed, so
     /// every replica deletes the same records. Gated like `Direct`.
     DirectExpire(direct::DirectExpire),
@@ -370,9 +374,14 @@ impl ParticipantMachine {
         let identity = self.store.identity().clone();
         let position = meta.position;
         let command_digest = meta.command_digest;
-        let direct = match command.payload()? {
-            ParticipantCommand::Direct(direct) => Some(direct.commit_ts),
-            _ => None,
+        let direct: Vec<CommitTs> = match command.payload()? {
+            ParticipantCommand::Direct(direct) => vec![direct.commit_ts],
+            ParticipantCommand::DirectBatch(batch) => batch
+                .members
+                .iter()
+                .map(|member| member.commit_ts)
+                .collect(),
+            _ => Vec::new(),
         };
         let applied = self
             .store
@@ -383,7 +392,7 @@ impl ParticipantMachine {
         // The entry applied (or was rejected) durably: its pending entry, if
         // this node proposed it, leaves the range clock.
         self.clock.observe_applied(position);
-        if let Some(commit_ts) = direct {
+        for commit_ts in direct {
             self.clock.settle(commit_ts);
         }
         Ok(applied)
@@ -605,6 +614,9 @@ fn apply(
     match command {
         ParticipantCommand::Direct(direct) => {
             return direct::apply(tx, group, config.as_ref(), direct);
+        }
+        ParticipantCommand::DirectBatch(batch) => {
+            return direct::apply_batch(tx, group, config.as_ref(), batch);
         }
         ParticipantCommand::DirectExpire(expire) => {
             return direct::expire(tx, group, config.as_ref(), expire);
@@ -1073,6 +1085,7 @@ fn apply(
         | ParticipantCommand::RejectTimestampPoint { .. }
         | ParticipantCommand::Lifecycle(_)
         | ParticipantCommand::Direct(_)
+        | ParticipantCommand::DirectBatch(_)
         | ParticipantCommand::DirectExpire(_)
         | ParticipantCommand::DirectForward(_)
         | ParticipantCommand::DirectPause(_)
@@ -1326,6 +1339,7 @@ impl std::fmt::Display for ParticipantCommand {
             Self::ResolveTimestampPoint { .. } => "participant-resolve-timestamp-point",
             Self::Resolve { .. } => "participant-resolve",
             Self::Direct(_) => "participant-direct",
+            Self::DirectBatch(_) => "participant-direct-batch",
             Self::DirectExpire(_) => "participant-direct-expire",
             Self::DirectForward(_) => "participant-direct-forward",
             Self::DirectPause(_) => "participant-direct-pause",
@@ -1655,6 +1669,7 @@ impl ParticipantCommand {
         matches!(
             self,
             Self::Direct(_)
+                | Self::DirectBatch(_)
                 | Self::DirectExpire(_)
                 | Self::DirectForward(_)
                 | Self::DirectPause(_)
@@ -1715,6 +1730,7 @@ impl OwnedPayload for ParticipantCommand {
                 }
             }
             Self::Direct(direct) => add(direct.heap_bytes()?)?,
+            Self::DirectBatch(batch) => add(batch.heap_bytes()?)?,
             Self::DirectForward(forward) => add(forward.heap_bytes())?,
             Self::PreparePage {
                 plan,
@@ -1751,6 +1767,9 @@ impl OwnedPayload for ParticipantCommand {
         if let Self::Direct(direct) = self {
             direct.attach_fields(owner.clone())?;
         }
+        if let Self::DirectBatch(batch) = self {
+            batch.attach_fields(owner.clone())?;
+        }
         if let Self::PreparePage { writes, .. } = self {
             for write in writes.iter() {
                 write.attach_charge(owner.clone())?;
@@ -1765,6 +1784,7 @@ impl OwnedPayload for ParticipantCommand {
             | Self::RejectTimestampPoint { page: command, .. } => command.is_attached(),
             Self::SplitImportPage { page, .. } => page.fields_attached(),
             Self::Direct(direct) => direct.fields_attached(),
+            Self::DirectBatch(batch) => batch.fields_attached(),
             Self::PreparePage { writes, .. } => writes.iter().all(PreparedWrite::fields_attached),
             _ => true,
         }

@@ -92,6 +92,32 @@ pub(crate) struct DirectCommit {
     /// compared only with a `DirectExpire` cutoff, never with a local clock.
     pub applied_unix_ms: u64,
 }
+/// GC2: several requests' commits to one range in one Data entry. Proposed
+/// only while Control's `data.direct.batch` cluster feature is enabled: an
+/// older replica cannot decode the variant. Apply validates each member in
+/// the section 4 order against the state the members before it left, and a
+/// rejected member writes nothing while the others apply. Members never
+/// share a key: the leader holds their key latches from read to apply, and
+/// apply refuses a member that shares a key with an earlier one. Each member
+/// keeps its own request id, digest, `commit_ts`, result and dedup record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectBatch {
+    pub members: Vec<DirectCommit>,
+}
+/// Members per `DirectBatch` at most (and `MAX_DIRECT_ENTRY_BYTES` encoded).
+pub(crate) const MAX_DIRECT_BATCH_MEMBERS: usize = 64;
+/// One member's outcome in `DirectReply::Batch`. A replayed member carries no
+/// result, so the reply stays within the participant reply bound whatever
+/// the stored results weigh: the leader reads the record it just applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum DirectMemberReply {
+    Applied { commit_ts: CommitTs },
+    Replayed,
+    Forwarded,
+    Rejected(Fault),
+}
 /// Delete dedup records and forward markers with `applied_unix_ms` below
 /// `min(cutoff_unix_ms, high-water - retention_ms)`, oldest first, at most
 /// `max_items` per entry. The proposer repeats it until the reply says
@@ -229,6 +255,8 @@ pub(crate) enum DirectReply {
     /// the queued path. Also the reply of a `DirectForward` that wrote one.
     Forwarded,
     Rejected(Fault),
+    /// GC2: one reply per `DirectBatch` member, in member order.
+    Batch(Vec<DirectMemberReply>),
 }
 /// What `direct_dedup` finds at an anchor for a request id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,10 +373,13 @@ impl DirectCommit {
 }
 
 fn reply(tx: &mut GroupTransaction<'_>, reply: DirectReply) -> Result<Transition, ProtocolError> {
-    let applied = matches!(
-        reply,
-        DirectReply::Applied { .. } | DirectReply::Replayed { .. } | DirectReply::Forwarded
-    );
+    let applied = match &reply {
+        DirectReply::Applied { .. } | DirectReply::Replayed { .. } | DirectReply::Forwarded => true,
+        DirectReply::Rejected(_) => false,
+        DirectReply::Batch(members) => members
+            .iter()
+            .any(|member| !matches!(member, DirectMemberReply::Rejected(_))),
+    };
     let encoded = tx.encode(&ParticipantReply::Direct(reply))?;
     Ok(if applied {
         Transition::Commit(encoded)
@@ -500,21 +531,165 @@ fn batch_estimate(command: &DirectCommit, dedup: usize) -> Result<usize, Protoco
         .ok_or_else(invalid)
 }
 
+/// What the ordered checks decided for one commit.
+enum Checked {
+    /// Every check passed: write it under this dedup key.
+    Write { dedup: Vec<u8>, estimate: usize },
+    /// The commit ends here and writes nothing.
+    Done(DirectReply),
+}
+
+/// The group high-waters one entry raises (RV-T4 F7, the split freeze
+/// bound). A group transaction does not read its own writes, so the members
+/// of a batch carry them in memory and the entry writes each once.
+struct Highs {
+    unix: u64,
+    unix_raised: bool,
+    direct: Option<CommitTs>,
+    direct_raised: bool,
+}
+impl Highs {
+    fn load(tx: &mut GroupTransaction<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            unix: load::<u64>(tx, UNIX_HIGH)?.unwrap_or(0),
+            unix_raised: false,
+            direct: load::<CommitTs>(tx, DIRECT_HIGH)?,
+            direct_raised: false,
+        })
+    }
+    /// `stamp` for a member: never below the high-water, raising it.
+    fn stamp(&mut self, applied_unix_ms: u64) -> u64 {
+        if applied_unix_ms > self.unix {
+            self.unix = applied_unix_ms;
+            self.unix_raised = true;
+        }
+        self.unix
+    }
+    fn commit(&mut self, commit_ts: CommitTs) {
+        if self.direct.is_none_or(|high| high < commit_ts) {
+            self.direct = Some(commit_ts);
+            self.direct_raised = true;
+        }
+    }
+    fn flush(self, tx: &mut GroupTransaction<'_>) -> Result<(), ProtocolError> {
+        if self.unix_raised {
+            tx.put_serialized(UNIX_HIGH, &self.unix)?;
+        }
+        if let Some(direct) = self.direct.filter(|_| self.direct_raised) {
+            tx.put_serialized(DIRECT_HIGH, &direct)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     group: &GroupIdentity,
     config: Option<&Config>,
     command: &DirectCommit,
 ) -> Result<Transition, ProtocolError> {
+    match check(tx, group, config, command, 0)? {
+        Checked::Done(reply) => self::reply(tx, reply),
+        Checked::Write { dedup, .. } => {
+            let mut highs = Highs::load(tx)?;
+            write(tx, command, &dedup, &mut highs)?;
+            highs.flush(tx)?;
+            reply(
+                tx,
+                DirectReply::Applied {
+                    commit_ts: command.commit_ts,
+                },
+            )
+        }
+    }
+}
+
+/// GC2: a `DirectBatch`. Each member runs the same ordered checks as a
+/// one-entry commit; the only state a member leaves for the next is the
+/// carried high-waters (members never share a key), and the native batch
+/// budget is shared.
+pub(super) fn apply_batch(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<&Config>,
+    batch: &DirectBatch,
+) -> Result<Transition, ProtocolError> {
+    if batch.members.is_empty() || batch.members.len() > MAX_DIRECT_BATCH_MEMBERS {
+        return rejected(tx, Fault::InvalidBinding);
+    }
+    let mut replies = Vec::with_capacity(batch.members.len());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut highs = None;
+    let mut used = 0usize;
+    for member in &batch.members {
+        // Defensive: the leader's latches keep members off each other's
+        // keys. A member that shares one with an earlier member would be
+        // validated against a head that member is about to change.
+        let mut shared = false;
+        let mut keys = Vec::with_capacity(member.writes.len());
+        for (key, _, _) in member.changes() {
+            let key = physical(0, key)?;
+            shared |= seen.contains(&key);
+            keys.push(key);
+        }
+        if shared {
+            replies.push(DirectMemberReply::Rejected(Fault::Conflict));
+            continue;
+        }
+        seen.extend(keys);
+        let reply = match check(tx, group, config, member, used)? {
+            Checked::Done(reply) => member_reply(reply),
+            Checked::Write { dedup, estimate } => {
+                if highs.is_none() {
+                    highs = Some(Highs::load(tx)?);
+                }
+                let Some(highs) = highs.as_mut() else {
+                    unreachable!("loaded above");
+                };
+                write(tx, member, &dedup, highs)?;
+                used = used.checked_add(estimate).ok_or_else(invalid)?;
+                DirectMemberReply::Applied {
+                    commit_ts: member.commit_ts,
+                }
+            }
+        };
+        replies.push(reply);
+    }
+    if let Some(highs) = highs {
+        highs.flush(tx)?;
+    }
+    reply(tx, DirectReply::Batch(replies))
+}
+
+fn member_reply(reply: DirectReply) -> DirectMemberReply {
+    match reply {
+        DirectReply::Applied { commit_ts } => DirectMemberReply::Applied { commit_ts },
+        DirectReply::Replayed { .. } => DirectMemberReply::Replayed,
+        DirectReply::Forwarded => DirectMemberReply::Forwarded,
+        DirectReply::Rejected(fault) => DirectMemberReply::Rejected(fault),
+        DirectReply::Batch(_) => DirectMemberReply::Rejected(Fault::InvalidBinding),
+    }
+}
+
+/// Steps 0 to 8 of plan section 4 for one commit. Nothing here writes.
+/// `used` is the native batch budget earlier members of the entry took.
+fn check(
+    tx: &mut GroupTransaction<'_>,
+    group: &GroupIdentity,
+    config: Option<&Config>,
+    command: &DirectCommit,
+    used: usize,
+) -> Result<Checked, ProtocolError> {
+    let done = |fault| Ok(Checked::Done(DirectReply::Rejected(fault)));
     let Some(config) = config else {
-        return rejected(tx, Fault::NotInitialized);
+        return done(Fault::NotInitialized);
     };
     // 0. `data.direct.v1` reached this group (the store-side gate).
     let Some(schema) = config.direct_schema else {
-        return rejected(tx, Fault::DirectInactive);
+        return done(Fault::DirectInactive);
     };
     if let Some(fault) = well_formed(group, command)? {
-        return rejected(tx, fault);
+        return done(fault);
     }
     let dedup_key = command.dedup_key().ok_or_else(invalid)?;
     let dedup = physical(DEDUP, &dedup_key)?;
@@ -523,11 +698,11 @@ pub(super) fn apply(
     if split_in_progress(config) {
         let reply = lookup(tx, &dedup, command.digest)?
             .unwrap_or(DirectReply::Rejected(Fault::SplitInProgress));
-        return self::reply(tx, reply);
+        return Ok(Checked::Done(reply));
     }
     // 2. The run and group fence.
     if config.authority != command.authority {
-        return rejected(tx, Fault::StaleAuthority);
+        return done(Fault::StaleAuthority);
     }
     // 3. Both epochs. The schema epoch is the group's direct epoch, which
     //    a DDL fence bumps before the Catalog publishes (plan section 7); a
@@ -536,23 +711,24 @@ pub(super) fn apply(
         || schema.epoch != command.schema_epoch
         || config.routing_epoch != command.routing_epoch
     {
-        return rejected(tx, Fault::StaleEpoch);
+        return done(Fault::StaleEpoch);
     }
     // 4. Every key belongs to the group.
     if command
         .changes()
         .any(|(key, _, _)| !owns(group, &config.span, key))
     {
-        return rejected(tx, Fault::InvalidBinding);
+        return done(Fault::InvalidBinding);
     }
     // 5. A committed request with this id and anchor replays or conflicts,
     //    and a forwarded one belongs to the queued path. This precedes the
     //    head checks, which the first attempt changed.
     if let Some(reply) = lookup(tx, &dedup, command.digest)? {
-        return self::reply(tx, reply);
+        return Ok(Checked::Done(reply));
     }
-    if batch_estimate(command, dedup.len())? > APPLY.batch_bytes - (64 << 10) {
-        return rejected(tx, Fault::ResourceLimit);
+    let estimate = batch_estimate(command, dedup.len())?;
+    if used.saturating_add(estimate) > APPLY.batch_bytes - (64 << 10) {
+        return done(Fault::ResourceLimit);
     }
     // 6-8. No intent, the exact head version, then a timestamp above the
     //      newest version, the GC floor and a split child's import cut.
@@ -567,19 +743,19 @@ pub(super) fn apply(
         heads.push((head.unwrap_or_default(), expected));
     }
     if heads.iter().any(|(head, _)| head.intent.is_some()) {
-        return rejected(tx, Fault::Incomplete);
+        return done(Fault::Incomplete);
     }
     if heads
         .iter()
         .any(|(head, expected)| head.version != *expected)
     {
-        return rejected(tx, Fault::Conflict);
+        return done(Fault::Conflict);
     }
     if heads.iter().any(|(head, _)| {
         head.version
             .is_some_and(|newest| command.commit_ts <= newest)
     }) {
-        return rejected(tx, Fault::Conflict);
+        return done(Fault::Conflict);
     }
     drop(heads);
     // A direct commit never lands at or below the group's GC floor (or a
@@ -591,9 +767,19 @@ pub(super) fn apply(
             .max(child.published_at.map_or(0, CommitTs::get))
     });
     if command.commit_ts.get() <= floor {
-        return rejected(tx, Fault::Conflict);
+        return done(Fault::Conflict);
     }
+    Ok(Checked::Write { dedup, estimate })
+}
 
+/// The writes of a checked commit: its versions, heads, index entries and
+/// dedup record. The high-waters are flushed by the caller.
+fn write(
+    tx: &mut GroupTransaction<'_>,
+    command: &DirectCommit,
+    dedup: &[u8],
+    highs: &mut Highs,
+) -> Result<(), ProtocolError> {
     #[derive(Serialize)]
     struct Version<'a> {
         value: Option<&'a RawValue>,
@@ -620,10 +806,10 @@ pub(super) fn apply(
     }
     let result =
         serde_json::from_str::<&RawValue>(command.result.as_str()).map_err(|_| invalid())?;
-    let applied_unix_ms = stamp(tx, command.applied_unix_ms)?;
+    let applied_unix_ms = highs.stamp(command.applied_unix_ms);
     put_entry(
         tx,
-        &dedup,
+        dedup,
         applied_unix_ms,
         &DedupRecord {
             applied_unix_ms,
@@ -632,16 +818,8 @@ pub(super) fn apply(
             result,
         },
     )?;
-    let high = load::<CommitTs>(tx, DIRECT_HIGH)?;
-    if high.is_none_or(|high| high < command.commit_ts) {
-        tx.put_serialized(DIRECT_HIGH, &command.commit_ts)?;
-    }
-    reply(
-        tx,
-        DirectReply::Applied {
-            commit_ts: command.commit_ts,
-        },
-    )
+    highs.commit(command.commit_ts);
+    Ok(())
 }
 
 /// `tag || logical key`.
@@ -1159,6 +1337,34 @@ impl crate::oltp_replication::owned::OwnedPayload for DirectCommit {
             && self
                 .changes()
                 .all(|(_, _, value)| value.is_none_or(CanonicalJson::is_charged))
+    }
+}
+
+impl DirectBatch {
+    pub(crate) fn heap_bytes(&self) -> Result<usize, ProtocolError> {
+        use crate::oltp_replication::owned::OwnedPayload as _;
+        let mut bytes = self
+            .members
+            .capacity()
+            .checked_mul(std::mem::size_of::<DirectCommit>())
+            .ok_or_else(invalid)?;
+        for member in &self.members {
+            bytes = bytes
+                .checked_add(member.heap_bytes()?)
+                .ok_or_else(invalid)?;
+        }
+        Ok(bytes)
+    }
+    pub(crate) fn attach_fields(&self, owner: Arc<ScratchLease>) -> Result<(), ProtocolError> {
+        use crate::oltp_replication::owned::OwnedPayload as _;
+        for member in &self.members {
+            member.attach_fields(owner.clone())?;
+        }
+        Ok(())
+    }
+    pub(crate) fn fields_attached(&self) -> bool {
+        use crate::oltp_replication::owned::OwnedPayload as _;
+        self.members.iter().all(DirectCommit::fields_attached)
     }
 }
 

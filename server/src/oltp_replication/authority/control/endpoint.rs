@@ -95,6 +95,10 @@ enum ReadRequest {
         operation_id: Uuid,
         action: super::DirectCapabilityOperation,
     },
+    /// GC2: the direct family's cluster features (`DirectFeatures`). An
+    /// older Control leader rejects the unknown request; callers treat that
+    /// as "not enabled".
+    DirectFeatures,
     ScopedQueueTransition {
         group_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +186,7 @@ impl ReadRequest {
                 | Self::ScopedQueue { .. }
                 | Self::ScopedQueueCapability
                 | Self::DirectCapability
+                | Self::DirectFeatures
                 | Self::ScopedQueueTransition { .. }
                 | Self::ScopedQueuePredecessor { .. }
                 | Self::ScopedQueueEpochRetired { .. }
@@ -430,6 +435,11 @@ impl ControlEndpoint {
                 }
                 ReadRequest::DirectCapability => {
                     let state = self.handle.direct_capability(session.remote()).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::DirectFeatures => {
+                    let state = self.handle.direct_features(session.remote()).await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
                 }
@@ -743,6 +753,33 @@ impl ControlClient {
             return Err(invalid("invalid Control direct capability"));
         }
         Ok(capability)
+    }
+
+    /// GC2: the strong Control view of the direct cluster features for this
+    /// caller. An older Control answers an error: not enabled.
+    pub(crate) async fn direct_features(&self) -> Result<super::DirectFeatures, ProtocolError> {
+        let reply = self.read(&ReadRequest::DirectFeatures).await?;
+        Ok(*reply.decode_section::<super::DirectFeatures>(0)?)
+    }
+
+    /// GC2: advertises `feature` for `local`, this caller's enrolled
+    /// identity, as the `Advertise { version: 1 }` every Control build
+    /// applies alike (see `control::direct`). A repeated advert answers a
+    /// conflict (its receipt exists), which is ignored: read
+    /// `direct_features` for the outcome.
+    pub(crate) async fn advertise_direct_feature(
+        &self,
+        feature: &str,
+        local: crate::oltp_replication::types::WorkerIdentity,
+    ) {
+        let _ = self
+            .change_direct_capability(
+                super::feature_operation_id(feature, local),
+                super::DirectCapabilityOperation::Advertise {
+                    version: super::DIRECT_VERSION,
+                },
+            )
+            .await;
     }
 
     /// Advertises `data.direct.v1` for this caller's enrolled identity, or

@@ -64,6 +64,7 @@ use uuid::Uuid;
 mod tls;
 
 mod gc1;
+mod gc2;
 
 struct Dir(PathBuf);
 impl Dir {
@@ -121,14 +122,18 @@ impl DirectTimestampSource for Counter {
     }
 }
 
-/// `.0`: `data.direct.v1` active; `.1`: the queued-history window (T7c).
-struct Gate(AtomicBool, AtomicBool);
+/// `.0`: `data.direct.v1` active; `.1`: the queued-history window (T7c);
+/// `.2`: `data.direct.batch` enabled (GC2).
+struct Gate(AtomicBool, AtomicBool, AtomicBool);
 impl DirectGate for Gate {
     fn direct_active(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
     fn history_settling(&self) -> bool {
         self.1.load(Ordering::Acquire)
+    }
+    fn direct_batch(&self) -> bool {
+        self.2.load(Ordering::Acquire)
     }
 }
 
@@ -181,6 +186,8 @@ struct Options {
     activate: bool,
     /// The Timestamp authority; a shared `Counter` by default.
     timestamps: Option<Arc<dyn DirectTimestampSource>>,
+    /// GC2: `data.direct.batch` enabled from the start.
+    batch: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -188,6 +195,7 @@ impl Default for Options {
             electors: vec![1],
             activate: true,
             timestamps: None,
+            batch: false,
             config: DirectConfig::default(),
             span: crate::oltp::mvcc::store::KeySpan {
                 start: None,
@@ -264,7 +272,11 @@ impl Cluster {
                 .map(|worker| (worker.worker_id, worker.clone()))
                 .collect(),
         ));
-        let gate = Arc::new(Gate(AtomicBool::new(true), AtomicBool::new(false)));
+        let gate = Arc::new(Gate(
+            AtomicBool::new(true),
+            AtomicBool::new(false),
+            AtomicBool::new(options.batch),
+        ));
         let schema = Arc::new(StaticSchema::default());
         let index = Uuid::new_v4();
         schema.insert(DirectTable {

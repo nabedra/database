@@ -5,7 +5,8 @@
 //! did not advertise cannot become a voter or learner of any group.
 use super::*;
 use crate::oltp_replication::authority::control::direct::{
-    DIRECT_VERSION, DirectActivation, DirectCapability, DirectCapabilityOperation,
+    DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
+    DirectCapabilityOperation, FeatureActivation, feature_operation_id,
 };
 
 const ACTIVATION: &[u8] = b"ct/direct-capability";
@@ -13,6 +14,29 @@ const READERS: &[u8] = b"ct/direct-reader/";
 /// Present once a queue owner reserved an eligible mutation unsettled while
 /// the capability was inactive (T7c). Never deleted.
 const QUEUED_HISTORY: &[u8] = b"ct/direct-queued-history";
+/// GC2: `data.direct.batch` is enabled (a `FeatureActivation`). Written only
+/// by a feature-aware build, never deleted.
+const BATCH_ENABLED: &[u8] = b"ct/feature/data.direct.batch";
+
+pub(in crate::oltp_replication::authority::control) fn batch_key() -> &'static [u8] {
+    BATCH_ENABLED
+}
+
+// Mixed-version tests (GC2): a Control replica of the build before cluster
+// features, simulated by switching off every feature-aware rule. Set by
+// `ControlMachine::apply` around one apply on the native thread that runs it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static LEGACY_V1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn legacy_v1() -> bool {
+    LEGACY_V1.with(std::cell::Cell::get)
+}
+#[cfg(not(test))]
+fn legacy_v1() -> bool {
+    false
+}
 
 pub(in crate::oltp_replication::authority::control) fn activation_key() -> &'static [u8] {
     ACTIVATION
@@ -27,6 +51,7 @@ pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
     state: &State,
     position: AppliedPosition,
+    operation_id: Uuid,
     actor: WorkerIdentity,
     action: &DirectCapabilityOperation,
     unix_ms: u64,
@@ -73,6 +98,14 @@ pub(super) fn apply(
             None
         }
     };
+    // GC2: the reply and every write above are what a pre-feature build
+    // produces for this entry. A feature-aware build may add only the
+    // enablement, and only when every enrolled worker advertised it.
+    if activation.is_some() && !legacy_v1() {
+        let batch_advert = matches!(action, DirectCapabilityOperation::Advertise { .. })
+            && operation_id == feature_operation_id(DIRECT_BATCH_FEATURE, actor);
+        maybe_enable_batch(tx, state, position, batch_advert.then_some(actor))?;
+    }
     Ok(ControlReply::DirectCapability(DirectCapability {
         version: DIRECT_VERSION,
         activation,
@@ -98,14 +131,39 @@ pub(super) fn active(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolErro
     Ok(tx.get(ACTIVATION)?.is_some())
 }
 
+/// `worker`'s current identity advertised `data.direct.batch`: the receipt of
+/// its feature advert exists (see `control::direct`).
+pub(super) fn supports_batch(
+    tx: &mut GroupTransaction<'_>,
+    worker: WorkerIdentity,
+) -> Result<bool, ProtocolError> {
+    let receipt = key(
+        b"ct/op/",
+        feature_operation_id(DIRECT_BATCH_FEATURE, worker),
+    );
+    Ok(load::<super::Receipt>(tx, &receipt)?
+        .is_some_and(|receipt| matches!(receipt.reply, ControlReply::DirectCapability(_))))
+}
+
+/// After enablement, only a worker whose current identity advertised
+/// `data.direct.batch` may join: an older build cannot decode `DirectBatch`.
+/// A pre-feature Control build has no enablement, so it never refuses here.
+fn batch_admits(
+    tx: &mut GroupTransaction<'_>,
+    worker: WorkerIdentity,
+) -> Result<bool, ProtocolError> {
+    Ok(legacy_v1() || tx.get(BATCH_ENABLED)?.is_none() || supports_batch(tx, worker)?)
+}
+
 /// After activation, only a worker that advertised its current identity may
 /// join a group or the ready set: an older build cannot decode direct
-/// entries. Before activation everyone may join.
+/// entries. Before activation everyone may join. The same holds for every
+/// enabled cluster feature (GC2).
 pub(super) fn admits(
     tx: &mut GroupTransaction<'_>,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    Ok(!active(tx)? || supports(tx, worker)?)
+    Ok((!active(tx)? || supports(tx, worker)?) && batch_admits(tx, worker)?)
 }
 
 /// `admits` for a replica named only by its worker id: the enrolled
@@ -120,7 +178,8 @@ pub(super) fn admits_worker_id(
     let Some(record) = load::<WorkerRecord>(tx, &key(WORKERS, worker_id))? else {
         return Ok(false);
     };
-    supports(tx, WorkerIdentity::from(&record.enrollment))
+    let worker = WorkerIdentity::from(&record.enrollment);
+    Ok(supports(tx, worker)? && batch_admits(tx, worker)?)
 }
 
 /// Test processes (T7c): while the file named by
@@ -152,19 +211,60 @@ fn can_activate(
     {
         return Ok(false);
     }
-    Ok(
-        all_advertised(tx, WORKERS, advertising, |entry: WorkerRecord| {
-            WorkerIdentity::from(&entry.enrollment)
-        })? && all_advertised(tx, APIS, advertising, |entry: ApiEnrollment| {
-            WorkerIdentity::from(entry.transport())
-        })?,
-    )
+    let advertised = |tx: &mut GroupTransaction<'_>, worker| {
+        Ok(advertising == Some(worker) || supports(tx, worker)?)
+    };
+    Ok(all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
+        WorkerIdentity::from(&entry.enrollment)
+    })? && all_members(tx, APIS, advertised, |entry: ApiEnrollment| {
+        WorkerIdentity::from(entry.transport())
+    })?)
 }
 
-fn all_advertised<T: serde::de::DeserializeOwned>(
+/// GC2: enables `data.direct.batch` once every enrolled worker's current
+/// identity advertised it (`advertising` is this entry's own advert, whose
+/// receipt this transaction cannot read yet). Every Control voter and
+/// learner is an enrolled worker, so they all run a feature-aware build and
+/// apply this write alike. API ingresses hold no replica and are not
+/// required. Mirrors `can_activate`'s membership guards.
+fn maybe_enable_batch(
+    tx: &mut GroupTransaction<'_>,
+    state: &State,
+    position: AppliedPosition,
+    advertising: Option<WorkerIdentity>,
+) -> Result<(), ProtocolError> {
+    if tx.get(BATCH_ENABLED)?.is_some()
+        || state.pending.is_some()
+        || state.restart.is_some()
+        || state.ready.ready_count == 0
+        || state.invalid_ready != 0
+        || tx.get(placement::ACTIVE)?.is_some()
+    {
+        return Ok(());
+    }
+    let advertised = |tx: &mut GroupTransaction<'_>, worker| {
+        Ok(advertising == Some(worker) || supports_batch(tx, worker)?)
+    };
+    if all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
+        WorkerIdentity::from(&entry.enrollment)
+    })? {
+        save(
+            tx,
+            BATCH_ENABLED,
+            &FeatureActivation {
+                activated_at: position,
+                enrollment_revision: state.enrollment_revision,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether `advertised` holds for every member under `prefix`.
+fn all_members<T: serde::de::DeserializeOwned>(
     tx: &mut GroupTransaction<'_>,
     prefix: &[u8],
-    advertising: Option<WorkerIdentity>,
+    advertised: impl Fn(&mut GroupTransaction<'_>, WorkerIdentity) -> Result<bool, ProtocolError>,
     identity: impl Fn(T) -> WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
     let mut cursor = None;
@@ -182,7 +282,7 @@ fn all_advertised<T: serde::de::DeserializeOwned>(
         })?;
         for worker in members {
             cursor = Some(super::key(prefix, worker.worker_id));
-            if advertising != Some(worker) && !supports(tx, worker)? {
+            if !advertised(tx, worker)? {
                 return Ok(false);
             }
         }
