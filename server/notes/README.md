@@ -1,5 +1,9 @@
 # Historical server evidence
 
-These notes record commands, paths, protocol domains and observed results from the implementation under its former MeshDB name. They remain unchanged so that the evidence retains its original meaning. Current instructions and names live in [the server guide](../docs/reference.md).
+These notes are from before the project was renamed, when it was called
+MeshDB. They record the commands, paths, protocol domains and results of that
+work, and we left them unchanged so they still mean what they meant then. For
+current instructions and names, use [the server guide](../docs/reference.md).
 
-Renaming the project does not establish that prior acceptance scenarios have been rerun. The current rename verification is recorded in [the rename evidence](../rename-evidence.md).
+The rename didn't rerun any of the acceptance scenarios recorded here. What we
+did check for the rename is in [the rename evidence](../rename-evidence.md).
