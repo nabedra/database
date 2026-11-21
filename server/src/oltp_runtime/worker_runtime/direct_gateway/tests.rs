@@ -226,7 +226,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
     struct ReplyPressure {
         service: Arc<dyn DirectService>,
         id: Uuid,
-        hold: Mutex<Option<ChargedBuffer>>,
+        holds: Mutex<Vec<ChargedBuffer>>,
     }
     impl DirectService for ReplyPressure {
         fn execute<'a>(
@@ -249,7 +249,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
                         shared.buffer_bytes_used(ByteClass::Data),
                         config.control_bytes - config.progress_bytes
                     );
-                    *self.hold.lock().unwrap() = Some(hold);
+                    self.holds.lock().unwrap().push(hold);
                 }
                 Ok(response)
             })
@@ -281,7 +281,7 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         let pressure = Arc::new(ReplyPressure {
             service: direct::installed(shared).unwrap(),
             id,
-            hold: Mutex::new(None),
+            holds: Mutex::new(Vec::new()),
         });
         direct::install(shared, &(pressure.clone() as Arc<dyn DirectService>));
         let insert = body(
@@ -293,10 +293,10 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
         );
         let (status, envelope) = call(&app, insert.clone(), true).await;
         direct::install(shared, &pressure.service);
-        assert!(
-            pressure.hold.lock().unwrap().take().is_some(),
-            "post-apply hold reached"
-        );
+        let mut holds = pressure.holds.lock().unwrap();
+        assert!(!holds.is_empty(), "post-apply hold reached");
+        holds.clear();
+        drop(holds);
         let get = body(
             Uuid::new_v4(),
             "table.get",
@@ -404,12 +404,8 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         assert_eq!(stats.forwards, 0, "{stats:?}");
         assert_eq!(leader()["entries_applied"], json!(6));
 
-        // Without a declared length the request takes the queued path and
-        // still answers the same (the full parsing charge applies). The
-        // queue owner settles each eligible mutation at its anchor before it
-        // reserves it (T7c), so none can also run directly; gets are not
-        // settled (RV-FINAL M3).
-        let markers = leader()["forward_markers_written"].as_u64().unwrap();
+        // A body without a declared length has the full parsing charge and
+        // uses the same eligibility and dedup rules.
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
             let (status, envelope) =
@@ -421,11 +417,9 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
             );
         }
         let after = gateway.stats();
-        assert_eq!(after.direct_done, stats.direct_done, "{after:?}");
-        assert!(after.forwards >= 8, "{after:?}");
-        assert!(after.forwards - stats.forwards <= mutations, "no get settled: {after:?}");
-        let written = leader()["forward_markers_written"].as_u64().unwrap() - markers;
-        assert!((8..=mutations).contains(&written), "{}", leader());
+        assert_eq!(after.direct_done, 2 * stats.direct_done, "{after:?}");
+        assert_eq!(after.forwards, 0, "{after:?}");
+        assert_eq!(leader()["entries_applied"], json!(12));
 
         // The runtime stats show the gateway, the executor and the switch.
         let reply = runtime.stats().await.unwrap();
@@ -610,7 +604,7 @@ fn report(line: &str) {
 /// O15/D03, RV-FINAL M3 (user decision 2026-11-21): in rollback mode
 /// (`direct_oltp: false` while `data.direct.v1` is active) a queued get has
 /// no exactly-once identity of its own. Through the gateway (declared
-/// length) and through the queue owner (no declared length) it proposes no
+/// length or streamed body) it proposes no
 /// Data entry and writes no forward marker, so no dedup record or expiry
 /// key. A mutation in the same mode is still settled (one marker). The run
 /// reports per-get Data entries, forwards, journal bytes and wall time; the
