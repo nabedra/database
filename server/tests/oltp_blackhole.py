@@ -8,12 +8,15 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from threading import Lock
 import time
 
 from oltp_direct_cluster import DATABASE, WORKERS, Http, Rf3Cluster, call, operation, uid
 from oltp_recovery_operations import initial_range
 
 from nabedra import Database
+
+PRINT_LOCK = Lock()
 
 
 def privileged(*args):
@@ -103,7 +106,8 @@ class IsolatedWorkers(Rf3Cluster):
 
 
 def record(event, **values):
-    print(json.dumps(dict(event=event, **values)), flush=True)
+    with PRINT_LOCK:
+        print(json.dumps(dict(event=event, **values)), flush=True)
 
 
 def wait_leaders(cluster, groups, workers, *, down=None, started=None, limit=12):
@@ -170,9 +174,7 @@ def traffic(cluster, table, write, started, window, first_key):
     return successes, trace
 
 
-def scenario(cluster, tables, groups, victim, bound):
-    leaders = wait_leaders(cluster, groups, WORKERS)
-    assert set(leaders) == set(groups), leaders
+def scenario(cluster, tables, groups, leaders, victim, bound, round_no):
     survivors = [name for name in WORKERS if name != victim]
     token = cluster.auth['data_token']
     gateway = cluster.api_urls['api1']
@@ -184,7 +186,7 @@ def scenario(cluster, tables, groups, victim, bound):
     window = max(11, bound + 2)
     with cluster.blackhole(victim) as started, ThreadPoolExecutor(max_workers=len(tables) * 2 + 1) as pool:
         elections = pool.submit(wait_leaders, cluster, groups, survivors, down=victim, started=started)
-        running = {(table[0], write): pool.submit(traffic, cluster, table, write, started, window, (WORKERS.index(victim) + 1) * 10000)
+        running = {(table[0], write): pool.submit(traffic, cluster, table, write, started, window, round_no * 10000)
                    for table in tables for write in (False, True)}
         for key, future in running.items():
             results[key] = future.result()
@@ -214,7 +216,7 @@ def scenario(cluster, tables, groups, victim, bound):
                 assert call(gateway, '/v1/operations', request, token=token, ca=cluster.ca) == (200, original)
     assert set(new_leaders) == set(groups), (victim, new_leaders)
     record('drop result', victim=victim, failures=failures)
-    return failures, leaders
+    return failures
 
 
 def main():
@@ -241,15 +243,23 @@ def main():
             tables.append((label, table.id))
             groups[label] = initial_range(cluster, table.id)['group_id']
         failures = []
-        covered = set()
-        for victim in WORKERS:
-            results, leaders = scenario(cluster, tables, groups, victim, args.bound)
-            covered.update(group for group, leader in leaders.items() if leader == victim)
-            failures.extend(results)
+        remaining = ['timestamps', 'control', *(label for label, _ in tables)]
+        round_no = 0
+        while remaining:
+            leaders = wait_leaders(cluster, groups, WORKERS)
+            assert set(leaders) == set(groups), leaders
+            victim = leaders[remaining[0]]
+            remaining = [label for label in remaining if leaders[label] != victim]
+            round_no += 1
+            failures.extend(scenario(cluster, tables, groups, leaders, victim, args.bound, round_no))
             cluster.wait_workers()
-        assert set(groups) == covered, ('leader drop coverage', covered, groups)
+        leaders = wait_leaders(cluster, groups, WORKERS)
+        assert set(leaders) == set(groups), leaders
+        follower = min(WORKERS, key=lambda name: sum(leaders[label] == name for label, _ in tables))
+        assert any(leaders[label] != follower for label, _ in tables), leaders
+        failures.extend(scenario(cluster, tables, groups, leaders, follower, args.bound, round_no + 1))
         assert not failures, failures
-        record('O06/O18 packet drop passed', groups=sorted(covered))
+        record('O06/O18 packet drop passed', groups=sorted(groups))
 
 
 if __name__ == '__main__':

@@ -73,6 +73,10 @@ const MAX_RANGES: usize = 1024;
 /// The leader gets this much less time than the gateway, so its own
 /// deadline answer arrives before the gateway gives up.
 const LEADER_MARGIN: Duration = Duration::from_millis(100);
+// Leave time for another voter to answer within the gateway deadline, even
+// when TCP accepts frames but the peer never acknowledges or replies.
+const PEER_ATTEMPT: Duration = Duration::from_millis(1500);
+const UNRESPONSIVE_BACKOFF: Duration = Duration::from_secs(3);
 const FIRST_PAUSE: Duration = Duration::from_millis(10);
 const MAX_PAUSE: Duration = Duration::from_millis(200);
 
@@ -365,6 +369,7 @@ pub(crate) struct GatewayStats {
     pub stale_routes: AtomicU64,
     pub not_leader: AtomicU64,
     pub resends: AtomicU64,
+    pub peer_timeouts: AtomicU64,
     pub unknown: AtomicU64,
     pub overloaded: AtomicU64,
 }
@@ -381,6 +386,7 @@ pub(crate) struct GatewayStatsSnapshot {
     pub stale_routes: u64,
     pub not_leader: u64,
     pub resends: u64,
+    pub peer_timeouts: u64,
     pub unknown: u64,
     pub overloaded: u64,
 }
@@ -402,6 +408,7 @@ impl GatewayStats {
             stale_routes: get(&self.stale_routes),
             not_leader: get(&self.not_leader),
             resends: get(&self.resends),
+            peer_timeouts: get(&self.peer_timeouts),
             unknown: get(&self.unknown),
             overloaded: get(&self.overloaded),
         }
@@ -723,6 +730,7 @@ impl DirectGateway {
     ) -> Result<Terminal, ProtocolError> {
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
+        let mut unresponsive: Option<(u64, Instant)> = None;
         let mut refreshed_unknown_table = false;
         loop {
             if Instant::now() >= deadline {
@@ -760,7 +768,7 @@ impl DirectGateway {
                 }
                 continue;
             };
-            let voters = match self.voters(&range, false).await {
+            let voters = match self.voters(&range, false, deadline).await {
                 Ok(voters) if !voters.is_empty() => voters,
                 _ => {
                     if !pause(deadline, &mut delay).await {
@@ -769,21 +777,47 @@ impl DirectGateway {
                     continue;
                 }
             };
-            let voter = range
+            let now = Instant::now();
+            let skip = unresponsive
+                .filter(|&(_, until)| until > now)
+                .map(|(node, _)| node);
+            let (index, voter) = range
                 .leader_hint()
-                .and_then(|node| voters.iter().find(|voter| voter.node_id == node))
-                .copied()
-                .unwrap_or_else(|| voters[rotation % voters.len()]);
+                .filter(|node| Some(*node) != skip)
+                .and_then(|node| {
+                    voters
+                        .iter()
+                        .enumerate()
+                        .find(|(_, voter)| voter.node_id == node)
+                })
+                .unwrap_or_else(|| {
+                    let first = rotation % voters.len();
+                    voters
+                        .iter()
+                        .enumerate()
+                        .cycle()
+                        .skip(first)
+                        .take(voters.len())
+                        .find(|(_, voter)| Some(voter.node_id) != skip)
+                        .unwrap_or((first, &voters[first]))
+                });
+            let voter = *voter;
+            rotation = index + 1;
             request.schema_epoch = table.schema_epoch;
             request.routing_epoch = range.shard.routing_epoch;
             request.group = range.group().group_id;
-            let left = deadline.saturating_duration_since(Instant::now());
+            let attempt = if voters.len() > 1 {
+                deadline.min(now + PEER_ATTEMPT)
+            } else {
+                deadline
+            };
+            let left = attempt.saturating_duration_since(now);
             request.deadline = left
                 .saturating_sub(LEADER_MARGIN)
                 .max(left / 2)
                 .max(Duration::from_millis(1));
             let sent = tokio::time::timeout_at(
-                deadline,
+                attempt,
                 self.transport.send(range.group(), voter, request, forward),
             )
             .await;
@@ -799,11 +833,12 @@ impl DirectGateway {
                 );
             }
             let reply = match sent {
-                // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
-                    *uncertain = true;
-                    self.cache.remove_if_current(&table);
-                    return Err(deadline_error(true));
+                    GatewayStats::bump(&self.stats.peer_timeouts);
+                    unresponsive = Some((voter.node_id, Instant::now() + UNRESPONSIVE_BACKOFF));
+                    // The call may have reached the leader. Retry the exact
+                    // body and id and let the Data dedup record settle it.
+                    Err(DirectSendError::Uncertain(unknown()))
                 }
                 Ok(reply) => reply,
             };
@@ -821,7 +856,7 @@ impl DirectGateway {
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {
-                    if error.code == ErrorCode::OutcomeUnknown {
+                    if error.code == ErrorCode::OutcomeUnknown && attempt == deadline {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
@@ -834,8 +869,12 @@ impl DirectGateway {
                         // decides.
                         *uncertain = true;
                         GatewayStats::bump(&self.stats.resends);
-                        range.leader_hint.store(0, Ordering::Relaxed);
-                        rotation += 1;
+                        let _ = range.leader_hint.compare_exchange(
+                            voter.node_id,
+                            0,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
                         if !pause(deadline, &mut delay).await {
                             return Err(deadline_error(true));
                         }
@@ -879,7 +918,7 @@ impl DirectGateway {
                 }
                 Ok(DirectResponse::NotLeader { hint }) => {
                     GatewayStats::bump(&self.stats.not_leader);
-                    match hint.filter(|node| *node != voter.node_id) {
+                    match hint.filter(|node| *node != voter.node_id && Some(*node) != skip) {
                         Some(node) if voters.iter().any(|voter| voter.node_id == node) => {
                             range.leader_hint.store(node, Ordering::Relaxed);
                         }
@@ -887,11 +926,15 @@ impl DirectGateway {
                             // A leader outside the cached placement: the
                             // replicas moved.
                             range.leader_hint.store(0, Ordering::Relaxed);
-                            let _ = self.voters(&range, true).await;
+                            let _ = self.voters(&range, true, deadline).await;
                         }
                         None => {
-                            range.leader_hint.store(0, Ordering::Relaxed);
-                            rotation += 1;
+                            let _ = range.leader_hint.compare_exchange(
+                                voter.node_id,
+                                0,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
                             // No leader known (an election): back off.
                             if !pause(deadline, &mut delay).await {
                                 return Err(deadline_error(*uncertain));
@@ -906,12 +949,16 @@ impl DirectGateway {
                     if error.code == ErrorCode::Overloaded && !*uncertain {
                         return Err(error);
                     }
-                    range.leader_hint.store(0, Ordering::Relaxed);
-                    rotation += 1;
+                    let _ = range.leader_hint.compare_exchange(
+                        voter.node_id,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                     if error.code == ErrorCode::ValidationError {
                         // The receiver refused this replica identity: read
                         // the placement again.
-                        let _ = self.voters(&range, true).await;
+                        let _ = self.voters(&range, true, deadline).await;
                     }
                     if !pause(deadline, &mut delay).await {
                         return Err(deadline_error(*uncertain));
@@ -922,8 +969,12 @@ impl DirectGateway {
                     // record decides whether the first attempt committed.
                     *uncertain = true;
                     GatewayStats::bump(&self.stats.resends);
-                    range.leader_hint.store(0, Ordering::Relaxed);
-                    rotation += 1;
+                    let _ = range.leader_hint.compare_exchange(
+                        voter.node_id,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                     if !pause(deadline, &mut delay).await {
                         return Err(deadline_error(true));
                     }
@@ -1033,12 +1084,16 @@ impl DirectGateway {
         &self,
         range: &RangeRoute,
         refresh: bool,
+        deadline: Instant,
     ) -> Result<Arc<[Voter]>, ProtocolError> {
         if !refresh && let Some(voters) = range.cached_voters() {
             return Ok(voters);
         }
         GatewayStats::bump(&self.stats.placement_reads);
-        let mut voters = self.source.placement(range.group(), refresh).await?;
+        let mut voters =
+            tokio::time::timeout_at(deadline, self.source.placement(range.group(), refresh))
+                .await
+                .map_err(|_| route_unavailable())??;
         voters.sort_unstable_by_key(|voter| voter.node_id);
         voters.dedup_by_key(|voter| voter.node_id);
         if voters.is_empty() || voters.len() > 7 {

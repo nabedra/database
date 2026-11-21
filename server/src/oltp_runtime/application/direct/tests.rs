@@ -752,6 +752,70 @@ async fn watchdog<T, F: Future<Output = Option<T>>>(mut probe: impl FnMut() -> F
     .expect("gateway fixture watchdog")
 }
 
+struct BlackholedLeader {
+    disconnected: Mutex<Option<Instant>>,
+}
+
+impl DirectTransport for BlackholedLeader {
+    fn send<'a>(
+        &'a self,
+        _group: &'a GroupIdentity,
+        voter: Voter,
+        request: &'a DirectRequest,
+        _forward: bool,
+    ) -> SendFuture<'a> {
+        let disconnected = *self.disconnected.lock().unwrap();
+        Box::pin(async move {
+            let reply = match (voter.node_id, disconnected) {
+                (1, Some(_)) => std::future::pending().await,
+                (1, None) => DirectResponse::Done(DirectData::from_json("null").unwrap()),
+                (2, Some(since)) if since.elapsed() >= Duration::from_millis(1_800) => {
+                    assert_eq!(request.digest, digest(request.body.as_ref()));
+                    DirectResponse::Done(DirectData::from_json("true").unwrap())
+                }
+                _ => DirectResponse::NotLeader { hint: Some(1) },
+            };
+            Ok(reply)
+        })
+    }
+}
+
+/// O06/O18: a cached Data leader stops answering. The gateway must get past
+/// both the silent connection and the survivors' stale leader hints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_o18_cached_blackholed_data_leader_leaves_time_to_retry() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1, 2, 3]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = Arc::new(BlackholedLeader {
+        disconnected: Mutex::new(None),
+    });
+    let gateway = DirectGateway::new(
+        resources(),
+        cluster.database.clone(),
+        direct_on(),
+        source.clone(),
+        transport.clone(),
+    );
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 1}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    *transport.disconnected.lock().unwrap() = Some(Instant::now());
+    let id = Uuid::new_v4();
+    let update = cluster.body(
+        id,
+        "table.update",
+        json!({"key": 1, "values": {"value": 2}}),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
+    cluster.shutdown().await;
+    assert_eq!(
+        result.expect("blackholed voter used the entire client budget"),
+        Answer::Data(json!(true))
+    );
+    assert_eq!(source.reads(), (1, 1));
+}
+
 /// O03/D01 (gateway level): every eligible operation goes to the range
 /// leader and returns the queued path's result shapes; the steady state
 /// makes no Catalog or Control read per request; ineligible operations and
