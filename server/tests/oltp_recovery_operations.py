@@ -189,13 +189,15 @@ def restart_during_split(cluster, send_op):
     for name in WORKERS:
         write_json(cluster.barrier_dir(name) / 'gates.json', {split_id: 'split_children_imported'})
 
+    def request_split(name, request):
+        return send(cluster.urls[name], cluster.auth['admin_token'], request,
+                    path='/v1/cluster/operations', timeout=120)
+
     def split():
         for name in WORKERS:
-            status, reply = send(cluster.urls[name], cluster.auth['admin_token'], body,
-                                 path='/v1/cluster/operations', timeout=120)
-            if status == 200:
-                return reply['data']
-            assert status == 503, (name, status, reply)
+            status, reply = request_split(name, body)
+            if status != 503 or (cluster.barrier_dir(name) / f'reached-{split_id}').exists():
+                return status, reply
         raise AssertionError('no worker could run the split')
 
     def imported():
@@ -230,15 +232,41 @@ def restart_during_split(cluster, send_op):
                 (cluster.barrier_dir(name) / f'release-{split_id}').touch()
             if release_join is not None:
                 release_join.touch()
-        result = pending.result()
-    assert result['state'] == 'published' and len(result['children']) == 2, result
+        interrupted = pending.result()
+    assert interrupted[0] != 200, interrupted
     cluster.wait_workers()
+
+    # Recovery increments the owner term, so the paused split cannot publish.
+    # An exact retry settles its abort. A fresh request then splits the source.
+    def settle_fenced_split():
+        result = request_split(owner, body)
+        return result if result[0] not in (503, 504) else None
+
+    refusal = wait_for(settle_fenced_split, 'fenced split settled')
+    assert refusal == request_split(owner, body), refusal
+    status, reply = refusal
+    assert status == 409 and reply == {
+        'request_id': split_id,
+        'error': dict(code='conflict', message='manual split interrupted by worker recovery', outcome='not_applied'),
+    }, refusal
+    retry = operation('storage.shard.split', body['payload'])
+
+    def publish():
+        status, reply = request_split(owner, retry)
+        if status in (503, 504):
+            return None
+        result = success(status, reply)
+        return result if result['state'] != 'importing' else None
+
+    result = wait_for(publish, 'replacement split published')
+    assert result['state'] == 'published' and len(result['children']) == 2, result
     for row in rows:
         assert success(*send_op(get(table, row['id']))) == row
     for group in result['children']:
         route = cluster.admin('storage.replica.placement', {'group': group})
         assert len(route['members']) == route['record']['replica_count'] == 3, route
-    report('O17/D07 restart during split', worker=victim, split=split_id, children=2, voters_per_child=3)
+    report('O17/D07 restart during split', worker=victim, aborted_split=split_id,
+           published_split=retry['request_id'], children=2, voters_per_child=3)
 
 
 def o06_r01_r03_r06_retained_restart(binary, test_executable, root):

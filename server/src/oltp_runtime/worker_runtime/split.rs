@@ -169,11 +169,35 @@ impl WorkerRuntime {
                 .await;
         }
         if attempt.authority != authority {
-            return Err(ProtocolError::new(
+            if attempt.intent.automatic.is_some()
+                || attempt.authority.run_id != authority.run_id
+                || attempt.authority.owner_term >= authority.owner_term
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::Conflict,
+                    "split attempt belongs to a fenced scheduler owner",
+                    Outcome::Unknown,
+                ));
+            }
+            // The current owner has already reconciled any durable decision
+            // above. The fence prevents the old owner from creating one now.
+            // A retry of an interrupted manual split can settle its abort.
+            let error = crate::oltp::failure(
                 ErrorCode::Conflict,
-                "split attempt belongs to a fenced scheduler owner",
-                Outcome::Unknown,
-            ));
+                "manual split interrupted by worker recovery",
+            );
+            self.services
+                .status
+                .terminal_failure(authority, attempt.request, error)
+                .await?;
+            let proof = self
+                .services
+                .status
+                .failure_settled_proof(attempt.txn, attempt.request)
+                .await?;
+            return self
+                .settle_split_proof(client, &attempt, authority, proof)
+                .await;
         }
         let needs_placement = attempt.children().is_err();
         if let Some(placement) = placement {
@@ -428,6 +452,17 @@ impl WorkerRuntime {
                     .release_lifecycle(authority, guard, proof.clone())
                     .await?;
             }
+        } else if let GroupKind::Data { table_id, .. } = attempt.intent.source.kind
+            && let Some(binding) = self
+                .services
+                .catalog
+                .participant()
+                .lifecycle_holder(table_id)
+                .await?
+            && binding.txn == attempt.txn
+            && binding.request == attempt.request
+        {
+            self.help_lifecycle(binding).await?;
         }
         self.close_split(client, attempt, authority, proof).await?;
         self.split_result(attempt, statement.decision.decision)

@@ -305,8 +305,12 @@ impl PeerDirectory for AppliedPeerDirectory {
         if group.cluster_id != self.cluster {
             return Err(invalid());
         }
-        if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
-            .as_ref().filter(|candidate| candidate.enrollment.worker_id == peer.worker_id)
+        if let Some(candidate) = self
+            .prepared
+            .read()
+            .map_err(|_| unavailable())?
+            .as_ref()
+            .filter(|candidate| candidate.enrollment.worker_id == peer.worker_id)
         {
             if WorkerIdentity::from(&candidate.enrollment) != peer {
                 return Err(invalid());
@@ -427,9 +431,12 @@ mod tests {
             group_format_version: 1,
         };
         let old = enrollment();
-        let directory =
-            AppliedPeerDirectory::from_bootstrap(control.clone(), vec![old.clone()], shared.clone())
-                .unwrap();
+        let directory = AppliedPeerDirectory::from_bootstrap(
+            control.clone(),
+            vec![old.clone()],
+            shared.clone(),
+        )
+        .unwrap();
         let next = WorkerEnrollment {
             incarnation: Uuid::new_v4(),
             enrollment_revision: 2,

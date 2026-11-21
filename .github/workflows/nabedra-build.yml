@@ -1,8 +1,8 @@
 # Heavy builds and verification for the remove-RocksDB track, on free standard runners.
 # See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
 # pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
-# Opt-in jobs: put [ci docker], [ci campaign], [ci acceptance], [ci direct] or [ci memory] in the pushed head
-# commit message, or use workflow_dispatch once this file is on the default branch.
+# Opt-in checks: put [ci docker], [ci campaign], [ci acceptance], [ci direct], [ci rep1]
+# or [ci memory] in the pushed head commit message.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
 # and manifests, and saves it right after its build step, before any test runs, so a failing test

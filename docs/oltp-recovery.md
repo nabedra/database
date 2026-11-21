@@ -70,6 +70,11 @@ can observe retryable failures during that transition. There is no guaranteed
 production failover time. The process check uses a 60-second budget between
 successful reads of a separate range.
 
+If recovery fenced a manual split, retry the split operation with its
+original request ID and body. The current owner settles any committed result
+or returns `conflict` with `not_applied` for a split it aborted. After an
+abort, issue a new request ID if the source range still needs splitting.
+
 Control requires the previous incarnation to leave the ready set. Enrollment
 then requires proof from the retained mount key and exclusive ownership of
 the directory. These checks prevent two processes from serving one Raft
