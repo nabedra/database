@@ -174,6 +174,157 @@ async fn create(app: &Router) -> Value {
     created["data"]["id"].clone()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d03_q05_bug1_direct_retry_without_content_length_replays_original_result() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-bug1-streamed-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let id = Uuid::new_v4();
+        let insert = |value| {
+            body(
+                id,
+                "table.insert",
+                json!({
+                    "table_id": table, "row": {"id": 7, "value": value, "tag": "a"},
+                }),
+            )
+        };
+        let original = call(&app, insert(1), true).await;
+        assert_eq!(original, (200, json!({"request_id": id, "data": null})));
+        let replay = call(&app, insert(1), false).await;
+        let conflict = call(&app, insert(2), false).await;
+        assert_eq!(conflict.0, 409, "{conflict:?}");
+        assert_eq!(conflict.1["error"]["code"], "conflict");
+        let get = body(
+            Uuid::new_v4(),
+            "table.get",
+            json!({"table_id": table, "key": 7}),
+        );
+        assert_eq!(call(&app, get, true).await.1["data"]["value"], 1);
+        runtime.drain().await.unwrap();
+        assert_eq!(replay, original);
+    })
+    .await
+    .expect("streamed retry watchdog");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
+    use crate::oltp::mvcc::store::ParticipantHandle;
+    use crate::oltp::pool::{ByteClass, ChargedBuffer};
+    use crate::oltp_replication::multiplex::EndpointFuture;
+    use crate::oltp_replication::service_rpc::direct::{
+        self, DirectRequest, DirectResponse, DirectService,
+    };
+    use std::sync::Mutex;
+
+    struct ReplyPressure {
+        service: Arc<dyn DirectService>,
+        id: Uuid,
+        hold: Mutex<Option<ChargedBuffer>>,
+    }
+    impl DirectService for ReplyPressure {
+        fn execute<'a>(
+            &'a self,
+            handle: &'a Arc<ParticipantHandle>,
+            request: DirectRequest,
+        ) -> EndpointFuture<'a, DirectResponse> {
+            Box::pin(async move {
+                let inject = request.request_id == self.id;
+                let response = self.service.execute(handle, request).await?;
+                if inject {
+                    assert!(matches!(response, DirectResponse::Done(_)), "{response:?}");
+                    let shared = handle.resources();
+                    let config = shared.config();
+                    let free = config.control_bytes
+                        - config.progress_bytes
+                        - shared.buffer_bytes_used(ByteClass::Data);
+                    let hold = shared.allocate_bytes(ByteClass::Data, free)?;
+                    assert_eq!(
+                        shared.buffer_bytes_used(ByteClass::Data),
+                        config.control_bytes - config.progress_bytes
+                    );
+                    *self.hold.lock().unwrap() = Some(hold);
+                }
+                Ok(response)
+            })
+        }
+
+        fn forward<'a>(
+            &'a self,
+            handle: &'a Arc<ParticipantHandle>,
+            request: DirectRequest,
+        ) -> EndpointFuture<'a, DirectResponse> {
+            self.service.forward(handle, request)
+        }
+
+        fn stats(&self) -> Value {
+            self.service.stats()
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-bug1-reply-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let shared = &runtime.services.shared;
+        let id = Uuid::new_v4();
+        let pressure = Arc::new(ReplyPressure {
+            service: direct::installed(shared).unwrap(),
+            id,
+            hold: Mutex::new(None),
+        });
+        direct::install(shared, &(pressure.clone() as Arc<dyn DirectService>));
+        let insert = body(
+            id,
+            "table.insert",
+            json!({
+                "table_id": table, "row": {"id": 7, "value": 1, "tag": "a"},
+            }),
+        );
+        let (status, envelope) = call(&app, insert.clone(), true).await;
+        direct::install(shared, &pressure.service);
+        assert!(
+            pressure.hold.lock().unwrap().take().is_some(),
+            "post-apply hold reached"
+        );
+        let get = body(
+            Uuid::new_v4(),
+            "table.get",
+            json!({"table_id": table, "key": 7}),
+        );
+        assert_eq!(call(&app, get, true).await.1["data"]["value"], 1);
+        assert_eq!(
+            call(&app, insert, true).await,
+            (200, json!({"request_id": id, "data": null}))
+        );
+        let changed = body(
+            id,
+            "table.insert",
+            json!({
+                "table_id": table, "row": {"id": 7, "value": 2, "tag": "a"},
+            }),
+        );
+        let conflict = call(&app, changed, true).await;
+        assert_eq!(conflict.0, 409, "{conflict:?}");
+        runtime.drain().await.unwrap();
+        assert_eq!(status, 503, "{envelope}");
+        assert_eq!(envelope["error"]["code"], "outcome_unknown", "{envelope}");
+        assert_eq!(envelope["error"]["outcome"], "unknown", "{envelope}");
+    })
+    .await
+    .expect("reply pressure watchdog");
+}
+
 /// D01/O03/O02 on one worker: every eligible operation's results, errors
 /// and types over the direct path equal the queued path's for the same
 /// program; the topology is read once per table. The baseline worker runs

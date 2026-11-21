@@ -181,6 +181,13 @@ impl ApplicationEndpoint {
             .ok_or_else(stale_route)
     }
 
+    fn encode_submission(
+        shared: &WorkerSharedResources,
+        record: &RequestRecord,
+    ) -> Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError> {
+        Ok((shared.encode_in(ByteClass::Data, record, 16 << 10)?, None))
+    }
+
     fn finish_reply(
         shared: &WorkerSharedResources,
         session: &AuthenticatedSession,
@@ -271,7 +278,7 @@ impl Endpoint for ApplicationEndpoint {
                                 .settle_before_reserve(body.as_ref())
                                 .await?;
                             let record = worker.submit(placement, body, session.remote()).await?;
-                            Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                            Self::encode_submission(shared, &record)
                         }
                         Method::ScopedObserve {
                             run_id,
@@ -328,7 +335,7 @@ impl Endpoint for ApplicationEndpoint {
                     Method::Submit { bytes } => {
                         let body = request_body(bytes, &sections)?;
                         let record = runtime.submit_charged(body, session.remote()).await?;
-                        Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                        Self::encode_submission(&shared, &record)
                     }
                     Method::Observe {
                         run_id,
@@ -688,6 +695,60 @@ fn unavailable() -> ProtocolError {
 pub(super) fn submission_unknown(mut error: ProtocolError) -> ProtocolError {
     error.outcome = Outcome::Unknown;
     error
+}
+
+#[cfg(test)]
+#[test]
+fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
+    use crate::oltp::pool::SharedResourceConfig;
+    use crate::request_queue::{QueueLimits, RequestQueue};
+
+    let member = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request_id": id, "operation": "table.create",
+        "payload": {"name": "items", "schema": {"id": "int64"}, "key": "id", "format": "parquet"},
+    }))
+    .unwrap();
+    let mut queue = RequestQueue::new(
+        Uuid::new_v4(),
+        1,
+        1,
+        QueueLimits {
+            max_pending_requests: 4,
+            max_queue_bytes_per_replica: 1 << 20,
+            max_retained_result_bytes_per_worker: 1 << 20,
+            result_retention_ms: 1_000,
+        },
+        [member].into(),
+    )
+    .unwrap();
+    let staged = queue.propose(body.clone(), 0).unwrap();
+    let accepted = queue.acknowledge(staged.identity(), member).unwrap();
+    assert!(accepted.accepted);
+    let shared = WorkerSharedResources::new(
+        1,
+        crate::config::WorkerResources::default(),
+        SharedResourceConfig {
+            control_bytes: (4 << 20) + 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let held = shared.allocate_bytes(ByteClass::Data, 4096).unwrap();
+    let error = ApplicationEndpoint::encode_submission(&shared, &accepted)
+        .err()
+        .unwrap();
+    drop(held);
+    let retry = queue.propose(body, 0).unwrap();
+    assert_eq!(retry, accepted);
+    assert_eq!(queue.pending(), 1);
+    let (reply, _) = ApplicationEndpoint::encode_submission(&shared, &retry).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RequestRecord>(reply.as_ref()).unwrap(),
+        accepted
+    );
+    assert_eq!(error.outcome, Outcome::Unknown);
 }
 
 #[cfg(test)]
