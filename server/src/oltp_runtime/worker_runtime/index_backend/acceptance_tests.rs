@@ -127,12 +127,17 @@ impl Fixture {
     }
 
     async fn point(&self, key: i64) -> Value {
-        tests::call(
+        let (status, reply) = post(
             &self.app,
+            "/v1/operations",
+            TOKEN,
+            Uuid::new_v4(),
             "table.get",
             json!({"table_id":self.definition.table_id,"key":key}),
         )
-        .await
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        reply["data"].clone()
     }
 
     fn spawn_resume(
@@ -219,13 +224,13 @@ async fn post(
     operation: &str,
     payload: Value,
 ) -> (StatusCode, Value) {
+    let body = json!({"request_id":id,"operation":operation,"payload":payload}).to_string();
     let request = Request::post(path)
         .header("authorization", format!("Bearer {token}"))
         .header("x-nabedra-database", TOKEN)
         .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"request_id":id,"operation":operation,"payload":payload}).to_string(),
-        ))
+        .header("content-length", body.len())
+        .body(Body::from(body))
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
