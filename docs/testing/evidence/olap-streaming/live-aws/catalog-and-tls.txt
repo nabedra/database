@@ -1,0 +1,16 @@
+Test binary SHA256: d4ec203fb9715eddaae9394b0ff99b17c3cacdb35b989f6a8505055c1a172a64
+olap live test started: 2026-11-21T10:50:22+00:00
+running 1 test
+live-context-probe phase=construct
+live-context-probe phase=absent-get
+live-context-probe absent-get-kind=NoSuchKey
+live-context-probe phase=owned-init
+live-context-probe phase=read-list
+live-context-probe phase=catalog-compare-and-swap
+live-context-probe phase=complete
+test storage::s3::live_context_probe::explicit_context_first_use ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 588 filtered out; finished in 2.10s
+Live test objects: 1, total bytes: 249
+olap live test finished: 2026-11-21T10:50:34+00:00
+Teardown infrastructure mutations submitted: 0
+Teardown S3 prefix: complete
