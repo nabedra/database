@@ -1472,7 +1472,7 @@ async fn service_grant(
 /// and role while the locally applied Control revision is unchanged and the
 /// Control read started under 5 s ago.
 async fn authorize(
-    control: &ControlClient,
+    control: &Arc<ControlClient>,
     session: &AuthenticatedSession,
     header: &Header,
 ) -> Result<(), ProtocolError> {
@@ -1505,20 +1505,61 @@ async fn authorize(
             .await;
     }
     let key = GrantKey::new(session.remote(), header.action, session.group(), None);
-    control
-        .service_grants()
-        .role(key, revision, || async {
-            control
-                .service_role(
-                    &scope,
-                    session.remote(),
-                    header.action,
-                    session.group().clone(),
-                )
-                .await
-                .map(Some)
-        })
-        .await
+    let read = || async {
+        control
+            .service_role(
+                &scope,
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+            .await
+            .map(Some)
+    };
+    // RD2: a range leader's calls on the direct path (`AllocateDirect` at the
+    // Timestamp leader, Catalog reads) keep their role warm, so an idle
+    // leader's next commit does not wait for a Control read.
+    if header.action == ServiceAction::DirectLeader {
+        let refresh = || {
+            warm_role(
+                control,
+                scope.clone(),
+                session.remote(),
+                header.action,
+                session.group().clone(),
+            )
+        };
+        return control
+            .service_grants()
+            .role_warm(key, revision, read, refresh)
+            .await;
+    }
+    control.service_grants().role(key, revision, read).await
+}
+
+/// The background refresh of one warm role check (RD2, `grant_cache`).
+pub(super) fn warm_role(
+    control: &Arc<ControlClient>,
+    scope: crate::oltp_runtime::replica::QueueScope,
+    remote: WorkerIdentity,
+    action: ServiceAction,
+    target: GroupIdentity,
+) -> grant_cache::Refresh {
+    let control = Arc::downgrade(control);
+    Arc::new(move || {
+        let control = control.upgrade()?;
+        let revision = control.applied_revision();
+        let (scope, target) = (scope.clone(), target.clone());
+        Some((
+            revision,
+            Box::pin(async move {
+                control
+                    .service_role(&scope, remote, action, target)
+                    .await
+                    .map(Some)
+            }),
+        ))
+    })
 }
 async fn reply(
     shared: &Arc<WorkerSharedResources>,

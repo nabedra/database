@@ -795,6 +795,14 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
         };
         // Warm the topology cache and the session.
         assert_eq!(call(&app, get(), true).await.0, 200);
+        // These tasks share the native job counters with the mTLS request.
+        // The retirement task also runs the index reclamation sweep. Join
+        // both tasks after stopping them so a slow runner cannot count a
+        // periodic inventory scan or enrollment refresh as reply decoding.
+        let retirement = runtime.retirement.lock().unwrap().take().unwrap();
+        retirement.abort();
+        assert!(retirement.await.unwrap_err().is_cancelled());
+        runtime.services.stop_directory_refresh_for_test().await;
         let gateway = runtime.direct_gateway_handle().unwrap().clone();
         let before = gateway.stats();
         let shared = runtime.services.shared.clone();
@@ -820,7 +828,7 @@ async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
             query_after - query,
             control_after - control
         );
-        // Background Control work on an idle RF1 worker is allowed for.
+        // Each native reply codec job would contribute one job per GET.
         assert!(
             control_after - control < GETS / 2,
             "Control jobs for {GETS} gets: {}",

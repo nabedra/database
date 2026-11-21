@@ -59,6 +59,13 @@ EXECUTION = {
 }
 
 
+def worker_env(value):
+    name, sep, _ = value.partition('=')
+    if not sep or not re.fullmatch(r'NABEDRA_BENCH_[A-Z0-9_]+', name):
+        raise argparse.ArgumentTypeError('expected NABEDRA_BENCH_NAME=VALUE')
+    return value
+
+
 def worker_cpu_quotas(value):
     quotas = [field.strip() for field in value.split(',')]
     if len(quotas) != len(WORKERS) or any(
@@ -758,6 +765,8 @@ cp "/fixture/$1-volume.json" /data/.nabedra-docker-volume.json
 '''
             cpu = format(Decimal(self.worker_nano_cpus[name]).scaleb(-9).normalize(), 'f')
             hold = ('-e', 'NABEDRA_BENCH_HOLD_COMPACTION=1') if self.args.hold_compaction else ()
+            # RD2: benchmark-only worker switches, e.g. NABEDRA_BENCH_NO_GRANT_WARM=1.
+            hold += tuple(option for item in self.args.worker_env for option in ('-e', item))
             self.launch(name, cpu, WORKER_MEMORY, 'sh', ['-c', script, 'worker', name, self.binary],
                         options=('-p', '127.0.0.1::8000', '--mount', f'type=volume,source={volume},target=/data',
                                  *hold))
@@ -1058,7 +1067,7 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         self.metadata['allocations'] = {'worker_bytes': WORKER_MEMORY,
             'api_cpu': None if args.api_cpus is None else float(args.api_cpus), 'api_bytes': API_MEMORY, 'driver_cpu': float(DRIVER_CPU),
             'driver_bytes': DRIVER_MEMORY, 'total_cpu': 4, 'total_bytes': 7_900_000_000,
-            'hold_compaction': bool(args.hold_compaction)}
+            'hold_compaction': bool(args.hold_compaction), 'worker_env': list(args.worker_env)}
         allocations = self.metadata['allocations']
         if args.worker_cpus == DEFAULT_WORKER_CPUS:
             allocations['worker_cpu'] = 1.0
@@ -1288,6 +1297,8 @@ def main():
                         help='PERF1: API container CPU quota (default %(default)s, NS11), or none')
     parser.add_argument('--hold-compaction', action='store_true',
                         help='PERF1, benchmark only: hold compaction off on every worker (L0 triggers out of reach)')
+    parser.add_argument('--worker-env', action='append', default=[], type=worker_env,
+                        help='RD2, benchmark only: NABEDRA_BENCH_*=VALUE set on every worker (repeatable)')
     parser.add_argument('--worker-cpus', type=worker_cpu_quotas, default=DEFAULT_WORKER_CPUS,
                         help='comma-separated CPU quotas for w1, w2 and w3 (default: 1,1,1)')
     parser.add_argument('--status-seed-worker', choices=WORKERS,
