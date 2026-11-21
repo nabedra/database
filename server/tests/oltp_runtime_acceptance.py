@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1618,6 +1619,86 @@ def run_native_assertions(test_executable, cases):
         assert result.returncode == 0 and 'test result: ok. 1 passed; 0 failed; 0 ignored;' in result.stdout, name
 
 
+@contextmanager
+def check_case(name, failures):
+    try:
+        yield
+    except Exception:
+        failures.append(name)
+        traceback.print_exc()
+
+
+def admission_acceptance(binary, test_executable):
+    failures = []
+    with check_case('explicit overload', failures):
+        preaccept_disconnect(test_executable)
+        tentative_copy_disconnect(test_executable)
+        count_pressure(test_executable)
+        assertion('O13', 'explicit-overload', 'Queue bytes and accepted pending count independently refused new work with 429 not_applied. Existing requests settled and later work succeeded.')
+    with check_case('mixed load', failures):
+        assertion('O13', 'accepted-identity-conservation', load_conservation(test_executable))
+    with check_case('RF3 admission and receipts', failures):
+        simultaneous_admission(binary, test_executable)
+    with check_case('disk headroom', failures):
+        disk = disk_pressure_settlement(test_executable)
+        if disk is None:
+            assertion('O13', 'protected-disk-headroom', 'The low-disk process fixture needs a Linux loopback mount with passwordless sudo.', 'not-run')
+        else:
+            assertion('O13', 'protected-disk-headroom', disk)
+    with check_case('settlement and expiry', failures):
+        retirement_and_committed_cold_replay(binary)
+        cli_supervisor(binary)
+        run_native_assertions(test_executable, [
+            'q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes',
+            'm01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop',
+            'm02_queue_results_cpu_and_memory_share_one_ceiling',
+            'm03_o19_byte_arena_distinguishes_waiting_from_impossible_work',
+            'm03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headroom',
+            'm03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom',
+            'c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop',
+            'f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic',
+            'f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles',
+            'o22_c05_c07_m02_m03_f03_cancelled_receiver_leaves_grant_with_job',
+            'q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection',
+            'q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy',
+            'ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive',
+        ])
+        assertion('O13', 'settlement-and-expiry', 'Expired read receipts were explicit, old committed DDL replayed its exact result, and cancellation at the tested native boundaries released ownership.')
+    assertion('O13', 'scheduler-contract', 'The complete F03 cancellation boundary matrix still needs process evidence.', 'not-run')
+    incomplete('O13', 'the complete F03 process cancellation matrix remains unverified')
+    assert not failures, failures
+
+
+def cold_recovery_acceptance(binary, test_executable):
+    failures = []
+    with check_case('native decision fences', failures):
+        run_native_assertions(test_executable, [
+            'o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions',
+            'r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures',
+        ])
+        assertion('O15', 'post-fence-rejection', 'Native Status and Timestamp apply rejected delayed old-authority decisions and preserved the new-run abandonment.')
+    with check_case('RF1 cold run', failures):
+        failure_boundaries(test_executable)
+        evidence('O15', 'rf1-cold-queue', interruptions=list(FENCE_STAGES), direct_oltp=DIRECT)
+    with check_case('capability activation boundary', failures):
+        activation_boundary(test_executable)
+    with check_case('RF1 direct write boundaries', failures):
+        rf1_direct_recovery(test_executable)
+    with check_case('RF3 cold run', failures):
+        rf3_complete = binary and rf3_cold_recovery(binary, test_executable)
+        if not rf3_complete:
+            incomplete('O15', 'RF3 cold start requires loopback pool mounts with passwordless sudo on Linux')
+        elif not failures:
+            assertion('O15', 'cold-run-abandonment', 'RF1 and RF3 old pending UUIDs stayed abandoned on raw resubmission and the new queue held no pending old work.')
+            assertion('O15', 'pre-fence-decisions', 'The original committed value and receipt survived cold start. RF3 recorded its Status position before the new group fence.')
+            assertion('O15', 'abort-without-reexecution', 'Old prepared and queued work left one application attempt trace. Cold recovery removed the prepared intent and allowed an exclusive table drop.')
+            assertion('O15', 'old-receipt-outcomes', 'Committed, abandoned, and temporarily unavailable proof produced distinct receipt outcomes.')
+            assertion('O15', 'interrupted-fences', 'RF1 and RF3 stopped after each durable allocator, Status, and shard fence, then resumed the same cold transition.')
+            evidence('O15', 'direct-in-flight', replication_factors=[1, 3], direct_oltp=DIRECT,
+                     proposed_write_absent=DIRECT, applied_write_replayed=DIRECT)
+    assert not failures, failures
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary')
@@ -1636,38 +1717,7 @@ if __name__ == '__main__':
     elif args.scenario == 'admission':
         if not args.test_executable or not args.binary:
             parser.error('--test-executable and --binary are required')
-        preaccept_disconnect(args.test_executable)
-        tentative_copy_disconnect(args.test_executable)
-        count_pressure(args.test_executable)
-        assertion('O13', 'explicit-overload', 'Queue bytes and accepted pending count independently refused new work with 429 not_applied. Existing requests settled and later work succeeded.')
-        load = load_conservation(args.test_executable)
-        assertion('O13', 'accepted-identity-conservation', load)
-        retirement_and_committed_cold_replay(args.binary)
-        cli_supervisor(args.binary)
-        simultaneous_admission(args.binary, args.test_executable)
-        disk = disk_pressure_settlement(args.test_executable)
-        run_native_assertions(args.test_executable, [
-            'q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes',
-            'm01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop',
-            'm02_queue_results_cpu_and_memory_share_one_ceiling',
-            'm03_o19_byte_arena_distinguishes_waiting_from_impossible_work',
-            'm03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headroom',
-            'm03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom',
-            'c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop',
-            'f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic',
-            'f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles',
-            'o22_c05_c07_m02_m03_f03_cancelled_receiver_leaves_grant_with_job',
-            'q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection',
-            'q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy',
-            'ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive',
-        ])
-        assertion('O13', 'settlement-and-expiry', 'Expired read receipts were explicit, old committed DDL replayed its exact result, and cancellation at the tested native boundaries released ownership.')
-        assertion('O13', 'scheduler-contract', 'The process tests and focused resource cases ran. The complete F03 cancellation boundary matrix still needs process evidence.', 'not-run')
-        if disk is None:
-            assertion('O13', 'protected-disk-headroom', 'The low-disk process fixture needs a Linux loopback mount with passwordless sudo.', 'not-run')
-        else:
-            assertion('O13', 'protected-disk-headroom', disk)
-        incomplete('O13', 'the complete F03 process cancellation matrix remains unverified')
+        admission_acceptance(args.binary, args.test_executable)
     elif args.scenario == 'queue-survival':
         if not args.test_executable or not args.binary:
             parser.error('--test-executable and --binary are required')
@@ -1678,25 +1728,7 @@ if __name__ == '__main__':
     elif args.scenario == 'failure-boundaries':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
-        failure_boundaries(args.test_executable)
-        evidence('O15', 'rf1-cold-queue', interruptions=list(FENCE_STAGES), direct_oltp=DIRECT)
-        activation_boundary(args.test_executable)
-        rf1_direct_recovery(args.test_executable)
-        run_native_assertions(args.test_executable, [
-            'o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions',
-            'r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures',
-        ])
-        assertion('O15', 'post-fence-rejection', 'Native Status and Timestamp apply rejected delayed old-authority decisions and preserved the new-run abandonment.')
-        if args.binary and rf3_cold_recovery(args.binary, args.test_executable):
-            assertion('O15', 'cold-run-abandonment', 'RF1 and RF3 old pending UUIDs stayed abandoned on raw resubmission and the new queue held no pending old work.')
-            assertion('O15', 'pre-fence-decisions', 'The original committed value and receipt survived cold start. RF3 recorded its Status position before the new group fence.')
-            assertion('O15', 'abort-without-reexecution', 'Old prepared and queued work left one application attempt trace. Cold recovery removed the prepared intent and allowed an exclusive table drop.')
-            assertion('O15', 'old-receipt-outcomes', 'Committed, abandoned, and temporarily unavailable proof produced distinct receipt outcomes.')
-            assertion('O15', 'interrupted-fences', 'RF1 and RF3 stopped after each durable allocator, Status, and shard fence, then resumed the same cold transition.')
-            evidence('O15', 'direct-in-flight', replication_factors=[1, 3], direct_oltp=DIRECT,
-                     proposed_write_absent=DIRECT, applied_write_replayed=DIRECT)
-        else:
-            incomplete('O15', 'RF3 cold start requires loopback pool mounts with passwordless sudo on Linux')
+        cold_recovery_acceptance(args.binary, args.test_executable)
     elif args.scenario == 'activation-boundary':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
