@@ -1,26 +1,32 @@
 # Nabedra Events
 
-Nabedra Events stores a durable log per topic partition and a checkpoint per
-subscription and partition. Brokers replicate Events data independently of
-the OLAP and OLTP engines. Producers choose a partition and keep the event
-UUID, partition and payload for retries. Consumers claim one subscription
-partition at a time and acknowledge the prefix they have processed.
+Nabedra Events is a replicated event log. Each topic is split into
+partitions, and each partition is a durable log. For every subscription, the
+brokers also store one checkpoint per partition. Events runs on its own
+brokers and replicates its data separately from the OLAP and OLTP engines.
 
-See the [Python client and OLAP sink](../../orm/python/docs/events.md) and
-[design and acceptance plan](../../plans/events.md).
+A producer picks the partition for each event. To retry a publish safely, it
+keeps the event's UUID, partition and payload and sends the same values again.
+A consumer claims one partition of a subscription at a time and acknowledges
+events in order, up to the last one it has processed.
+
+The [Python client and OLAP sink guide](../../orm/python/docs/events.md) covers
+the client side, and the [design and acceptance plan](../../plans/events.md)
+explains the design.
 
 ## Run in Docker
 
-From the repository root, build the standalone broker.
+From the repository root, build the broker image:
 
 ```sh
 docker build --build-arg BUILD_JOBS=2 \
   -t nabedra-events:local -f server/events/deploy/Dockerfile server
 ```
 
-Generate a fixture with three brokers, one volume per broker, and an aggregate
-limit of two CPUs and 1536 MiB of memory. Pick lower totals if Docker is hosting
-another test. For a single broker use `--brokers 1`. To test RF1 promotion,
+Then generate a Compose fixture and start it. This one has three brokers, one
+volume per broker, and a combined limit of two CPUs and 1536 MiB of memory.
+Lower the totals if Docker is running another test. Use `--brokers 1` for a
+single broker. To test promoting topics from replication factor 1 (RF1) to RF3,
 start with three or more brokers and `--metadata-voters 1`.
 
 ```sh
@@ -31,22 +37,23 @@ docker compose -f "$fixture_dir/compose.json" up -d
 curl --fail --retry 10 --retry-connrefused http://127.0.0.1:18080/readyz
 ```
 
-The first broker listens on loopback port 18080. The next two use 18081 and
-18082. Peer listeners are on the fixture network. The fixture uses local HTTP
-and generated credentials stored in its private directory. To restart against
-the same disks, use `docker compose stop` followed by `up -d` with the same
-Compose file. A regular `down` also preserves its named volumes.
+The brokers listen on loopback ports 18080, 18081 and 18082, and talk to each
+other over the fixture's Docker network. The fixture uses plain HTTP and keeps
+the credentials it generates in its own directory. To restart on the same
+disks, run `docker compose stop` and then `up -d` with the same Compose file.
+A plain `down` keeps the named volumes too.
 
 ## Issue grants and create topics
 
-Issue a grant by supplying a broker config and a JSON grant to
-`nabedra-events issue-grant --config FILE --grant FILE`. Use short expirations
-in epoch milliseconds. A publish grant has
-`"scope":{"operation":"publish","topic":"orders"}`. A read grant includes
-`"operation":"read","topic":"orders","subscription":"analytics"` in its scope.
-Give a sink its own read grant and database credentials.
+Clients authenticate with grants. To issue one, pass a broker config and a
+JSON grant to `nabedra-events issue-grant --config FILE --grant FILE`. Keep
+expirations short. They are in epoch milliseconds. A publish grant has the
+scope `{"operation":"publish","topic":"orders"}`, and a read grant's scope
+includes `"operation":"read","topic":"orders","subscription":"analytics"`.
+Give each sink its own read grant and its own database credentials.
 
-For the Docker fixture, create an operator grant valid for one hour.
+For the Docker fixture, start with an operator grant that is valid for one
+hour:
 
 ```sh
 python3 - "$fixture_dir/operator.json" <<'PY'
@@ -73,7 +80,9 @@ admin() {
 }
 ```
 
-Choose a UUID before submitting an operation and save the body for retries.
+Administrative changes are operations, each identified by a UUID you choose.
+Pick the UUID before you submit, and keep the body so that a retry sends
+exactly the same request:
 
 ```sh
 base=http://127.0.0.1:18080
@@ -83,26 +92,34 @@ admin "$base/v1/admin/operations" -H 'Content-Type: application/json' \
 admin "$base/v1/admin/operations/$operation_id"
 ```
 
-Wait for the receipt to show `"state":"completed"` before the next topology
-change. Use replication factor 1 on a single broker. A cluster can host up to
-4,095 data partitions and one metadata group. A request that would exceed the
-partition limit returns `partition_limit` before recording a pending operation.
-To add a subscription,
-submit `{"type":"create_subscription","topic":"orders","subscription":"analytics","start":"earliest"}`
-as the action in a new operation. `latest` starts at the current tail on each
-partition. To replay, create another subscription. A checkpoint that falls
-behind retention returns `checkpoint_expired` and the earliest available
-offset. Verify which data was removed before using `reset_subscription` with
-the topic, partition and subscription to resume at the retention floor.
+Wait until the receipt shows `"state":"completed"` before you make the next
+topology change. On a single broker, use replication factor 1.
+
+A cluster can host up to 4,095 data partitions plus one metadata group. A
+request that would go over that limit fails with `partition_limit`, and the
+broker doesn't record it as a pending operation.
+
+To add a subscription, submit a new operation whose action is
+`{"type":"create_subscription","topic":"orders","subscription":"analytics","start":"earliest"}`.
+With `"start":"latest"` instead, the subscription begins at the current end of
+each partition. Subscriptions are independent, so to replay a topic you create
+another one.
+
+If a checkpoint falls behind retention, the broker returns `checkpoint_expired` with
+the earliest offset that is still available. Check which events were deleted,
+then run `reset_subscription` with the topic, partition and subscription to
+resume from the oldest retained event.
 
 ## Inspect and change placement
 
-All administrative reads and writes use an operator grant. Submit the actions
-below using the same receipt API. Read `/v1/admin/topics/{topic}` for current
-placements. Use `/v1/admin/groups/{group}` to compare Raft state across brokers,
-and the topic's `/partitions/{partition}` and
-`/partitions/{partition}/subscriptions/{subscription}` paths for tail and
-checkpoint positions.
+Every administrative read and write needs an operator grant. To see where a
+topic's partitions live, read `/v1/admin/topics/{topic}`. To compare Raft state
+across brokers, read `/v1/admin/groups/{group}`. Under the topic path,
+`/partitions/{partition}` shows a partition's tail, and
+`/partitions/{partition}/subscriptions/{subscription}` shows a subscription's
+checkpoint.
+
+Submit the actions below as operations, the same way as `create_topic`:
 
 | Operation | Action fields |
 | --- | --- |
@@ -114,11 +131,14 @@ checkpoint positions.
 | Redistribute a topic | `type: rebalance`, `topic` |
 | Drain a broker | `type: drain`, `broker_id` |
 
-For RF1 promotion, bring up three eligible brokers in distinct zones. Move the
-metadata group to all three voters, promote each topic, then check replica
-progress before decommissioning any source. For a drain, retain the old broker
-until the operation completes and committed membership excludes it from
-every group. Keep the prior partition ID for retries after adding partitions.
+To promote from RF1, bring up three eligible brokers in different zones. Move
+the metadata group to all three as voters, promote each topic, and check that
+the replicas have caught up before you retire any of the original brokers.
 
-See the [AWS runbook](deploy/aws/README.md) for production provisioning,
-credentials, backup, disk replacement, recovery and monitoring.
+When you drain a broker, keep it running until the operation completes and the
+committed membership of every group no longer includes it. After adding
+partitions, producers that retry an earlier publish must keep using the
+partition ID they first chose.
+
+For production provisioning, credentials, backups, disk replacement, recovery
+and monitoring, see the [AWS runbook](deploy/aws/README.md).

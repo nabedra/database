@@ -725,7 +725,7 @@ jobs:
             rc=0
             NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
               --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
-              --category compatibility --category queries --category transactions --category recovery --category growth \
+              --category compatibility --category queries --category transactions --category recovery \
               --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
             # Exit 2 allows incomplete scenarios outside the required RF3 transaction cases.
             if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
@@ -774,6 +774,79 @@ jobs:
         with:
           name: direct-evidence
           path: artifacts
+          retention-days: 14
+
+  direct-growth:
+    name: ${{ matrix.scenario }} growth acceptance, direct_oltp ${{ matrix.mode || 'on/off' }}
+    if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [O16, O21, O26]
+        include:
+          - scenario: O28
+            mode: 'on'
+          - scenario: O28
+            mode: 'off'
+    env:
+      SCENARIO: ${{ matrix.scenario }}
+      MODES: ${{ matrix.mode || 'on off' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: oltp-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
+          restore-keys: oltp-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build scenario executables
+        working-directory: server
+        run: |
+          if [ "$SCENARIO" = O28 ]; then export CARGO_PROFILE_TEST_OPT_LEVEL=1; fi
+          cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json-render-diagnostics \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and (.target.kind | index("lib"))) | .executable' \
+            | tail -1 > test-executable.txt
+          test -x "$(cat test-executable.txt)"
+          echo "NABEDRA_TEST_EXE=$(cat test-executable.txt)" >> "$GITHUB_ENV"
+          if [ "$SCENARIO" = O21 ]; then
+            CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+            echo "NABEDRA_BIN=$PWD/target/release/nabedra-db" >> "$GITHUB_ENV"
+          else
+            cargo build --locked --no-default-features --features oltp --bin nabedra-db
+            echo "NABEDRA_BIN=$PWD/target/debug/nabedra-db" >> "$GITHUB_ENV"
+          fi
+      - name: Run the selected scenario
+        run: |
+          status=0
+          limit=600
+          if [ "$SCENARIO" = O21 ] || [ "$SCENARIO" = O28 ]; then limit=3600; fi
+          for mode in $MODES; do
+            echo "direct_oltp=$mode"
+            rc=0
+            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+              --server-binary "$NABEDRA_BIN" --scenario "$SCENARIO" --timeout "$limit" \
+              --output "artifacts/acceptance-$mode" || rc=$?
+            if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
+          done
+          exit "$status"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: direct-growth-${{ matrix.scenario }}${{ matrix.mode && format('-{0}', matrix.mode) || '' }}
+          path: artifacts/acceptance-*
           retention-days: 14
 
   # FLAKE1 (G7 follow-up): worker anon memory under point-update load on a real RF3 cluster

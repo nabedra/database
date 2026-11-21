@@ -1946,6 +1946,33 @@ impl HttpRuntime for WorkerRuntime {
                     stats["test_group_leader"] =
                         serde_json::json!(self.services.manager.test_group_leader(group));
                 }
+                if let Some(request) = super::recovery_tests::pool_sync::status_probe() {
+                    let lookup = match self.durable_lookup(request).await {
+                        Ok(Some(IdentityLookup::Terminal(terminal))) => {
+                            let result = match &terminal {
+                                TerminalIdentity::Committed { outcome, .. } => {
+                                    Some(outcome.result()?)
+                                }
+                                _ => None,
+                            };
+                            serde_json::json!({"terminal": terminal, "result": result})
+                        }
+                        Ok(Some(_)) => serde_json::json!({"pending": true}),
+                        Ok(None) => serde_json::Value::Null,
+                        Err(error) => serde_json::json!({"error": error}),
+                    };
+                    stats["test_pool_sync"] = serde_json::json!({
+                        "pools_requiring_recovery": self.services.pools.pool_ids()?.into_iter()
+                            .filter_map(|id| self.services.pools.get(id).ok().flatten())
+                            .filter(|pool| pool.requires_recovery()).count(),
+                        "status": lookup,
+                    });
+                }
+                if let Some(observed) =
+                    super::recovery_tests::maintenance::observe(&self.services).await?
+                {
+                    stats["test_maintenance"] = observed;
+                }
             }
             Ok(EncodedResponse {
                 status: 200,
