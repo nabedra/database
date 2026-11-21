@@ -930,8 +930,15 @@ def assert_forged_continuation_rejected(facade, table, first, last_key, expected
         control.unlink(missing_ok=True)
 
 
+def gateway_stats(facade, name):
+    status, stats = facade.api(name, '/v1/runtime/stats')
+    assert status == 200, (status, stats)
+    return stats['direct_gateway']
+
+
 def o28(facade):
     cluster = facade.cluster
+    cluster.wait_direct_active()
     table = facade.db.create_table('paged_scan', {'id': str, 'category': int, 'value': int}, key='id')
 
     def key(index):
@@ -1040,9 +1047,9 @@ def o28(facade):
                                             values=dict(value=rows[-1]['value'])))
     exact = facade.api('api1', OPERATIONS, update, timeout=30)
     assert exact == (200, dict(request_id=update['request_id'], data=True)), exact
-    warm = cluster.stats('api1')['direct_gateway']
+    warm = gateway_stats(facade, 'api1')
     assert facade.api('api1', OPERATIONS, update, timeout=30) == exact
-    reused = cluster.stats('api1')['direct_gateway']
+    reused = gateway_stats(facade, 'api1')
     assert all(reused[field] == warm[field] for field in ('catalog_reads', 'placement_reads'))
     assert 0 < reused['cached_ranges'] < len(routes), reused
     assert 0 < reused['cached_route_bytes'] <= reused['peak_cached_route_bytes'] <= reused['cache_limit_bytes'], reused
