@@ -1112,34 +1112,32 @@ impl Client {
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
         let sections = [payload.clone(), None, None];
-        let reply = match reservation {
-            None => {
-                self.transport
-                    .request_classified(
-                        &self.group,
-                        worker,
-                        method.purpose(),
-                        header,
-                        sections,
-                        64 << 10,
-                    )
-                    .await
-            }
-            Some(reservation) => {
-                self.transport
-                    .request_reserved(
-                        reservation,
-                        &self.group,
-                        worker,
-                        method.purpose(),
-                        header,
-                        sections,
-                        64 << 10,
-                    )
-                    .await
-            }
-        }
-        .map_err(|error| {
+        // One boxed transport future, whichever lane path: every service
+        // call nests this future, and holding both variants inline grew
+        // the callers' futures until debug builds overflowed a Tokio
+        // worker's stack (run 44895705548, D05 and quorum workers).
+        let transport: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ReceivedReply, RequestError>> + Send + '_>,
+        > = match reservation {
+            None => Box::pin(self.transport.request_classified(
+                &self.group,
+                worker,
+                method.purpose(),
+                header,
+                sections,
+                64 << 10,
+            )),
+            Some(reservation) => Box::pin(self.transport.request_reserved(
+                reservation,
+                &self.group,
+                worker,
+                method.purpose(),
+                header,
+                sections,
+                64 << 10,
+            )),
+        };
+        let reply = transport.await.map_err(|error| {
                 tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
                 CallError::Transport(error)
             })?;
