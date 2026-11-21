@@ -897,6 +897,68 @@ def count_pressure(test_executable):
             wait_until(retired, 'terminal count-pressure work did not settle')
 
 
+def disk_pressure_settlement(test_executable):
+    if not Rf3Cluster.mounts_available():
+        return None
+    with tempfile.TemporaryDirectory(prefix='nabedra-o13-disk-') as directory:
+        server = RuntimeServer(test_executable, directory)
+        server.test_executable = str(Path(test_executable).resolve())
+        server.execution.update(result_retention_ms=600_000)
+        mount = str(server.directory)
+        subprocess.run(['sudo', '-n', 'mount', '-t', 'tmpfs', '-o',
+                        f'size=512m,mode=0700,uid={os.getuid()},gid={os.getgid()}', 'tmpfs', mount],
+                       capture_output=True, check=True, timeout=30)
+        try:
+            with server, closing(Http(server.url, server.token)) as client:
+                db = Database(server.url, server.token, database='test', timeout=30)
+                table = db.create_table('disk_pressure', {'id': str, 'value': int}, key='id')
+                commit, abort = [operation('table.insert', dict(table_id=table.id, row=dict(id=key, value=1)))
+                                 for key in ('commit', 'abort')]
+                gates(server.root, [(commit, 'prepared'), (abort, 'prepared')])
+                (server.root / f"refuse-prepared-commit-{abort['request_id']}").touch()
+                for request in (commit, abort):
+                    assert_accepted(client.exchange('/v1/requests', request), server.run_id, request)
+                    wait_reached([server.root], request, 'prepared')
+
+                filler = server.directory / 'acc3-disk-pressure'
+                remaining = os.statvfs(server.directory)
+                keep = 1 << 20
+                size = remaining.f_bavail * remaining.f_frsize - keep
+                assert size > 0
+                with filler.open('xb') as allocation:
+                    os.posix_fallocate(allocation.fileno(), 0, size)
+                free = os.statvfs(server.directory)
+                assert free.f_bavail * free.f_frsize <= keep, free
+                try:
+                    for request in (commit, abort):
+                        release(server.root, request)
+                    exact_receipt(client.exchange, server.run_id, commit, None)
+
+                    def abort_receipt():
+                        status, receipt = client.exchange(receipt_path(server.run_id, abort))
+                        assert status == 200, receipt
+                        if receipt['state'] != 'failed':
+                            assert receipt['state'] in ('running', 'committing'), receipt
+                            return None
+                        assert receipt['error']['code'] == 'conflict', receipt
+                        assert receipt['error']['outcome'] == 'not_applied', receipt
+                        return receipt
+
+                    wait_until(abort_receipt, 'prepared transaction did not settle ABORT under disk pressure', timeout=20)
+                    assert table.get('commit') == dict(id='commit', value=1)
+                    assert table.get('abort') is None
+                    assert table.query().count() == 1
+                    table.drop()
+                    assert db.tables() == []
+                    queue = server.stats()['queue']
+                    assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+                finally:
+                    filler.unlink()
+                return dict(free_bytes=free.f_bavail * free.f_frsize, committed=1, aborted=1, pending=0)
+        finally:
+            subprocess.run(['sudo', '-n', 'umount', mount], capture_output=True, check=True, timeout=30)
+
+
 def load_conservation(test_executable):
     with tempfile.TemporaryDirectory(prefix='nabedra-o13-load-') as directory:
         server = RuntimeServer(test_executable, directory)
@@ -1583,6 +1645,7 @@ if __name__ == '__main__':
         retirement_and_committed_cold_replay(args.binary)
         cli_supervisor(args.binary)
         simultaneous_admission(args.binary, args.test_executable)
+        disk = disk_pressure_settlement(args.test_executable)
         run_native_assertions(args.test_executable, [
             'q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes',
             'm01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop',
@@ -1599,9 +1662,12 @@ if __name__ == '__main__':
             'ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive',
         ])
         assertion('O13', 'settlement-and-expiry', 'Expired read receipts were explicit, old committed DDL replayed its exact result, and cancellation at the tested native boundaries released ownership.')
-        assertion('O13', 'scheduler-contract', 'Process pressure and native resource fault cases ran. A bounded transient receipt observation with no submit retry and every F03 boundary still need process evidence.', 'not-run')
-        assertion('O13', 'protected-disk-headroom', 'The native ENOSPC case checked live Raft cores and later settlement. COMMIT and ABORT progress on a dedicated disk reserve remain unverified.', 'not-run')
-        incomplete('O13', 'full scheduler fault matrix and protected disk settlement remain unverified')
+        assertion('O13', 'scheduler-contract', 'The process tests and focused resource cases ran. The complete F03 cancellation boundary matrix still needs process evidence.', 'not-run')
+        if disk is None:
+            assertion('O13', 'protected-disk-headroom', 'The low-disk process fixture needs a Linux loopback mount with passwordless sudo.', 'not-run')
+        else:
+            assertion('O13', 'protected-disk-headroom', disk)
+        incomplete('O13', 'the complete F03 process cancellation matrix remains unverified')
     elif args.scenario == 'queue-survival':
         if not args.test_executable or not args.binary:
             parser.error('--test-executable and --binary are required')
