@@ -908,21 +908,32 @@ impl Client {
         }
         let raw = reply.header.clone();
         let shared = self.shared.clone();
-        let decoded: ReplyHeader = shared
-            .execute(
-                if method.purpose() == Purpose::Storage {
-                    ExecutionClass::Query
-                } else {
-                    ExecutionClass::Control
-                },
-                node,
-                0,
-                move || {
-                    crate::protocol::json_input(raw.as_slice(), 4096).map_err(|_| invalid())?;
-                    serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())
-                },
-            )
-            .await?;
+        // PERF2b: a small direct reply (a point operation's answer) is
+        // checked and decoded on this task, not in two native jobs.
+        let inline = matches!(method, Method::Direct(_) | Method::DirectForward(_))
+            && reply.sections[0]
+                .as_ref()
+                .is_none_or(|section| section.len() <= INLINE_REPLY_BYTES);
+        let header = move || {
+            crate::protocol::json_input(raw.as_slice(), 4096).map_err(|_| invalid())?;
+            serde_json::from_slice::<ReplyHeader>(raw.as_slice()).map_err(|_| invalid())
+        };
+        let decoded: ReplyHeader = if inline {
+            header()?
+        } else {
+            shared
+                .execute(
+                    if method.purpose() == Purpose::Storage {
+                        ExecutionClass::Query
+                    } else {
+                        ExecutionClass::Control
+                    },
+                    node,
+                    0,
+                    header,
+                )
+                .await?
+        };
         if decoded.node != node || decoded.nonce != reply.nonce() {
             return Err(invalid());
         }
@@ -934,27 +945,31 @@ impl Client {
         if input.len() as u64 != decoded.bytes {
             return Err(invalid());
         }
-        let (digest, bytes) = self
-            .shared
-            .execute(
-                if method.purpose() == Purpose::Storage {
-                    ExecutionClass::Query
-                } else {
-                    ExecutionClass::Control
-                },
-                node,
-                0,
-                move || {
-                    use sha2::{Digest as _, Sha256};
-                    Ok((
-                        Digest::from_bytes(Sha256::digest(input.as_slice()).into()),
-                        crate::oltp::mvcc::json_decode_budget(input.as_slice())?
-                            .checked_add(4096)
-                            .ok_or_else(invalid)?,
-                    ))
-                },
-            )
-            .await?;
+        let measure = move || {
+            use sha2::{Digest as _, Sha256};
+            Ok((
+                Digest::from_bytes(Sha256::digest(input.as_slice()).into()),
+                crate::oltp::mvcc::json_decode_budget(input.as_slice())?
+                    .checked_add(4096)
+                    .ok_or_else(invalid)?,
+            ))
+        };
+        let (digest, bytes) = if inline {
+            measure()?
+        } else {
+            self.shared
+                .execute(
+                    if method.purpose() == Purpose::Storage {
+                        ExecutionClass::Query
+                    } else {
+                        ExecutionClass::Control
+                    },
+                    node,
+                    0,
+                    measure,
+                )
+                .await?
+        };
         if digest != decoded.digest {
             return Err(invalid());
         }
@@ -976,6 +991,10 @@ impl Client {
         }))
     }
 }
+/// A direct reply section up to this size is framed inline at the leader
+/// and checked and decoded inline at the gateway (PERF2b); larger ones keep
+/// their native jobs.
+const INLINE_REPLY_BYTES: usize = 4 << 10;
 struct ServiceResponse {
     reply: ReceivedReply,
     node: u64,
@@ -1214,7 +1233,44 @@ async fn reply(
 ) -> Result<ChargedReply, ProtocolError> {
     let nonce = session.nonce();
     let data = session.purpose() == Purpose::Storage;
+    // PERF2b: a small direct answer (only `Method::Direct` and
+    // `DirectForward` use the ingress purpose) is framed on this task.
+    let inline = session.purpose() == Purpose::ApiIngress
+        && !matches!(&result, Ok(bytes) if bytes.len() > INLINE_REPLY_BYTES);
     let resources = shared.clone();
+    let frame = move || {
+        use sha2::{Digest as _, Sha256};
+        let (payload, error) = match result {
+            Ok(bytes) => (Some(bytes), None),
+            Err(error) => (None, Some(error)),
+        };
+        let bytes = payload.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        let digest = Digest::from_bytes(
+            Sha256::digest(payload.as_ref().map_or(&[][..], |bytes| bytes.as_slice())).into(),
+        );
+        let header = resources.encode_in(
+            if data {
+                ByteClass::Data
+            } else {
+                ByteClass::Progress
+            },
+            &ReplyHeader {
+                node,
+                nonce,
+                bytes,
+                digest,
+                error,
+            },
+            4096,
+        )?;
+        Ok(ChargedReply {
+            header,
+            sections: [payload, None, None],
+        })
+    };
+    if inline {
+        return frame();
+    }
     shared
         .execute(
             if data {
@@ -1224,37 +1280,7 @@ async fn reply(
             },
             node,
             0,
-            move || {
-                use sha2::{Digest as _, Sha256};
-                let (payload, error) = match result {
-                    Ok(bytes) => (Some(bytes), None),
-                    Err(error) => (None, Some(error)),
-                };
-                let bytes = payload.as_ref().map_or(0, |bytes| bytes.len() as u64);
-                let digest = Digest::from_bytes(
-                    Sha256::digest(payload.as_ref().map_or(&[][..], |bytes| bytes.as_slice()))
-                        .into(),
-                );
-                let header = resources.encode_in(
-                    if data {
-                        ByteClass::Data
-                    } else {
-                        ByteClass::Progress
-                    },
-                    &ReplyHeader {
-                        node,
-                        nonce,
-                        bytes,
-                        digest,
-                        error,
-                    },
-                    4096,
-                )?;
-                Ok(ChargedReply {
-                    header,
-                    sections: [payload, None, None],
-                })
-            },
+            frame,
         )
         .await
 }

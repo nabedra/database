@@ -177,12 +177,15 @@ struct Options {
     /// entry counts see only the requests' own entries. Off, the first
     /// direct request activates it.
     activate: bool,
+    /// The Timestamp authority; a shared `Counter` by default.
+    timestamps: Option<Arc<dyn DirectTimestampSource>>,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             electors: vec![1],
             activate: true,
+            timestamps: None,
             config: DirectConfig::default(),
             span: crate::oltp::mvcc::store::KeySpan {
                 start: None,
@@ -275,7 +278,10 @@ impl Cluster {
                 covering: Page::new(Vec::new()).unwrap(),
             }],
         });
-        let timestamps = Arc::new(Counter(AtomicU64::new(1_000)));
+        let timestamps: Arc<dyn DirectTimestampSource> = options
+            .timestamps
+            .clone()
+            .unwrap_or_else(|| Arc::new(Counter(AtomicU64::new(1_000))));
         let mut voters = Vec::new();
         for (index, ((worker, tls), listener)) in
             workers.iter().zip(&certificates).zip(listeners).enumerate()
@@ -2273,5 +2279,212 @@ async fn d03_t7b_a_new_leader_expires_records_on_ranges_it_never_served() {
     }
     // The old leader, now a follower, proposes nothing.
     assert_eq!(cluster.voters[old].executor.expire_served().await, 0);
+    cluster.shutdown().await;
+}
+
+/// A Timestamp authority whose answers a test controls: `hold` keeps every
+/// allocation pending until it is cleared, `stale` answers the next one
+/// with a value below every committed version.
+struct Steered {
+    next: AtomicU64,
+    calls: AtomicU64,
+    answered: AtomicU64,
+    hold: AtomicBool,
+    stale: AtomicBool,
+}
+impl DirectTimestampSource for Steered {
+    fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            while self.hold.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let first = if self.stale.swap(false, Ordering::SeqCst) {
+                1
+            } else {
+                self.next.fetch_add(count, Ordering::SeqCst)
+            };
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            DirectTimestampRange::new(
+                CommitTs::new(first).unwrap(),
+                CommitTs::new(first + count - 1).unwrap(),
+            )
+        })
+    }
+}
+
+/// D01 (PERF2b items 1 and 2): the leader's barrier check, epochs, dedup
+/// lookup and newest version come from one Query-class native job, and a
+/// small entry's apply takes one job instead of four. Before, a get took
+/// four jobs (two Control, two Query).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d01_perf2b_leader_reads_share_one_native_job() {
+    use crate::oltp::pool::ExecutionClass;
+    const ROUNDS: u64 = 20;
+    // Background work on an idle Data leader (none is expected).
+    const SLACK: u64 = 4;
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 10, "tag": "a", "score": 2.0}}),
+            )
+            .await,
+        done("null")
+    );
+    cluster.converge(leader).await;
+    let shared = cluster.voters[leader].shared.clone();
+    let jobs = || {
+        (
+            shared.native_jobs(ExecutionClass::Query),
+            shared.native_jobs(ExecutionClass::Control),
+        )
+    };
+    let (query, control) = jobs();
+    for _ in 0..ROUNDS {
+        assert_eq!(
+            cluster
+                .op(leader, "table.get", serde_json::json!({"key": 1}))
+                .await,
+            done(r#"{"id":1,"score":2.0,"tag":"a","value":10}"#)
+        );
+    }
+    let (query_after, control_after) = jobs();
+    assert!(
+        query_after - query <= ROUNDS + SLACK,
+        "Query jobs for {ROUNDS} gets: {}",
+        query_after - query
+    );
+    assert!(
+        control_after - control <= SLACK,
+        "Control jobs for {ROUNDS} gets: {}",
+        control_after - control
+    );
+    eprintln!(
+        "perf2b: {ROUNDS} gets took {} Query and {} Control jobs",
+        query_after - query,
+        control_after - control
+    );
+    let (query, control) = jobs();
+    for round in 0..ROUNDS {
+        assert_eq!(
+            cluster
+                .op(
+                    leader,
+                    "table.update",
+                    serde_json::json!({"key": 1, "values": {"value": round}}),
+                )
+                .await,
+            done("true")
+        );
+    }
+    let (query_after, control_after) = jobs();
+    eprintln!(
+        "perf2b: {ROUNDS} updates took {} Query and {} Control jobs",
+        query_after - query,
+        control_after - control
+    );
+    // These counts include replication (AppendEntries encodes and replies),
+    // index reads and the append, so only the change is asserted. Measured
+    // on this fixture: base 439 Query and 139 Control jobs for 20 updates
+    // (about 22 and 7 each), PERF2b 360 and 102 (18 and 5). Per update, the
+    // reads lose the dedup and latest jobs and the epochs and barrier
+    // applied reads, and gain the snapshot; the apply loses its digest,
+    // reply budget and reply decode jobs.
+    assert!(
+        query_after - query <= 20 * ROUNDS + SLACK,
+        "Query jobs for {ROUNDS} updates: {}",
+        query_after - query
+    );
+    assert!(
+        control_after - control <= 6 * ROUNDS + SLACK,
+        "Control jobs for {ROUNDS} updates: {}",
+        control_after - control
+    );
+    cluster.shutdown().await;
+}
+
+/// O09 (PERF2b item 4): the commit timestamp is fetched while the leader
+/// reads, after the token and the latches. A read-only outcome drops the
+/// fetch, even one that never answers, and commits nothing. A timestamp
+/// that is not above a version the attempt read is replaced before the
+/// proposal, so apply never sees it and the commit is still one entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
+    let source = Arc::new(Steered {
+        next: AtomicU64::new(1_000),
+        calls: AtomicU64::new(0),
+        answered: AtomicU64::new(0),
+        hold: AtomicBool::new(false),
+        stale: AtomicBool::new(false),
+    });
+    let cluster = Cluster::new(Options {
+        timestamps: Some(source.clone()),
+        ..Options::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 10, "tag": "a", "score": 2.0}}),
+            )
+            .await,
+        done("null")
+    );
+    // Read-only: the fetch started (one call) and was dropped unanswered.
+    source.hold.store(true, Ordering::SeqCst);
+    let calls = source.calls.load(Ordering::SeqCst);
+    let before = cluster.last_index(leader);
+    let missing = tokio::time::timeout(
+        Duration::from_secs(5),
+        cluster.op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 99, "values": {"value": 1}}),
+        ),
+    )
+    .await
+    .expect("a read-only outcome does not wait for its timestamp");
+    assert_eq!(missing, done("false"));
+    assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
+    assert_eq!(cluster.last_index(leader), before, "nothing committed");
+    // The held call answers nobody once released; later calls follow it.
+    source.hold.store(false, Ordering::SeqCst);
+    watchdog(|| async {
+        (source.answered.load(Ordering::SeqCst) == source.calls.load(Ordering::SeqCst))
+            .then_some(())
+    })
+    .await;
+    let (version, _) = cluster.latest(leader, cluster.row_key(1)).await;
+    let version = version.expect("the inserted row");
+    source.stale.store(true, Ordering::SeqCst);
+    let calls = source.calls.load(Ordering::SeqCst);
+    let before = cluster.last_index(leader);
+    let updated = cluster
+        .op(
+            leader,
+            "table.update",
+            serde_json::json!({"key": 1, "values": {"value": 11}}),
+        )
+        .await;
+    assert_eq!(updated, done("true"));
+    assert!(
+        source.calls.load(Ordering::SeqCst) >= calls + 2,
+        "the stale value was replaced by a second fetch"
+    );
+    assert_eq!(
+        cluster.last_index(leader),
+        before + 1,
+        "one entry: apply never saw the stale timestamp"
+    );
+    let (newer, value) = cluster.latest(leader, cluster.row_key(1)).await;
+    assert!(newer.expect("updated row") > version);
+    assert!(value.unwrap().contains(r#""value":11"#));
     cluster.shutdown().await;
 }

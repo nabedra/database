@@ -103,6 +103,124 @@ impl ParticipantHandle {
         serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())
     }
 
+    /// The leader's read barrier index: a valid lease, else ReadIndex.
+    /// Pass it to `direct_snapshot`, which checks it in its own snapshot.
+    pub(crate) async fn direct_lease_index(&self) -> Result<u64, ProtocolError> {
+        self.direct_local()?;
+        self.local_consensus().lease_read_index().await
+    }
+
+    /// One snapshot of this replica's applied state for the direct leader
+    /// (PERF2b): the applied position checked against `barrier` (from
+    /// `direct_lease_index`), the group's epochs, the dedup record of
+    /// `request_id` at `anchor`, and the newest version of `anchor`'s row.
+    /// It replaces `direct_epochs`, the barrier's applied read,
+    /// `direct_dedup_after_barrier` and `direct_latest`, one native job each,
+    /// with one Query-class job. `None` means this replica has not applied
+    /// the barrier's index yet. Each part keeps its own error, so callers
+    /// map them exactly as they mapped the separate reads.
+    pub(crate) async fn direct_snapshot(
+        &self,
+        barrier: u64,
+        table_id: Uuid,
+        anchor: Key,
+        request_id: Uuid,
+    ) -> Result<Option<DirectSnapshot>, ProtocolError> {
+        self.direct_local()?;
+        let machine = self.local_machine();
+        let key = MvccKey::Row {
+            table_id,
+            primary_key: anchor.clone(),
+        };
+        machine.range_clock().wait_latest(&key).await?;
+        let group = self.identity.clone();
+        let store = machine.store.clone();
+        let raw = machine
+            .store
+            .read(
+                TransactionBudget {
+                    scratch_bytes: 32 << 20,
+                    batch_bytes: 0,
+                    // `direct_latest`'s bound, the largest Query reply. A
+                    // dedup result is at most 48 KiB, and a row at most a
+                    // request body, far below it.
+                    output_bytes: 8 << 20,
+                },
+                move |view| {
+                    // As `read_barrier`: the snapshot must hold the
+                    // barrier's index, or the caller retries.
+                    let applied = store.applied_position_in(view)?.map(|at| at.index);
+                    if applied.is_none_or(|applied| applied < barrier) {
+                        tracing::error!(group=%group.group_id, ?applied, required=barrier,
+                            "direct read barrier not applied in the read snapshot");
+                        return view.encode(&SnapshotReply::<'_>::default());
+                    }
+                    let raw = view.pinned(CONFIG)?.ok_or_else(invalid)?;
+                    if raw.len() > METADATA_BYTES {
+                        return Err(recovery_unknown());
+                    }
+                    let config: Config =
+                        serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
+                    drop(raw);
+                    let epochs = ParticipantEpochs {
+                        authority: config.authority,
+                        catalog_group_id: config.catalog_group_id,
+                        schema_epoch: config.schema_epoch,
+                        routing_epoch: config.routing_epoch,
+                        direct_schema: config.direct_schema,
+                    };
+                    let (dedup, dedup_error) = match crate::oltp::mvcc::store::direct::dedup_in(
+                        view, &group, &config, table_id, anchor, request_id,
+                    ) {
+                        Ok(found) => (found, None),
+                        Err(error) => (None, Some(error)),
+                    };
+                    latest_in(view, &group, &config, &key, |view, latest| {
+                        let (latest, latest_error) = match latest {
+                            // A dedup hit answers both callers from the
+                            // record: the row value is not needed, and the
+                            // reply stays within one row's bound.
+                            Ok(LatestReply::Value { version, .. }) if dedup.is_some() => (
+                                Some(LatestReply::Value {
+                                    version,
+                                    value: None,
+                                }),
+                                None,
+                            ),
+                            Ok(latest) => (Some(latest), None),
+                            Err(error) => (None, Some(error)),
+                        };
+                        view.encode(&SnapshotReply {
+                            epochs: Some(epochs),
+                            dedup,
+                            dedup_error,
+                            latest,
+                            latest_error,
+                        })
+                    })
+                },
+            )
+            .await?;
+        let reply: SnapshotReply<'_> =
+            serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())?;
+        let Some(epochs) = reply.epochs else {
+            return Ok(None);
+        };
+        let latest = match (reply.latest, reply.latest_error) {
+            (_, Some(error)) => Err(error),
+            (Some(latest), None) => Ok(latest.into()),
+            (None, None) => return Err(recovery_unknown()),
+        };
+        Ok(Some(DirectSnapshot {
+            epochs,
+            dedup: match reply.dedup_error {
+                Some(error) => Err(error),
+                None => Ok(reply.dedup),
+            },
+            latest,
+        }))
+    }
+
     /// The newest version of `key` on this replica, after every commit this
     /// leader registered on the key applied (range clock `wait_latest`). The
     /// wait fails with `StorageUnavailable` when leadership changes.
@@ -127,68 +245,41 @@ impl ParticipantHandle {
                     let config: Config =
                         serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
                     drop(raw);
-                    let latest = ReadTs::new(u64::MAX).map_err(|_| invalid())?;
-                    match lineage::validate_read(&config, latest) {
-                        Ok(()) => {}
-                        Err(error) if error.code == ErrorCode::SplitPublicationPending => {
-                            return view.encode(&LatestReply::SplitInProgress);
-                        }
-                        Err(error) if error.code == ErrorCode::StorageUnavailable => {
-                            return view.encode(&LatestReply::NotOwned);
-                        }
-                        Err(error) => return Err(error),
-                    }
-                    if !owns(&group, &config.span, &key) {
-                        return view.encode(&LatestReply::NotOwned);
-                    }
-                    let length = key_length(&key)?;
-                    view.with_scratch_buffer(length + 9, |view, buffer| {
-                        encode_key(&key, &mut buffer[1..1 + length]);
-                        let end = length + 1;
-                        buffer[0] = HEAD;
-                        if let Some(raw) = view.pinned(&buffer[..end])? {
-                            let head: Head =
-                                serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
-                            if head.intent.is_some() {
-                                return view.encode(&LatestReply::Blocked);
-                            }
-                        }
-                        buffer[0] = VALUE;
-                        buffer[end..].copy_from_slice(&0u64.to_be_bytes());
-                        let Some(record) = view.first_from(&buffer[..end], buffer)? else {
-                            return view.encode(&LatestReply::Value {
-                                version: None,
-                                value: None,
-                            });
-                        };
-                        if record.key().len() != buffer.len() {
-                            return Err(recovery_unknown());
-                        }
-                        let version = CommitTs::new(!u64::from_be_bytes(
-                            record.key()[end..]
-                                .try_into()
-                                .map_err(|_| recovery_unknown())?,
-                        ))
-                        .map_err(|_| recovery_unknown())?;
-                        #[derive(Deserialize)]
-                        #[serde(deny_unknown_fields)]
-                        struct Version<'a> {
-                            #[serde(borrow)]
-                            value: Option<&'a RawValue>,
-                        }
-                        let value: Version<'_> = serde_json::from_slice(record.value())
-                            .map_err(|_| recovery_unknown())?;
-                        view.encode(&LatestReply::Value {
-                            version: Some(version),
-                            value: value.value,
-                        })
+                    latest_in(view, &group, &config, &key, |view, reply| {
+                        view.encode(&reply?)
                     })
                 },
             )
             .await?;
         let reply: LatestReply<'_> =
             serde_json::from_slice(raw.as_slice()).map_err(|_| recovery_unknown())?;
-        Ok(match reply {
+        Ok(reply.into())
+    }
+}
+
+/// What `direct_snapshot` read.
+pub(crate) struct DirectSnapshot {
+    pub epochs: ParticipantEpochs,
+    pub dedup: Result<Option<crate::oltp::mvcc::store::direct::DedupLookup>, ProtocolError>,
+    pub latest: Result<LatestRead, ProtocolError>,
+}
+
+/// `direct_snapshot`'s native reply. No `epochs`: the barrier index was not
+/// applied in the snapshot.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotReply<'a> {
+    epochs: Option<ParticipantEpochs>,
+    dedup: Option<crate::oltp::mvcc::store::direct::DedupLookup>,
+    dedup_error: Option<ProtocolError>,
+    #[serde(borrow)]
+    latest: Option<LatestReply<'a>>,
+    latest_error: Option<ProtocolError>,
+}
+
+impl From<LatestReply<'_>> for LatestRead {
+    fn from(reply: LatestReply<'_>) -> Self {
+        match reply {
             LatestReply::Value { version, value } => LatestRead::Value {
                 version,
                 value: value.map(ToOwned::to_owned),
@@ -196,6 +287,105 @@ impl ParticipantHandle {
             LatestReply::Blocked => LatestRead::Blocked,
             LatestReply::NotOwned => LatestRead::NotOwned,
             LatestReply::SplitInProgress => LatestRead::SplitInProgress,
-        })
+        }
     }
+}
+
+/// The newest committed state of `key` in `view`'s snapshot, handed to
+/// `finish` (which encodes it while the value is still borrowed). A failed
+/// lookup reaches `finish` as `Err`; only `finish`'s own errors and a
+/// scratch allocation failure return from here directly.
+fn latest_in<'a, R>(
+    view: &mut crate::oltp::pool::GroupRead<'a>,
+    group: &GroupIdentity,
+    config: &Config,
+    key: &MvccKey,
+    finish: impl for<'r> FnOnce(
+        &mut crate::oltp::pool::GroupRead<'a>,
+        Result<LatestReply<'r>, ProtocolError>,
+    ) -> Result<R, ProtocolError>,
+) -> Result<R, ProtocolError> {
+    let latest = match ReadTs::new(u64::MAX) {
+        Ok(latest) => latest,
+        Err(_) => return finish(view, Err(invalid())),
+    };
+    match lineage::validate_read(config, latest) {
+        Ok(()) => {}
+        Err(error) if error.code == ErrorCode::SplitPublicationPending => {
+            return finish(view, Ok(LatestReply::SplitInProgress));
+        }
+        Err(error) if error.code == ErrorCode::StorageUnavailable => {
+            return finish(view, Ok(LatestReply::NotOwned));
+        }
+        Err(error) => return finish(view, Err(error)),
+    }
+    if !owns(group, &config.span, key) {
+        return finish(view, Ok(LatestReply::NotOwned));
+    }
+    let length = match key_length(key) {
+        Ok(length) => length,
+        Err(error) => return finish(view, Err(error)),
+    };
+    view.with_scratch_buffer(length + 9, |view, buffer| {
+        encode_key(key, &mut buffer[1..1 + length]);
+        let end = length + 1;
+        buffer[0] = HEAD;
+        let blocked = view.pinned(&buffer[..end]).and_then(|raw| match raw {
+            Some(raw) => {
+                let head: Head = serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
+                Ok(head.intent.is_some())
+            }
+            None => Ok(false),
+        });
+        match blocked {
+            Err(error) => return finish(view, Err(error)),
+            Ok(true) => return finish(view, Ok(LatestReply::Blocked)),
+            Ok(false) => {}
+        }
+        buffer[0] = VALUE;
+        buffer[end..].copy_from_slice(&0u64.to_be_bytes());
+        let record = match view.first_from(&buffer[..end], buffer) {
+            Err(error) => return finish(view, Err(error)),
+            Ok(None) => {
+                return finish(
+                    view,
+                    Ok(LatestReply::Value {
+                        version: None,
+                        value: None,
+                    }),
+                );
+            }
+            Ok(Some(record)) => record,
+        };
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Version<'a> {
+            #[serde(borrow)]
+            value: Option<&'a RawValue>,
+        }
+        let decoded = (|| {
+            if record.key().len() != buffer.len() {
+                return Err(recovery_unknown());
+            }
+            let version = CommitTs::new(!u64::from_be_bytes(
+                record.key()[end..]
+                    .try_into()
+                    .map_err(|_| recovery_unknown())?,
+            ))
+            .map_err(|_| recovery_unknown())?;
+            let value: Version<'_> =
+                serde_json::from_slice(record.value()).map_err(|_| recovery_unknown())?;
+            Ok((version, value.value))
+        })();
+        match decoded {
+            Err(error) => finish(view, Err(error)),
+            Ok((version, value)) => finish(
+                view,
+                Ok(LatestReply::Value {
+                    version: Some(version),
+                    value,
+                }),
+            ),
+        }
+    })
 }

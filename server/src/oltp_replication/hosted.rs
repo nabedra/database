@@ -227,24 +227,30 @@ where
             let position = position(entry.log_id);
             let class = execution_class(self.store());
             let shared = self.store().resources().clone();
+            let inline = match entry.payload() {
+                Payload::Normal(command) => bounded_digest(command, INLINE_BYTES),
+                Payload::Membership(_) => None,
+                Payload::Blank => Some(Ok(blank_digest())),
+            };
             let digest_entry = entry.clone();
-            let digest = shared
-                .execute(class, position.index, 0, move || {
-                    match digest_entry.payload() {
-                        Payload::Normal(command) => serialized_digest(command),
-                        Payload::Membership(membership) => {
-                            serialized_digest(&StoredMembershipOf::<C>::new(
-                                Some(digest_entry.log_id),
-                                membership.clone(),
-                            ))
+            let digest = match inline {
+                Some(digest) => digest.map_err(disk)?,
+                None => shared
+                    .execute(class, position.index, 0, move || {
+                        match digest_entry.payload() {
+                            Payload::Normal(command) => serialized_digest(command),
+                            Payload::Membership(membership) => {
+                                serialized_digest(&StoredMembershipOf::<C>::new(
+                                    Some(digest_entry.log_id),
+                                    membership.clone(),
+                                ))
+                            }
+                            Payload::Blank => Ok(blank_digest()),
                         }
-                        Payload::Blank => Ok(Digest::from_bytes(
-                            Sha256::digest(b"nabedra/typed-raft-blank/v1").into(),
-                        )),
-                    }
-                })
-                .await
-                .map_err(disk)?;
+                    })
+                    .await
+                    .map_err(disk)?,
+            };
             let meta = ApplyMeta {
                 position,
                 command_digest: digest,
@@ -308,16 +314,23 @@ where
                     index=position.index, "typed Raft state applied");
             }
             if let Some(responder) = responder {
-                let required = if let Some(raw) = &raw {
-                    let input = raw.clone();
-                    shared
-                        .execute(class, position.index, 0, move || {
-                            crate::oltp::mvcc::json_decode_budget(input.as_slice())
-                        })
-                        .await
-                        .map_err(disk)?
-                } else {
-                    1
+                // PERF2b: a small reply is measured and decoded on this
+                // task; a large one still runs as native jobs.
+                let small = raw.as_ref().is_none_or(|raw| raw.len() <= INLINE_BYTES);
+                let required = match &raw {
+                    Some(raw) if small => {
+                        crate::oltp::mvcc::json_decode_budget(raw.as_slice()).map_err(disk)?
+                    }
+                    Some(raw) => {
+                        let input = raw.clone();
+                        shared
+                            .execute(class, position.index, 0, move || {
+                                crate::oltp::mvcc::json_decode_budget(input.as_slice())
+                            })
+                            .await
+                            .map_err(disk)?
+                    }
+                    None => 1,
                 };
                 // The entry applied durably on every replica; only this
                 // proposer's answer cannot be decoded within its budget. Drop
@@ -334,18 +347,23 @@ where
                 // Independent precharged reply-decode capacity is acquired
                 // before native/CPU. Neither transport wire arena is needed.
                 let owner = Arc::new(shared.reserve_reply_decode(required).await.map_err(disk)?);
-                let (reply, owner) = shared
-                    .execute(class, position.index, 0, move || {
-                        let reply = raw
-                            .map(|raw| {
-                                serde_json::from_slice::<C::Reply>(raw.as_slice())
-                                    .map_err(|_| invalid("corrupt typed durable response"))
-                            })
-                            .transpose()?;
-                        Ok((reply, owner))
-                    })
-                    .await
-                    .map_err(disk)?;
+                let decode = move || {
+                    let reply = raw
+                        .map(|raw| {
+                            serde_json::from_slice::<C::Reply>(raw.as_slice())
+                                .map_err(|_| invalid("corrupt typed durable response"))
+                        })
+                        .transpose()?;
+                    Ok((reply, owner))
+                };
+                let (reply, owner) = if small {
+                    decode().map_err(disk)?
+                } else {
+                    shared
+                        .execute(class, position.index, 0, decode)
+                        .await
+                        .map_err(disk)?
+                };
                 responder.send(Applied::owned(position, reply, owner));
             }
         }
@@ -410,6 +428,54 @@ where
             Some(file) => self.snapshot(file).await.map(Some),
             None => Ok(None),
         }
+    }
+}
+
+/// Entries and replies up to this many encoded bytes are hashed or decoded
+/// on the applying task instead of in a native job (PERF2b). That is a few
+/// microseconds of bounded CPU, against a cross-thread handoff of 0.3-0.5 ms
+/// on a loaded host. Larger ones keep their native jobs.
+const INLINE_BYTES: usize = 4 << 10;
+
+fn blank_digest() -> Digest {
+    Digest::from_bytes(Sha256::digest(b"nabedra/typed-raft-blank/v1").into())
+}
+
+/// `serialized_digest` of `value` if its encoding fits in `limit` bytes:
+/// the serialization stops at the limit, so at most `limit` bytes are
+/// hashed here. `None` asks the caller for the native job.
+fn bounded_digest(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> Option<Result<Digest, ProtocolError>> {
+    struct Writer {
+        hash: Sha256,
+        left: usize,
+        over: bool,
+    }
+    impl io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.left {
+                self.over = true;
+                return Err(io::Error::other("inline digest limit"));
+            }
+            self.left -= bytes.len();
+            self.hash.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        hash: Sha256::new(),
+        left: limit,
+        over: false,
+    };
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Some(Ok(Digest::from_bytes(writer.hash.finalize().into()))),
+        Err(_) if writer.over => None,
+        Err(_) => Some(Err(invalid("typed Raft entry does not serialize"))),
     }
 }
 
@@ -755,6 +821,14 @@ where
             }
         })
     }
+    fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+        Box::pin(async move {
+            match self.read_index(ReadPolicy::LeaseRead).await {
+                Ok(index) => Ok(index),
+                Err(_) => self.read_index(ReadPolicy::ReadIndex).await,
+            }
+        })
+    }
     fn current_leader(&self) -> Option<u64> {
         use openraft::type_config::async_runtime::watch::WatchReceiver;
         // A stopped core's metrics may still name a leader (RV-APPLY F4).
@@ -784,6 +858,47 @@ where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
     M: TypedMachine<C>,
 {
+    /// `read_barrier`'s Raft half: the index a read must have applied. The
+    /// caller checks it against its own snapshot (`lease_read_index`).
+    async fn read_index(&self, policy: ReadPolicy) -> Result<u64, ProtocolError> {
+        let lease = matches!(policy, ReadPolicy::LeaseRead);
+        let kind = self.state.store().identity().kind.clone();
+        crate::oltp_runtime::stage_timing::variant(
+            if lease {
+                "raft.lease_read_by_kind."
+            } else {
+                "raft.read_index_by_kind."
+            },
+            &kind,
+        )
+        .record(std::time::Duration::ZERO);
+        let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            &kind,
+            if lease {
+                [
+                    "raft.data.lease_index",
+                    "raft.ts.lease_index",
+                    "raft.meta.lease_index",
+                ]
+            } else {
+                [
+                    "raft.data.read_index_only",
+                    "raft.ts.read_index_only",
+                    "raft.meta.read_index_only",
+                ]
+            },
+        )
+        .timer();
+        let barrier = self
+            .raft
+            .ensure_linearizable(policy)
+            .await
+            .map_err(|error| {
+                tracing::warn!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,lease,"typed linearizable read failed");
+                unavailable()
+            })?;
+        Ok(barrier.index())
+    }
     async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
         {
             let lease = matches!(policy, ReadPolicy::LeaseRead);

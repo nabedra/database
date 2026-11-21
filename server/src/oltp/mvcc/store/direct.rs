@@ -837,6 +837,20 @@ pub(super) fn read_dedup(
     }
     let config: Config = serde_json::from_slice(&raw).map_err(|_| recovery_unknown())?;
     drop(raw);
+    let found = dedup_in(view, group, &config, table_id, anchor, request_id)?;
+    view.encode(&found)
+}
+
+/// `read_dedup` against an already-read `config`, without encoding: the
+/// leader's combined snapshot read (PERF2b) shares one config read.
+pub(super) fn dedup_in(
+    view: &mut crate::oltp::pool::GroupRead<'_>,
+    group: &GroupIdentity,
+    config: &Config,
+    table_id: Uuid,
+    anchor: Key,
+    request_id: Uuid,
+) -> Result<Option<DedupLookup>, ProtocolError> {
     let row = MvccKey::Row {
         table_id,
         primary_key: anchor.clone(),
@@ -884,7 +898,7 @@ pub(super) fn read_dedup(
             },
         }),
     };
-    view.encode(&found)
+    Ok(found)
 }
 
 pub(super) fn expire(
