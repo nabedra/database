@@ -1073,7 +1073,9 @@ async fn o28_d07_queue_settlement_refreshes_a_retired_split_parent() {
         cluster.voters(),
     );
     let transport = cluster.transport();
-    let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
+    let gateway = cluster
+        .gateway(direct_on(), source.clone(), transport.clone())
+        .with_deadline(Duration::from_secs(2));
     let id = Uuid::new_v4();
     let get = cluster.body(id, "table.get", json!({"key": 7}));
     assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
@@ -1086,6 +1088,11 @@ async fn o28_d07_queue_settlement_refreshes_a_retired_split_parent() {
 
     let id = Uuid::new_v4();
     let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+    let error = gateway.route(&mutation, true).await.err().unwrap();
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(error.outcome, Outcome::Unknown);
+    assert_eq!(source.reads(), (1, 1));
+
     assert!(matches!(
         gateway.route(&mutation, true).await,
         Ok(Routed::Queued)

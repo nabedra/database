@@ -566,13 +566,13 @@ impl DirectGateway {
         let mut uncertain = false;
         if !get && (mode != DirectMode::Direct || asynchronous) {
             return self
-                .settle(&anchor, &mut request, deadline, &mut uncertain)
+                .settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                 .await;
         }
         if scanned.op == Op::InsertMany && (!one_range || body.len() > MAX_DIRECT_BATCH_BODY) {
             GatewayStats::bump(&self.stats.fallbacks);
             return self
-                .settle(&anchor, &mut request, deadline, &mut uncertain)
+                .settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                 .await;
         }
         let batch = (scanned.op == Op::InsertMany).then_some((&scanned, &table));
@@ -598,7 +598,7 @@ impl DirectGateway {
             Ok(Terminal::Failed(error))
                 if uncertain && !get && error.code != ErrorCode::Conflict =>
             {
-                self.settle(&anchor, &mut request, deadline, &mut uncertain)
+                self.settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
             Ok(Terminal::Failed(error)) => Err(error),
@@ -615,7 +615,7 @@ impl DirectGateway {
             }
             Ok(Terminal::Fallback(_)) => {
                 GatewayStats::bump(&self.stats.fallbacks);
-                self.settle(&anchor, &mut request, deadline, &mut uncertain)
+                self.settle(&table, &anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
             Err(error) if get && error.outcome == Outcome::Unknown => Err(ProtocolError::new(
@@ -646,6 +646,7 @@ impl DirectGateway {
     /// result; an unreachable anchor is `outcome_unknown`.
     async fn settle(
         &self,
+        route: &Arc<TableRoute>,
         anchor: &Key,
         request: &mut DirectRequest,
         deadline: Instant,
@@ -696,7 +697,12 @@ impl DirectGateway {
                 }
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
-                Err(_) => return Err(self.final_error(unknown())),
+                Err(_) => {
+                    // A retired parent cannot answer StaleRoute. Drop only
+                    // this attempt's route so an exact retry can read Catalog.
+                    self.cache.remove_if_current(route);
+                    return Err(self.final_error(unknown()));
+                }
             }
         }
     }
@@ -718,7 +724,6 @@ impl DirectGateway {
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
         let mut refreshed_unknown_table = false;
-        let mut refreshed_unreachable = false;
         loop {
             if Instant::now() >= deadline {
                 return Err(deadline_error(*uncertain));
@@ -764,18 +769,6 @@ impl DirectGateway {
                     continue;
                 }
             };
-            if rotation >= voters.len() && !refreshed_unreachable {
-                // An already retired source can no longer report StaleRoute.
-                // Check Catalog once after the cached voter set fails.
-                refreshed_unreachable = true;
-                if self
-                    .refresh(&table, deadline)
-                    .await
-                    .is_some_and(|fresh| !Arc::ptr_eq(&table, &fresh))
-                {
-                    continue;
-                }
-            }
             let voter = range
                 .leader_hint()
                 .and_then(|node| voters.iter().find(|voter| voter.node_id == node))
@@ -863,9 +856,6 @@ impl DirectGateway {
                     } else if error.code != ErrorCode::StorageUnavailable {
                         range.leader_hint.store(voter.node_id, Ordering::Relaxed);
                         return Ok(Terminal::Failed(error));
-                    } else {
-                        range.leader_hint.store(0, Ordering::Relaxed);
-                        rotation += 1;
                     }
                     // Not applied and transient: retry within the deadline.
                     if !pause(deadline, &mut delay).await {
