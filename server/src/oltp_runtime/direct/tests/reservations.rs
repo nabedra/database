@@ -102,13 +102,20 @@ async fn o08_o13_small_data_proposals_share_two_gib() {
         }
     }
     assert_eq!(read(&disk(), "reserved_bytes"), reserved);
-    for (id, result) in futures_util::future::join_all(pending)
-        .await
+    // Consuming each response releases its decoded-reply charge while Raft
+    // is still applying the rest of the entries.
+    let replies = pending
         .into_iter()
-        .enumerate()
-    {
+        .map(|proposal| async move { proposal.await.unwrap().reply });
+    let replies = tokio::time::timeout(
+        Duration::from_secs(45),
+        futures_util::future::join_all(replies),
+    )
+    .await
+    .expect("small proposals did not settle");
+    for (id, reply) in replies.into_iter().enumerate() {
         assert_eq!(
-            result.unwrap().reply,
+            reply,
             ParticipantReply::Direct(DirectReply::Applied {
                 commit_ts: CommitTs::new(1_000 + id as u64).unwrap(),
             })

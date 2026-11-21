@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: '2'
+      CARGO_BUILD_JOBS: '4'
       GC1_MODES: 'on'
       GC1_BATCH: 'on'
       GC1_RANGES: '1'
@@ -55,7 +55,7 @@ jobs:
           trap 'sudo umount "$mount_dir" && rmdir "$mount_dir"' EXIT
           for mode in base head; do
             rc=0
-            TMPDIR="$mount_dir" "$RUNNER_TEMP/res2-$mode" o08_o13_small_data_proposals_share_two_gib \
+            TMPDIR="$mount_dir" timeout 90 "$RUNNER_TEMP/res2-$mode" o08_o13_small_data_proposals_share_two_gib \
               --ignored --nocapture 2>&1 | tee "evidence/$mode-reservation.log" || rc=$?
             if [ "$mode" = base ]; then
               test "$rc" -eq 101
