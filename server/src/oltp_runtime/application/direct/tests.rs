@@ -757,6 +757,117 @@ async fn watchdog<T, F: Future<Output = Option<T>>>(mut probe: impl FnMut() -> F
     .expect("gateway fixture watchdog")
 }
 
+struct BlackholedLeader {
+    disconnected: Mutex<Option<Instant>>,
+}
+
+impl DirectTransport for BlackholedLeader {
+    fn send<'a>(
+        &'a self,
+        _group: &'a GroupIdentity,
+        voter: Voter,
+        request: &'a DirectRequest,
+        _forward: bool,
+    ) -> SendFuture<'a> {
+        let disconnected = *self.disconnected.lock().unwrap();
+        Box::pin(async move {
+            let reply = match (voter.node_id, disconnected) {
+                (1, Some(_)) => std::future::pending().await,
+                (1, None) => DirectResponse::Done(DirectData::from_json("null").unwrap()),
+                (2, Some(since)) if since.elapsed() >= Duration::from_millis(1_800) => {
+                    assert_eq!(request.digest, digest(request.body.as_ref()));
+                    DirectResponse::Done(DirectData::from_json("true").unwrap())
+                }
+                _ => DirectResponse::NotLeader { hint: Some(1) },
+            };
+            Ok(reply)
+        })
+    }
+}
+
+/// O06/O18: a cached Data leader stops answering. The gateway must get past
+/// both the silent connection and the survivors' stale leader hints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_o18_cached_blackholed_data_leader_leaves_time_to_retry() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1, 2, 3]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = Arc::new(BlackholedLeader {
+        disconnected: Mutex::new(None),
+    });
+    let gateway = DirectGateway::new(
+        resources(),
+        cluster.database.clone(),
+        direct_on(),
+        source.clone(),
+        transport.clone(),
+    );
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 1}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    *transport.disconnected.lock().unwrap() = Some(Instant::now());
+    let id = Uuid::new_v4();
+    let update = cluster.body(
+        id,
+        "table.update",
+        json!({"key": 1, "values": {"value": 2}}),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
+    cluster.shutdown().await;
+    assert_eq!(
+        result.expect("blackholed voter used the entire client budget"),
+        Answer::Data(json!(true))
+    );
+    assert_eq!(source.reads(), (1, 1));
+}
+
+/// O06/O18: Timestamp may delay a live Data leader. A routing probe lets
+/// another leader answer without discarding the original in-flight reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_o18_slow_live_leader_keeps_one_mutation_attempt() {
+    struct SlowLiveVoter(AtomicUsize);
+    impl DirectTransport for SlowLiveVoter {
+        fn send<'a>(
+            &'a self,
+            _group: &'a GroupIdentity,
+            voter: Voter,
+            _request: &'a DirectRequest,
+            _forward: bool,
+        ) -> SendFuture<'a> {
+            Box::pin(async move {
+                if voter.node_id == 1 {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(PEER_ATTEMPT + Duration::from_millis(300)).await;
+                    return Ok(DirectResponse::Done(DirectData::from_json("true").unwrap()));
+                }
+                Ok(DirectResponse::NotLeader { hint: Some(1) })
+            })
+        }
+    }
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1, 2, 3]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = Arc::new(SlowLiveVoter(AtomicUsize::new(0)));
+    let gateway = DirectGateway::new(
+        resources(),
+        cluster.database.clone(),
+        direct_on(),
+        source,
+        transport.clone(),
+    );
+    let id = Uuid::new_v4();
+    let update = cluster.body(
+        id,
+        "table.update",
+        json!({"key": 1, "values": {"value": 2}}),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(4), answer(&gateway, &update, id)).await;
+    cluster.shutdown().await;
+    assert_eq!(result.unwrap(), Answer::Data(json!(true)));
+    assert_eq!(transport.0.load(Ordering::Relaxed), 1);
+    assert!(gateway.stats().not_leader > 0);
+}
+
 /// O03/D01 (gateway level): every eligible operation goes to the range
 /// leader and returns the queued path's result shapes; the steady state
 /// makes no Catalog or Control read per request; ineligible operations and
@@ -1166,6 +1277,38 @@ async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
         }
         assert_eq!(source.reads(), (2, 2));
     }
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_o18_failed_settlement_keeps_the_independent_range_warm() {
+    let mut cluster = Cluster::new().await;
+    let left = cluster.add_group(span(None, Some(5)), 1, &[1]).await;
+    let right = cluster.add_group(span(Some(5), None), 1, &[1]).await;
+    let source = Source::new(vec![cluster.fill(&[left, right])], cluster.voters());
+    let transport = cluster.transport();
+    let gateway = cluster
+        .gateway(direct_on(), source.clone(), transport.clone())
+        .with_deadline(Duration::from_millis(400));
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 7}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    transport
+        .retired
+        .lock()
+        .unwrap()
+        .insert(cluster.shard(left).group.group_id);
+    let write = cluster.body(
+        Uuid::new_v4(),
+        "table.insert",
+        json!({"row": {"id": 1, "value": 1}}),
+    );
+    assert_eq!(
+        gateway.route(&write, true).await.err().unwrap().code,
+        ErrorCode::OutcomeUnknown
+    );
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    assert_eq!(source.reads(), (1, 2));
     cluster.shutdown().await;
 }
 
@@ -1847,6 +1990,7 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
         schema_epoch: 1,
         range: Arc::new(RangeRoute::new(group(None, Some(10)))),
         unavailable: AtomicBool::new(false),
+        refresh_before_settle: AtomicBool::new(false),
         _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
     };
     let keys = |bytes: &[u8]| {
@@ -1937,6 +2081,7 @@ fn o28_topology_cache_is_a_byte_bounded_range_lru() {
             schema_epoch: 1,
             range: Arc::new(RangeRoute::new(shard)),
             unavailable: AtomicBool::new(false),
+            refresh_before_settle: AtomicBool::new(false),
             _charge: shared
                 .reserve_scratch(ByteClass::Progress, CACHE_BYTES / 2)
                 .unwrap(),

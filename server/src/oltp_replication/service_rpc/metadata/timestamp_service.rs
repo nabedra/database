@@ -1261,7 +1261,7 @@ impl Endpoint for TimestampEndpoint {
                 ).await;
                 return reply(self.handle.resources(), &session, self.node, result).await;
             }
-            if head.method.inline_small_reply()
+            if head.method.is_allocate_direct()
                 && sections
                     .section(0)
                     .is_some_and(|section| section.len() <= INLINE_REPLY_BYTES)

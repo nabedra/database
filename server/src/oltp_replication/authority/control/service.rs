@@ -1374,9 +1374,15 @@ impl ControlHandle {
                 ) {
                     let api: ApiEnrollment = load(view, &machine::key(APIS, remote.worker_id))?
                         .ok_or_else(unauthorized)?;
+                    // The Data endpoint binds the exact hosted group. For
+                    // direct ingress, Control only proves the API's current
+                    // enrollment in the database and direct activation.
+                    let direct = action == ServiceAction::ApiIngress
+                        && matches!(target.kind, GroupKind::Data { .. })
+                        && view.get(machine::direct::activation_key())?.is_some();
                     if WorkerIdentity::from(api.transport()) != remote
                         || api.database != database
-                        || target != control
+                        || (target != control && !direct)
                     {
                         return Err(unauthorized());
                     }
@@ -1412,10 +1418,11 @@ impl ControlHandle {
                             Some(ScopedIngressGrant::from_placement(&queue)?),
                         )
                     } else {
-                        if state.owner.is_none()
-                            || state.ready.ready_count == 0
-                            || state.invalid_ready != 0
-                            || state.pending.is_some()
+                        if !direct
+                            && (state.owner.is_none()
+                                || state.ready.ready_count == 0
+                                || state.invalid_ready != 0
+                                || state.pending.is_some())
                         {
                             return Err(stale());
                         }

@@ -1,0 +1,406 @@
+{
+  "api_routing": {
+    "catalog_reads": 29,
+    "direct_done": 160,
+    "fallbacks": 0,
+    "forward_replayed": 0,
+    "forwards": 24,
+    "not_leader": 35,
+    "overloaded": 0,
+    "peer_timeouts": 73,
+    "placement_reads": 4,
+    "queued": 22,
+    "requests": 212,
+    "resends": 75,
+    "stale_routes": 0,
+    "unknown": 4
+  },
+  "dns": {
+    "errors": 0,
+    "lookups": 146,
+    "max_ms": 17.472
+  },
+  "events": {
+    "O17/O18 row and receipt oracle": {
+      "acknowledged_direct": 215,
+      "check": "O17/O18 row and receipt oracle",
+      "elapsed_seconds": 342.91,
+      "exact_rows": 281,
+      "failed_receipts": [
+        {
+          "original_status": 202,
+          "receipt": {
+            "error": {
+              "code": "overloaded",
+              "message": "worker outgoing lane full",
+              "outcome": "not_applied"
+            },
+            "request_id": "55af1b11-f9d0-4b9a-8b36-9c6fa3edf539",
+            "result": null,
+            "run_id": "cc4b3a89-a93c-418d-b371-9d42766e099d",
+            "state": "failed"
+          }
+        },
+        {
+          "original_status": 202,
+          "receipt": {
+            "error": {
+              "code": "overloaded",
+              "message": "worker outgoing lane full",
+              "outcome": "not_applied"
+            },
+            "request_id": "45d471f0-ded6-4d65-8404-e20a28ae6e6e",
+            "result": null,
+            "run_id": "cc4b3a89-a93c-418d-b371-9d42766e099d",
+            "state": "failed"
+          }
+        },
+        {
+          "original_status": 202,
+          "receipt": {
+            "error": {
+              "code": "overloaded",
+              "message": "worker outgoing lane full",
+              "outcome": "not_applied"
+            },
+            "request_id": "a210c3eb-92d2-4fa0-bfa4-35f1cb22d229",
+            "result": null,
+            "run_id": "cc4b3a89-a93c-418d-b371-9d42766e099d",
+            "state": "failed"
+          }
+        },
+        {
+          "original_status": 202,
+          "receipt": {
+            "error": {
+              "code": "overloaded",
+              "message": "worker outgoing lane full",
+              "outcome": "not_applied"
+            },
+            "request_id": "c58d5473-400c-4083-9a38-d5be2391a9d5",
+            "result": null,
+            "run_id": "cc4b3a89-a93c-418d-b371-9d42766e099d",
+            "state": "failed"
+          }
+        }
+      ],
+      "originally_accepted_receipts": 21,
+      "retried_receipts": 31
+    },
+    "O18 two-zone quorum": {
+      "check": "O18 two-zone quorum",
+      "elapsed_seconds": 278.328,
+      "first_read_after_stop_seconds": 52.251,
+      "read_completion_gap_seconds": 52.982,
+      "stop_seconds": 0.491,
+      "zone": "a"
+    },
+    "O18 zone-restored": {
+      "check": "O18 zone-restored",
+      "elapsed_seconds": 280.303,
+      "node": "nabedra-live3-9c477120-worker",
+      "zone": "a"
+    },
+    "O18 zone-stop-issued": {
+      "check": "O18 zone-stop-issued",
+      "elapsed_seconds": 225.445,
+      "node": "nabedra-live3-9c477120-worker",
+      "zone": "a"
+    },
+    "O18 zone-stopped": {
+      "check": "O18 zone-stopped",
+      "elapsed_seconds": 225.937,
+      "node": "nabedra-live3-9c477120-worker",
+      "zone": "a"
+    },
+    "docker-lane": {
+      "check": "docker-lane",
+      "elapsed_seconds": 350.524,
+      "status": "released"
+    },
+    "host": {
+      "check": "host",
+      "context": "desktop-linux",
+      "csi": "hostpath",
+      "docker": "28.3.3",
+      "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw",
+      "elapsed_seconds": 0.454,
+      "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64",
+      "kind": "kind v0.33.0 go1.27.0 darwin/amd64",
+      "scenario": "zone",
+      "server_sha256": "0a2d572c26a668ef9ced6ce8282cd53bc657e9cc3cf48e78ecd4a14f2730e542",
+      "server_source": "7bcc902d58854ae550e8153da4bc21d948c691e7",
+      "source": "7bcc902d58854ae550e8153da4bc21d948c691e7",
+      "test_executable_sha256": null
+    },
+    "kind-delete": {
+      "check": "kind-delete",
+      "elapsed_seconds": 350.336,
+      "kind_exit": 0,
+      "peak_vm_used_bytes": 2608422912,
+      "remaining_nodes": [],
+      "status": "passed"
+    },
+    "session-failed": {
+      "check": "session-failed",
+      "elapsed_seconds": 343.032,
+      "message": "[{'original_status': 202, 'receipt': {'request_id': '55af1b11-f9d0-4b9a-8b36-9c6fa3edf539', 'run_id': 'cc4b3a89-a93c-418d-b371-9d42766e099d', 'state': 'failed', 'result': None, 'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'}}}, {'original_status': 202, 'receipt': {'request_id': '45d471f0-ded6-4d65-8404-e20a28ae6e6e', 'run_id': 'cc4b3a89-a93c-418d-b371-9d42766e099d', 'state': 'failed', 'result': None, 'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'}}}, {'original_status': 202, 'receipt': {'request_id': 'a210c3eb-92d2-4fa0-bfa4-35f1cb22d229', 'run_id': 'cc4b3a89-a93c-418d-b371-9d42766e099d', 'state': 'failed', 'result': None, 'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'}}}, {'original_status': 202, 'receipt': {'request_id': 'c58d5473-400c-4083-9a38-d5be2391a9d5', 'run_id': 'cc4b3a89-a93c-418d-b371-9d42766e099d', 'state': 'failed', 'result': None, 'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'}}}]",
+      "type": "AssertionError"
+    }
+  },
+  "operations": {
+    "read": {
+      "attempts": 14,
+      "first_success_seconds": 52.251,
+      "p99_ms": 7022.909,
+      "status_counts": {
+        "200": 8,
+        "None": 6
+      },
+      "successes_while_down": 7
+    },
+    "write": {
+      "attempts": 120,
+      "first_success_seconds": 30.12,
+      "p99_ms": 7015.399,
+      "status_counts": {
+        "200": 103,
+        "503": 15,
+        "None": 2
+      },
+      "successes_while_down": 102
+    }
+  },
+  "stage_timing": {
+    "api": {
+      "gw.direct.lane_wait": {
+        "count": 336,
+        "le_us": {
+          "1024": 1,
+          "1048576": 2,
+          "128": 1,
+          "16": 126,
+          "256": 1,
+          "262144": 2,
+          "32": 19,
+          "4": 3,
+          "524288": 2,
+          "64": 6,
+          "65536": 1,
+          "8": 172
+        },
+        "max_us": 624674,
+        "sum_us": 2519200
+      },
+      "gw.direct.send": {
+        "count": 336,
+        "le_us": {
+          "1024": 41,
+          "1048576": 1,
+          "131072": 5,
+          "16384": 92,
+          "2048": 41,
+          "2097152": 69,
+          "262144": 3,
+          "32768": 40,
+          "4096": 17,
+          "524288": 4,
+          "65536": 9,
+          "8192": 14
+        },
+        "max_us": 1506050,
+        "sum_us": 109775754
+      }
+    },
+    "w2-0": {
+      "control.read.enrollment_revision": {
+        "count": 67,
+        "le_us": {
+          "131072": 1,
+          "16384": 4,
+          "16777216": 1,
+          "32768": 1,
+          "4096": 22,
+          "4194304": 1,
+          "65536": 3,
+          "8192": 34
+        },
+        "max_us": 10391063,
+        "sum_us": 13926705
+      },
+      "leader.get.token": {
+        "count": 11,
+        "le_us": {
+          "4": 11
+        },
+        "max_us": 3,
+        "sum_us": 27
+      },
+      "leader.get.total": {
+        "count": 11,
+        "le_us": {
+          "128": 2,
+          "32": 7,
+          "64": 2
+        },
+        "max_us": 113,
+        "sum_us": 424
+      },
+      "leader.mutation.table": {
+        "count": 118,
+        "le_us": {
+          "128": 1,
+          "16": 70,
+          "2097152": 1,
+          "256": 1,
+          "32": 4,
+          "64": 3,
+          "8": 35,
+          "8388608": 3
+        },
+        "max_us": 8062416,
+        "sum_us": 19875950
+      },
+      "rpc.call.ParticipantRead": {
+        "count": 138,
+        "le_us": {
+          "16384": 32,
+          "2097152": 1,
+          "262144": 1,
+          "32768": 9,
+          "4096": 8,
+          "4194304": 1,
+          "65536": 8,
+          "8192": 71,
+          "8388608": 7
+        },
+        "max_us": 8378778,
+        "sum_us": 53212429
+      },
+      "rpc.call.ParticipantReadPage": {
+        "count": 21,
+        "le_us": {
+          "16": 3,
+          "16384": 5,
+          "32768": 3,
+          "4096": 1,
+          "8": 1,
+          "8192": 8
+        },
+        "max_us": 20571,
+        "sum_us": 171531
+      }
+    },
+    "w3-0": {
+      "control.read.enrollment_revision": {
+        "count": 67,
+        "le_us": {
+          "131072": 1,
+          "16384": 7,
+          "16777216": 1,
+          "32768": 2,
+          "4096": 44,
+          "65536": 2,
+          "8192": 10
+        },
+        "max_us": 10005857,
+        "sum_us": 10517179
+      },
+      "leader.get.barrier": {
+        "count": 39,
+        "le_us": {
+          "16": 3,
+          "256": 3,
+          "32": 30,
+          "512": 1,
+          "64": 2
+        },
+        "max_us": 403,
+        "sum_us": 1593
+      },
+      "leader.get.epochs": {
+        "count": 39,
+        "le_us": {
+          "128": 1,
+          "2": 22,
+          "32": 1,
+          "4": 14,
+          "512": 1
+        },
+        "max_us": 288,
+        "sum_us": 461
+      },
+      "leader.get.read": {
+        "count": 39,
+        "le_us": {
+          "1024": 16,
+          "16384": 1,
+          "2048": 5,
+          "256": 1,
+          "32768": 1,
+          "4096": 2,
+          "512": 10,
+          "8192": 3
+        },
+        "max_us": 29074,
+        "sum_us": 83135
+      },
+      "leader.get.table": {
+        "count": 39,
+        "le_us": {
+          "1048576": 1,
+          "16": 14,
+          "16777216": 1,
+          "2048": 1,
+          "2097152": 6,
+          "32": 1,
+          "4194304": 1,
+          "8": 2,
+          "8388608": 12
+        },
+        "max_us": 8388619,
+        "sum_us": 105221657
+      },
+      "leader.get.token": {
+        "count": 39,
+        "le_us": {
+          "1": 39
+        },
+        "max_us": 0,
+        "sum_us": 0
+      },
+      "leader.get.total": {
+        "count": 39,
+        "le_us": {
+          "1024": 5,
+          "1048576": 1,
+          "16777216": 1,
+          "2048": 5,
+          "2097152": 6,
+          "32768": 1,
+          "4096": 2,
+          "4194304": 1,
+          "512": 2,
+          "8192": 3,
+          "8388608": 12
+        },
+        "max_us": 8389220,
+        "sum_us": 105308968
+      },
+      "rpc.call.ParticipantRead": {
+        "count": 30,
+        "le_us": {
+          "1048576": 1,
+          "16384": 3,
+          "2097152": 6,
+          "32768": 3,
+          "4194304": 1,
+          "8192": 3,
+          "8388608": 13
+        },
+        "max_us": 8385897,
+        "sum_us": 104964642
+      }
+    }
+  }
+}

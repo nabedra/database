@@ -1,0 +1,203 @@
+{
+  "source": "b423c2d731dd59c8096babe37978ddac2ea2c5d0",
+  "run": "https://github.com/zPy52/nabedra-database/actions/runs/44949594158",
+  "result": "passed",
+  "covered": [
+    "az1_0",
+    "az1_1",
+    "control",
+    "timestamps"
+  ],
+  "faults": [
+    {
+      "victim": "w2",
+      "leaders_before": {
+        "control": "w1",
+        "timestamps": "w2",
+        "az1_0": "w1",
+        "az1_1": "w1"
+      },
+      "requests": [
+        {
+          "table": "az1_0",
+          "operation": "write",
+          "statuses": {
+            "200": 48
+          },
+          "first_verified_seconds": 5.613,
+          "max_attempt_seconds": 5.61
+        },
+        {
+          "table": "az1_1",
+          "operation": "write",
+          "statuses": {
+            "200": 48
+          },
+          "first_verified_seconds": 5.612,
+          "max_attempt_seconds": 5.609
+        },
+        {
+          "table": "az1_1",
+          "operation": "read",
+          "statuses": {
+            "200": 106
+          },
+          "first_verified_seconds": 0.015,
+          "max_attempt_seconds": 0.013
+        },
+        {
+          "table": "az1_0",
+          "operation": "read",
+          "statuses": {
+            "200": 106
+          },
+          "first_verified_seconds": 0.013,
+          "max_attempt_seconds": 0.011
+        }
+      ],
+      "leaders_after": {
+        "control": "w1",
+        "az1_0": "w1",
+        "az1_1": "w1",
+        "timestamps": "w1"
+      },
+      "leader_observation_seconds": {
+        "control": 0.018,
+        "az1_0": 0.034,
+        "az1_1": 0.041,
+        "timestamps": 5.388
+      },
+      "failed_assertions": []
+    },
+    {
+      "victim": "w1",
+      "leaders_before": {
+        "control": "w1",
+        "timestamps": "w1",
+        "az1_0": "w1",
+        "az1_1": "w1"
+      },
+      "requests": [
+        {
+          "table": "az1_1",
+          "operation": "read",
+          "statuses": {
+            "200": 49
+          },
+          "first_verified_seconds": 5.963,
+          "max_attempt_seconds": 5.962
+        },
+        {
+          "table": "az1_0",
+          "operation": "read",
+          "statuses": {
+            "200": 50
+          },
+          "first_verified_seconds": 5.913,
+          "max_attempt_seconds": 5.911
+        },
+        {
+          "table": "az1_1",
+          "operation": "write",
+          "statuses": {
+            "200": 45
+          },
+          "first_verified_seconds": 6.114,
+          "max_attempt_seconds": 6.112
+        },
+        {
+          "table": "az1_0",
+          "operation": "write",
+          "statuses": {
+            "200": 45
+          },
+          "first_verified_seconds": 6.114,
+          "max_attempt_seconds": 6.112
+        }
+      ],
+      "leaders_after": {
+        "az1_1": "w2",
+        "az1_0": "w3",
+        "control": "w2",
+        "timestamps": "w2"
+      },
+      "leader_observation_seconds": {
+        "az1_1": 4.636,
+        "az1_0": 4.859,
+        "control": 4.92,
+        "timestamps": 5.278
+      },
+      "failed_assertions": []
+    },
+    {
+      "victim": "w1",
+      "leaders_before": {
+        "control": "w2",
+        "timestamps": "w2",
+        "az1_0": "w3",
+        "az1_1": "w2"
+      },
+      "requests": [
+        {
+          "table": "az1_1",
+          "operation": "write",
+          "statuses": {
+            "200": 99
+          },
+          "first_verified_seconds": 0.027,
+          "max_attempt_seconds": 0.025
+        },
+        {
+          "table": "az1_1",
+          "operation": "read",
+          "statuses": {
+            "200": 106
+          },
+          "first_verified_seconds": 0.013,
+          "max_attempt_seconds": 0.011
+        },
+        {
+          "table": "az1_0",
+          "operation": "read",
+          "statuses": {
+            "200": 106
+          },
+          "first_verified_seconds": 0.013,
+          "max_attempt_seconds": 0.012
+        },
+        {
+          "table": "az1_0",
+          "operation": "write",
+          "statuses": {
+            "200": 99
+          },
+          "first_verified_seconds": 0.024,
+          "max_attempt_seconds": 0.023
+        }
+      ],
+      "leaders_after": {
+        "control": "w2",
+        "timestamps": "w2",
+        "az1_0": "w3",
+        "az1_1": "w2"
+      },
+      "leader_observation_seconds": {
+        "control": 0.02,
+        "timestamps": 0.034,
+        "az1_0": 0.043,
+        "az1_1": 0.051
+      },
+      "failed_assertions": []
+    }
+  ],
+  "sampled_stage_max_us": {
+    "control.read.enrollment_revision": 5001926,
+    "gw.direct.lane_wait": 5902420,
+    "gw.direct.send": 5952019,
+    "leader.get.barrier": 4663,
+    "leader.get.table": 538230,
+    "rpc.call.ParticipantRead": 501565,
+    "ts.rpc.thin": 751794,
+    "ts.rpc.thin_failed": 0
+  }
+}
