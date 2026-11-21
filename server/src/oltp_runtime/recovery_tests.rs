@@ -692,12 +692,17 @@ async fn replacement_peer_probe(config: PathBuf) {
         config.group.clone(), config.targets.clone(), shared.clone(),
     ).unwrap();
     if let Some(view) = config.queue_view {
-        use crate::oltp_replication::multiplex::RequestError;
         use super::{replica::QueueScope, worker_endpoint::QueueRequest};
+        use crate::oltp_replication::multiplex::RequestError;
 
         let [target] = config.targets.as_slice() else {
             panic!("queue enrollment probe requires one target");
         };
+        // The fixture pins the outbound receiver. The real receiver checks
+        // the caller against its applied Control enrollment.
+        directory
+            .install_system_trust(1, config.targets.clone(), Vec::new(), None)
+            .unwrap();
         for stale in [false, true] {
             let mut enrollment = config.from.clone();
             if stale {

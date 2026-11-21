@@ -279,12 +279,16 @@ impl HostedGroupManager {
             let replica = routes
                 .get(&group.group_id)
                 .and_then(|route| {
-                    route.replicas.values().find(|replica| {
-                        replica.running.leader() == Some(replica.member.node_id)
-                    })
+                    route
+                        .replicas
+                        .values()
+                        .find(|replica| replica.running.leader() == Some(replica.member.node_id))
                 })
                 .ok_or_else(unavailable)?;
-            let target = replica.running.members().into_iter()
+            let target = replica
+                .running
+                .members()
+                .into_iter()
                 .find(|member| member.worker_id == target)
                 .ok_or_else(unavailable)?;
             (replica.member.clone(), target)

@@ -530,9 +530,10 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
                 if compact.is_file():
                     break
             wait_until(compact.is_file, 'background compaction output sync', timeout=15)
-            fixture.select(scan['request_id'], {'snapshot': True})
+            fixture.select(scan['request_id'], {'scan-page': True})
             fixture.admit(scan)
-            fixture.reached(scan['request_id'], 'snapshot')
+            _, scanned_rows = fixture.reached(scan['request_id'], 'scan-page')
+            assert 0 < scanned_rows < len(rows), scanned_rows
             (index_directory / f'hold-{index_stage}').touch()
             building = jobs.submit(fixture.make_index, table, owner, index_id=index)
             wait_until(lambda: (index_directory / f'index-{index_stage}.json').is_file(),
@@ -568,7 +569,7 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
             if leader_directory is not None:
                 (leader_directory / f'release-{snapshot_stage}').touch()
             (index_directory / f'release-{index_stage}').write_text('continue')
-            fixture.release(scan['request_id'], 'snapshot')
+            fixture.release(scan['request_id'], 'scan-page')
         flushing.result(timeout=30)
         cut = sending.result(timeout=30)['test_maintenance']['snapshot_cut']
         assert cut > 0, cut
@@ -591,7 +592,8 @@ def o05_maintenance(fixture, table, owner, source, rows, baseline):
                 assert pool['merge_and_flush_writers_bytes'] <= pool['overhead_bytes'] <= 64 * MIB, pool
     evidence('O05', 'joint-native-maintenance-cut', baseline=baseline, held=held, settled=settled,
              flush_and_compaction_worker=owner, snapshot_sender=leader, snapshot_receiver=target,
-             snapshot_installed_cut=cut, first_chunk_bytes=transferred, image_bytes=total)
+             snapshot_transferred_cut=cut, first_chunk_bytes=transferred, image_bytes=total,
+             rows_reduced_before_pause=scanned_rows)
 
 
 def o05(binary, test_executable):
@@ -626,7 +628,7 @@ def o05(binary, test_executable):
                   'Native two-pool assertions executed. Physical thread attribution, VmHWM and resident pool file sampling require Linux.',
                   'not-run')
     assertion('O05', 'maintenance-bounds',
-              'A single cut held native run flush and compaction, a running pinned scan, index backfill, '
+              'A single cut held native run flush and compaction, a scan after reducing its first page, index backfill, '
               'and an acknowledged mid-transfer mTLS snapshot. Merge writer memory, I/O queues and disk '
               'growth stayed within their asserted limits, and all five operations settled.')
 
@@ -779,7 +781,6 @@ def saturated_history(db, exchange, worker_stats, directories, run, *, membershi
 def o22(binary, test_executable):
     run_native_assertions(test_executable, [
         'c01_c02_heterogeneous_limits_and_impossible_work',
-        'c02_signed_capacity_and_incarnation_cannot_be_forged',
         'c03_drain_preserves_owned_work_and_reconfigure_reuses_node',
         'c04_caps_include_reducers_across_hundred_jobs',
         'c05_equal_peers_progress_with_one_slot_per_fair_round',

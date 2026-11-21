@@ -27,7 +27,7 @@ pub(crate) fn wrap(fs: Arc<dyn Fs>) -> Arc<dyn Fs> {
             if directory.join("enable-post-sync-fault").is_file()
                 || directory.join("enable-maintenance-observation").is_file() =>
         {
-            Arc::new(FaultSync { fs, directory })
+            Arc::new(ObservedFs { fs, directory })
         }
         _ => fs,
     }
@@ -58,12 +58,12 @@ pub(crate) fn observe_create_plan(request: Uuid, table: Uuid) {
     }
 }
 
-struct FaultSync {
+struct ObservedFs {
     fs: Arc<dyn Fs>,
     directory: PathBuf,
 }
 
-impl Fs for FaultSync {
+impl Fs for ObservedFs {
     fn open(&self, path: &Path, mode: OpenMode) -> io::Result<Arc<dyn FsFile>> {
         let file = self.fs.open(path, mode)?;
         match path.extension().and_then(|ext| ext.to_str()) {

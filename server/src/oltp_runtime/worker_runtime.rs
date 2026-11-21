@@ -1945,7 +1945,9 @@ impl HttpRuntime for WorkerRuntime {
                     let lookup = match self.durable_lookup(request).await {
                         Ok(Some(IdentityLookup::Terminal(terminal))) => {
                             let result = match &terminal {
-                                TerminalIdentity::Committed { outcome, .. } => Some(outcome.result()?),
+                                TerminalIdentity::Committed { outcome, .. } => {
+                                    Some(outcome.result()?)
+                                }
                                 _ => None,
                             };
                             serde_json::json!({"terminal": terminal, "result": result})
@@ -1961,7 +1963,9 @@ impl HttpRuntime for WorkerRuntime {
                         "status": lookup,
                     });
                 }
-                if let Some(observed) = super::recovery_tests::maintenance::observe(&self.services).await? {
+                if let Some(observed) =
+                    super::recovery_tests::maintenance::observe(&self.services).await?
+                {
                     stats["test_maintenance"] = observed;
                 }
             }
