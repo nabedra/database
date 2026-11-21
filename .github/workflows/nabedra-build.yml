@@ -296,7 +296,8 @@ jobs:
           if [[ "${{ contains(github.event.head_commit.message, '[ci o22]') }}" == true ]]; then
             for mode in on off; do
               out="$RUNNER_TEMP/o22-$mode"
-              NABEDRA_TEST_DIRECT_OLTP="$mode" python3 scripts/acceptance_oltp.py --scenario O22 \
+              NABEDRA_ACCEPTANCE_PYTHON=python3 NABEDRA_TEST_DIRECT_OLTP="$mode" \
+                python3 scripts/acceptance_oltp.py --scenario O22 \
                 --test-binary "$test_executable" --server-binary server/target/debug/nabedra-db \
                 --output "$out" 2>&1 | tee "oltp-rep1-o22-$mode.log" || status=1
               cp "$out/O22.log" "oltp-rep1-o22-$mode-assertions.log" || status=1
