@@ -381,18 +381,19 @@ impl Measure {
         }
     }
 
-    /// Runs one request on the leader's runtime; returns (ok, latency).
+    /// Runs one request on the leader's runtime; returns the response and
+    /// the time from `due` (its scheduled arrival) to its completion.
     fn spawn(
         &self,
         group: usize,
         request: DirectRequest,
+        due: std::time::Instant,
     ) -> tokio::task::JoinHandle<(DirectResponse, Duration)> {
         let executor = self.voters[0].executor.clone();
         let handle = self.voters[0].groups[group].handle.clone();
         self.voters[0].runtime.as_ref().unwrap().spawn(async move {
-            let started = std::time::Instant::now();
             let response = executor.execute(&handle, request).await;
-            (response, started.elapsed())
+            (response, due.elapsed())
         })
     }
 
@@ -408,7 +409,10 @@ impl Measure {
                     .collect();
                 let request =
                     self.request(g, "table.insert_many", serde_json::json!({ "rows": rows }));
-                let (response, _) = self.spawn(g, request).await.unwrap();
+                let (response, _) = self
+                    .spawn(g, request, std::time::Instant::now())
+                    .await
+                    .unwrap();
                 assert!(
                     matches!(response, DirectResponse::Done(_)),
                     "seed {response:?}"
@@ -487,6 +491,8 @@ const STAGES: &[&str] = &[
     "raft.data.append_write",
     "raft.data.apply_entry",
     "raft.data.apply_machine",
+    "raft.data.append_merged",
+    "raft.data.append_order_wait",
     "raft.data.net.append",
     "raft.data.net.append_handle",
 ];
@@ -535,13 +541,17 @@ async fn phase(
                 "table.update",
                 serde_json::json!({"key": key, "values": {"value": i as i64}}),
             );
-            let (response, latency) = measure.spawn(g, request).await.unwrap();
+            let (response, latency) = measure
+                .spawn(g, request, std::time::Instant::now())
+                .await
+                .unwrap();
             count(&response, latency, &mut latencies);
         }
     } else {
         let total = (rate * seconds) as usize;
         let interval = Duration::from_secs_f64(1.0 / rate);
         let origin = tokio::time::Instant::now();
+        let origin_std = std::time::Instant::now();
         let mut tasks = Vec::with_capacity(total);
         for i in 0..total {
             let due = origin + interval * i as u32;
@@ -553,13 +563,12 @@ async fn phase(
                 "table.update",
                 serde_json::json!({"key": key, "values": {"value": i as i64}}),
             );
-            let task = measure.spawn(g, request);
-            tasks.push((due, task));
-        }
-        for (due, task) in tasks {
-            let (response, _) = task.await.unwrap();
             // Latency from the scheduled arrival (open loop).
-            let latency = due.elapsed();
+            let task = measure.spawn(g, request, origin_std + interval * i as u32);
+            tasks.push(task);
+        }
+        for task in tasks {
+            let (response, latency) = task.await.unwrap();
             count(&response, latency, &mut latencies);
         }
     }
@@ -661,21 +670,32 @@ fn gc1_measure_direct_write_cost() {
         .enable_all()
         .build()
         .unwrap();
+    let modes: Vec<bool> = std::env::var("GC1_MODES")
+        .unwrap_or_else(|_| "on".to_owned())
+        .split(',')
+        .map(|mode| mode.trim() == "on")
+        .collect();
     runtime.block_on(async {
-        for ranges in ranges {
-            let measure = Measure::new(ranges as usize, rows).await;
-            measure.seed(rows).await;
-            // Warm up the sessions, caches and the timestamp client.
-            let _ = phase(&measure, 50.0, 2.0, 0, rows).await;
-            if ranges as usize == 1 && serial > 0 {
-                let record = phase(&measure, 0.0, 0.0, serial, rows).await;
-                println!("GC1 {record}");
+        for coalesce in modes {
+            crate::oltp_replication::typed_log::COALESCE_APPENDS.store(coalesce, Ordering::Relaxed);
+            for &ranges in &ranges {
+                let measure = Measure::new(ranges as usize, rows).await;
+                measure.seed(rows).await;
+                // Warm up the sessions, caches and the timestamp client.
+                let _ = phase(&measure, 50.0, 2.0, 0, rows).await;
+                let mut records = Vec::new();
+                if ranges as usize == 1 && serial > 0 {
+                    records.push(phase(&measure, 0.0, 0.0, serial, rows).await);
+                }
+                for &rate in &rates {
+                    records.push(phase(&measure, rate, seconds, 0, rows).await);
+                }
+                for mut record in records {
+                    record["coalesce_appends"] = serde_json::json!(coalesce);
+                    println!("\nGC1 {record}");
+                }
+                measure.shutdown().await;
             }
-            for &rate in &rates {
-                let record = phase(&measure, rate, seconds, 0, rows).await;
-                println!("GC1 {record}");
-            }
-            measure.shutdown().await;
         }
     });
     runtime.shutdown_background();

@@ -1221,3 +1221,80 @@ async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
     .await
     .expect("PERF2d marker watchdog");
 }
+
+/// O06/O11 (fsync before ack), GC1: appends queued behind a held sync share
+/// one synced write, and a vote queued between appends is never merged
+/// across. With the first append's sync held, appends 1 and 2 queue, then a
+/// vote, then appends 3 and 4. After the release the writes are `[0]`,
+/// `[1, 2]`, the vote, `[3, 4]`: four journal syncs. Before GC1 every append
+/// was its own synced write (six); merging across the vote would give three.
+/// No callback fires while the first sync is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let rig = GatedLog::new();
+        let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
+        let syncs = || pool.kv_store().stats().journal_syncs;
+        let before = syncs();
+        rig.gated.state(|gate| gate.closed = true);
+        let mut acks = Vec::new();
+        let mut ack = |index: u64| {
+            let (sent, acked) = TestConfig::oneshot();
+            acks.push(acked);
+            ([blank(index)], IOFlushed::signal(sent))
+        };
+        let (entries, flushed) = ack(0);
+        log.append(entries, flushed).await.unwrap();
+        rig.entered().await;
+        for index in [1, 2] {
+            let (entries, flushed) = ack(index);
+            log.append(entries, flushed).await.unwrap();
+        }
+        // The vote takes its writer place behind appends 0 to 2.
+        let mut voter = log.clone();
+        let mut vote = tokio::spawn(async move {
+            voter.save_vote(&Vote::new_committed(2, 1)).await.unwrap();
+            voter
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut vote)
+                .await
+                .is_err(),
+            "the vote waits for the held append"
+        );
+        for index in [3, 4] {
+            let (entries, flushed) = ack(index);
+            log.append(entries, flushed).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for acked in &mut acks {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), acked)
+                    .await
+                    .is_err(),
+                "no append reports a flush before its sync"
+            );
+        }
+        rig.gated.state(|gate| gate.closed = false);
+        let mut voter = vote.await.unwrap();
+        for acked in acks {
+            acked.await.unwrap().unwrap();
+        }
+        log.drain().await;
+        assert_eq!(
+            syncs() - before,
+            4,
+            "writes [0], [1, 2], vote, [3, 4]: one sync each"
+        );
+        assert_eq!(
+            log_ids(log.try_get_log_entries(..).await.unwrap()),
+            (0..5).map(id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            voter.read_vote().await.unwrap(),
+            Some(Vote::new_committed(2, 1))
+        );
+    })
+    .await
+    .expect("GC1 append coalescing watchdog");
+}
