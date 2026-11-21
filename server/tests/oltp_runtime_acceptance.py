@@ -30,7 +30,7 @@ from acceptance_nodes import announcement
 from acceptance_nabedra import child_pids, reaped
 from nabedra import Database
 from nabedra._cli_config import protected_write
-from oltp_direct_cluster import Http, Rf3Cluster, WORKERS, call, operation, write_json
+from oltp_direct_cluster import Http, IDENTITY_FIELDS, Rf3Cluster, WORKERS, call, operation, write_json
 from oltp_process import Server, raw, terminal
 
 
@@ -732,6 +732,37 @@ def launch_retained(cluster, name):
     cluster.launch_worker(name)
 
 
+def renewed_enrollment(node):
+    previous = node['enrollment']
+    return dict(previous, incarnation=str(uuid.uuid4()),
+                enrollment_revision=previous['enrollment_revision'] + 1)
+
+
+def install_enrollment(cluster, name, enrollment):
+    node = cluster.config[name]['node']
+    node['enrollment'] = enrollment
+    node['mount']['generation'] += 1
+    node['mount']['worker'] = {field: enrollment[field] for field in IDENTITY_FIELDS}
+    cluster.enrollments[name] = enrollment
+
+
+def prepare_rolling_restart(cluster, stopped, observer):
+    node = cluster.config[stopped]['node']
+    previous = {field: node['enrollment'][field] for field in IDENTITY_FIELDS}
+    enrollment = renewed_enrollment(node)
+    intent = dict(id=str(uuid.uuid4()), run_id=cluster.run_id, previous=previous, next=enrollment,
+                  pool_id=node['pool_id'], mount_generation=node['mount']['generation'] + 1)
+    request = operation('worker.restart.prepare', intent, intent['id'])
+    status, reply = call(cluster.urls[observer], '/v1/cluster/operations', request,
+                         token=cluster.auth['admin_token'])
+    assert status == 200 and reply['data']['identity'] == {
+        field: enrollment[field] for field in IDENTITY_FIELDS}, reply
+    node['control_enrollments'] = sorted(cluster.enrollments.values(), key=lambda record: record['worker_id'])
+    node['rolling'] = dict(preparation_id=intent['id'], run_id=cluster.run_id)
+    install_enrollment(cluster, stopped, enrollment)
+    return {'request_id': intent['id']}
+
+
 def signed_control_saturation(cluster, owner, table, expected):
     # Each stalled terminal installation owns a QueueData handler and a
     # coordinator copy permit. Four held installations fill the copy pool.
@@ -778,7 +809,10 @@ def signed_control_saturation(cluster, owner, table, expected):
 
 
 def queue_survival(binary, test_executable):
-    with native_cluster(binary, test_executable, 'o14') as cluster:
+    if not Rf3Cluster.mounts_available():
+        incomplete('O14', 'RF3 retained worker restart requires loopback mounts with passwordless sudo on Linux')
+        return
+    with native_cluster(binary, test_executable, 'o14', mounts=True) as cluster:
         run = cluster.run_id
         directories = [cluster.barrier_dir(name) for name in WORKERS]
         db = Database(cluster.api_urls['api1'], cluster.auth['data_token'], database='test',
@@ -820,6 +854,10 @@ def queue_survival(binary, test_executable):
         removed, survivor = [name for name in WORKERS if name != owner]
         cluster.workers[removed].kill()
         same_run_ready(cluster, run, (owner, survivor), 2)
+        # Persist the first worker's replacement enrollment while there is
+        # still a Control quorum. The new process will open the retained mount
+        # and restore the quorum without taking a cold-start path.
+        restart = prepare_rolling_restart(cluster, removed, owner)
         cluster.workers[owner].kill()
         for request in (read, mutation):
             record = read_record(cluster, survivor, request)
@@ -838,7 +876,26 @@ def queue_survival(binary, test_executable):
 
         # Restore the first lost worker without the original owner. Recovery
         # must copy from the one process that still has the accepted body.
+        join_dir = cluster.barrier_dir(removed)
+        join = {'request_id': str(uuid.uuid4())}
+        (join_dir / 'rolling-test-id').write_text(join['request_id'])
+        write_json(join_dir / 'gates.json', {
+            restart['request_id']: 'rolling_before_join', join['request_id']: 'rolling_copy_complete'})
         launch_retained(cluster, removed)
+        try:
+            wait_reached([join_dir], restart, 'rolling_before_join')
+            same_run_ready(cluster, run, (survivor,), 1)
+            release(join_dir, restart)
+            wait_reached([join_dir], join, 'rolling_copy_complete')
+            copied = json.loads((join_dir / 'rolling-copy.json').read_text())
+            assert copied['statement']['source']['worker_id'] == cluster.enrollments[survivor]['worker_id'], copied
+            for request in (read, mutation):
+                path = join_dir / f"record-{request['request_id']}.json"
+                record = json.loads(path.read_text())
+                assert assert_record(record, run, request) == originals[request['request_id']], record
+        finally:
+            release(join_dir, restart)
+            release(join_dir, join)
         same_run_ready(cluster, run, (survivor, removed), 2)
         for name in (survivor, removed):
             for request in (read, mutation):
@@ -849,6 +906,7 @@ def queue_survival(binary, test_executable):
         for directory in directories:
             for request in (read, mutation):
                 release(directory, request)
+        cluster.connection = cluster.admin('cluster.connection', {})
         cluster.apis['api2'].stop()
         cluster.start_api('api2', DIRECT)
         with closing(gateway(cluster, 'api2')) as restored:
@@ -861,6 +919,7 @@ def queue_survival(binary, test_executable):
         assert recovered.get('no_quorum') is None
         assert recovered.query().count() == 2
         assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway returned the historical row and one mutation result.')
+        prepare_rolling_restart(cluster, owner, survivor)
         launch_retained(cluster, owner)
         same_run_ready(cluster, run, WORKERS, 3)
 
@@ -1063,6 +1122,7 @@ def simultaneous_admission(binary, test_executable):
             assert status == 409 and conflict['error']['outcome'] == 'not_applied', conflict
             release(owner, request)
             wait_reached([copy_target], request, 'before-terminal-copy')
+            cancel_receipt_observer(cluster, owner, request)
             observed = client.exchange(receipt_path(run, request))
             assert observed == (200, dict(request_id=request['request_id'], run_id=run,
                                           state='committing', result=None, error=None)), observed
@@ -1073,7 +1133,8 @@ def simultaneous_admission(binary, test_executable):
             assert table.get('one') == dict(id='one', value=8)
             assert table.get('wrong') is None
             assert table.query().count() == 1
-        assert (owner / f"attempts-{request['request_id']}").read_text().splitlines() == ['queued']
+        assert (owner / f"attempts-{request['request_id']}").read_text().splitlines() == [
+            'queued', 'observation-refused']
         decision = json.loads((owner / f"decision-{request['request_id']}.json").read_text())
         assert decision['txn'] == dict(request_id=request['request_id'], attempt=1), decision
         assert 'commit' in decision['decision'], decision
@@ -1113,6 +1174,20 @@ def simultaneous_admission(binary, test_executable):
         cluster.start_api('api1', DIRECT)
         reservation_reply_loss(cluster, owner, table)
         transient_receipt_observation(cluster, owner, table)
+
+
+def cancel_receipt_observer(cluster, owner, request):
+    request_id = request['request_id']
+    (owner / f'release-{request_id}').unlink()
+    gates(owner, [(request, 'observation-refused')])
+    (owner / f'lose-observation-{request_id}').touch()
+    try:
+        with closing(gateway(cluster, 'api2')) as observer:
+            observer.connection.request('GET', receipt_path(cluster.run_id, request),
+                                        headers=observer.headers)
+            wait_reached([owner], request, 'observation-refused')
+    finally:
+        release(owner, request)
 
 
 def reservation_reply_loss(cluster, owner, table):
@@ -1343,6 +1418,10 @@ def rf3_cold_recovery(binary, test_executable):
                 receipts.append(receipt)
                 cluster.workers['w1'].kill()
                 (seed_dir / f'cold-fence-{stage}.hold').unlink()
+                node = cluster.config['w1']['node']
+                install_enrollment(cluster, 'w1', renewed_enrollment(node))
+                node['control_enrollments'] = sorted(
+                    cluster.enrollments.values(), key=lambda record: record['worker_id'])
                 launch_retained(cluster, 'w1')
 
         profile = cluster.cold_start(keep_certificates=True, before_ready=interrupt)
@@ -1652,6 +1731,7 @@ def admission_acceptance(binary, test_executable):
             'q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes',
             'm01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop',
             'm02_queue_results_cpu_and_memory_share_one_ceiling',
+            'm02_m03_f03_two_buffered_requests_terminate_under_memory_pressure',
             'm03_o19_byte_arena_distinguishes_waiting_from_impossible_work',
             'm03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headroom',
             'm03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom',
