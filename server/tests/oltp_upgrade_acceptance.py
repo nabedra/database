@@ -3,7 +3,6 @@
 
 import argparse
 import copy
-from functools import partial
 import hashlib
 import json
 import os
@@ -100,20 +99,26 @@ def verify_rf3(cluster, groups):
         assert {(member['worker_id'], member['pool_id']) for member in placement['members']} == expected, placement
 
 
-def create_index(operator, table, name, column, covering):
+def create_index(url, token, table, name, column, covering):
     index_id, build_id = uid(), uid()
     definition = dict(table_id=table.id, index_id=index_id, name=name, columns=[column], covering=covering)
-    operator('storage.index.create', definition, build_id)
+    admin_request([url], token, 'storage.index.create', definition, build_id)
     selector = dict(table_id=table.id, index_id=index_id, build_id=build_id, attempt=1)
     deadline = time.monotonic() + 120
-    while True:
-        reply = operator('storage.index.status', selector)
-        if reply['state'] == 'ready':
-            assert reply['definition'] == definition, reply
-            return selector, definition
-        assert reply['state'] in ('building', 'pending', 'backfilling', 'validating'), reply
-        assert time.monotonic() < deadline, reply
+    while time.monotonic() < deadline:
+        status, reply = call(url, '/v1/cluster/operations', operation('storage.index.status', selector),
+                             token=token, timeout=10)
+        if status == 200:
+            if reply['data']['state'] == 'ready':
+                assert reply['data']['definition'] == definition, reply
+                return selector, definition
+            assert reply['data']['state'] == 'building', reply
+        else:
+            # A legacy status read can hit the Catalog intent during Ready publication.
+            assert status in (429, 503) and reply['error']['code'] in (
+                'storage_unavailable', 'outcome_unknown', 'overloaded'), reply
         time.sleep(0.5)
+    raise AssertionError(f'legacy index {name} did not become ready')
 
 
 def seed_legacy_indexes(binary, root):
@@ -125,13 +130,13 @@ def seed_legacy_indexes(binary, root):
     archive = root / 'legacy-seed-archive'
     with RuntimeServer(binary, local, cli=True) as server:
         token = json.loads((local / 'auth.json').read_text())['admin_token']
-        operator = partial(admin_request, [server.url], token)
         with Database(url=server.url, token=server.token, database=DATABASE) as db:
             ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
             locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
-            indexes = (create_index(operator, ledger, 'by_bucket', 'bucket', ['label']),
-                       create_index(operator, locations, 'by_region', 'region', ['score']))
-        manifest = operator('archive.create', dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
+            indexes = (create_index(server.url, token, ledger, 'by_bucket', 'bucket', ['label']),
+                       create_index(server.url, token, locations, 'by_region', 'region', ['score']))
+        manifest = admin_request([server.url], token, 'archive.create',
+                                 dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
     print('MIG1 legacy indexes created and archived', flush=True)
     return archive, manifest['scope'], indexes
 
@@ -288,8 +293,12 @@ def interrupt_restore(cluster):
 
 
 def volume_digest(root):
-    return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in root.rglob('*') if path.is_file()}
+    files = {}
+    for path in root.rglob('*'):
+        if path.is_file():
+            with path.open('rb') as stream:
+                files[str(path.relative_to(root))] = hashlib.file_digest(stream, 'sha256').hexdigest()
+    return files
 
 
 def ns22_old_volume_refusal(source, new_binary):
@@ -299,7 +308,10 @@ def ns22_old_volume_refusal(source, new_binary):
     pool = root / 'pool' / 'NABEDRA_OLTP_POOL.json'
     assert json.loads(pool.read_text())['pool_format_version'] == 1, pool
     before = volume_digest(root)
-    path = source.root / 'w1.json'
+    path = source.root / 'legacy-w1.json'
+    config = copy.deepcopy(config)
+    config['node'].pop('restore', None)
+    write_json(path, config, 0o600)
     new_config = copy.deepcopy(config)
     new_config['node']['mount']['identity']['pool_format_version'] = 2
     corrected = source.root / 'native-w1.json'
