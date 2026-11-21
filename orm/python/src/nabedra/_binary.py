@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-CLI_VERSION = '0.2.1'
+CLI_VERSION = '0.2.2'
 CONFIG_VERSION = 2
 PROTOCOL_VERSION = 1
 BINARY_FAILURE = (

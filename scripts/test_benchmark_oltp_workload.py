@@ -107,7 +107,7 @@ class SnapshotOracleTest(unittest.TestCase):
             ({'succeeded_rps': 1}, [{'key': 1, 'value': 2, 'status': 'succeeded'}]),
         ]
         args = SimpleNamespace(rates=parse_rates('1'), seconds=1, warmup_seconds=1, repetitions=1,
-                               clients=1, rows=2, seed=1, timeout=1)
+                               clients=1, rows=2, seed=1, timeout=1, snapshot_between_phases=True)
         with TemporaryDirectory() as directory, patch('benchmark_oltp_workload.measure', side_effect=timed_phases):
             output = Path(directory)
             result = run_workload(args, adapter, output, {})
@@ -117,6 +117,60 @@ class SnapshotOracleTest(unittest.TestCase):
         self.assertEqual(result['phases'][0]['unresolved_after_reconciliation'], 1)
         self.assertEqual(result['phases'][1]['snapshot']['mismatches'], 0)
         self.assertEqual(result['phases'][1]['snapshot']['prior_unresolved_values_observed'], 1)
+
+    def test_perf2e_snapshot_is_read_once_after_the_measured_phases(self):
+        adapter = Mock(spec=['seed', 'read', 'close'])
+        adapter.seed.return_value = None
+        adapter.read.side_effect = [{0: 0, 1: 0}, {0: 1, 1: 2}]
+        phases = [
+            ({'succeeded_rps': 0}, [{'key': 0, 'value': 1, 'status': 'unresolved'}]),
+            ({'succeeded_rps': 1}, [{'key': 1, 'value': 2, 'status': 'succeeded'}]),
+        ]
+        args = SimpleNamespace(rates=parse_rates('1'), seconds=1, warmup_seconds=1, repetitions=1,
+                               clients=1, rows=2, seed=1, timeout=1)
+        with TemporaryDirectory() as directory, patch('benchmark_oltp_workload.measure', side_effect=phases):
+            result = run_workload(args, adapter, Path(directory), {})
+        # The seed check, then one read after both phases: none between them.
+        self.assertEqual(adapter.read.call_count, 2)
+        self.assertEqual(result['verification']['phases'], 2)
+        self.assertEqual(result['phases'][0]['snapshot']['source'], 'expected state')
+        self.assertEqual(result['phases'][1]['snapshot']['source'], 'snapshot read')
+        self.assertEqual(result['phases'][1]['snapshot']['mismatches'], 0)
+        # The unresolved value from the first phase is observed in the final snapshot.
+        self.assertEqual(result['phases'][1]['snapshot']['prior_unresolved_values_observed'], 1)
+        self.assertEqual(result['verification']['final_snapshot'], result['phases'][1]['snapshot'])
+
+    def test_perf2e_deferred_check_still_fails_on_a_lost_acknowledged_write(self):
+        adapter = Mock(spec=['seed', 'read', 'close'])
+        adapter.seed.return_value = None
+        adapter.read.side_effect = [{0: 0, 1: 0}, {0: 0, 1: 2}]
+        phases = [
+            ({'succeeded_rps': 1}, [{'key': 0, 'value': 1, 'status': 'succeeded'}]),
+            ({'succeeded_rps': 1}, [{'key': 1, 'value': 2, 'status': 'succeeded'}]),
+        ]
+        args = SimpleNamespace(rates=parse_rates('1'), seconds=1, warmup_seconds=1, repetitions=1,
+                               clients=1, rows=2, seed=1, timeout=1)
+        with TemporaryDirectory() as directory, patch('benchmark_oltp_workload.measure', side_effect=phases):
+            with self.assertRaisesRegex(RuntimeError, 'snapshot verification failed'):
+                run_workload(args, adapter, Path(directory), {})
+            saved = json.loads((Path(directory) / 'results.json').read_text())
+        self.assertEqual(saved['phases'][1]['snapshot']['first_mismatches'], [{'key': 0, 'expected': 1, 'actual': 0}])
+
+    def test_perf2e_gets_are_checked_against_the_expected_state_of_earlier_phases(self):
+        adapter = Mock(spec=['seed', 'read', 'close'])
+        adapter.seed.return_value = None
+        adapter.read.side_effect = [{0: 0, 1: 0}, {0: 1, 1: 0}]
+        phases = [
+            ({'succeeded_rps': 1}, [{'key': 0, 'value': 1, 'status': 'succeeded'}]),
+            ({'succeeded_rps': 1}, [{'op': 'get', 'key': 0, 'value': 2, 'status': 'succeeded', 'read_value': 0}]),
+        ]
+        args = SimpleNamespace(rates=parse_rates('1'), seconds=1, warmup_seconds=1, repetitions=1,
+                               clients=1, rows=2, seed=1, timeout=1)
+        with TemporaryDirectory() as directory, patch('benchmark_oltp_workload.measure', side_effect=phases):
+            with self.assertRaisesRegex(RuntimeError, 'snapshot verification failed'):
+                run_workload(args, adapter, Path(directory), {})
+            saved = json.loads((Path(directory) / 'results.json').read_text())
+        self.assertEqual(saved['phases'][1]['snapshot']['first_read_mismatches'], [{'key': 0, 'expected': 1, 'actual': 0}])
 
     def test_unobserved_candidate_budget_is_bounded_by_the_dataset(self):
         rows = Rows({0: 0})

@@ -71,8 +71,9 @@ interface ExchangeOptions {
 
 const maxBody = 8 * 1024 * 1024
 const maxIdleSockets = 4
-// Below the server's 5 s HTTP/1.1 header read timeout, which also ends idle connections.
-const idleSocketMs = 2_000
+// Below the server's 30 s idle bound for kept-alive API connections. A connection the server
+// closed earlier (a full listener evicts its oldest idle connection) leaves the free pool on close.
+const idleSocketMs = 25_000
 const maxTimerMs = 2_147_483_647
 const mutations = new Set([
   "table.create", "table.drop", "table.insert", "table.insert_many", "table.update",

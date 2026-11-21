@@ -58,6 +58,9 @@ def add_workload_args(parser):
                         help='stop the sweep after a rate whose median successful p99 exceeds this')
     parser.add_argument('--stop-on-rejection', action='store_true',
                         help='stop the sweep after a rate with any explicit rejection')
+    parser.add_argument('--snapshot-between-phases', action='store_true',
+                        help='read the verification snapshot after every phase, between the measured '
+                             'phases (before PERF2e); by default one snapshot is read after the last phase')
 
 
 def _offered_updates(rate, seconds):
@@ -181,7 +184,13 @@ def measure(executor, args, adapter, rate, seconds, phase_seed, first_value):
     }, samples
 
 
-def verify(adapter, before, samples, pending_values):
+def verify(adapter, before, samples, pending_values, *, model=False):
+    """Check one phase against the state before it and return (report, state after it).
+
+    With `model`, the state after the phase is the expected one instead of a snapshot
+    read: every acknowledged write applied, every unresolved value still a candidate.
+    The next phase's gets are checked against it, and a later snapshot read checks it.
+    """
     required = dict(before)
     uncertain = {}
     carried = sum(len(values) for values in pending_values.values())
@@ -205,7 +214,7 @@ def verify(adapter, before, samples, pending_values):
     for key, value in uncertain.items():
         pending_values.setdefault(key, set()).add(value)
 
-    actual = adapter.read(range(len(before)))
+    actual = dict(required) if model else adapter.read(range(len(before)))
     differences = []
     prior_values_observed = []
     for key in sorted(set(required) | set(actual)):
@@ -230,7 +239,26 @@ def verify(adapter, before, samples, pending_values):
             'unobserved_unresolved_values_before_phase': carried,
             'unobserved_unresolved_values_after_snapshot': pending,
             'prior_unresolved_values_observed': len(prior_values_observed),
-            'first_prior_unresolved_values_observed': prior_values_observed[:10]}, actual
+            'first_prior_unresolved_values_observed': prior_values_observed[:10],
+            'source': 'expected state' if model else 'snapshot read'}, actual
+
+
+def verify_after_phases(adapter, before, phases, pending_values):
+    """Verify every phase after the sweep, outside the measured windows (PERF2e).
+
+    Each phase is checked against the expected state after the phases before it, and
+    one snapshot read after the last phase checks the final state. An acknowledged
+    write that a later acknowledged write overwrote is not observable in that read.
+    """
+    started_ns, started_wall, started_cpu = time.monotonic_ns(), wall_ns(), process_time()
+    for index, (phase, samples) in enumerate(phases):
+        phase['snapshot'], before = verify(adapter, before, samples, pending_values,
+                                           model=index < len(phases) - 1)
+    ended_ns = time.monotonic_ns()
+    return {'mode': 'one snapshot read after the last measured phase', 'phases': len(phases),
+            'start_unix_ns': started_wall, 'end_unix_ns': started_wall + (ended_ns - started_ns),
+            'seconds': (ended_ns - started_ns) / 1e9, 'driver_cpu_seconds': process_time() - started_cpu,
+            'final_snapshot': phases[-1][0]['snapshot']}
 
 
 def phase_stats(adapter):
@@ -250,7 +278,7 @@ def run_workload(args, adapter, output, metadata):
                           'clock': 'monotonic_ns'},
                'settings': {field: getattr(args, field, None) for field in ('rates', 'seconds', 'warmup_seconds',
                             'repetitions', 'clients', 'rows', 'seed', 'timeout', 'operation', 'read_fraction',
-                            'stop_p99_ms', 'stop_on_rejection')},
+                            'stop_p99_ms', 'stop_on_rejection', 'snapshot_between_phases')},
                'workload': {
                    'update': 'existing bigint primary-key updates to a bigint value',
                    'get': 'point gets of existing bigint primary keys',
@@ -265,6 +293,10 @@ def run_workload(args, adapter, output, metadata):
 
     next_value = 1
     pending_values = {}
+    # PERF2e: by default the snapshot check (a queued scan) runs once, after the last
+    # measured phase, so its work never overlaps or lingers into a measured phase.
+    between_phases = getattr(args, 'snapshot_between_phases', False)
+    deferred = []
     try:
         seed_details = adapter.seed(args.rows)
         if seed_details is not None:
@@ -300,12 +332,16 @@ def run_workload(args, adapter, output, metadata):
                         for sample in samples:
                             stream.write(json.dumps(sample, separators=(',', ':')) + '\n')
                     results['phases'].append(phase)
-                    phase['snapshot'], before = verify(adapter, before, samples, pending_values)
                     phase['protocol_failures'] = sum('protocol_error' in sample or 'unexpected_result' in sample
                                                      for sample in samples)
-                    save()
-                    if phase['snapshot']['mismatches']:
-                        raise RuntimeError(f'{label} snapshot verification failed: {phase["snapshot"]}')
+                    if between_phases:
+                        phase['snapshot'], before = verify(adapter, before, samples, pending_values)
+                        save()
+                        if phase['snapshot']['mismatches']:
+                            raise RuntimeError(f'{label} snapshot verification failed: {phase["snapshot"]}')
+                    else:
+                        deferred.append((phase, samples))
+                        save()
                 stop_p99 = getattr(args, 'stop_p99_ms', None)
                 if stop_p99 is None and not getattr(args, 'stop_on_rejection', False):
                     continue
@@ -318,6 +354,12 @@ def run_workload(args, adapter, output, metadata):
                     results['stopped_after_rate'] = rate
                     results['stop_reason'] = {'median_p99_ms': None if math.isinf(median_p99) else median_p99,
                                               'rejected': rejected}
+        if deferred:
+            results['verification'] = verify_after_phases(adapter, before, deferred, pending_values)
+            save()
+            for phase, _ in deferred:
+                if phase['snapshot']['mismatches']:
+                    raise RuntimeError(f'{phase["label"]} snapshot verification failed: {phase["snapshot"]}')
         results['correctness_verified'] = all(
             not phase['unresolved_after_reconciliation'] and not phase['protocol_failures']
             for phase in results['phases']
