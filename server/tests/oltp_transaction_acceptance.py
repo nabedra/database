@@ -194,6 +194,8 @@ def run_batch(facade, table, groups, items, category, pool, *, race=False):
         _, participants = facade.reached(request_id, 'participants')
     except TimeoutError as error:
         if race and batch_reply.done():
+            _, stats = facade.api('api1', '/v1/runtime/stats')
+            print(json.dumps({'direct_gateway': stats.get('direct_gateway'), 'batch': request_id}), flush=True)
             raise AssertionError(f'Cross-range request never reached Prepare: {batch_reply.result()}') from error
         raise
     actual = [part['group'] for part in participants]

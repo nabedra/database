@@ -698,6 +698,7 @@ impl DirectGateway {
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
         let mut refreshed_unknown_table = false;
+        let mut refreshed_unavailable_route = false;
         loop {
             if Instant::now() >= deadline {
                 return Err(deadline_error(*uncertain));
@@ -729,12 +730,23 @@ impl DirectGateway {
             let voters = match self.voters(&range, false).await {
                 Ok(voters) if !voters.is_empty() => voters,
                 _ => {
+                    if !refreshed_unavailable_route {
+                        refreshed_unavailable_route = true;
+                        self.refresh(&table, deadline).await;
+                    }
                     if !pause(deadline, &mut delay).await {
                         return Err(deadline_error(*uncertain));
                     }
                     continue;
                 }
             };
+            // A retired source may be unreachable or have no registered replicas.
+            // After trying its voters, consult Catalog even if no peer can redirect us.
+            if rotation >= voters.len() && !refreshed_unavailable_route {
+                refreshed_unavailable_route = true;
+                self.refresh(&table, deadline).await;
+                continue;
+            }
             let voter = range
                 .leader_hint()
                 .and_then(|node| voters.iter().find(|voter| voter.node_id == node))
