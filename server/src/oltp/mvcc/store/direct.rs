@@ -1164,3 +1164,8 @@ impl crate::oltp_replication::owned::OwnedPayload for DirectCommit {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn acceptance_indexed_direct_replay() {
+    tests::o11_crash_replay_of_a_direct_commit_entry_is_idempotent();
+}

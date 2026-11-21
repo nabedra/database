@@ -976,6 +976,13 @@ impl DirectExecutor {
         let fault = match applied.reply {
             ParticipantReply::Direct(DirectReply::Applied { .. }) => {
                 self.stats.applied();
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                    "direct-timestamp",
+                    request.request_id,
+                    &commit_ts,
+                )
+                .await;
                 // T9 process barrier (D02, D04): the entry has reached quorum and
                 // applied here; the reply has not left the leader yet.
                 #[cfg(test)]

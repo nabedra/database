@@ -398,6 +398,36 @@ pub(crate) async fn transaction_checkpoint(
     }
 }
 
+/// Private test-process observation of the local Timestamp service. A follower
+/// must pass the same lease/ReadIndex check as the owner of a cached window.
+pub(super) async fn timestamp_probe(
+    source: &dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+) -> Option<serde_json::Value> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    if !directory.join("probe-timestamp").is_file() {
+        return None;
+    }
+    let wall_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = tokio::time::timeout(Duration::from_secs(2), source.allocate_direct(4)).await;
+    Some(match result {
+        Ok(Ok(range)) => serde_json::json!({ "window": range, "wall_seconds": wall_seconds }),
+        other => serde_json::json!({
+            "window": null, "wall_seconds": wall_seconds, "error": format!("{other:?}"),
+        }),
+    })
+}
+
+pub(super) fn group_leader_probe() -> Option<Uuid> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::read_to_string(directory.join("probe-group-leader"))
+        .ok()?
+        .parse()
+        .ok()
+}
+
 pub(super) fn mark(name: &str, request: Uuid) {
     if let Some(Some(barrier)) = BARRIER.get() {
         if barrier.request == request {

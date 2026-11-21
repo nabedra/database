@@ -1189,3 +1189,38 @@ fn d01_perf2b_inline_digest_equals_the_native_digest() {
     let large = serde_json::json!({"blob": "x".repeat(INLINE_BYTES)});
     assert!(bounded_digest(&large, INLINE_BYTES).is_none());
 }
+
+pub(crate) fn acceptance_o11_storage() {
+    use crate::oltp_acceptance::clause;
+
+    d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log();
+    o11_purge_and_snapshot_never_pass_the_durable_applied_index();
+    kv_crash::o11_d09_ns10_raft_writes_survive_cuts_at_sampled_operations();
+    clause(
+        "O11",
+        "idempotent-apply",
+        "passed",
+        "FaultFs restarted production Raft after a lost applied suffix and sampled checkpoint and purge cuts. Every recovered command changed the counter once.",
+    );
+    crate::oltp_replication::manager::acceptance_overlapped_append();
+    clause(
+        "O11",
+        "optimization-durability",
+        "passed",
+        "FaultFs exercised deferred apply and durable snapshot/purge. RF3 PERF2d cuts retained a follower-quorum commit when the leader had not synced and dropped the uncommitted entry when no voter synced.",
+    );
+    crate::oltp::mvcc::store::direct::acceptance_indexed_direct_replay();
+    clause(
+        "O11",
+        "data-index-result-position",
+        "passed",
+        "Reopened the real pool at the same applied position and command digest. The base row, index entry, serialized result and dedup result matched the original entry.",
+    );
+    crate::oltp::pool::acceptance_damaged_checkpoints();
+    clause(
+        "O11",
+        "damaged-state-rejection",
+        "passed",
+        "Truncated checkpoint bytes, corrupt membership and a checksum-valid but inconsistent header were all rejected without activating an invalid cut.",
+    );
+}

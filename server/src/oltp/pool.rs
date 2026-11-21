@@ -17,6 +17,8 @@ mod storage;
 pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::acceptance_damaged_checkpoints;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,

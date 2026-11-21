@@ -1008,4 +1008,6 @@ fn execution_class(store: &GroupStore) -> ExecutionClass {
 pub(crate) mod direct_leadership;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::acceptance_o11_storage;
 pub(crate) mod transient;
