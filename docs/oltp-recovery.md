@@ -84,16 +84,27 @@ identity or an empty directory from discarding its vote and log history.
 
 A permanently lost primary volume on a registered system voter has no
 supported same-run replacement procedure. Keep the surviving quorum
-running. A blank mount cannot satisfy the retained restart proof. The worker
-drain procedure requires a live source and enough ready workers. Restoring
-a backup creates a new run and recovers data only through the archived cut.
+running. Keep the lost worker's bootstrap file and certificate out of use.
+A blank mount cannot satisfy the retained restart proof. Reusing the old
+bootstrap identity on a newly provisioned mount would discard that voter's
+vote and log history.
+
+Read `cluster.connection` on a surviving worker to check the run and ready
+worker count. Use `storage.replica.placement` to see the recorded placement.
+The placement can still list the lost voter, so its replica count alone
+cannot establish how many voters are available. Keep the survivors running
+while reconciling receipts in the original run. If a second failure prevents
+quorum, wait for a retained voter to return. A full backup restore creates
+a new run and recovers data through the archived cut.
 
 For a quarantined Data replica or refused secondary pool, check
 `quarantined_groups` under `storage` and `refused_pools` in
 `GET /v1/runtime/stats`. A registered worker that can still run reports the
 damage to Control. When a healthy eligible pool and a surviving quorum are
-available, Control installs and catches up a fresh learner, commits joint Raft
-membership and publishes the new voter. The old replica remains excluded.
+available, Control installs and catches up a fresh learner before promotion.
+It commits the change with both the old and new Raft majorities and publishes
+the stable voter set. A retry after interruption uses the same planned
+removed and replacement replicas.
 The scheduler leaves system-group repairs and unreadable primary pools for
 operator recovery. A quarantined replica stays offline if a second loss
 prevents quorum. Keep damaged storage until the replacement is committed.

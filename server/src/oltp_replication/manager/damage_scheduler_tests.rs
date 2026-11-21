@@ -1121,10 +1121,8 @@ async fn ns23_o06_o17_ns14b_g3_journal_value_damage_is_replaced_by_control() {
     .expect("NS14b G3 watchdog");
 }
 
-/// NS23 / O17: the Control leader stops in the middle of a replacement, after
-/// it claimed the group and hosted the fresh learner. The next Control leader
-/// resumes exactly that plan: same fresh identity and placement, no second
-/// claim, no extra member, and the replacement completes.
+/// NS23 / O17: the Control leader stops after the Data group enters joint
+/// consensus. The successor must finish the same plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ns23_o17_ns14b_control_leader_change_mid_replacement_resumes_the_same_plan() {
     timeout(Duration::from_secs(300), async {
@@ -1177,7 +1175,41 @@ async fn ns23_o17_ns14b_control_leader_change_mid_replacement_resumes_the_same_p
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(begun_by_old, 1);
 
-        // The Control leader stops mid-replacement.
+        // Stop at the same durable boundary as a lost reply after the joint
+        // entry. Append exactly that entry to keep the uniform step pending.
+        let data = cluster.data_host(cluster.data_leader().await).unwrap();
+        let old = data.observe_membership().await.unwrap();
+        let learner = data
+            .replicate_learner(old, plan.replacement.clone())
+            .await
+            .unwrap();
+        let next = plan.next_members();
+        let membership = super::super::entry::Membership::new(
+            vec![
+                plan.members.iter().map(|member| member.node_id).collect(),
+                next.iter().map(|member| member.node_id).collect(),
+            ],
+            plan.members
+                .iter()
+                .chain(&next)
+                .map(|member| (member.node_id, member.clone()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .unwrap();
+        data.raft
+            .append_membership(
+                membership,
+                super::super::entry::Payload::Blank,
+                [openraft::raft::Precondition::LastMembershipLogId {
+                    last_membership_log_id: Some(super::super::hosted::log_id(
+                        learner.caught_up_through(),
+                    )),
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(data.observe_stable_membership().await.is_err());
+        drop(data);
         cluster.stop(3).await;
         let record = cluster.replaced(Duration::from_secs(150)).await;
         let replacement = cluster.check_replaced(&record, acknowledged).await;

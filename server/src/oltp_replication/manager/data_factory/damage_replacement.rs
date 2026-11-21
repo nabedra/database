@@ -236,7 +236,12 @@ impl DamageReplacementEndpoint {
             .manager()
             .hosted_data(&plan.group, member.node_id)?;
         let replaced = running
-            .replace_damaged_voter(&plan.damaged, plan.replacement.clone())
+            .replace_damaged_voter(
+                &plan.members,
+                &plan.next_members(),
+                &plan.damaged,
+                plan.replacement.clone(),
+            )
             .await?;
         Ok(Answer::Replaced(replaced.proof))
     }
