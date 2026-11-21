@@ -917,13 +917,14 @@ impl<'a> Exec<'a> {
     /// Disarms, closes cleanly, reopens and checks the exact final state. Returns the
     /// filesystem of the closed store.
     pub fn finish(&mut self) -> Result<FaultFs, String> {
-        if self.armed.is_some() {
+        if let Some(kind) = self.armed.take() {
+            // Disarm first, then look. Background work (the segment preparer, a flush)
+            // can reach the armed operation between a check and the disarm; checking
+            // first missed that crash and failed the final close (seed 6 regression,
+            // PR #23 CI run 44914430280). `crash_after` never clears a crash.
+            self.fs.crash_after(u64::MAX);
             if self.fs.is_crashed() {
-                let kind = self.armed.unwrap();
                 self.cut(kind, "armed crash at the end")?;
-            } else {
-                self.fs.crash_after(u64::MAX);
-                self.armed = None;
             }
         }
         if self.fault.take().is_some() {
