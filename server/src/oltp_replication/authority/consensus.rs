@@ -74,6 +74,15 @@ pub(crate) trait Consensus<C: OwnedPayload, R>: Send + Sync {
     fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
         Box::pin(async move { Ok(self.ensure_linearizable_lease().await?.applied.index) })
     }
+    /// The lease barrier's applied position, taken from consensus memory
+    /// rather than a store read (RD1). Every effect of the entries up to it
+    /// is visible to the replica's in-memory state; a caller that reads the
+    /// store must use `ensure_linearizable_lease` or check the store's own
+    /// applied position. The Timestamp leader's `AllocateDirect` reads only
+    /// its in-memory window.
+    fn lease_read_position(&self) -> ConsensusFuture<'_, AppliedPosition> {
+        Box::pin(async move { Ok(self.ensure_linearizable_lease().await?.applied) })
+    }
     /// The node this replica last observed as leader, if any. A routing
     /// hint only, never an authority.
     fn current_leader(&self) -> Option<u64> {

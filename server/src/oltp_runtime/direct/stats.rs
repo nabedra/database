@@ -25,8 +25,12 @@ pub(crate) enum RetryCause {
     Unavailable,
     /// The group's fence moved; the next attempt reads the new authority.
     Authority,
+    /// RD1: the group's direct schema in the attempt's snapshot differs from
+    /// the one the table descriptor was looked up with. The mutation drops
+    /// its latches and looks the table up again from the group's epochs.
+    Schema,
 }
-const RETRY_CAUSES: usize = 5;
+const RETRY_CAUSES: usize = 6;
 
 /// Why a proposal (a `DirectCommit`, a forward marker, a group activation or
 /// an expiry page) produced no reply. Tells a slow election from a stuck
@@ -65,6 +69,9 @@ pub(crate) struct DirectStats {
     index_changes_proposed: AtomicU64,
     batch_buckets: [AtomicU64; BATCH_BUCKETS.len() + 1],
     read_only: AtomicU64,
+    /// RD1: mutations that read the group's epochs from the store before
+    /// latching (no epochs from an earlier snapshot of this group).
+    epoch_reads: AtomicU64,
     fallbacks: [AtomicU64; FallbackReason::ALL.len()],
     retries: [AtomicU64; RETRY_CAUSES],
     proposal_failures: [AtomicU64; PROPOSAL_FAILURES.len()],
@@ -123,6 +130,9 @@ impl DirectStats {
     }
     pub(crate) fn read_only(&self) {
         bump(&self.read_only);
+    }
+    pub(crate) fn epoch_read(&self) {
+        bump(&self.epoch_reads);
     }
     pub(crate) fn fallback(&self, reason: FallbackReason) {
         let index = FallbackReason::ALL
@@ -196,6 +206,7 @@ impl DirectStats {
             ("leadership", RetryCause::Leadership),
             ("unavailable", RetryCause::Unavailable),
             ("authority", RetryCause::Authority),
+            ("schema", RetryCause::Schema),
         ];
         let retries = causes
             .iter()
@@ -214,6 +225,7 @@ impl DirectStats {
             entries_applied: load(&self.applied),
             replayed: load(&self.replayed),
             read_only: load(&self.read_only),
+            pre_latch_epoch_reads: load(&self.epoch_reads),
             rows_proposed: load(&self.rows_proposed),
             index_changes_proposed: load(&self.index_changes_proposed),
             batch_sizes,
@@ -251,6 +263,8 @@ pub(crate) struct DirectStatsSnapshot {
     pub entries_applied: u64,
     pub replayed: u64,
     pub read_only: u64,
+    /// RD1: mutations that read the group's epochs before latching.
+    pub pre_latch_epoch_reads: u64,
     pub rows_proposed: u64,
     pub index_changes_proposed: u64,
     /// Rows per proposed entry.
