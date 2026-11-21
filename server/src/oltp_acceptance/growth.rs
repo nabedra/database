@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::Command};
+use std::{path::PathBuf, process::Command, time::Duration};
 
 pub(crate) async fn pause_routing_page(read_ts: u64) {
     let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
@@ -34,6 +34,22 @@ pub(crate) fn count_overflow_requested(read_ts: u64) -> bool {
     std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")
         .map(PathBuf::from)
         .is_some_and(|dir| dir.join(format!("count-overflow-{read_ts}")).is_file())
+}
+
+#[test]
+#[ignore = "registered worker process for the growth scenarios"]
+fn registered_worker_child() {
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+    let path = std::env::var_os("NABEDRA_OLTP_TEST_REGISTERED_CONFIG")
+        .expect("registered worker configuration path");
+    crate::oltp_runtime::standalone_network_runtime()
+        .unwrap()
+        .block_on(crate::oltp_runtime::registered_process::run(path.into()))
+        .unwrap();
 }
 
 fn run(scenario: &str) {

@@ -2,7 +2,7 @@
 """Registered RF3 shard, storage growth and metadata acceptance."""
 
 import argparse
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
@@ -19,7 +19,7 @@ import time
 from uuid import UUID
 
 from oltp_direct_acceptance import admin_owner, col, dump
-from oltp_direct_cluster import MIB, WORKERS, Rf3Cluster, call, operation, uid, write_json
+from oltp_direct_cluster import CHILD, MIB, WORKERS, Rf3Cluster, call, operation, uid, write_json
 from oltp_recovery_operations import (
     TRANSPORT_ERRORS, initial_range, restart_during_split, retained_config, success, two_ready, wait_for,
 )
@@ -64,18 +64,34 @@ def pending_clause(scenario, clause, reason):
 
 
 def split(cluster, source, boundary, split_id=None):
-    split_id = split_id or uid()
-    for _ in range(32):
-        result = admin_owner(cluster, 'storage.shard.split',
-                             dict(source=source, boundary=boundary, page_bytes=MIB), split_id)
-        if result['state'] == 'published':
-            children = result['children']
-            assert len(children) == 2 and children[0] != children[1], result
-            assert all(child['kind']['data']['table_id'] == source['kind']['data']['table_id']
-                       for child in children), result
-            return result
-        assert result['state'] == 'importing', result
-    raise AssertionError(f'split {split_id} never published: {result}')
+    request = operation('storage.shard.split', dict(source=source, boundary=boundary, page_bytes=MIB),
+                        split_id)
+    attempts = deque(maxlen=6)
+
+    def published():
+        for worker in cluster.live():
+            try:
+                status, reply = admin(cluster, worker, request, timeout=30)
+            except TRANSPORT_ERRORS as error:
+                attempts.append((worker, repr(error)))
+                continue
+            if status in (429, 503, 504):
+                attempts.append((worker, status, reply))
+                continue
+            result = success(status, reply)
+            assert result['state'] in ('importing', 'published'), result
+            return result if result['state'] == 'published' else None
+        return None
+
+    try:
+        result = wait_for(published, 'same-ID shard split publication', 150)
+    except AssertionError as error:
+        raise AssertionError(f"split {request['request_id']} did not publish: {list(attempts)}") from error
+    children = result['children']
+    assert len(children) == 2 and children[0] != children[1], result
+    assert all(child['kind']['data']['table_id'] == source['kind']['data']['table_id']
+               for child in children), result
+    return result
 
 
 def row(key, category=7, value=None):
@@ -184,7 +200,7 @@ def snapshot_recovery(facade):
         source = initial_range(cluster, table.id)
         victim = next(worker for worker in WORKERS if worker != owner)
         survivors = stop_worker(cluster, victim)
-        for key in range(1, 49):
+        for key in range(1, 81):
             request = operation('table.insert', dict(table_id=table.id, row=row(key)))
             assert test.data(request) is None
 
@@ -202,9 +218,10 @@ def snapshot_recovery(facade):
                          'native install staged on the lagging follower', 120)
         assert first['staged_generation'] == first['generation'] + 1, first
         assert first['applied']['index'] < first['incoming']['index'] and not activated.exists(), first
-        assert get(test, neighbor, 777) == row(777)
         cluster.workers[victim].kill()
         cluster.workers[victim].stop()
+        neighbor_get = operation('table.get', dict(table_id=neighbor.id, key=777))
+        assert read_after_transition(test, neighbor_get) == row(777)
         staged.unlink()
         control.write_text('observe')
         launch_retained(cluster, victim, config)
@@ -214,8 +231,8 @@ def snapshot_recovery(facade):
         assert restarted['generation'] == first['generation'] and restarted['applied'] == first['applied']
         assert second['generation'] == second['staged_generation'] == restarted['staged_generation']
         assert second['applied'] == second['incoming'] == restarted['incoming']
-        assert query(test, table) == [row(key) for key in range(49)]
-        assert get(test, neighbor, 777) == row(777)
+        assert read_after_transition(test, test.query(table)) == [row(key) for key in range(81)]
+        assert read_after_transition(test, operation('table.get', neighbor_get['payload'])) == row(777)
     except BaseException:
         dump(cluster)
         raise
@@ -628,10 +645,22 @@ def o21(facade):
     with ThreadPoolExecutor(max_workers=2) as executor:
         running = executor.submit(write_group, 500, 72_000)
         assert writing.wait(15)
-        assert get(facade, table, 0, api='api2') == dict(id=0, text=text, value=0)
+        probe = operation('table.get', dict(table_id=table.id, key=0))
+        assert read_after_transition(facade, probe) == dict(id=0, text=text, value=0)
         assert not running.done(), 'read ran after the load ended'
-        _, publication = wait_for(lambda: automatic_view(cluster, source, 'published'),
-                                  'automatic split publication', 240)
+
+        def split_during_load():
+            if running.done():
+                running.result()
+            return automatic_view(cluster, source, 'published')
+
+        try:
+            _, publication = wait_for(split_during_load, 'automatic split publication', 240)
+        except AssertionError:
+            print(json.dumps(dict(scenario='O21', split_views={
+                worker: cluster.admin('storage.shard.split.status', {}, worker)
+                for worker in cluster.live()})), flush=True)
+            raise
         running.result()
         attempt = publication['transition']['attempt']
         parts = [split_child(source, attempt, side) for side in ('left', 'right')]
@@ -927,6 +956,7 @@ def main():
             automatic=dict(shard_target_bytes=32 * MIB, minimum_free_bytes=64 * MIB)
             if args.scenario == 'O21' else None,
             test_executable=None if args.scenario == 'O21' else args.test_executable,
+            test_child='oltp_growth_acceptance::registered_worker_child' if paged else CHILD,
             direct=dict.fromkeys(WORKERS, direct), api_direct=(direct, direct))
         facade = Transactions(cluster, direct)
         try:
