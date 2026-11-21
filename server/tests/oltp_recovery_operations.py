@@ -1014,7 +1014,8 @@ def o17_a02_scale(binary, test_executable, root):
         permit = wait_for(stop_permit, 'mount closure and committed queue removal')
         assert permit['record']['intent'] == drain, permit
         closure = permit['record']['phase']['closed']
-        assert closure['mount']['expected'] == mount and closure['ready']['run_id'] == cluster.run_id
+        assert closure['mount']['expected'] == mount, closure
+        assert closure['ready']['ready_count'] == 3 and closure['ready']['view']['run_id'] == cluster.run_id, closure
         cluster.wait_workers()
         process.stop()
         for worker_name in WORKERS:

@@ -109,7 +109,8 @@ pathlib.Path('/pool/.nabedra-docker-volume.json').write_text(json.dumps(raw))
         record = permit['record']
         assert record['intent'] == drain and record['id'] == drain_id, permit
         closure = record['phase']['closed']
-        assert closure['mount']['expected'] == mount and closure['ready']['run_id'] == topology.run_id, permit
+        assert closure['mount']['expected'] == mount, permit
+        assert closure['ready']['ready_count'] == 3 and closure['ready']['view']['run_id'] == topology.run_id, permit
         before_stop = wait_for(lambda: ready(3), 'RF3 ready set before terminating data worker', 40)
         assert before_stop['replication_factor'] == 3 and before_stop['run_id'] == topology.run_id
         assert run('docker', 'inspect', '--format', '{{.Id}}', name).strip() == container_id
