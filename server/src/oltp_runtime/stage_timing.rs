@@ -96,13 +96,29 @@ impl Drop for Timer {
 /// text before its first `(`, `{` or space), e.g. one stage per RPC method.
 /// The set of variant names is finite, so their leaked names are bounded.
 pub(crate) fn variant(prefix: &'static str, value: &impl std::fmt::Debug) -> &'static Stage {
-    static NAMES: OnceLock<Mutex<Vec<(String, &'static Stage)>>> = OnceLock::new();
     let debug = format!("{value:?}");
     let end = debug
         .find(|c: char| c == '(' || c == '{' || c == ' ')
         .unwrap_or(debug.len())
         .min(48);
-    let name = format!("{prefix}{}", &debug[..end]);
+    named(prefix, &debug[..end])
+}
+
+/// The stage `prefix` + the variant name of a serde-encoded enum value: the
+/// first JSON string of `json` (`"current"` or `{"cold_pin":...}`).
+pub(crate) fn json_variant(prefix: &'static str, json: &[u8]) -> &'static Stage {
+    let text = std::str::from_utf8(&json[..json.len().min(64)]).unwrap_or("");
+    let name = text
+        .split('"')
+        .nth(1)
+        .filter(|name| name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .unwrap_or("other");
+    named(prefix, name)
+}
+
+fn named(prefix: &'static str, suffix: &str) -> &'static Stage {
+    static NAMES: OnceLock<Mutex<Vec<(String, &'static Stage)>>> = OnceLock::new();
+    let name = format!("{prefix}{suffix}");
     let mut names = NAMES
         .get_or_init(Mutex::default)
         .lock()

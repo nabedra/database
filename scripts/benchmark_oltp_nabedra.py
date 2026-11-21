@@ -1070,7 +1070,8 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             data = args.output / 'perf.data'
             # The workers run as root in their containers: perf needs root to attach.
             perf = ['perf'] if os.geteuid() == 0 else ['sudo', '-n', 'perf']
-            subprocess.run([*perf, 'record', '-F', str(args.perf_frequency), '--call-graph', 'dwarf,8192',
+            call_graph = 'dwarf,8192' if args.perf_call_graph == 'dwarf' else 'fp'
+            subprocess.run([*perf, 'record', '-F', str(args.perf_frequency), '--call-graph', call_graph,
                             '-p', ','.join(pids.values()), '-o', str(data), '--', 'sleep', str(args.perf_record)],
                            check=True, capture_output=True, timeout=args.perf_record + 300)
             with (args.output / 'perf-report.txt').open('w') as stream:
@@ -1234,6 +1235,8 @@ def main():
                         help='Linux host only: perf-sample the workers for this many seconds during the workload')
     parser.add_argument('--perf-delay', type=float, default=20, help='seconds after the driver starts before perf starts')
     parser.add_argument('--perf-frequency', type=int, default=249)
+    parser.add_argument('--perf-call-graph', choices=('dwarf', 'fp'), default='dwarf',
+                        help='perf unwinding: fp needs a binary built with frame pointers')
     parser.add_argument('--soak', action='store_true', help='run the storage soak instead of the rate sweep')
     parser.add_argument('--soak-rows', type=int, default=80_000)
     parser.add_argument('--soak-payload-bytes', type=int, default=2048)

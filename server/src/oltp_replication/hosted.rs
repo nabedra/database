@@ -779,6 +779,15 @@ where
         {
             let lease = matches!(policy, ReadPolicy::LeaseRead);
             let kind = self.state.store().identity().kind.clone();
+            crate::oltp_runtime::stage_timing::variant(
+                if lease {
+                    "raft.lease_read_by_kind."
+                } else {
+                    "raft.read_index_by_kind."
+                },
+                &kind,
+            )
+            .record(std::time::Duration::ZERO);
             let _timer = crate::oltp_runtime::stage_timing::by_kind(
                 &kind,
                 if lease {

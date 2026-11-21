@@ -1072,6 +1072,9 @@ fn parse(
     }
     crate::protocol::json_input(bytes, SERVICE_HEADER_BYTES).map_err(|_| invalid())?;
     let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    // PERF1: service calls this process serves, by method.
+    crate::oltp_runtime::stage_timing::variant("rpc.serve.", &header.method)
+        .record(std::time::Duration::ZERO);
     if header.to_node != node
         || session.purpose() != header.method.purpose()
         || (if header.method.input_limit() > 0 {

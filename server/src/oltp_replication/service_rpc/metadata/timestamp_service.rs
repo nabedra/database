@@ -1189,6 +1189,7 @@ impl Endpoint for TimestampEndpoint {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
+            let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.serve.total").timer();
             let head = self.parse(&session, bytes.as_slice())?;
             if let Method::TimestampPointDecisionRead { route, source_digest, locator_digest } = head.method {
                 let result = self.read_point_decision(
@@ -1348,12 +1349,19 @@ impl TimestampClient {
         // read barrier, whichever member the route names: reuse a recently
         // confirmed member list instead of reading Control per call (PERF1).
         if let Request::AllocateDirect { .. } = request {
+            use crate::oltp_runtime::stage_timing::{perf_stage, timed};
             let method = request.method();
-            let payload = encode(&self.client.shared, request).await?;
-            return self
-                .client
-                .repeat_reusing_routes_as(self.client.action, method, Some(payload))
-                .await;
+            let payload = timed(
+                perf_stage!("ts.rpc.encode"),
+                encode(&self.client.shared, request),
+            )
+            .await?;
+            return timed(
+                perf_stage!("ts.rpc.converge"),
+                self.client
+                    .repeat_reusing_routes_as(self.client.action, method, Some(payload)),
+            )
+            .await;
         }
         if matches!(
             request,
@@ -1638,7 +1646,12 @@ impl TimestampClient {
         if count == 0 || count > MAX_DIRECT_COUNT {
             return Err(invalid());
         }
-        let range: DirectTimestampRange = self.value(Request::AllocateDirect { count }).await?;
+        let response = self.response(Request::AllocateDirect { count }).await?;
+        let (range, _): (DirectTimestampRange, _) = crate::oltp_runtime::stage_timing::timed(
+            crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode"),
+            response.decoded(&self.client.shared),
+        )
+        .await?;
         range.expect_len(count)
     }
     pub(crate) async fn confirmed_allocation(

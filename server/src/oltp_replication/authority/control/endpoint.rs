@@ -1275,6 +1275,10 @@ impl ControlClient {
         let header = self
             .shared
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
+        // PERF1: Control reads this process issues, by request kind.
+        let _timer =
+            crate::oltp_runtime::stage_timing::json_variant("control.read.", header.as_slice())
+                .timer();
         let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
         let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });

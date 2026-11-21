@@ -675,46 +675,47 @@ jobs:
           path: ns18-bench.log
           retention-days: 14
 
-  # PERF1: CPU profile of the RF3 direct path. Opt-in with [ci perf] next to [ci bench]: runs the
-  # benchmark driver on this runner (same caps as NS11) with the bench job's release binary, records
-  # per-stage timings from /v1/runtime/stats and samples every worker with perf.
+  # PERF1: CPU profile of the RF3 direct path. Opt-in with [ci perf]: builds a release binary with
+  # frame pointers (for perf call graphs; the bench job's binary stays the comparison build), runs
+  # the benchmark driver on this runner with the NS11 caps, records per-stage timings from
+  # /v1/runtime/stats and samples every worker with perf at idle (serial pair) and at 50 updates/s.
   perf:
     name: direct path CPU profile and stage timings (PERF1)
-    if: contains(github.event.head_commit.message, '[ci perf]') && contains(github.event.head_commit.message, '[ci bench]')
-    needs: bench
+    if: contains(github.event.head_commit.message, '[ci perf]')
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - uses: actions/download-artifact@v4
-        with:
-          name: bench-binary
-          path: bench-bin
+      - name: Release nabedra-db with frame pointers (bookworm)
+        run: |
+          mkdir -p perf-bin
+          docker run --rm -v "$PWD:/w" -w /w/server -e CARGO_BUILD_JOBS=4 -e CARGO_TERM_COLOR=never \
+            -e RUSTFLAGS="-C force-frame-pointers=yes" "rust:${RUST_TOOLCHAIN}-bookworm" \
+            sh -ec 'cargo build --locked --release --no-default-features --features oltp --bin nabedra-db && cp target/release/nabedra-db /w/perf-bin/nabedra-db-fp'
+          sudo chown -R "$(id -u):$(id -g)" perf-bin server/target || true
+          ls -la perf-bin
       - name: Benchmark image and perf
         run: |
-          chmod +x bench-bin/nabedra-db-*
           printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
           sudo apt-get update -qq
           sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y -qq linux-tools-azure
           sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
           perf --version; nproc; free -m
-      - name: Serial pair with stage timings
+      - name: Serial pair with stage timings and an idle profile
         run: |
-          bin=$(ls "$PWD"/bench-bin/nabedra-db-*)
           cd scripts
-          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$bin" --direct-oltp on \
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/serial" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
-            --clients 1 --rows 2000 --seed 20261118 --timeout 10
-      - name: 20 updates/s with perf
+            --clients 1 --rows 2000 --seed 20261118 --timeout 10 --perf-record 30 --perf-delay 20 --perf-frequency 999 --perf-call-graph fp
+      - name: 50 updates/s with perf
         run: |
-          bin=$(ls "$PWD"/bench-bin/nabedra-db-*)
           cd scripts
-          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$bin" --direct-oltp on \
-            --output "$GITHUB_WORKSPACE/perf-out/rate20" --rates 20 --seconds 60 --warmup-seconds 5 --repetitions 1 \
-            --clients 32 --rows 2000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/rate50" --rates 50 --seconds 60 --warmup-seconds 5 --repetitions 1 \
+            --clients 32 --rows 5000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
       - if: always()
         uses: actions/upload-artifact@v4
