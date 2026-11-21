@@ -23,6 +23,7 @@ pub(crate) mod direct_client;
 mod handle;
 mod index_metadata;
 pub(crate) mod point_decision;
+mod retry_snapshot;
 mod scoped_admission;
 mod scoped_retirement;
 mod service;
@@ -117,6 +118,12 @@ pub(crate) enum TimestampCommand {
         view: AuthorityView,
         identity: PinIdentity,
         reservation: IdentityReservation,
+        pin_id: uuid::Uuid,
+    },
+    RetrySnapshot {
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: super::status::SealedSettlement,
         pin_id: uuid::Uuid,
     },
     BindSnapshotContext {
@@ -223,6 +230,7 @@ impl fmt::Display for TimestampCommand {
             Self::Fence { .. } => "timestamp.fence",
             Self::FenceReady { .. } => "timestamp.ready_fence",
             Self::BeginSnapshot { .. } => "timestamp.begin_snapshot",
+            Self::RetrySnapshot { .. } => "timestamp.retry_snapshot",
             Self::BindSnapshotContext { .. } => "timestamp.bind_snapshot_context",
             Self::ScopedSnapshot(command) => command.name(),
             Self::AllocateCommit { .. } => "timestamp.allocate_commit",
@@ -397,6 +405,8 @@ struct PinRecord {
     state: PinState,
     #[serde(default)]
     purpose: PinPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_pins: Option<retry_snapshot::Pins>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scoped_copy_proof: Option<ScopedCopyProof>,
 }
@@ -677,6 +687,12 @@ fn apply(
             reservation,
             pin_id,
         } => scoped_admission::begin(tx, state, *view, identity, reservation, *pin_id, None),
+        TimestampCommand::RetrySnapshot {
+            view,
+            identity,
+            previous,
+            pin_id,
+        } => retry_snapshot::begin(tx, state, *view, identity, previous, *pin_id),
         TimestampCommand::BindSnapshotContext {
             view,
             identity,
@@ -719,11 +735,14 @@ fn apply(
                 nonce = Some(uuid::Uuid::from_slice(value).map_err(|_| unknown())?);
                 Ok(())
             })?;
-            let Some(nonce) = nonce else {
+            let pin = if let Some(nonce) = nonce {
+                load::<PinRecord>(tx, &pin_key(nonce))?.ok_or_else(unknown)?
+            } else if let Some(pin) =
+                retry_snapshot::for_commit(tx, statement.txn, statement.read_ts)?
+            {
+                pin
+            } else {
                 return reject(tx, Fault::UnknownPin);
-            };
-            let Some(pin) = load::<PinRecord>(tx, &pin_key(nonce))? else {
-                return Err(unknown());
             };
             if pin.pin.read_ts != statement.read_ts
                 || pin.request != Some(statement.request)
@@ -807,6 +826,7 @@ fn apply(
                 }
                 PinState::Active => {
                     tx.delete(&active_key(pin.pin))?;
+                    retry_snapshot::release(tx, &mut pin)?;
                 }
                 PinState::ScopedReleased { .. }
                 | PinState::ScopeSuperseded { .. }
@@ -1282,6 +1302,7 @@ fn begin_metadata(
             state: PinState::Active,
             purpose,
             scoped_copy_proof: None,
+            retry_pins: None,
         },
     )?;
     tx.put(&active_key(pin), identity.nonce.as_bytes())?;

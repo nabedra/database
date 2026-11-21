@@ -1122,6 +1122,7 @@ fn verify_lookup_record(
             && reservation.kind == RequestKind::Mutation
             && decision.txn.request_id == reservation.request_id
             && decision.manifest.status_group_id == scope.group_id
+            && !decision.decision.retries_snapshot()
             && matches!(
                 (decision.decision, outcome),
                 (TxnDecision::Commit { .. }, MutationOutcome::Success(_))

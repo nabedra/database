@@ -14,6 +14,7 @@ mod migration;
 mod placement;
 mod pool_drain;
 mod query_statistics;
+mod queued_attempt;
 mod recovery;
 pub(super) mod retirement;
 #[cfg(test)]
@@ -29,7 +30,7 @@ use super::{
     bootstrap::LocalServices,
     http_runtime::{HttpRuntime, OwnedReceipt},
     replica::*,
-    transaction::TransactionCoordinator,
+    transaction::{RETRY_PROGRESS_TIMEOUT, TransactionCoordinator},
     worker_endpoint::AuthorityReader,
 };
 use crate::{
@@ -55,6 +56,7 @@ use crate::{
     response::{self, EncodedResponse},
     scheduling::{MemoryCharge, ResourceScheduler},
 };
+use queued_attempt::QueuedAttempt;
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1217,13 +1219,15 @@ impl WorkerRuntime {
                     id,
                     armed: true,
                 };
-                runtime.execute(id, captured_point).await.map_err(|error| {
-                    eprintln!(
-                        "nabedra-db: request {id} execution failed: {:?}: {}",
-                        error.code, error.message
-                    );
-                    error
-                })?;
+                runtime
+                    .execute(id, captured_point, None)
+                    .await
+                    .inspect_err(|error| {
+                        eprintln!(
+                            "nabedra-db: request {id} execution failed: {:?}: {}",
+                            error.code, error.message
+                        );
+                    })?;
                 settlement.armed = false;
                 Ok(())
             }) {
@@ -1328,6 +1332,7 @@ impl WorkerRuntime {
         &self,
         id: Uuid,
         captured_point: Option<CatalogCapture>,
+        resumed: Option<QueuedAttempt>,
     ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         super::recovery_tests::pause("queued", id).await;
@@ -1336,32 +1341,136 @@ impl WorkerRuntime {
         let read = input.context.read.as_ref().ok_or_else(unknown)?;
         let current = self.services.control.current(&self.services.scope).await?;
         let authority = current.ready.view.authority();
-        let pin = self
-            .services
-            .catalog
-            .snapshot(read.storage_pin.read_ts, authority)?;
-        #[cfg(test)]
-        super::recovery_tests::transaction_checkpoint("snapshot", id, &read.storage_pin.read_ts)
-            .await;
-        let point = captured_point
-            .as_ref()
-            .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));
-        let txn = TxnId {
-            request_id: id,
-            attempt: 1,
-        };
+        let mut attempt = resumed.unwrap_or_else(|| QueuedAttempt::original(id, read.storage_pin));
+        let initial_txn = attempt.txn;
         let mutation = input.request.operation.is_mutation();
-        let mut guards = BTreeMap::new();
+        let mut captured_point = captured_point;
+        let encoded = loop {
+            let txn = attempt.txn;
+            let pin = self
+                .services
+                .catalog
+                .snapshot(attempt.pin.read_ts, authority)?;
+            #[cfg(test)]
+            if txn.attempt == 1 {
+                super::recovery_tests::transaction_checkpoint("snapshot", id, &pin.read_ts).await;
+            }
+            // The pinned Running copy barrier has finished.
+            if txn == initial_txn
+                && let Ok(mut replica) = self.services.replica.lock()
+            {
+                replica.observe_dispatch(current, running);
+            }
+            let point = captured_point
+                .as_ref()
+                .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));
+            let mut guards = BTreeMap::new();
+            let planned = self
+                .plan_queued(&input, &pin, txn, request, point, &mut guards)
+                .await?;
+            drop(captured_point.take());
+            break match planned {
+                Ok(PlannedOperation::Read(bytes)) => {
+                    let shared = self.services.shared.clone();
+                    shared
+                        .execute(ExecutionClass::Query, 0, 0, move || {
+                            let raw: &serde_json::value::RawValue =
+                                serde_json::from_slice(bytes.as_ref()).map_err(|_| unknown())?;
+                            Ok(response::encode_success(id, raw, false))
+                        })
+                        .await?
+                }
+                Ok(PlannedOperation::Mutation(plan)) => {
+                    let decision = Box::pin(self.transactions.commit_queued(
+                        authority,
+                        txn,
+                        request,
+                        pin.read_ts,
+                        plan,
+                        self.direct_switch().map(Arc::as_ref),
+                    ))
+                    .await?;
+                    if decision.statement().decision.retries_snapshot() {
+                        attempt = self
+                            .advance_queued_attempt(current, &read.identity, &decision)
+                            .await?;
+                        continue;
+                    }
+                    match decision.outcome().ok_or_else(unknown)?.result() {
+                        Ok(value) => response::encode_success(id, &value, true),
+                        Err(error) => response::encode_error(Some(id), error),
+                    }
+                }
+                Err(PlanError::Protocol(error)) => {
+                    if mutation {
+                        let terminal = self
+                            .services
+                            .status
+                            .terminal_failure(authority, request, error.clone())
+                            .await?;
+                        #[cfg(test)]
+                        super::recovery_tests::transaction_checkpoint(
+                            "status-failure",
+                            id,
+                            &terminal,
+                        )
+                        .await;
+                        if !guards.is_empty() {
+                            let settled = self
+                                .services
+                                .status
+                                .failure_settled_proof(txn, request)
+                                .await?;
+                            for (_, guard) in guards {
+                                self.services
+                                    .catalog
+                                    .participant()
+                                    .release_lifecycle(authority, guard, settled.clone())
+                                    .await?;
+                            }
+                        }
+                        terminal_response(id, &terminal)?
+                    } else {
+                        response::encode_error(Some(id), error)
+                    }
+                }
+                Err(_) => return Err(unknown()),
+            };
+        };
+        self.services
+            .queue
+            .finish(id, encoded.status, encoded.body, now())
+            .await?;
+        self.changed.notify_waiters();
+        let statement = self
+            .services
+            .replica
+            .lock()
+            .map_err(|_| unknown())?
+            .terminal_statement(id)
+            .map_err(QueueError::protocol)?;
+        // A failed cleanup does not undo an acknowledged decision/result. Keep
+        // the complete record and retry through the bounded retirement loop.
+        let _ = self.services.timestamps.release(statement).await;
+        Ok(())
+    }
+    async fn plan_queued(
+        &self,
+        input: &DecodedInput,
+        pin: &crate::oltp::mvcc::catalog::PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        point: Option<&crate::oltp::mvcc::catalog::PointCatalog>,
+        guards: &mut BTreeMap<Uuid, crate::oltp::mvcc::store::lifecycle::VerifiedLifecycleGuard>,
+    ) -> Result<Result<PlannedOperation, PlanError>, ProtocolError> {
+        let mutation = input.request.operation.is_mutation();
+        let mut blocked_since = None;
         let mut split_retry: Option<(tokio::time::Instant, ProtocolError)> = None;
         let mut split_backoff = std::time::Duration::from_millis(50);
-        // The pinned Running copy barrier has finished and the backend is about to start.
-        if let Ok(mut replica) = self.services.replica.lock() {
-            replica.observe_dispatch(current, running);
-        }
         let planned = loop {
             let planning = self.planner.plan(
                 input.request.operation.clone(),
-                &pin,
+                pin,
                 txn,
                 request,
                 input.owner.clone(),
@@ -1400,7 +1509,7 @@ impl WorkerRuntime {
                 {
                     #[cfg(test)]
                     if split_retry.is_none() {
-                        super::recovery_tests::pause("split_read_pending", id).await;
+                        super::recovery_tests::pause("split_read_pending", txn.request_id).await;
                     }
                     // Each plan drops its native and query grants before waiting.
                     // Re-read Catalog at the original accepted timestamp.
@@ -1413,14 +1522,19 @@ impl WorkerRuntime {
                 }
                 PlanError::Blocked(intent) => {
                     #[cfg(test)]
-                    super::recovery_tests::transaction_checkpoint("blocked", id, &intent).await;
+                    super::recovery_tests::transaction_checkpoint(
+                        "blocked",
+                        txn.request_id,
+                        &intent,
+                    )
+                    .await;
                     self.help_intent(intent).await?;
                 }
                 PlanError::LifecyclePending(binding) => {
                     #[cfg(test)]
                     super::recovery_tests::transaction_checkpoint(
                         "lifecycle-blocked",
-                        id,
+                        txn.request_id,
                         &binding,
                     )
                     .await;
@@ -1436,77 +1550,17 @@ impl WorkerRuntime {
                 }
                 other => break Err(other),
             }
+            if txn.attempt > 1
+                && blocked_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= RETRY_PROGRESS_TIMEOUT
+            {
+                return Err(unknown());
+            }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         };
-        drop(captured_point);
-        let encoded = match planned {
-            Ok(PlannedOperation::Read(bytes)) => {
-                let shared = self.services.shared.clone();
-                shared
-                    .execute(ExecutionClass::Query, 0, 0, move || {
-                        let raw: &serde_json::value::RawValue =
-                            serde_json::from_slice(bytes.as_ref()).map_err(|_| unknown())?;
-                        Ok(response::encode_success(id, raw, false))
-                    })
-                    .await?
-            }
-            Ok(PlannedOperation::Mutation(plan)) => {
-                let decision = self
-                    .transactions
-                    .commit(authority, txn, request, read.storage_pin.read_ts, plan)
-                    .await?;
-                match decision.outcome().ok_or_else(unknown)?.result() {
-                    Ok(value) => response::encode_success(id, &value, true),
-                    Err(error) => response::encode_error(Some(id), error),
-                }
-            }
-            Err(PlanError::Protocol(error)) => {
-                if mutation {
-                    let terminal = self
-                        .services
-                        .status
-                        .terminal_failure(authority, request, error.clone())
-                        .await?;
-                    #[cfg(test)]
-                    super::recovery_tests::transaction_checkpoint("status-failure", id, &terminal)
-                        .await;
-                    if !guards.is_empty() {
-                        let settled = self
-                            .services
-                            .status
-                            .failure_settled_proof(txn, request)
-                            .await?;
-                        for (_, guard) in guards {
-                            self.services
-                                .catalog
-                                .participant()
-                                .release_lifecycle(authority, guard, settled.clone())
-                                .await?;
-                        }
-                    }
-                    terminal_response(id, &terminal)?
-                } else {
-                    response::encode_error(Some(id), error)
-                }
-            }
-            Err(_) => return Err(unknown()),
-        };
-        self.services
-            .queue
-            .finish(id, encoded.status, encoded.body, now())
-            .await?;
-        self.changed.notify_waiters();
-        let statement = self
-            .services
-            .replica
-            .lock()
-            .map_err(|_| unknown())?
-            .terminal_statement(id)
-            .map_err(QueueError::protocol)?;
-        // A failed cleanup does not undo an acknowledged decision/result. Keep
-        // the complete record and retry through the bounded retirement loop.
-        let _ = self.services.timestamps.release(statement).await;
-        Ok(())
+        Ok(planned)
     }
     async fn help_intent(&self, intent: IntentRef) -> Result<(), ProtocolError> {
         let authority = self

@@ -223,8 +223,8 @@ pub(super) fn apply(
         if identity.terminal.is_some() {
             return reject(tx, StatusFault::AlreadyDecided);
         }
-        let txn_key = txn_key(b't', *txn, &[]);
-        if let Some(old) = load::<Transaction>(tx, &txn_key)? {
+        let record_key = txn_key(b't', *txn, &[]);
+        if let Some(old) = load::<Transaction>(tx, &record_key)? {
             if old.request != *request
                 || old.read_ts != *read_ts
                 || old.expected != *participant_count
@@ -239,6 +239,24 @@ pub(super) fn apply(
         // a second manifest after an ambiguous RPC.
         if identity.reservation.scoped.is_some() && (*participant_count > 1 || txn.attempt != 1) {
             return reject(tx, StatusFault::InvalidBinding);
+        }
+        if txn.attempt > 1 {
+            if txn.attempt > MAX_QUEUED_MUTATION_ATTEMPTS {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
+            let prior = TxnId {
+                request_id: txn.request_id,
+                attempt: txn.attempt - 1,
+            };
+            let Some(previous) = load::<Transaction>(tx, &txn_key(b't', prior, &[]))? else {
+                return reject(tx, StatusFault::Incomplete);
+            };
+            if previous.txn != prior
+                || !settled_retry(&previous, *request)
+                || *read_ts <= previous.read_ts
+            {
+                return reject(tx, StatusFault::InvalidBinding);
+            }
         }
         let initial = super::super::metadata_digest(
             b"nabedra/status-manifest/v1\0",
@@ -272,7 +290,7 @@ pub(super) fn apply(
             outcome: outcome.clone(),
             decode_owner: None,
         };
-        put(tx, &txn_key, &state)?;
+        put(tx, &record_key, &state)?;
         return commit(tx, StatusReply::Manifest(state.draft()));
     }
     if let StatusCommand::TerminalFailure {
@@ -310,21 +328,39 @@ pub(super) fn apply(
                 StatusReply::Identity(IdentityLookup::Terminal(terminal.clone())),
             );
         }
-        let mut has_txn = false;
-        let prefix = txn_key(
-            b't',
-            TxnId {
-                request_id: request.request_id,
-                attempt: 0,
+        // Planning may fail on the fresh snapshot, for example if another
+        // request inserted the key. All earlier attempts must be closed.
+        let mut attempts = 0;
+        let mut closed = true;
+        let progress = tx.scan_page(
+            &transaction_prefix(request.request_id),
+            None,
+            MAX_QUEUED_MUTATION_ATTEMPTS as usize,
+            |key, raw| {
+                attempts += 1;
+                #[derive(Deserialize)]
+                struct Prior {
+                    txn: TxnId,
+                    request: RequestBinding,
+                    resolved: u64,
+                    expected: u64,
+                    settled_at: Option<AppliedPosition>,
+                    decision: Option<DecisionStatement>,
+                }
+                let prior: Prior = serde_json::from_slice(raw).map_err(|_| unknown())?;
+                closed &= prior.txn.attempt == attempts
+                    && key == txn_key(b't', prior.txn, &[])
+                    && prior.request == *request
+                    && prior.resolved == prior.expected
+                    && prior.settled_at.is_some()
+                    && prior
+                        .decision
+                        .as_ref()
+                        .is_some_and(|d| d.decision.retries_snapshot());
+                Ok(())
             },
-            &[],
-        );
-        let prefix = &prefix[..prefix.len() - 8];
-        tx.scan_page(prefix, None, 1, |_, _| {
-            has_txn = true;
-            Ok(())
-        })?;
-        if has_txn {
+        )?;
+        if !closed || !progress.exhausted || attempts >= MAX_QUEUED_MUTATION_ATTEMPTS {
             return reject(tx, StatusFault::AlreadyDecided);
         }
         let terminal = TerminalIdentity::Failed {
@@ -565,8 +601,24 @@ pub(super) fn apply(
                 decided_at: position,
                 decision: TxnDecision::Abort { reason: *reason },
             };
-            state.outcome = outcome.clone();
-            decide(tx, &record_key, &mut state, decision.clone())?;
+            if *reason == AbortReason::RetrySnapshot {
+                let identity: IdentityRecord =
+                    load(tx, &key(IDENTITIES, txn.request_id))?.ok_or_else(unknown)?;
+                if identity.reservation.scoped.is_some()
+                    || identity.terminal.is_some()
+                    || state.created_authority != current
+                    || txn.attempt >= MAX_QUEUED_MUTATION_ATTEMPTS
+                    || !outcome.is_not_applied()
+                {
+                    return reject(tx, StatusFault::InvalidBinding);
+                }
+                state.outcome = outcome.clone();
+                state.decision = Some(decision.clone());
+                put(tx, &record_key, &state)?;
+            } else {
+                state.outcome = outcome.clone();
+                decide(tx, &record_key, &mut state, decision.clone())?;
+            }
             commit(tx, StatusReply::Decided(decision))
         }
         StatusCommand::RecordResolved { evidence, .. } => {
@@ -606,6 +658,16 @@ pub(super) fn apply(
         _ => Err(invalid()),
     }
 }
+fn settled_retry(state: &Transaction, request: RequestBinding) -> bool {
+    state.request == request
+        && state.resolved == state.expected
+        && state.settled_at.is_some()
+        && state
+            .decision
+            .as_ref()
+            .is_some_and(|d| d.decision.retries_snapshot())
+}
+
 fn decide(
     tx: &mut GroupTransaction<'_>,
     record_key: &[u8],
@@ -1172,7 +1234,7 @@ impl StatusHandle {
                 else {
                     return Err(invalid());
                 };
-                if original != request {
+                if original != request || view.get(&txn_key(b't', txn, &[]))?.is_some() {
                     return Err(invalid());
                 }
                 let digest = super::super::metadata_digest(

@@ -24,7 +24,7 @@ use crate::{
     oltp_replication::{
         authority::control::{
             ControlClient, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectCapability,
-            DirectCapabilityOperation,
+            DirectCapabilityOperation, QUEUED_SNAPSHOT_RETRY_FEATURE,
         },
         types::WorkerIdentity,
     },
@@ -60,6 +60,7 @@ pub(crate) struct DirectSwitch {
     active: AtomicBool,
     /// GC2: Control enabled `data.direct.batch` (as last observed; sticky).
     batch: AtomicBool,
+    snapshot_retry: AtomicBool,
     /// End (Unix ms) of the queued-history window, 0 without one (T7c).
     history_until: AtomicU64,
     /// Control recorded this owner's pre-activation queued history (T7c).
@@ -96,6 +97,7 @@ impl DirectSwitch {
             direct_oltp,
             active: AtomicBool::new(false),
             batch: AtomicBool::new(false),
+            snapshot_retry: AtomicBool::new(false),
             history_until: AtomicU64::new(0),
             history_noted: AtomicBool::new(false),
             #[cfg(test)]
@@ -117,6 +119,17 @@ impl DirectSwitch {
     pub(crate) fn is_batch_enabled(&self) -> bool {
         self.batch.load(Ordering::Acquire)
     }
+    pub(crate) async fn queued_snapshot_retry_enabled(&self) -> bool {
+        if self.snapshot_retry.load(Ordering::Acquire) {
+            return true;
+        }
+        let enabled = self.control.queued_snapshot_retry_enabled().await == Ok(true);
+        if enabled {
+            self.snapshot_retry.store(true, Ordering::Release);
+        }
+        enabled
+    }
+
     /// The `direct_oltp` configuration of this process.
     pub(crate) fn direct_oltp(&self) -> bool {
         self.direct_oltp
@@ -266,10 +279,9 @@ impl DirectSwitch {
         true
     }
 
-    /// Advertises this worker's support, then watches for activation and for
-    /// the `data.direct.batch` enablement (GC2). The task ends once both are
-    /// observed or `stop` is called. Errors (an older Control, a leader
-    /// change) are retried every `POLL`.
+    /// Advertises this worker's support and watches until Control enables
+    /// direct commits, direct batching and queued snapshot retries.
+    /// An older Control or a leader change may require another poll.
     pub(crate) fn start(self: &Arc<Self>) {
         let switch = Arc::downgrade(self);
         let mut stop = self.stop.subscribe();
@@ -291,8 +303,18 @@ impl DirectSwitch {
                     return;
                 };
                 let reevaluate = polls % reevaluate_every == reevaluate_every - 1;
+                let snapshot_retry = switch.queued_snapshot_retry_enabled().await;
+                if !snapshot_retry {
+                    switch
+                        .control
+                        .advertise_direct_feature(QUEUED_SNAPSHOT_RETRY_FEATURE, switch.local)
+                        .await;
+                }
                 if switch.is_direct_active() {
-                    if switch.watch_batch(reevaluate).await {
+                    if !snapshot_retry && reevaluate {
+                        let _ = switch.change(DirectCapabilityOperation::Activate).await;
+                    }
+                    if switch.watch_batch(reevaluate).await && snapshot_retry {
                         return;
                     }
                 } else {
@@ -319,7 +341,10 @@ impl DirectSwitch {
                         // An advert that reached Control before this worker
                         // was ready could not enable the feature: ask for a
                         // re-evaluation right away.
-                        if switch.observe(capability) && switch.watch_batch(true).await {
+                        if switch.observe(capability)
+                            && switch.watch_batch(true).await
+                            && snapshot_retry
+                        {
                             return;
                         }
                     }

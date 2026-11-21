@@ -99,6 +99,7 @@ enum ReadRequest {
     /// older Control leader rejects the unknown request; callers treat that
     /// as "not enabled".
     DirectFeatures,
+    QueuedSnapshotRetryEnabled,
     ScopedQueueTransition {
         group_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -187,6 +188,7 @@ impl ReadRequest {
                 | Self::ScopedQueueCapability
                 | Self::DirectCapability
                 | Self::DirectFeatures
+                | Self::QueuedSnapshotRetryEnabled
                 | Self::ScopedQueueTransition { .. }
                 | Self::ScopedQueuePredecessor { .. }
                 | Self::ScopedQueueEpochRetired { .. }
@@ -445,6 +447,11 @@ impl ControlEndpoint {
                     let state = self.handle.direct_capability(session.remote()).await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::QueuedSnapshotRetryEnabled => {
+                    let enabled = self.handle.queued_snapshot_retry_enabled().await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &enabled, HEADER_LIMIT)?
                 }
                 ReadRequest::DirectFeatures => {
                     let state = self.handle.direct_features(session.remote()).await?;
@@ -768,6 +775,11 @@ impl ControlClient {
     pub(crate) async fn direct_features(&self) -> Result<super::DirectFeatures, ProtocolError> {
         let reply = self.read(&ReadRequest::DirectFeatures).await?;
         Ok(*reply.decode_section::<super::DirectFeatures>(0)?)
+    }
+
+    pub(crate) async fn queued_snapshot_retry_enabled(&self) -> Result<bool, ProtocolError> {
+        let reply = self.read(&ReadRequest::QueuedSnapshotRetryEnabled).await?;
+        Ok(*reply.decode_section::<bool>(0)?)
     }
 
     /// GC2: advertises `feature` for `local`, this caller's enrolled

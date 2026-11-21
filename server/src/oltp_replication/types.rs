@@ -365,6 +365,8 @@ pub struct TxnId {
     pub attempt: u64,
 }
 
+pub(crate) const MAX_QUEUED_MUTATION_ATTEMPTS: u64 = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Timestamp(std::num::NonZeroU64);
@@ -550,6 +552,8 @@ pub struct PreparedParticipant {
 #[serde(rename_all = "snake_case")]
 pub enum AbortReason {
     Conflict,
+    /// The attempt is aborted and resolved before the logical request retries.
+    RetrySnapshot,
     Validation,
     ResourceLimit,
     AbandonedByFence,
@@ -559,6 +563,13 @@ pub enum AbortReason {
 pub enum TxnDecision {
     Commit { commit_ts: CommitTs },
     Abort { reason: AbortReason },
+}
+impl TxnDecision {
+    pub(crate) fn retries_snapshot(self) -> bool {
+        self == Self::Abort {
+            reason: AbortReason::RetrySnapshot,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

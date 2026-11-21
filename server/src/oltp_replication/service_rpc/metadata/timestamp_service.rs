@@ -68,6 +68,11 @@ enum Request {
         identity: PinIdentity,
         reservation: IdentityReservation,
     },
+    RetrySnapshot {
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: crate::oltp_replication::authority::status::SealedSettlement,
+    },
     Bind {
         view: AuthorityView,
         identity: PinIdentity,
@@ -259,6 +264,7 @@ impl Request {
             Self::CloseBackup { .. } => 16,
             Self::AllocateDirect { .. } => 41,
             Self::AdvanceFloor { .. } => 42,
+            Self::RetrySnapshot { .. } => 43,
         };
         Method::TimestampCall {
             operation,
@@ -754,6 +760,27 @@ impl TimestampEndpoint {
                     self.handle
                         .begin_snapshot(view, identity, reservation)
                         .await?,
+                )
+                .await
+            }
+            Request::RetrySnapshot {
+                view,
+                identity,
+                previous,
+            } => {
+                let statement = previous.statement();
+                let group = self.status.manifest(statement.txn, statement.manifest)?;
+                let actual = self
+                    .status_client(group)
+                    .await?
+                    .settled_proof(statement.txn, statement.manifest)
+                    .await?;
+                if actual.statement() != statement {
+                    return Err(invalid());
+                }
+                encode(
+                    shared,
+                    self.handle.retry_snapshot(view, identity, actual).await?,
                 )
                 .await
             }
@@ -1420,6 +1447,7 @@ impl TimestampClient {
             request,
             Request::Current
                 | Request::Begin { .. }
+                | Request::RetrySnapshot { .. }
                 | Request::Bind { .. }
                 | Request::Allocate { .. }
                 | Request::Allocation { .. }
@@ -2317,6 +2345,21 @@ impl TimestampService for TimestampClient {
         Box::pin(
             async move { TimestampClient::begin_snapshot(self, view, identity, reservation).await },
         )
+    }
+    fn retry_snapshot<'a>(
+        &'a self,
+        view: AuthorityView,
+        identity: PinIdentity,
+        previous: crate::oltp_replication::authority::status::VerifiedSettlement,
+    ) -> ConsensusFuture<'a, StoragePin> {
+        Box::pin(async move {
+            self.value(Request::RetrySnapshot {
+                view,
+                identity,
+                previous: previous.into_sealed(),
+            })
+            .await
+        })
     }
     fn bind_snapshot_context<'a>(
         &'a self,
