@@ -36,14 +36,14 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 #[derive(Clone)]
 pub(crate) struct ControlMachine {
     store: GroupStore,
-    replacement_directory: Option<std::sync::Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    replacement_trust: Option<system_trust::ReplacementTrust>,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self { store, replacement_directory: None })
+        Ok(Self { store, replacement_trust: None })
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -58,27 +58,48 @@ impl ControlMachine {
         let position = meta.position;
         let digest = meta.command_digest;
         let payload = command.payload()?;
-        let refresh = matches!(payload,
+        let refresh = matches!(
+            payload,
             ControlCommand::SystemRecovery { .. }
-            | ControlCommand::Enroll { .. }
-            | ControlCommand::CompleteRestart { .. }
+                | ControlCommand::Enroll { .. }
+                | ControlCommand::CompleteRestart { .. }
+                | ControlCommand::PublishFence { .. }
         );
-        if let ControlCommand::SystemRecovery { command, .. } = payload
-            && matches!(command.as_ref(), super::SystemRecoveryCommand::Mount { .. })
-            && let Some(directory) = &self.replacement_directory
-        {
-            directory.replace_revocation_view(true);
-        }
+        let mount = match payload {
+            ControlCommand::SystemRecovery { command, .. } => match command.as_ref() {
+                super::SystemRecoveryCommand::Mount { proof, .. } => Some(proof.id),
+                _ => None,
+            },
+            _ => None,
+        };
+        let directory = self.replacement_trust.as_ref().map(|trust| trust.directory.as_ref());
+        let reload = directory.filter(|_| mount.is_some()).map(|directory| directory.reloading_revocations());
+        let revoked = reload.as_ref().map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
+        let revoke = revoked.clone();
         let result = self.store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
                 }
-                apply(tx, &scope, position, digest, command.payload()?)
+                let transition = apply(tx, &scope, position, digest, command.payload()?)?;
+                if let (Some(id), Some(revoke)) = (mount, revoke)
+                    && let Transition::Commit(reply) = &transition
+                    && decode::<ControlReply>(reply.as_ref())? == ControlReply::SystemReplacementMounted
+                    && let Some(record) = load::<super::ReplacementRecord>(tx, &system_recovery::by_id(id))?
+                {
+                    let _ = revoke.set(record.intent.previous);
+                }
+                Ok(transition)
             })
             .await?;
-        if refresh && let Some(directory) = &self.replacement_directory {
-            self.refresh_replacement_trust(directory).await?;
+        if let Some(directory) = directory
+            && let Some(worker) = revoked.as_ref().and_then(|change| change.get())
+        {
+            directory.record_revocation(*worker);
+        }
+        drop(reload);
+        if refresh {
+            self.refresh_or_retry().await;
         }
         Ok(result)
     }
@@ -1056,6 +1077,7 @@ fn apply_initialized(
             state.ready = pending.next;
             state.owner = pending.next_owner;
             if pending.cold {
+                system_recovery::retire_on_cold_fence(tx)?;
                 // A cold fence begun by an earlier binary can still publish.
                 save(tx, &key(RUNS, pending.expected.view.run_id), &true)?;
                 save(tx, &key(RUNS, pending.next.view.run_id), &true)?;
@@ -1647,15 +1669,14 @@ fn unknown() -> ProtocolError {
 impl crate::oltp_replication::hosted::TypedMachine<super::super::config::ControlConfig>
     for ControlMachine
 {
-    fn installing_snapshot(&self) {
-        if let Some(directory) = &self.replacement_directory {
-            directory.replace_revocation_view(true);
-        }
+    fn installing_snapshot(&self) -> impl Send {
+        self.replacement_trust.as_ref().map(|trust| trust.directory.reloading_revocations())
     }
     async fn snapshot_installed(&self) -> Result<(), ProtocolError> {
-        if let Some(directory) = &self.replacement_directory {
-            self.refresh_replacement_trust(directory).await?;
+        if let Some(trust) = &self.replacement_trust {
+            trust.directory.require_revocation_snapshot();
         }
+        self.refresh_or_retry().await;
         Ok(())
     }
     fn store(&self) -> &GroupStore {

@@ -176,6 +176,7 @@ impl ReadRequest {
             Self::Current
                 | Self::ColdPin { .. }
                 | Self::GroupInventoryRevision
+                | Self::WorkerExcluded { .. }
                 | Self::Groups { .. }
                 | Self::Group { .. }
                 | Self::GroupMembers { .. }
@@ -1288,7 +1289,9 @@ impl ControlClient {
             crate::oltp_runtime::stage_timing::json_variant("control.read.", header.as_slice())
                 .timer();
         let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
-        let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
+        let role_dependency = placement_role || matches!(request,
+            ReadRequest::ServiceRole { .. } | ReadRequest::WorkerExcluded { .. }
+        );
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
         let deadline = request
             .supports_bounded_failover()

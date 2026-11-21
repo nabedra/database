@@ -1521,6 +1521,9 @@ async fn run_stream(
         if common.directory.revoked(session.remote()) {
             return Err(super::revoked_peer());
         }
+        if let Some(check) = common.directory.check_inbound(session.remote()) {
+            check.await?;
+        }
         let reply = endpoint.handle(session, header, sections).await?;
         validate_reply(&common.config, class, &reply)?;
         Ok((reply, handler))

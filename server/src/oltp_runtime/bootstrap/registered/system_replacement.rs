@@ -18,7 +18,7 @@ pub(super) async fn join(
     // RegisteredWorker validates the configured expectation against the
     // mounted directory and holds both locks through the peer exchange.
     let proof = ReplacementMountProof::sign(control.identity(), record, &record.intent.mount, key)?;
-    let mut mount_committed = false;
+    let mut mount_committed = worker.replacement_mount_committed;
     loop {
         let mut mounted = false;
         if let Some((applied, accepted, complete)) =
@@ -71,14 +71,18 @@ pub(super) async fn join(
                         mount_committed = true;
                         break;
                     }
-                    Err(error)
-                        if matches!(
-                            error.code,
-                            ErrorCode::Conflict | ErrorCode::UnsupportedOperation
-                        ) =>
-                    {
+                    Err(error) if error.code == ErrorCode::Conflict => {
+                        // A first mount may have committed while its response was lost.
+                        // This process still owns the exact directory it opened.
+                        if worker.manager.check_replacement_mount(
+                            control.identity(), WorkerIdentity::from(enrollment), &proof, true,
+                        ).await.is_ok_and(|mounted| mounted) {
+                            mount_committed = true;
+                            break;
+                        }
                         return Err(error);
                     }
+                    Err(error) if error.code == ErrorCode::UnsupportedOperation => return Err(error),
                     Err(error) => {
                         tracing::debug!(code=?error.code, message=error.message, "system replacement mount waits")
                     }

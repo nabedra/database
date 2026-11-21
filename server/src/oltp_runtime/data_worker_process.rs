@@ -245,6 +245,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         group.clone(),
         Arc::new(Routes(voters)),
     )?;
+    let bootstrap_peers: Vec<_> = pinned.iter().map(|(_, peer)| *peer).collect();
     let joining = DataWorkerClient::new(client.clone(), shared.clone(), group.clone(), pinned);
     let last_error = Mutex::new(None);
     let replacement = if let Some(drain) = node.eks_replacement_drain {
@@ -343,6 +344,13 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
             },
         )
         .await?;
+        startup_read(
+            deadline, &last_error, "exclude replaced Control bootstrap peers", || async {
+                directory.exclude_replaced_bootstrap_peers(&control, &bootstrap_peers).await
+                    .map_err(limited_enrollment_retry)
+            },
+        ).await?;
+        directory.check_remote_revocations(&control)?;
         startup_read(
             deadline,
             &last_error,

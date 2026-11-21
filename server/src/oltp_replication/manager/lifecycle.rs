@@ -350,7 +350,7 @@ where
                 Duration::from_secs(30),
                 self.raft.change_membership_if(
                     new_ids,
-                    true,
+                    false,
                     [Precondition::LastMembershipLogId {
                         last_membership_log_id: guarded_id,
                     }],

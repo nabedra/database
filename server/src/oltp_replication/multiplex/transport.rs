@@ -112,6 +112,11 @@ pub trait PeerDirectory: Send + Sync + 'static {
     fn revoked(&self, _peer: WorkerIdentity) -> bool {
         false
     }
+    /// Data-only workers have no applied Control replica. They can validate
+    /// each inbound exchange through a separate Control authority lane.
+    fn check_inbound(&self, _peer: WorkerIdentity) -> Option<EndpointFuture<'_, ()>> {
+        None
+    }
     /// Whether `peer` is an enrolled API gateway (not a worker).
     fn is_api(&self, _peer: WorkerIdentity) -> bool {
         false
@@ -1006,6 +1011,9 @@ impl WorkerTransport {
             trace.phase = RaftTransportPhase::Handle;
             if self.common.directory.revoked(hello.from) {
                 return Err(revoked_peer());
+            }
+            if let Some(check) = self.common.directory.check_inbound(hello.from) {
+                check.await?;
             }
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;

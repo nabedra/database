@@ -125,13 +125,13 @@ impl LocalServices {
         let result = tokio::time::timeout_at(deadline, async {
             let groups = worker.start_system_groups(registered_raft_config()).await?;
             let raw_control = groups.control.ok_or_else(unavailable)?;
-            let raw_timestamps = groups.timestamps.ok_or_else(unavailable)?;
+            let raw_timestamps = groups.timestamps;
             let mut status_groups = Vec::new();
             for running in groups.status {
                 let handle = StatusHandle::new(StatusMachine::new(running.state.store().clone())?, running.clone());
                 status_groups.push((running, handle));
             }
-            let raw_catalog = groups.catalog.ok_or_else(unavailable)?;
+            let raw_catalog = groups.catalog;
             let pins = operator_pins;
             let policy = worker.bootstrap_policy;
             let control = ControlHandle::new(
@@ -182,28 +182,32 @@ impl LocalServices {
                     std::time::Duration::from_secs(5),
                 ),
             );
-            let native_timestamps = TimestampHandle::new(
-                TimestampMachine::new(raw_timestamps.state.store().clone())?,
-                raw_timestamps.clone(),
-            );
-            let native_catalog = Arc::new(ParticipantHandle::new(
-                ParticipantMachine::new(raw_catalog.state.store().clone())?,
-                raw_catalog.clone(),
-            ));
+            let native_timestamps = raw_timestamps.as_ref().map(|running| {
+                Ok::<_, ProtocolError>(TimestampHandle::new(
+                    TimestampMachine::new(running.state.store().clone())?, running.clone(),
+                ))
+            }).transpose()?;
+            let native_catalog = raw_catalog.as_ref().map(|running| {
+                Ok::<_, ProtocolError>(Arc::new(ParticipantHandle::new(
+                    ParticipantMachine::new(running.state.store().clone())?, running.clone(),
+                )))
+            }).transpose()?;
             let peer = Arc::new(QueuePeerClient::new(
                 manager.client(),
                 shared.clone(),
                 placements.control.identity.clone(),
             )?);
-            native_timestamps.install_release_reader(rpc.clone(), peer.clone())?;
-            // T3's ReserveWindow predicate (T7): data.direct.v1 is active.
-            native_timestamps.install_direct_gate(
-                super::super::worker_runtime::direct_capability::ControlReserveWindowGate::new(
-                    rpc.clone(),
-                ),
-            );
-            // PERF1: keep a window reserved after a queued allocation discards it.
-            native_timestamps.spawn_direct_prefill();
+            if let Some(native_timestamps) = &native_timestamps {
+                native_timestamps.install_release_reader(rpc.clone(), peer.clone())?;
+                // T3's ReserveWindow predicate (T7): data.direct.v1 is active.
+                native_timestamps.install_direct_gate(
+                    super::super::worker_runtime::direct_capability::ControlReserveWindowGate::new(
+                        rpc.clone(),
+                    ),
+                );
+                // PERF1: keep a window reserved after a queued allocation discards it.
+                native_timestamps.spawn_direct_prefill();
+            }
             for (running, handle) in &status_groups {
                 let node = running.state.resident().node_id();
                 let endpoint = StatusEndpoint::new(
@@ -217,32 +221,36 @@ impl LocalServices {
                 endpoint.install_admission_reader(peer.clone())?;
                 manager.bind_service(handle.identity(), node, endpoint)?;
             }
-            let timestamp_endpoint = TimestampEndpoint::new(
-                native_timestamps.clone(),
-                raw_timestamps.state.resident().node_id(),
-                rpc.clone(),
-                manager.client(),
-                status_topology.clone(),
-            )?;
-            if let Some(repository) = &archive_repository {
-                timestamp_endpoint.install_backup_reader(repository.clone())?;
-            }
-            manager.bind_service(
-                &placements.timestamps.identity,
-                raw_timestamps.state.resident().node_id(),
-                timestamp_endpoint,
-            )?;
-            manager.bind_service(
-                &placements.catalog.identity,
-                raw_catalog.state.resident().node_id(),
-                ParticipantEndpoint::new(
-                    native_catalog.clone(),
-                    raw_catalog.state.resident().node_id(),
+            if let (Some(raw_timestamps), Some(native_timestamps)) = (&raw_timestamps, &native_timestamps) {
+                let timestamp_endpoint = TimestampEndpoint::new(
+                    native_timestamps.clone(),
+                    raw_timestamps.state.resident().node_id(),
                     rpc.clone(),
                     manager.client(),
-                    Some(status_topology.clone()),
-                )?,
-            )?;
+                    status_topology.clone(),
+                )?;
+                if let Some(repository) = &archive_repository {
+                    timestamp_endpoint.install_backup_reader(repository.clone())?;
+                }
+                manager.bind_service(
+                    &placements.timestamps.identity,
+                    raw_timestamps.state.resident().node_id(),
+                    timestamp_endpoint,
+                )?;
+            }
+            if let (Some(raw_catalog), Some(native_catalog)) = (&raw_catalog, &native_catalog) {
+                manager.bind_service(
+                    &placements.catalog.identity,
+                    raw_catalog.state.resident().node_id(),
+                    ParticipantEndpoint::new(
+                        native_catalog.clone(),
+                        raw_catalog.state.resident().node_id(),
+                        rpc.clone(),
+                        manager.client(),
+                        Some(status_topology.clone()),
+                    )?,
+                )?;
+            }
             let operator = &worker.operator;
             let recovery = if replacing {
                 None
@@ -347,7 +355,9 @@ impl LocalServices {
                     if raw_control.ensure_linearizable().await.is_ok() {
                         register(&control, &operator, &raw_control, authority).await?;
                     }
-                    if raw_timestamps.ensure_linearizable().await.is_ok() {
+                    if let (Some(raw_timestamps), Some(native_timestamps)) = (&raw_timestamps, &native_timestamps)
+                        && raw_timestamps.ensure_linearizable().await.is_ok()
+                    {
                         if native_timestamps.current_authority().await?.is_none() {
                             native_timestamps
                                 .fence(
@@ -358,7 +368,7 @@ impl LocalServices {
                                 )
                                 .await?;
                         }
-                        register(&control, &operator, &raw_timestamps, authority).await?;
+                        register(&control, operator, raw_timestamps, authority).await?;
                     }
                     for (running, handle) in &status_groups {
                         if running.ensure_linearizable().await.is_ok() {
@@ -372,7 +382,9 @@ impl LocalServices {
                             register(&control, &operator, running, authority).await?;
                         }
                     }
-                    if raw_catalog.ensure_linearizable().await.is_ok() {
+                    if let (Some(raw_catalog), Some(native_catalog)) = (&raw_catalog, &native_catalog)
+                        && raw_catalog.ensure_linearizable().await.is_ok()
+                    {
                         if native_catalog.activation().await?.is_none() {
                             let seed = ParticipantMachine::new(raw_catalog.state.store().clone())?
                                 .restore_seed()
@@ -395,7 +407,7 @@ impl LocalServices {
                                 )
                                 .await?;
                         }
-                        register(&control, &operator, &raw_catalog, authority).await?;
+                        register(&control, operator, raw_catalog, authority).await?;
                     }
                     let mut complete = true;
                     for placement in placements.all() {
@@ -458,14 +470,16 @@ impl LocalServices {
                 placements.control.identity.clone(),
                 placements.catalog.voters.clone(),
             )?;
+            let data_bootstrap = if placements.catalog.local(local.worker_id).is_some() {
+                &placements.catalog
+            } else {
+                &placements.control
+            };
             let factory = DataGroupFactory::new(
                     manager.clone(),
                     worker.pool.clone(),
-                    placements
-                        .catalog
-                        .local(local.worker_id)
-                        .ok_or_else(unavailable)?,
-                    placements.catalog.voters.clone(),
+                    data_bootstrap.local(local.worker_id).ok_or_else(unavailable)?,
+                    data_bootstrap.voters.clone(),
                     placements.catalog.identity.clone(),
                     control.clone(),
                     rpc.clone(),
@@ -788,13 +802,9 @@ impl LocalServices {
                     scope,
                     local,
                     replication_factor,
-                    // Every registered worker hosts a Timestamp replica:
-                    // `AllocateDirect` tries it in process first (it only
-                    // answers on the leader), then the service lane.
-                    direct_timestamps: Some(native_timestamps
-                        as Arc<
-                            dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
-                        >),
+                    direct_timestamps: native_timestamps.map(|handle| handle as Arc<
+                        dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+                    >),
                     cold_history: Some(
                         super::super::worker_runtime::cold_history::Sources::Registered {
                             timestamps: timestamps.clone(),

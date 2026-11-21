@@ -2,7 +2,15 @@ use super::*;
 use crate::oltp_replication::{
     authority::control::ReplacementRecord, multiplex::AppliedPeerDirectory,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tokio::sync::{Mutex, mpsc};
+
+#[derive(Clone)]
+pub(super) struct ReplacementTrust {
+    pub(super) directory: Arc<AppliedPeerDirectory>,
+    order: Arc<Mutex<()>>,
+    retry: mpsc::Sender<()>,
+}
 
 impl ControlMachine {
     pub(crate) async fn refresh_replacement_trust(
@@ -41,7 +49,7 @@ impl ControlMachine {
                         after.as_deref(),
                         128,
                         |key, bytes| {
-                            if revoked.len() == 1024 {
+                            if revoked.len() == system_recovery::MAX_REVOCATIONS {
                                 return Err(unknown());
                             }
                             revoked.push(decode::<WorkerIdentity>(bytes)?);
@@ -81,14 +89,13 @@ impl ControlMachine {
             })
             .await?;
         if let Some(trust) = decode::<Option<Trust>>(raw.as_ref())? {
-            directory.install_system_trust(
-                trust.revision,
-                trust.operators,
-                trust.revoked,
-                trust.candidate,
-            )?;
+            // The revocation set has its own reservation. Installing it must
+            // succeed even when rebuilding the candidate/operator view cannot.
+            directory.install_revocations(trust.revoked);
+            directory.install_system_trust(trust.revision, trust.operators, trust.candidate)?;
+        } else {
+            directory.install_revocations(Vec::new());
         }
-        directory.replace_revocation_view(false);
         Ok(())
     }
 }
@@ -102,12 +109,45 @@ struct Trust {
 }
 
 impl ControlMachine {
+    pub(super) async fn refresh_or_retry(&self) {
+        let Some(trust) = &self.replacement_trust else { return };
+        let _order = trust.order.lock().await;
+        if let Err(error) = self.refresh_replacement_trust(&trust.directory).await {
+            tracing::warn!(code=?error.code, message=%error.message, "Control replacement trust refresh deferred");
+            let _ = trust.retry.try_send(());
+        }
+    }
+
     pub(crate) async fn with_replacement_directory(
         mut self,
         directory: Arc<AppliedPeerDirectory>,
     ) -> Result<Self, ProtocolError> {
-        self.refresh_replacement_trust(&directory).await?;
-        self.replacement_directory = Some(directory);
+        directory.reserve_revocations(system_recovery::MAX_REVOCATIONS)?;
+        directory.require_revocation_snapshot();
+        let (retry, mut pending) = mpsc::channel(1);
+        let order = Arc::new(Mutex::new(()));
+        let weak = Arc::downgrade(&directory);
+        let reader = self.clone();
+        let retry_order = order.clone();
+        tokio::spawn(async move {
+            while pending.recv().await.is_some() {
+                let mut delay = Duration::from_millis(100);
+                loop {
+                    tokio::time::sleep(delay).await;
+                    if pending.is_closed() {
+                        return;
+                    }
+                    let Some(directory) = weak.upgrade() else { return };
+                    let _order = retry_order.lock().await;
+                    if reader.refresh_replacement_trust(&directory).await.is_ok() {
+                        break;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        });
+        self.replacement_trust = Some(ReplacementTrust { directory, order, retry });
+        self.refresh_or_retry().await;
         Ok(self)
     }
 }

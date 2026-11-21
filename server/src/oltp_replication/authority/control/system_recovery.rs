@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub(crate) const CAPABILITY: &str = "control.system-replacement.v1";
 pub(crate) const EXECUTION_CAPABILITY: &str = "control.system-replacement.execute.v1";
+pub(crate) const HARDENING_CAPABILITY: &str = "control.system-replacement.hardening.v1";
 pub(crate) const MAX_GROUPS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,8 +156,14 @@ pub(crate) enum SystemRecoveryCommand {
         group: Box<GroupRecord>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         execution: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hardening: bool,
         voters: [WorkerIdentity; 3],
         enrollment_revision: u64,
+        authorization: AuthorizationStamp,
+    },
+    Abandon {
+        id: Uuid,
         authorization: AuthorizationStamp,
     },
     Mount {
@@ -184,7 +191,7 @@ pub(crate) enum SystemRecoveryCommand {
 impl SystemRecoveryCommand {
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
-            Self::Mount { .. } | Self::Publish { .. } => 0,
+            Self::Mount { .. } | Self::Publish { .. } | Self::Abandon { .. } => 0,
             Self::Enable { group, .. } => {
                 size_of::<GroupRecord>() + group.identity.database.capacity_bytes()
             }

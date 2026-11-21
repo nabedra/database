@@ -10,6 +10,9 @@ pub(in crate::oltp_replication::authority::control) const ACTIVATION: &[u8] =
 
 pub(in crate::oltp_replication::authority::control) const EXECUTION: &[u8] =
     b"ct/system-replacement-execution";
+pub(in crate::oltp_replication::authority::control) const HARDENING: &[u8] =
+    b"ct/system-replacement-hardening";
+pub(super) const MAX_REVOCATIONS: usize = 1024;
 pub(super) const PREPARING: &[u8] = b"ct/system-replacement-preparing";
 pub(super) const REVOKED_WORKERS: &[u8] = b"ct/system-replacement-revoked-worker/";
 pub(in crate::oltp_replication::authority::control) const ACTIVE: &[u8] =
@@ -53,6 +56,10 @@ pub(in crate::oltp_replication::authority::control) fn by_target(worker: Uuid) -
     key(b"ct/system-replacement-target/", worker)
 }
 
+pub(in crate::oltp_replication::authority::control) fn abandoned(id: Uuid) -> Vec<u8> {
+    key(b"ct/system-replacement-abandoned/", id)
+}
+
 fn by_certificate(certificate: Digest) -> Vec<u8> {
     let mut key = b"ct/system-replacement-certificate/".to_vec();
     key.extend_from_slice(certificate.as_bytes());
@@ -84,6 +91,8 @@ pub(super) fn apply(
                 *group_inventory_revision,
             );
         }
+        SystemRecoveryCommand::Abandon { id, authorization } =>
+            (authorization, serialized_digest(&(b"abandon-system-replacement".as_slice(), id))?),
         SystemRecoveryCommand::Publish {
             id,
             group,
@@ -93,12 +102,15 @@ pub(super) fn apply(
         SystemRecoveryCommand::Enable {
             group,
             execution,
+            hardening,
             voters,
             enrollment_revision,
             authorization,
         } => (
             authorization,
-            if *execution {
+            if *hardening {
+                serialized_digest(&(group, voters, enrollment_revision, execution, hardening))?
+            } else if *execution {
                 serialized_digest(&(group, voters, enrollment_revision, execution))?
             } else {
                 serialized_digest(&(group, voters, enrollment_revision))?
@@ -130,17 +142,37 @@ pub(super) fn apply(
     }
     match command {
         SystemRecoveryCommand::Mount { .. } => unreachable!("mount applied above"),
+        SystemRecoveryCommand::Abandon { id, .. } => {
+            if tx.get(HARDENING)?.is_none() {
+                return fault(Fault::NotReady);
+            }
+            if tx.get(&abandoned(*id))?.is_some() {
+                return Ok(ControlReply::SystemReplacementAbandoned);
+            }
+            let Some(record) = load::<ReplacementRecord>(tx, &by_id(*id))? else {
+                return fault(Fault::NotFound);
+            };
+            if load::<Uuid>(tx, &by_worker(record.intent.previous.worker_id))? != Some(*id)
+                || tx.get(&revoked_id(record.intent.previous.worker_id))?.is_some()
+            {
+                return fault(Fault::Conflict);
+            }
+            retire(tx, &record)?;
+            Ok(ControlReply::SystemReplacementAbandoned)
+        }
         SystemRecoveryCommand::Publish {
             id, group, applied, ..
         } => publish(tx, state, *id, *group, *applied),
         SystemRecoveryCommand::Enable {
             group,
             execution,
+            hardening,
             voters,
             enrollment_revision,
             ..
         } => {
-            if let Some(existing) = load(tx, if *execution { EXECUTION } else { ACTIVATION })? {
+            let capability = if *hardening { HARDENING } else if *execution { EXECUTION } else { ACTIVATION };
+            if let Some(existing) = load(tx, capability)? {
                 return Ok(ControlReply::SystemReplacementEnabled(existing));
             }
             if *enrollment_revision != state.enrollment_revision
@@ -166,8 +198,11 @@ pub(super) fn apply(
             if tx.get(ACTIVATION)?.is_none() {
                 save(tx, ACTIVATION, &position)?;
             }
-            if *execution {
+            if *execution && tx.get(EXECUTION)?.is_none() {
                 save(tx, EXECUTION, &position)?;
+            }
+            if *hardening {
+                save(tx, HARDENING, &position)?;
             }
             Ok(ControlReply::SystemReplacementEnabled(position))
         }
@@ -183,14 +218,21 @@ pub(super) fn apply(
                 return fault(Fault::NotReady);
             }
             let lookup = by_worker(intent.previous.worker_id);
-            if let Some(id) = load::<Uuid>(tx, &lookup)? {
+            let obsolete = if let Some(id) = load::<Uuid>(tx, &lookup)? {
                 let record: ReplacementRecord = load(tx, &by_id(id))?.ok_or_else(unknown)?;
-                return if record.intent == **intent {
-                    Ok(ControlReply::SystemReplacementPrepared(Box::new(record)))
-                } else {
-                    fault(Fault::Conflict)
-                };
-            }
+                if record.intent == **intent && record.intent.run_id == state.ready.view.run_id {
+                    return Ok(ControlReply::SystemReplacementPrepared(Box::new(record)));
+                }
+                if tx.get(HARDENING)?.is_none()
+                    || record.intent.run_id == state.ready.view.run_id
+                    || tx.get(&revoked_id(record.intent.previous.worker_id))?.is_some()
+                {
+                    return fault(Fault::Conflict);
+                }
+                Some(record)
+            } else {
+                None
+            };
             if tx.get(&by_id(intent.id))?.is_some()
                 || (intent.mount_public_key.is_some() && tx.get(PREPARING)?.is_some())
             {
@@ -247,6 +289,9 @@ pub(super) fn apply(
                 groups: groups.to_vec(),
                 applied_at: position,
             };
+            if let Some(obsolete) = obsolete {
+                retire(tx, &obsolete)?;
+            }
             save(tx, &lookup, &intent.id)?;
             save(tx, &by_id(intent.id), &record)?;
             save(tx, &target, &intent.id)?;
@@ -256,6 +301,48 @@ pub(super) fn apply(
             }
             Ok(ControlReply::SystemReplacementPrepared(Box::new(record)))
         }
+    }
+}
+
+fn retire(tx: &mut GroupTransaction<'_>, record: &ReplacementRecord) -> Result<(), ProtocolError> {
+    let id = record.intent.id;
+    save(tx, &abandoned(id), &true)?;
+    tx.delete(&by_worker(record.intent.previous.worker_id))?;
+    if load::<Uuid>(tx, PREPARING)? == Some(id) {
+        tx.delete(PREPARING)?;
+    }
+    // The target and certificate reservations permanently fence this candidate.
+    Ok(())
+}
+
+pub(super) fn retire_on_cold_fence(tx: &mut GroupTransaction<'_>) -> Result<(), ProtocolError> {
+    if tx.get(HARDENING)?.is_some()
+        && tx.get(ACTIVE)?.is_none()
+        && let Some(id) = load::<Uuid>(tx, PREPARING)?
+    {
+        let record = load::<ReplacementRecord>(tx, &by_id(id))?.ok_or_else(unknown)?;
+        retire(tx, &record)?;
+    }
+    Ok(())
+}
+
+fn revocation_capacity_available(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolError> {
+    let mut count = 0;
+    let mut after = None;
+    loop {
+        let mut next = None;
+        let page = tx.scan_page(REVOKED_WORKERS, after.as_deref(), 128, |key, _| {
+            count += 1;
+            next = Some(key.to_vec());
+            Ok(())
+        })?;
+        if count >= MAX_REVOCATIONS {
+            return Ok(false);
+        }
+        if page.exhausted {
+            return Ok(true);
+        }
+        after = next;
     }
 }
 
@@ -346,11 +433,18 @@ fn mount(
     let Some(record) = load::<ReplacementRecord>(tx, &by_id(proof.id))? else {
         return fault(Fault::NotFound);
     };
-    if proof.verify(scope, &record).is_err() || state.ready.view.run_id != record.intent.run_id {
+    if proof.verify(scope, &record).is_err()
+        || state.ready.view.run_id != record.intent.run_id
+        || tx.get(&abandoned(proof.id))?.is_some()
+    {
         return fault(Fault::Unauthorized);
     }
     let old = record.intent.previous;
+    let hardened = tx.get(HARDENING)?.is_some();
     if load::<WorkerIdentity>(tx, &revoked_id(old.worker_id))? == Some(old) {
+        if hardened {
+            return fault(Fault::Conflict);
+        }
         return if load::<WorkerRecord>(tx, &key(WORKERS, proof.worker.worker_id))?
             .is_some_and(|worker| WorkerIdentity::from(&worker.enrollment) == proof.worker)
         {
@@ -384,6 +478,10 @@ fn mount(
     {
         return fault(Fault::Stale);
     }
+    if hardened && !revocation_capacity_available(tx)? {
+        return fault(Fault::Busy);
+    }
+    let next_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
     for plan in &record.groups {
         save(
             tx,
@@ -403,10 +501,7 @@ fn mount(
             previous_process: None,
         },
     )?;
-    state.enrollment_revision = state
-        .enrollment_revision
-        .checked_add(1)
-        .ok_or_else(unknown)?;
+    state.enrollment_revision = next_revision;
     Ok(ControlReply::SystemReplacementMounted)
 }
 

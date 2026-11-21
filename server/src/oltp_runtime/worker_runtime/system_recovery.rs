@@ -34,6 +34,12 @@ impl ReplacementCheck {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReplacementAbandon {
+    pub(crate) id: Uuid,
+}
+
 struct CheckedGroups {
     state: State,
     groups: Vec<(GroupRecord, [ReplicaMember; 3])>,
@@ -80,6 +86,22 @@ impl WorkerRuntime {
                 "capability": SYSTEM_REPLACEMENT_CAPABILITY,
                 "applied_at": position,
             }),
+            true,
+        ))
+    }
+
+    pub(crate) async fn abandon_system_replacement(
+        &self,
+        request_id: Uuid,
+        id: Uuid,
+    ) -> Result<EncodedResponse, ProtocolError> {
+        self.require_system_replacement_operator()?;
+        self.services.control.abandon_system_replacement(
+            &self.services.manager, &self.services.operator, request_id, id,
+        ).await?;
+        Ok(response::encode_success(
+            request_id,
+            &serde_json::json!({"id": id, "abandoned": true}),
             true,
         ))
     }

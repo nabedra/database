@@ -185,6 +185,7 @@ pub(crate) struct RegisteredWorker {
     pub cold: Option<cold::OpenedCold>,
     pub rolling: Option<restart::OpenedRestart>,
     pub system_replacement: Option<ReplacementRecord>,
+    pub replacement_mount_committed: bool,
     replacement_retained: Option<(Arc<DirectoryOwner>, RetainedIdentity)>,
     pub restart_mount: Option<restart::RestartMount>,
     pub operator: LocalOperatorPermit,
@@ -400,7 +401,7 @@ impl RegisteredWorker {
             return Err(invalid());
         }
         // A system voter must have an authenticated Control enrollment.
-        if config.placements.all().any(|placement| {
+        if replacement.is_none() && config.placements.all().any(|placement| {
             placement.voters.iter().any(|voter| !enrolled.contains(&voter.worker_id))
         }) {
             return Err(invalid());
@@ -518,6 +519,75 @@ impl RegisteredWorker {
             shared.clone(),
             ownership.clone(),
         )?;
+        let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
+        if listener.local_addr().map_err(storage)?.port() != config.bind.port()
+            || config.bind.port() == 0
+        {
+            return Err(invalid());
+        }
+        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+        let mut bootstrap_peers = config.control_enrollments.to_vec();
+        if rolling.is_some() {
+            bootstrap_peers.retain(|peer| peer.worker_id != config.enrollment.worker_id);
+        }
+        if let Some(record) = &replacement {
+            bootstrap_peers.retain(|peer| peer.worker_id != record.intent.previous.worker_id);
+        }
+        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
+            control_identity.clone(),
+            bootstrap_peers,
+            shared.clone(),
+        )?;
+        directory.set_cold_bootstrap(cold.is_some());
+        if let Some(record) = &replacement {
+            directory.allow_replacement_bootstrap(record)?;
+        }
+        let transport = Arc::new(WorkerTransport::new(
+            &config.enrollment,
+            &tls,
+            shared.clone(),
+            directory.clone(),
+            registry.clone(),
+            TransportConfig::default(),
+        )?);
+        let manager = Arc::new(HostedGroupManager {
+            shared: shared.clone(),
+            client: transport.client(),
+            registry,
+            routes: Arc::new(Mutex::new(BTreeMap::new())),
+            ownership: Some(ownership.clone()),
+            starts: tokio::sync::Mutex::new(()),
+            damage_sink: Arc::new(Mutex::new(None)),
+            health: Arc::default(),
+        });
+        let mut restart_mount = None;
+        let mut replacement_mount_committed = false;
+        if let Some(record) = &replacement {
+            let mount = restart::RestartMount::open(&ownership, primary_mount.as_ref(), true)?
+                .ok_or_else(invalid)?;
+            let proof = crate::oltp_replication::authority::control::ReplacementMountProof::sign(
+                &control_identity, record, &record.intent.mount, &mount.key,
+            )?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            replacement_mount_committed = tokio::time::timeout_at(deadline, async {
+                loop {
+                    for peer in config.control_enrollments.iter()
+                        .filter(|peer| peer.worker_id != record.intent.previous.worker_id)
+                    {
+                        match manager.check_replacement_mount(
+                            &control_identity, WorkerIdentity::from(peer), &proof,
+                            previous_process.is_some(),
+                        ).await {
+                            Ok(mounted) => return Ok(mounted),
+                            Err(error) if error.code == ErrorCode::Conflict => return Err(error),
+                            Err(_) => {}
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }).await.map_err(|_| unavailable())??;
+            restart_mount = Some(mount);
+        }
         let mut restored = None;
         let pool = if let Some(anchor) = anchor {
             let exclusion = match (previous_process, anchor.observation().expected.profile) {
@@ -561,54 +631,17 @@ impl RegisteredWorker {
             OltpPool::open_development(ownership.path.join("pool"), identity, shared.clone())?
         };
         let bootstrap_policy = retained.restore_policy.unwrap_or(policy);
-        let restart_mount = restart::RestartMount::open(&ownership, primary_mount.as_ref(), rolling.is_some() || replacement.is_some())?;
+        if replacement.is_none() {
+            restart_mount = restart::RestartMount::open(
+                &ownership, primary_mount.as_ref(), rolling.is_some(),
+            )?;
+        }
         let pools = WorkerPools::new(pool.clone(), WorkerIdentity::from(&config.enrollment), primary_mount)?;
         let secondary = config.secondary_pools.into_inner().into_iter().zip(secondary_anchors).collect();
         if cold.is_none() && rolling.is_none() {
             retain_identity(&ownership, &retained)?;
         }
         let replacement_retained = replacement.as_ref().map(|_| (ownership.clone(), retained));
-        let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
-        if listener.local_addr().map_err(storage)?.port() != config.bind.port()
-            || config.bind.port() == 0
-        {
-            return Err(invalid());
-        }
-        let registry = Arc::new(EndpointRegistry::new(shared.clone()));
-        let mut bootstrap_peers = config.control_enrollments.into_inner();
-        if rolling.is_some() {
-            bootstrap_peers.retain(|peer| peer.worker_id != config.enrollment.worker_id);
-        }
-        if let Some(record) = &replacement {
-            bootstrap_peers.retain(|peer| peer.worker_id != record.intent.previous.worker_id);
-        }
-        let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
-            control_identity,
-            bootstrap_peers,
-            shared.clone(),
-        )?;
-        directory.set_cold_bootstrap(cold.is_some());
-        if let Some(record) = &replacement {
-            directory.allow_replacement_bootstrap(record)?;
-        }
-        let transport = Arc::new(WorkerTransport::new(
-            &config.enrollment,
-            &tls,
-            shared.clone(),
-            directory.clone(),
-            registry.clone(),
-            TransportConfig::default(),
-        )?);
-        let manager = Arc::new(HostedGroupManager {
-            shared: shared.clone(),
-            client: transport.client(),
-            registry,
-            routes: Arc::new(Mutex::new(BTreeMap::new())),
-            ownership: Some(ownership.clone()),
-            starts: tokio::sync::Mutex::new(()),
-            damage_sink: Arc::new(Mutex::new(None)),
-            health: Arc::default(),
-        });
         Ok(Self {
             manager,
             shared,
@@ -626,6 +659,7 @@ impl RegisteredWorker {
             cold,
             rolling,
             system_replacement: replacement,
+            replacement_mount_committed,
             replacement_retained,
             restart_mount,
             operator,
@@ -888,8 +922,16 @@ fn install_replacement_placements(
     }
     let lost = intent.previous.worker_id;
     let update = |group: &mut GroupPlacement| -> Result<(), ProtocolError> {
-        let plan = record.groups.iter().find(|plan| plan.expected.identity == group.identity)
-            .ok_or_else(invalid)?;
+        let plan = record.groups.iter().find(|plan| plan.expected.identity == group.identity);
+        let Some(plan) = plan else {
+            return if group.voters.iter().any(|voter| voter.worker_id == lost)
+                || group.identity.kind == GroupKind::Control
+            {
+                Err(invalid())
+            } else {
+                Ok(())
+            };
+        };
         if group.voters.as_ref() != plan.old.as_slice() {
             return Err(invalid());
         }

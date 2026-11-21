@@ -34,10 +34,22 @@ struct Entry {
 struct SystemTrust {
     revision: u64,
     operators: BTreeMap<Uuid, WorkerEnrollment>,
-    revoked_workers: BTreeSet<Uuid>,
-    revoked_certificates: BTreeSet<Digest>,
     candidate: Option<(ReplacementRecord, bool)>,
     _charge: ScratchLease,
+}
+
+#[derive(Default)]
+struct Revocations {
+    workers: BTreeSet<Uuid>,
+    certificates: BTreeSet<Digest>,
+}
+
+pub(crate) struct RevocationReload<'a>(&'a AtomicBool);
+
+impl Drop for RevocationReload<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 pub(crate) struct AppliedPeerDirectory {
@@ -52,6 +64,10 @@ pub(crate) struct AppliedPeerDirectory {
     epoch: AtomicU64,
     cold_bootstrap: AtomicBool,
     reloading_revocations: AtomicBool,
+    revocations_ready: AtomicBool,
+    revocations: RwLock<Revocations>,
+    revocation_memory: std::sync::OnceLock<ScratchLease>,
+    remote_revocations: std::sync::OnceLock<std::sync::Weak<ControlClient>>,
     refresh: tokio::sync::Mutex<()>,
 }
 impl AppliedPeerDirectory {
@@ -79,6 +95,10 @@ impl AppliedPeerDirectory {
             epoch: AtomicU64::new(1),
             cold_bootstrap: AtomicBool::new(false),
             reloading_revocations: AtomicBool::new(false),
+            revocations_ready: AtomicBool::new(true),
+            revocations: RwLock::new(Revocations::default()),
+            revocation_memory: std::sync::OnceLock::new(),
+            remote_revocations: std::sync::OnceLock::new(),
             refresh: tokio::sync::Mutex::new(()),
         });
         for peer in peers {
@@ -94,6 +114,31 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
+    pub(crate) fn check_remote_revocations(&self, control: &Arc<ControlClient>) -> Result<(), ProtocolError> {
+        self.remote_revocations.set(Arc::downgrade(control)).map_err(|_| invalid())
+    }
+
+    pub(crate) async fn exclude_replaced_bootstrap_peers(
+        &self,
+        control: &ControlClient,
+        peers: &[WorkerIdentity],
+    ) -> Result<(), ProtocolError> {
+        for &peer in peers {
+            if control.worker_replaced(peer).await? {
+                self.remove_replaced(peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_replaced(&self, peer: WorkerIdentity) -> Result<(), ProtocolError> {
+        let mut entries = self.entries.write().map_err(|_| unavailable())?;
+        if entries.get(&peer.worker_id).is_some_and(|entry| WorkerIdentity::from(&entry.enrollment) == peer) {
+            entries.remove(&peer.worker_id);
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_cold_bootstrap(&self, cold: bool) {
         self.cold_bootstrap.store(cold, Ordering::Release);
     }
@@ -134,13 +179,11 @@ impl AppliedPeerDirectory {
         &self,
         revision: u64,
         operators: Vec<WorkerEnrollment>,
-        revoked: Vec<WorkerIdentity>,
         candidate: Option<(ReplacementRecord, bool)>,
     ) -> Result<(), ProtocolError> {
         let charge = self.shared.reserve_scratch(
             crate::oltp::pool::ByteClass::Progress,
-            4096 + revoked.len() * 128
-                + candidate
+            4096 + candidate
                     .as_ref()
                     .map_or(0, |(record, _)| record.groups.len() * 2048),
         )?;
@@ -150,20 +193,45 @@ impl AppliedPeerDirectory {
                 .into_iter()
                 .map(|entry| (entry.worker_id, entry))
                 .collect(),
-            revoked_workers: revoked.iter().map(|worker| worker.worker_id).collect(),
-            revoked_certificates: revoked
-                .iter()
-                .map(|worker| worker.certificate_sha256)
-                .collect(),
             candidate,
             _charge: charge,
         });
         Ok(())
     }
 
-    pub(crate) fn replace_revocation_view(&self, updating: bool) {
-        self.reloading_revocations
-            .store(updating, Ordering::Release);
+    pub(crate) fn reserve_revocations(&self, limit: usize) -> Result<(), ProtocolError> {
+        if self.revocation_memory.get().is_none() {
+            let lease = self.shared.reserve_scratch(crate::oltp::pool::ByteClass::Progress, limit * 128)?;
+            let _ = self.revocation_memory.set(lease);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reloading_revocations(&self) -> RevocationReload<'_> {
+        self.reloading_revocations.store(true, Ordering::Release);
+        RevocationReload(&self.reloading_revocations)
+    }
+
+    pub(crate) fn require_revocation_snapshot(&self) {
+        self.revocations_ready.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn install_revocations(&self, revoked: Vec<WorkerIdentity>) {
+        for worker in revoked {
+            self.record_revocation(worker);
+        }
+        self.revocations_ready.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn record_revocation(&self, worker: WorkerIdentity) {
+        let mut revoked = self.revocations.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        revoked.workers.insert(worker.worker_id);
+        revoked.certificates.insert(worker.certificate_sha256);
+    }
+
+    fn trust_available(&self) -> bool {
+        self.revocations_ready.load(Ordering::Acquire)
+            && !self.reloading_revocations.load(Ordering::Acquire)
     }
 
     pub(crate) fn has_mounted_replacement(&self) -> bool {
@@ -178,11 +246,7 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn system_placement_changed(&self) -> bool {
-        self.system.read().is_ok_and(|system| {
-            system
-                .as_ref()
-                .is_some_and(|state| !state.revoked_workers.is_empty())
-        })
+        self.revocations.read().is_ok_and(|revoked| !revoked.workers.is_empty())
     }
 
     pub(crate) fn replacement_capability_active(&self) -> bool {
@@ -190,12 +254,12 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available() {
             return Some(false);
         }
         match self.system.read() {
             Ok(state) => state.as_ref().map(|state| {
-                !Self::denied(state, identity.worker_id, Some(identity.certificate_sha256))
+                !self.denied( identity.worker_id, Some(identity.certificate_sha256))
                     && state
                         .operators
                         .get(&identity.worker_id)
@@ -209,9 +273,11 @@ impl AppliedPeerDirectory {
         }
     }
 
-    fn denied(state: &SystemTrust, worker: Uuid, certificate: Option<Digest>) -> bool {
-        state.revoked_workers.contains(&worker)
-            || certificate.is_some_and(|digest| state.revoked_certificates.contains(&digest))
+    fn denied(&self, worker: Uuid, certificate: Option<Digest>) -> bool {
+        self.revocations.read().map_or(true, |revoked| {
+            revoked.workers.contains(&worker)
+                || certificate.is_some_and(|digest| revoked.certificates.contains(&digest))
+        })
     }
 
     fn install(
@@ -424,12 +490,18 @@ impl PeerDirectory for AppliedPeerDirectory {
         Some(self.revision().max(revision))
     }
     fn revoked(&self, peer: WorkerIdentity) -> bool {
-        self.reloading_revocations.load(Ordering::Acquire)
-            || self.system.read().map_or(true, |state| {
-                state.as_ref().is_some_and(|state| {
-                    Self::denied(state, peer.worker_id, Some(peer.certificate_sha256))
-                })
-            })
+        !self.trust_available() || self.denied(peer.worker_id, Some(peer.certificate_sha256))
+    }
+    fn check_inbound(&self, peer: WorkerIdentity) -> Option<EndpointFuture<'_, ()>> {
+        let control = self.remote_revocations.get()?;
+        Some(Box::pin(async move {
+            let control = control.upgrade().ok_or_else(unavailable)?;
+            if control.worker_replaced(peer).await? {
+                self.remove_replaced(peer)?;
+                return Err(invalid());
+            }
+            Ok(())
+        }))
     }
     fn is_api(&self, peer: WorkerIdentity) -> bool {
         self.entries.read().is_ok_and(|entries| {
@@ -440,13 +512,13 @@ impl PeerDirectory for AppliedPeerDirectory {
         })
     }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available() {
+            return Err(unavailable());
+        }
+        if self.denied(worker, None) {
             return Err(unavailable());
         }
         if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if Self::denied(state, worker, None) {
-                return Err(unavailable());
-            }
             if let Some((record, _)) = &state.candidate
                 && record.intent.next.worker_id == worker
             {
@@ -491,13 +563,13 @@ impl PeerDirectory for AppliedPeerDirectory {
         if group.cluster_id != self.cluster {
             return Err(invalid());
         }
-        if self.reloading_revocations.load(Ordering::Acquire) {
+        if !self.trust_available() {
             return Err(unavailable());
         }
+        if self.denied(peer.worker_id, Some(peer.certificate_sha256)) {
+            return Err(invalid());
+        }
         if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
-            if Self::denied(state, peer.worker_id, Some(peer.certificate_sha256)) {
-                return Err(invalid());
-            }
             if let Some((record, mounted)) = &state.candidate
                 && record.intent.next.worker_id == peer.worker_id
             {

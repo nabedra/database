@@ -70,6 +70,12 @@ impl WorkerRuntime {
                     let check: super::worker_runtime::system_recovery::ReplacementCheck =
                         serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
                     check.validate()?;
+                } else if request.operation == "worker.system_replacement.abandon" {
+                    let abandon: super::worker_runtime::system_recovery::ReplacementAbandon =
+                        serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+                    if abandon.id.is_nil() {
+                        return Err(invalid());
+                    }
                 } else if request.operation == "worker.system_replacement.prepare" {
                     let intent: ReplacementIntent =
                         serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
@@ -162,6 +168,11 @@ impl WorkerRuntime {
         }
         if request.operation == "worker.system_replacement.enable" {
             return self.enable_system_replacement(request.request_id).await;
+        }
+        if request.operation == "worker.system_replacement.abandon" {
+            let abandon: super::worker_runtime::system_recovery::ReplacementAbandon =
+                serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self.abandon_system_replacement(request.request_id, abandon.id).await;
         }
         if request.operation == "worker.system_replacement.prepare" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
