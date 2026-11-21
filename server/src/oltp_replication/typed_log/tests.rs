@@ -1085,25 +1085,20 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
             .await
             .unwrap();
         rig.gated.wait_for_sync().await;
-        let apply = tokio::spawn({
-            let mut log = log.clone();
-            async move {
-                let mut stream = Box::pin(log.entries_stream(1..3).await);
-                let mut applied = Vec::new();
-                while let Some(entry) = stream.next().await {
-                    applied.push(entry.unwrap().log_id);
-                }
-                applied
-            }
-        });
+        let mut reader = log.clone();
+        let mut apply = Box::pin(reader.entries_stream(1..3).await);
         log.save_committed(Some(id(2))).await.unwrap();
         assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
         assert_eq!(
             log_ids(log.limited_get_log_entries(1, 3).await.unwrap()),
             [id(1), id(2)]
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        assert!(!apply.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), apply.next())
+                .await
+                .is_err(),
+            "applying the batch must wait for its local sync"
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(1), &mut pending)
                 .await
@@ -1112,7 +1107,8 @@ async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
 
         drop(held);
         pending.await.unwrap().unwrap();
-        assert_eq!(apply.await.unwrap(), [id(1), id(2)]);
+        let applied = apply.map(|entry| entry.unwrap().log_id).collect::<Vec<_>>();
+        assert_eq!(applied.await, [id(1), id(2)]);
         while log.read_committed().await.unwrap() != Some(id(2)) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -1296,6 +1296,7 @@ async fn f03_native_drain_waits_for_cancelled_guard_drop() {
 
     tokio::time::timeout(Duration::from_secs(10), async {
         let resources = shared(SharedResourceConfig::default());
+        let baseline = resources.scheduler().usage();
         let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
         let reservation = prepared.reserve_compute(44, 1024).await.unwrap();
         let work_gate = Arc::new(Gate {
@@ -1339,10 +1340,12 @@ async fn f03_native_drain_waits_for_cancelled_guard_drop() {
             futures_util::poll!(&mut drain).is_pending(),
             "native drain returned while the cancelled guard still held its scheduler permit"
         );
-        assert_eq!(resources.scheduler().usage()[0].1, 1);
+        let usage = resources.scheduler().usage();
+        assert_eq!(usage[0].1, 1);
+        assert_eq!(usage[0].2, baseline[0].2 + 1024);
         drop(release_drop);
         drain.await;
-        assert_eq!(resources.scheduler().usage()[0].1, 0);
+        assert_eq!(resources.scheduler().usage(), baseline);
     })
     .await
     .expect("native work, cancellation cleanup and drain watchdog");
