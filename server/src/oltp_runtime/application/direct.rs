@@ -311,16 +311,6 @@ impl TopologyCache {
             .entries
             .remove(&table_id);
     }
-    fn remove_if_current(&self, route: &Arc<TableRoute>) {
-        let mut lru = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if lru
-            .entries
-            .get(&route.table_id)
-            .is_some_and(|(current, _)| Arc::ptr_eq(current, route))
-        {
-            lru.entries.remove(&route.table_id);
-        }
-    }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
@@ -746,6 +736,7 @@ impl DirectGateway {
         let mut attempts = FuturesUnordered::new();
         let mut pending = [None; 7];
         let mut attempted_route: Option<(_, Arc<[Voter]>)> = None;
+        let mut next_probe = Instant::now();
         let mut refreshed_unknown_table = false;
         loop {
             if Instant::now() >= deadline {
@@ -808,25 +799,30 @@ impl DirectGateway {
                 attempted_route = Some((route, voters.clone()));
             }
             let now = Instant::now();
+            let waiting_for_probe = now < next_probe && !attempts.is_empty();
             let available = |voter: &Voter| !pending.contains(&Some(voter.node_id));
-            let next = range
-                .leader_hint()
-                .and_then(|node| {
-                    voters
-                        .iter()
-                        .enumerate()
-                        .find(|(_, voter)| voter.node_id == node && available(voter))
-                })
-                .or_else(|| {
-                    let first = rotation % voters.len();
-                    voters
-                        .iter()
-                        .enumerate()
-                        .cycle()
-                        .skip(first)
-                        .take(voters.len())
-                        .find(|(_, voter)| available(voter))
-                });
+            let next = if waiting_for_probe {
+                None
+            } else {
+                range
+                    .leader_hint()
+                    .and_then(|node| {
+                        voters
+                            .iter()
+                            .enumerate()
+                            .find(|(_, voter)| voter.node_id == node && available(voter))
+                    })
+                    .or_else(|| {
+                        let first = rotation % voters.len();
+                        voters
+                            .iter()
+                            .enumerate()
+                            .cycle()
+                            .skip(first)
+                            .take(voters.len())
+                            .find(|(_, voter)| available(voter))
+                    })
+            };
             request.schema_epoch = table.schema_epoch;
             request.routing_epoch = range.shard.routing_epoch;
             request.group = range.group().group_id;
@@ -863,6 +859,8 @@ impl DirectGateway {
                 } else {
                     deadline
                 }
+            } else if waiting_for_probe {
+                deadline.min(next_probe)
             } else {
                 deadline
             };
@@ -870,6 +868,7 @@ impl DirectGateway {
             {
                 Ok(Some(settled)) => settled,
                 Ok(None) => return Err(deadline_error(*uncertain)),
+                Err(_) if waiting_for_probe && attempt < deadline => continue,
                 Err(_) => {
                     *uncertain = true;
                     GatewayStats::bump(&self.stats.peer_timeouts);
@@ -909,13 +908,6 @@ impl DirectGateway {
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {
-                    if error.code == ErrorCode::OutcomeUnknown {
-                        // The leader could not settle an attempt within the
-                        // deadline: pass it through as unknown.
-                        *uncertain = true;
-                        self.cache.remove_if_current(&table);
-                        return Err(error);
-                    }
                     if error.outcome == Outcome::Unknown {
                         // Not settled yet (a proposal failed in an election):
                         // resend the same id and body; the dedup record
@@ -923,7 +915,11 @@ impl DirectGateway {
                         *uncertain = true;
                         GatewayStats::bump(&self.stats.resends);
                         range.forget_leader(voter.node_id);
-                        if !pause(deadline, &mut delay).await {
+                        if error.code == ErrorCode::OutcomeUnknown {
+                            // The old leader spent its execution budget.
+                            // Check the dedup result while time remains.
+                            delay = Duration::ZERO;
+                        } else if !pause(deadline, &mut delay).await {
                             return Err(deadline_error(true));
                         }
                         continue;
@@ -980,8 +976,12 @@ impl DirectGateway {
                         }
                         None => {
                             range.forget_leader(voter.node_id);
-                            // No leader known (an election): back off.
-                            if !pause(deadline, &mut delay).await {
+                            // Back off the next probe, while still polling a
+                            // leader that may be finishing the request.
+                            if !attempts.is_empty() {
+                                delay = (delay * 2).clamp(FIRST_PAUSE, MAX_PAUSE);
+                                next_probe = Instant::now() + delay;
+                            } else if !pause(deadline, &mut delay).await {
                                 return Err(deadline_error(*uncertain));
                             }
                         }

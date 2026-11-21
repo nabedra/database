@@ -60,9 +60,12 @@ class IsolatedWorkers(Rf3Cluster):
         finally:
             self.close()
             for namespace, peer in reversed(created):
-                privileged('ip', 'netns', 'delete', namespace)
-                if subprocess.run(['ip', 'link', 'show', peer], capture_output=True).returncode == 0:
+                try:
                     privileged('ip', 'link', 'delete', peer)
+                except subprocess.CalledProcessError as error:
+                    if 'Cannot find device' not in error.stderr:
+                        raise
+                privileged('ip', 'netns', 'delete', namespace)
             privileged('ip', 'link', 'delete', self.bridge)
 
     @contextmanager
@@ -224,7 +227,9 @@ def main():
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--bound', type=float, default=6.5)
+    # Up to 3 s of leader lease, 3 s of election delay, and 2 s to
+    # renew the Control grant and reach Catalog and Timestamp on a cold leader.
+    parser.add_argument('--bound', type=float, default=8)
     args = parser.parse_args()
     assert sys.platform.startswith('linux') and os.getuid() != 0, 'requires Linux with passwordless sudo'
     cluster = IsolatedWorkers(args.binary, args.output, test_executable=args.test_executable)
