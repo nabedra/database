@@ -116,7 +116,7 @@ pathlib.Path('/pool/.nabedra-docker-volume.json').write_text(json.dumps(raw))
         run('docker', 'stop', '-t', '10', container_id, timeout=25)
         cluster.evidence.record('O17/A02 stop permit before Docker termination', permit=permit,
                                 ready=before_stop, container_id=container_id,
-                                accepted_receipts=sum(status == 202 for _, status in traffic.receipts))
+                                accepted_receipts=sum(status == 202 for _, status, _ in traffic.receipts))
     finally:
         logs = run('docker', 'logs', name, check=False)
         cluster.evidence.file('scale-data-worker.log', logs.stdout + logs.stderr)

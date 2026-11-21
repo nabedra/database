@@ -711,12 +711,15 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
         placements = [cluster.admin('storage.replica.placement', {'group': group}) for group in groups]
         queued = insert(table, 1, 1234)
         during_prepare = insert(table, -2, 500)
+        fenced = insert(table, -3, 600)
+        fenced_id = fenced['request_id']
         queued_id = queued['request_id']
         preparation_write_id = during_prepare['request_id']
-        requests = (queued, during_prepare)
+        requests = (queued, during_prepare, fenced)
         ids = [request['request_id'] for request in requests]
         for name in WORKERS:
-            write_json(cluster.barrier_dir(name) / 'gates.json', dict.fromkeys(ids, 'queued'))
+            write_json(cluster.barrier_dir(name) / 'gates.json',
+                       {queued_id: 'queued', preparation_write_id: 'queued', fenced_id: 'prepared'})
             write_json(cluster.barrier_dir(name) / 'inspect.json', ids)
         for request in requests:
             accepted = send_op(request, '/v1/requests')
@@ -724,7 +727,8 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
 
         def executing():
             return next((name for name in WORKERS
-                         if all((cluster.barrier_dir(name) / f'reached-{id}').exists() for id in ids)), None)
+                         if all((cluster.barrier_dir(name) / f'reached-{id}').exists() for id in ids)
+                         and (cluster.barrier_dir(name) / f'reached-{fenced_id}').read_text() == 'prepared'), None)
 
         victim = wait_for(executing, 'accepted operation reached execution gate')
         survivors = [name for name in WORKERS if name != victim]
@@ -836,6 +840,26 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
             assert success(*send_op(get(table, row['id']))) == row, body
         await_receipt(queued_id)
         assert success(*send_op(get(table, 1))) == {'id': 1, 'value': 1234}
+        fenced_error = dict(code='conflict', message='original execution authority was fenced',
+                            outcome='not_applied')
+        fenced_path = f'/v1/requests/{cluster.run_id}/{fenced_id}'
+
+        def fenced_receipt():
+            status, response = send_op(None, fenced_path, timeout=5)
+            if status == 200 and response['state'] in ('succeeded', 'failed', 'abandoned'):
+                return response
+
+        assert wait_for(fenced_receipt, 'prepared mutation reconciles in the original run', PROBE_WINDOW) == dict(
+            request_id=fenced_id, run_id=cluster.run_id, state='failed', result=None, error=fenced_error)
+        decision = next(json.loads(path.read_text()) for name in survivors
+                        if (path := cluster.barrier_dir(name) / f'resolved-{fenced_id}.json').is_file())
+        assert decision['txn'] == {'request_id': fenced_id, 'attempt': 1}, decision
+        assert decision['request']['run_id'] == cluster.run_id, decision
+        assert decision['decision'] == {'abort': {'reason': 'abandoned_by_fence'}}, decision
+        assert send_op(fenced) == (409, {'request_id': fenced_id, 'error': fenced_error})
+        assert success(*send_op(get(table, -3))) is None
+        report('O14/R01/Q06 prepared mutation reconciled after owner fence', decision=decision,
+               receipt=fenced_error, row_present=False)
         recovered_nodes = []
         expected_voters = []
         for group, before in zip(groups, placements):

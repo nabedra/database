@@ -119,7 +119,9 @@ returned CSI `OutOfRange` and the existing data remained readable.
 The final audit verified the acknowledged direct writes, then stopped
 when polling a same-ID queued retry yielded a terminal
 `overloaded/not_applied` receipt for an earlier HTTP 503. The exact combined row count and applied
-voter checks did not finish in this run. [Host-path request and cleanup trace](hostpath/trace.jsonl)
+voter checks did not finish in this run. The 503 carried `storage_unavailable`
+with outcome `unknown`. The later receipt resolved that uncertainty.
+[Host-path request and cleanup trace](hostpath/trace.jsonl)
 
 Two early Rawfile probes stopped during infrastructure setup. A third run
 created three PVC objects, which stayed pending because the plugin rejected
@@ -141,6 +143,11 @@ The duplicate mount request returned the original growth claim with one
 attempt. The direct-write audit passed for 259 acknowledgments. The queued
 audit stopped at a request that had received HTTP 202 and later settled
 with `conflict/not_applied` after its original execution authority was fenced.
+The audit now continues when an already accepted mutation resolves to this
+explicit abort, or when an unknown submission resolves to the recorded
+handler-lane refusal. The final table comparison checks that each failed
+mutation left its row absent. The historical storage traces ended before that
+comparison.
 [Native Rawfile trace](rawfile-storage/trace.jsonl)
 
 The first Docker scale attempt reached native preparation but the new
