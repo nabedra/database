@@ -60,7 +60,7 @@ struct Transition {
 }
 
 #[derive(Default)]
-struct Sweep {
+pub(super) struct Sweep {
     revision: Option<u64>,
     after: Option<Uuid>,
     page: VecDeque<GroupRecord>,
@@ -68,7 +68,11 @@ struct Sweep {
     done: bool,
 }
 impl Sweep {
-    async fn next(
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.done && self.page.is_empty()
+    }
+
+    pub(super) async fn next(
         &mut self,
         runtime: &WorkerRuntime,
     ) -> Result<Option<GroupRecord>, ProtocolError> {

@@ -47,8 +47,8 @@ use super::{
         unsupported_service_route,
     },
     multiplex::{
-        AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, ReceivePlan,
-        RequestError, RequestTarget, TrafficClass, WorkerClient,
+        AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
+        ReceivePlan, RequestError, RequestTarget, TrafficClass, WorkerClient,
     },
 };
 use crate::oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, WorkerSharedResources};
@@ -186,6 +186,10 @@ enum Method {
     ParticipantPropose {
         progress: bool,
     },
+    ParticipantIndexReclaim,
+    ParticipantStoredIndex {
+        after: Option<uuid::Uuid>,
+    },
     /// A point operation for the range leader (plan section 6). The body is
     /// the first payload section.
     Direct(direct::DirectHeader),
@@ -215,6 +219,7 @@ impl Method {
             | Self::ParticipantScanOpen { .. }
             | Self::ParticipantFence { .. }
             | Self::ParticipantResolveTimestampPoint
+            | Self::ParticipantIndexReclaim
             | Self::ParticipantPropose { progress: true } => Purpose::Settlement,
             Self::Direct(_) | Self::DirectForward(_) => Purpose::ApiIngress,
             _ => Purpose::Authority,
@@ -270,6 +275,7 @@ impl Method {
                 crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES
             }
             Self::ParticipantPropose { progress: true } => 128 << 10,
+            Self::ParticipantIndexReclaim => 4096,
             Self::TimestampPointDecisionRead { .. }
             | Self::ParticipantTimestampPointSeal { .. }
             | Self::ParticipantTimestampPointRejection { .. }
@@ -1133,6 +1139,16 @@ impl Client {
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
         let sections = [payload.clone(), None, None];
+        let worker = if matches!(
+            method,
+            Method::ParticipantIndexReclaim
+                | Method::ParticipantStoredIndex { .. }
+                | Method::TimestampCall { operation: 42, .. }
+        ) {
+            RequestTarget::Feature(worker.worker_id(), PeerFeature::IndexReclamation)
+        } else {
+            worker
+        };
         // One boxed transport future, whichever lane path: every service
         // call nests this future, and holding both variants inline grew
         // the callers' futures until debug builds overflowed a Tokio

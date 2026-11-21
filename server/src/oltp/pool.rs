@@ -17,14 +17,14 @@ mod storage;
 pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-pub(crate) use tests::acceptance_damaged_checkpoints;
 pub use resources::{
     ByteClass, ChargedBuffer, ChargedBytes, ExecutionClass, NativeComputeGuard, PreparedNative,
     QueueLease, ScratchLease, SharedResourceConfig, WorkerSharedResources,
 };
 use resources::{ByteReservation, capacity};
 pub(crate) use resources::{GroupCapacityLease, RAFT_REPLICA_BYTES};
+#[cfg(test)]
+pub(crate) use tests::{acceptance_damaged_checkpoints, o29_pool_recovery};
 
 use super::{failure, recovery_unknown};
 use crate::{
@@ -271,14 +271,10 @@ impl OltpPool {
         shared: Arc<WorkerSharedResources>,
         mount: Option<VerifiedPoolMount>,
     ) -> Result<Self, ProtocolError> {
-        Self::open_path_on(
-            path,
-            identity,
-            shared,
-            mount,
-            nabedra_kv::fs::real(),
-            &|_| {},
-        )
+        let fs = nabedra_kv::fs::real();
+        #[cfg(test)]
+        let fs = crate::oltp_runtime::recovery_tests::pool_sync::wrap(fs);
+        Self::open_path_on(path, identity, shared, mount, fs, &|_| {})
     }
     fn open_path_on(
         path: &Path,
@@ -1939,6 +1935,14 @@ impl<'a> GroupTransaction<'a> {
         visit: impl FnMut(&[u8], &[u8]) -> Result<(), ProtocolError>,
     ) -> Result<ScanProgress, ProtocolError> {
         self.read.scan_page(prefix, after, max_items, visit)
+    }
+    pub(crate) fn scan_page_until(
+        &mut self,
+        prefix: &[u8],
+        max_items: usize,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<bool, ProtocolError>,
+    ) -> Result<ScanProgress, ProtocolError> {
+        self.read.scan_page_until(prefix, None, max_items, visit)
     }
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
         if key.len() > MAX_KEY_BYTES {

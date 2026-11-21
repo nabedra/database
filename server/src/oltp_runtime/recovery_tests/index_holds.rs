@@ -36,6 +36,7 @@ pub(crate) enum Checkpoint {
     Refresh,
     Validation,
     ReadPin,
+    Reclaim,
 }
 
 #[derive(Debug)]

@@ -1237,9 +1237,7 @@ mod rv_ns6;
 
 mod ns14;
 
-#[tokio::test]
-#[ignore = "run through scripts/acceptance_oltp.py"]
-async fn acceptance_o29() {
+pub(crate) async fn o29_pool_recovery() {
     use crate::{oltp_acceptance::clause, oltp_replication::typed_log::tests::GatedSync};
 
     let dir = Dir::new();
@@ -1329,12 +1327,6 @@ async fn acceptance_o29() {
         "passed",
         "The original pool and both existing and newly requested group aliases shared a recovery latch after post-sync EIO.",
     );
-    clause(
-        "O29",
-        "unreadable-is-uncertain",
-        "not-run",
-        "Both handles refused a strong read and a second transition after post-sync EIO. The UUID comes from the test transition, so actual table.create recomputation remains unverified.",
-    );
 
     let replay = proof
         .transaction(meta(0), budget(), |_| panic!("reran a known decision"))
@@ -1352,12 +1344,6 @@ async fn acceptance_o29() {
         .unwrap();
     assert_eq!(get(&proof, b"healthy").await, b"usable");
     assert!(!healthy.requires_recovery());
-    clause(
-        "O29",
-        "authoritative-decision-replay",
-        "not-run",
-        "Replayed an exact applied reply on an independent authoritative pool. Reconciliation through the application Status service remains unverified.",
-    );
     clause(
         "O29",
         "healthy-pool-isolation",
