@@ -511,10 +511,12 @@ class Rf3Cluster:
     def tail(self, name, size=6000):
         path = self.root / f'{name}.log'
         try:
-            data = path.read_bytes()
+            with path.open('rb') as log:
+                end = log.seek(0, os.SEEK_END)
+                log.seek(max(0, end - size))
+                return log.read(size).decode(errors='replace')
         except OSError:
             return ''
-        return data[-size:].decode(errors='replace')
 
     # Cold start (D09) -------------------------------------------------------------------
     def kill_all(self):

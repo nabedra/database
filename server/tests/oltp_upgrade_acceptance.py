@@ -20,7 +20,7 @@ from oltp_direct_acceptance import run_program
 from oltp_direct_cluster import DATABASE, ROOT, WORKERS, Rf3Cluster, call, operation, uid, write_json
 from oltp_orm_contract import exercise
 from oltp_runtime_acceptance import RuntimeServer
-from nabedra import Database, col
+from nabedra import Database, LimitExceededError, col
 
 sys.path.insert(0, str(ROOT / 'scripts'))
 from oltp_upgrade_export import archive_path
@@ -28,7 +28,7 @@ from oltp_upgrade_export import archive_path
 GUIDE = 'docs/oltp-rocksdb-upgrade.md'
 ROW_COUNT = 101_200
 BOUNDARY = 50_000
-BATCH_ROWS = 8_192
+BATCH_ROWS = 4_096
 VERIFY_ROWS = 4_096
 DELETED = {7, BOUNDARY + 7}
 ORM_TABLE = 'migration_orm'
@@ -175,10 +175,21 @@ def seed(cluster, db, indexes):
     assert len({group['group_id'] for group in children}) == 2, children
     verify_rf3(cluster, children)
     ledger_index, location_index = indexes
+    batch_rows = BATCH_ROWS
     for lower, upper in ((0, keys_at_boundary[0]), (keys_at_boundary[-1] + 1, ROW_COUNT)):
-        for start in range(lower, upper, BATCH_ROWS):
-            batch = [ledger_row(key) for key in range(start, min(start + BATCH_ROWS, upper))]
-            assert ledger.insert_many(batch) == len(batch), start
+        start = lower
+        while start < upper:
+            batch = [ledger_row(key) for key in range(start, min(start + batch_rows, upper))]
+            try:
+                assert ledger.insert_many(batch) == len(batch), start
+            except LimitExceededError as error:
+                if (batch_rows != BATCH_ROWS or error.outcome != 'not_applied'
+                        or str(error) != 'worker storage capacity unavailable'):
+                    raise
+                batch_rows //= 2
+                print(f'MIG2 legacy worker refused a {len(batch)}-row batch; using {batch_rows} rows', flush=True)
+                continue
+            start += len(batch)
     for key in sorted(DELETED):
         assert ledger.delete(key) is True, key
 
@@ -399,6 +410,7 @@ def main():
                 seed_archive, seed_scope, indexes = seed_legacy_indexes(args.old_binary, root)
             source = MigrationCluster(args.old_binary, root / 'old', repository=repository,
                                       archive=seed_archive, scope=seed_scope)
+            source.worker_env['NABEDRA_OLTP_RPC_TRACE'] = '1'
             clusters.append(source)
             with phase(timings, 'old RF3 startup'):
                 source.start()
@@ -455,7 +467,7 @@ def main():
                 (args.output / 'legacy-local.log').write_bytes((root / 'legacy-local' / 'server.log').read_bytes())
             for cluster in clusters:
                 for name in [*WORKERS, 'api1']:
-                    if log := cluster.tail(name, size=16000):
+                    if log := cluster.tail(name, size=64000):
                         (args.output / f'{cluster.root.name}-{name}.log').write_text(log)
                         print(f'--- {cluster.root.name}/{name} ---\n{log}', file=sys.stderr)
             raise
