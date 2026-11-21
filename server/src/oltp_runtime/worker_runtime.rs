@@ -1323,6 +1323,9 @@ impl WorkerRuntime {
             .services
             .catalog
             .snapshot(read.storage_pin.read_ts, authority)?;
+        #[cfg(test)]
+        super::recovery_tests::transaction_checkpoint("snapshot", id, &read.storage_pin.read_ts)
+            .await;
         let point = captured_point
             .as_ref()
             .and_then(|catalog| catalog.point_for(&pin, read.catalog_root));

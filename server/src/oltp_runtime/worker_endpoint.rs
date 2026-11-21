@@ -1934,6 +1934,9 @@ impl Endpoint for QueueEndpoint {
                     #[cfg(test)]
                     if record.state.terminal() {
                         super::recovery_tests::pause("before-terminal-copy", record.request_id).await;
+                        if super::recovery_tests::lose_terminal_copy(record.request_id).await {
+                            return Err(unavailable());
+                        }
                     }
                     #[cfg(test)]
                     if record.ready.view.owner_term > 1 {

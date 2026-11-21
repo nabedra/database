@@ -2,6 +2,39 @@
 //! in their owning modules. Run these explicitly through the central runner.
 use std::{path::PathBuf, process::Command};
 
+#[path = "oltp_acceptance/o07.rs"]
+mod o07;
+#[path = "oltp_acceptance/o10.rs"]
+mod o10;
+
+fn transaction_scenario(scenario: &str) {
+    let Some(binary) = std::env::var_os("NABEDRA_OLTP_BINARY") else {
+        let marker = serde_json::json!({
+            "scenario": scenario, "status": "not-run", "reason": "missing actual OLTP server executable",
+        });
+        eprintln!("NABEDRA_OLTP_ACCEPTANCE {marker}");
+        return;
+    };
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_transaction_acceptance.py");
+    let status = Command::new(
+        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
+    )
+    .arg(script)
+    .args(["--scenario", scenario])
+    .arg("--binary")
+    .arg(binary)
+    .arg("--test-executable")
+    .arg(std::env::current_exe().unwrap())
+    .env("PYTHONDONTWRITEBYTECODE", "1")
+    .status()
+    .expect("launch RF3 transaction acceptance");
+    assert!(
+        status.success(),
+        "{scenario} RF3 transaction assertions failed"
+    );
+}
+
 #[test]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o01() {

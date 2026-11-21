@@ -325,6 +325,33 @@ pub(super) async fn lose_admission_rejection(request: Uuid) -> bool {
     true
 }
 
+pub(super) async fn lose_terminal_copy(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    if std::fs::remove_file(PathBuf::from(directory).join(format!("lose-terminal-copy-{request}")))
+        .is_err()
+    {
+        return false;
+    }
+    transaction_checkpoint("terminal-copy-lost", request, &request).await;
+    true
+}
+
+pub(crate) async fn lose_status_inspection(request: Uuid) -> bool {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    if !PathBuf::from(directory)
+        .join(format!("lose-status-inspection-{request}"))
+        .is_file()
+    {
+        return false;
+    }
+    transaction_checkpoint("status-inspect-unavailable", request, &request).await;
+    true
+}
+
 pub(super) fn observe_decision(
     stage: &str,
     statement: &crate::oltp_replication::types::DecisionStatement,
