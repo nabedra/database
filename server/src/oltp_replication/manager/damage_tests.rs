@@ -52,6 +52,8 @@ impl PeerDirectory for Directory {
 /// One worker process: pool on `FaultFs`, manager, transport.
 struct Worker {
     fault: FaultFs,
+    /// Holds this worker's journal syncs on demand (PERF2d tests).
+    gate: Option<crate::oltp_replication::typed_log::tests::GatedSync>,
     shared: Arc<WorkerSharedResources>,
     pool: Option<OltpPool>,
     manager: Option<Arc<HostedGroupManager>>,
@@ -84,6 +86,10 @@ impl Cluster {
     /// `count` workers, node `n` on worker `n - 1`; `voters` of them form the
     /// group, the others host a spare replica that is not a member yet.
     async fn new(count: usize, voters: usize) -> Self {
+        Self::new_with(count, voters, false).await
+    }
+    /// [`Self::new`], with every worker's journal syncs behind a gate.
+    async fn new_with(count: usize, voters: usize, gated: bool) -> Self {
         let dir = Temporary(std::env::temp_dir().join(format!("ns23-{}", Uuid::new_v4())));
         std::fs::create_dir(&dir.0).unwrap();
         let tls = tls::certificates(&dir.0, count as u64);
@@ -158,6 +164,7 @@ impl Cluster {
             fault.create_dir_all_durable(&path);
             cluster.workers.push(Worker {
                 fault,
+                gate: gated.then(crate::oltp_replication::typed_log::tests::GatedSync::new),
                 shared,
                 pool: None,
                 manager: None,
@@ -218,7 +225,10 @@ impl Cluster {
         let identity = self.pool_identity(index);
         let path = self.pool_path(index);
         let worker = &mut self.workers[index];
-        let fs: Arc<dyn Fs> = Arc::new(worker.fault.clone());
+        let fs: Arc<dyn Fs> = match &worker.gate {
+            Some(gate) => Arc::new(gate.over(worker.fault.clone())),
+            None => Arc::new(worker.fault.clone()),
+        };
         let pool = OltpPool::open_development_on(&path, identity, worker.shared.clone(), fs)?;
         let registry = Arc::new(EndpointRegistry::new(worker.shared.clone()));
         let transport = Arc::new(
@@ -278,6 +288,24 @@ impl Cluster {
         worker.fault = worker.fault.kill();
     }
 
+    /// Power cut of worker `index`: its disk becomes `disk` (a crash or
+    /// power-loss image taken earlier). The stopped replica may be fatal.
+    async fn power_cut(&mut self, index: usize, disk: FaultFs) {
+        let worker = &mut self.workers[index];
+        if let Some(manager) = worker.manager.take() {
+            let _ = manager.shutdown().await;
+        }
+        worker.host = None;
+        if let Some(stop) = worker.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(transport) = worker.transport.take() {
+            let _ = transport.await;
+        }
+        worker.pool = None;
+        worker.fault = disk;
+    }
+
     fn host(&self, index: usize) -> &ManagedTimestamps {
         self.workers[index].host.as_ref().unwrap()
     }
@@ -328,6 +356,41 @@ impl Cluster {
         applied.position
     }
 
+    /// [`Self::fence`] as a task whose outcome the caller inspects.
+    fn fence_task(
+        &self,
+        leader: usize,
+        term: u64,
+    ) -> tokio::task::JoinHandle<Result<AppliedPosition, ProtocolError>> {
+        let run_id = self.run_id;
+        let ready = move |term| ReadyMembership {
+            view: AuthorityView {
+                run_id,
+                owner_term: term,
+                membership_revision: 1,
+            },
+            ready_root: ReadySetHasher::default().finish(),
+            ready_count: 0,
+        };
+        let host = self.host(leader).clone();
+        tokio::spawn(async move {
+            let handle = TimestampHandle::new(
+                TimestampMachine::new(host.state.store().clone()).unwrap(),
+                host.clone(),
+            );
+            let expected = (term > 1).then(|| ready(term - 1).view.authority());
+            handle
+                .fence(
+                    Uuid::new_v4(),
+                    expected,
+                    ready(term).view.authority(),
+                    ready(term),
+                )
+                .await
+                .map(|applied| applied.position)
+        })
+    }
+
     /// The fenced authority term a replica applied.
     async fn applied_term(&self, index: usize) -> u64 {
         let saved = self
@@ -340,15 +403,16 @@ impl Cluster {
                     batch_bytes: 0,
                     output_bytes: 16 << 10,
                 },
-                |view| {
-                    let raw = view.get(b"ts/state")?.unwrap();
-                    view.copy_output(raw.as_ref())
+                // A restarted replica may not have replayed its state yet.
+                |view| match view.get(b"ts/state")? {
+                    Some(raw) => view.copy_output(raw.as_ref()),
+                    None => view.copy_output(b"null"),
                 },
             )
             .await
             .unwrap();
         let saved: serde_json::Value = serde_json::from_slice(saved.as_slice()).unwrap();
-        saved["authority"]["owner_term"].as_u64().unwrap()
+        saved["authority"]["owner_term"].as_u64().unwrap_or(0)
     }
 
     /// The last log index the leader knows `node` replicated.
@@ -891,6 +955,154 @@ async fn o29_rv_apply_latched_pool_stops_routing_without_a_restart_loop() {
         );
         assert!(!cluster.host(follower).raft.is_running());
         cluster.fence(leader, 3).await;
+        cluster.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Waits until replica `index` applied the fenced term `term`.
+async fn applied_term_reaches(cluster: &Cluster, index: usize, term: u64) {
+    timeout(Duration::from_secs(30), async {
+        while cluster.applied_term(index).await != term {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("replica {index} applies term {term}"));
+}
+
+/// O29/NS10, PERF2d (RF3, real workers on gated `FaultFs`): the leader's own
+/// journal sync is held after its append returned. Both followers sync and
+/// acknowledge the entry, so it commits without the leader, but the leader
+/// does not count itself and does not apply or acknowledge it before its own
+/// sync. Then the leader loses power before that sync: the client is never
+/// acknowledged, the followers keep the committed entry and apply it under a
+/// new leader, and the old leader catches up from them after its restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commit() {
+    timeout(Duration::from_secs(120), async {
+        let mut cluster = Cluster::new_with(3, 3, true).await;
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        let followers: Vec<usize> = (0..3).filter(|index| *index != leader).collect();
+        let first = cluster.fence(leader, 1).await;
+        let gate = cluster.workers[leader].gate.clone().unwrap();
+        gate.hold();
+        let fence = cluster.fence_task(leader, 2);
+        let next = first.index + 1;
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
+                let replicated = followers
+                    .iter()
+                    .all(|follower| cluster.matched(leader, *follower as u64 + 1) >= Some(next));
+                if replicated && metrics.cluster_committed.is_some_and(|id| id.index >= next) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both followers acknowledge and the entry commits");
+        assert!(gate.entered() > 0, "the leader's own sync is held");
+        assert!(
+            cluster.matched(leader, leader as u64 + 1) < Some(next),
+            "the leader counted itself before its sync"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !fence.is_finished(),
+            "the leader acknowledged before its own sync"
+        );
+        assert_eq!(cluster.applied_term(leader).await, 1);
+
+        let disk = cluster.workers[leader].fault.crash();
+        cluster.workers[leader].fault.halt();
+        gate.release();
+        let outcome = timeout(Duration::from_secs(20), fence).await;
+        assert!(
+            !matches!(outcome, Ok(Ok(Ok(_)))),
+            "an entry the leader never synced was acknowledged by it"
+        );
+        cluster.power_cut(leader, disk).await;
+
+        let elected = cluster.leader(&followers).await;
+        for follower in &followers {
+            applied_term_reaches(&cluster, *follower, 2).await;
+        }
+        cluster.start(leader, None, false).await.unwrap();
+        applied_term_reaches(&cluster, leader, 2).await;
+        cluster.fence(elected, 3).await;
+        for index in 0..3 {
+            applied_term_reaches(&cluster, index, 3).await;
+        }
+        cluster.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// O29/NS10, PERF2d (RF3, real workers on gated `FaultFs`): every replica's
+/// sync is held, so the entry is pending on all three and none acknowledges
+/// it. A power cut of all three loses it everywhere: it was never committed
+/// or acknowledged, and the restarted group fences the same term again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
+    timeout(Duration::from_secs(120), async {
+        let mut cluster = Cluster::new_with(3, 3, true).await;
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        let first = cluster.fence(leader, 1).await;
+        let gates: Vec<_> = (0..3)
+            .map(|index| cluster.workers[index].gate.clone().unwrap())
+            .collect();
+        for gate in &gates {
+            gate.hold();
+        }
+        let fence = cluster.fence_task(leader, 2);
+        timeout(Duration::from_secs(20), async {
+            while gates.iter().any(|gate| gate.entered() == 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every replica reaches its held sync");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
+        assert!(
+            metrics
+                .cluster_committed
+                .is_none_or(|id| id.index <= first.index),
+            "committed without a synced quorum: {:?}",
+            metrics.cluster_committed
+        );
+        assert!(!fence.is_finished());
+
+        let disks: Vec<_> = (0..3)
+            .map(|index| cluster.workers[index].fault.crash())
+            .collect();
+        for index in 0..3 {
+            cluster.workers[index].fault.halt();
+        }
+        for gate in &gates {
+            gate.release();
+        }
+        let outcome = timeout(Duration::from_secs(20), fence).await;
+        assert!(!matches!(outcome, Ok(Ok(Ok(_)))));
+        for (index, disk) in disks.into_iter().enumerate() {
+            cluster.power_cut(index, disk).await;
+        }
+        for index in 0..3 {
+            cluster.start(index, None, false).await.unwrap();
+        }
+        let leader = cluster.leader(&[0, 1, 2]).await;
+        for index in 0..3 {
+            applied_term_reaches(&cluster, index, 1).await;
+        }
+        // Fencing term 2 again expects term 1: the lost entry never applied.
+        cluster.fence(leader, 2).await;
+        for index in 0..3 {
+            applied_term_reaches(&cluster, index, 2).await;
+        }
         cluster.shutdown().await;
     })
     .await
