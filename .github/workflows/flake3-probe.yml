@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fixture: [typed-log, d11]
+        fixture: [d11]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.94.1 --profile minimal
@@ -68,6 +68,7 @@ jobs:
               --suite d11 --output "flake3/d11-$round" > "flake3/d11-$round.log" 2>&1 || rc=$?
             printf 'round=%s exit=%s\n' "$round" "$rc"
             cat "flake3/d11-$round.log"
+            grep -E "FLAKE3|index build stopped" "flake3/d11-$round/logs/rf1-cli-server-stderr.log" | tail -30 || true
             if [ "$rc" != 0 ]; then failed=$((failed + 1)); fi
           done
           echo "$failed/8 rounds failed"
