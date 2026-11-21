@@ -1824,6 +1824,7 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
         key_type: ColumnType::Int64,
         schema_epoch: 1,
         range: Arc::new(RangeRoute::new(group(None, Some(10)))),
+        unavailable: AtomicBool::new(false),
         _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
     };
     let keys = |bytes: &[u8]| {
@@ -1913,6 +1914,7 @@ fn o28_topology_cache_is_a_byte_bounded_range_lru() {
             key_type: ColumnType::Int64,
             schema_epoch: 1,
             range: Arc::new(RangeRoute::new(shard)),
+            unavailable: AtomicBool::new(false),
             _charge: shared
                 .reserve_scratch(ByteClass::Progress, CACHE_BYTES / 2)
                 .unwrap(),

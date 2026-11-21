@@ -60,7 +60,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -262,12 +262,16 @@ pub(crate) struct TableRoute {
     pub key_type: ColumnType,
     pub schema_epoch: u64,
     pub range: Arc<RangeRoute>,
+    // Keep key-column metadata on an unavailable range so retrying an
+    // insert can look up its anchor without filling another range first.
+    unavailable: AtomicBool,
     _charge: ScratchLease,
 }
 impl TableRoute {
     fn covers(&self, key: Option<&Key>) -> bool {
         key.is_none_or(|key| {
-            key.validate(self.key_type).is_err() || self.range.shard.contains_key(key)
+            !self.unavailable.load(Ordering::Relaxed)
+                && (key.validate(self.key_type).is_err() || self.range.shard.contains_key(key))
         })
     }
 
@@ -380,12 +384,6 @@ impl TopologyCache {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(table_id, |_, _| true);
-    }
-    fn remove_if_current(&self, route: &Arc<TableRoute>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(route.table_id, |current, _| Arc::ptr_eq(current, route));
     }
     fn usage(&self) -> (usize, usize, usize) {
         let lru = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -836,9 +834,9 @@ impl DirectGateway {
                 // The anchor cannot be reached: the request may have run
                 // directly before, so it must not go queued.
                 Err(_) => {
-                    // A retired parent cannot answer StaleRoute. Drop only
-                    // this attempt's route so an exact retry can read Catalog.
-                    self.cache.remove_if_current(&current);
+                    // A retired parent cannot answer StaleRoute. Disable only
+                    // this attempt's range so an exact retry can read Catalog.
+                    current.unavailable.store(true, Ordering::Relaxed);
                     return Err(self.final_error(unknown()));
                 }
             }
@@ -916,7 +914,7 @@ impl DirectGateway {
                 // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
                     *uncertain = true;
-                    self.cache.remove_if_current(&table);
+                    table.unavailable.store(true, Ordering::Relaxed);
                     return Err(deadline_error(true));
                 }
                 Ok(reply) => reply,
@@ -944,7 +942,7 @@ impl DirectGateway {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
-                        self.cache.remove_if_current(&table);
+                        table.unavailable.store(true, Ordering::Relaxed);
                         return Err(error);
                     }
                     if error.outcome == Outcome::Unknown {
@@ -1155,6 +1153,7 @@ impl DirectGateway {
             key_type: fill.key_type,
             schema_epoch: fill.schema_epoch,
             range,
+            unavailable: AtomicBool::new(false),
             _charge: charge,
         })
     }
