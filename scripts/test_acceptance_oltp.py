@@ -24,6 +24,7 @@ class EssentialRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             report = json.loads((root / 'report/results.json').read_text())
             self.assertEqual(len(report['results']), 29)
+            self.assertIn("O01 not-run: executed 0/6 clauses", result.stdout)
             self.assertEqual(report['summary'], {'passed': 0, 'failed': 0, 'not-run': 1})
             self.assertEqual(next(r for r in report['results'] if r['scenario'] == 'O01')['status'], 'not-run')
 
@@ -39,24 +40,45 @@ class EssentialRunnerTests(unittest.TestCase):
     def test_actual_results_ignored_tests_and_missing_prerequisites_remain_distinct(self):
         passed = 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n'
         marker = acceptance.MARKER + json.dumps(dict(scenario='O01', status='not-run', reason='provider unavailable')) + '\n'
-        cases = [
-            (passed, 0, 'passed'),
-            ('test result: ok. 0 passed; 0 failed; 1 ignored;\n', 0, 'not-run'),
-            (passed + marker, 0, 'not-run'),
-            (marker, 1, 'failed'),
-            (passed + acceptance.MARKER + '{}\n', 0, 'failed'),
-            ('', 0, 'not-run'),
-        ]
         scenario = next(s for s in acceptance.SCENARIOS if s.id == 'O01')
+
+        def assertion(clause, status='passed', **fields):
+            return acceptance.ASSERTION_MARKER + json.dumps(dict(
+                scenario='O01', assertion=clause, status=status,
+                detail={'fixture': 'unit test'},
+            ) | fields) + '\n'
+
+        first, last = scenario.clauses[0], scenario.clauses[-1]
+        complete = ''.join(map(assertion, scenario.clauses))
+        incomplete = ''.join(map(assertion, scenario.clauses[:-1]))
+        cases = [
+            (complete + passed, 0, 'passed', 6, []),
+            (passed, 0, 'not-run', 0, scenario.clauses),
+            (incomplete + passed, 0, 'not-run', 5, [last]),
+            (incomplete + assertion(last, 'not-run') + passed, 0, 'not-run', 5, [last]),
+            (incomplete + assertion(last, 'failed') + passed, 0, 'failed', 6, []),
+            ('test result: ok. 0 passed; 0 failed; 1 ignored;\n', 0, 'not-run', 0, scenario.clauses),
+            (complete + passed + marker, 0, 'not-run', 6, []),
+            (marker, 1, 'failed', 0, scenario.clauses),
+            (passed + acceptance.MARKER + '{}\n', 0, 'failed', 0, scenario.clauses),
+            (passed + assertion(first, scenario='O02'), 0, 'failed', 0, scenario.clauses),
+            (passed + assertion('invented'), 0, 'failed', 0, scenario.clauses),
+            (passed + complete + assertion(first), 0, 'failed', 6, []),
+        ]
         with tempfile.TemporaryDirectory(prefix='nabedra-runner-test-') as directory:
             root = Path(directory)
             binary = root / 'fake-test-executable'
-            for output, exit_code, expected in cases:
+            for output, exit_code, expected, executed, missing in cases:
                 with self.subTest(expected=expected, exit_code=exit_code, output=output):
                     binary.write_text(f'#!{sys.executable}\nimport sys\nprint({output!r}, end="")\nsys.exit({exit_code})\n')
                     binary.chmod(0o700)
                     result = acceptance.run_scenario(binary, 'acceptance_o01', scenario, {}, root / 'case.log', 5)
                     self.assertEqual(result['status'], expected)
+                    self.assertEqual(result['executed_clauses'], executed)
+                    self.assertEqual(result['missing_clauses'], missing)
+                    self.assertTrue(all(clause in result['reason'] for clause in missing))
+                    self.assertTrue(all(report['detail'] == {'fixture': 'unit test'}
+                                        for report in result['assertions']))
 
 
 if __name__ == '__main__':

@@ -550,10 +550,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Build the OLAP server for engine parity
+        run: |
+          cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap \
+            --bin nabedra-db --target-dir server/target/olap
       - name: Acceptance (no AWS, no comparative benchmarks)
         run: |
           # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
-          rc=0; python scripts/acceptance_oltp.py --category compatibility --category queries --category transactions \
+          python -m unittest discover -s scripts -p test_acceptance_oltp.py
+          rc=0
+          python scripts/acceptance_oltp.py --olap-binary server/target/olap/debug/nabedra-db \
+            --category compatibility --category queries --category transactions \
             --category recovery --category growth --output artifacts/oltp-acceptance || rc=$?
           [ "$rc" = 0 ] || [ "$rc" = 2 ]
       - if: always()
@@ -634,19 +641,28 @@ jobs:
         run: |
           set -o pipefail
           NABEDRA_TEST_DIRECT_OLTP=off "$NABEDRA_TEST_EXE" --test-threads 4 $OLTP_BASELINE_SKIPS 2>&1 | tee ../artifacts/oltp-lib-direct-off.log
-      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
+      - name: Build the OLAP server for engine parity
+        id: build-olap
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
+          cargo build --locked --manifest-path server/Cargo.toml --no-default-features --features olap \
+            --bin nabedra-db --target-dir server/target/olap
+      - name: OLTP acceptance, direct_oltp on and off (no AWS, no benchmarks)
+        if: ${{ !cancelled() && steps.build-olap.outcome == 'success' }}
+        run: |
+          python -m unittest discover -s scripts -p test_acceptance_oltp.py
           status=0
           for mode in on off; do
+            echo "direct_oltp=$mode"
+            rc=0
             NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
-              --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
-              --category recovery --category growth --output "artifacts/acceptance-$mode" > "artifacts/acceptance-$mode.log" 2>&1 || rc=$?
-            # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
-            if [ "${rc:-0}" != 0 ] && [ "$rc" != 2 ]; then status=1; fi; rc=0
-            tail -40 "artifacts/acceptance-$mode.log"
+              --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
+              --category compatibility --category queries --category transactions --category recovery --category growth \
+              --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
+            # Exit 2 means some scenarios still lack full coverage.
+            if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
           done
-          exit $status
+          exit "$status"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
