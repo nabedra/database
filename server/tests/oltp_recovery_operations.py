@@ -178,6 +178,67 @@ def two_ready(cluster, survivors):
                .get('ready_workers') == 2 for name in survivors)
 
 
+def o06_o17_system_replacement_check(binary, test_executable, root):
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable)
+    try:
+        cluster.start()
+        connection = cluster.admin('cluster.connection', {})
+        victim = WORKERS[0]
+        survivors = [name for name in WORKERS if name != victim]
+        enrollment = cluster.enrollments[victim]
+        previous = {field: enrollment[field] for field in IDENTITY_FIELDS}
+        check = operation('worker.system_replacement.check',
+                          dict(run_id=connection['run_id'], previous=previous))
+
+        def observe(token=None):
+            return send(cluster.urls[survivors[0]], token or cluster.auth['admin_token'], check,
+                        path='/v1/cluster/operations', timeout=15)
+
+        status, reply = observe(cluster.auth['data_token'])
+        assert status in (401, 403), (status, reply)
+        status, reply = observe()
+        assert status == 409 and 'reachable' in json.dumps(reply), (status, reply)
+
+        cluster.wait_direct_active()
+        send_op = lambda body: send(cluster.api_urls['api1'], cluster.auth['data_token'],
+                                    body, ca=cluster.ca)
+        table = create(send_op, 'rep3_preflight')
+        acknowledged = insert(table, 1, 77)
+        original = send_op(acknowledged)
+        assert success(*original) is None
+        cluster.workers[victim].kill()
+        mount = Path(cluster.config[victim]['node']['directory'])
+        subprocess.run(['sudo', '-n', 'umount', str(mount)], check=True, timeout=60)
+        cluster.mounted.remove(mount)
+        assert not (mount / 'pool').exists()
+        wait_for(lambda: two_ready(cluster, survivors), 'surviving ready workers')
+
+        cluster.workers[survivors[1]].pause()
+        try:
+            status, reply = observe()
+            assert status == 503, (status, reply)
+        finally:
+            cluster.workers[survivors[1]].resume()
+
+        def checked():
+            status, reply = observe()
+            if status == 503:
+                return None
+            return success(status, reply)
+
+        result = wait_for(checked, 'all affected groups have surviving quorum', PROBE_WINDOW)
+        expected = {group['identity']['group_id']
+                    for group in cluster.config[victim]['node']['placements'].values()}
+        expected.add(initial_range(cluster, table)['group_id'])
+        assert set(result['groups']) == expected, result
+        assert send_op(acknowledged) == original
+        assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
+        report('O06/O17 system replacement preflight', lost_worker=victim,
+               groups=len(expected), refused_live_worker=True, refused_without_quorum=True)
+    finally:
+        cluster.close()
+
+
 def restart_during_split(cluster, send_op):
     table = create(send_op, 'rep1_split')
     rows = [{'id': key, 'value': key * 3} for key in (1, 9)]
@@ -475,7 +536,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart'), default='all')
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check'), default='all')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='nabedra-rep1-') as directory:
         root = Path(directory).resolve()
@@ -484,6 +545,9 @@ def main():
         if args.suite in ('all', 'restart'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_r01_r03_r06_retained_restart(args.binary, args.test_executable, root / 'restart')
+        if args.suite in ('all', 'replacement-check'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
 
 
 if __name__ == '__main__':
