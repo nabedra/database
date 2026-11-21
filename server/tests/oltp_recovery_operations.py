@@ -930,8 +930,10 @@ def o17_a02_scale(binary, test_executable, root):
                       mount=mount, mount_public_key=public.hex())
         assert cluster.admin('storage.growth.prepare_worker', intent)['identity'] == worker
         bind = f'127.0.0.1:{free_port()}'
+        auth = root / 'data-worker-auth.json'
+        write_json(auth, {key: cluster.auth[key] for key in ('admin_token', 'data_token')}, 0o600)
         # The native data-worker process does not use the test executable.
-        cfg = dict(version=1, bind=bind, auth_file=str(root / 'auth.json'),
+        cfg = dict(version=1, bind=bind, auth_file=str(auth),
                    resources=resources(1024 << 20), execution=EXECUTION,
                    node=dict(intent=intent, bind=enrollment['endpoint'], scheduler_node_id=4,
                              certificate=str(root / f'{name}.pem'), private_key=str(root / f'{name}.key'),
