@@ -133,7 +133,7 @@ where
             {
                 return Err(unavailable());
             }
-            Ok(super::hosted::position(*membership_position))
+            Ok(super::hosted::position(membership_position))
         })
     }
     fn leader(&self) -> Option<u64> {

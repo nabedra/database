@@ -287,6 +287,9 @@ impl ControlHandle {
     ) -> Result<(), ProtocolError> {
         self.registered_directory.set(directory).map_err(|_| unauthorized())
     }
+    pub(crate) fn system_placement_changed(&self) -> bool {
+        self.registered_directory.get().is_some_and(|directory| directory.system_placement_changed())
+    }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
         self.machine.store().resources()
     }
@@ -1854,7 +1857,7 @@ impl AuthorityReader for ControlHandle {
         Box::pin(self.authority(scope, Some((remote, timestamps_group_id)), false))
     }
 }
-fn load<T: serde::de::DeserializeOwned>(
+pub(super) fn load<T: serde::de::DeserializeOwned>(
     view: &mut GroupRead<'_>,
     key: &[u8],
 ) -> Result<Option<T>, ProtocolError> {

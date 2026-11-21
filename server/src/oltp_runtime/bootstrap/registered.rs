@@ -545,6 +545,14 @@ impl LocalServices {
             });
             let catalog =
                 CatalogHandle::new(startup_read(deadline, &error_trace, "Catalog participant", || resolver.participant(&placements.catalog.identity)).await?)?;
+            if replacing {
+                use crate::oltp_replication::authority::control::{DIRECT_VERSION, DirectCapabilityOperation};
+                startup_read(deadline, &error_trace, "replacement direct capability", || async {
+                    rpc.change_direct_capability(Uuid::new_v4(), DirectCapabilityOperation::Advertise {
+                        version: DIRECT_VERSION,
+                    }).await.map(|_| ())
+                }).await?;
+            }
             let (state, ticket, bootstrap) = restart::begin_queue_join(
                 &control, &operator, local, seed, deadline, &error_trace,
             ).await?;
@@ -1110,6 +1118,7 @@ impl ParticipantResolver for RegisteredParticipants {
                     end: None,
                 },
             };
+            let voters = self.data.initial_voters(&self.control, &self.rpc).await?;
             let started = tokio::time::Instant::now();
             let hosted = async {
                 let current = self
@@ -1123,13 +1132,13 @@ impl ParticipantResolver for RegisteredParticipants {
                     return Err(unavailable());
                 }
                 let ready = ready_members(&self.control, current.ready).await?;
-                self.data.host_all(spec.clone(), &self.control, &ready).await
+                self.data.host_all(spec.clone(), &self.control, &ready, &voters).await
             }
             .await;
             tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = started.elapsed().as_millis(), ok = hosted.is_ok(), "initial Data group");
             hosted?;
             let started = tokio::time::Instant::now();
-            let activated = self.data.activate(spec).await;
+            let activated = self.data.activate(spec, &voters).await;
             tracing::debug!(group_id = %group.group_id, stage = "data_activate", ms = started.elapsed().as_millis(), ok = activated.is_ok(), "initial Data group");
             let observation = activated?;
             let generation = id(group.group_id, b"control-membership");

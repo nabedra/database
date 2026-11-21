@@ -1248,7 +1248,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
         let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
         let syncs = || pool.kv_store().stats().journal_syncs;
         let before = syncs();
-        rig.gated.state(|gate| gate.closed = true);
+        let held_sync = rig.gated.hold();
         let mut acks = Vec::new();
         let mut ack = |index: u64| {
             let (sent, acked) = TestConfig::oneshot();
@@ -1257,7 +1257,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
         };
         let (entries, flushed) = ack(0);
         log.append(entries, flushed).await.unwrap();
-        rig.entered().await;
+        rig.gated.wait_for_sync().await;
         for index in [1, 2] {
             let (entries, flushed) = ack(index);
             log.append(entries, flushed).await.unwrap();
@@ -1287,7 +1287,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
                 "no append reports a flush before its sync"
             );
         }
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held_sync);
         let mut voter = vote.await.unwrap();
         for acked in acks {
             acked.await.unwrap().unwrap();

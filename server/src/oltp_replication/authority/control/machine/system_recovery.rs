@@ -405,7 +405,7 @@ fn publish(
             Ok::<_, ProtocolError>(count + usize::from(tx.get(&published(id, item.expected.identity.group_id))?.is_none()))
         })?;
     let next = plan.next(record.intent.previous.worker_id)?;
-    let digest = serialized_digest(&(b"nabedra/system-replacement-placement/v1", id, group))?;
+    let digest = serialized_digest(&(b"nabedra/system-replacement-placement/v1".as_slice(), id, group))?;
     let generation = Uuid::from_bytes(digest.as_bytes()[..16].try_into().expect("digest prefix"));
     let placement = GroupRecord {
         identity: plan.expected.identity.clone(),

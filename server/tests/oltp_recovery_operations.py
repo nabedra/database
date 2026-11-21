@@ -303,8 +303,17 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         assert success(*operator(leader, enable)) == activation
         fresh = cluster.certificate('replacement')
         fresh_mount = cluster.mount_pool('replacement', uid(), fresh)
+        mount_key = cluster.root / 'replacement-mount.pem'
+        cluster.openssl('genpkey', '-algorithm', 'Ed25519', '-out', mount_key)
+        mount_key.chmod(0o600)
+        def mount_der(*args):
+            return subprocess.check_output(['openssl', 'pkey', '-in', str(mount_key),
+                                            '-outform', 'DER', *args], timeout=30)[-32:]
+        mount_seed = Path(fresh_mount['mount_path']) / 'NABEDRA_RESTART_KEY'
+        mount_seed.write_bytes(mount_der())
+        mount_seed.chmod(0o600)
         intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
-                      next=fresh, mount=fresh_mount)
+                      next=fresh, mount=fresh_mount, mount_public_key=mount_der('-pubout').hex())
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
         borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
         bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))

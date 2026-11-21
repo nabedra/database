@@ -32,7 +32,7 @@ struct Entry {
     _charge: Arc<ScratchLease>,
 }
 struct SystemTrust {
-    operators: BTreeSet<WorkerIdentity>,
+    operators: BTreeMap<Uuid, WorkerEnrollment>,
     revoked_workers: BTreeSet<Uuid>,
     revoked_certificates: BTreeSet<Digest>,
     candidate: Option<(ReplacementRecord, bool)>,
@@ -107,14 +107,14 @@ impl AppliedPeerDirectory {
     pub(crate) fn install_system_trust(
         &self,
         _revision: u64,
-        operators: Vec<WorkerIdentity>,
+        operators: Vec<WorkerEnrollment>,
         revoked: Vec<WorkerIdentity>,
         candidate: Option<(ReplacementRecord, bool)>,
     ) -> Result<(), ProtocolError> {
         let charge = self.shared.reserve_scratch(crate::oltp::pool::ByteClass::Progress,
             4096 + revoked.len() * 128 + candidate.as_ref().map_or(0, |(record, _)| record.groups.len() * 2048))?;
         *self.system.write().map_err(|_| unavailable())? = Some(SystemTrust {
-            operators: operators.into_iter().collect(),
+            operators: operators.into_iter().map(|entry| (entry.worker_id, entry)).collect(),
             revoked_workers: revoked.iter().map(|worker| worker.worker_id).collect(),
             revoked_certificates: revoked.iter().map(|worker| worker.certificate_sha256).collect(),
             candidate,
@@ -128,13 +128,19 @@ impl AppliedPeerDirectory {
             state.candidate.as_ref().is_some_and(|(_, mounted)| *mounted)))
     }
 
+    pub(crate) fn system_placement_changed(&self) -> bool {
+        self.system.read().is_ok_and(|system| system.as_ref().is_some_and(|state|
+            !state.revoked_workers.is_empty()))
+    }
+
     pub(crate) fn replacement_capability_active(&self) -> bool {
         self.system.read().is_ok_and(|system| system.is_some())
     }
 
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
         match self.system.read() {
-            Ok(state) => state.as_ref().map(|state| state.operators.contains(&identity)),
+            Ok(state) => state.as_ref().map(|state| state.operators.get(&identity.worker_id)
+                .is_some_and(|entry| WorkerIdentity::from(entry) == identity)),
             Err(_) => Some(false),
         }
     }
@@ -360,11 +366,18 @@ impl PeerDirectory for AppliedPeerDirectory {
             {
                 return Ok(record.intent.next.clone());
             }
+            // During a retained restart the prepared entry must override the
+            // previous operator, so applied operators are a later fallback.
         }
         if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
             .as_ref().filter(|candidate| candidate.enrollment.worker_id == worker)
         {
             return Ok(candidate.enrollment.clone());
+        }
+        if let Some(enrollment) = self.system.read().map_err(|_| unavailable())?
+            .as_ref().and_then(|state| state.operators.get(&worker))
+        {
+            return Ok(enrollment.clone());
         }
         self.entries
             .read()
@@ -393,9 +406,11 @@ impl PeerDirectory for AppliedPeerDirectory {
                     return Err(invalid());
                 }
                 let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
-                    || (*mounted && purpose == Purpose::Raft
+                    || (*mounted && matches!(purpose, Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress)
                         && record.groups.iter().any(|plan| plan.expected.identity == *group))
-                    || (*mounted && state.operators.contains(&peer));
+                    || (*mounted && state.operators.get(&peer.worker_id)
+                        .is_some_and(|entry| WorkerIdentity::from(entry) == peer) && group == &self.control
+                        && matches!(purpose, Purpose::Authority | Purpose::ControlDelegation));
                 return if admitted { Ok(TransportTrust::AppliedEnrollment) } else { Err(unavailable()) };
             }
         }
@@ -418,6 +433,15 @@ impl PeerDirectory for AppliedPeerDirectory {
                 // retained restart. Until enrollment, route callers must
                 // continue to the surviving replicas.
                 Err(unavailable())
+            };
+        }
+        if let Some(operator) = self.system.read().map_err(|_| unavailable())?
+            .as_ref().and_then(|state| state.operators.get(&peer.worker_id))
+        {
+            return if WorkerIdentity::from(operator) == peer {
+                Ok(TransportTrust::AppliedEnrollment)
+            } else {
+                Err(invalid())
             };
         }
         let entries = self.entries.read().map_err(|_| unavailable())?;
@@ -449,7 +473,8 @@ impl PeerDirectory for AppliedPeerDirectory {
                 Ok(TransportTrust::AppliedEnrollment)
             }
             Role::BootstrapControl(_)
-                if (purpose == Purpose::Raft || (group == &self.control && purpose == Purpose::SystemRecovery))
+                if (matches!(purpose, Purpose::Raft | Purpose::Snapshot | Purpose::RaftProgress)
+                    || (group == &self.control && purpose == Purpose::SystemRecovery))
                     && self.learner_groups.read().map_err(|_| unavailable())?
                         .get(&peer.worker_id).is_some_and(|groups| groups.contains(&group.group_id)) =>
             {

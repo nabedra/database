@@ -14,16 +14,16 @@ impl ControlMachine {
         let raw = self
             .store
             .read_metadata(BUDGET, move |view| {
-                let Some(state) = load::<State>(view, STATE)? else {
+                let Some(state) = super::super::service::load::<State>(view, STATE)? else {
                     return view.encode(&None::<Trust>);
                 };
                 if view.get(system_recovery::ACTIVATION)?.is_none() {
                     return view.encode(&None::<Trust>);
                 }
-                let active = load::<Uuid>(view, system_recovery::ACTIVE)?;
-                let candidate = match load::<Uuid>(view, system_recovery::PREPARING)? {
+                let active = super::super::service::load::<Uuid>(view, system_recovery::ACTIVE)?;
+                let candidate = match super::super::service::load::<Uuid>(view, system_recovery::PREPARING)? {
                     Some(id) => Some((
-                        load::<ReplacementRecord>(view, &system_recovery::by_id(id))?
+                        super::super::service::load::<ReplacementRecord>(view, &system_recovery::by_id(id))?
                             .ok_or_else(unknown)?,
                         active == Some(id),
                     )),
@@ -43,7 +43,7 @@ impl ControlMachine {
                     if page.exhausted { break; }
                 }
                 let mut operators = Vec::new();
-                let group = load::<GroupRecord>(view, &key(GROUPS, control_id))?;
+                let group = super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;
                 if let Some(group) = group {
                     let mut members = Vec::new();
                     view.scan_page(&member_prefix(group.generation), None, 16, |_, bytes| {
@@ -51,8 +51,8 @@ impl ControlMachine {
                         Ok(())
                     })?;
                     for member in members {
-                        if let Some(worker) = load::<WorkerRecord>(view, &key(WORKERS, member.worker_id))? {
-                            operators.push(WorkerIdentity::from(&worker.enrollment));
+                        if let Some(worker) = super::super::service::load::<WorkerRecord>(view, &key(WORKERS, member.worker_id))? {
+                            operators.push(worker.enrollment);
                         }
                     }
                 }
@@ -74,7 +74,7 @@ impl ControlMachine {
 #[derive(Serialize, serde::Deserialize)]
 struct Trust {
     revision: u64,
-    operators: Vec<WorkerIdentity>,
+    operators: Vec<WorkerEnrollment>,
     revoked: Vec<WorkerIdentity>,
     candidate: Option<(ReplacementRecord, bool)>,
 }
