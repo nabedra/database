@@ -58,6 +58,9 @@ pub trait TypedConfig:
     fn accepts(_kind: &GroupKind) -> bool {
         false
     }
+    fn requires_index_reclamation(_command: &Self::Command) -> bool {
+        false
+    }
     const MAX_REPLY_DECODE_BYTES: usize = 256 << 10;
     type Reply: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static;
 }

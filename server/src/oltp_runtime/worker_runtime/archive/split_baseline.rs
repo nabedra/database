@@ -122,7 +122,7 @@ impl WorkerRuntime {
                                 participant,
                                 child,
                                 row.source_pin.read_ts,
-                                true,
+                                None,
                             )
                             .await?;
                         }

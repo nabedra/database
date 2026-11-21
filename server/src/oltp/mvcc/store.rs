@@ -31,6 +31,7 @@ pub(crate) mod direct;
 mod handle;
 pub(crate) mod image_archive;
 pub(crate) mod index;
+pub(crate) mod index_reclaim;
 pub(crate) mod lifecycle;
 pub(crate) mod lineage;
 pub(crate) mod point;
@@ -176,6 +177,7 @@ pub(crate) enum ParticipantCommand {
     /// Activates direct commits on a Data group, or fences them before a
     /// DDL publishes (plan section 7). Gated like `Direct`.
     DirectSchema(direct::DirectSchemaFence),
+    ReclaimIndex(index_reclaim::ReclaimIndex),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -221,6 +223,10 @@ pub(crate) enum ParticipantReply {
         published_at: CommitTs,
     },
     DirectSchema(direct::DirectSchema),
+    IndexReclaimed {
+        deleted: usize,
+        complete: bool,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -621,6 +627,9 @@ fn apply(
         ParticipantCommand::DirectSchema(fence) => {
             return direct::schema(tx, group, config, fence);
         }
+        ParticipantCommand::ReclaimIndex(reclaim) => {
+            return index_reclaim::apply(tx, group, config, *reclaim);
+        }
         _ => {}
     }
     let Some(config) = config else {
@@ -632,7 +641,7 @@ fn apply(
     let (scope, command) = match command {
         ParticipantCommand::Scoped { scope, command } => {
             let command = command.payload()?;
-            if command.is_direct() {
+            if command.is_direct() || matches!(command, ParticipantCommand::ReclaimIndex(_)) {
                 return reject(tx, Fault::InvalidBinding);
             }
             if let Err(fault) = scoped_queue::check(tx, group, &config, *scope, command)? {
@@ -663,7 +672,7 @@ fn apply(
         }
         _ => (None, false, command),
     };
-    if command.is_direct() {
+    if command.is_direct() || matches!(command, ParticipantCommand::ReclaimIndex(_)) {
         return reject(tx, Fault::InvalidBinding);
     }
     if let ParticipantCommand::Lifecycle(command) = command {
@@ -1077,7 +1086,8 @@ fn apply(
         | ParticipantCommand::DirectForward(_)
         | ParticipantCommand::DirectPause(_)
         | ParticipantCommand::ChildPublished(_)
-        | ParticipantCommand::DirectSchema(_) => unreachable!(),
+        | ParticipantCommand::DirectSchema(_)
+        | ParticipantCommand::ReclaimIndex(_) => unreachable!(),
     }
 }
 
@@ -1331,6 +1341,7 @@ impl std::fmt::Display for ParticipantCommand {
             Self::DirectPause(_) => "participant-direct-pause",
             Self::ChildPublished(_) => "participant-child-published",
             Self::DirectSchema(_) => "participant-direct-schema",
+            Self::ReclaimIndex(_) => "participant-reclaim-index",
         })
     }
 }
@@ -1773,3 +1784,5 @@ impl OwnedPayload for ParticipantCommand {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::index_reclamation_storage_evidence;

@@ -9,6 +9,7 @@ mod deployment;
 mod direct_gateway;
 mod index_admin;
 mod index_backend;
+mod index_reclaim;
 mod migration;
 mod placement;
 mod pool_drain;
@@ -249,26 +250,30 @@ impl WorkerRuntime {
             }
         }
         let retirement = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let Some(runtime) = weak.upgrade() else {
-                    break;
-                };
-                if !runtime.accepting.load(Ordering::Acquire) {
-                    break;
+            let reclaim = index_reclaim::reclaim_indexes(weak.clone());
+            let retire = async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let Some(runtime) = weak.upgrade() else {
+                        break;
+                    };
+                    if !runtime.accepting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = runtime.tick_supervision();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.dispatch_retained(),
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.retire_expired(),
+                    )
+                    .await;
                 }
-                let _ = runtime.tick_supervision();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.dispatch_retained(),
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.retire_expired(),
-                )
-                .await;
-            }
+            };
+            tokio::join!(retire, reclaim);
         });
         *runtime.retirement.lock().map_err(|_| unknown())? = Some(retirement);
         let endpoint = super::application::ApplicationEndpoint::new(&runtime);

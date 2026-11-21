@@ -3,7 +3,7 @@
 //! Current process enrollment remains a transport concern, not a Raft node ID.
 use super::{
     authority::consensus::Applied,
-    entry::{LogId, OwnedRaftEntry, Vote},
+    entry::{LogId, OwnedRaftEntry, Payload, Vote},
     hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
@@ -338,7 +338,7 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         rpc.entries.truncate(encoded.len());
         let previous = rpc.prev_log_id;
         let last = rpc.last_log_id();
-        let (payload, entries, target) = match encoded.len() {
+        let (payload, entries, mut target) = match encoded.len() {
             0 => (None, None, RequestTarget::from(self.node.worker_id)),
             1 => (
                 encoded.pop(),
@@ -356,6 +356,12 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 )
             }
         };
+        if rpc.entries.iter().any(|entry| match entry.payload() {
+            Payload::Normal(command) => command.payload().is_ok_and(C::requires_index_reclamation),
+            _ => false,
+        }) {
+            target = RequestTarget::Feature(self.node.worker_id, PeerFeature::IndexReclamation);
+        }
         let header = Header {
             from_node: self.factory.local.node_id,
             to_node: self.target,
