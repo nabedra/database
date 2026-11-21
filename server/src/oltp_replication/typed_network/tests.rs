@@ -15,7 +15,7 @@ use crate::{
         types::*,
     },
 };
-use openraft::{RaftSnapshotBuilder, storage::RaftStateMachine};
+use openraft::storage::RaftStateMachine;
 use std::{collections::BTreeMap, path::PathBuf};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use uuid::Uuid;
@@ -214,9 +214,10 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
             .fence(Uuid::new_v4(), None, ready.view.authority(), ready)
             .await
             .unwrap();
+        // SNAP1: what the replication task sends a lagging follower: a fresh
+        // cut, whose file is written during the transfer below.
         let mut state = hosts[leader].state.clone();
-        let mut builder = state.get_snapshot_builder().await;
-        let snapshot = builder.build_snapshot().await.unwrap();
+        let snapshot = state.get_current_snapshot().await.unwrap().unwrap();
         let expected = snapshot.meta.clone();
         let mut factory = TypedNetworkFactory::<TimestampConfig>::new(
             managers[leader].client(),

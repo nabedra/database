@@ -1100,7 +1100,7 @@ pub(super) fn registered_raft_config() -> openraft::Config {
     }
 }
 
-fn raft_config() -> openraft::Config {
+pub(crate) fn raft_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 100,
         election_timeout_min: 200,
