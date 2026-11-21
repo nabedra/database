@@ -1060,6 +1060,42 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
     cluster.shutdown().await;
 }
 
+/// O28: a point lookup must work past the former 1,024-range fill cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o28_gateway_routes_a_key_past_the_former_table_fill_cap() {
+    let mut cluster = Cluster::new().await;
+    let last = cluster.add_group(span(Some(1025), None), 1026, &[1]).await;
+    let mut fill = cluster.fill(&[last]);
+    let template = fill.shards[0].clone();
+    for end in (1..=1025).rev() {
+        let mut shard = template.clone();
+        shard.group.group_id = Uuid::new_v4();
+        let GroupKind::Data { shard_id, .. } = &mut shard.group.kind else {
+            unreachable!();
+        };
+        *shard_id = Uuid::new_v4();
+        shard.span = span((end > 1).then_some(end - 1), Some(end));
+        fill.shards.insert(0, shard);
+    }
+    let source = Source::new(vec![fill], cluster.voters());
+    let switch = direct_on();
+    let gateway = cluster.gateway(switch.clone(), source.clone(), cluster.transport());
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 1025}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    switch.set_direct_oltp(false);
+    let id = Uuid::new_v4();
+    let update = cluster.body(
+        id,
+        "table.update",
+        json!({"key": 1025, "values": {"value": 1}}),
+    );
+    assert_eq!(answer(&gateway, &update, id).await, Answer::Queued);
+    assert!(cluster.settled(last, 1025, id).await);
+    assert_eq!(source.reads(), (1, 1));
+    cluster.shutdown().await;
+}
+
 /// O28/D07: a cached parent cannot report a newer epoch after its voters
 /// retire. Settle the queued mutation at the child from a refreshed Catalog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
