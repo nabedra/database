@@ -479,9 +479,22 @@ async fn snap1_o11_o16_policy_builds_write_nothing_and_current_snapshot_is_a_fre
     assert_eq!(files(&snapshots), 0, "a policy build wrote a snapshot file");
 
     let mut state = node.consensus.state.clone();
+    // Metrics trail the state machine: the cut names at least what they
+    // reported before it, and they reach exactly the cut's position.
+    let before = node.consensus.raft.metrics().borrow_watched().last_applied;
     let current = state.get_current_snapshot().await.unwrap().unwrap();
-    let applied = node.consensus.raft.metrics().borrow_watched().last_applied;
-    assert_eq!(current.meta.last_log_id, applied);
+    assert!(
+        current.meta.last_log_id >= before,
+        "{:?} {before:?}",
+        current.meta
+    );
+    let cut_at = current.meta.last_log_id.clone();
+    node.consensus
+        .raft
+        .wait(Some(Duration::from_secs(20)))
+        .metrics(|m| m.last_applied >= cut_at, "metrics reach the cut")
+        .await
+        .unwrap();
     let cut = current.snapshot.cut().unwrap().clone();
     assert!(cut.pins_view());
     assert_eq!(

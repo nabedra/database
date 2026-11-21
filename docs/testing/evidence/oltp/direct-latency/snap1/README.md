@@ -11,7 +11,10 @@ SNAP1 makes a Raft snapshot a **cut**:
 - A lagging follower gets a fresh cut from `get_current_snapshot`. The replication task writes that cut's file from the
   pinned view, in 1 MiB native jobs. The file is not fsynced and lives under `snapshots/<group>/outgoing/`. The task then
   releases the view.
-- The production profiles set `snapshot_policy = LogsSinceLast(1024)` and keep 4,096 entries.
+- The production profiles now set `snapshot_policy = LogsSinceLast(5000)` and keep 1,000 entries explicitly. These are
+  OpenRaft's defaults. A cut is cheap, so the interval only sets how often the log is purged. A trial with 1,024 / 4,096
+  was dropped. With it, O26 failed with `direct_oltp` off; the default values failed the same way once and then passed
+  twice, so the trial values were not shown to cause that failure.
 
 ## Soak A/B on runners (relative numbers only)
 
