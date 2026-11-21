@@ -111,6 +111,8 @@ pub struct TypedLogStore<C: TypedConfig> {
     resident: Option<super::multiplex::ReplicaLease>,
     node_id: u64,
     _writer: Arc<WriterState>,
+    /// Appends waiting for their synced write (GC1).
+    appends: Arc<AppendQueue<C>>,
     /// Shared with the host's state machine (RV-APPLY F1).
     retry: Arc<HostRetry>,
     #[cfg(test)]
@@ -130,6 +132,7 @@ impl<C: TypedConfig> Clone for TypedLogStore<C> {
             resident: self.resident.clone(),
             node_id: self.node_id,
             _writer: self._writer.clone(),
+            appends: self.appends.clone(),
             retry: self.retry.clone(),
             #[cfg(test)]
             append_hook: self.append_hook.clone(),
@@ -146,6 +149,106 @@ struct WriterState {
     pending: Arc<Pending>,
     /// The group's `overlay::Overlay<C::Command>`, shared by every handle.
     overlay: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+    /// The group's `AppendQueue<C>`, shared by every handle (GC1).
+    appends: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Test switch for GC1 measurements: off, every append is its own synced
+/// write, as before GC1.
+#[cfg(test)]
+pub(crate) static COALESCE_APPENDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Appends that took their place in the writer order and wait for their
+/// synced write, in log order (GC1, group commit inside one group).
+///
+/// The append that gets the writer order first writes every append queued
+/// behind it in one synced write, up to `MAX_APPEND_ENTRIES` entries, and
+/// fires their `IOFlushed` callbacks in order after that write. The later
+/// appends' tasks then find nothing left and return. This is ScyllaDB's
+/// commitlog group commit: concurrent mutations share one segment write and
+/// one sync. It changes no durability rule: each callback still fires only
+/// after a synced write that holds all of its entries, and a crash still
+/// leaves a consecutive durable prefix (one synced batch per chunk, in log
+/// order).
+///
+/// A vote, truncation or purge starts a new epoch when it takes its place in
+/// the writer order, and an append never shares a write with one from another
+/// epoch, so those operations keep their submission order relative to the
+/// appends (openraft orders vote and log IO).
+struct AppendQueue<C: TypedConfig> {
+    state: std::sync::Mutex<AppendQueueState<C>>,
+}
+struct AppendQueueState<C: TypedConfig> {
+    epoch: u64,
+    jobs: std::collections::VecDeque<AppendJob<C>>,
+}
+struct AppendJob<C: TypedConfig> {
+    epoch: u64,
+    batch: Arc<Vec<OwnedRaftEntry<C::Command>>>,
+    callback: IOFlushed<C>,
+    pending: PendingGuard,
+    #[cfg(test)]
+    hook: Option<AppendHook>,
+}
+impl<C: TypedConfig> AppendJob<C> {
+    fn first(&self) -> u64 {
+        self.batch[0].index()
+    }
+    fn last(&self) -> u64 {
+        self.batch[self.batch.len() - 1].index()
+    }
+}
+impl<C: TypedConfig> Default for AppendQueue<C> {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(AppendQueueState {
+                epoch: 0,
+                jobs: std::collections::VecDeque::new(),
+            }),
+        }
+    }
+}
+impl<C: TypedConfig> AppendQueue<C> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, AppendQueueState<C>> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// A vote, truncation or purge is about to take its writer place.
+    fn barrier(&self) {
+        let mut state = self.lock();
+        state.epoch = state.epoch.wrapping_add(1);
+    }
+    fn push(&self, mut job: AppendJob<C>) {
+        let mut state = self.lock();
+        job.epoch = state.epoch;
+        state.jobs.push_back(job);
+    }
+    /// Called while holding the writer order: the head append and the
+    /// consecutive appends of its epoch behind it, up to
+    /// `MAX_APPEND_ENTRIES` entries. Empty when an earlier write took this
+    /// task's append.
+    fn take(&self) -> Vec<AppendJob<C>> {
+        let mut state = self.lock();
+        let mut taken: Vec<AppendJob<C>> = Vec::new();
+        let mut entries = 0usize;
+        while let Some(next) = state.jobs.front() {
+            if let Some(previous) = taken.last() {
+                #[cfg(test)]
+                if !COALESCE_APPENDS.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if next.epoch != previous.epoch
+                    || previous.last().checked_add(1) != Some(next.first())
+                    || entries + next.batch.len() > MAX_APPEND_ENTRIES
+                {
+                    break;
+                }
+            }
+            entries += next.batch.len();
+            taken.extend(state.jobs.pop_front());
+        }
+        taken
+    }
 }
 #[derive(Default)]
 struct Pending {
@@ -223,6 +326,12 @@ impl<C: TypedConfig> TypedLogStore<C> {
             .clone()
             .downcast::<overlay::Overlay<C::Command>>()
             .map_err(|_| invalid("Raft writer overlay has another entry type"))?;
+        let appends = writer
+            .appends
+            .get_or_init(|| Arc::new(AppendQueue::<C>::default()))
+            .clone()
+            .downcast::<AppendQueue<C>>()
+            .map_err(|_| invalid("Raft writer queue has another config"))?;
         Ok(Self {
             store,
             writes: writer.order.clone(),
@@ -232,6 +341,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
             resident: None,
             node_id,
             _writer: writer,
+            appends,
             retry: Arc::default(),
             #[cfg(test)]
             append_hook: Arc::new(std::sync::Mutex::new(None)),
@@ -669,6 +779,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         // appends still syncing (PERF2d). A queued commit marker lands
         // first, so this synced write persists it too.
         self.overlay.markers_written().await;
+        self.appends.barrier();
         let _order = self.writes.lock().await;
         let (store, retry) = (&self.store, &self.retry);
         retry
@@ -815,6 +926,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         let writer = self._writer.clone();
         let retry = self.retry.clone();
         let overlay = self.overlay.clone();
+        let appends = self.appends.clone();
         // Dropping this method's awaiter cannot cancel the owned sync operation
         // or discard its completion callback. The host joins pending operations
         // before releasing replica residency and stopping its runtime.
@@ -836,7 +948,17 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         })
         .await;
         overlay.publish(&batch);
-        let (first, last) = (batch[0].index(), batch[batch.len() - 1].index());
+        // GC1: queued in the same order as the writer place just taken. The
+        // task that gets the order first writes this append and the ones
+        // queued behind it together (see `AppendQueue`).
+        appends.push(AppendJob {
+            epoch: 0,
+            batch,
+            callback,
+            pending,
+            #[cfg(test)]
+            hook: append_hook,
+        });
         crate::oltp_runtime::stage_timing::by_kind(
             &self.store.identity().kind,
             [
@@ -850,13 +972,17 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             use crate::oltp_runtime::stage_timing::by_kind;
             let kind = store.identity().kind.clone();
             let started = std::time::Instant::now();
-            let _retained_entries = batch.clone();
             let _writer = writer;
-            let _pending = pending;
             let _order = match held {
                 Some(guard) => guard,
                 None => order.await,
             };
+            let jobs = appends.take();
+            if jobs.is_empty() {
+                // An earlier write held this append's entries and fired its
+                // callback.
+                return;
+            }
             by_kind(
                 &kind,
                 [
@@ -866,6 +992,30 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 ],
             )
             .since(started);
+            if jobs.len() > 1 {
+                let merged = by_kind(
+                    &kind,
+                    [
+                        "raft.data.append_merged",
+                        "raft.ts.append_merged",
+                        "raft.meta.append_merged",
+                    ],
+                );
+                for _ in 1..jobs.len() {
+                    merged.record(std::time::Duration::ZERO);
+                }
+            }
+            let batch: Arc<Vec<OwnedRaftEntry<C::Command>>> = if jobs.len() == 1 {
+                jobs[0].batch.clone()
+            } else {
+                Arc::new(
+                    jobs.iter()
+                        .flat_map(|job| job.batch.iter().cloned())
+                        .collect(),
+                )
+            };
+            #[cfg(test)]
+            let append_hook = jobs.iter().find_map(|job| job.hook.clone());
             let ordered = std::time::Instant::now();
             let result: io::Result<()> = async {
                 if overlay.failed() {
@@ -982,23 +1132,39 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             }
             // Durable and visible in the store, or failed: leave the overlay
             // before reporting, so a flushed entry is always read back stored.
-            let committed = overlay.settle(first, last, result.is_ok());
-            callback.io_completed(
-                result
-                    .as_ref()
-                    .map(|_| ())
-                    .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())),
-            );
+            // Callbacks fire in log order.
+            let mut committed = None;
+            let mut pending = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let AppendJob {
+                    batch: job_batch,
+                    callback,
+                    pending: guard,
+                    ..
+                } = job;
+                let (first, last) = (job_batch[0].index(), job_batch[job_batch.len() - 1].index());
+                if let Some(id) = overlay.settle(first, last, result.is_ok()) {
+                    committed = Some(id);
+                }
+                callback.io_completed(
+                    result.as_ref().map(|_| ()).map_err(|error: &io::Error| {
+                        io::Error::new(error.kind(), error.to_string())
+                    }),
+                );
+                pending.push(guard);
+            }
             if let Some(id) = committed
                 && let Err(error) = save_commit_marker(&store, &retry, Some(id), true).await
             {
                 tracing::warn!(group=%store.identity().group_id,code=?error.code,"deferred Raft commit marker not saved");
             }
+            drop(pending);
         });
         Ok(())
     }
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> io::Result<()> {
+        self.appends.barrier();
         let _order = self.writes.lock().await;
         self.retry
             .retry(RaftWrite::Truncate, || {
@@ -1038,6 +1204,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         Ok(())
     }
     async fn purge(&mut self, id: LogId) -> io::Result<()> {
+        self.appends.barrier();
         let _order = self.writes.lock().await;
         // Application state may be unsynced. Never purge entries whose applied
         // state a crash could still lose: they are its only replay source.
