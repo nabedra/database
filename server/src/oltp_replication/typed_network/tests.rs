@@ -49,7 +49,8 @@ fn o26_learner_accepts_current_leader_while_replaying_historical_membership() {
     let history = crate::oltp_replication::entry::Membership::new(
         vec![[1, 2, 3].into_iter().collect()],
         BTreeMap::from([(1, first), (2, second), (3, third)]),
-    );
+    )
+    .unwrap();
     assert_eq!(raft_sender(&history, &bootstrap, 4), Some(&leader));
 }
 
