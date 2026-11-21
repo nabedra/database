@@ -1,7 +1,7 @@
 use super::*;
 use crate::oltp_replication::authority::control::{
-    MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup, ReplacementIntent, ReplacementRecord,
-    ReplacementMountProof, SystemRecoveryCommand,
+    MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup, ReplacementIntent, ReplacementMountProof,
+    ReplacementRecord, SystemRecoveryCommand,
 };
 use crate::oltp_replication::owned::serialized_digest;
 
@@ -19,7 +19,9 @@ pub(in crate::oltp_replication::authority::control) fn revoked_id(worker: Uuid) 
     key(REVOKED_WORKERS, worker)
 }
 
-pub(in crate::oltp_replication::authority::control) fn revoked_certificate(certificate: Digest) -> Vec<u8> {
+pub(in crate::oltp_replication::authority::control) fn revoked_certificate(
+    certificate: Digest,
+) -> Vec<u8> {
     let mut key = b"ct/system-replacement-revoked-certificate/".to_vec();
     key.extend_from_slice(certificate.as_bytes());
     key
@@ -32,7 +34,9 @@ pub(super) fn blocked_enrollment(
     let reserved = load::<Uuid>(tx, &by_certificate(enrollment.certificate_sha256))?;
     let target = load::<Uuid>(tx, &by_target(enrollment.worker_id))?;
     Ok(tx.get(&revoked_id(enrollment.worker_id))?.is_some()
-        || tx.get(&revoked_certificate(enrollment.certificate_sha256))?.is_some()
+        || tx
+            .get(&revoked_certificate(enrollment.certificate_sha256))?
+            .is_some()
         || (reserved.is_some() && reserved != target)
         || (target.is_some() && tx.get(&key(WORKERS, enrollment.worker_id))?.is_none()))
 }
@@ -64,10 +68,28 @@ pub(super) fn apply(
     command: &SystemRecoveryCommand,
 ) -> Result<ControlReply, ProtocolError> {
     let (authorization, evidence) = match command {
-        SystemRecoveryCommand::Mount { proof, ready, enrollment_revision, group_inventory_revision } =>
-            return mount(tx, scope, state, proof, *ready, *enrollment_revision, *group_inventory_revision),
-        SystemRecoveryCommand::Publish { id, group, applied, authorization } =>
-            (authorization, serialized_digest(&(id, group, applied))?),
+        SystemRecoveryCommand::Mount {
+            proof,
+            ready,
+            enrollment_revision,
+            group_inventory_revision,
+        } => {
+            return mount(
+                tx,
+                scope,
+                state,
+                proof,
+                *ready,
+                *enrollment_revision,
+                *group_inventory_revision,
+            );
+        }
+        SystemRecoveryCommand::Publish {
+            id,
+            group,
+            applied,
+            authorization,
+        } => (authorization, serialized_digest(&(id, group, applied))?),
         SystemRecoveryCommand::Enable {
             group,
             execution,
@@ -108,8 +130,9 @@ pub(super) fn apply(
     }
     match command {
         SystemRecoveryCommand::Mount { .. } => unreachable!("mount applied above"),
-        SystemRecoveryCommand::Publish { id, group, applied, .. } =>
-            publish(tx, state, *id, *group, *applied),
+        SystemRecoveryCommand::Publish {
+            id, group, applied, ..
+        } => publish(tx, state, *id, *group, *applied),
         SystemRecoveryCommand::Enable {
             group,
             execution,
@@ -208,7 +231,9 @@ pub(super) fn apply(
                 || tx.get(&by_worker(intent.next.worker_id))?.is_some()
                 || blocked_enrollment(tx, &intent.next)?
                 || !certificate_unused(tx, intent.next.certificate_sha256)?
-                || intent.mount_public_key.is_some_and(|digest| digest.as_bytes() == &[0; 32])
+                || intent
+                    .mount_public_key
+                    .is_some_and(|digest| digest.as_bytes() == &[0; 32])
                 || (intent.mount_public_key.is_some() && tx.get(EXECUTION)?.is_none())
             {
                 return fault(Fault::Invalid);
@@ -220,7 +245,6 @@ pub(super) fn apply(
                 intent: intent.clone(),
                 groups: groups.to_vec(),
                 applied_at: position,
-                inventory_revision: intent.mount_public_key.map(|_| *group_inventory_revision),
             };
             save(tx, &lookup, &intent.id)?;
             save(tx, &by_id(intent.id), &record)?;
@@ -337,37 +361,84 @@ fn mount(
     if state.ready != ready
         || state.enrollment_revision != enrollment_revision
         || state.group_inventory_revision != group_inventory_revision
-        || record.inventory_revision != Some(group_inventory_revision)
         || state.pending.is_some()
         || state.restart.is_some()
         || state.invalid_ready != 0
-        || state.owner.is_none_or(|owner| owner.worker_id == old.worker_id)
+        || state
+            .owner
+            .is_none_or(|owner| owner.worker_id == old.worker_id)
         || tx.get(ACTIVE)?.is_some()
         || tx.get(placement::ACTIVE)?.is_some()
         || tx.get(data_worker::PREPARED)?.is_some()
-        || tx.get(&ready_key(state.ready_generation, old.worker_id))?.is_some()
+        || tx
+            .get(&ready_key(state.ready_generation, old.worker_id))?
+            .is_some()
         || load::<WorkerRecord>(tx, &key(WORKERS, old.worker_id))?
             .is_none_or(|worker| WorkerIdentity::from(&worker.enrollment) != old)
         || tx.get(&key(WORKERS, proof.worker.worker_id))?.is_some()
         || tx.get(&key(APIS, proof.worker.worker_id))?.is_some()
         || !certificate_unused(tx, proof.worker.certificate_sha256)?
         || !validate_groups(tx, scope, &record.intent, &record.groups)?
+        || !covers_every_group(tx, &record)?
     {
         return fault(Fault::Stale);
     }
     for plan in &record.groups {
-        save(tx, &placement::claim_key(plan.expected.identity.group_id), &proof.id)?;
+        save(
+            tx,
+            &placement::claim_key(plan.expected.identity.group_id),
+            &proof.id,
+        )?;
     }
     save(tx, ACTIVE, &proof.id)?;
     save(tx, &revoked_id(old.worker_id), &old)?;
     save(tx, &revoked_certificate(old.certificate_sha256), &old)?;
     tx.delete(&key(WORKERS, old.worker_id))?;
-    save(tx, &key(WORKERS, proof.worker.worker_id), &WorkerRecord {
-        enrollment: record.intent.next,
-        previous_process: None,
-    })?;
-    state.enrollment_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
+    save(
+        tx,
+        &key(WORKERS, proof.worker.worker_id),
+        &WorkerRecord {
+            enrollment: record.intent.next,
+            previous_process: None,
+        },
+    )?;
+    state.enrollment_revision = state
+        .enrollment_revision
+        .checked_add(1)
+        .ok_or_else(unknown)?;
     Ok(ControlReply::SystemReplacementMounted)
+}
+
+fn covers_every_group(
+    tx: &mut GroupTransaction<'_>,
+    record: &ReplacementRecord,
+) -> Result<bool, ProtocolError> {
+    let lost = record.intent.previous.worker_id;
+    let mut after = None;
+    loop {
+        let mut next = None;
+        let mut candidates = Vec::new();
+        let page = tx.scan_page(GROUPS, after.as_deref(), 128, |key, bytes| {
+            let group = decode::<GroupRecord>(bytes)?;
+            candidates.push((group.generation, group.identity.group_id));
+            next = Some(key.to_vec());
+            Ok(())
+        })?;
+        for (generation, group) in candidates {
+            if tx.get(&member_worker_key(generation, lost))?.is_some()
+                && !record
+                    .groups
+                    .iter()
+                    .any(|plan| plan.expected.identity.group_id == group)
+            {
+                return Ok(false);
+            }
+        }
+        if page.exhausted {
+            return Ok(true);
+        }
+        after = next;
+    }
 }
 
 pub(in crate::oltp_replication::authority::control) fn published(id: Uuid, group: Uuid) -> Vec<u8> {
@@ -387,7 +458,11 @@ fn publish(
     let Some(record) = load::<ReplacementRecord>(tx, &by_id(id))? else {
         return fault(Fault::NotFound);
     };
-    let Some(plan) = record.groups.iter().find(|plan| plan.expected.identity.group_id == group) else {
+    let Some(plan) = record
+        .groups
+        .iter()
+        .find(|plan| plan.expected.identity.group_id == group)
+    else {
         return fault(Fault::Invalid);
     };
     let claim = placement::claim_key(group);
@@ -400,12 +475,25 @@ fn publish(
     {
         return fault(Fault::Stale);
     }
-    let remaining = record.groups.iter().filter(|item| item.expected.identity.group_id != group)
+    let remaining = record
+        .groups
+        .iter()
+        .filter(|item| item.expected.identity.group_id != group)
         .try_fold(0, |count, item| {
-            Ok::<_, ProtocolError>(count + usize::from(tx.get(&published(id, item.expected.identity.group_id))?.is_none()))
+            Ok::<_, ProtocolError>(
+                count
+                    + usize::from(
+                        tx.get(&published(id, item.expected.identity.group_id))?
+                            .is_none(),
+                    ),
+            )
         })?;
     let next = plan.next(record.intent.previous.worker_id)?;
-    let digest = serialized_digest(&(b"nabedra/system-replacement-placement/v1".as_slice(), id, group))?;
+    let digest = serialized_digest(&(
+        b"nabedra/system-replacement-placement/v1".as_slice(),
+        id,
+        group,
+    ))?;
     let generation = Uuid::from_bytes(digest.as_bytes()[..16].try_into().expect("digest prefix"));
     let placement = GroupRecord {
         identity: plan.expected.identity.clone(),
@@ -421,7 +509,10 @@ fn publish(
     }
     save(tx, &key(GROUPS, group), &placement)?;
     save(tx, &published(id, group), &placement)?;
-    state.group_inventory_revision = state.group_inventory_revision.checked_add(1).ok_or_else(unknown)?;
+    state.group_inventory_revision = state
+        .group_inventory_revision
+        .checked_add(1)
+        .ok_or_else(unknown)?;
     tx.delete(&claim)?;
     if remaining == 0 {
         tx.delete(ACTIVE)?;
@@ -434,6 +525,8 @@ pub(super) fn waits_for_groups(
     tx: &mut GroupTransaction<'_>,
     worker: Uuid,
 ) -> Result<bool, ProtocolError> {
-    let Some(active) = load::<Uuid>(tx, ACTIVE)? else { return Ok(false) };
+    let Some(active) = load::<Uuid>(tx, ACTIVE)? else {
+        return Ok(false);
+    };
     Ok(load::<Uuid>(tx, &by_target(worker))? == Some(active))
 }

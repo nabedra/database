@@ -56,7 +56,10 @@ pub(crate) struct ReplacementGroup {
 impl ReplacementGroup {
     pub(crate) fn next(&self, lost: Uuid) -> Result<[ReplicaMember; 3], ProtocolError> {
         let mut next = self.old.clone();
-        let removed = next.iter_mut().find(|member| member.worker_id == lost).ok_or_else(invalid)?;
+        let removed = next
+            .iter_mut()
+            .find(|member| member.worker_id == lost)
+            .ok_or_else(invalid)?;
         *removed = self.learner.clone();
         next.sort_by_key(|member| member.node_id);
         validate_voters(&next).map_err(|_| invalid())?;
@@ -93,8 +96,6 @@ pub(crate) struct ReplacementRecord {
     pub intent: ReplacementIntent,
     pub groups: Vec<ReplacementGroup>,
     pub applied_at: AppliedPosition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inventory_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +109,9 @@ pub(crate) struct ReplacementMountProof {
 impl ReplacementMountProof {
     fn message(scope: &GroupIdentity, record: &ReplacementRecord) -> Result<Digest, ProtocolError> {
         crate::oltp_replication::owned::serialized_digest(&(
-            b"nabedra/system-replacement-mount/v1".as_slice(), scope, record,
+            b"nabedra/system-replacement-mount/v1".as_slice(),
+            scope,
+            record,
         ))
     }
 
@@ -118,7 +121,9 @@ impl ReplacementMountProof {
         mounted: &PoolMountExpectation,
         key: &RestartMountKey,
     ) -> Result<Self, ProtocolError> {
-        if mounted != &record.intent.mount || record.intent.mount_public_key != Some(key.public_key()) {
+        if mounted != &record.intent.mount
+            || record.intent.mount_public_key != Some(key.public_key())
+        {
             return Err(invalid());
         }
         Ok(Self {
@@ -128,7 +133,11 @@ impl ReplacementMountProof {
         })
     }
 
-    pub(super) fn verify(&self, scope: &GroupIdentity, record: &ReplacementRecord) -> Result<(), ProtocolError> {
+    pub(super) fn verify(
+        &self,
+        scope: &GroupIdentity,
+        record: &ReplacementRecord,
+    ) -> Result<(), ProtocolError> {
         if self.id != record.intent.id || self.worker != WorkerIdentity::from(&record.intent.next) {
             return Err(invalid());
         }

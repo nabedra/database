@@ -136,15 +136,28 @@ impl WorkerRuntime {
     ) -> Result<EncodedResponse, ProtocolError> {
         self.require_system_replacement_operator()?;
         let control = &self.services.control;
-        let record = control.system_replacement_record(check.previous.worker_id).await?
-            .filter(|record| record.intent.previous == check.previous && record.intent.run_id == check.run_id)
+        let record = control
+            .system_replacement_record(check.previous.worker_id)
+            .await?
+            .filter(|record| {
+                record.intent.previous == check.previous && record.intent.run_id == check.run_id
+            })
             .ok_or_else(|| conflict("system replacement intent or run differs from Control"))?;
-        let (_, mounted, complete) = control.replacement_record_local(record.intent.id).await?
+        let (_, mounted, complete) = control
+            .replacement_record_local(record.intent.id)
+            .await?
             .ok_or_else(quorum_unavailable)?;
-        let scratch = self.services.shared.reserve_scratch(ByteClass::Progress, record.groups.len() * 2048)?;
+        let scratch = self
+            .services
+            .shared
+            .reserve_scratch(ByteClass::Progress, record.groups.len() * 2048)?;
         let mut groups = Vec::new();
         for plan in &record.groups {
-            let routes = self.services.control_client.replica_routes(&plan.expected.identity).await?;
+            let routes = self
+                .services
+                .control_client
+                .replica_routes(&plan.expected.identity)
+                .await?;
             groups.push(serde_json::json!({"record": routes.record, "members": routes.members}));
         }
         let response = response::encode_success(

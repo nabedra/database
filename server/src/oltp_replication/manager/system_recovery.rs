@@ -210,7 +210,13 @@ impl HostedGroupManager {
         control: &GroupIdentity,
         target: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        self.verify_recovery_advert(control, target, Request::AdvertiseExecution, SYSTEM_REPLACEMENT_EXECUTION).await
+        self.verify_recovery_advert(
+            control,
+            target,
+            Request::AdvertiseExecution,
+            SYSTEM_REPLACEMENT_EXECUTION,
+        )
+        .await
     }
 
     pub(crate) async fn verify_recovery_capability(
@@ -218,7 +224,13 @@ impl HostedGroupManager {
         control: &GroupIdentity,
         target: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        self.verify_recovery_advert(control, target, Request::Advertise, SYSTEM_REPLACEMENT_CAPABILITY).await
+        self.verify_recovery_advert(
+            control,
+            target,
+            Request::Advertise,
+            SYSTEM_REPLACEMENT_CAPABILITY,
+        )
+        .await
     }
 
     async fn verify_recovery_advert(
@@ -228,7 +240,9 @@ impl HostedGroupManager {
         request: Request,
         capability: &str,
     ) -> Result<(), ProtocolError> {
-        let header = self.shared.encode_in(ByteClass::Progress, &request, HEADER)?;
+        let header = self
+            .shared
+            .encode_in(ByteClass::Progress, &request, HEADER)?;
         let reply = self
             .client
             .request_classified(
@@ -258,7 +272,8 @@ impl HostedGroupManager {
         local: &ReplicaMember,
     ) -> Result<Arc<dyn Running>, ProtocolError> {
         let routes = self.routes.lock().map_err(|_| unavailable())?;
-        routes.get(&plan.expected.identity.group_id)
+        routes
+            .get(&plan.expected.identity.group_id)
             .and_then(|routes| routes.replicas.get(&local.node_id))
             .filter(|replica| !replica.retiring && replica.member == *local)
             .map(|replica| replica.running.clone())
@@ -271,7 +286,8 @@ impl HostedGroupManager {
     ) -> Result<(), ProtocolError> {
         for plan in &record.groups {
             self.replacement_replica(plan, &plan.learner)?
-                .verify_replacement_applied(plan, record.intent.previous.worker_id).await?;
+                .verify_replacement_applied(plan, record.intent.previous.worker_id)
+                .await?;
         }
         Ok(())
     }
@@ -283,8 +299,13 @@ impl HostedGroupManager {
     ) -> Result<AppliedPosition, ProtocolError> {
         let local = self.client.local_identity().worker_id;
         let members = plan.next(lost)?;
-        let member = members.iter().find(|member| member.worker_id == local).ok_or_else(invalid)?;
-        self.replacement_replica(plan, member)?.reconcile_system_replacement(plan, lost).await
+        let member = members
+            .iter()
+            .find(|member| member.worker_id == local)
+            .ok_or_else(invalid)?;
+        self.replacement_replica(plan, member)?
+            .reconcile_system_replacement(plan, lost)
+            .await
     }
 
     pub(crate) async fn send_mount_proof(
@@ -293,7 +314,8 @@ impl HostedGroupManager {
         target: WorkerIdentity,
         proof: &ReplacementMountProof,
     ) -> Result<(), ProtocolError> {
-        self.recovery_call::<()>(scope, target, &Request::Mount(proof.clone())).await
+        self.recovery_call::<()>(scope, target, &Request::Mount(proof.clone()))
+            .await
     }
 
     async fn recovery_call<T: serde::de::DeserializeOwned + Clone + Send + 'static>(
@@ -302,11 +324,24 @@ impl HostedGroupManager {
         target: WorkerIdentity,
         request: &Request,
     ) -> Result<T, ProtocolError> {
-        let header = self.shared.encode_in(ByteClass::Progress, request, HEADER)?;
-        let reply = self.client.request_classified(scope, target, Purpose::SystemRecovery,
-            header, [None, None, None], REPLY_DECODE_BYTES).await?;
-        if reply.remote_identity() != target || reply.group() != scope
-            || reply.purpose() != Purpose::SystemRecovery || reply.sections.iter().any(Option::is_some)
+        let header = self
+            .shared
+            .encode_in(ByteClass::Progress, request, HEADER)?;
+        let reply = self
+            .client
+            .request_classified(
+                scope,
+                target,
+                Purpose::SystemRecovery,
+                header,
+                [None, None, None],
+                REPLY_DECODE_BYTES,
+            )
+            .await?;
+        if reply.remote_identity() != target
+            || reply.group() != scope
+            || reply.purpose() != Purpose::SystemRecovery
+            || reply.sections.iter().any(Option::is_some)
         {
             return Err(invalid());
         }
@@ -328,27 +363,42 @@ impl HostedGroupManager {
         };
         // The candidate stays outside Control elections until the other groups
         // have their stable memberships recorded.
-        let plan = record.groups.iter().filter(|plan| remaining.contains(&plan.expected.identity.group_id))
+        let plan = record
+            .groups
+            .iter()
+            .filter(|plan| remaining.contains(&plan.expected.identity.group_id))
             .min_by_key(|plan| match plan.expected.identity.kind {
                 GroupKind::Data { .. } => 0,
                 GroupKind::Control => 2,
                 _ => 1,
-            }).ok_or_else(invalid)?;
+            })
+            .ok_or_else(invalid)?;
         let group = plan.expected.identity.group_id;
         let lost = record.intent.previous.worker_id;
         let local = self.client.local_identity();
-        let request = Request::Reconcile { id: record.intent.id, group };
+        let request = Request::Reconcile {
+            id: record.intent.id,
+            group,
+        };
         let next = plan.next(lost)?;
         let mut last = unavailable();
         for member in next {
             let result = if member.worker_id == local.worker_id {
                 self.reconcile_replacement_local(plan, lost).await
             } else {
-                let target = control.worker(member.worker_id).await?.ok_or_else(unavailable)?;
-                self.recovery_call(control.identity(), WorkerIdentity::from(&target), &request).await
+                let target = control
+                    .worker(member.worker_id)
+                    .await?
+                    .ok_or_else(unavailable)?;
+                self.recovery_call(control.identity(), WorkerIdentity::from(&target), &request)
+                    .await
             };
             match result {
-                Ok(applied) => return control.publish_system_replacement_group(running, permit, &record, group, applied).await,
+                Ok(applied) => {
+                    return control
+                        .publish_system_replacement_group(running, permit, &record, group, applied)
+                        .await;
+                }
                 Err(error) => last = error,
             }
         }
@@ -458,11 +508,16 @@ impl QuorumEndpoint {
         if running.raft.current_leader().await != Some(running.state.resident().node_id()) {
             return Err(unavailable());
         }
-        let (record, mounted, _) = control.replacement_record_local(proof.id).await?.ok_or_else(unavailable)?;
+        let (record, mounted, _) = control
+            .replacement_record_local(proof.id)
+            .await?
+            .ok_or_else(unavailable)?;
         if proof.worker != WorkerIdentity::from(&record.intent.next) {
             return Err(invalid());
         }
-        self.manager.verify_recovery_execution(control.identity(), proof.worker).await?;
+        self.manager
+            .verify_recovery_execution(control.identity(), proof.worker)
+            .await?;
         let state = control.inspect().await?.ok_or_else(unavailable)?;
         if !mounted {
             // Check liveness again just before the transaction that revokes
@@ -471,7 +526,11 @@ impl QuorumEndpoint {
                 cluster_id: control.identity().cluster_id,
                 database: control.identity().database.clone(),
             };
-            let peer = QueuePeerClient::new(self.manager.client(), self.manager.shared.clone(), control.identity().clone())?;
+            let peer = QueuePeerClient::new(
+                self.manager.client(),
+                self.manager.shared.clone(),
+                control.identity().clone(),
+            )?;
             let lost = record.intent.previous;
             match peer.probe(lost, scope, state.ready).await {
                 PeerReachability::Unreachable => {}
@@ -480,7 +539,11 @@ impl QuorumEndpoint {
             }
             for plan in &record.groups {
                 let mut checked = false;
-                for survivor in plan.old.iter().filter(|member| member.worker_id != lost.worker_id) {
+                for survivor in plan
+                    .old
+                    .iter()
+                    .filter(|member| member.worker_id != lost.worker_id)
+                {
                     let request = QuorumRequest {
                         group: plan.expected.identity.clone(),
                         voters: plan.old.clone(),
@@ -488,14 +551,27 @@ impl QuorumEndpoint {
                         leader: survivor.node_id,
                         minimum: plan.expected.membership_position,
                     };
-                    let result = if survivor.worker_id == self.manager.client.local_identity().worker_id {
-                        self.manager.surviving_quorum(&request).await
-                    } else {
-                        let enrollment = control.worker(survivor.worker_id).await?.ok_or_else(unavailable)?;
-                        self.manager.remote_surviving_quorum(control.identity(), WorkerIdentity::from(&enrollment), &request).await
-                    };
+                    let result =
+                        if survivor.worker_id == self.manager.client.local_identity().worker_id {
+                            self.manager.surviving_quorum(&request).await
+                        } else {
+                            let enrollment = control
+                                .worker(survivor.worker_id)
+                                .await?
+                                .ok_or_else(unavailable)?;
+                            self.manager
+                                .remote_surviving_quorum(
+                                    control.identity(),
+                                    WorkerIdentity::from(&enrollment),
+                                    &request,
+                                )
+                                .await
+                        };
                     match result {
-                        Ok(_) => { checked = true; break; }
+                        Ok(_) => {
+                            checked = true;
+                            break;
+                        }
                         Err(error) if error.code == ErrorCode::Conflict => return Err(error),
                         Err(_) => {}
                     }
@@ -505,16 +581,28 @@ impl QuorumEndpoint {
                 }
             }
         }
-        control.mount_system_replacement(&running, proof, &state).await
+        control
+            .mount_system_replacement(&running, proof, &state)
+            .await
     }
 
     async fn reconcile(&self, id: Uuid, group: Uuid) -> Result<AppliedPosition, ProtocolError> {
-        let (record, mounted, _) = self.control.replacement_record_local(id).await?.ok_or_else(unavailable)?;
+        let (record, mounted, _) = self
+            .control
+            .replacement_record_local(id)
+            .await?
+            .ok_or_else(unavailable)?;
         if !mounted {
             return Err(unavailable());
         }
-        let plan = record.groups.iter().find(|plan| plan.expected.identity.group_id == group).ok_or_else(invalid)?;
-        self.manager.reconcile_replacement_local(plan, record.intent.previous.worker_id).await
+        let plan = record
+            .groups
+            .iter()
+            .find(|plan| plan.expected.identity.group_id == group)
+            .ok_or_else(invalid)?;
+        self.manager
+            .reconcile_replacement_local(plan, record.intent.previous.worker_id)
+            .await
     }
 }
 
@@ -553,14 +641,19 @@ impl Endpoint for QuorumEndpoint {
                         .encode_in(ByteClass::Progress, &proof, HEADER)?
                 }
                 Request::Mount(proof) => self.manager.shared.encode_in(
-                    ByteClass::Progress, &self.mount(proof).await, HEADER,
+                    ByteClass::Progress,
+                    &self.mount(proof).await,
+                    HEADER,
                 )?,
                 Request::Reconcile { id, group } => self.manager.shared.encode_in(
-                    ByteClass::Progress, &self.reconcile(id, group).await, HEADER,
+                    ByteClass::Progress,
+                    &self.reconcile(id, group).await,
+                    HEADER,
                 )?,
-                Request::Advertise | Request::AdvertiseExecution => {
-                    capability_reply(&self.manager.shared, matches!(request, Request::AdvertiseExecution))?
-                }
+                Request::Advertise | Request::AdvertiseExecution => capability_reply(
+                    &self.manager.shared,
+                    matches!(request, Request::AdvertiseExecution),
+                )?,
             };
             Ok(ChargedReply {
                 header,
@@ -623,7 +716,10 @@ impl Endpoint for ReplacementCapabilityEndpoint {
     }
 }
 
-fn capability_reply(shared: &WorkerSharedResources, execution: bool) -> Result<ChargedBytes, ProtocolError> {
+fn capability_reply(
+    shared: &WorkerSharedResources,
+    execution: bool,
+) -> Result<ChargedBytes, ProtocolError> {
     #[cfg(test)]
     if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|path| {
         std::path::Path::new(&path)
@@ -632,7 +728,11 @@ fn capability_reply(shared: &WorkerSharedResources, execution: bool) -> Result<C
     }) {
         return Err(unsupported());
     }
-    let capability = if execution { SYSTEM_REPLACEMENT_EXECUTION } else { SYSTEM_REPLACEMENT_CAPABILITY };
+    let capability = if execution {
+        SYSTEM_REPLACEMENT_EXECUTION
+    } else {
+        SYSTEM_REPLACEMENT_CAPABILITY
+    };
     shared.encode_in(ByteClass::Progress, &capability, HEADER)
 }
 

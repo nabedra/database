@@ -179,7 +179,8 @@ def two_ready(cluster, survivors):
 
 
 def o06_o17_system_replacement_check(binary, test_executable, root):
-    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable)
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable,
+                         status_partitions=2)
     peer_probe = None
     try:
         cluster.start()
@@ -318,8 +319,11 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             return success(status, reply)
 
         result = wait_for(checked, 'all affected groups have surviving quorum', PROBE_WINDOW)
-        expected = {group['identity']['group_id']
-                    for group in cluster.config[victim]['node']['placements'].values()}
+        original_placements = cluster.config[victim]['node']['placements']
+        system_groups = [original_placements[label]
+                         for label in ('control', 'timestamps', 'status', 'catalog')]
+        system_groups.extend(original_placements['status_partitions'])
+        expected = {group['identity']['group_id'] for group in system_groups}
         expected.add(initial_range(cluster, table)['group_id'])
         assert set(result['groups']) == expected, result
         leader = wait_for(lambda: control_leader(survivors), 'new Control leader', PROBE_WINDOW)
@@ -365,6 +369,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             scheduler_node_id=4, enrollment=fresh, bind=fresh['endpoint'], mount=fresh_mount,
             certificate=str(cluster.root / 'replacement.pem'),
             private_key=str(cluster.root / 'replacement.key'), system_replacement=prepared,
+            bootstrap_placements=original_placements,
         )
         cluster.config['replacement'] = replacement
         candidate_barrier = cluster.barrier_dir('replacement')

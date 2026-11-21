@@ -1,7 +1,6 @@
 use super::*;
 use crate::oltp_replication::{
-    authority::control::ReplacementMountProof,
-    manager::ManagedControl,
+    authority::control::ReplacementMountProof, manager::ManagedControl,
     multiplex::AppliedPeerDirectory,
 };
 use std::time::Duration;
@@ -21,14 +20,20 @@ pub(super) async fn join(
     let proof = ReplacementMountProof::sign(control.identity(), record, &record.intent.mount, key)?;
     loop {
         let mut mounted = false;
-        if let Some((applied, accepted, complete)) = control.replacement_record_local(record.intent.id).await? {
+        if let Some((applied, accepted, complete)) =
+            control.replacement_record_local(record.intent.id).await?
+        {
             if &applied != record {
                 return Err(failure("system replacement differs from committed intent"));
             }
             if complete && worker.manager.replacement_applied(record).await.is_ok() {
                 let state = control.inspect().await?.ok_or_else(unavailable)?;
-                if state.ready.view.run_id != record.intent.run_id || state.policy != worker.bootstrap_policy {
-                    return Err(failure("system replacement run or bootstrap policy differs"));
+                if state.ready.view.run_id != record.intent.run_id
+                    || state.policy != worker.bootstrap_policy
+                {
+                    return Err(failure(
+                        "system replacement run or bootstrap policy differs",
+                    ));
                 }
                 return Ok(());
             }
@@ -38,17 +43,35 @@ pub(super) async fn join(
             // If leadership moves to this worker between the final Raft
             // transition and its Control publication, it can finish that
             // publication without acquiring queue readiness first.
-            if let Err(error) = worker.manager.advance_system_replacement(control, running, &worker.operator).await {
+            if let Err(error) = worker
+                .manager
+                .advance_system_replacement(control, running, &worker.operator)
+                .await
+            {
                 tracing::debug!(code=?error.code, message=error.message, "system replacement promotion waits");
             }
         } else {
-            for enrollment in original.iter().filter(|peer| peer.worker_id != record.intent.previous.worker_id) {
-                match worker.manager.send_mount_proof(control.identity(), WorkerIdentity::from(enrollment), &proof).await {
+            for enrollment in original
+                .iter()
+                .filter(|peer| peer.worker_id != record.intent.previous.worker_id)
+            {
+                match worker
+                    .manager
+                    .send_mount_proof(control.identity(), WorkerIdentity::from(enrollment), &proof)
+                    .await
+                {
                     Ok(()) => break,
-                    Err(error) if matches!(error.code, ErrorCode::Conflict | ErrorCode::UnsupportedOperation) => {
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            ErrorCode::Conflict | ErrorCode::UnsupportedOperation
+                        ) =>
+                    {
                         return Err(error);
                     }
-                    Err(error) => tracing::debug!(code=?error.code, message=error.message, "system replacement mount waits"),
+                    Err(error) => {
+                        tracing::debug!(code=?error.code, message=error.message, "system replacement mount waits")
+                    }
                 }
             }
         }

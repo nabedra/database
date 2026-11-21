@@ -161,6 +161,8 @@ struct RetainedIdentity {
     previous: WorkerIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system_replacement: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "disabled")]
+    replacement_requires_restart: bool,
     #[serde(default)]
     restore_policy: Option<Digest>,
     #[serde(default)]
@@ -183,6 +185,7 @@ pub(crate) struct RegisteredWorker {
     pub cold: Option<cold::OpenedCold>,
     pub rolling: Option<restart::OpenedRestart>,
     pub system_replacement: Option<ReplacementRecord>,
+    replacement_retained: Option<(Arc<DirectoryOwner>, RetainedIdentity)>,
     pub restart_mount: Option<restart::RestartMount>,
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
@@ -201,6 +204,16 @@ pub(crate) struct RegisteredSystemGroups {
     pub catalog: Option<ManagedCatalog>,
 }
 impl RegisteredWorker {
+    pub(crate) fn seal_replacement_identity(&mut self) -> Result<(), ProtocolError> {
+        if let Some((owner, mut record)) = self.replacement_retained.take() {
+            // Once this incarnation may join the queue, a process restart
+            // must use the regular retained-mount protocol and a new identity.
+            record.replacement_requires_restart = true;
+            retain_identity(&owner, &record)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn open_secondary_pools(
         &mut self,
         control: &crate::oltp_replication::authority::control::ControlHandle,
@@ -554,6 +567,7 @@ impl RegisteredWorker {
         if cold.is_none() && rolling.is_none() {
             retain_identity(&ownership, &retained)?;
         }
+        let replacement_retained = replacement.as_ref().map(|_| (ownership.clone(), retained));
         let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
         if listener.local_addr().map_err(storage)?.port() != config.bind.port()
             || config.bind.port() == 0
@@ -573,6 +587,7 @@ impl RegisteredWorker {
             bootstrap_peers,
             shared.clone(),
         )?;
+        directory.set_cold_bootstrap(cold.is_some());
         if let Some(record) = &replacement {
             directory.allow_replacement_bootstrap(record)?;
         }
@@ -611,6 +626,7 @@ impl RegisteredWorker {
             cold,
             rolling,
             system_replacement: replacement,
+            replacement_retained,
             restart_mount,
             operator,
             transport,
@@ -665,6 +681,7 @@ fn inspect_identity(
             let old: RetainedIdentity = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
             let resume = config.system_replacement.as_ref().is_some_and(|record|
                 old.system_replacement == Some(record.intent.id)
+                    && !old.replacement_requires_restart
                     && old.previous == WorkerIdentity::from(&config.enrollment));
             if old.format != 1
                 || old.bootstrap_id != config.bootstrap_id
@@ -740,6 +757,7 @@ fn inspect_identity(
             lock_inode,
             previous: WorkerIdentity::from(&config.enrollment),
             system_replacement: config.system_replacement.as_ref().map(|record| record.intent.id),
+            replacement_requires_restart: false,
             restore_policy,
             cold,
         },

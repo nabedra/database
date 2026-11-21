@@ -1,7 +1,6 @@
 use super::*;
 use crate::oltp_replication::{
-    authority::control::ReplacementRecord,
-    multiplex::AppliedPeerDirectory,
+    authority::control::ReplacementRecord, multiplex::AppliedPeerDirectory,
 };
 use std::sync::Arc;
 
@@ -21,31 +20,43 @@ impl ControlMachine {
                     return view.encode(&None::<Trust>);
                 }
                 let active = super::super::service::load::<Uuid>(view, system_recovery::ACTIVE)?;
-                let candidate = match super::super::service::load::<Uuid>(view, system_recovery::PREPARING)? {
-                    Some(id) => Some((
-                        super::super::service::load::<ReplacementRecord>(view, &system_recovery::by_id(id))?
+                let candidate =
+                    match super::super::service::load::<Uuid>(view, system_recovery::PREPARING)? {
+                        Some(id) => Some((
+                            super::super::service::load::<ReplacementRecord>(
+                                view,
+                                &system_recovery::by_id(id),
+                            )?
                             .ok_or_else(unknown)?,
-                        active == Some(id),
-                    )),
-                    None => None,
-                };
+                            active == Some(id),
+                        )),
+                        None => None,
+                    };
                 let mut revoked = Vec::new();
                 let mut after = None;
                 loop {
                     let mut next = None;
-                    let page = view.scan_page(system_recovery::REVOKED_WORKERS, after.as_deref(), 128, |key, bytes| {
-                        if revoked.len() == 1024 {
-                            return Err(unknown());
-                        }
-                        revoked.push(decode::<WorkerIdentity>(bytes)?);
-                        next = Some(key.to_vec());
-                        Ok(())
-                    })?;
-                    if page.exhausted { break; }
+                    let page = view.scan_page(
+                        system_recovery::REVOKED_WORKERS,
+                        after.as_deref(),
+                        128,
+                        |key, bytes| {
+                            if revoked.len() == 1024 {
+                                return Err(unknown());
+                            }
+                            revoked.push(decode::<WorkerIdentity>(bytes)?);
+                            next = Some(key.to_vec());
+                            Ok(())
+                        },
+                    )?;
+                    if page.exhausted {
+                        break;
+                    }
                     after = next;
                 }
                 let mut operators = Vec::new();
-                let group = super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;
+                let group =
+                    super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;
                 if let Some(group) = group {
                     let mut members = Vec::new();
                     view.scan_page(&member_prefix(group.generation), None, 16, |_, bytes| {
@@ -53,7 +64,10 @@ impl ControlMachine {
                         Ok(())
                     })?;
                     for member in members {
-                        if let Some(worker) = super::super::service::load::<WorkerRecord>(view, &key(WORKERS, member.worker_id))? {
+                        if let Some(worker) = super::super::service::load::<WorkerRecord>(
+                            view,
+                            &key(WORKERS, member.worker_id),
+                        )? {
                             operators.push(worker.enrollment);
                         }
                     }
@@ -67,7 +81,12 @@ impl ControlMachine {
             })
             .await?;
         if let Some(trust) = decode::<Option<Trust>>(raw.as_ref())? {
-            directory.install_system_trust(trust.revision, trust.operators, trust.revoked, trust.candidate)?;
+            directory.install_system_trust(
+                trust.revision,
+                trust.operators,
+                trust.revoked,
+                trust.candidate,
+            )?;
         }
         Ok(())
     }

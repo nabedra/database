@@ -1,8 +1,11 @@
 use super::*;
 use crate::oltp_replication::{
     authority::control::{
-        ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
-        machine::system_recovery::{ACTIVATION, ACTIVE, EXECUTION, by_id, by_worker, published, revoked_id},
+        ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord,
+        SystemRecoveryCommand,
+        machine::system_recovery::{
+            ACTIVATION, ACTIVE, EXECUTION, by_id, by_worker, published, revoked_id,
+        },
     },
     manager::{HostedGroupManager, ManagedControl},
     owned::serialized_digest,
@@ -139,7 +142,8 @@ impl ControlHandle {
             ))?,
         )?;
         if self.system_replacement_activation().await?.is_none()
-            || (intent.mount_public_key.is_some() && self.system_replacement_execution().await?.is_none())
+            || (intent.mount_public_key.is_some()
+                && self.system_replacement_execution().await?.is_none())
         {
             return Err(ProtocolError::new(
                 ErrorCode::UnsupportedOperation,
@@ -183,21 +187,31 @@ impl ControlHandle {
         manager: &HostedGroupManager,
         next: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        if !self.registered_directory.get().is_some_and(|directory| directory.replacement_capability_active()) {
+        if !self
+            .registered_directory
+            .get()
+            .is_some_and(|directory| directory.replacement_capability_active())
+        {
             return Ok(());
         }
         if self.system_replacement_execution().await?.is_some() {
-            manager.verify_recovery_execution(self.identity(), next).await
+            manager
+                .verify_recovery_execution(self.identity(), next)
+                .await
         } else {
-            manager.verify_recovery_capability(self.identity(), next).await
+            manager
+                .verify_recovery_capability(self.identity(), next)
+                .await
         }
     }
 
     async fn system_replacement_execution(&self) -> Result<Option<AppliedPosition>, ProtocolError> {
-        let raw = self.read(|view| {
-            let activation = load::<AppliedPosition>(view, EXECUTION)?;
-            view.encode(&activation)
-        }).await?;
+        let raw = self
+            .read(|view| {
+                let activation = load::<AppliedPosition>(view, EXECUTION)?;
+                view.encode(&activation)
+            })
+            .await?;
         machine::decode(raw.as_ref())
     }
 
@@ -205,38 +219,46 @@ impl ControlHandle {
         &self,
         id: Uuid,
     ) -> Result<Option<(ReplacementRecord, bool, bool)>, ProtocolError> {
-        let raw = self.machine.store().read_metadata(BUDGET, move |view| {
-            let record = if let Some(record) = load::<ReplacementRecord>(view, &by_id(id))? {
-                let mounted = view.get(&revoked_id(record.intent.previous.worker_id))?.is_some();
-                let complete = mounted && load::<Uuid>(view, ACTIVE)? != Some(id);
-                Some((record, mounted, complete))
-            } else {
-                None
-            };
-            view.encode(&record)
-        }).await?;
+        let raw = self
+            .machine
+            .store()
+            .read_metadata(BUDGET, move |view| {
+                let record = if let Some(record) = load::<ReplacementRecord>(view, &by_id(id))? {
+                    let mounted = view
+                        .get(&revoked_id(record.intent.previous.worker_id))?
+                        .is_some();
+                    let complete = mounted && load::<Uuid>(view, ACTIVE)? != Some(id);
+                    Some((record, mounted, complete))
+                } else {
+                    None
+                };
+                view.encode(&record)
+            })
+            .await?;
         machine::decode(raw.as_ref())
     }
 
     pub(crate) async fn active_system_replacement(
         &self,
     ) -> Result<Option<(ReplacementRecord, Vec<Uuid>)>, ProtocolError> {
-        let raw = self.read(|view| {
-            let active = if let Some(id) = load::<Uuid>(view, ACTIVE)? {
-                let record = load::<ReplacementRecord>(view, &by_id(id))?.ok_or_else(stale)?;
-                let mut remaining = Vec::new();
-                for plan in &record.groups {
-                    let group = plan.expected.identity.group_id;
-                    if view.get(&published(id, group))?.is_none() {
-                        remaining.push(group);
+        let raw = self
+            .read(|view| {
+                let active = if let Some(id) = load::<Uuid>(view, ACTIVE)? {
+                    let record = load::<ReplacementRecord>(view, &by_id(id))?.ok_or_else(stale)?;
+                    let mut remaining = Vec::new();
+                    for plan in &record.groups {
+                        let group = plan.expected.identity.group_id;
+                        if view.get(&published(id, group))?.is_none() {
+                            remaining.push(group);
+                        }
                     }
-                }
-                Some((record, remaining))
-            } else {
-                None
-            };
-            view.encode(&active)
-        }).await?;
+                    Some((record, remaining))
+                } else {
+                    None
+                };
+                view.encode(&active)
+            })
+            .await?;
         machine::decode(raw.as_ref())
     }
 
@@ -246,16 +268,19 @@ impl ControlHandle {
         proof: ReplacementMountProof,
         state: &State,
     ) -> Result<(), ProtocolError> {
-        match self.propose_system_recovery(
-            running,
-            Uuid::new_v4(),
-            SystemRecoveryCommand::Mount {
-                proof,
-                ready: state.ready,
-                enrollment_revision: state.enrollment_revision,
-                group_inventory_revision: state.group_inventory_revision,
-            },
-        ).await? {
+        match self
+            .propose_system_recovery(
+                running,
+                Uuid::new_v4(),
+                SystemRecoveryCommand::Mount {
+                    proof,
+                    ready: state.ready,
+                    enrollment_revision: state.enrollment_revision,
+                    group_inventory_revision: state.group_inventory_revision,
+                },
+            )
+            .await?
+        {
             ControlReply::SystemReplacementMounted => Ok(()),
             ControlReply::Rejected(Fault::Unauthorized) => Err(unauthorized()),
             _ => Err(unavailable("system replacement mount or inventory changed")),
@@ -277,7 +302,11 @@ impl ControlHandle {
             && permit.local == WorkerIdentity::from(&record.intent.next)
         {
             let membership = running.observe_stable_membership().await?;
-            let plan = record.groups.iter().find(|plan| plan.expected.identity == *self.identity()).ok_or_else(stale)?;
+            let plan = record
+                .groups
+                .iter()
+                .find(|plan| plan.expected.identity == *self.identity())
+                .ok_or_else(stale)?;
             if membership.replicas() != &plan.next(record.intent.previous.worker_id)? {
                 return Err(unauthorized());
             }
@@ -290,9 +319,19 @@ impl ControlHandle {
         } else {
             self.local_operator(permit, operation_id, evidence)?
         };
-        match self.propose_system_recovery(running, operation_id, SystemRecoveryCommand::Publish {
-            id, group, applied, authorization,
-        }).await? {
+        match self
+            .propose_system_recovery(
+                running,
+                operation_id,
+                SystemRecoveryCommand::Publish {
+                    id,
+                    group,
+                    applied,
+                    authorization,
+                },
+            )
+            .await?
+        {
             ControlReply::SystemReplacementPublished(_) => Ok(()),
             _ => Err(stale()),
         }

@@ -489,7 +489,8 @@ impl LocalServices {
                 }
             }
             registration.bind(Purpose::GroupLifecycle, factory.clone())?;
-            let split = SplitClient::new(data.clone(), rpc.clone(), placements.timestamps.identity.clone());
+            let split = SplitClient::new(data.clone(), rpc.clone(),
+                placements.timestamps.identity.clone(), placements.catalog.identity.clone());
             let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps.clone(), native_catalog.clone(), status_topology.clone())?;
             registration.bind(Purpose::ShardSplit, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitProof, split_endpoint.clone())?;
@@ -497,10 +498,12 @@ impl LocalServices {
             if let Some(recovery) = &recovery {
                 cold::finish(recovery, &worker, &control, &rpc, seed, deadline, &error_trace)
                     .await?;
+                directory.set_cold_bootstrap(false);
             }
             if !rolling {
                 restart::register_mount(&worker, &control, deadline, &error_trace).await?;
             }
+            worker.seal_replacement_identity()?;
             let restart_mount = worker
                 .restart_mount
                 .take()

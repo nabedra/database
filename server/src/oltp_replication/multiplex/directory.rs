@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -49,6 +49,7 @@ pub(crate) struct AppliedPeerDirectory {
     learner_groups: RwLock<BTreeMap<Uuid, BTreeSet<Uuid>>>,
     revision: AtomicU64,
     epoch: AtomicU64,
+    cold_bootstrap: AtomicBool,
     refresh: tokio::sync::Mutex<()>,
 }
 impl AppliedPeerDirectory {
@@ -74,6 +75,7 @@ impl AppliedPeerDirectory {
             learner_groups: RwLock::new(BTreeMap::new()),
             revision: AtomicU64::new(0),
             epoch: AtomicU64::new(1),
+            cold_bootstrap: AtomicBool::new(false),
             refresh: tokio::sync::Mutex::new(()),
         });
         for peer in peers {
@@ -89,6 +91,24 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
+    pub(crate) fn set_cold_bootstrap(&self, cold: bool) {
+        self.cold_bootstrap.store(cold, Ordering::Release);
+    }
+
+    // A complete cold restart must first rebuild the current Control quorum
+    // with the retained disks. The configured replacement incarnations only
+    // bridge the gap until the existing cold fence authorizes their enrollment.
+    fn cold_peer(&self, enrolled: &WorkerEnrollment) -> Option<WorkerEnrollment> {
+        if !self.cold_bootstrap.load(Ordering::Acquire) {
+            return None;
+        }
+        let entries = self.entries.read().ok()?;
+        let entry = entries.get(&enrolled.worker_id)?;
+        (matches!(entry.role, Role::BootstrapControl(_))
+            && entry.enrollment.enrollment_revision > enrolled.enrollment_revision)
+            .then(|| entry.enrollment.clone())
+    }
+
     pub(crate) fn allow_replacement_bootstrap(
         &self,
         record: &ReplacementRecord,
@@ -139,8 +159,11 @@ impl AppliedPeerDirectory {
 
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
         match self.system.read() {
-            Ok(state) => state.as_ref().map(|state| state.operators.get(&identity.worker_id)
-                .is_some_and(|entry| WorkerIdentity::from(entry) == identity)),
+            Ok(state) => state.as_ref().map(|state| !Self::denied(state, identity.worker_id, Some(identity.certificate_sha256))
+                && state.operators.get(&identity.worker_id).is_some_and(|entry| {
+                    WorkerIdentity::from(entry) == identity
+                        || self.cold_peer(entry).as_ref().map(WorkerIdentity::from) == Some(identity)
+                })),
             Err(_) => Some(false),
         }
     }
@@ -379,7 +402,7 @@ impl PeerDirectory for AppliedPeerDirectory {
         if let Some(enrollment) = self.system.read().map_err(|_| unavailable())?
             .as_ref().and_then(|state| state.operators.get(&worker))
         {
-            return Ok(enrollment.clone());
+            return Ok(self.cold_peer(enrollment).unwrap_or_else(|| enrollment.clone()));
         }
         self.entries
             .read()
@@ -440,11 +463,16 @@ impl PeerDirectory for AppliedPeerDirectory {
         if let Some(operator) = self.system.read().map_err(|_| unavailable())?
             .as_ref().and_then(|state| state.operators.get(&peer.worker_id))
         {
-            return if WorkerIdentity::from(operator) == peer {
-                Ok(TransportTrust::AppliedEnrollment)
-            } else {
-                Err(invalid())
-            };
+            if WorkerIdentity::from(operator) == peer {
+                return Ok(TransportTrust::AppliedEnrollment);
+            }
+            if self.cold_peer(operator).as_ref().map(WorkerIdentity::from) == Some(peer)
+                && group == &self.control
+                && matches!(purpose, Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery)
+            {
+                return Ok(TransportTrust::BootstrapControl);
+            }
+            return Err(invalid());
         }
         let entries = self.entries.read().map_err(|_| unavailable())?;
         let entry = entries.get(&peer.worker_id).ok_or_else(unavailable)?;
