@@ -1565,9 +1565,8 @@ impl ControlClient {
     /// REP6: every committed system revocation (the set Control hosts
     /// enforce), each page agreed by a majority of the Control pins. A
     /// Data-only worker seeds its revocation view with this at startup and
-    /// refreshes it once per [`REVOCATION_REFRESH`], never per exchange.
-    ///
-    /// [`REVOCATION_REFRESH`]: crate::oltp_replication::multiplex::REVOCATION_REFRESH
+    /// refreshes it once per second (`REVOCATION_REFRESH`), never per
+    /// exchange.
     pub(crate) async fn revocations_quorum(&self) -> Result<Vec<WorkerIdentity>, ProtocolError> {
         let mut revoked = Vec::new();
         let mut after = None;

@@ -874,6 +874,7 @@ impl WorkerTransport {
         })
     }
     /// Sessions closed when the directory learned their peer's revocation.
+    #[cfg(test)]
     pub(crate) fn revoked_session_closes(&self) -> u64 {
         self.common.revoked_closes.load(Ordering::Relaxed)
     }
