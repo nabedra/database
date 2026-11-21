@@ -720,12 +720,14 @@ async fn interrupt_publication() {
     let fixture = Fixture::new().await;
     fixture.seed(6).await;
     let record = fixture.declare().await;
+    // The historical reader must predate the publication transaction's own
+    // read timestamp so its undecided Catalog intents cannot block the read.
+    let historical = fixture.pin_query("query.explain").await;
     let phase =
         index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Validation);
     let actor = fixture.spawn_resume(record);
     let held = reached(phase).await;
     fixture.assert_building(&original(7)).await;
-    let historical = fixture.pin_query("query.explain").await;
     let catalog = fixture.runtime.services.catalog.participant();
     let catalog_id = catalog.identity().group_id;
     let mut holds = index_holds::register(catalog_id);
