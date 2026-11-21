@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -178,7 +179,7 @@ def two_ready(cluster, survivors):
                .get('ready_workers') == 2 for name in survivors)
 
 
-def o06_o17_system_replacement_check(binary, test_executable, root):
+def o06_o17_system_replacement_check(binary, test_executable, root, variant=None):
     cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable,
                          status_partitions=2)
     peer_probe = None
@@ -347,6 +348,18 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         mount_seed.chmod(0o600)
         intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
                       next=fresh, mount=fresh_mount, mount_public_key=mount_der('-pubout').hex())
+        if variant == 'abandon':
+            abandoned = cluster.certificate('abandoned')
+            abandoned_mount = cluster.mount_pool('abandoned', uid(), abandoned)
+            decoy = dict(intent, id=uid(), next=abandoned, mount=abandoned_mount)
+            assert success(*operator(leader, operation(
+                'worker.system_replacement.prepare', decoy, decoy['id'])))['intent'] == decoy
+            abandon = operation('worker.system_replacement.abandon', {'id': decoy['id']})
+            status, reply = send(cluster.urls[leader], cluster.auth['data_token'], abandon,
+                                 path='/v1/cluster/operations')
+            assert status in (401, 403), (status, reply)
+            for _ in range(2):
+                assert success(*operator(leader, abandon)) == {'id': decoy['id'], 'abandoned': True}
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
         borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
         bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))
@@ -442,6 +455,25 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
 
         stable_checkpoint = candidate_barrier / f'reached-{fresh["worker_id"]}'
         wait_for(stable_checkpoint.exists, 'replacement applied stable RF3 in every group', RECOVERY_DEADLINE)
+        if variant == 'wipe':
+            cluster.workers['replacement'].kill()
+            mount_root = Path(fresh_mount['mount_path'])
+            shutil.rmtree(mount_root / 'pool')
+            (mount_root / 'NABEDRA_REGISTERED_WORKER.json').unlink()
+            assert mount_seed.exists()
+            cluster.launch_worker('replacement')
+            attempt = cluster.workers['replacement']
+            assert attempt.popen.wait(timeout=30) != 0
+            assert 'replacement mount already committed' in cluster.tail('replacement'), cluster.tail('replacement')
+            assert not (mount_root / 'pool').exists(), 'startup opened a blank pool'
+            report('O17/NS23 refuses a wiped mounted replacement', intent=intent['id'])
+            return
+        if variant == 'abandon':
+            active_leader = wait_for(lambda: control_leader(survivors), 'surviving Control leader', PROBE_WINDOW)
+            status, reply = operator(active_leader, operation(
+                'worker.system_replacement.abandon', {'id': intent['id']}))
+            assert status == 409, (status, reply)
+            report('O17/R01 abandons only unmounted intents', intent=intent['id'])
         rf3_restored = time.monotonic()
         (candidate_barrier / f'release-{fresh["worker_id"]}').touch()
         copy_checkpoint = candidate_barrier / f'reached-{intent["id"]}'
@@ -855,7 +887,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed'),
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed',
+                                             'replacement-abandon', 'replacement-wipe'),
                         default='all')
     parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
@@ -869,6 +902,11 @@ def main():
         if args.suite in ('all', 'replacement-check'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
+
+        if args.suite in ('replacement-abandon', 'replacement-wipe'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / args.suite,
+                                              variant=args.suite.split('-')[1])
 
         if args.suite == 'replacement-mixed':
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
