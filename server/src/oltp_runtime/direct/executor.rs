@@ -209,6 +209,15 @@ impl DirectExecutor {
         self.stats.forward();
         let response = match self.admit(handle, &request) {
             Err(response) => response,
+            // User decision 2026-11-21 (RV-FINAL M3): a get has no
+            // exactly-once identity, so it never leaves a marker. A gateway
+            // of an older build that still forwards one takes the queued
+            // path; nothing is proposed or read.
+            Ok((_, parsed)) if matches!(parsed.operation, Operation::Get(_)) => {
+                DirectResponse::Fallback {
+                    reason: FallbackReason::Ineligible,
+                }
+            }
             Ok((admitted, parsed)) => {
                 let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
                 let response = self
@@ -571,12 +580,15 @@ impl DirectExecutor {
                     }
                     Err(error) => return Err(failed(error)),
                     Ok(read @ LatestRead::Value { .. }) => {
-                        // T7c: a get whose id the queued path accepted (a
-                        // forward marker at its key) is answered there:
-                        // after a cold start that is 404 abandoned, never a
-                        // fresh read. In the queued-history window an id
-                        // without a record may be such a request too.
-                        // Reads leave no record, so nothing else changes.
+                        // The key's record of this id, a local lookup: a
+                        // get that reuses the id of a mutation on its key
+                        // conflicts (409), and one whose id a queued
+                        // mutation settled here (a marker) goes queued,
+                        // where Status answers it. Gets themselves leave
+                        // no record and have no exactly-once identity (user
+                        // decision 2026-11-21, RV-FINAL M3), so the
+                        // queued-history window does not hold them back: a
+                        // read cannot apply or hide a pre-boundary mutation.
                         match by(
                             deadline,
                             handle.direct_dedup_after_barrier(
@@ -594,11 +606,6 @@ impl DirectExecutor {
                             }
                             Err(error) => return Err(failed(error)),
                             Ok(Some(found)) => return self.settled(found, request.digest),
-                            Ok(None) if self.gate.history_settling() => {
-                                return Err(DirectResponse::Fallback {
-                                    reason: FallbackReason::History,
-                                });
-                            }
                             Ok(None) => return self.get_result(read, &epochs),
                         }
                     }
@@ -661,8 +668,6 @@ impl DirectExecutor {
                 .collect(),
             Operation::Update(p) => vec![key(p.key.clone())],
             Operation::Delete(p) => vec![key(p.key.clone())],
-            // Only a forward reaches here with a get: its marker's anchor.
-            Operation::Get(p) => vec![key(p.key.clone())],
             _ => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Ineligible,

@@ -178,7 +178,8 @@ async fn create(app: &Router) -> Value {
 /// and types over the direct path equal the queued path's for the same
 /// program; the topology is read once per table. The baseline worker runs
 /// with `direct_oltp: false`: its mutations are settled at the anchor and
-/// executed queued, nothing runs directly.
+/// executed queued, nothing runs directly. Gets are never settled (user
+/// decision 2026-11-21, RV-FINAL M3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
     tokio::time::timeout(Duration::from_secs(240), async {
@@ -200,6 +201,12 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         eprintln!("d01 rf1 queued gateway: {gateway:?}");
         assert_eq!(gateway.direct_done, 0, "{gateway:?}");
         assert!(gateway.forwards >= 8, "every eligible mutation settled first: {gateway:?}");
+        let mutations = program(&table, 0)
+            .iter()
+            .filter(|(operation, _)| *operation != "table.get")
+            .count() as u64;
+        // The gateway and then the queue owner settle each mutation.
+        assert!(gateway.forwards <= 2 * mutations, "no get settled: {gateway:?}");
         baseline.drain().await.unwrap();
 
         // The direct path (`direct_oltp: true`).
@@ -249,7 +256,8 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         // Without a declared length the request takes the queued path and
         // still answers the same (the full parsing charge applies). The
         // queue owner settles each eligible mutation at its anchor before it
-        // reserves it (T7c), so none can also run directly.
+        // reserves it (T7c), so none can also run directly; gets are not
+        // settled (RV-FINAL M3).
         let markers = leader()["forward_markers_written"].as_u64().unwrap();
         let base = 2_000;
         for (index, (operation, payload)) in program(&table, base).into_iter().enumerate() {
@@ -264,11 +272,9 @@ async fn d01_o03_rf1_direct_results_equal_the_queued_path_over_mtls() {
         let after = gateway.stats();
         assert_eq!(after.direct_done, stats.direct_done, "{after:?}");
         assert!(after.forwards >= 8, "{after:?}");
-        assert!(
-            leader()["forward_markers_written"].as_u64().unwrap() >= markers + 8,
-            "{}",
-            leader()
-        );
+        assert!(after.forwards - stats.forwards <= mutations, "no get settled: {after:?}");
+        let written = leader()["forward_markers_written"].as_u64().unwrap() - markers;
+        assert!((8..=mutations).contains(&written), "{}", leader());
 
         // The runtime stats show the gateway, the executor and the switch.
         let reply = runtime.stats().await.unwrap();
@@ -456,7 +462,8 @@ fn report(line: &str) {
 /// length) and through the queue owner (no declared length) it proposes no
 /// Data entry and writes no forward marker, so no dedup record or expiry
 /// key. A mutation in the same mode is still settled (one marker). The run
-/// reports per-get Data entries, forwards, journal bytes and wall time.
+/// reports per-get Data entries, forwards, journal bytes and wall time; the
+/// same test on the previous rule (`fb20718`) recorded the baseline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
     const GETS: usize = 200;
@@ -521,14 +528,35 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
             after.4 - before.4,
         );
         report(&format!(
-            "M3 rollback-mode queued gets: {GETS} gets, {:.3} ms/get, Data entries {entries} \
-             ({:.2}/get), forward markers {markers}, gateway forwards {forwards}, journal bytes \
-             {journal} ({:.0}/get), store commits {commits} ({:.2}/get)",
+            "M3 rollback-mode queued gets: {GETS} gets, {:.3} ms/get, Data entries {} \
+             ({:.2}/get: DirectCommit {entries}, DirectForward markers {markers}), forward RPCs \
+             {forwards}, journal bytes {journal} ({:.0}/get), store commits {commits} ({:.2}/get)",
             elapsed.as_secs_f64() * 1e3 / GETS as f64,
-            entries as f64 / GETS as f64,
+            entries + markers,
+            (entries + markers) as f64 / GETS as f64,
             journal as f64 / GETS as f64,
             commits as f64 / GETS as f64,
         ));
+        assert_eq!((entries, markers, forwards), (0, 0, 0));
+        // Mutations keep the T7c rule in the same mode: settled, one marker.
+        let (status, updated) = call(
+            &app,
+            body(
+                Uuid::new_v4(),
+                "table.update",
+                json!({"table_id": table, "key": 1, "values": {"value": 11}}),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!((status, &updated["data"]), (200, &json!(true)), "{updated}");
+        let settled = snapshot().await;
+        assert_eq!(settled.1 - after.1, 1, "one forward marker");
+        assert_eq!(
+            settled.2 - after.2,
+            2,
+            "the gateway's forward, then the queue owner's"
+        );
         runtime.drain().await.unwrap();
     })
     .await

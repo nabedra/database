@@ -1304,9 +1304,14 @@ async fn d03_forward_markers_settle_request_ids_before_the_queued_path() {
 /// mutation whose anchor holds no dedup record: it may be the retry of a
 /// queued request reserved before activation without a marker, which only
 /// the queued path can answer. It answers `Fallback{History}` and writes
-/// nothing; gets answer the same. The gateway's forward still settles the
-/// id (a marker), and an id that already committed directly still replays
-/// its result. After the window the same leader executes again.
+/// nothing. The gateway's forward still settles the id (a marker), and an
+/// id that already committed directly still replays its result. After the
+/// window the same leader executes again.
+///
+/// Gets (user decision 2026-11-21, RV-FINAL M3): a read has no exactly-once
+/// identity, so the window does not hold it back, and a get forward writes
+/// no marker (`Ineligible`: no entry, no dedup or expiry key). The cheap
+/// local check stays: a get reusing a mutation's id on its key is 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
     let cluster = Cluster::new(Options::default()).await;
@@ -1373,16 +1378,17 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
             .await,
         done("null")
     );
-    // A get may be the retry of a queued read accepted before activation
-    // too: the same answer, nothing read.
+    // RV-FINAL M3: a get is a read, also inside the window. A retried
+    // pre-boundary get is a new read; nothing is proposed.
     let get = Uuid::new_v4();
     let get_body = cluster.body(get, "table.get", serde_json::json!({"key": 4}));
     assert_eq!(
         v.executor
             .execute(&v.handle, cluster.request(leader, &get_body, get))
             .await,
-        history
+        done(r#"{"id":4,"score":0.0,"tag":"b","value":4}"#)
     );
+    assert_eq!(v.executor.stats().entries_proposed, entries);
     // The gateway settles the fallen-back id: a marker, then the queued path.
     assert_eq!(
         v.executor
@@ -1393,10 +1399,29 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
         }
     );
     assert_eq!(v.executor.stats().forward_markers_written, 1);
+    // A get forward (an older gateway) writes no marker.
+    let (entries, dedup, expiry) = (
+        v.executor.stats().entries_proposed,
+        cluster.keys_with(leader, b'D').await,
+        cluster.keys_with(leader, b'E').await,
+    );
+    let ineligible = DirectResponse::Fallback {
+        reason: FallbackReason::Ineligible,
+    };
+    assert_eq!(
+        v.executor
+            .forward(&v.handle, cluster.request(leader, &get_body, get))
+            .await,
+        ineligible
+    );
+    assert_eq!(v.executor.stats().entries_proposed, entries);
+    assert_eq!(v.executor.stats().forward_markers_written, 1);
+    assert_eq!(cluster.keys_with(leader, b'D').await, dedup);
+    assert_eq!(cluster.keys_with(leader, b'E').await, expiry);
     let stats = serde_json::to_value(v.executor.stats()).unwrap();
     assert_eq!(
         stats["fallbacks"]["history"],
-        serde_json::json!(3),
+        serde_json::json!(2),
         "{stats}"
     );
 
@@ -1423,24 +1448,34 @@ async fn o15_d03_t7c_history_window_leaves_unknown_ids_to_the_queued_path() {
             .await,
         done(r#"{"id":4,"score":0.0,"tag":"b","value":40}"#)
     );
-    // A queued read is settled like a mutation: its marker keeps a later
-    // direct get of the same id on the queued path.
+    // A queued read leaves nothing at its key: the same id read directly
+    // later is a new read (RV-FINAL M3), and no entry is proposed for it.
     let read = Uuid::new_v4();
     let read_body = cluster.body(read, "table.get", serde_json::json!({"key": 4}));
-    let forwarded = DirectResponse::Fallback {
-        reason: FallbackReason::Forwarded,
-    };
+    let entries = v.executor.stats().entries_proposed;
     assert_eq!(
         v.executor
             .forward(&v.handle, cluster.request(leader, &read_body, read))
             .await,
-        forwarded
+        ineligible
     );
     assert_eq!(
         v.executor
             .execute(&v.handle, cluster.request(leader, &read_body, read))
             .await,
-        forwarded
+        done(r#"{"id":4,"score":0.0,"tag":"b","value":40}"#)
+    );
+    assert_eq!(v.executor.stats().entries_proposed, entries);
+    // A get reusing a queued mutation's id on its key (its marker)
+    // conflicts, as the queued path's identity would.
+    let reuse = cluster.body(id, "table.get", serde_json::json!({"key": 3}));
+    assert_eq!(
+        code(
+            &v.executor
+                .execute(&v.handle, cluster.request(leader, &reuse, id))
+                .await
+        ),
+        Some((ErrorCode::Conflict, Outcome::NotApplied))
     );
     // A get reusing a direct mutation's id on its key conflicts, as the
     // queued path's identity would.
