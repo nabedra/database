@@ -854,12 +854,28 @@ impl DirectExecutor {
             self.token(handle, clock, deadline),
         )
         .await?;
-        let prepared = self
-            .prepare(
-                handle, clock, request, table, operation, keys, deadline, *uncertain,
-            )
-            .await?;
-        let (epochs, computed, result) = match prepared {
+        // PERF2b: the commit timestamp is fetched while steps 3 and 4 run,
+        // in this task. `mutate` already holds the latches (plan section 5,
+        // rule 1), and registration below still refuses a timestamp at or
+        // below `max_read_ts`. An attempt that ends before the commit drops
+        // the fetch; an unused timestamp is only a gap.
+        let fetch = timed(
+            perf_stage!("leader.attempt.timestamp_fetch"),
+            by(deadline, self.timestamps.commit_ts()),
+        );
+        let prepare = self.prepare(
+            handle, clock, request, table, operation, keys, deadline, *uncertain,
+        );
+        tokio::pin!(fetch, prepare);
+        let mut fetched = None;
+        let prepared = loop {
+            tokio::select! {
+                biased;
+                ts = &mut fetch, if fetched.is_none() => fetched = Some(ts),
+                prepared = &mut prepare => break prepared,
+            }
+        };
+        let (epochs, computed, result) = match prepared? {
             Prepared::Commit {
                 epochs,
                 computed,
@@ -867,13 +883,20 @@ impl DirectExecutor {
             } => (epochs, computed, result),
             Prepared::Exit(exit) => return Ok(exit),
         };
-        let commit_ts = match timed(
-            perf_stage!("leader.attempt.timestamp"),
-            by(deadline, self.timestamps.commit_ts()),
-        )
-        .await
-        {
-            Ok(ts) => ts,
+        let waited = std::time::Instant::now();
+        let fetched = match fetched {
+            Some(fetched) => fetched,
+            None => fetch.await,
+        };
+        perf_stage!("leader.attempt.timestamp").since(waited);
+        let commit_ts = match fetched {
+            Ok(ts) if above_read_versions(ts, &computed.writes) => ts,
+            // A version newer than the overlapped fetch applied meanwhile:
+            // apply would reject the commit, so fetch again first.
+            Ok(_) => match by(deadline, self.timestamps.commit_ts()).await {
+                Ok(ts) => ts,
+                Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
+            },
             Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
         };
         let build = std::time::Instant::now();
@@ -1665,6 +1688,22 @@ fn latest_value(
         Err(error) if error.code == ErrorCode::StorageUnavailable => Ok(None),
         Err(error) => Err(failed(error)),
     }
+}
+
+/// True when `commit_ts` is above every version the attempt read. A
+/// timestamp fetched while the reads ran (PERF2b) can be older than a
+/// version that applied meanwhile; apply would reject it with `Conflict`.
+fn above_read_versions(commit_ts: CommitTs, writes: &[DirectWrite]) -> bool {
+    writes.iter().all(|write| {
+        write
+            .expected_version
+            .is_none_or(|version| commit_ts > version)
+            && write.index.iter().all(|change| {
+                change
+                    .expected_version
+                    .is_none_or(|version| commit_ts > version)
+            })
+    })
 }
 
 async fn by<T>(
