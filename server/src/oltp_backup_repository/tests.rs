@@ -1,5 +1,5 @@
-//! Real local filesystem transport assertions. The opaque history fixture does
-//! not establish database backup consistency or exercise a cloud provider.
+//! Archive transport assertions. The opaque history fixtures do not establish
+//! database backup consistency. Only the opt-in live probe contacts AWS.
 use super::*;
 use crate::{config::WorkerResources, oltp::pool::SharedResourceConfig};
 use std::{
@@ -331,6 +331,96 @@ async fn o19_filesystem_archive_retries_are_immutable_bounded_and_root_publishes
     drop(reader);
     drop(published);
     assert_eq!(shared.buffer_bytes_used(ByteClass::Data), 0);
+}
+
+#[cfg(feature = "oltp-backup-s3")]
+#[tokio::test]
+#[ignore = "requires explicitly authorized fresh live S3 fixture and external teardown"]
+async fn o19_live_s3_archive_reopens_and_reconciles_exact_retries() {
+    assert_eq!(
+        std::env::var("NABEDRA_LIVE_ARCHIVE_PROBE").ok().as_deref(),
+        Some("1")
+    );
+    let config = S3ArchiveConfig {
+        bucket: std::env::var("NABEDRA_S3_BUCKET").unwrap(),
+        prefix: std::env::var("NABEDRA_S3_PREFIX")
+            .unwrap()
+            .trim_end_matches('/')
+            .to_owned(),
+        region: std::env::var("AWS_REGION").unwrap(),
+    };
+    let shared = shared();
+    let transport = config.clone().connect(shared.clone()).await.unwrap();
+    let keys = Directory::new();
+    let key_path = private_key(&keys.0, "fixture-key", &[42; 32]);
+    let key_config = key_config(&[("fixture", &key_path)], Some("fixture"));
+    let repository = ArchiveRepository::new(
+        transport.clone(),
+        ArchiveKeys::load(Some(&key_config)).unwrap(),
+    );
+    let key = ArchiveKey {
+        cluster_id: Uuid::new_v4(),
+        archive_id: Uuid::new_v4(),
+    };
+    let chunks = [b"abcd".as_slice(), b"ef".as_slice()];
+    let history = br#"{"format_version":1,"history_root":"live-transport-fixture"}"#;
+
+    let mut first = UploadSession::new(repository.clone(), key, 4).unwrap();
+    first
+        .append(shared.copy_bytes(chunks[0]).unwrap())
+        .await
+        .unwrap();
+    assert!(read_root(&repository, key).await.is_err());
+    first
+        .append(shared.copy_bytes(chunks[1]).unwrap())
+        .await
+        .unwrap();
+    let published = first
+        .publish(shared.copy_bytes(history).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(published.header().archive_sha256, hash(b"abcdef"));
+    assert_eq!(published.header().part_count, 2);
+    assert_eq!(published.header().total_bytes, 6);
+
+    let mut repeat = UploadSession::new(repository.clone(), key, 4).unwrap();
+    for chunk in chunks {
+        repeat
+            .append(shared.copy_bytes(chunk).unwrap())
+            .await
+            .unwrap();
+    }
+    let same = repeat
+        .publish(shared.copy_bytes(history).unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(same.root_sha256(), published.root_sha256());
+    let mut changed = UploadSession::new(repository, key, 4).unwrap();
+    assert_eq!(
+        changed
+            .append(shared.copy_bytes(b"WXYZ").unwrap())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    let stored = transport
+        .get(key, chunk_name(0), stored_limit(&chunk_name(0)))
+        .await
+        .unwrap();
+    assert!(stored.as_ref().starts_with(b"NABEDRA-ARCHIVE\0\x01"));
+
+    let reopened = ArchiveRepository::new(
+        config.connect(shared).await.unwrap(),
+        ArchiveKeys::load(Some(&key_config)).unwrap(),
+    );
+    let mut reader = ArchiveReader::open(reopened, key).await.unwrap();
+    for chunk in chunks {
+        assert_eq!(reader.next().await.unwrap().unwrap().as_ref(), chunk);
+    }
+    assert!(reader.next().await.unwrap().is_none());
+    reader.verify_complete().unwrap();
+    assert_eq!(reader.root().root_sha256(), published.root_sha256());
 }
 
 #[tokio::test]
