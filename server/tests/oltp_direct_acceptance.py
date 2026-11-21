@@ -4,7 +4,9 @@
 Topologies (see `oltp_direct_cluster.py`): RF3 = three registered workers plus enrolled
 API gateways, each a separate host process, mTLS between them; RF1 = `nabedra-db serve`.
 
-  --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison
+  --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison,
+                     D11 index publication through the public CLI
+  --suite d11        only D11 index publication through the public CLI (RF1), for reruns
   --suite cluster    D01 (RF3, both ORMs, API and worker gateways, on/off), D03, D11 (drop),
                      D10 (gateway killed mid-stream)
   --suite d05        D05: one follower SIGSTOPped (and its rejoin), two SIGSTOPped, one SIGKILLed
@@ -275,13 +277,26 @@ def d09_rf1(server):
            gateway_after_cold_start=gateway)
 
 
+def stderr_wrapper(binary, path, log):
+    """The public CLI keeps only a bounded in-memory copy of its server's stderr, so a
+    CLI-launched server leaves no log (IDX1). This wrapper appends the server's stderr,
+    and that of the processes it starts, to `log`."""
+    import shlex
+    path.write_text('#!/bin/sh\nexec %s "$@" 2>>%s\n' % (shlex.quote(str(Path(binary).resolve())),
+                                                          shlex.quote(str(log))))
+    path.chmod(0o700)
+    return path
+
+
 def d11_rf1_cli(args, output):
     """D11 index publication through the public CLI's local topology (the RF1 server
     that serves index administration)."""
     from oltp_runtime_acceptance import RuntimeServer
     root = output / 'rf1-cli'
     root.mkdir(parents=True, exist_ok=True)
-    server = RuntimeServer(args.binary, root, cli=True)
+    binary = stderr_wrapper(args.binary, root / 'nabedra-db', root / 'server-stderr.log')
+    server = RuntimeServer(binary, root, cli=True)
+    trace = (root / 'admin-trace.log').open('a')
     try:
         server.start()
         auth = json.loads((root / 'auth.json').read_text())
@@ -291,12 +306,16 @@ def d11_rf1_cli(args, output):
             time.sleep(0.25)
 
         def admin(name, payload, request_id):
-            status, reply = call(server.url, '/v1/cluster/operations', operation(name, payload, request_id),
-                                 token=auth['admin_token'], timeout=60)
-            assert status == 200, (name, status, reply)
-            return reply['data']
+            body = operation(name, payload, request_id)
+            sent = time.time()
+            status, reply = call(server.url, '/v1/cluster/operations', body, token=auth['admin_token'], timeout=60)
+            trace.write(json.dumps(dict(sent=sent, elapsed=time.time() - sent, operation=name,
+                                        request_id=body['request_id'], status=status, reply=reply)) + '\n')
+            trace.flush()
+            return status, reply
         d11_index(server.url, server.token, None, admin, lambda: {'rf1': server.stats()})
     finally:
+        trace.close()
         server.stop()
         server.log.close()
 
@@ -441,7 +460,23 @@ def dump(cluster):
 
 def d11_index(url, token, ca, admin, stats):
     """D11 index publication racing direct writers. `admin(operation, payload, request_id)`
-    runs an admin operation; `stats()` returns `{name: /v1/runtime/stats}`."""
+    runs an admin operation and returns `(status, reply)`; `stats()` returns
+    `{name: /v1/runtime/stats}`.
+
+    `storage.index.status` is a read. While the Ready publication's Catalog intent covers
+    the index record it may answer a typed retryable error (`not_applied`), which this
+    poll retries. Any other answer, `outcome_unknown` above all, fails the scenario (IDX1)."""
+    poll = float(os.environ.get('NABEDRA_D11_STATUS_POLL_SECONDS', '0.5'))
+    retried = []
+
+    def status(selector):
+        code, reply = admin('storage.index.status', selector, None)
+        if code in (429, 503) and reply['error']['outcome'] == 'not_applied' \
+                and reply['error']['code'] in ('storage_unavailable', 'overloaded'):
+            retried.append((code, reply['error']['code'], reply['error']['message']))
+            return None
+        assert code == 200, ('storage.index.status', code, reply)
+        return reply['data']['state']
     db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca) if ca else None, timeout=30)
     table = db.create_table('d11_index', {'id': int, 'category': int, 'label': str}, key='id')
     table.insert_many([{'id': i, 'category': i % 8, 'label': f'seed-{i}'} for i in range(64)])
@@ -488,15 +523,17 @@ def d11_index(url, token, ca, admin, stats):
             definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
                           'covering': ['label']}
             build_id = uid()
-            created = admin('storage.index.create', definition, build_id)
+            code, created = admin('storage.index.create', definition, build_id)
+            assert code == 200, ('storage.index.create', code, created)
+            created = created['data']
             selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
             deadline = time.monotonic() + 120
             state = created['state']
             while state != 'ready':
-                assert state in ('building', 'pending', 'backfilling', 'validating'), created
+                assert state in (None, 'building', 'pending', 'backfilling', 'validating'), created
                 assert time.monotonic() < deadline, f'index never became ready: {state}'
-                time.sleep(0.5)
-                state = admin('storage.index.status', selector, None)['state']
+                time.sleep(poll)
+                state = status(selector)
             time.sleep(1.0)
         finally:
             stop.set()
@@ -518,7 +555,8 @@ def d11_index(url, token, ca, admin, stats):
         assert 'by_category' in plans[category], plans[category]
         assert indexed == expected.get(category, set()), (category, indexed ^ expected.get(category, set()))
     report('D11-index', table=table.id, rows=len(rows), acknowledged_direct_writes=len(acknowledged),
-           not_applied_errors=len(errors), index_state=state,
+           not_applied_errors=len(errors), index_state=state, status_retried=retried[:8],
+           status_retries=len(retried),
            direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
            plan_uses_index=True, plan_sample=plans[0][:300])
@@ -1145,7 +1183,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
-    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum'))
+    parser.add_argument('--suite', action='append', choices=('rf1', 'd11', 'cluster', 'd05', 'd09', 'barriers', 'quorum'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
@@ -1161,6 +1199,8 @@ def main():
             try:
                 if suite == 'rf1':
                     rf1_reference = suite_rf1(args, work)
+                elif suite == 'd11':
+                    d11_rf1_cli(args, work)
                 elif suite == 'cluster':
                     suite_cluster(args, work, rf1_reference)
                 elif suite == 'd05':
