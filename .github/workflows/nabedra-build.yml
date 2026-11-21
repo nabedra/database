@@ -279,6 +279,10 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      - uses: actions/setup-python@v5
+        if: contains(github.event.head_commit.message, '[ci res1]')
+        with:
+          python-version: "3.11"
       - name: RES1 disk admission in both direct modes
         if: contains(github.event.head_commit.message, '[ci res1]')
         run: |
