@@ -1122,6 +1122,17 @@ async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
     let (version, row) = cluster.latest(group, 0, 7).await;
     assert!(version.is_some());
     assert_eq!(row, Some(json!({"id": 7, "value": 1})));
+    let refused_id = Uuid::new_v4();
+    let refused = cluster.body(
+        refused_id,
+        "table.insert",
+        json!({"row": {"id": 8, "value": 2}}),
+    );
+    assert_eq!(
+        answer(&gateway, &refused, refused_id).await,
+        Answer::Error(ErrorCode::Unauthorized, Outcome::NotApplied)
+    );
+    assert_eq!(cluster.latest(group, 0, 8).await, (None, None));
     transport.deny.store(false, Ordering::SeqCst);
     switch.set_direct_oltp(false);
     assert_eq!(

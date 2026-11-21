@@ -806,6 +806,16 @@ fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
         serde_json::from_slice::<RequestRecord>(reply.as_ref()).unwrap(),
         accepted
     );
+    let mut changed: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
+    changed["payload"]["name"] = serde_json::json!("other");
+    let conflict = queue
+        .propose(serde_json::to_vec(&changed).unwrap(), 0)
+        .unwrap_err()
+        .protocol();
+    assert_eq!(
+        (conflict.code, conflict.outcome),
+        (ErrorCode::Conflict, Outcome::NotApplied)
+    );
     for error in [error, header_error] {
         assert_eq!(error.outcome, Outcome::Unknown);
         assert_eq!(error.code, ErrorCode::OutcomeUnknown);

@@ -1845,7 +1845,9 @@ async fn d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty
     let (version, row) = cluster.latest(leader, cluster.row_key(7)).await;
     assert!(version.is_some());
     assert!(row.is_some());
-    cluster.stop(leader).await;
+    tokio::time::timeout(Duration::from_secs(20), cluster.stop(leader))
+        .await
+        .expect("old leader shutdown watchdog");
     let next = cluster.leader().await;
     assert_ne!(next, leader);
     cluster.serving(next).await;

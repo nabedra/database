@@ -342,6 +342,8 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
             "post-apply hold reached"
         );
         drop(request);
+        drop(link);
+        drop(route);
         assert_eq!(call(&app, get(), true).await.1["data"]["value"], 1);
         assert_eq!(
             call(&app, insert, true).await,
