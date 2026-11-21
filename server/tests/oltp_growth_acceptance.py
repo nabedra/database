@@ -639,8 +639,10 @@ def check_capacity_deficit(facade):
         cluster.close()
 
 
-def insert_exact(facade, table, rows):
+def insert_exact(facade, table, rows, request_id=None):
     body = batch(table, rows)
+    if request_id is not None:
+        body['request_id'] = request_id
     deadline = time.monotonic() + 180
     last = None
     while time.monotonic() < deadline:
@@ -1012,7 +1014,11 @@ def o28(facade):
     # body and prove the warmed route does not reread Catalog or placement.
     update = operation('table.update', dict(table_id=table.id, key=rows[-1]['id'],
                                             values=dict(value=rows[-1]['value'])))
-    exact = facade.api('api1', OPERATIONS, update, timeout=30)
+    def last_page_update():
+        result = facade.api('api1', OPERATIONS, update, timeout=15)
+        return None if result[0] in (429, 503, 504) else result
+
+    exact = wait_for(last_page_update, 'same-ID mutation on the second Catalog page', 90)
     assert exact == (200, dict(request_id=update['request_id'], data=True)), exact
     warm = gateway_stats(facade, 'api1')
     assert facade.api('api1', OPERATIONS, update, timeout=30) == exact
@@ -1045,11 +1051,24 @@ def o28(facade):
                  'scan consumed the first Catalog page', 45)
         next_split()
         extra = row(key(1), category=8, value=-1)
-        insert_exact(facade, table, [extra])
+        insert_id = uid()
+        facade.select(insert_id, {'direct-timestamp': False, 'commit-stamp': False})
+        insert_exact(facade, table, [extra], insert_id)
         assert_stale_update_rejected(facade, stale_id)
         expected = [rows[0], extra, *rows[1:]]
-        before_loss = query(facade, table)
-        assert before_loss == expected, scan_difference(before_loss, expected)
+        fresh = facade.query(table)
+        facade.select(fresh['request_id'], {'snapshot': False})
+        before_loss = read_after_transition(facade, fresh, timeout=30)
+        if before_loss != expected:
+            cuts = {}
+            for request, stage in [(insert_id, 'direct-timestamp'), (insert_id, 'commit-stamp'),
+                                   (fresh['request_id'], 'snapshot')]:
+                cuts[stage] = [json.loads(path.read_text())
+                               for path in facade.paths(request, stage) if path.is_file()]
+            point = operation('table.get', dict(table_id=table.id, key=extra['id']))
+            print(json.dumps(dict(scenario='O28', cuts=cuts, exact_get=read_after_transition(facade, point),
+                                  scan=scan_difference(before_loss, expected))), flush=True)
+            raise AssertionError('fresh scan omitted an acknowledged mutation')
         records = facade.records(old_id)
         survivors = stop_worker(cluster, owner)
         recovered_owner, recovered_ts = facade.reached(old_id, 'snapshot', workers=survivors, timeout=90)
