@@ -170,3 +170,19 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.48s
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+GitHub Actions 44934576362 at cbf821720f4c3a3fe06a59c5c4e754767453c55a [ci rep1]
+OLTP job 136938301715
+{"cut": 4099, "direct_entries": 2, "incremental": "refused with full backup alternative", "restore_build": "same", "scenario": "O19/D03 rollback", "status": "passed"}
+{"ready_workers": 2, "scenario": "O17 lost mount refusal", "status": "passed", "worker": "w1"}
+{"acknowledged": 78, "applied_after": [92, 7], "applied_before": [91, 6], "attempts_with_errors": 0, "data_voters": 3, "max_independent_read_gap_seconds": 5.379, "ranges": 2, "scenario": "O06/R01/R03/R06 retained restart", "settled_receipts": 2, "status": "passed", "worker": "w1"}
+{"aborted_split": "810ba796-004c-47ee-b7d1-e5896c488afc", "children": 2, "published_split": "edc4d678-e733-4645-8e11-0f17847b064e", "scenario": "O17/D07 restart during split", "status": "passed", "voters_per_child": 3, "worker": "w1"}
+{"acknowledged_direct_writes": 9, "elapsed_loss_to_rf3_seconds": 30.632, "elapsed_queue_release_to_receipt_seconds": 0.576, "elapsed_start_to_rf3_seconds": 5.822, "groups": 6, "lost_control_leader": "w1", "probe_recovery_seconds": 18.142, "queued_gate_owner": "w3", "refused_candidate_missing_advert": true, "refused_data_quorum": true, "refused_live_worker": true, "refused_missing_advert": true, "refused_reused_certificate": true, "refused_without_quorum": true, "replayed_intent": true, "revoked_old_certificate": true, "scenario": "O06/O16/O17/NS23/R01/R03/R06/Q03 system replacement", "settled_receipts": 1, "status": "passed"}
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.11s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.94s
+test result: ok. 500 passed; 0 failed; 31 ignored; 0 measured; 2 filtered out; finished in 149.22s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.95s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.10s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

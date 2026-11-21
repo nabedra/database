@@ -168,6 +168,15 @@ class Kind:
             targets = [f'statefulset/csi-hostpathplugin-{zone}' for zone in ZONES]
         for target in targets:
             self.kube('rollout', 'status', target, '--timeout=180s', timeout=200)
+        if self.rawfile:
+            storage_nodes = {probe_node} if probe_node else set(self.nodes.values())
+
+            def rawfile_registered():
+                return storage_nodes <= {node['metadata']['name']
+                    for node in self.obj('csinode', namespaced=False)['items']
+                    if any(driver['name'] == RAWFILE for driver in node['spec']['drivers'])}
+
+            wait_for(rawfile_registered, 'Rawfile CSI registered on the storage nodes', 90)
         self.evidence.file('csi-ready.txt', self.kube('get', 'csidriver,csinode,storageclass', '-o', 'wide'))
 
     def load(self, engine, binary, test_executable=None, base_image='python:3.11-slim-trixie'):

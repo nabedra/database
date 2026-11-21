@@ -14,6 +14,6 @@ helm template live3-rawfile "$output/$chart" --namespace default \
   --set global.analytics.enabled=false --set analytics.enabled=false \
   --set capabilities.snapshots.enabled=false --set capabilities.apiServer.enabled=false \
   --set crds.enabled=false --set 'snapshotClasses[0].enabled=false' \
-  --set node.storagePools.default.reservedCapacity=6Gi \
+  --set-string node.storagePools.default.reservedCapacity=6GiB \
   --set node.storagePools.default.reservedCapacityMode=subtract-from-total \
   > "$output/rawfile.yaml"

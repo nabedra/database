@@ -40,7 +40,10 @@ PYTHONDONTWRITEBYTECODE=1 python3.11 scripts/local-kind/acceptance.py \
 
 Run again with `--scenario storage` and a fresh output directory for the
 host-path PVC and CSI error checks. Use `--scenario scale` for the local
-Docker data worker and drain permit check. To try the independent ext4
+Docker data worker and drain permit check. Use `--scenario rolling` or
+`--scenario zone` for either lifecycle check on its own. The zone check
+places Kubernetes DNS on the control plane before stopping any data node.
+To try the independent ext4
 volumes, render the pinned chart with Helm and replace `--csi-source` with
 `--rawfile-manifest "$LIVE3_WORK/rawfile.yaml"` for the storage run. Use
 `--scenario preflight` with that manifest to exercise one CSI volume before
@@ -71,6 +74,25 @@ started. The run removed all nodes and released the lane. Peak sampled VM
 use was 1,372,762,112 bytes. [Bootstrap output](post-merge-bootstrap/kind-create.txt) ·
 [Cleanup trace](post-merge-bootstrap/trace.jsonl)
 
-Two Rawfile probes also stopped during infrastructure setup. Neither
-created a PVC. [Rawfile attempts](rawfile-attempts/) ·
-[CI test transcripts](ci-test-results.txt)
+The next post-merge run reached a separate ready API and three attached
+PVC-backed StatefulSet workers. Kubernetes rejected a second writer, and
+the worker probes found matching accepted request bodies and context hashes
+in all three queues. After the zone A node stopped, independent reads did
+not recover during the 65 s watchdog. Both CoreDNS replicas were scheduled
+on that node. The corrected fixture puts CoreDNS on the control plane.
+[Request and cleanup trace](zone-attempt/trace.jsonl) ·
+[CoreDNS pod placement](zone-attempt/pods.txt) ·
+[Survivor output](zone-attempt/survivor-output.txt)
+
+Two early Rawfile probes stopped during infrastructure setup. A third run
+created three PVC objects, which stayed pending because the plugin rejected
+the fixture's `6Gi` reserve setting during startup. The chart documents
+`GiB`, and the generator now uses `6GiB`. [Driver output](rawfile-attempts/invalid-capacity-driver.txt) ·
+[Pod scheduling](rawfile-attempts/invalid-capacity-scheduler.txt)
+
+The Linux process tests reran after the hardening merge. Retained restart
+verified 78 acknowledged writes, two settled receipts and three applied
+Data voters across two ranges. The lost-system-worker replacement test
+recovered RF3 in 30.632 s and settled its queued receipt. These tests
+ran on Linux without Kubernetes. [CI test transcripts](ci-test-results.txt) ·
+[Recovery workflow](https://github.com/zPy52/nabedra-database/actions/runs/44934576362)
