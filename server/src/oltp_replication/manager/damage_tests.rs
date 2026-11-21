@@ -207,6 +207,25 @@ impl Cluster {
         self.members[&(index as u64 + 1)].clone()
     }
 
+    async fn replace_damaged(
+        &self,
+        leader: usize,
+        damaged: usize,
+        fresh: ReplicaMember,
+    ) -> Result<super::DamagedReplacement, ProtocolError> {
+        let old = [self.member(0), self.member(1), self.member(2)];
+        let next = old
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != damaged)
+            .map(|(_, member)| member.clone())
+            .chain(std::iter::once(fresh.clone()))
+            .collect::<Vec<_>>();
+        self.host(leader)
+            .replace_damaged_voter(&old, &next, &old[damaged], fresh)
+            .await
+    }
+
     /// Starts (or restarts) worker `index`: opens its pool, its transport on
     /// its enrolled address, and the group's replica. The replica start is the
     /// worker's own: it opens the retained group, which a quarantine refuses.
@@ -539,9 +558,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         let fresh = cluster.member(3);
         let blocked = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(damaged), fresh.clone()),
+            cluster.replace_damaged(leader, damaged, fresh.clone()),
         )
         .await;
         assert!(
@@ -556,9 +573,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         let leader = cluster.leader(&[leader, other]).await;
         let replaced = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(damaged), fresh.clone()),
+            cluster.replace_damaged(leader, damaged, fresh.clone()),
         )
         .await
         .expect("replacement finished")
@@ -596,8 +611,7 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         assert_eq!(cluster.applied_term(3).await, term);
         // Idempotent once committed.
         let again = cluster
-            .host(leader)
-            .replace_damaged_voter(&cluster.member(damaged), fresh.clone())
+            .replace_damaged(leader, damaged, fresh.clone())
             .await
             .unwrap();
         assert_eq!(again.proof.removed, cluster.member(damaged));
@@ -873,9 +887,7 @@ async fn o06_o17_rv_final_m4_given_up_replica_bytes_are_released_after_replaceme
         let fresh = cluster.member(3);
         let replaced = timeout(
             Duration::from_secs(60),
-            cluster
-                .host(leader)
-                .replace_damaged_voter(&cluster.member(follower), fresh.clone()),
+            cluster.replace_damaged(leader, follower, fresh.clone()),
         )
         .await
         .expect("replacement finished")

@@ -1179,7 +1179,10 @@ async fn ns23_o17_ns14b_control_leader_change_mid_replacement_resumes_the_same_p
         // entry. Append exactly that entry to keep the uniform step pending.
         let data = cluster.data_host(cluster.data_leader().await).unwrap();
         let old = data.observe_membership().await.unwrap();
-        let learner = data.replicate_learner(old, plan.replacement.clone()).await.unwrap();
+        let learner = data
+            .replicate_learner(old, plan.replacement.clone())
+            .await
+            .unwrap();
         let next = plan.next_members();
         let membership = super::super::entry::Membership::new(
             vec![
@@ -1193,13 +1196,18 @@ async fn ns23_o17_ns14b_control_leader_change_mid_replacement_resumes_the_same_p
                 .collect::<BTreeMap<_, _>>(),
         )
         .unwrap();
-        data.raft.append_membership(
-            membership,
-            super::super::entry::Payload::Blank,
-            [openraft::raft::Precondition::LastMembershipLogId {
-                last_membership_log_id: Some(super::super::hosted::log_id(learner.caught_up_through())),
-            }],
-        ).await.unwrap();
+        data.raft
+            .append_membership(
+                membership,
+                super::super::entry::Payload::Blank,
+                [openraft::raft::Precondition::LastMembershipLogId {
+                    last_membership_log_id: Some(super::super::hosted::log_id(
+                        learner.caught_up_through(),
+                    )),
+                }],
+            )
+            .await
+            .unwrap();
         assert!(data.observe_stable_membership().await.is_err());
         drop(data);
         cluster.stop(3).await;

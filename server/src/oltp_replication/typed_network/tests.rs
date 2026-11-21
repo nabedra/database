@@ -451,14 +451,23 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
             .raft
             .wait(Some(Duration::from_secs(10)))
             .metrics(
-                |metrics| metrics.snapshot.is_some_and(|entry| entry.index >= before.position.index),
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .is_some_and(|entry| entry.index >= before.position.index)
+                },
                 "snapshot includes the acknowledged Timestamp fence",
             )
             .await
             .unwrap()
             .snapshot
             .unwrap();
-        hosts[leader].raft.trigger().purge_log(snapshot.index).await.unwrap();
+        hosts[leader]
+            .raft
+            .trigger()
+            .purge_log(snapshot.index)
+            .await
+            .unwrap();
         hosts[leader]
             .raft
             .wait(Some(Duration::from_secs(10)))
@@ -494,7 +503,11 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
             .applied_index_at_least(Some(next.applied_at().index), "target membership applied")
             .await
             .unwrap();
-        assert!(target_metrics.snapshot.is_some_and(|entry| entry.index >= snapshot.index));
+        assert!(
+            target_metrics
+                .snapshot
+                .is_some_and(|entry| entry.index >= snapshot.index)
+        );
         let target = hosts[3].state.store();
         let activation = target.replica_activation(&next).await.unwrap();
         let statement = activation.statement();
@@ -552,7 +565,11 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
         assert!(
             hosts[leader]
                 .reconcile_voter_replacement(
-                    &expected, &final_members, &peers[&4], leader as u64 + 1, None
+                    &expected,
+                    &final_members,
+                    &peers[&4],
+                    leader as u64 + 1,
+                    None
                 )
                 .await
                 .is_err(),
