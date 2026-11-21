@@ -1,0 +1,2 @@
+nabedra-db: data worker Unauthorized: Control refused data worker queue join
+nabedra-db: data worker failed

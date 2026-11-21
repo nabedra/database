@@ -250,7 +250,9 @@ pub(super) fn storage_error(error: nabedra_kv::Error) -> ProtocolError {
 pub(super) fn unsupported_format(found: &str) -> ProtocolError {
     failure(
         ErrorCode::StorageUnavailable,
-        &format!("unsupported store format: {found}"),
+        &format!(
+            "unsupported store format: {found}. For RocksDB-era OLTP pools, use the archive export and restore procedure in docs/oltp-rocksdb-upgrade.md"
+        ),
     )
 }
 const NO_SPACE: &str = "OLTP storage device is full; the write was not applied";

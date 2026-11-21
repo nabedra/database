@@ -199,12 +199,13 @@ def announcement(process, timeout=60):
 class Rf3Cluster:
     def __init__(self, binary, root, *, test_executable=None, direct=None, api_direct=(True,),
                  worker_env=None, key_type='ed25519', worker_memory=2048 * MIB, mounts=False,
-                 status_partitions=1, test_child=CHILD):
+                 status_partitions=1, test_child=CHILD, pool_format_version=2):
         self.binary = str(Path(binary).resolve())
         # Cold start (D09) requires each pool on its own Docker-profile mount
         # (`cold::validate`). With `mounts`, every worker directory is a tmpfs
         # mounted with `sudo -n` and labelled like a provisioned Docker volume.
         self.mounts = mounts
+        self.pool_format_version = pool_format_version
         self.mounted = []
         self.test_executable = str(Path(test_executable).resolve()) if test_executable else None
         self.test_child = test_child
@@ -267,6 +268,18 @@ class Rf3Cluster:
         self.enrollments.clear()
 
     def _start(self):
+        self.prepare_workers()
+        for name in WORKERS:
+            self.launch_worker(name)
+        self.wait_workers()
+        connection = self.admin('cluster.connection', {})
+        assert connection['cluster_id'] == self.cluster_id and len(connection['control_peers']) == 3, connection
+        self.connection = connection
+        for index, direct in enumerate(self.api_direct, start=1):
+            self.start_api(f'api{index}', direct)
+        return self
+
+    def prepare_workers(self):
         self.openssl('req', '-x509', '-newkey', self.key_spec, '-nodes', '-days', '1', '-keyout',
                      self.root / 'ca.key', '-out', self.ca, '-subj', '/CN=Nabedra T9 direct fixture')
         write_json(self.root / 'auth.json', self.auth, 0o600)
@@ -302,19 +315,13 @@ class Rf3Cluster:
                         placements=placements, control_enrollments=peers, operator_pins=pins)
             if self.mounts:
                 node.update(mount=self.mount_pool(name, pool[name], enrollment[name]))
+            execution = dict(EXECUTION)
+            if self.direct[name] is not None:
+                execution['direct_oltp'] = self.direct[name]
             self.config[name] = dict(version=1, bind=f'127.0.0.1:{free_port()}', auth_file=str(self.root / 'auth.json'),
                                      node=node, resources=resources(self.worker_memory),
-                                     execution=EXECUTION | dict(direct_oltp=self.direct[name]))
+                                     execution=execution)
             self.enrollments[name] = enrollment[name]
-        for name in WORKERS:
-            self.launch_worker(name)
-        self.wait_workers()
-        connection = self.admin('cluster.connection', {})
-        assert connection['cluster_id'] == self.cluster_id and len(connection['control_peers']) == 3, connection
-        self.connection = connection
-        for index, direct in enumerate(self.api_direct, start=1):
-            self.start_api(f'api{index}', direct)
-        return self
 
     @staticmethod
     def mounts_available():
@@ -334,7 +341,7 @@ class Rf3Cluster:
         identity = {field: enrollment[field]
                     for field in ('worker_id', 'incarnation', 'enrollment_revision', 'certificate_sha256')}
         return dict(profile={'docker': {'volume_marker': marker}}, worker=identity, generation=1,
-                    identity=dict(engine='oltp', pool_format_version=2, cluster_id=self.cluster_id,
+                    identity=dict(engine='oltp', pool_format_version=self.pool_format_version, cluster_id=self.cluster_id,
                                   worker_id=enrollment['worker_id'], pool_id=pool_id),
                     mount_path=str(directory), provider_volume_id='docker-volume:' + volume, filesystem_uuid='')
 
@@ -419,10 +426,11 @@ class Rf3Cluster:
                           topology=dict(mode='remote', cluster_id=self.cluster_id,
                                         control_group_id=self.connection['control_group_id'],
                                         control_peers=self.connection['control_peers'], enrollment=record,
-                                        direct_oltp=direct,
                                         worker_tls=dict(cert_file=str(self.root / f'{name}.pem'),
                                                         key_file=str(self.root / f'{name}.key'), ca_file=str(self.ca))),
                           worker=dict(resources=resources(2048 * MIB, 2), execution=EXECUTION, queue_size=128))
+            if direct is not None:
+                config['topology']['direct_oltp'] = direct
             setattr(self, f'_{name}_config', config)
         config = getattr(self, f'_{name}_config')
         config['topology']['control_peers'] = self.connection['control_peers']
@@ -513,10 +521,12 @@ class Rf3Cluster:
     def tail(self, name, size=6000):
         path = self.root / f'{name}.log'
         try:
-            data = path.read_bytes()
+            with path.open('rb') as log:
+                end = log.seek(0, os.SEEK_END)
+                log.seek(max(0, end - size))
+                return log.read(size).decode(errors='replace')
         except OSError:
             return ''
-        return data[-size:].decode(errors='replace')
 
     # Cold start (D09) -------------------------------------------------------------------
     def kill_all(self):

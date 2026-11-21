@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 244, in <module>
+    main()
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 239, in main
+    keys, values = zone_loss(fleet, args.output, topology)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/source/scripts/local-kind/cache_lifecycle.py", line 131, in zone_loss
+    fleet.wait_placement(validated, seconds=60)
+  File "/source/scripts/cache-acceptance/cluster.py", line 210, in wait_placement
+    return wait("committed placement", predicate, seconds=seconds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/source/scripts/cache-acceptance/cluster.py", line 38, in wait
+    raise AssertionError(f"timeout awaiting {description}")
+AssertionError: timeout awaiting committed placement

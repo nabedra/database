@@ -1,0 +1,16 @@
+NAME                                                   ATTACHREQUIRED   PODINFOONMOUNT   STORAGECAPACITY   TOKENREQUESTS   REQUIRESREPUBLISH   MODES                  AGE
+csidriver.storage.k8s.io/hostpath-a.live3.csi.k8s.io   true             true             false             <unset>         false               Persistent,Ephemeral   9s
+csidriver.storage.k8s.io/hostpath-b.live3.csi.k8s.io   true             true             false             <unset>         false               Persistent,Ephemeral   9s
+csidriver.storage.k8s.io/hostpath-c.live3.csi.k8s.io   true             true             false             <unset>         false               Persistent,Ephemeral   9s
+
+NAME                                                          DRIVERS   AGE
+csinode.storage.k8s.io/nabedra-live3-a15b555b-control-plane   0         2m
+csinode.storage.k8s.io/nabedra-live3-a15b555b-worker          1         111s
+csinode.storage.k8s.io/nabedra-live3-a15b555b-worker2         1         111s
+csinode.storage.k8s.io/nabedra-live3-a15b555b-worker3         1         112s
+
+NAME                                             PROVISIONER                   RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+storageclass.storage.k8s.io/live3-a              hostpath-a.live3.csi.k8s.io   Delete          WaitForFirstConsumer   true                   9s
+storageclass.storage.k8s.io/live3-b              hostpath-b.live3.csi.k8s.io   Delete          WaitForFirstConsumer   true                   9s
+storageclass.storage.k8s.io/live3-c              hostpath-c.live3.csi.k8s.io   Delete          WaitForFirstConsumer   true                   9s
+storageclass.storage.k8s.io/standard (default)   rancher.io/local-path         Delete          WaitForFirstConsumer   false                  115s

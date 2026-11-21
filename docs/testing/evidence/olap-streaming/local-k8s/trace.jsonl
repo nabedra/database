@@ -1,0 +1,6 @@
+{"check": "docker-checks", "elapsed_seconds": 0.3, "scenario": "olap", "server_source": "20c102659f058c6a512cb1b924087032ea07a44d", "sha256": "d1258ad5f7d28020dd3b9d5de36e10971317bfaf699120d539975ce94485abb9"}
+{"check": "docker-lane", "elapsed_seconds": 0.318, "status": "acquired"}
+{"check": "olap", "container": "nabedra-live3-olap-806c6aa6", "elapsed_seconds": 0.319, "image": "python:3.11-slim-bookworm", "status": "started"}
+{"check": "olap", "elapsed_seconds": 50.139, "exit_code": 0, "status": "passed", "vm_peak_used_bytes": 1038258176}
+{"check": "container-cleanup", "elapsed_seconds": 50.49, "name": "nabedra-live3-olap-806c6aa6", "remaining": false}
+{"check": "docker-lane", "elapsed_seconds": 50.494, "status": "released"}
