@@ -24,6 +24,8 @@ const GROUP_HANDLE_BYTES: usize = 64 << 10;
 const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
 pub(crate) const RAFT_REPLICA_BYTES: usize = 8 << 20;
 
+pub(crate) const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SharedResourceConfig {
     pub query_threads: usize,
@@ -58,7 +60,7 @@ impl Default for SharedResourceConfig {
             apply_bytes_per_slot: 65 << 20,
             query_reply_bytes: 8 << 20,
             control_reply_bytes: 1 << 20,
-            reply_decode_bytes: 1 << 20,
+            reply_decode_bytes: DEFAULT_REPLY_DECODE_BYTES,
             data_apply_reply_bytes: 1 << 20,
             max_open_pools: 8,
             max_group_handles: 128,
@@ -88,6 +90,8 @@ pub struct WorkerSharedResources {
     native_jobs: [AtomicU64; 2],
     task_memory_limit_bytes: usize,
     decode_bytes: Arc<AtomicUsize>,
+    #[cfg(test)]
+    peak_decode_bytes: AtomicUsize,
     thread_budget: super::super::NativeThreadBudget,
     pub(crate) read_attempts: crate::oltp_replication::service_rpc::ReadAttempts,
     read_replica: OnceLock<Weak<Mutex<crate::oltp_runtime::replica::WorkerReplica>>>,
@@ -235,6 +239,8 @@ impl WorkerSharedResources {
             native_jobs: Default::default(),
             task_memory_limit_bytes: limits.task_memory_limit_bytes as usize,
             decode_bytes: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            peak_decode_bytes: AtomicUsize::new(0),
             thread_budget,
             read_attempts: Default::default(),
             read_replica: OnceLock::new(),
@@ -508,7 +514,7 @@ impl WorkerSharedResources {
                 let charge = self
                     .scheduler
                     .charge_memory(self.scheduler_node_id, bytes as u64)?;
-                self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+                self.account_decode(bytes);
                 ScratchBacking::Working {
                     charge: Mutex::new(charge),
                     counter: self.decode_bytes.clone(),
@@ -540,6 +546,26 @@ impl WorkerSharedResources {
             backing: ScratchBacking::Combined([current, extra]),
         }))
     }
+    fn account_decode(&self, bytes: usize) {
+        let previous = self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+        #[cfg(test)]
+        self.peak_decode_bytes
+            .fetch_max(previous + bytes, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = previous;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_working_decode_peak(&self) {
+        self.peak_decode_bytes
+            .swap(self.working_decode_bytes(), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_working_decode_bytes(&self) -> usize {
+        self.peak_decode_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn working_decode_bytes(&self) -> usize {
         self.decode_bytes.load(Ordering::Acquire)
     }
@@ -653,7 +679,7 @@ impl WorkerSharedResources {
                     .scheduler
                     .reserve_memory(request, self.scheduler_node_id, bytes as u64)
                     .await?;
-                self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
+                self.account_decode(bytes);
                 Ok(ScratchLease {
                     backing: ScratchBacking::Working {
                         charge: Mutex::new(charge),

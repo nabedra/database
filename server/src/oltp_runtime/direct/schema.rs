@@ -2,8 +2,10 @@
 //! step 4: "validate the row against the cached table descriptor").
 //!
 //! A cache entry is keyed by the table, the route's schema epoch and the
-//! group's direct schema epoch (T7). Every DirectCommit carries the direct
-//! epoch and apply refuses a stale one. The DDL fence of plan section 7
+//! group's direct schema epoch and lifecycle (T7). Direct epochs are local
+//! to a group, so a split child can reuse a parent's earlier epoch under a
+//! different lifecycle. Every DirectCommit carries the direct epoch and
+//! apply refuses a stale one. The DDL fence of plan section 7
 //! commits a new direct epoch, bound to the table lifecycle id the Catalog is
 //! about to publish, to every Data group of the table before the Catalog
 //! publishes a new descriptor or writable index set. A load accepts only the
@@ -306,10 +308,7 @@ impl CatalogSchema {
             lifecycle_id: table.lifecycle_id,
             indexes,
         });
-        self.remember(
-            (table_id, schema_epoch, group.map(|group| group.epoch)),
-            table.clone(),
-        );
+        self.remember((table_id, schema_epoch, group), table.clone());
         Ok(SchemaLookup::Table(table))
     }
 }
@@ -322,7 +321,7 @@ impl DirectSchema for CatalogSchema {
         authority: Authority,
     ) -> ConsensusFuture<'_, SchemaLookup> {
         Box::pin(async move {
-            if let Some(table) = self.cached((table_id, schema_epoch, group.map(|g| g.epoch))) {
+            if let Some(table) = self.cached((table_id, schema_epoch, group)) {
                 return Ok(SchemaLookup::Table(table));
             }
             self.load(table_id, schema_epoch, group, authority).await
@@ -352,8 +351,8 @@ impl DirectSchema for CatalogSchema {
         })
     }
 }
-/// (table, route schema epoch, group direct epoch when checked).
-type CacheKey = (Uuid, u64, Option<u64>);
+/// (table, route schema epoch, group direct epoch and lifecycle when checked).
+type CacheKey = (Uuid, u64, Option<GroupSchema>);
 
 fn invalid() -> ProtocolError {
     ProtocolError::new(

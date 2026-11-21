@@ -175,7 +175,7 @@ pub(crate) struct ChildPublished {
 /// is the Catalog table lifecycle id (`TableRecord::lifecycle_id`) whose
 /// descriptor and index set direct commits must be computed from. `None`
 /// means the table was dropped: every direct commit answers `StaleEpoch`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectSchema {
     pub epoch: u64,
