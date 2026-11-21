@@ -1059,7 +1059,8 @@ impl PreparedNative {
             // result and guard have both dropped.
             let _ = tx.send((result, guard, settlement));
         }))?;
-        let (result, guard, _settlement) = rx.await.map_err(|_| super::super::recovery_unknown())?;
+        let (result, guard, _settlement) =
+            rx.await.map_err(|_| super::super::recovery_unknown())?;
         Ok((result, guard))
     }
 }
