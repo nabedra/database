@@ -1,0 +1,2065 @@
+{
+ "fsync-base": {
+  "memory": {
+   "w1": {
+    "peak": 108613632,
+    "anon": 66113536,
+    "file": 38969344,
+    "anon_thp": 44040192
+   },
+   "w2": {
+    "peak": 82112512,
+    "anon": 61734912,
+    "file": 16834560,
+    "anon_thp": 39845888
+   },
+   "w3": {
+    "peak": 91582464,
+    "anon": 64245760,
+    "file": 24227840,
+    "anon_thp": 44040192
+   }
+  },
+  "largest_peak": 108613632,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "update | rejected | 429 | worker outgoing lane full": 106,
+   "update | unresolved | 503 | request replication or scheduler authority unavailable": 10,
+   "update | unresolved | 503 | original worker authority or result unavailable": 8,
+   "update | unresolved | None | TimeoutError": 8,
+   "update | rejected | 429 | executor admission capacity exhausted": 301
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 2505815.7714285715,
+  "fsyncs_per_ack": 347.22857142857146,
+  "fsync_fdatasync_total": 12153,
+  "acknowledged_writes": 35
+ },
+ "fsync-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 72994816,
+    "anon": 41824256,
+    "file": 26882048,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 60125184,
+    "anon": 39628800,
+    "file": 16453632,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 54861824,
+    "anon": 39276544,
+    "file": 11718656,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 72994816,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 468
+  },
+  "wbytes_per_ack": 12594.324786324787,
+  "fsyncs_per_ack": 2.9914529914529915,
+  "fsync_fdatasync_total": 1400,
+  "acknowledged_writes": 468
+ },
+ "get-base": {
+  "memory": {
+   "w1": {
+    "peak": 97038336,
+    "anon": 55685120,
+    "file": 39276544,
+    "anon_thp": 23068672
+   },
+   "w2": {
+    "peak": 72458240,
+    "anon": 52830208,
+    "file": 16076800,
+    "anon_thp": 23068672
+   },
+   "w3": {
+    "peak": 75534336,
+    "anon": 52551680,
+    "file": 19357696,
+    "anon_thp": 23068672
+   }
+  },
+  "largest_peak": 97038336,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": null,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 0
+ },
+ "get-cand-off": {
+  "memory": {
+   "w1": {
+    "peak": 91148288,
+    "anon": 55291904,
+    "file": 31481856,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 85426176,
+    "anon": 50380800,
+    "file": 30973952,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 76439552,
+    "anon": 50024448,
+    "file": 22323200,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 91148288,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": null,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 0
+ },
+ "get-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 78843904,
+    "anon": 47362048,
+    "file": 27828224,
+    "anon_thp": 33554432
+   },
+   "w2": {
+    "peak": 66609152,
+    "anon": 42831872,
+    "file": 18518016,
+    "anon_thp": 27262976
+   },
+   "w3": {
+    "peak": 57008128,
+    "anon": 41680896,
+    "file": 11857920,
+    "anon_thp": 27262976
+   }
+  },
+  "largest_peak": 78843904,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "get | rejected | 429 | executor admission capacity exhausted": 36
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": null,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 0
+ },
+ "get-main": {
+  "memory": {
+   "w1": {
+    "peak": 145932288,
+    "anon": 53739520,
+    "file": 86429696,
+    "anon_thp": 39845888
+   },
+   "w2": {
+    "peak": 136544256,
+    "anon": 46825472,
+    "file": 84013056,
+    "anon_thp": 33554432
+   },
+   "w3": {
+    "peak": 128380928,
+    "anon": 44216320,
+    "file": 78499840,
+    "anon_thp": 31457280
+   }
+  },
+  "largest_peak": 145932288,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": null,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 0
+ },
+ "mix-base": {
+  "memory": {
+   "w1": {
+    "peak": 97460224,
+    "anon": 56008704,
+    "file": 38993920,
+    "anon_thp": 23068672
+   },
+   "w2": {
+    "peak": 69160960,
+    "anon": 52940800,
+    "file": 13549568,
+    "anon_thp": 23068672
+   },
+   "w3": {
+    "peak": 77836288,
+    "anon": 52555776,
+    "file": 22179840,
+    "anon_thp": 23068672
+   }
+  },
+  "largest_peak": 97460224,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 2234368.0,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 2
+ },
+ "mix-cand-off": {
+  "memory": {
+   "w1": {
+    "peak": 102612992,
+    "anon": 55148544,
+    "file": 43294720,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 75689984,
+    "anon": 50282496,
+    "file": 21565440,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 74473472,
+    "anon": 50049024,
+    "file": 20094976,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 102612992,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 686080.0,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 2
+ },
+ "mix-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 84897792,
+    "anon": 49037312,
+    "file": 31469568,
+    "anon_thp": 33554432
+   },
+   "w2": {
+    "peak": 59506688,
+    "anon": 43393024,
+    "file": 12328960,
+    "anon_thp": 27262976
+   },
+   "w3": {
+    "peak": 65011712,
+    "anon": 43220992,
+    "file": 18272256,
+    "anon_thp": 27262976
+   }
+  },
+  "largest_peak": 84897792,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "get | rejected | 429 | executor admission capacity exhausted": 59,
+   "update | rejected | 429 | executor admission capacity exhausted": 6
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 342
+  },
+  "wbytes_per_ack": 12719.157894736842,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 342
+ },
+ "mix-main": {
+  "memory": {
+   "w1": {
+    "peak": 154501120,
+    "anon": 55652352,
+    "file": 92860416,
+    "anon_thp": 41943040
+   },
+   "w2": {
+    "peak": 138694656,
+    "anon": 49479680,
+    "file": 82415616,
+    "anon_thp": 35651584
+   },
+   "w3": {
+    "peak": 130879488,
+    "anon": 47951872,
+    "file": 76406784,
+    "anon_thp": 35651584
+   }
+  },
+  "largest_peak": 154501120,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 71
+  },
+  "wbytes_per_ack": 14191.774647887323,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 71
+ },
+ "serial-base": {
+  "memory": {
+   "w1": {
+    "peak": 92729344,
+    "anon": 46276608,
+    "file": 42323968,
+    "anon_thp": 23068672
+   },
+   "w2": {
+    "peak": 59232256,
+    "anon": 43921408,
+    "file": 8753152,
+    "anon_thp": 23068672
+   },
+   "w3": {
+    "peak": 65998848,
+    "anon": 43642880,
+    "file": 17338368,
+    "anon_thp": 23068672
+   }
+  },
+  "largest_peak": 92729344,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 781591.2727272727,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "serial-cand-off": {
+  "memory": {
+   "w1": {
+    "peak": 81371136,
+    "anon": 49115136,
+    "file": 28315648,
+    "anon_thp": 31457280
+   },
+   "w2": {
+    "peak": 72884224,
+    "anon": 46964736,
+    "file": 22007808,
+    "anon_thp": 31457280
+   },
+   "w3": {
+    "peak": 67125248,
+    "anon": 46379008,
+    "file": 16883712,
+    "anon_thp": 29360128
+   }
+  },
+  "largest_peak": 81371136,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 275549.0909090909,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "serial-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 70893568,
+    "anon": 38981632,
+    "file": 27934720,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 51466240,
+    "anon": 36593664,
+    "file": 11374592,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 56049664,
+    "anon": 36483072,
+    "file": 16064512,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 70893568,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 11
+  },
+  "wbytes_per_ack": 30161.454545454544,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "serial-main": {
+  "memory": {
+   "w1": {
+    "peak": 149790720,
+    "anon": 38567936,
+    "file": 95395840,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 126390272,
+    "anon": 36061184,
+    "file": 84504576,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 119799808,
+    "anon": 35758080,
+    "file": 74534912,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 149790720,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 11
+  },
+  "wbytes_per_ack": 21597.090909090908,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "serial-snap-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 71364608,
+    "anon": 40976384,
+    "file": 20901888,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 58691584,
+    "anon": 38465536,
+    "file": 16662528,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 60891136,
+    "anon": 38322176,
+    "file": 18804736,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 71364608,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 11
+  },
+  "wbytes_per_ack": 140381.0909090909,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "serial-snap-main": {
+  "memory": {
+   "w1": {
+    "peak": 152559616,
+    "anon": 53878784,
+    "file": 92827648,
+    "anon_thp": 39845888
+   },
+   "w2": {
+    "peak": 130547712,
+    "anon": 44683264,
+    "file": 80060416,
+    "anon_thp": 31457280
+   },
+   "w3": {
+    "peak": 127746048,
+    "anon": 42700800,
+    "file": 79138816,
+    "anon_thp": 29360128
+   }
+  },
+  "largest_peak": 152559616,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 11
+  },
+  "wbytes_per_ack": 125114.18181818182,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 11
+ },
+ "soak-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 1595138048,
+    "anon": 107192320,
+    "file": 1329868800,
+    "anon_thp": 88080384
+   },
+   "w2": {
+    "peak": 1344065536,
+    "anon": 93036544,
+    "file": 1103958016,
+    "anon_thp": 75497472
+   },
+   "w3": {
+    "peak": 1352634368,
+    "anon": 97796096,
+    "file": 1147752448,
+    "anon_thp": 77594624
+   }
+  },
+  "largest_peak": 1595138048,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "update | rejected | 429 | executor admission capacity exhausted": 1235
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 28505
+  },
+  "wbytes_per_ack": 0.0,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 28505
+ },
+ "soak100-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 1502461952,
+    "anon": 110100480,
+    "file": 1238036480,
+    "anon_thp": 92274688
+   },
+   "w2": {
+    "peak": 1477566464,
+    "anon": 100552704,
+    "file": 1263837184,
+    "anon_thp": 81788928
+   },
+   "w3": {
+    "peak": 1728094208,
+    "anon": 106975232,
+    "file": 1337044992,
+    "anon_thp": 90177536
+   }
+  },
+  "largest_peak": 1728094208,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "update | rejected | 429 | executor admission capacity exhausted": 5890
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 53685
+  },
+  "wbytes_per_ack": 181977.5320480581,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 53685
+ },
+ "update-cand-off": {
+  "memory": {
+   "w1": {
+    "peak": 98701312,
+    "anon": 59047936,
+    "file": 35180544,
+    "anon_thp": 41943040
+   },
+   "w2": {
+    "peak": 83030016,
+    "anon": 51195904,
+    "file": 27488256,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 73539584,
+    "anon": 50716672,
+    "file": 19030016,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 98701312,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 270791.1111111111,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 18
+ },
+ "update-cr-base": {
+  "memory": {
+   "w1": {
+    "peak": 102100992,
+    "anon": 60538880,
+    "file": 35872768,
+    "anon_thp": 39845888
+   },
+   "w2": {
+    "peak": 77783040,
+    "anon": 53927936,
+    "file": 20672512,
+    "anon_thp": 23068672
+   },
+   "w3": {
+    "peak": 75169792,
+    "anon": 53657600,
+    "file": 16814080,
+    "anon_thp": 23068672
+   }
+  },
+  "largest_peak": 102100992,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": null,
+  "wbytes_per_ack": 759580.4444444445,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 18
+ },
+ "update-cr-cand-on": {
+  "memory": {
+   "w1": {
+    "peak": 125968384,
+    "anon": 63053824,
+    "file": 58535936,
+    "anon_thp": 33554432
+   },
+   "w2": {
+    "peak": 103264256,
+    "anon": 56627200,
+    "file": 38412288,
+    "anon_thp": 27262976
+   },
+   "w3": {
+    "peak": 101400576,
+    "anon": 56164352,
+    "file": 37580800,
+    "anon_thp": 29360128
+   }
+  },
+  "largest_peak": 125968384,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {
+   "update | rejected | 429 | executor admission capacity exhausted": 1211
+  },
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 5178
+  },
+  "wbytes_per_ack": 14898.428736964079,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 5178
+ },
+ "update-main": {
+  "memory": {
+   "w1": {
+    "peak": 151998464,
+    "anon": 47886336,
+    "file": 98254848,
+    "anon_thp": 20971520
+   },
+   "w2": {
+    "peak": 123609088,
+    "anon": 41652224,
+    "file": 76165120,
+    "anon_thp": 20971520
+   },
+   "w3": {
+    "peak": 124313600,
+    "anon": 41365504,
+    "file": 76963840,
+    "anon_thp": 20971520
+   }
+  },
+  "largest_peak": 151998464,
+  "oom": {
+   "driver": [
+    0,
+    0,
+    false
+   ],
+   "api": [
+    0,
+    0,
+    false
+   ],
+   "w3": [
+    0,
+    0,
+    false
+   ],
+   "w2": [
+    0,
+    0,
+    false
+   ],
+   "w1": [
+    0,
+    0,
+    false
+   ]
+  },
+  "caps": {
+   "driver": [
+    "",
+    650000000,
+    900000000,
+    900000000
+   ],
+   "api": [
+    "35000 100000",
+    350000000,
+    550000000,
+    550000000
+   ],
+   "w3": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w2": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ],
+   "w1": [
+    "100000 100000",
+    1000000000,
+    2150000000,
+    2150000000
+   ]
+  },
+  "budget_verified": true,
+  "refusals": {},
+  "fallbacks": null,
+  "retries": null,
+  "proposal_failures": null,
+  "batch_sizes": {
+   "le_1": 504
+  },
+  "wbytes_per_ack": 12499.301587301587,
+  "fsyncs_per_ack": null,
+  "fsync_fdatasync_total": null,
+  "acknowledged_writes": 504
+ }
+}

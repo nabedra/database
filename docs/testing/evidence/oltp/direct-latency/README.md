@@ -19,6 +19,8 @@ The verdict comes first; the tables and method follow.
 
 PERF2c follow-up (HTTP keep-alive on the OLTP API, idle Control reads): [perf2c/README.md](perf2c/README.md).
 
+Final comparative benchmark of the follow-up PR (BENCH2: G1–G7 and the direct-path targets): [final/README.md](final/README.md).
+
 ## Fixes
 
 | Commit | Change | Effect (controlled host, serial) |

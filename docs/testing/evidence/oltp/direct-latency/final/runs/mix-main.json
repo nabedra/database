@@ -1,0 +1,395 @@
+{
+ "run": "mix-main",
+ "settings": {
+  "rates": [
+   1,
+   2,
+   5,
+   20,
+   50,
+   100,
+   200,
+   500,
+   1000
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 3.0,
+  "repetitions": 3,
+  "clients": 32,
+  "rows": 5000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "mix",
+  "read_fraction": 0.95,
+  "stop_p99_ms": 100.0,
+  "stop_on_rejection": true,
+  "snapshot_between_phases": false
+ },
+ "workload": "point gets and updates of existing bigint primary keys (--read-fraction gets)",
+ "started_utc": "2026-11-21T08:26:52.821692+00:00",
+ "error": null,
+ "correctness_verified": true,
+ "metadata": {
+  "engine": "nabedra",
+  "binary_sha256": "bf370a7e73e505dd69b1de977267a1378055e545d6f5600649c90988f2015ac2",
+  "server_version": "nabedra-db 0.1.1 oltp",
+  "image": "sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc",
+  "direct_oltp": "on",
+  "pool_format_version": 2,
+  "workspace_head": "5eb80fb8d6fa27d7ce5d809ce6c53c3ebd5f47da",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "844bdd5a56ffbad5197ee2da52d355782d34c30c5002b2263740ca367bfa3eb0",
+   "benchmark_oltp_workload.py": "3f43e38951020343f8bf65e8de2f275f189b83aae96f8136573ad15824ebe21e"
+  },
+  "docker_environment": {
+   "ServerVersion": "28.3.3",
+   "OperatingSystem": "Docker Desktop",
+   "Architecture": "x86_64",
+   "KernelVersion": "6.10.14-linuxkit",
+   "NCPU": 8,
+   "MemTotal": 8220114944,
+   "CgroupVersion": "2"
+  },
+  "allocations": {
+   "worker_bytes": 2150000000,
+   "api_cpu": 0.35,
+   "api_bytes": 550000000,
+   "driver_cpu": 0.65,
+   "driver_bytes": 900000000,
+   "total_cpu": 4,
+   "total_bytes": 7900000000,
+   "worker_cpu": 1.0
+  },
+  "consistency": "Nabedra production OLTP",
+  "data_bytes": {
+   "w1": 67133110,
+   "w2": 67133110,
+   "w3": 67133110
+  },
+  "direct_activation_seconds_after_api_ready": 2.101532500004396
+ },
+ "summary": {
+  "run": "mix-main",
+  "error": null,
+  "correctness_verified": true,
+  "stopped_after_rate": 50,
+  "stop_reason": {
+   "median_p99_ms": 113.042692,
+   "rejected": 0
+  },
+  "rates": {
+   "1": {
+    "reps": 3,
+    "offered": 15,
+    "median_succeeded_rps": 1.0,
+    "median_p50_ms": 13.337191,
+    "median_p95_ms": 22.649297,
+    "median_p99_ms": 22.649297,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 15,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 13.129893,
+      "median_p99_ms": 19.417173,
+      "succeeded": 14,
+      "offered": 14
+     },
+     "update": {
+      "median_p50_ms": 38.376753,
+      "median_p99_ms": 38.376753,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "2": {
+    "reps": 3,
+    "offered": 30,
+    "median_succeeded_rps": 2.0,
+    "median_p50_ms": 16.72979,
+    "median_p95_ms": 40.151339,
+    "median_p99_ms": 40.151339,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 30,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 16.72979,
+      "median_p99_ms": 22.007324,
+      "succeeded": 29,
+      "offered": 29
+     },
+     "update": {
+      "median_p50_ms": 40.151339,
+      "median_p99_ms": 40.151339,
+      "succeeded": 1,
+      "offered": 1
+     }
+    }
+   },
+   "5": {
+    "reps": 3,
+    "offered": 75,
+    "median_succeeded_rps": 5.0,
+    "median_p50_ms": 17.513286,
+    "median_p95_ms": 22.470103,
+    "median_p99_ms": 29.409296,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 75,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 16.768982,
+      "median_p99_ms": 28.733789,
+      "succeeded": 73,
+      "offered": 73
+     },
+     "update": {
+      "median_p50_ms": 42.3710395,
+      "median_p99_ms": 42.3710395,
+      "succeeded": 2,
+      "offered": 2
+     }
+    }
+   },
+   "20": {
+    "reps": 3,
+    "offered": 300,
+    "median_succeeded_rps": 20.0,
+    "median_p50_ms": 15.575126,
+    "median_p95_ms": 37.509176,
+    "median_p99_ms": 66.736304,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 300,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 15.501317,
+      "median_p99_ms": 71.036887,
+      "succeeded": 285,
+      "offered": 285
+     },
+     "update": {
+      "median_p50_ms": 31.502855,
+      "median_p99_ms": 66.736304,
+      "succeeded": 15,
+      "offered": 15
+     }
+    }
+   },
+   "50": {
+    "reps": 3,
+    "offered": 750,
+    "median_succeeded_rps": 49.98045938969471,
+    "median_p50_ms": 12.586357,
+    "median_p95_ms": 42.589427,
+    "median_p99_ms": 113.042692,
+    "statuses": {
+     "client_capacity": 0,
+     "failed": 0,
+     "rejected": 0,
+     "succeeded": 750,
+     "unresolved": 0
+    },
+    "mismatches": 0,
+    "unresolved_after_reconciliation": 0,
+    "by_operation": {
+     "get": {
+      "median_p50_ms": 12.350441,
+      "median_p99_ms": 113.042692,
+      "succeeded": 713,
+      "offered": 713
+     },
+     "update": {
+      "median_p50_ms": 33.028258,
+      "median_p99_ms": 64.284212,
+      "succeeded": 37,
+      "offered": 37
+     }
+    }
+   }
+  }
+ },
+ "direct_counters": {
+  "batch_sizes": {
+   "le_1": 71
+  },
+  "entries_applied": 71,
+  "entries_proposed": 71,
+  "get_micros_total": 2856253,
+  "gets": 1333,
+  "gets_done": 1333,
+  "mutation_micros_total": 1799584,
+  "mutations": 71,
+  "mutations_done": 71,
+  "requests": 1404,
+  "rows_proposed": 71,
+  "expire_entries": 1
+ },
+ "refusals": {},
+ "resources": {
+  "window_s": 91.628624037,
+  "acknowledged_writes": 71,
+  "io": {
+   "w1": {
+    "wbytes": 335872,
+    "wios": 159,
+    "cpu_usec": 21925915,
+    "throttled_periods": 2,
+    "periods": 996,
+    "window_s": 99.587106256
+   },
+   "w2": {
+    "wbytes": 335872,
+    "wios": 159,
+    "cpu_usec": 8138848,
+    "throttled_periods": 0,
+    "periods": 996,
+    "window_s": 99.632146548
+   },
+   "w3": {
+    "wbytes": 335872,
+    "wios": 159,
+    "cpu_usec": 8121748,
+    "throttled_periods": 0,
+    "periods": 996,
+    "window_s": 99.634551058
+   }
+  },
+  "wbytes_total": 1007616,
+  "wbytes_per_ack": 14191.774647887323,
+  "strace": null,
+  "fsync_fdatasync_total": null,
+  "fsyncs_per_ack": null,
+  "finals": {
+   "driver": {
+    "memory_peak": null,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "",
+    "nano_cpus": 650000000,
+    "memory_limit": 900000000,
+    "memory_swap": 900000000,
+    "throttled": "0/0"
+   },
+   "api": {
+    "memory_peak": 38023168,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "35000 100000",
+    "nano_cpus": 350000000,
+    "memory_limit": 550000000,
+    "memory_swap": 550000000,
+    "throttled": "51/1092"
+   },
+   "w3": {
+    "memory_peak": 130879488,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1290"
+   },
+   "w2": {
+    "memory_peak": 138694656,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "0/1311"
+   },
+   "w1": {
+    "memory_peak": 154501120,
+    "oom": 0,
+    "oom_kill": 0,
+    "max": 0,
+    "oom_killed_flag": false,
+    "cpu_max": "100000 100000",
+    "nano_cpus": 1000000000,
+    "memory_limit": 2150000000,
+    "memory_swap": 2150000000,
+    "throttled": "5/1330"
+   }
+  },
+  "budget_verified": true,
+  "errors": [],
+  "memory_stat_max": {
+   "w1": {
+    "max_anon": 55652352,
+    "max_file": 92860416
+   },
+   "w2": {
+    "max_anon": 49479680,
+    "max_file": 82415616
+   },
+   "w3": {
+    "max_anon": 47951872,
+    "max_file": 76406784
+   },
+   "api": {
+    "max_anon": 20168704,
+    "max_file": 3674112
+   }
+  }
+ },
+ "verification": {
+  "mode": "one snapshot read after the last measured phase",
+  "phases": 20,
+  "start_unix_ns": 1795249718407113685,
+  "end_unix_ns": 1795249728003016572,
+  "seconds": 9.595902887,
+  "driver_cpu_seconds": 0.09608299699999989,
+  "final_snapshot": {
+   "rows": 5000,
+   "sha256": "d445c70509f801c29cb818761699df23085ff46a1ae10fe5688fae4f5e2a364b",
+   "mismatches": 0,
+   "first_mismatches": [],
+   "read_mismatches": 0,
+   "first_read_mismatches": [],
+   "unresolved_keys": 0,
+   "unresolved_keys_with_new_value": 0,
+   "unobserved_unresolved_values_before_phase": 0,
+   "unobserved_unresolved_values_after_snapshot": 0,
+   "prior_unresolved_values_observed": 0,
+   "first_prior_unresolved_values_observed": [],
+   "source": "snapshot read"
+  }
+ }
+}
