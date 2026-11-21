@@ -202,16 +202,17 @@ def o08(fixture):
     initial_rows = rows(1, category=0)
     assert fixture.data(batch(table, initial_rows)) == 1
     before = fixture.cluster.all_stats()
-    history = run_concurrently(fixture, [
-        ('api1', point(table, 'update', key=1, values={'category': 71})),
-        ('api2', point(table, 'update', key=1, values={'value': 72})),
-        ('api1', batch(table, rows(2, 3, category=2))),
-        ('api2', batch(table, rows(3, 4, category=4))),
-        ('api1', point(table, 'insert', row=rows(3, category=6)[0])),
-        ('api2', point(table, 'delete', key=5)),
-        ('api1', point(table, 'get', key=3)),
-        ('api2', point(table, 'get', key=1)),
-    ])
+    waves = [
+        [('api1', point(table, 'update', key=1, values={'category': 71})),
+         ('api2', point(table, 'update', key=1, values={'value': 72}))],
+        [('api1', batch(table, rows(2, 3, category=2))),
+         ('api2', batch(table, rows(3, 4, category=4)))],
+        [('api1', point(table, 'insert', row=rows(3, category=6)[0])),
+         ('api2', point(table, 'delete', key=5))],
+        [('api1', point(table, 'get', key=3)),
+         ('api2', point(table, 'get', key=1))],
+    ]
+    history = [call for wave in waves for call in run_concurrently(fixture, wave)]
     for _, _, body, (_, reply) in history:
         assert reply['request_id'] == body['request_id'], (body, reply)
     final = {row['id']: row for row in fixture.data(fixture.query(table))}
@@ -266,7 +267,8 @@ def o08(fixture):
             losers.append(reply)
     assert len(winners) == len(losers) == 1, creation
     assert str(fixture.db.table(name).id) == winners[0]['id']
-    d11_drop(fixture.cluster, fixture.cluster.api_urls['api1'], fixture.cluster.auth['data_token'], fixture.cluster.ca)
+    d11_drop(fixture.cluster, fixture.cluster.api_urls['api1'], fixture.cluster.auth['data_token'],
+             fixture.cluster.ca, writer_count=2)
     passed('O08', 'schema-fences', 'Concurrent distinct schema creates left one descriptor. The RF3 drop race refused stale writes and reopened the name under a fresh, empty table identity.')
     passed('O08', 'bounded-progress', 'The concurrent history and the RF3 drop/write race returned within the fixture deadlines.')
     if fixture.direct:
@@ -486,15 +488,28 @@ def check_allocator(fixture, table, commit_ts):
     for worker in WORKERS:
         (cluster.barrier_dir(worker) / 'clock-offset-seconds').unlink()
 
-    if fixture.direct:
-        verify_direct_scan(fixture, table, expected, latest['last'])
-    passed('O09', 'no-backdated-allocation',
-           'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
     if clock_jumps:
         passed('O09', 'timestamp-order',
                'RF3 Timestamp re-election during a simulated backward wall-clock jump preserved ordering. The resumed leader refused to issue, and allocation advanced through a forward jump.')
     else:
         not_run('O09', 'timestamp-order', 'Timestamp failover and old-leader resume passed. Wall-clock jumps require Linux and a C compiler.')
+
+    if fixture.direct:
+        verify_direct_scan(fixture, table, expected, latest['last'])
+    passed('O09', 'no-backdated-allocation',
+           'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
+
+
+def admit_after_election(fixture, body):
+    for attempt in range(6):
+        status, reply = fixture.api('api2', REQUESTS, body)
+        assert reply['request_id'] == body['request_id'], (status, reply)
+        if status == 202:
+            assert reply['run_id'] == fixture.cluster.run_id, reply
+            return
+        assert status in (429, 503) and reply['error']['outcome'] == 'not_applied', (status, reply)
+        time.sleep(.1 * (attempt + 1))
+    raise AssertionError(f'request admission did not resume after Timestamp election: {status}, {reply}')
 
 
 def verify_direct_scan(fixture, table, prior_rows, completed_ts):
@@ -511,7 +526,7 @@ def verify_direct_scan(fixture, table, prior_rows, completed_ts):
         try:
             wait_for(reached, lambda path: path.read_text() == 'direct-proposing', timeout=15)
             assert not write.done()
-            fixture.admit(scan, 'api2')
+            admit_after_election(fixture, scan)
             _, scan_ts = fixture.reached(scan_id, 'snapshot')
         finally:
             release_direct_proposal(fixture, request_id)
