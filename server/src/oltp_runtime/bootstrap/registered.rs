@@ -438,6 +438,9 @@ impl LocalServices {
                 placements.control.identity.clone(),
                 placements.catalog.voters.clone(),
             )?;
+            let data_raft = registered_raft_config();
+            #[cfg(test)]
+            let data_raft = super::super::recovery_tests::snapshot_test_config(data_raft);
             let factory = DataGroupFactory::new(
                     manager.clone(),
                     worker.pool.clone(),
@@ -450,7 +453,7 @@ impl LocalServices {
                     control.clone(),
                     rpc.clone(),
                     status_topology.clone(),
-                    registered_raft_config(),
+                    data_raft,
                 )?;
             if rolling {
                 startup_read(deadline, &error_trace, "rolling retained Data groups", || factory.rehost_retained(&pools)).await?;

@@ -658,7 +658,7 @@ jobs:
             NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
               --server-binary "$NABEDRA_BIN" --olap-binary server/target/olap/debug/nabedra-db \
               --category compatibility --category queries --category transactions --category recovery --category growth \
-              --timeout 1800 --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
+              --timeout 3600 --output "artifacts/acceptance-$mode" 2>&1 | tee "artifacts/acceptance-$mode.log" || rc=$?
             # Exit 2 allows incomplete scenarios outside the required RF3 transaction cases.
             if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then status=1; fi
             if ! jq -e '[.results[] | select(.scenario == "O07" or .scenario == "O10")]

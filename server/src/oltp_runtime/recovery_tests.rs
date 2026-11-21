@@ -13,6 +13,36 @@ struct Barrier {
 }
 static BARRIER: OnceLock<Option<Barrier>> = OnceLock::new();
 
+pub(crate) async fn pause_routing_page(read_ts: u64) {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return;
+    };
+    let control = directory.join(format!("routing-page-{read_ts}.pause"));
+    if !control.is_file() {
+        return;
+    }
+    let reached = directory.join(format!("routing-page-{read_ts}.reached"));
+    std::fs::write(reached, b"").expect("record first routing page traversal");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while control.is_file() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "routing page watchdog expired"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+pub(super) fn snapshot_test_config(mut config: openraft::Config) -> openraft::Config {
+    if std::env::var_os("NABEDRA_OLTP_TEST_SHORT_DATA_SNAPSHOTS").is_some() {
+        config.snapshot_policy = openraft::SnapshotPolicy::LogsSinceLast(16);
+        config.max_in_snapshot_log_to_keep = 4;
+        config.purge_batch_size = 1;
+    }
+    config
+}
+
 pub(super) async fn build_archive_split_index(
     runtime: std::sync::Arc<super::worker_runtime::WorkerRuntime>,
     directory: PathBuf,

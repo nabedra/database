@@ -206,6 +206,11 @@ impl<'a> RoutingCursor<'a> {
             let Some(id) = self.next_page else {
                 return Ok(None);
             };
+            #[cfg(test)]
+            if self.pages_read == 1 {
+                crate::oltp_runtime::recovery_tests::pause_routing_page(self.pin.read_ts.get())
+                    .await;
+            }
             self.page = None;
             let (_, page) = value(
                 self.catalog
