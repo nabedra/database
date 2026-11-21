@@ -237,7 +237,18 @@ def o08(fixture):
     assert fixture.data(point(table, 'delete', key=9)) is True
     assert exchange(fixture, conflict, 'api2') == first
     assert fixture.data(point(table, 'get', key=9)) is None
-    passed('O08', 'stable-results', 'Queued no-op and conflict replays through the same identity returned the original outcome after a change that would reverse a re-executed result.')
+    if fixture.direct:
+        original = point(table, 'insert', row=rows(10, category=9)[0])
+        succeeded = exchange(fixture, original)
+        changed = {**original, 'payload': {**original['payload'], 'row': rows(10, category=99)[0]}}
+        rejected = exchange(fixture, changed)
+        assert succeeded == (200, dict(request_id=original['request_id'], data=None)), succeeded
+        assert rejected[0] == 409 and rejected[1]['error']['outcome'] == 'not_applied', rejected
+        assert fixture.data(point(table, 'delete', key=10)) is True
+        assert exchange(fixture, original, 'api2') == succeeded
+        assert exchange(fixture, changed) == rejected
+        assert fixture.data(point(table, 'get', key=10)) is None
+    passed('O08', 'stable-results', 'Queued no-op and conflict replays kept the exact outcome after the row changed. With direct routing, the original commit result and changed-body refusal stayed stable after deletion.')
 
     name = 'schema_race'
     creates = []
@@ -353,6 +364,8 @@ def o09(fixture):
         stage = f'seal-{group_id}'
         _, seal = fixture.reached(request, stage)
         assert seal['participant'] == plan, (seal, plan)
+        assert seal['txn'] == dict(request_id=request, attempt=1), seal
+        assert seal['sealed_at']['index'] > proof['position']['index'], (seal, proof)
         assert not any(path.exists() for path in fixture.paths(request, 'commit-stamp'))
         fixture.release(request, stage)
     _, stamp = fixture.reached(request, 'commit-stamp')
@@ -454,7 +467,8 @@ def check_allocator(fixture, table, commit_ts):
             assert abs(backward - (time.time() - 60)) < 5, backward
     finally:
         cluster.workers[previous].resume()
-    assert timestamp_probe(fixture, previous)['window'] is None, 'deposed Timestamp leader issued its old window'
+    resumed = timestamp_probe(fixture, previous)
+    assert resumed['window'] is None and 'Elapsed' not in resumed['error'], resumed
     for worker in WORKERS:
         (cluster.barrier_dir(worker) / 'clock-offset-seconds').write_text('60')
     _, latest, forward = allocator(fixture, survivors)
@@ -497,6 +511,13 @@ def o11(fixture):
     fixture.select(held['request_id'], {'participants': True})
     fixture.admit(held)
     fixture.reached(held['request_id'], 'participants')
+    decided = batch(table, rows(4, 5, category=5))
+    decision_id = decided['request_id']
+    fixture.select(decision_id, {'commit-reply': True, 'decision': False})
+    fixture.admit(decided, 'api2')
+    _, durable = fixture.reached(decision_id, 'commit-reply')
+    assert durable['request']['request_id'] == decision_id and 'commit' in durable['decision'], durable
+    assert not any(path.exists() for path in fixture.paths(decision_id, 'decision'))
     fixture.cluster.kill_all()
     old_run = fixture.cluster.run_id
     fixture.cluster.cold_start(keep_certificates=True)
@@ -521,10 +542,15 @@ def o11(fixture):
             'outcome': 'unknown',
         },
     }), (status, abandoned)
-    assert fixture.data(fixture.query(table), 'api2') == rows(1, 2, 3, category=5)
-    assert fixture.data(fixture.query(table, 5), 'api2') == rows(1, 2, 3, category=5)
+    expected = rows(1, 2, 3, 4, 5, category=5)
+    assert fixture.data(fixture.query(table), 'api2') == expected
+    assert fixture.data(fixture.query(table, 5), 'api2') == expected
+    code, replay = fixture.api('api2', f'{REQUESTS}/{old_run}/{decision_id}')
+    assert (code, replay) == (200, dict(
+        request_id=decision_id, run_id=old_run, state='succeeded', result=2, error=None,
+    )), (code, replay)
     passed('O11', 'committed-state-replay',
-           'SIGKILL of all RF3 workers and gateways preserved acknowledged mutations and exact decisions. A request gated before Prepare was abandoned after cold start.')
+           'SIGKILL of all RF3 workers and gateways preserved acknowledged mutations and their exact results. A durable decision with a held reply was recovered, and a pre-Prepare request was abandoned.')
 
 
 SCENARIOS = {'O06': o06, 'O08': o08, 'O09': o09, 'O11': o11}

@@ -1299,14 +1299,24 @@ async fn acceptance_o29() {
     };
     assert_eq!(syncs(), 1, "the failed live write must already be durable");
 
+    let attempted = Arc::new(AtomicUsize::new(0));
     for handle in [&group, &alias] {
-        let strong_read = handle.read(budget(), |_| panic!("read from uncertain pool"));
+        let observed = attempted.clone();
+        let strong_read = handle.read(budget(), move |view| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            view.copy_output(b"unexpected read")
+        });
         assert_eq!(strong_read.await.err(), Some(recovery_unknown()));
-        let same_request = handle.transaction(meta(0), budget(), |_| {
-            panic!("the missing live decision must never trigger a new table identity")
+        let observed = attempted.clone();
+        let same_request = handle.transaction(meta(0), budget(), move |tx| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            let regenerated = Uuid::new_v4().to_string();
+            tx.put(b"table", regenerated.as_bytes())?;
+            Ok(Transition::Commit(tx.copy_output(regenerated.as_bytes())?))
         });
         assert_eq!(same_request.await.err(), Some(recovery_unknown()));
     }
+    assert_eq!(attempted.load(Ordering::Relaxed), 0);
     assert_eq!(syncs(), 1, "no second decision was appended");
     assert!(pool.requires_recovery() && alias_pool.requires_recovery());
     assert_eq!(

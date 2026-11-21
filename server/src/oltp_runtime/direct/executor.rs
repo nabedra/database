@@ -981,7 +981,8 @@ impl DirectExecutor {
                     "direct-timestamp",
                     request.request_id,
                     &commit_ts,
-                ).await;
+                )
+                .await;
                 // T9 process barrier (D02, D04): the entry has reached quorum and
                 // applied here; the reply has not left the leader yet.
                 #[cfg(test)]

@@ -1116,7 +1116,7 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
 async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower() {
     use nabedra_kv::fs::{Fault, FaultError, FsOp};
 
-    let mut cluster = Cluster::new_with(3, 3, true).await;
+    let cluster = Cluster::new_with(3, 3, true).await;
     let leader = cluster.leader(&[0, 1, 2]).await;
     let followers: Vec<_> = (0..3).filter(|node| *node != leader).collect();
     let (delayed, failing) = (followers[0], followers[1]);

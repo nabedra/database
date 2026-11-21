@@ -183,11 +183,7 @@ pub(super) fn observe_rolling_copy(
     };
     observe_record(replica);
     let copied = serde_json::json!({"statement": statement, "queue":replica.stats()});
-    std::fs::write(
-        directory.join("rolling-copy.json"),
-        serde_json::to_vec(&copied).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(directory.join("rolling-copy.json"), serde_json::to_vec(&copied).unwrap()).unwrap();
 }
 pub(super) async fn pause_rolling_copy() {
     if let Some((_, id)) = rolling_test() {
@@ -196,11 +192,9 @@ pub(super) async fn pause_rolling_copy() {
 }
 pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
     const STAGE: &str = "staged-copy-refused";
-    if BARRIER
-        .get()
-        .and_then(Option::as_ref)
-        .is_some_and(|barrier| barrier.request == request && barrier.stage == STAGE)
-    {
+    if BARRIER.get().and_then(Option::as_ref).is_some_and(|barrier| {
+        barrier.request == request && barrier.stage == STAGE
+    }) {
         pause(STAGE, request).await;
         return true;
     }
@@ -209,10 +203,7 @@ pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
 fn rolling_test() -> Option<(PathBuf, Uuid)> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
     let input = std::fs::read_to_string(directory.join("rolling-test-id")).ok()?;
-    Some((
-        directory,
-        input.trim().parse().expect("rolling fixture UUID"),
-    ))
+    Some((directory, input.trim().parse().expect("rolling fixture UUID")))
 }
 pub(crate) async fn pause(stage: &str, request: Uuid) {
     if stage == "queued" {

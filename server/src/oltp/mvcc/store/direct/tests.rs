@@ -941,7 +941,13 @@ pub(super) async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         index: next_index,
     };
     assert_eq!(reopened.dump().await, state, "the commit is durable");
-    let cut = reopened.machine.store().applied_state(BUDGET).await.unwrap().unwrap();
+    let cut = reopened
+        .machine
+        .store()
+        .applied_state(BUDGET)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(cut.position, meta(next_index - 1).position);
     assert_eq!(cut.command_digest, meta(next_index - 1).command_digest);
     for key in [key, index] {
@@ -951,7 +957,11 @@ pub(super) async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         assert_eq!(visible["value"]["value"]["id"], 1);
     }
     let repeated = OwnedCommand::new_owned(command, &reopened.shared, ByteClass::Data).unwrap();
-    let repeated = reopened.machine.apply(meta(next_index - 1), repeated).await.unwrap();
+    let repeated = reopened
+        .machine
+        .apply(meta(next_index - 1), repeated)
+        .await
+        .unwrap();
     assert_eq!(repeated.as_slice(), result);
     // The same request proposed again as a new entry replays.
     assert_eq!(

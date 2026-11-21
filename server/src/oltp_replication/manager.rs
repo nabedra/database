@@ -225,9 +225,16 @@ impl HostedGroupManager {
     pub(crate) fn test_group_leader(&self, group: uuid::Uuid) -> Option<uuid::Uuid> {
         let routes = self.routes.lock().ok()?;
         let routes = routes.get(&group)?;
-        let leader = routes.replicas.values().find_map(|route| route.running.leader())?;
+        let leader = routes
+            .replicas
+            .values()
+            .find_map(|route| route.running.leader())?;
         routes.replicas.values().find_map(|route| {
-            route.running.members().into_iter().find(|member| member.node_id == leader)
+            route
+                .running
+                .members()
+                .into_iter()
+                .find(|member| member.node_id == leader)
                 .map(|member| member.worker_id)
         })
     }

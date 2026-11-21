@@ -1877,37 +1877,38 @@ impl HttpRuntime for WorkerRuntime {
             let scheduler = self.services.shared.scheduler().usage();
             #[allow(unused_mut)]
             let mut stats = serde_json::json!({
-                    "engine":"oltp", "queue":queue, "scheduler":scheduler,
-                    "accept_to_dispatch":accept_to_dispatch,
-                    "block_cache":self.services.shared.block_cache_usage(),
-                    "storage":self.services.shared.storage_stats(),
-                    // Rule 6: secondary pools refused at open, with the error class.
-                    "refused_pools":self.services.pools.refused_report(),
-                    "working_decode_bytes":self.services.shared.working_decode_bytes(),
-                    "native_thread_budget":self.services.shared.thread_budget(),
-                    // `null` until `data.direct.v1` activates the executor.
-                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
-                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
-                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                            .map(|service| service.stats())
-                            .unwrap_or(serde_json::Value::Null),
-                    },
-                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
-                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
-                        "history_settling":switch.history_settling(),
-                    })),
-                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
-                    // Local lane refusals (NS11 finding 8).
-                    "transport":self.services.manager.client().lane_refusals(),
-                    // RV-APPLY: transient retries and stopped cores.
-                    "raft":self.services.manager.raft_health(),
-                    // PERF1: per-stage latency histograms of this process.
-                    "stage_timing":super::stage_timing::snapshot(),
-                });
+                "engine":"oltp", "queue":queue, "scheduler":scheduler,
+                "accept_to_dispatch":accept_to_dispatch,
+                "block_cache":self.services.shared.block_cache_usage(),
+                "storage":self.services.shared.storage_stats(),
+                // Rule 6: secondary pools refused at open, with the error class.
+                "refused_pools":self.services.pools.refused_report(),
+                "working_decode_bytes":self.services.shared.working_decode_bytes(),
+                "native_thread_budget":self.services.shared.thread_budget(),
+                // `null` until `data.direct.v1` activates the executor.
+                "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                    Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                    None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                        .map(|service| service.stats())
+                        .unwrap_or(serde_json::Value::Null),
+                },
+                "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                    "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                    "history_settling":switch.history_settling(),
+                })),
+                "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                // Local lane refusals (NS11 finding 8).
+                "transport":self.services.manager.client().lane_refusals(),
+                // RV-APPLY: transient retries and stopped cores.
+                "raft":self.services.manager.raft_health(),
+                // PERF1: per-stage latency histograms of this process.
+                "stage_timing":super::stage_timing::snapshot(),
+            });
             #[cfg(test)]
             {
                 if let Some(source) = &self.services.direct_timestamps
-                    && let Some(probe) = super::recovery_tests::timestamp_probe(source.as_ref()).await
+                    && let Some(probe) =
+                        super::recovery_tests::timestamp_probe(source.as_ref()).await
                 {
                     stats["test_timestamp"] = probe;
                 }

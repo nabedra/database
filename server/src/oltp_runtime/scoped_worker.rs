@@ -958,16 +958,20 @@ impl ScopedWorker {
                 error = *cause;
             }
             match error {
-                PlanError::Blocked(intent) if Instant::now() < deadline => {
+                blocked @ (PlanError::Blocked(_) | PlanError::LifecyclePending(_))
+                    if Instant::now() < deadline =>
+                {
                     #[cfg(test)]
-                    super::recovery_tests::transaction_checkpoint(
-                        "blocked", txn.request_id, &intent,
-                    ).await;
+                    if let PlanError::Blocked(intent) = blocked {
+                        super::recovery_tests::transaction_checkpoint(
+                            "blocked",
+                            txn.request_id,
+                            &intent,
+                        )
+                        .await;
+                    }
                     #[cfg(not(test))]
-                    let _ = intent;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                PlanError::LifecyclePending(_) if Instant::now() < deadline => {
+                    let _ = blocked;
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 PlanError::Protocol(error) => return Err((error, guards.into_values().collect())),
