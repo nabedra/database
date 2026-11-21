@@ -1,46 +1,64 @@
 # Nabedra
 
-Nabedra includes a Rust server and Python and TypeScript ORMs. The OLAP engine
-stores immutable Parquet snapshots in object storage. The OLTP engine stores
-durable indexed tables. The native Cache engine serves in-memory keys over RESP2.
+Nabedra is a database server written in Rust, with ORMs for Python and
+TypeScript. You pick one of three engines when you build the server:
+
+- **OLAP** keeps each table as immutable Parquet snapshots in S3. It suits
+  analytical queries.
+- **OLTP** keeps indexed tables on a local disk, using `nabedra-kv`, our own
+  storage engine. It suits many small reads and writes, and it doesn't need S3.
+- **Cache** is an in-memory key-value store that speaks RESP2, the Redis wire
+  protocol.
+
+To run the database, start with the [server guide](server/README.md). For
+client code, see the [Python guide](orm/python/README.md) or the
+[TypeScript guide](orm/typescript/README.md). If you'd rather learn by
+building something, the [task tracker tutorial](server/TUTORIAL.md) walks
+through the server and the Python client.
 
 ## Repository layout
 
 ```text
-server/          Rust database server, getting started and operational docs
+server/          Rust database server, plus its setup and operations docs
+  kv/            nabedra-kv, the OLTP storage engine
+  events/        Nabedra Events, the replicated event log
 orm/
-  python/        Python ORM, CLI, application gateway and package tests
-  typescript/    TypeScript ORM, CLI and package tests
-scripts/         Repository installer and cross-component acceptance runners
-docs/testing/    Shared test contracts, audits and recorded execution evidence
-plans/           Design plans and implementation requirements
+  python/        Python ORM, the nabedra CLI and the application gateway
+  typescript/    TypeScript ORM and CLI
+  cache-contract/  Behavior both Cache clients must share, with its test runner
+scripts/         Installer and acceptance runners that span components
+docs/testing/    Test contracts, audits and recorded test runs
+plans/           Design plans and requirements
 ```
 
-Start with the [server guide](server/README.md) to run the database. See the
-[Python guide](orm/python/README.md) and the [TypeScript guide](orm/typescript/README.md)
-for client examples. The [task tracker tutorial](server/TUTORIAL.md) walks
-through the server and the Python client.
+Each component documents its own setup in its folder. Run commands from the
+repository root unless a guide says otherwise.
 
-## Working in this repository
+## Cache
 
-Each component keeps its setup instructions and documentation in its own folder.
-Run repository commands from the root unless a guide says otherwise. Shared
-acceptance scripts and test evidence cover interactions between the server and
-clients.
+Build `nabedra-db` with the `cache` Cargo feature to get the Cache engine.
+Standalone servers and private clusters accept the same commands, and the same
+ORM code works against both.
 
-Testing and release checks run locally through Codex or Claude Code agents with
-explicit CPU and memory budgets. Use the reusable scripts in `scripts/` and the
-contracts in `docs/testing/`. GitHub Actions are not used.
+- [Standalone setup and TLS](docs/cache/standalone.md)
+- [Private cluster on EC2](docs/cache/ec2.md)
+- [Reproducing the benchmarks](docs/testing/cache-benchmark.md)
 
-Read [CONTRIBUTION.md](CONTRIBUTION.md) before opening an issue or pull request,
-and follow [AGENTS.md](AGENTS.md) when changing worker execution or recovery.
+## Testing
 
-## Native Cache
+Focused checks run locally, usually through Codex or Claude Code agents with
+fixed CPU and memory limits. They use the scripts in `scripts/` and the
+contracts in `docs/testing/`. GitHub Actions runs the full Rust builds and test
+suites on every push to `main` and every PR, and maintainers can also start the
+Docker image, crash campaign and acceptance jobs there.
 
-Build `nabedra-db` with the `cache` Cargo feature for the RESP2-compatible
-in-memory engine. The standalone and private cluster paths use the same
-commands and Cache ORMs.
+## Contributing
 
-- [Standalone configuration and TLS](docs/cache/standalone.md)
-- [Private EC2 deployment](docs/cache/ec2.md)
-- [Benchmark reproduction](docs/testing/cache-benchmark.md)
+We only accept bug fixes from outside contributors. Read
+[CONTRIBUTING.md](CONTRIBUTING.md) before you open an issue or a pull request.
+If you change how workers execute or recover requests, also follow
+[AGENTS.md](AGENTS.md).
+
+## License
+
+Nabedra is available under the [MIT License](LICENSE).

@@ -1,14 +1,17 @@
 # Nabedra Python ORM
 
-The synchronous Python client creates tables, reads and writes rows, and builds
-queries for a running Nabedra Database server. It requires Python 3.11+ and uses
-only the standard library at runtime. The package also includes the `nabedra`
-CLI and optional application gateway integrations.
+This is the Python client for a running Nabedra Database server. It creates
+tables, reads and writes rows, and builds queries. The client is synchronous,
+needs Python 3.11 or newer, and uses only the standard library at runtime. The
+package also ships the `nabedra` CLI and optional application gateway
+integrations.
 
 ## Get started
 
-Start a database with the [server guide](https://github.com/zPy52/nabedra-database/blob/main/server/README.md), then install
-the client in a virtual environment:
+First start a database with the
+[server guide](https://github.com/zPy52/nabedra-database/blob/main/server/README.md).
+Then install the client in a virtual environment and export the token you
+gave the server:
 
 ```sh
 python3.11 -m venv .venv
@@ -16,8 +19,8 @@ python3.11 -m venv .venv
 export NABEDRA_TOKEN='<same-token-configured-on-your-server>'
 ```
 
-Run this example with that environment's Python. It uses a fresh table name
-on each run and retains the table:
+Run this with the virtual environment's Python. It creates a table with a new
+random name each time, and it doesn't delete the table afterwards:
 
 ```python
 import uuid
@@ -37,41 +40,23 @@ adults = users.where(col("age") >= 18).select("id", "age").collect()
 assert adults == [{"id": "alice", "age": 24}]
 ```
 
-The client reads `NABEDRA_TOKEN` unless you pass `token=` explicitly. AWS
-credentials belong on the server. For a remote server, use HTTPS; the client
-verifies certificates and hostnames and accepts `ca_file=` for a private CA.
+The client reads the token from `NABEDRA_TOKEN` unless you pass `token=`. It
+never needs AWS credentials, because those stay on the server. Use HTTPS for
+any server that isn't on your machine. The client checks the certificate and
+hostname, and `ca_file=` lets you trust a private CA.
 
-`mode` accepts `"oltp"` and `"olap"`; both currently use the same engine.
-The client does not retry operations automatically. Preserve the request
-identity and follow the [uncertain-write guidance](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md#errors-and-uncertain-writes)
-if a write loses its response.
+`mode` takes `"oltp"` or `"olap"`. For now it only records which workload you
+expect, since both modes use the same server API.
 
-## Develop from this checkout
-
-Run from the repository root:
-
-```sh
-python3.11 -m venv orm/python/.venv
-orm/python/.venv/bin/python -m pip install -e './orm/python[gateway]'
-orm/python/.venv/bin/python -m unittest discover -s orm/python/tests -v
-```
-
-The `gateway` extra installs HTTPX for application gateway tests. Normal ORM use
-needs no extra dependencies. The Python package does not bundle the Rust server;
-the [repository installer](https://github.com/zPy52/nabedra-database/blob/main/scripts/install_nabedra.py) installs both.
-
-## More documentation
-
-- [OLAP query streaming and PyTorch](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/streaming.md)
-- [Python API, CLI, receipts and limits](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md)
-- [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
-- [Application gateway setup](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
-- [Contribution guide](https://github.com/zPy52/nabedra-database/blob/main/CONTRIBUTION.md)
+The client never retries an operation on its own. If a write loses its
+response, you can't tell whether it was applied. Keep its request identity and
+follow the
+[guidance on uncertain writes](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md#errors-and-uncertain-writes).
 
 ## Cache
 
-Use a synchronous context manager with a Nabedra Cache endpoint. The client
-opens a connection pool and releases it when the context exits.
+`Cache` connects to a Nabedra Cache server. Use it as a context manager: it
+opens a connection pool on entry and closes it on exit.
 
 ```python
 from nabedra.cache import Cache
@@ -82,9 +67,35 @@ with Cache.connect("rediss://cache.example.com:6379", username=user,
     value = cache.get("sku:42")
 ```
 
-`Cache` is also exported from `nabedra`. Call `delete`, `expire`, `persist`,
-`ttl_ms` and `increment` on the same handle. `get` returns exact bytes or
-`None`. Use `cluster=True` with bootstrap endpoints and `allowed_nodes` or
-`allowed_node_suffix` when node names differ from the seeds. The
-[shared contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
+You can also import `Cache` from `nabedra`. The same handle has `delete`,
+`expire`, `persist`, `ttl_ms` and `increment`. `get` returns the stored bytes
+unchanged, or `None` when the key is missing.
+
+For a cluster, pass `cluster=True` and a list of seed endpoints. If the cluster
+nodes have different hostnames from the seeds, list them in `allowed_nodes` or
+give their common DNS suffix in `allowed_node_suffix`. The
+[shared Cache contract](https://github.com/zPy52/nabedra-database/tree/main/orm/cache-contract)
 describes deadlines, routing and errors.
+
+## Develop from this checkout
+
+From the repository root:
+
+```sh
+python3.11 -m venv orm/python/.venv
+orm/python/.venv/bin/python -m pip install -e './orm/python[gateway]'
+orm/python/.venv/bin/python -m unittest discover -s orm/python/tests -v
+```
+
+The `gateway` extra installs HTTPX, which the application gateway tests need.
+Plain ORM use needs no extras. The package doesn't include the Rust server.
+To install both, use the
+[repository installer](https://github.com/zPy52/nabedra-database/blob/main/scripts/install_nabedra.py).
+
+## More documentation
+
+- [OLAP query streaming and PyTorch](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/streaming.md)
+- [Python API, CLI, receipts and limits](https://github.com/zPy52/nabedra-database/blob/main/orm/python/docs/reference.md)
+- [Task tracker tutorial](https://github.com/zPy52/nabedra-database/blob/main/server/TUTORIAL.md)
+- [Application gateway setup](https://github.com/zPy52/nabedra-database/blob/main/server/docs/cli-and-serverless.md#host-an-application-endpoint)
+- [Contribution guide](https://github.com/zPy52/nabedra-database/blob/main/CONTRIBUTING.md)
