@@ -73,20 +73,10 @@ env:
 jobs:
   kv:
     name: nabedra-kv
-    needs: features
-    needs: features
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: o02-engine-features
-      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
-        with:
-          name: o02-engine-features
-      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
@@ -581,10 +571,15 @@ jobs:
   acceptance:
     name: Linux OLTP acceptance
     if: inputs.acceptance || contains(github.event.head_commit.message, '[ci acceptance]')
+    needs: features
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: o02-engine-features
+      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy,rustfmt && rustup default "$RUST_TOOLCHAIN"
@@ -623,10 +618,15 @@ jobs:
   direct:
     name: direct point path D01-D12, suites with direct_oltp on/off (T9)
     if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]')
+    needs: features
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: o02-engine-features
+      - run: echo "NABEDRA_O02_ENGINE_FEATURES=$PWD/o02-engine-features.json" >> "$GITHUB_ENV"
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
