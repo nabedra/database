@@ -251,3 +251,95 @@ fn ns05_power_loss_keeps_synced_writes_and_an_exact_prefix() {
 fn ns05_power_loss_with_4k_units_zero_and_garbage() {
     power_loss_campaign(PowerLoss::destroy_4k(), "NS05_4K_SEEDS", 150);
 }
+
+/// KVfix4 (NS01 1e6, CI seed 4242 step 49509, "second reopen failed: a journal segment
+/// the manifest records is missing"). A Kill stopped a segment roll after its rename and
+/// header sync but before the directory sync. The first open appended to that segment
+/// and a flush recorded it in the manifest; a crash right after lost the segment's name.
+/// The failed directory sync stands for the Kill point: an injected EIO leaves the
+/// rename pending exactly as a stop right before the sync would.
+#[test]
+fn ns04_kvfix4_kill_inside_a_roll_then_crash_after_reopen_keeps_the_manifests_segments() {
+    use nabedra_kv::fs::{Fault, FsOp};
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let journal = dir.join("journal");
+    let options = |fs: &FaultFs| {
+        let mut o = small_options(Arc::new(fs.clone()), bg.clone());
+        // No flush, compaction or GC before the test asks: the journal directory then
+        // sees only the open, the spare preparer and the roll.
+        o.memtable_bytes = 4 << 20;
+        o.max_replay_bytes = 64 << 20;
+        o.max_journal_bytes = 64 << 20;
+        o
+    };
+    let journal_dir_syncs = |fs: &FaultFs| {
+        fs.calls()
+            .iter()
+            .filter(|c| c.op == FsOp::SyncDir && c.path == journal && c.ok)
+            .count()
+    };
+    let store = Store::open(&dir, options(&fs)).unwrap().store;
+    let at_open = journal_dir_syncs(&fs);
+    let mut model = Model::new();
+    let put = |store: &Store, model: &mut Model, i: usize| {
+        let key = format!("k{i:04}").into_bytes();
+        let mut b = nabedra_kv::WriteBatch::new();
+        b.put(&key, &[i as u8; 1000]);
+        let r = store
+            .submit(b, Durability::Sync, Box::new(()))
+            .and_then(|c| c.wait());
+        if r.is_ok() {
+            model.insert(key, vec![i as u8; 1000]);
+        }
+        r
+    };
+    // Past half of the first segment, then wait until the preparer's spare is durable:
+    // the roll then takes it and creates no file.
+    let mut i = 0;
+    while i < 8 {
+        put(&store, &mut model, i).unwrap();
+        i += 1;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while journal_dir_syncs(&fs) == at_open {
+        assert!(std::time::Instant::now() < deadline, "no spare prepared");
+        std::thread::yield_now();
+    }
+    // The roll's directory sync fails: the journal latches with the rename pending.
+    fs.inject(Fault::on(FsOp::SyncDir).path_prefix(&journal));
+    while put(&store, &mut model, i).is_ok() {
+        i += 1;
+        assert!(i < 100, "the journal never rolled");
+    }
+    fs.halt();
+    drop(store);
+
+    // The kill image, then an open that appends to the rolled-to segment and flushes,
+    // so the manifest records it. Its later directory syncs (retirement) fail, as if the
+    // machine stopped before them.
+    let killed = fs.kill();
+    let opened = Store::open(&dir, options(&killed)).unwrap();
+    assert_eq!(
+        dump(&opened.store.snapshot()),
+        model,
+        "the kill lost synced writes"
+    );
+    killed.inject(Fault::on(FsOp::SyncDir).path_prefix(&journal).repeat());
+    for _ in 0..2 {
+        put(&opened.store, &mut model, i).unwrap();
+        i += 1;
+    }
+    let _ = opened.store.flush();
+    killed.halt();
+    drop(opened);
+
+    // A crash right after: only durable state.
+    let again = Store::open(&dir, options(&killed.crash()))
+        .unwrap_or_else(|e| panic!("reopen after the crash failed: {e} ({e:?})"));
+    assert_eq!(
+        dump(&again.store.snapshot()),
+        model,
+        "synced writes were lost"
+    );
+}
