@@ -206,7 +206,9 @@ impl<C: TypedConfig> TypedNetwork<C> {
         }
         let group = self.factory.resident.identity();
         #[cfg(test)]
-        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id) {
+        if crate::oltp_runtime::recovery_tests::block_raft_for_test(group.group_id)
+            || crate::oltp_growth_acceptance::data_raft_isolated(group.group_id)
+        {
             return Err(unavailable());
         }
         let (purpose, traffic) = header.route(&group.kind);
@@ -664,6 +666,11 @@ where
         bytes: &'a [u8],
     ) -> EndpointFuture<'a, ReceivePlan> {
         Box::pin(async move {
+            #[cfg(test)]
+            if crate::oltp_growth_acceptance::data_raft_isolated(self.resident.identity().group_id)
+            {
+                return Err(unavailable());
+            }
             if session.purpose() == Purpose::Snapshot {
                 return self.snapshot_preflight(session, bytes);
             }
