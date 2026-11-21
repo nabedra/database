@@ -42,6 +42,10 @@ def assertion(scenario, clause, detail, status='passed'):
         dict(scenario=scenario, assertion=clause, status=status, detail=detail)), flush=True)
 
 
+def evidence(scenario, case, **observed):
+    print(json.dumps(dict(scenario=scenario, case=case, **observed)), flush=True)
+
+
 def incomplete(scenario, reason):
     print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(
         dict(scenario=scenario, status='not-run', reason=reason)), flush=True)
@@ -93,7 +97,10 @@ def exact_receipt(exchange, run, request, result, timeout=60):
             assert body['state'] in ('queued', 'running', 'committing', 'reconciling'), body
             assert body == dict(expected, state=body['state'], result=None), body
         else:
-            assert_unknown((status, body), request)
+            if status == 429:
+                assert body['error']['outcome'] == 'not_applied', body
+            else:
+                assert_unknown((status, body), request)
         return None
 
     return wait_until(observe, f"terminal receipt {request['request_id']}", timeout)
@@ -249,9 +256,12 @@ class RuntimeServer(AbstractContextManager):
     def __enter__(self):
         return self.start()
 
-    def __exit__(self, *_):
+    def __exit__(self, error_type, *_):
         try:
-            self.stop()
+            if error_type is not None:
+                self.log.flush()
+                print((self.root / 'server.log').read_bytes()[-8192:].decode(errors='replace'), file=sys.stderr)
+            self.stop(abrupt=error_type is not None)
         finally:
             self.log.close()
 
@@ -282,7 +292,9 @@ def retirement_and_committed_cold_replay(binary):
             stats = server.stats()
             assert stats['queue']['accepted_records'] == 0, stats
             assert stats['queue']['charged_queue_bytes'] == stats['queue']['charged_result_bytes'] == 0, stats
-            assert raw(server.url, '/v1/requests/' + accepted['run_id'] + '/' + read['request_id'], token=server.token)[0] == 404
+            code, expired = raw(server.url, receipt_path(accepted['run_id'], read), token=server.token)
+            assert code == 404 and expired['error']['code'] == 'not_found', expired
+            assert expired['error']['outcome'] == 'not_applied' and 'expir' in expired['error']['message'], expired
             assert raw(server.url, '/v1/requests', read, token=server.token)[0] == 404
             assert table.get('one') == {'id': 'one', 'value': 7}
             previous = server.run_id
@@ -642,6 +654,7 @@ def native_cluster(binary, test_executable, label, *, mounts=False):
         except BaseException:
             for name in (*cluster.workers, *cluster.apis):
                 print(f'{name}\n{cluster.tail(name)}', file=sys.stderr)
+            cluster.kill_all()
             raise
         finally:
             cluster.close()
@@ -685,7 +698,7 @@ def read_record(cluster, name, request):
 def assert_record(record, run, request):
     body = json.dumps(request, separators=(',', ':'))
     assert record['request_id'] == request['request_id'] and record['run_id'] == run, record
-    assert record['body'] == body and record['body_hash'] == hashlib.sha256(body.encode()).hexdigest(), record
+    assert record['body'] == body and record['body_hash'] == record['digest'] == hashlib.sha256(body.encode()).hexdigest(), record
     assert record['accepted'] is True, record
     context = record['context']
     assert context['read']['storage_pin']['read_ts'] > 0, context
@@ -718,6 +731,51 @@ def launch_retained(cluster, name):
     cluster.launch_worker(name)
 
 
+def signed_control_saturation(cluster, owner, table, expected):
+    # Each stalled terminal installation owns a QueueData handler and a
+    # coordinator copy permit. Four held installations fill the copy pool.
+    target, observer = [name for name in WORKERS if name != owner]
+    directory = cluster.barrier_dir(target)
+    requests = [operation('table.get', dict(table_id=table.id, key=expected['id'])) for _ in range(5)]
+    held, overflow = requests[:4], requests[4]
+    write_json(directory / 'gates.json', {request['request_id']: 'before-terminal-copy' for request in held})
+    write_json(cluster.barrier_dir(owner) / 'inspect.json', [overflow['request_id']])
+
+    def submit_overflow():
+        with closing(gateway(cluster, timeout=60)) as client:
+            return client.exchange('/v1/requests', overflow)
+
+    with closing(gateway(cluster)) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            for request in held:
+                assert_accepted(client.exchange('/v1/requests', request), cluster.run_id, request)
+                wait_reached([directory], request, 'before-terminal-copy')
+
+            pending = pool.submit(submit_overflow)
+            overflow_record = cluster.barrier_dir(owner) / f"record-{overflow['request_id']}.json"
+
+            def recorded():
+                cluster.stats(owner)
+                return overflow_record.exists()
+
+            wait_until(recorded, 'copy-pressure probe did not stage', timeout=8)
+            assert not json.loads(overflow_record.read_text())['accepted']
+            assert not pending.done(), 'a staged request passed the occupied copy pool'
+            for request in held:
+                observed = worker(cluster, observer, receipt_path(cluster.run_id, request))
+                assert observed == (200, dict(request_id=request['request_id'], run_id=cluster.run_id,
+                                              state='committing', result=None, error=None)), observed
+        finally:
+            for request in held:
+                release(directory, request)
+            (directory / 'gates.json').unlink()
+        for request in held:
+            exact_receipt(client.exchange, cluster.run_id, request, expected)
+        assert_accepted(pending.result(), cluster.run_id, overflow)
+        exact_receipt(client.exchange, cluster.run_id, overflow, expected)
+    assertion('O14', 'signed-control-progress', 'Four authenticated terminal sends occupied the copy pool. Control receipts progressed while a fifth installation waited, then every result settled exactly.')
+
+
 def queue_survival(binary, test_executable):
     with native_cluster(binary, test_executable, 'o14') as cluster:
         run = cluster.run_id
@@ -736,6 +794,9 @@ def queue_survival(binary, test_executable):
             assert_accepted(first.exchange('/v1/requests', read), run, read)
             owner_dir = wait_reached(directories, read, 'queued')
             owner = owner_dir.name
+            signed_control_saturation(cluster, owner, table, original_row)
+            for directory in directories:
+                gates(directory, [(read, 'queued'), (mutation, 'committed')])
             assert table.update('seed', {'value': 2}) is True
             assert_accepted(first.exchange('/v1/requests', mutation), run, mutation)
             assert wait_reached(directories, mutation, 'committed') == owner_dir
@@ -753,7 +814,7 @@ def queue_survival(binary, test_executable):
             assert second.exchange(receipt_path(run, read)) == (200, dict(
                 request_id=read['request_id'], run_id=run, state='queued', result=None, error=None))
         cluster.kill_api('api2')
-        assertion('O14', 'api-loss', 'Both enrolled gateways stopped after 202. The second gateway observed the first gateway’s original queued receipt.')
+        evidence('O14', 'api-loss', gateways=2, same_run=run)
 
         removed, survivor = [name for name in WORKERS if name != owner]
         cluster.workers[removed].kill()
@@ -762,9 +823,17 @@ def queue_survival(binary, test_executable):
         for request in (read, mutation):
             record = read_record(cluster, survivor, request)
             assert assert_record(record, run, request) == originals[request['request_id']], record
-            assert record['state'] in ('queued', 'running'), record
-            assert_unknown(worker(cluster, survivor, receipt_path(run, request), timeout=25), request)
-        assertion('O14', 'quorum-loss', 'The lone RF3 voter could not settle a receipt and retained both complete records on the original run.')
+            assert record['state'] in ('queued', 'running', 'reconciling'), record
+            reply = worker(cluster, survivor, receipt_path(run, request), timeout=25)
+            if reply[0] == 200:
+                assert reply[1]['run_id'] == run and reply[1]['state'] in ('queued', 'running', 'reconciling'), reply
+            else:
+                assert_unknown(reply, request)
+        unavailable = operation('table.insert', dict(table_id=table.id, row=dict(id='no_quorum', value=4)))
+        denied = call(cluster.urls[survivor], '/v1/operations', unavailable,
+                      token=cluster.auth['data_token'], timeout=40)
+        assert denied[0] == 503 and denied[1]['request_id'] == unavailable['request_id'], denied
+        assertion('O14', 'quorum-loss-retains-queue', 'The lone RF3 voter could not commit a new mutation and retained both complete records on the original run.')
 
         # Restore the first lost worker without the original owner. Recovery
         # must copy from the one process that still has the accepted body.
@@ -774,8 +843,7 @@ def queue_survival(binary, test_executable):
             for request in (read, mutation):
                 record = read_record(cluster, name, request)
                 assert assert_record(record, run, request) == originals[request['request_id']], record
-        assertion('O14', 'original-context', 'Recovered copies matched the exact body, digest, pinned read timestamp, catalog and schema epochs, and accepted authorization.')
-        assertion('O14', 'join-with-outstanding-work', 'The restored worker had the complete pending records after it became ready.')
+        evidence('O14', 'join-with-outstanding-work', worker=removed, recovered_records=len(originals))
 
         for directory in directories:
             for request in (read, mutation):
@@ -789,10 +857,269 @@ def queue_survival(binary, test_executable):
                              ca_file=str(cluster.ca), timeout=30).table('same_run')
         assert recovered.get('seed') == dict(id='seed', value=2)
         assert recovered.get('once') == dict(id='once', value=3)
+        assert recovered.get('no_quorum') is None
         assert recovered.query().count() == 2
-        assertion('O14', 'same-run-outcomes', 'The restored gateway returned the pinned old row and the original mutation result. The newest data held exactly two rows.')
+        assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway returned the historical row and one mutation result.')
         launch_retained(cluster, owner)
         same_run_ready(cluster, run, WORKERS, 3)
+
+
+def count_pressure(test_executable):
+    with tempfile.TemporaryDirectory(prefix='nabedra-o13-count-') as directory:
+        server = RuntimeServer(test_executable, directory, short_retention=True)
+        server.test_executable = str(Path(test_executable).resolve())
+        server.execution.update(max_pending_requests=4, result_retention_ms=5000)
+        held = [operation('table.list', {}) for _ in range(4)]
+        gates(server.root, [(request, 'queued') for request in held])
+        with server, closing(Http(server.url, server.token)) as client:
+            for request in held:
+                assert_accepted(client.exchange('/v1/requests', request), server.run_id, request)
+                wait_reached([server.root], request, 'queued')
+            full = server.stats()['queue']
+            assert full['queued_records'] == full['accepted_records'] == len(held), full
+            assert 0 < full['charged_queue_bytes'] < server.execution['max_queue_bytes_per_replica'], full
+            refused = operation('table.list', {})
+            status, rejection = client.exchange('/v1/requests', refused)
+            assert status == 429 and rejection['error']['outcome'] == 'not_applied', rejection
+            assert server.stats()['queue'] == full
+            for request in held:
+                release(server.root, request)
+            for request in held:
+                exact_receipt(client.exchange, server.run_id, request, [])
+            later = operation('table.list', {})
+            assert_accepted(client.exchange('/v1/requests', later), server.run_id, later)
+            exact_receipt(client.exchange, server.run_id, later, [])
+
+            def retired():
+                queue = server.stats()['queue']
+                return all(value == 0 for value in queue.values())
+
+            wait_until(retired, 'terminal count-pressure work did not settle')
+
+
+def load_conservation(test_executable):
+    with tempfile.TemporaryDirectory(prefix='nabedra-o13-load-') as directory:
+        server = RuntimeServer(test_executable, directory)
+        server.test_executable = str(Path(test_executable).resolve())
+        server.execution.update(max_pending_requests=64, result_retention_ms=600_000)
+        with server:
+            db = Database(server.url, server.token, database='test', timeout=30)
+            source = db.create_table('stable', {'id': int, 'value': int}, key='id')
+            output = db.create_table('writes', {'id': int, 'value': int}, key='id')
+            rows = [dict(id=index, value=index * 2) for index in range(256)]
+            assert source.insert_many(rows) == len(rows)
+            query = dict(select=None, filter=None, order_by=None, limit=None)
+            expected_rows, jobs = [], []
+            for index in range(1000):
+                if index % 8 == 0:
+                    row = dict(id=index, value=index * 3)
+                    expected_rows.append(row)
+                    request = operation('table.insert', dict(table_id=output.id, row=row))
+                    expected = None
+                elif index % 2 == 0:
+                    row = rows[index % len(rows)]
+                    request = operation('table.get', dict(table_id=source.id, key=row['id']))
+                    expected = row
+                else:
+                    request = operation('query.count', dict(table_id=source.id, query=query))
+                    expected = len(rows)
+                jobs.append((request, expected))
+            baseline = server.stats()['queue']
+            accepted = {}
+            lock = threading.Lock()
+
+            def consume(batch):
+                with closing(Http(server.url, server.token, timeout=30)) as client:
+                    for request, expected in batch:
+                        status, body = client.exchange('/v1/requests', request)
+                        assert_accepted((status, body), server.run_id, request)
+                        with lock:
+                            assert request['request_id'] not in accepted, request
+                            accepted[request['request_id']] = expected
+                        exact_receipt(client.exchange, server.run_id, request, expected, timeout=30)
+
+            with ThreadPoolExecutor(max_workers=8) as clients:
+                futures = [clients.submit(consume, jobs[part::8]) for part in range(8)]
+                peak_compute = peak_charged = peak_queue = 0
+                while not all(future.done() for future in futures):
+                    stats = server.stats()
+                    peak_compute = max(peak_compute, sum(item[1] for item in stats['scheduler']))
+                    peak_charged = max(peak_charged, sum(item[2] for item in stats['scheduler']))
+                    queue = stats['queue']
+                    peak_queue = max(peak_queue, queue['charged_queue_bytes'])
+                    assert queue['charged_queue_bytes'] <= server.execution['max_queue_bytes_per_replica'], queue
+                    assert queue['charged_result_bytes'] <= server.execution['max_retained_result_bytes_per_worker'], queue
+                    assert peak_compute <= 2 and peak_charged <= 8 << 30, stats
+                    time.sleep(.05)
+                for future in futures:
+                    future.result()
+            assert accepted == {request['request_id']: expected for request, expected in jobs}
+            queue = server.stats()['queue']
+            assert queue['accepted_records'] == baseline['accepted_records'] + len(jobs), queue
+            assert queue['terminal_records'] == baseline['terminal_records'] + len(jobs), queue
+            assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+            assert output.query().order_by('id').collect() == expected_rows
+            rss_high_water = None
+            proc_status = Path(f'/proc/{server.process.pid}/status')
+            if proc_status.is_file():
+                rss_high_water = next(int(line.split()[1]) * 1024 for line in
+                                      proc_status.read_text().splitlines() if line.startswith('VmHWM:'))
+            return dict(accepted=len(accepted), peak_compute=peak_compute,
+                        peak_charged_bytes=peak_charged, peak_queue_bytes=peak_queue, peak_rss_bytes=rss_high_water)
+
+
+def simultaneous_admission(binary, test_executable):
+    with native_cluster(binary, test_executable, 'o13-identities') as cluster:
+        run = cluster.run_id
+        directories = [cluster.barrier_dir(name) for name in WORKERS]
+        db = Database(cluster.api_urls['api1'], cluster.auth['data_token'], database='test',
+                      ca_file=str(cluster.ca), timeout=30)
+        table = db.create_table('ids', {'id': str, 'value': int}, key='id')
+        request = operation('table.insert', dict(table_id=table.id, row=dict(id='one', value=8)))
+        for directory in directories:
+            gates(directory, [(request, 'queued')])
+        start = threading.Barrier(2, timeout=10)
+
+        def submit(name):
+            with closing(gateway(cluster, name)) as client:
+                start.wait()
+                return client.exchange('/v1/requests', request)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = [pool.submit(submit, name) for name in ('api1', 'api2')]
+            for future in pending:
+                assert_accepted(future.result(), run, request)
+        owner = wait_reached(directories, request, 'queued')
+        before = read_record(cluster, owner.name, request)
+        identity = assert_record(before, run, request)
+        copy_target = next(directory for directory in directories if directory != owner)
+        gates(copy_target, [(request, 'before-terminal-copy')])
+        with closing(gateway(cluster, 'api2')) as client:
+            changed = dict(request, payload=dict(table_id=table.id, row=dict(id='wrong', value=9)))
+            status, conflict = client.exchange('/v1/requests', changed)
+            assert status == 409 and conflict['error']['outcome'] == 'not_applied', conflict
+            release(owner, request)
+            wait_reached([copy_target], request, 'before-terminal-copy')
+            observed = client.exchange(receipt_path(run, request))
+            assert observed == (200, dict(request_id=request['request_id'], run_id=run,
+                                          state='committing', result=None, error=None)), observed
+            assert assert_record(read_record(cluster, owner.name, request), run, request) == identity
+            release(copy_target, request)
+            exact_receipt(client.exchange, run, request, None)
+            exact_receipt(client.exchange, run, request, None)
+            assert table.get('one') == dict(id='one', value=8)
+            assert table.get('wrong') is None
+            assert table.query().count() == 1
+        assert (owner / f"attempts-{request['request_id']}").read_text().splitlines() == ['queued']
+        decision = json.loads((owner / f"decision-{request['request_id']}.json").read_text())
+        assert decision['txn'] == dict(request_id=request['request_id'], attempt=1), decision
+        assert 'commit' in decision['decision'], decision
+        for name in WORKERS:
+            final = read_record(cluster, name, request)
+            assert assert_record(final, run, request) == identity and final['state'] == 'succeeded', final
+        evidence('O13', 'Q05', gateways=2, accepted_identity=request['request_id'], decision=decision['decided_at'])
+        evidence('O13', 'terminal-copy-race', during_copy=observed[1]['state'], replicas=len(WORKERS))
+
+        staged = operation('table.get', dict(table_id=table.id, key='one'))
+        gates(copy_target, [(staged, 'before-staged-copy')])
+        write_json(owner / 'inspect.json', [staged['request_id']])
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            def submit_staged():
+                with closing(gateway(cluster)) as client:
+                    return client.exchange('/v1/requests', staged)
+
+            pending = pool.submit(submit_staged)
+            try:
+                wait_reached([copy_target], staged, 'before-staged-copy')
+                assert not pending.done(), '202 before the final staged installation'
+                assert not read_record(cluster, owner.name, staged)['accepted']
+                cluster.kill_api('api1')
+                try:
+                    pending.result()
+                except TRANSPORT_ERRORS:
+                    pass
+                else:
+                    raise AssertionError('the killed gateway acknowledged a tentative copy')
+            finally:
+                release(copy_target, staged)
+        with closing(gateway(cluster, 'api2')) as client:
+            exact_receipt(client.exchange, run, staged, dict(id='one', value=8))
+        evidence('O13', 'Q03', before_installation_acknowledged=False, recovered_from_second_api=True)
+
+        cluster.apis['api1'].stop()
+        cluster.start_api('api1', DIRECT)
+        reservation_reply_loss(cluster, owner, table)
+        transient_receipt_observation(cluster, owner, table)
+
+
+def reservation_reply_loss(cluster, owner, table):
+    request = operation('table.insert', dict(table_id=table.id, row=dict(id='reserved', value=11)))
+    identity = request['request_id']
+    gates(owner, [(request, 'reservation-applied')])
+    (owner / f'lose-reservation-{identity}').touch()
+
+    def submit():
+        with closing(gateway(cluster)) as client:
+            return client.exchange('/v1/requests', request)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(submit)
+        try:
+            wait_reached([owner], request, 'reservation-applied')
+            durable = json.loads((owner / f'reservation-{identity}.json').read_text())
+            reservation = durable['identity']['reserved']
+            assert set(reservation) == {'request_id', 'digest', 'original_run', 'reservation_id', 'kind'}, durable
+            assert reservation['request_id'] == identity and reservation['original_run'] == cluster.run_id, durable
+            exact_body = json.dumps(request, separators=(',', ':')).encode()
+            assert reservation['digest'] == hashlib.sha256(exact_body).hexdigest(), durable
+            assert reservation['kind'] == 'mutation', durable
+            assert not first.done()
+            cluster.stats(owner.name)
+            assert not (owner / f'record-{identity}.json').exists(), 'a reservation installed executable RAM work'
+            cluster.kill_api('api1')
+            try:
+                first.result()
+            except TRANSPORT_ERRORS:
+                pass
+            else:
+                raise AssertionError('the killed gateway replied to the initial reservation')
+        finally:
+            release(owner, request)
+    with closing(gateway(cluster, 'api2')) as client:
+        assert_accepted(client.exchange('/v1/requests', request), cluster.run_id, request)
+        exact_receipt(client.exchange, cluster.run_id, request, None)
+    db = Database(cluster.api_urls['api2'], cluster.auth['data_token'], database='test',
+                  ca_file=str(cluster.ca), timeout=30)
+    assert db.table('ids').query().order_by('id').collect() == [dict(id='one', value=8), dict(id='reserved', value=11)]
+    evidence('O13', 'lost-reservation-reply', fields=sorted(reservation), original_run=reservation['original_run'])
+
+
+def transient_receipt_observation(cluster, owner, table):
+    query = dict(select=None, filter=None, order_by=None, limit=None)
+    request = operation('query.count', dict(table_id=table.id, query=query))
+    request_id = request['request_id']
+    gates(owner, [(request, 'observation-refused')])
+    (owner / f'lose-observation-{request_id}').touch()
+    trace = owner / f'submissions-{request_id}'
+    trace.touch()
+
+    def submit():
+        with closing(gateway(cluster, 'api2')) as client:
+            return client.exchange('/v1/operations', request)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(submit)
+        try:
+            wait_reached([owner], request, 'observation-refused')
+            original = assert_record(read_record(cluster, owner.name, request), cluster.run_id, request)
+            assert not pending.done()
+        finally:
+            release(owner, request)
+        assert pending.result() == (200, dict(request_id=request_id, data=2))
+    assert trace.read_text().splitlines() == [request_id]
+    final = read_record(cluster, owner.name, request)
+    assert assert_record(final, cluster.run_id, request) == original and final['state'] == 'succeeded', final
+    evidence('O13', 'Q04-transient-receipt', submissions=1, lost_observations=1)
 
 
 FENCE_STAGES = ('allocator', 'status', 'shard')
@@ -988,6 +1315,20 @@ def rf3_cold_recovery(binary, test_executable):
         # An exclusive lifecycle operation must acquire the guard left by the
         # interrupted prepare and use the fenced rollback to remove its intent.
         table.drop()
+        unavailable = [cluster.workers[name] for name in WORKERS[1:]]
+        try:
+            for process in unavailable:
+                process.pause()
+            assert_unknown(worker(cluster, WORKERS[0], receipt_path(run, committed), timeout=25), committed)
+            abandoned = queued['prepared']
+            assert_unknown(worker(cluster, WORKERS[0], receipt_path(run, abandoned), timeout=25), abandoned)
+        finally:
+            for process in unavailable:
+                process.resume()
+        with closing(gateway(cluster)) as client:
+            exact_receipt(client.exchange, run, committed, None)
+            assert_abandoned(client.exchange(receipt_path(run, abandoned)), abandoned)
+        evidence('O15', 'unavailable-proof', unavailable_voters=len(unavailable), receipts_restored=True)
     return True
 
 
@@ -1235,32 +1576,61 @@ if __name__ == '__main__':
             parser.error('--test-executable and --binary are required')
         preaccept_disconnect(args.test_executable)
         tentative_copy_disconnect(args.test_executable)
-        assertion('O13', 'preaccept-overload', 'Queue bytes and tentative count independently refused new work with 429 not_applied and settled their charges.')
+        count_pressure(args.test_executable)
+        assertion('O13', 'explicit-overload', 'Queue bytes and accepted pending count independently refused new work with 429 not_applied. Existing requests settled and later work succeeded.')
+        load = load_conservation(args.test_executable)
+        assertion('O13', 'accepted-identity-conservation', load)
         retirement_and_committed_cold_replay(args.binary)
-        assertion('O13', 'expiry-and-retirement', 'Expired read results returned 404, the queue retired their charges, and committed DDL replayed its exact result after cold start.')
         cli_supervisor(args.binary)
-        incomplete('O13', 'RF3 copy loss, CPU and disk headroom, lost reservation replies, and resource fault variations are pending')
+        simultaneous_admission(args.binary, args.test_executable)
+        run_native_assertions(args.test_executable, [
+            'q01_thousand_body_owners_and_coordinator_waiters_preserve_order_and_bytes',
+            'm01_f03_canonical_json_needs_charge_and_extracted_clones_keep_decode_owner_after_frame_drop',
+            'm02_queue_results_cpu_and_memory_share_one_ceiling',
+            'm03_o19_byte_arena_distinguishes_waiting_from_impossible_work',
+            'm03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headroom',
+            'm03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom',
+            'c06_f01_f02_f03_actual_overlap_refill_errors_panic_and_receiver_drop',
+            'f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic',
+            'f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles',
+            'o22_c05_c07_m02_m03_f03_cancelled_receiver_leaves_grant_with_job',
+            'q02_q06_o09_o13_same_term_ready_revision_reconciles_admission_rejection',
+            'q06_t04_receipt_race_reuses_terminal_version_and_retains_pin_until_every_copy',
+            'ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive',
+        ])
+        assertion('O13', 'settlement-and-expiry', 'Expired read receipts were explicit, old committed DDL replayed its exact result, and cancellation at the tested native boundaries released ownership.')
+        assertion('O13', 'scheduler-contract', 'Process pressure and native resource fault cases ran. A bounded transient receipt observation with no submit retry and every F03 boundary still need process evidence.', 'not-run')
+        assertion('O13', 'protected-disk-headroom', 'The native ENOSPC case checked live Raft cores and later settlement. COMMIT and ABORT progress on a dedicated disk reserve remain unverified.', 'not-run')
+        incomplete('O13', 'full scheduler fault matrix and protected disk settlement remain unverified')
     elif args.scenario == 'queue-survival':
         if not args.test_executable or not args.binary:
             parser.error('--test-executable and --binary are required')
         run_native_assertions(args.test_executable, [
             'r03_q03_join_empty_single_multiple_and_exhausted_pages_have_correct_done_flag'])
-        assertion('O14', 'bootstrap-pages', 'The native queue snapshot asserted empty, single, intermediate, final, and exhausted pages.')
+        assertion('O14', 'paged-bootstrap', 'The native queue snapshot asserted empty, single, intermediate, final, and exhausted pages.')
         queue_survival(args.binary, args.test_executable)
-        incomplete('O14', 'signed control saturation alongside terminal copying is pending')
     elif args.scenario == 'failure-boundaries':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')
         failure_boundaries(args.test_executable)
-        assertion('O15', 'rf1-cold-queue', 'RF1 abandoned queued and prepared work, preserved a durable commit, and resumed after interruption at each group fence.')
+        evidence('O15', 'rf1-cold-queue', interruptions=list(FENCE_STAGES), direct_oltp=DIRECT)
         activation_boundary(args.test_executable)
-        assertion('O15', 'activation-boundary', 'The pre-activation UUID replayed its original outcome or stayed abandoned across activation.')
         rf1_direct_recovery(args.test_executable)
+        run_native_assertions(args.test_executable, [
+            'o10_o15_r04_r05_native_point_cold_projection_keeps_first_positions',
+            'r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures',
+        ])
+        assertion('O15', 'post-fence-rejection', 'Native Status and Timestamp apply rejected delayed old-authority decisions and preserved the new-run abandonment.')
         if args.binary and rf3_cold_recovery(args.binary, args.test_executable):
-            assertion('O15', 'rf3-cold-queue', 'RF3 resumed one cold transition after a stop at each group fence. The earlier decision survived and old pending work stayed abandoned.')
-            assertion('O15', 'direct-in-flight', 'Both topologies checked the direct path’s before-proposal and after-apply cuts.' if DIRECT else
-                'Both topologies verified rollback mode proposed zero direct entries.')
-        incomplete('O15', 'late decision rejection and unavailable proof are pending')
+            assertion('O15', 'cold-run-abandonment', 'RF1 and RF3 old pending UUIDs stayed abandoned on raw resubmission and the new queue held no pending old work.')
+            assertion('O15', 'pre-fence-decisions', 'The original committed value and receipt survived cold start. RF3 recorded its Status position before the new group fence.')
+            assertion('O15', 'abort-without-reexecution', 'Old prepared and queued work left one application attempt trace. Cold recovery removed the prepared intent and allowed an exclusive table drop.')
+            assertion('O15', 'old-receipt-outcomes', 'Committed, abandoned, and temporarily unavailable proof produced distinct receipt outcomes.')
+            assertion('O15', 'interrupted-fences', 'RF1 and RF3 stopped after each durable allocator, Status, and shard fence, then resumed the same cold transition.')
+            evidence('O15', 'direct-in-flight', replication_factors=[1, 3], direct_oltp=DIRECT,
+                     proposed_write_absent=DIRECT, applied_write_replayed=DIRECT)
+        else:
+            incomplete('O15', 'RF3 cold start requires loopback pool mounts with passwordless sudo on Linux')
     elif args.scenario == 'activation-boundary':
         if not args.test_executable:
             parser.error('--test-executable is required for actual process barriers')

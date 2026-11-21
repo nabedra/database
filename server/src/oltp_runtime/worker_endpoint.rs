@@ -1932,6 +1932,10 @@ impl Endpoint for QueueEndpoint {
                         .prepare_payload(&session, current, &record, &sections)
                         .await?;
                     #[cfg(test)]
+                    if !record.accepted {
+                        super::recovery_tests::pause("before-staged-copy", record.request_id).await;
+                    }
+                    #[cfg(test)]
                     if record.state.terminal() {
                         super::recovery_tests::pause("before-terminal-copy", record.request_id).await;
                     }

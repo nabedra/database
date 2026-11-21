@@ -359,6 +359,44 @@ pub(super) async fn lose_admission_rejection(request: Uuid) -> bool {
     true
 }
 
+pub(super) async fn lose_reservation_reply(
+    request: Uuid,
+    reply: &crate::oltp_replication::authority::status::StatusReply,
+) -> bool {
+    let Some(directory) = take_fault("lose-reservation", request) else {
+        return false;
+    };
+    let path = directory.join(format!("reservation-{request}.json"));
+    std::fs::write(path, serde_json::to_vec(reply).unwrap()).unwrap();
+    pause("reservation-applied", request).await;
+    true
+}
+
+pub(super) async fn lose_receipt_observation(request: Uuid) -> bool {
+    if take_fault("lose-observation", request).is_none() {
+        return false;
+    }
+    pause("observation-refused", request).await;
+    true
+}
+
+fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;
+    Some(directory)
+}
+
+pub(super) fn count_submission(request: Uuid) {
+    use std::io::Write as _;
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return;
+    };
+    let path = PathBuf::from(directory).join(format!("submissions-{request}"));
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+        writeln!(file, "{request}").unwrap();
+    }
+}
+
 pub(super) fn observe_decision(
     stage: &str,
     statement: &crate::oltp_replication::types::DecisionStatement,
