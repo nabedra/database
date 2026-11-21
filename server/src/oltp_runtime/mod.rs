@@ -32,6 +32,8 @@ mod scoped_worker;
 mod transaction;
 pub mod worker_endpoint;
 pub(crate) mod worker_runtime;
+// PERF1: per-stage latency histograms (`stage_timing` in `/v1/runtime/stats`).
+pub(crate) mod stage_timing;
 
 use crate::{
     config::{ExecutionConfig, WorkerResources},
@@ -235,7 +237,7 @@ pub async fn run(options: ServeOptions) -> Result<(), &'static str> {
         }
         runtime.stop_accepting();
     };
-    let result = crate::network::serve_router(listener, app, tls, shutdown)
+    let result = crate::network::serve_router_keep_alive(listener, app, tls, shutdown)
         .await
         .map_err(|_| "listener failed");
     runtime

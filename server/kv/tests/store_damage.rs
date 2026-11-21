@@ -315,6 +315,63 @@ fn ns07_r1_store_wide_record_damage_refuses() {
     }
 }
 
+/// NS07 G2 / FLAKE1: a block cached by an earlier read was checked when it was read, so
+/// damage to its bytes on disk afterwards is not met while it stays cached: the read
+/// returns the checked value, never the damaged bytes. Once the store's cached blocks are
+/// evicted, the next read goes to the file, returns Corruption and quarantines g01.
+#[test]
+fn ns07_g2_cached_block_was_checked_and_eviction_meets_later_damage() {
+    let (fs, dir) = fault_fs();
+    let bg = Background::new(2).unwrap();
+    let s = open(&dir, options(&fs, &bg));
+    for k in 0..30 {
+        write_kv(
+            &s,
+            &group_prefix(1),
+            &group_key(1, k),
+            &val(&format!("g1-{k:02}")),
+            false,
+            Durability::NoSync,
+        );
+    }
+    s.flush().unwrap();
+    // This read fills the block cache with the checked block.
+    let key = group_key(1, 7);
+    assert_eq!(
+        s.snapshot().get(&key).unwrap().unwrap().as_ref(),
+        val("g1-07")
+    );
+    let (run, off) = find_one(&fs, &dir.join("runs"), b"<<g1-07>>");
+    fs.flip_bit(&run, off + 50, 6).unwrap();
+    let before = s.stats().corruption_detected;
+    assert_eq!(
+        s.snapshot().get(&key).unwrap().unwrap().as_ref(),
+        val("g1-07"),
+        "the cached block was checked when it was read"
+    );
+    assert_eq!(s.stats().corruption_detected, before);
+    assert!(s.quarantined().is_empty());
+
+    assert!(s.evict_cached_blocks() > 0);
+    let r = s.snapshot().get(&key);
+    assert!(
+        matches!(
+            r,
+            Err(Error::Corruption {
+                file: FileId::Run { .. },
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    assert!(s.stats().corruption_detected > before);
+    assert_eq!(s.quarantined().len(), 1);
+    assert_eq!(
+        s.quarantined()[0].scope.as_ref(),
+        group_prefix(1).as_slice()
+    );
+}
+
 /// NS07 G2 at read time: a damaged data block of a run holding only g01 makes the read
 /// return Corruption (never a wrong value), counts it, reports g01 to `on_damage`,
 /// quarantines g01 for later reads and persists that.

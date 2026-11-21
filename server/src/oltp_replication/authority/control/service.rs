@@ -284,6 +284,11 @@ impl ControlHandle {
     pub(crate) fn identity(&self) -> &GroupIdentity {
         self.machine.store().identity()
     }
+    /// The Control log index this worker's replica has applied, from memory,
+    /// or None without a running local replica. A change hint only.
+    pub(crate) fn applied_index(&self) -> Option<u64> {
+        self.consensus.applied_index()
+    }
     async fn submit(
         &self,
         command: ControlCommand,
@@ -879,12 +884,22 @@ impl ControlHandle {
         .await
     }
 
-    async fn read(
+    /// A linearizable read of the local machine. Each call site is counted
+    /// as `control.barrier.site.<file>:<line>` (PERF2c).
+    #[track_caller]
+    fn read(
         &self,
         read: impl FnOnce(&mut GroupRead<'_>) -> Result<ChargedBytes, ProtocolError> + Send + 'static,
-    ) -> Result<ChargedBytes, ProtocolError> {
-        self.consensus.ensure_linearizable().await?;
-        self.machine.store().read(BUDGET, read).await
+    ) -> impl std::future::Future<Output = Result<ChargedBytes, ProtocolError>> + Send + '_ {
+        let site = crate::oltp_runtime::stage_timing::site(
+            "control.barrier.site.",
+            std::panic::Location::caller(),
+        );
+        async move {
+            let _timer = site.timer();
+            self.consensus.ensure_linearizable().await?;
+            self.machine.store().read(BUDGET, read).await
+        }
     }
     pub(crate) async fn excluded(
         &self,
@@ -1770,6 +1785,51 @@ impl ControlHandle {
         machine::decode(bytes.as_ref())
     }
 }
+/// Paces a polling loop's linearizable Control reads (PERF2c). After a pass
+/// that found nothing to do, the next pass is due only once this worker's
+/// Control replica has applied a new entry, the caller's `key` changed, or
+/// `max_idle` passed. Every pass that runs still reads through a ReadIndex
+/// barrier: the gate only skips passes, it never serves a read. A change
+/// committed elsewhere reaches the local replica within a replication or
+/// heartbeat round, and `max_idle` bounds the delay when it cannot (a
+/// lagging or removed voter). Without a local replica every pass is due.
+pub(crate) struct IdlePasses<K> {
+    quiet: Option<(u64, K, tokio::time::Instant)>,
+    max_idle: std::time::Duration,
+}
+impl<K: PartialEq> IdlePasses<K> {
+    pub(crate) fn new(max_idle: std::time::Duration) -> Self {
+        Self {
+            quiet: None,
+            max_idle,
+        }
+    }
+    pub(crate) fn due(&self, applied: Option<u64>, key: &K, now: tokio::time::Instant) -> bool {
+        match (&self.quiet, applied) {
+            (Some((index, quiet_key, since)), Some(applied)) => {
+                applied != *index
+                    || key != quiet_key
+                    || now.saturating_duration_since(*since) >= self.max_idle
+            }
+            _ => true,
+        }
+    }
+    /// Records the outcome of a pass that started at `started`, when the
+    /// replica had applied `applied` and the caller's key was `key`. Only a
+    /// pass that found nothing to do (`quiet`) lets later passes be skipped.
+    pub(crate) fn record(
+        &mut self,
+        quiet: bool,
+        applied: Option<u64>,
+        key: K,
+        started: tokio::time::Instant,
+    ) {
+        self.quiet = match (quiet, applied) {
+            (true, Some(applied)) => Some((applied, key, started)),
+            _ => None,
+        };
+    }
+}
 impl AuthorityReader for ControlHandle {
     fn current<'a>(&'a self, scope: &'a QueueScope) -> EndpointFuture<'a, QueueAuthority> {
         Box::pin(self.authority(scope, None, false))
@@ -1814,4 +1874,41 @@ fn unauthorized() -> ProtocolError {
         "Control role is not authorized",
         Outcome::NotApplied,
     )
+}
+
+#[cfg(test)]
+mod idle_passes_tests {
+    use super::IdlePasses;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// PERF2c: a quiet pass lets later passes be skipped only while the local
+    /// Control replica applied nothing new, the key is unchanged and less than
+    /// `max_idle` passed. A busy or failed pass, or no local replica, keeps
+    /// every pass due.
+    #[test]
+    fn perf2c_idle_passes_skip_only_quiet_unchanged_passes() {
+        let start = Instant::now();
+        let mut idle = IdlePasses::new(Duration::from_secs(2));
+        // the first pass is due
+        assert!(idle.due(Some(7), &1, start));
+        idle.record(true, Some(7), 1, start);
+        assert!(!idle.due(Some(7), &1, start + Duration::from_millis(250)));
+        assert!(!idle.due(Some(7), &1, start + Duration::from_millis(1999)));
+        // max idle
+        assert!(idle.due(Some(7), &1, start + Duration::from_secs(2)));
+        // new entry
+        assert!(idle.due(Some(8), &1, start + Duration::from_millis(250)));
+        // key changed
+        assert!(idle.due(Some(7), &2, start + Duration::from_millis(250)));
+        // no replica
+        assert!(idle.due(None, &1, start + Duration::from_millis(250)));
+
+        idle.record(false, Some(7), 1, start);
+        // busy pass
+        assert!(idle.due(Some(7), &1, start + Duration::from_millis(250)));
+        idle.record(true, None, 1, start);
+        // no replica
+        assert!(idle.due(Some(7), &1, start + Duration::from_millis(250)));
+    }
 }

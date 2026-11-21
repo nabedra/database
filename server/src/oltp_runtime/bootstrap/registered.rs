@@ -191,6 +191,8 @@ impl LocalServices {
                     rpc.clone(),
                 ),
             );
+            // PERF1: keep a window reserved after a queued allocation discards it.
+            native_timestamps.spawn_direct_prefill();
             for (running, handle) in &status_groups {
                 let node = running.state.resident().node_id();
                 let endpoint = StatusEndpoint::new(
@@ -921,10 +923,23 @@ fn spawn_membership(
     tokio::spawn(async move {
         // The ticket of this worker's own Join while it rejoins the ready set.
         let mut rejoining: Option<Uuid> = None;
+        // At idle, every worker repeated two linearizable Control reads
+        // each 250 ms (PERF2c); quiet passes now wait for a Control change.
+        let mut idle = crate::oltp_replication::authority::control::IdlePasses::new(
+            std::time::Duration::from_secs(2),
+        );
         loop {
             if *stop.borrow_and_update() {
                 break;
             }
+            let started = tokio::time::Instant::now();
+            let applied = control.applied_index();
+            let held = replica.lock().ok().map(|replica| replica.authority());
+            if !idle.due(applied, &held, started) {
+                tokio::select! {_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
+                continue;
+            }
+            // Ok(true) when the pass found nothing to do.
             let progress = async {
                 let current = control.current(&scope).await?;
                 let previous = replica.lock().map_err(|_| unavailable())?.authority();
@@ -951,13 +966,14 @@ fn spawn_membership(
                                 members,
                             )
                             .await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 if rejoining.is_none() && current.owner != local {
-                    return Ok(());
+                    return Ok(current == previous);
                 }
                 let state = control.inspect().await?.ok_or_else(unavailable)?;
+                let quiet = current == previous && rejoining.is_none() && state.pending.is_none();
                 if let (Some(ticket), Some(Pending::Ready(pending))) = (rejoining, &state.pending)
                     && pending.transition_id == ticket
                     && pending.target == local
@@ -971,7 +987,7 @@ fn spawn_membership(
                     && let Some(Pending::Ready(pending)) = state.pending
                 {
                     if pending.change != crate::oltp_replication::authority::control::ReadyChange::Join {
-                        return Ok(());
+                        return Ok(false);
                     }
                     if pending.phase == ReadyPhase::AwaitingQueueProof {
                         let ticket = JoinTicket {
@@ -985,10 +1001,14 @@ fn spawn_membership(
                         join_owner.advance(&control, &pending).await?;
                     }
                 }
-                Ok::<_, ProtocolError>(())
+                Ok::<_, ProtocolError>(quiet)
             };
             tokio::select! {result=progress=>{
-                if let Err(error)=result { tracing::debug!(worker=%local.worker_id, code=?error.code, outcome=?error.outcome, message=error.message, "queue membership progress waits"); }
+                let quiet = match result {
+                    Ok(quiet) => quiet,
+                    Err(error) => { tracing::debug!(worker=%local.worker_id, code=?error.code, outcome=?error.outcome, message=error.message, "queue membership progress waits"); false }
+                };
+                idle.record(quiet, applied, held, started);
             },_=stop.changed()=>{}}
             tokio::select! {_=tokio::time::sleep(std::time::Duration::from_millis(250))=>{},_=stop.changed()=>{}}
         }

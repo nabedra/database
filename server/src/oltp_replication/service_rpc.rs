@@ -62,6 +62,21 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 // Registered election timeouts reach three seconds. Leave time to refresh
 // routes and reach the new leader without using the full public wait budget.
 const SERVICE_CONVERGENCE: Duration = Duration::from_secs(5);
+/// How long a routing-independent call reuses a member list without reading
+/// the group record again (plan section 1 bounds cached grants the same way).
+const ROUTE_REUSE: Duration = Duration::from_secs(5);
+/// PERF2a: while a client served `AllocateDirect` within [`ROUTE_WARM_IDLE`],
+/// a background task re-confirms its member list once it is older than half
+/// of [`ROUTE_REUSE`], checking every [`ROUTE_REFRESH`]. A serial caller then
+/// never pays the Control group read; the staleness bound stays
+/// [`ROUTE_REUSE`], and a failed call still drops the list.
+const ROUTE_REFRESH: Duration = Duration::from_secs(1);
+const ROUTE_WARM_IDLE: Duration = Duration::from_secs(30);
+/// PERF2a: an `AllocateDirect` reply header or body at most this long is
+/// checked and decoded on the calling task, not through a native-executor
+/// hop. Both are a few hundred bytes of JSON; larger replies (a long error
+/// message) keep the hop.
+pub(super) const INLINE_REPLY_BYTES: usize = 1024;
 const RECEIVER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const HINTED_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const SCOPED_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -231,6 +246,17 @@ impl Method {
                     | ServiceAction::ScopedQueueFenceReceipt { .. }
             ) || matches!(self, Self::ScopedStatusParticipant { .. }))
     }
+    /// Calls whose small replies are decoded inline (PERF2a): only
+    /// `AllocateDirect`, whose reply is a fixed-shape range.
+    fn inline_small_reply(self) -> bool {
+        matches!(
+            self,
+            Self::TimestampCall {
+                operation: 41,
+                mutation: true
+            }
+        )
+    }
     fn input_limit(self) -> usize {
         match self {
             Self::StatusCall { .. } | Self::TimestampCall { .. } => 128 << 10,
@@ -314,7 +340,58 @@ struct Client {
     /// tried last until it answers again, so a paused leader costs one
     /// attempt deadline, not one per call (D05/LIVE1).
     stalled: AtomicU64,
+    /// `AllocateDirect` counters and warm-route state (PERF2a).
+    direct: DirectRouting,
     _metadata: Arc<ScratchLease>,
+}
+
+/// PERF2a state of the thin `AllocateDirect` path on one [`Client`]. The
+/// three counters are read by tests; production sees the `ts.rpc.thin`,
+/// `ts.rpc.converge_fallback` and `ts.routes.refresh` stages.
+struct DirectRouting {
+    /// Calls answered by the single attempt to the cached leader.
+    #[cfg_attr(not(test), allow(dead_code))]
+    thin: AtomicU64,
+    /// Calls that went through [`Client::converge_with`] instead.
+    #[cfg_attr(not(test), allow(dead_code))]
+    converged: AtomicU64,
+    /// Member-list refreshes done by the warm-route task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    refreshes: AtomicU64,
+    /// Milliseconds since `epoch` of the last `AllocateDirect` call.
+    used_ms: AtomicU64,
+    epoch: std::time::Instant,
+    /// Whether the warm-route task runs.
+    warming: std::sync::atomic::AtomicBool,
+}
+impl DirectRouting {
+    fn new() -> Self {
+        Self {
+            thin: AtomicU64::new(0),
+            converged: AtomicU64::new(0),
+            refreshes: AtomicU64::new(0),
+            used_ms: AtomicU64::new(0),
+            epoch: std::time::Instant::now(),
+            warming: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+    fn idle(&self) -> bool {
+        self.now_ms()
+            .saturating_sub(self.used_ms.load(Ordering::Relaxed))
+            > ROUTE_WARM_IDLE.as_millis() as u64
+    }
+}
+
+/// `AllocateDirect` routing counters of one client (tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirectRoutingStats {
+    pub thin: u64,
+    pub converged: u64,
+    pub refreshes: u64,
 }
 impl Client {
     fn new(
@@ -337,6 +414,7 @@ impl Client {
             action,
             leader: AtomicU64::new(0),
             stalled: AtomicU64::new(0),
+            direct: DirectRouting::new(),
             _metadata: metadata,
         })
     }
@@ -360,16 +438,25 @@ impl Client {
             return self.repeat_as(action, method, payload).await;
         }
         let mut possibly_applied = false;
-        self.call_round(action, method, &payload, &mut possibly_applied, None)
+        self.call_round(action, method, &payload, &mut possibly_applied, None, false)
             .await
-            .map_err(Into::into)
+            .map_err(|error| {
+                let error = ProtocolError::from(error);
+                // An earlier replica may have executed the call before this
+                // round met a local refusal on the next one (G1).
+                if possibly_applied && !method.can_repeat_read() {
+                    return mutation_uncertain(error);
+                }
+                error
+            })
     }
     async fn converge(
         &self,
         method: Method,
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
-        self.converge_as(self.action, method, Some(payload), false).await
+        self.converge_as(self.action, method, Some(payload), false)
+            .await
     }
 
     /// Call only for a repeatable read or an exact, idempotent command.
@@ -382,6 +469,163 @@ impl Client {
         self.converge_as(action, method, payload, true).await
     }
 
+    /// `AllocateDirect` in one transport round trip (PERF2a). Its result
+    /// does not depend on which replica answers, only on the receiver's own
+    /// checks: only the Timestamp leader answers, after its lease barrier.
+    /// So it makes a single bounded attempt to the cached leader on a member
+    /// list a strong Control read confirmed within [`ROUTE_REUSE`] (PERF1),
+    /// with no route read and no native hop on this side; a stale route can
+    /// make the call fail but never answer it wrongly. A route failure
+    /// forgets the leader and drops the member list. Any failure then
+    /// converges as [`Self::repeat_as`] does, reusing confirmed routes and
+    /// within the same deadline, trying a leader that timed out last
+    /// (D05/LIVE1).
+    pub(super) async fn allocate_direct_as(
+        self: &Arc<Self>,
+        action: ServiceAction,
+        method: Method,
+        payload: ChargedBytes,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        use crate::oltp_runtime::stage_timing::{perf_stage, timed};
+        let deadline = Instant::now() + SERVICE_CONVERGENCE;
+        self.direct
+            .used_ms
+            .store(self.direct.now_ms(), Ordering::Relaxed);
+        self.keep_routes_warm();
+        let payload = Some(payload);
+        if let Some(response) = timed(
+            perf_stage!("ts.rpc.thin"),
+            self.cached_leader_attempt(action, method, &payload, deadline),
+        )
+        .await
+        {
+            self.direct.thin.fetch_add(1, Ordering::Relaxed);
+            return Ok(response);
+        }
+        self.direct.converged.fetch_add(1, Ordering::Relaxed);
+        timed(
+            perf_stage!("ts.rpc.converge_fallback"),
+            self.converge_with(action, method, payload, true, true, deadline),
+        )
+        .await
+    }
+
+    async fn cached_leader_attempt(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        deadline: Instant,
+    ) -> Option<ServiceResponse> {
+        let routes = self
+            .control
+            .recent_replica_routes(&self.group, ROUTE_REUSE)?;
+        let node = match self.leader.load(Ordering::Relaxed) {
+            0 => routes.last_successful_node()?,
+            node => node,
+        };
+        // A leader whose last attempt timed out is tried last, by the
+        // converging path, until it answers again (D05/LIVE1).
+        if node == self.stalled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let member = routes
+            .members
+            .iter()
+            .find(|member| member.node_id == node)?;
+        let attempt = timeout_at(
+            deadline.min(Instant::now() + SCOPED_MUTATION_TIMEOUT),
+            self.call_member(action, method, payload, node, member.worker_id.into()),
+        )
+        .await;
+        let route_failed = match attempt {
+            Ok(Ok(Ok(response))) => {
+                routes.record_successful_node(node);
+                return Some(response);
+            }
+            Err(_) => {
+                self.stalled.store(node, Ordering::Relaxed);
+                true
+            }
+            Ok(Ok(Err(error))) => route_unavailable(&error),
+            Ok(Err(CallError::Transport(
+                RequestError::Protocol(error) | RequestError::PeerRejected { error, .. },
+            ))) => route_unavailable(&error) || error == invalid(),
+            Ok(Err(CallError::Transport(RequestError::Unreachable))) => true,
+            Ok(Err(CallError::Transport(RequestError::OutgoingLaneFull))) => false,
+            // The reply failed this side's checks.
+            Ok(Err(CallError::Local(_))) => true,
+        };
+        crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.thin_failed").record(Duration::ZERO);
+        if route_failed {
+            let _ = self
+                .leader
+                .compare_exchange(node, 0, Ordering::Relaxed, Ordering::Relaxed);
+            self.control.invalidate_replica_routes(&routes);
+        }
+        None
+    }
+
+    /// Starts the warm-route task unless it runs (PERF2a). It holds the
+    /// client weakly and stops after [`ROUTE_WARM_IDLE`] without a call.
+    fn keep_routes_warm(self: &Arc<Self>) {
+        if self.direct.warming.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.direct.warming.store(false, Ordering::Release);
+            return;
+        };
+        let client = Arc::downgrade(self);
+        runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(ROUTE_REFRESH).await;
+                let Some(client) = client.upgrade() else {
+                    return;
+                };
+                if client.direct.idle() {
+                    client.direct.warming.store(false, Ordering::Release);
+                    // A call that saw `warming` set just before the store
+                    // started no task: take over if it is recent.
+                    if client.direct.idle()
+                        || client.direct.warming.swap(true, Ordering::AcqRel)
+                    {
+                        return;
+                    }
+                }
+                if client
+                    .control
+                    .recent_replica_routes(&client.group, ROUTE_REUSE / 2)
+                    .is_some()
+                {
+                    continue;
+                }
+                let refreshed = crate::oltp_runtime::stage_timing::timed(
+                    crate::oltp_runtime::stage_timing::perf_stage!("ts.routes.refresh"),
+                    tokio::time::timeout(
+                        SERVICE_CONVERGENCE,
+                        client.control.replica_routes(&client.group),
+                    ),
+                )
+                .await;
+                if let Ok(Ok(_)) = refreshed {
+                    client.direct.refreshes.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    tracing::debug!(group=%client.group.group_id, "AllocateDirect route refresh failed");
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn direct_routing_stats(&self) -> DirectRoutingStats {
+        DirectRoutingStats {
+            thin: self.direct.thin.load(Ordering::Relaxed),
+            converged: self.direct.converged.load(Ordering::Relaxed),
+            refreshes: self.direct.refreshes.load(Ordering::Relaxed),
+        }
+    }
+
     async fn converge_as(
         &self,
         action: ServiceAction,
@@ -390,7 +634,28 @@ impl Client {
         bound_mutation_attempt: bool,
     ) -> Result<ServiceResponse, ProtocolError> {
         let deadline = Instant::now() + SERVICE_CONVERGENCE;
-        let peer_deadline = (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
+        self.converge_with(
+            action,
+            method,
+            payload,
+            bound_mutation_attempt,
+            false,
+            deadline,
+        )
+        .await
+    }
+
+    async fn converge_with(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: Option<ChargedBytes>,
+        bound_mutation_attempt: bool,
+        reuse_routes: bool,
+        deadline: Instant,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        let peer_deadline =
+            (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
         let mut delay = Duration::from_millis(50);
         let mut possibly_applied = false;
         loop {
@@ -402,6 +667,7 @@ impl Client {
                     &payload,
                     &mut possibly_applied,
                     peer_deadline,
+                    reuse_routes,
                 ),
             )
             .await
@@ -457,6 +723,7 @@ impl Client {
         payload: &Option<ChargedBytes>,
         possibly_applied: &mut bool,
         convergence_deadline: Option<Instant>,
+        reuse_routes: bool,
     ) -> Result<ServiceResponse, CallError> {
         let mut failed_read_hint = None;
         if action == ServiceAction::Owner
@@ -465,6 +732,26 @@ impl Client {
                 .await
         {
             return result;
+        }
+        if reuse_routes
+            && let Some(routes) = self.control.recent_replica_routes(&self.group, ROUTE_REUSE)
+        {
+            let result = self
+                .call_routed(
+                    action,
+                    method,
+                    payload,
+                    possibly_applied,
+                    &routes,
+                    None,
+                    convergence_deadline,
+                )
+                .await;
+            if result.is_ok() {
+                return result;
+            }
+            // The members may have changed: read them again below.
+            self.control.invalidate_replica_routes(&routes);
         }
         tracing::debug!(group=%self.group.group_id, method=?method, "service replica routes start");
         let routes = self.control.replica_routes(&self.group).await.map_err(|error| {
@@ -798,6 +1085,7 @@ impl Client {
             return Err(unsupported_service_route().into());
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
+        let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
         let reply = self
             .transport
             .request_classified(
@@ -814,33 +1102,61 @@ impl Client {
                 CallError::Transport(error)
             })?;
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport completed");
+        self.member_reply(method, node, worker, reply)
+            .await
+            .map_err(|error| {
+                // The peer answered, so it may have executed the call before
+                // this side failed to check or charge the reply (G1).
+                CallError::Local(if method.can_repeat_read() {
+                    error
+                } else {
+                    mutation_uncertain(error)
+                })
+            })
+    }
+
+    async fn member_reply(
+        &self,
+        method: Method,
+        node: u64,
+        worker: RequestTarget,
+        reply: ReceivedReply,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, ProtocolError> {
         if reply.remote_identity().worker_id != worker.worker_id()
             || reply.group() != &self.group
             || reply.purpose() != method.purpose()
             || reply.sections[1].is_some()
             || reply.sections[2].is_some()
         {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         let raw = reply.header.clone();
-        let shared = self.shared.clone();
-        let decoded: ReplyHeader = shared
-            .execute(
-                if method.purpose() == Purpose::Storage {
-                    ExecutionClass::Query
-                } else {
-                    ExecutionClass::Control
-                },
-                node,
-                0,
-                move || {
-                    crate::protocol::json_input(raw.as_slice(), 4096).map_err(|_| invalid())?;
-                    serde_json::from_slice(raw.as_slice()).map_err(|_| invalid())
-                },
-            )
-            .await?;
+        let class = if method.purpose() == Purpose::Storage {
+            ExecutionClass::Query
+        } else {
+            ExecutionClass::Control
+        };
+        // PERF2b: a small direct reply (a point operation's answer) is
+        // checked and decoded on this task, not in two native jobs.
+        // PERF2a: so is a small fixed-shape reply (`AllocateDirect`).
+        let inline = (matches!(method, Method::Direct(_) | Method::DirectForward(_))
+            && reply.sections[0]
+                .as_ref()
+                .is_none_or(|section| section.len() <= DIRECT_INLINE_REPLY_BYTES))
+            || (method.inline_small_reply()
+                && raw.len() <= INLINE_REPLY_BYTES
+                && reply.sections[0]
+                    .as_ref()
+                    .is_none_or(|section| section.len() <= INLINE_REPLY_BYTES));
+        let decoded: ReplyHeader = if inline {
+            decode_reply_header(raw.as_slice())?
+        } else {
+            self.shared
+                .execute(class, node, 0, move || decode_reply_header(raw.as_slice()))
+                .await?
+        };
         if decoded.node != node || decoded.nonce != reply.nonce() {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         if let Some(error) = decoded.error {
             tracing::debug!(group=%self.group.group_id, method=?method, node=node, code=?error.code, outcome=?error.outcome, "service peer returned error");
@@ -848,31 +1164,19 @@ impl Client {
         }
         let input = reply.sections[0].as_ref().ok_or_else(invalid)?.clone();
         if input.len() as u64 != decoded.bytes {
-            return Err(invalid().into());
+            return Err(invalid());
         }
-        let (digest, bytes) = self
-            .shared
-            .execute(
-                if method.purpose() == Purpose::Storage {
-                    ExecutionClass::Query
-                } else {
-                    ExecutionClass::Control
-                },
-                node,
-                0,
-                move || {
-                    use sha2::{Digest as _, Sha256};
-                    Ok((
-                        Digest::from_bytes(Sha256::digest(input.as_slice()).into()),
-                        crate::oltp::mvcc::json_decode_budget(input.as_slice())?
-                            .checked_add(4096)
-                            .ok_or_else(invalid)?,
-                    ))
-                },
-            )
-            .await?;
+        let (digest, bytes) = if inline {
+            reply_digest_and_budget(input.as_slice())?
+        } else {
+            self.shared
+                .execute(class, node, 0, move || {
+                    reply_digest_and_budget(input.as_slice())
+                })
+                .await?
+        };
         if digest != decoded.digest {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node=node, decode_bytes=bytes, "service reply decode reserve start");
         let reply = if method.purpose() == Purpose::Storage {
@@ -891,6 +1195,23 @@ impl Client {
             method,
         }))
     }
+}
+/// A direct reply section up to this size is framed inline at the leader
+/// and checked and decoded inline at the gateway (PERF2b); larger ones keep
+/// their native jobs.
+const DIRECT_INLINE_REPLY_BYTES: usize = 4 << 10;
+fn decode_reply_header(raw: &[u8]) -> Result<ReplyHeader, ProtocolError> {
+    crate::protocol::json_input(raw, 4096).map_err(|_| invalid())?;
+    serde_json::from_slice(raw).map_err(|_| invalid())
+}
+fn reply_digest_and_budget(input: &[u8]) -> Result<(Digest, usize), ProtocolError> {
+    use sha2::{Digest as _, Sha256};
+    Ok((
+        Digest::from_bytes(Sha256::digest(input).into()),
+        crate::oltp::mvcc::json_decode_budget(input)?
+            .checked_add(4096)
+            .ok_or_else(invalid)?,
+    ))
 }
 struct ServiceResponse {
     reply: ReceivedReply,
@@ -1018,6 +1339,9 @@ fn parse(
     }
     crate::protocol::json_input(bytes, SERVICE_HEADER_BYTES).map_err(|_| invalid())?;
     let header: Header = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    // PERF1: service calls this process serves, by method.
+    crate::oltp_runtime::stage_timing::variant("rpc.serve.", &header.method)
+        .record(std::time::Duration::ZERO);
     if header.to_node != node
         || session.purpose() != header.method.purpose()
         || (if header.method.input_limit() > 0 {
@@ -1127,6 +1451,13 @@ async fn reply(
 ) -> Result<ChargedReply, ProtocolError> {
     let nonce = session.nonce();
     let data = session.purpose() == Purpose::Storage;
+    // PERF2b: a small direct answer (only `Method::Direct` and
+    // `DirectForward` use the ingress purpose) is framed on this task.
+    let inline = session.purpose() == Purpose::ApiIngress
+        && !matches!(&result, Ok(bytes) if bytes.len() > DIRECT_INLINE_REPLY_BYTES);
+    if inline {
+        return build_reply(shared, data, nonce, node, result);
+    }
     let resources = shared.clone();
     shared
         .execute(
@@ -1137,39 +1468,57 @@ async fn reply(
             },
             node,
             0,
-            move || {
-                use sha2::{Digest as _, Sha256};
-                let (payload, error) = match result {
-                    Ok(bytes) => (Some(bytes), None),
-                    Err(error) => (None, Some(error)),
-                };
-                let bytes = payload.as_ref().map_or(0, |bytes| bytes.len() as u64);
-                let digest = Digest::from_bytes(
-                    Sha256::digest(payload.as_ref().map_or(&[][..], |bytes| bytes.as_slice()))
-                        .into(),
-                );
-                let header = resources.encode_in(
-                    if data {
-                        ByteClass::Data
-                    } else {
-                        ByteClass::Progress
-                    },
-                    &ReplyHeader {
-                        node,
-                        nonce,
-                        bytes,
-                        digest,
-                        error,
-                    },
-                    4096,
-                )?;
-                Ok(ChargedReply {
-                    header,
-                    sections: [payload, None, None],
-                })
-            },
+            move || build_reply(&resources, data, nonce, node, result),
         )
         .await
+}
+/// [`reply`] on the calling task, for a small fixed-shape `AllocateDirect`
+/// answer or its error (PERF2a): one SHA-256 of at most
+/// [`INLINE_REPLY_BYTES`] and a header of a few hundred bytes.
+fn reply_inline(
+    shared: &Arc<WorkerSharedResources>,
+    session: &AuthenticatedSession,
+    node: u64,
+    result: Result<ChargedBytes, ProtocolError>,
+) -> Result<ChargedReply, ProtocolError> {
+    let data = session.purpose() == Purpose::Storage;
+    build_reply(shared, data, session.nonce(), node, result)
+}
+fn build_reply(
+    resources: &Arc<WorkerSharedResources>,
+    data: bool,
+    nonce: uuid::Uuid,
+    node: u64,
+    result: Result<ChargedBytes, ProtocolError>,
+) -> Result<ChargedReply, ProtocolError> {
+    use sha2::{Digest as _, Sha256};
+    let (payload, error) = match result {
+        Ok(bytes) => (Some(bytes), None),
+        Err(error) => (None, Some(error)),
+    };
+    let bytes = payload.as_ref().map_or(0, |bytes| bytes.len() as u64);
+    let digest = Digest::from_bytes(
+        Sha256::digest(payload.as_ref().map_or(&[][..], |bytes| bytes.as_slice())).into(),
+    );
+    let header = resources.encode_in(
+        if data {
+            ByteClass::Data
+        } else {
+            ByteClass::Progress
+        },
+        &ReplyHeader {
+            node,
+            nonce,
+            bytes,
+            digest,
+            error,
+        },
+        4096,
+    )?;
+    Ok(ChargedReply {
+        header,
+        sections: [payload, None, None],
+    })
 }
 fn unavailable() -> ProtocolError {
     ProtocolError::new(

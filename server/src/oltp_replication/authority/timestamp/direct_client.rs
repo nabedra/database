@@ -7,8 +7,15 @@
 //! timestamps are higher (O09: no cached timestamp behind a completed
 //! operation).
 //!
+//! A caller that finds the client idle makes its own call on its own task,
+//! with no driver task to wake (PERF2a). When it returns, or is cancelled,
+//! the callers that queued meanwhile go to a spawned driver. A cancelled
+//! leading call issues nothing to anyone else; a panic in it fails only that
+//! caller, as an `Unknown` outcome.
+//!
 //! A worker that hosts a Timestamp replica tries it in process first. Only the
-//! leader can answer. On any local failure, or when the local attempt misses
+//! leader can answer, so the replica is skipped while its own Raft names
+//! another leader (PERF2a). On any local failure, or when the local attempt misses
 //! `LOCAL_DEADLINE`, the client uses the remote route and skips the local
 //! replica for `LOCAL_BACKOFF`. The deadline matters when the local node
 //! passes its read barrier and is then partitioned mid-`ReserveWindow`: its
@@ -21,6 +28,7 @@ use crate::{
     oltp_replication::types::CommitTs,
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
+use futures_util::FutureExt as _;
 use std::{
     collections::VecDeque,
     sync::{
@@ -102,22 +110,26 @@ impl DirectTimestampClient {
                 Outcome::NotApplied,
             ));
         }
-        let (reply, receive) = oneshot::channel();
-        let start = {
+        let receive = {
             let mut queue = self.inner.lock_queue();
-            queue.waiters.push_back(Waiter { count, reply });
-            !std::mem::replace(&mut queue.running, true)
+            if std::mem::replace(&mut queue.running, true) {
+                let (reply, receive) = oneshot::channel();
+                queue.waiters.push_back(Waiter { count, reply });
+                Some(receive)
+            } else {
+                // Idle: no call is in flight and nobody waits.
+                None
+            }
         };
-        if start {
-            tokio::spawn(self.inner.clone().drive());
-        }
-        receive.await.map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::StorageUnavailable,
-                "direct timestamp allocation stopped",
-                Outcome::Unknown,
-            )
-        })?
+        let Some(receive) = receive else {
+            let _leading = Leading(Some(self.inner.clone()));
+            return std::panic::AssertUnwindSafe(self.inner.call(count))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(stopped()))
+                .and_then(|range| range.expect_len(count));
+        };
+        receive.await.map_err(|_| stopped())?
     }
     /// Calls issued to either route (for tests and stats).
     pub(crate) fn calls(&self) -> u64 {
@@ -130,6 +142,45 @@ impl DirectTimestampClient {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.inner.lock_queue().waiters.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn idle(&self) -> bool {
+        !self.inner.lock_queue().running
+    }
+}
+fn stopped() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "direct timestamp allocation stopped",
+        Outcome::Unknown,
+    )
+}
+/// Held by a caller that makes its own call (PERF2a). However that call
+/// ends, the callers queued meanwhile go to a new driver, or `running`
+/// clears when nobody waits.
+struct Leading(Option<Arc<Inner>>);
+impl Drop for Leading {
+    fn drop(&mut self) {
+        let Some(inner) = self.0.take() else {
+            return;
+        };
+        let mut queue = inner.lock_queue();
+        if queue.waiters.is_empty() {
+            queue.running = false;
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                drop(queue);
+                runtime.spawn(inner.clone().drive());
+            }
+            // No runtime to drive them: fail the waiters, as a cancelled
+            // driver does.
+            Err(_) => {
+                queue.running = false;
+                queue.waiters.clear();
+            }
+        }
     }
 }
 /// Clears `running` if the driver is cancelled or panics. Its in-flight batch
@@ -150,8 +201,13 @@ impl Inner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    async fn drive(self: Arc<Self>) {
-        let mut running = Running(Some(self.clone()));
+    /// The guard exists before the first poll, so a driver dropped unpolled
+    /// (spawned onto a runtime that is shutting down) still clears `running`.
+    fn drive(self: Arc<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let running = Running(Some(self.clone()));
+        async move { self.drive_with(running).await }
+    }
+    async fn drive_with(self: Arc<Self>, mut running: Running) {
         loop {
             let (batch, total) = {
                 let mut queue = self.lock_queue();
@@ -200,8 +256,9 @@ impl Inner {
         }
     }
     async fn call(&self, count: u64) -> Result<DirectTimestampRange, ProtocolError> {
+        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.client.call").timer();
         self.calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(local) = &self.local {
+        if let Some(local) = self.local.as_ref().filter(|local| local.may_answer()) {
             let skip = self
                 .local_skip_until
                 .lock()
@@ -211,6 +268,8 @@ impl Inner {
                 match tokio::time::timeout(self.local_deadline, local.allocate_direct(count)).await
                 {
                     Ok(Ok(range)) => {
+                        crate::oltp_runtime::stage_timing::perf_stage!("ts.client.local_answered")
+                            .record(Duration::ZERO);
                         self.local_calls.fetch_add(1, Ordering::Relaxed);
                         return Ok(range);
                     }
@@ -224,6 +283,10 @@ impl Inner {
                 }
             }
         }
-        self.remote.allocate_direct(count).await
+        crate::oltp_runtime::stage_timing::timed(
+            crate::oltp_runtime::stage_timing::perf_stage!("ts.client.remote"),
+            self.remote.allocate_direct(count),
+        )
+        .await
     }
 }

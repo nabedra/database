@@ -435,6 +435,7 @@ impl DirectLink {
             }
         };
         let payload = Some(request.body.clone());
+        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
         match self
             .client
             .call_member_at(
@@ -454,7 +455,9 @@ impl DirectLink {
                 // A reply that does not decode came after execution.
                 .map_err(DirectSendError::Uncertain),
             Ok(Err(error)) => Err(by_outcome(error)),
-            Err(CallError::Local(error)) => Err(DirectSendError::NotApplied(error)),
+            // Local failures before sending keep `not_applied`; those after
+            // the leader answered carry an unknown outcome.
+            Err(CallError::Local(error)) => Err(by_outcome(error)),
             Err(CallError::Transport(RequestError::OutgoingLaneFull)) => Err(
                 DirectSendError::NotApplied(RequestError::OutgoingLaneFull.into()),
             ),

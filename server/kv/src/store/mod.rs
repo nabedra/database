@@ -805,6 +805,17 @@ impl Store {
         self.inner.shutdown()
     }
 
+    /// Drops this store's run blocks and journal values from the block cache, so the next
+    /// read of each goes to its file and checks it again. Cached entries were checked when
+    /// they were read; tests that damage files under a running store use this to make the
+    /// next read meet the damage. Returns how many entries were dropped.
+    #[doc(hidden)]
+    pub fn evict_cached_blocks(&self) -> usize {
+        self.inner
+            .cache
+            .erase_namespace(self.inner.table_cache.context().namespace)
+    }
+
     /// Runs per level, for tests and stats.
     pub fn level_runs(&self) -> Vec<usize> {
         self.inner

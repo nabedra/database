@@ -177,7 +177,7 @@ class ManagementTests(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()) as output:
                         self.assertEqual(cli.main(['--version', '--json']), 0)
                     versions = json.loads(output.getvalue())
-                    self.assertEqual(versions['cli'], '0.2.1')
+                    self.assertEqual(versions['cli'], '0.2.2')
                     self.assertEqual(versions['binary'], '0.1.1')
             with patch.dict(os.environ, {'NABEDRA_SERVER_BINARY': 'absent'}):
                 with self.assertRaises(RuntimeError):

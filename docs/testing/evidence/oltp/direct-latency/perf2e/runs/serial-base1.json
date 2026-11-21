@@ -1,0 +1,440 @@
+{
+ "metadata": {
+  "binary_sha256": "acdcc665a23b61e692270bcbd2686013672e8be806e5cf7f291358793a422588",
+  "workspace_head": "734c8159d5759bede49017f6e8cfd75ac50de4b4",
+  "benchmark_source_sha256": {
+   "benchmark_oltp_nabedra.py": "2adfa901973a3eac0c4981239ac7466b5a18ff9abb5a6437539ecda4ca297ea4",
+   "benchmark_oltp_workload.py": "18aa9230863f9f90c50d2d37c164a4a6e07da9c1d027663e3e06697eac133fee"
+  },
+  "direct_oltp": "on"
+ },
+ "settings": {
+  "rates": [
+   0.2
+  ],
+  "seconds": 5.0,
+  "warmup_seconds": 5.0,
+  "repetitions": 10,
+  "clients": 1,
+  "rows": 2000,
+  "seed": 20261118,
+  "timeout": 10.0,
+  "operation": "update",
+  "read_fraction": 0.95,
+  "stop_p99_ms": null,
+  "stop_on_rejection": false
+ },
+ "correctness_verified": true,
+ "initial_snapshot": {
+  "rows": 2000,
+  "sha256": "45264bb2a12894dbc5ad41e75c3dd5cf6df2722117dac10b329fc66f4daed671",
+  "mismatches": 0,
+  "first_mismatches": [],
+  "read_mismatches": 0,
+  "first_read_mismatches": [],
+  "unresolved_keys": 0,
+  "unresolved_keys_with_new_value": 0,
+  "unobserved_unresolved_values_before_phase": 0,
+  "unobserved_unresolved_values_after_snapshot": 0,
+  "prior_unresolved_values_observed": 0,
+  "first_prior_unresolved_values_observed": []
+ },
+ "phases": [
+  {
+   "label": "0.2-warmup",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 44.065362,
+    "p90": 44.065362,
+    "p95": 44.065362,
+    "p99": 44.065362,
+    "max": 44.065362
+   },
+   "start_unix_ns": 1795237883095975058,
+   "drain_end_unix_ns": 1795237888095975058,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "cb8e0fe3384a48e51120f971beb2e2b897f1aa64d93bfd9fab3e15ce50b9e3c6",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep1",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 40.493526,
+    "p90": 40.493526,
+    "p95": 40.493526,
+    "p99": 40.493526,
+    "max": 40.493526
+   },
+   "start_unix_ns": 1795237892086955385,
+   "drain_end_unix_ns": 1795237897086955385,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "0fdc583653c7d0a23ab1dbf58c125dbde3ea55fbd13c29308b97c73b80a9665d",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep2",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 39.066278,
+    "p90": 39.066278,
+    "p95": 39.066278,
+    "p99": 39.066278,
+    "max": 39.066278
+   },
+   "start_unix_ns": 1795237901669777133,
+   "drain_end_unix_ns": 1795237906669777133,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "9ac0787e53c656c878395f993da3c890a2a9b8171155f235bdc00ea190592902",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep3",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 61.48276,
+    "p90": 61.48276,
+    "p95": 61.48276,
+    "p99": 61.48276,
+    "max": 61.48276
+   },
+   "start_unix_ns": 1795237912986103819,
+   "drain_end_unix_ns": 1795237917986103819,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "2c838efe790c12cada25e81a94e6cf6156c543aec2aeb9bc5faf0510ff0a761e",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep4",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 37.777471,
+    "p90": 37.777471,
+    "p95": 37.777471,
+    "p99": 37.777471,
+    "max": 37.777471
+   },
+   "start_unix_ns": 1795237924219032497,
+   "drain_end_unix_ns": 1795237929219032497,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "a7d605515d7d334b866a1abc88d5a4c882adbc4d77e715fa4e8b4e336e95a82f",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep5",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 48.490405,
+    "p90": 48.490405,
+    "p95": 48.490405,
+    "p99": 48.490405,
+    "max": 48.490405
+   },
+   "start_unix_ns": 1795237934393463441,
+   "drain_end_unix_ns": 1795237939393463441,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "832989fb53a233c273ae0e0ee9e5f661f68135a9234c03c5dfd41b29e0abb66a",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep6",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 63.878181,
+    "p90": 63.878181,
+    "p95": 63.878181,
+    "p99": 63.878181,
+    "max": 63.878181
+   },
+   "start_unix_ns": 1795237944141129790,
+   "drain_end_unix_ns": 1795237949141129790,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "4962dccd5b95014cd0da3a8f95567c58d74fa203f1f0a0947e77f3a7c7108bc5",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep7",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 31.541951,
+    "p90": 31.541951,
+    "p95": 31.541951,
+    "p99": 31.541951,
+    "max": 31.541951
+   },
+   "start_unix_ns": 1795237954432228552,
+   "drain_end_unix_ns": 1795237959432228552,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "f2992bfc0d3c14ea8aa79f648b18316cbd9558c6168933c3197bd5331d06b8cb",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep8",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 45.98893,
+    "p90": 45.98893,
+    "p95": 45.98893,
+    "p99": 45.98893,
+    "max": 45.98893
+   },
+   "start_unix_ns": 1795237964804817170,
+   "drain_end_unix_ns": 1795237969804817170,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "6daacc147af3a4f0f742486d8ef4354ec2289b2653ec232ad35e82e40ea129ee",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep9",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 35.720797,
+    "p90": 35.720797,
+    "p95": 35.720797,
+    "p99": 35.720797,
+    "max": 35.720797
+   },
+   "start_unix_ns": 1795237976048843376,
+   "drain_end_unix_ns": 1795237981048843376,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "819b5becb3efa7a0637d31e38a518276577509666751fbde636301526a1cb41b",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  },
+  {
+   "label": "0.2-rep10",
+   "rate": 0.2,
+   "offered": 1,
+   "statuses": {
+    "client_capacity": 0,
+    "failed": 0,
+    "rejected": 0,
+    "succeeded": 1,
+    "unresolved": 0
+   },
+   "success_latency_ms": {
+    "count": 1,
+    "p50": 63.489928,
+    "p90": 63.489928,
+    "p95": 63.489928,
+    "p99": 63.489928,
+    "max": 63.489928
+   },
+   "start_unix_ns": 1795237986401350890,
+   "drain_end_unix_ns": 1795237991401350890,
+   "snapshot": {
+    "rows": 2000,
+    "sha256": "0c35487fc52072d11bfc3a99b290b9707bc6fa9797ff2e5f8a03de7553fe3e44",
+    "mismatches": 0,
+    "first_mismatches": [],
+    "read_mismatches": 0,
+    "first_read_mismatches": [],
+    "unresolved_keys": 0,
+    "unresolved_keys_with_new_value": 0,
+    "unobserved_unresolved_values_before_phase": 0,
+    "unobserved_unresolved_values_after_snapshot": 0,
+    "prior_unresolved_values_observed": 0,
+    "first_prior_unresolved_values_observed": []
+   }
+  }
+ ]
+}

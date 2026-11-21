@@ -82,6 +82,10 @@ pub struct WorkerSharedResources {
     scheduler: ResourceScheduler,
     scheduler_node_id: u64,
     next_native_job: AtomicU64,
+    /// Native jobs prepared per class (Query, Control), for tests that
+    /// count a request's handoffs (PERF2b).
+    #[cfg(test)]
+    native_jobs: [AtomicU64; 2],
     task_memory_limit_bytes: usize,
     decode_bytes: Arc<AtomicUsize>,
     thread_budget: super::super::NativeThreadBudget,
@@ -228,6 +232,8 @@ impl WorkerSharedResources {
             scheduler,
             scheduler_node_id,
             next_native_job: AtomicU64::new(1),
+            #[cfg(test)]
+            native_jobs: Default::default(),
             task_memory_limit_bytes: limits.task_memory_limit_bytes as usize,
             decode_bytes: Arc::new(AtomicUsize::new(0)),
             thread_budget,
@@ -766,6 +772,8 @@ impl WorkerSharedResources {
             owner: self.clone(),
             _permit: None,
         };
+        #[cfg(test)]
+        self.native_jobs[class as usize].fetch_add(1, Ordering::Relaxed);
         let executor = match class {
             ExecutionClass::Query => &self.query,
             ExecutionClass::Control => &self.control,
@@ -778,6 +786,11 @@ impl WorkerSharedResources {
             .map_err(|_| capacity())?;
         lease._permit = Some(permit);
         Ok(PreparedNative { class, lease })
+    }
+    /// Native jobs prepared so far in `class`.
+    #[cfg(test)]
+    pub(crate) fn native_jobs(&self, class: ExecutionClass) -> u64 {
+        self.native_jobs[class as usize].load(Ordering::Relaxed)
     }
     /// Close admission and join every prepared or dispatched native lease.
     /// Callers must release their own prepared work before awaiting this drain.
@@ -809,9 +822,23 @@ impl WorkerSharedResources {
         task_bytes: u64,
         work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
     ) -> Result<T, ProtocolError> {
+        use crate::oltp_runtime::stage_timing::perf_stage;
+        let started = std::time::Instant::now();
         let prepared = self.prepare(class).await?;
         let grant = prepared.reserve_compute(request, task_bytes).await?;
-        prepared.run_with_guard(grant, work).await?.0
+        let admitted = std::time::Instant::now();
+        let result = prepared.run_with_guard(grant, work).await;
+        match class {
+            ExecutionClass::Query => {
+                perf_stage!("native.query.admit").record(admitted - started);
+                perf_stage!("native.query.run").since(admitted);
+            }
+            ExecutionClass::Control => {
+                perf_stage!("native.control.admit").record(admitted - started);
+                perf_stage!("native.control.run").since(admitted);
+            }
+        }
+        result?.0
     }
 }
 

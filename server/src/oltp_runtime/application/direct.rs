@@ -23,6 +23,10 @@
 //!   as is; a forward marker sends the request down the queued path, and
 //!   no later direct attempt of that id can apply. When the anchor cannot be
 //!   reached the answer is `outcome_unknown`, never the queued path.
+//! - never settles a `table.get` (user decision 2026-11-21, RV-FINAL M3): a
+//!   read has no exactly-once identity of its own, so a get that does not
+//!   run directly takes the queued path as is and costs no Data entry. A
+//!   retried get that runs directly is a new linearizable read.
 //!
 //! The off switch: while `data.direct.v1` is not active every request takes
 //! the queued path exactly as before (O01).
@@ -78,8 +82,12 @@ pub(crate) enum DirectMode {
     /// `data.direct.v1` is not active: the queued path, unchanged.
     Off,
     /// Active, `direct_oltp: false`: eligible mutations are settled at
-    /// their anchor, then take the queued path.
+    /// their anchor, then take the queued path. Gets take it unsettled.
     ForwardOnly,
+    /// Active, `direct_oltp: true`, inside the queued-history window (T7c):
+    /// eligible mutations are settled and go queued, because the leader
+    /// would answer `Fallback{History}`; gets go direct (RV-FINAL M3).
+    Settling,
     /// Active, `direct_oltp: true`: eligible operations go direct.
     Direct,
 }
@@ -93,12 +101,12 @@ impl crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch {
     /// The gateway's mode: `requires_forward()` is the capability,
     /// `routes_direct()` adds `direct_oltp`. Within the queued-history
     /// window (T7c) eligible mutations are settled and go queued: the leader
-    /// would answer `Fallback{History}` anyway.
+    /// would answer `Fallback{History}` anyway. Gets still go direct.
     pub(crate) fn mode(&self) -> DirectMode {
-        mode(
-            self.requires_forward(),
-            self.routes_direct() && !self.history_settling(),
-        )
+        match mode(self.requires_forward(), self.routes_direct()) {
+            DirectMode::Direct if self.history_settling() => DirectMode::Settling,
+            mode => mode,
+        }
     }
 }
 impl DirectRouting for crate::oltp_runtime::worker_runtime::direct_capability::DirectSwitch {
@@ -113,6 +121,8 @@ impl DirectRouting for crate::oltp_runtime::worker_runtime::direct_capability::D
 pub(crate) struct GatewaySwitch {
     active: std::sync::atomic::AtomicBool,
     direct_oltp: std::sync::atomic::AtomicBool,
+    /// The queued-history window (T7c).
+    history: std::sync::atomic::AtomicBool,
 }
 #[cfg(test)]
 impl Default for GatewaySwitch {
@@ -120,6 +130,7 @@ impl Default for GatewaySwitch {
         Self {
             active: std::sync::atomic::AtomicBool::new(false),
             direct_oltp: std::sync::atomic::AtomicBool::new(true),
+            history: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -131,14 +142,20 @@ impl GatewaySwitch {
     pub(crate) fn set_direct_oltp(&self, enabled: bool) {
         self.direct_oltp.store(enabled, Ordering::Release);
     }
+    pub(crate) fn set_history(&self, settling: bool) {
+        self.history.store(settling, Ordering::Release);
+    }
 }
 #[cfg(test)]
 impl DirectRouting for GatewaySwitch {
     fn mode(&self) -> DirectMode {
-        mode(
+        match mode(
             self.active.load(Ordering::Acquire),
             self.active.load(Ordering::Acquire) && self.direct_oltp.load(Ordering::Acquire),
-        )
+        ) {
+            DirectMode::Direct if self.history.load(Ordering::Acquire) => DirectMode::Settling,
+            mode => mode,
+        }
     }
 }
 /// `forward`: the capability is active (every queued eligible request is
@@ -386,7 +403,8 @@ pub(crate) enum Routed {
     /// The complete response: committed, replayed or read directly.
     Done(EncodedResponse),
     /// Take the queued path. For an eligible mutation while the capability
-    /// is active, the request id is settled at its anchor first.
+    /// is active, the request id is settled at its anchor first; a get is
+    /// never settled.
     Queued,
 }
 
@@ -480,9 +498,11 @@ impl DirectGateway {
 
     /// Routes one request body. `asynchronous` is `POST /v1/requests` (and
     /// the queue owner's own check, T7c): never direct, but its eligible
-    /// operations, gets included, are settled at their anchor while the
-    /// capability is active, like any other request that goes queued.
-    /// An error is the request's final answer.
+    /// mutations are settled at their anchor while the capability is
+    /// active, like any other mutation that goes queued. A get that does not
+    /// go direct is queued unsettled: no forward, no Data entry (user
+    /// decision 2026-11-21, RV-FINAL M3). An error is the request's final
+    /// answer.
     pub(crate) async fn route(
         &self,
         body: &[u8],
@@ -500,14 +520,16 @@ impl DirectGateway {
         };
         let get = scanned.op == Op::Get;
         GatewayStats::bump(&self.stats.requests);
+        if get && (asynchronous || mode == DirectMode::ForwardOnly) {
+            return Ok(self.queued());
+        }
         let deadline = Instant::now() + self.deadline;
         let table = match self.table(scanned.table_id, None, deadline).await {
             Ok(Some(table)) => table,
             // No such table: nothing can have committed directly into it.
             Ok(None) => return Ok(self.queued()),
-            // A read needs no settlement here: the queue owner settles it
-            // before it reserves the id (T7c), or refuses it.
-            Err(_) if get && !asynchronous => return Ok(self.queued()),
+            // A read needs no settlement.
+            Err(_) if get => return Ok(self.queued()),
             Err(error) => return Err(error),
         };
         let Some(RouteKeys {
@@ -532,7 +554,7 @@ impl DirectGateway {
             deadline: self.deadline,
         };
         let mut uncertain = false;
-        if mode == DirectMode::ForwardOnly || asynchronous {
+        if !get && (mode != DirectMode::Direct || asynchronous) {
             return self
                 .settle(&anchor, &mut request, deadline, &mut uncertain)
                 .await;
@@ -561,7 +583,10 @@ impl DirectGateway {
             // Settle the id at the anchor instead: a dedup record replays the
             // result, otherwise a marker sends it queued, which answers it.
             // A conflict comes after the lookup and stands.
-            Ok(Terminal::Failed(error)) if uncertain && error.code != ErrorCode::Conflict => {
+            // A get committed nothing: its failure stands.
+            Ok(Terminal::Failed(error))
+                if uncertain && !get && error.code != ErrorCode::Conflict =>
+            {
                 self.settle(&anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
@@ -571,9 +596,12 @@ impl DirectGateway {
                 GatewayStats::bump(&self.stats.fallbacks);
                 Ok(self.queued())
             }
-            // Gets too (T7c): a queued read is settled like a mutation, so
-            // no later direct get of its id answers after the queued path
-            // accepted it (an abandoned read stays 404).
+            // A get that falls back (an open intent, a split) is queued as
+            // is: a read has no exactly-once identity to settle (RV-FINAL M3).
+            Ok(Terminal::Fallback(_)) if get => {
+                GatewayStats::bump(&self.stats.fallbacks);
+                Ok(self.queued())
+            }
             Ok(Terminal::Fallback(_)) => {
                 GatewayStats::bump(&self.stats.fallbacks);
                 self.settle(&anchor, &mut request, deadline, &mut uncertain)
@@ -1173,12 +1201,13 @@ fn route_unavailable() -> ProtocolError {
 
 /// Reads the envelope and the routing fields of an eligible operation.
 /// Rows are skipped, not decoded.
-/// An eligible operation (`get`, `insert`, `insert_many`, `update`,
-/// `upsert`, `delete`): the requests a queue owner settles at their anchor
-/// before it reserves them while `data.direct.v1` is active (T7c). A body
-/// this scan does not recognize never runs directly.
-pub(crate) fn eligible(body: &[u8]) -> bool {
-    scan(body).is_some()
+/// An eligible mutation (`insert`, `insert_many`, `update`, `upsert`,
+/// `delete`): the requests a queue owner settles at their anchor before it
+/// reserves them while `data.direct.v1` is active (T7c). Gets are eligible
+/// for the direct path but never settled (user decision 2026-11-21,
+/// RV-FINAL M3). A body this scan does not recognize never runs directly.
+pub(crate) fn settled_before_queue(body: &[u8]) -> bool {
+    scan(body).is_some_and(|scanned| scanned.op != Op::Get)
 }
 
 fn scan(body: &[u8]) -> Option<Scanned<'_>> {

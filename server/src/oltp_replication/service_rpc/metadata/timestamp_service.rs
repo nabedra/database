@@ -510,6 +510,28 @@ impl TimestampEndpoint {
         Ok(transfer)
     }
 
+    /// `AllocateDirect` without native-executor hops (PERF2a): the request
+    /// and the range are a few bytes of fixed-shape JSON, decoded and
+    /// encoded on this task under the same charges as [`decode`] and
+    /// [`encode`]. The handle still passes its lease barrier first.
+    async fn serve_allocate_direct(
+        &self,
+        sections: &ChargedSections,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        let shared = self.handle.resources();
+        let raw = sections.section(0).ok_or_else(invalid)?.as_slice();
+        let budget = crate::oltp::mvcc::json_decode_budget(raw)?;
+        let owner = shared
+            .reserve_scratch_wait(ByteClass::Progress, budget, 0)
+            .await?;
+        let request: Request = serde_json::from_slice(raw).map_err(|_| invalid())?;
+        drop(owner);
+        let Request::AllocateDirect { count } = request else {
+            return Err(invalid());
+        };
+        let range = self.handle.allocate_direct(count).await?;
+        shared.encode_in(ByteClass::Progress, &range, LIMIT)
+    }
     async fn dispatch(
         &self,
         session: &AuthenticatedSession,
@@ -1189,12 +1211,22 @@ impl Endpoint for TimestampEndpoint {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
+            let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.serve.total").timer();
             let head = self.parse(&session, bytes.as_slice())?;
             if let Method::TimestampPointDecisionRead { route, source_digest, locator_digest } = head.method {
                 let result = self.read_point_decision(
                     sections, head.action, route, source_digest, locator_digest,
                 ).await;
                 return reply(self.handle.resources(), &session, self.node, result).await;
+            }
+            if head.method.inline_small_reply()
+                && sections
+                    .section(0)
+                    .is_some_and(|section| section.len() <= INLINE_REPLY_BYTES)
+            {
+                let result = Box::pin(self.serve_allocate_direct(&sections)).await;
+                drop(sections);
+                return reply_inline(self.handle.resources(), &session, self.node, result);
             }
             let result = async {
                 let (request, owner) = decode::<Request>(self.handle.resources(), sections).await?;
@@ -1344,6 +1376,14 @@ impl TimestampClient {
         // AllocateDirect repeats safely (values above every completed
         // allocation), so a stalled leader gets a per-replica deadline and
         // the call moves on to the new leader (D05/LIVE1).
+        // AllocateDirect is answered only by the Timestamp leader after its
+        // read barrier, whichever member the route names: reuse a recently
+        // confirmed member list instead of reading Control per call (PERF1).
+        if let Request::AllocateDirect { .. } = request {
+            // Boxed: every Timestamp call awaits `response`, so this branch
+            // must not grow its future (debug-build stack depth).
+            return Box::pin(self.allocate_direct_response(request)).await;
+        }
         if matches!(
             request,
             Request::AllocateDirect { .. }
@@ -1371,6 +1411,34 @@ impl TimestampClient {
                 | Request::Released { .. }
         );
         self.client.named(request.method(), request, converge).await
+    }
+    async fn allocate_direct_response(
+        &self,
+        request: Request,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        use crate::oltp_runtime::stage_timing::{perf_stage, timed};
+        let method = request.method();
+        // PERF2a: the request is a few bytes of fixed-shape JSON (the same
+        // bytes as before, so every peer decodes it): encode it on this task.
+        let payload = {
+            let _timer = perf_stage!("ts.rpc.encode").timer();
+            self.client
+                .shared
+                .encode_in(ByteClass::Progress, &request, LIMIT)?
+        };
+        timed(
+            perf_stage!("ts.rpc.converge"),
+            self.client
+                .allocate_direct_as(self.client.action, method, payload),
+        )
+        .await
+    }
+    /// `AllocateDirect` routing counters (PERF2a, tests).
+    #[cfg(test)]
+    pub(crate) fn direct_routing_stats(
+        &self,
+    ) -> crate::oltp_replication::service_rpc::DirectRoutingStats {
+        self.client.direct_routing_stats()
     }
     async fn value<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
@@ -1627,7 +1695,16 @@ impl TimestampClient {
         if count == 0 || count > MAX_DIRECT_COUNT {
             return Err(invalid());
         }
-        let range: DirectTimestampRange = self.value(Request::AllocateDirect { count }).await?;
+        let response = self.response(Request::AllocateDirect { count }).await?;
+        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode").timer();
+        // PERF2a: a range is about 60 bytes; decode it on this task. Its
+        // decode charge was reserved with the reply (`member_reply`).
+        let section = response.reply.sections[0].as_ref().ok_or_else(invalid)?;
+        let range: DirectTimestampRange = if section.len() <= INLINE_REPLY_BYTES {
+            serde_json::from_slice(section.as_slice()).map_err(|_| invalid())?
+        } else {
+            response.decoded(&self.client.shared).await?.0
+        };
         range.expect_len(count)
     }
     pub(crate) async fn confirmed_allocation(

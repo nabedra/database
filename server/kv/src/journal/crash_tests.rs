@@ -1111,3 +1111,214 @@ fn ns08_spare_segments_are_prepared_off_the_commit_path() {
     assert!(files <= j.segments().len() + 1, "{files} files");
     j.crash();
 }
+
+// ---------------------------------------------------------------------------------------
+// G7 (NS11): page cache of zero-filled and retired segments
+
+/// Each zero-filled segment's pages are dropped once its zeros and header are synced,
+/// and a retired segment's pages once it is free again. NS11 measured the 64 MiB zero
+/// fill staying in the page cache charged to every worker (G7).
+#[test]
+fn g7_zero_filled_and_retired_segments_drop_their_pages() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let shared: Arc<dyn Fs> = Arc::new(fs.clone());
+    let sink = Arc::new(Sink::default());
+    let segment_bytes = 16 << 10;
+    let options = JournalOptions {
+        segment_bytes,
+        ..opts()
+    };
+    let dir = Path::new("/db/journal");
+    let (j, _) = Journal::open(shared, dir, options, 0, sink.clone()).unwrap();
+    for i in 0..12u8 {
+        j.submit(sized(&[b'v', i], 2000), Durability::Sync, Box::new(()))
+            .unwrap()
+            .wait()
+            .unwrap();
+    }
+    let calls = fs.calls();
+    let free_files: Vec<_> = calls
+        .iter()
+        .filter(|c| {
+            c.op == FsOp::Open && c.len == 2 && c.path.extension().is_some_and(|e| e == "free")
+        })
+        .map(|c| c.path.clone())
+        .collect();
+    // The preparer may still be creating a spare: check the segments it finished.
+    let mut finished = 0;
+    for path in &free_files {
+        let at = |op: FsOp| {
+            calls
+                .iter()
+                .position(|c| c.op == op && &c.path == path && c.ok)
+        };
+        let Some(synced) = at(FsOp::SyncAll) else {
+            continue;
+        };
+        finished += 1;
+        let dropped = at(FsOp::AdviseDontNeed).unwrap_or_else(|| panic!("{path:?} dropped"));
+        assert!(synced < dropped, "{path:?}: pages dropped before the sync");
+        assert_eq!(
+            (calls[dropped].offset, calls[dropped].len),
+            (0, segment_bytes)
+        );
+    }
+    assert!(finished >= 2, "the journal rolled: {free_files:?}");
+    fs.clear_calls();
+    let first = j.segments()[0].segment;
+    j.retire(first).unwrap();
+    let calls = fs.calls();
+    let free = segment::path_of(dir, first, segment::FREE_EXT);
+    let renamed = calls
+        .iter()
+        .position(|c| c.op == FsOp::Rename && c.target.as_deref() == Some(free.as_path()))
+        .expect("retired segment renamed to free");
+    // File calls are logged under the path the file was created at: the oldest live
+    // segment is the first one created at open. (The preparer may log its own drop.)
+    let created_at = &free_files[0];
+    let dropped = calls
+        .iter()
+        .position(|c| c.op == FsOp::AdviseDontNeed && &c.path == created_at)
+        .expect("retired segment pages dropped");
+    assert!(renamed < dropped);
+    assert_eq!(
+        (calls[dropped].offset, calls[dropped].len),
+        (0, segment_bytes)
+    );
+    j.crash();
+}
+
+/// G7: a large zero fill syncs and drops its pages every `ZERO_DROP_BYTES`, so it never
+/// holds more than about that much page cache, and never drops a page it did not sync.
+#[test]
+fn g7_zero_fill_drops_its_pages_as_it_goes() {
+    let fs = FaultFs::new();
+    let dir = Path::new("/db/journal");
+    fs.create_dir_all_durable(dir);
+    let segment_bytes = 3 * segment::ZERO_DROP_BYTES + (1 << 20);
+    segment::create_free(&fs, dir, 7, segment_bytes, true, None).unwrap();
+    let mut unsynced = 0u64;
+    let mut synced_dirty = 0u64;
+    let mut most = 0u64;
+    let mut drops = Vec::new();
+    for call in fs.calls() {
+        match call.op {
+            FsOp::Write => {
+                unsynced += call.len;
+                most = most.max(unsynced + synced_dirty);
+            }
+            FsOp::SyncData | FsOp::SyncAll => {
+                synced_dirty += unsynced;
+                unsynced = 0;
+            }
+            FsOp::AdviseDontNeed => {
+                assert_eq!(unsynced, 0, "dropped pages before syncing them");
+                synced_dirty = 0;
+                drops.push((call.offset, call.len));
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        most <= segment::ZERO_DROP_BYTES + (2 << 20),
+        "the fill held {most} bytes of pages"
+    );
+    // Contiguous drops of synced zeros from the records area, then the whole file once
+    // the header is written and synced.
+    assert_eq!(drops.len(), 4, "{drops:?}");
+    assert_eq!(drops.last(), Some(&(0, segment_bytes)));
+    let mut next = format::RECORDS_START;
+    for &(offset, len) in &drops[..3] {
+        assert_eq!(offset, next, "{drops:?}");
+        assert!(len >= segment::ZERO_DROP_BYTES, "{drops:?}");
+        next = offset + len;
+    }
+    assert!(next < segment_bytes, "{drops:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// KVfix4: directory entries a killed process left unsynced
+
+/// NS01 1e6 (CI seed 4242, step 49509): a Kill landed inside a roll, after the new
+/// segment's rename and header sync but before the directory sync. The process's view
+/// (the kill image) holds the new name; the device does not. The first open used that
+/// segment as its active one and acknowledged synced records in it, the store recorded it
+/// in the manifest, and a crash right after lost the name: "a journal segment the
+/// manifest records is missing", with the synced records gone. Open must make the
+/// directory it recovered from durable before anything relies on it.
+///
+/// The failed directory sync stands for the Kill point deterministically: an injected
+/// EIO leaves the rename pending exactly as a stop right before the sync would.
+#[test]
+fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced_records() {
+    let fs = FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let dir = Path::new("/db/journal");
+    let (j, _, _) = open(Arc::new(fs.clone()), dir).unwrap();
+    let free = |j: &Journal| lock(&j.shared.table).free.len();
+    let put = |j: &Journal, tag: String| {
+        j.submit(sized(tag.as_bytes(), 1500), Durability::Sync, Box::new(()))
+            .and_then(|c| c.wait())
+    };
+    // Past half of the first segment, then wait for the preparer's spare: the roll then
+    // takes it and creates nothing, and the preparer stays idle.
+    let mut synced = 0;
+    for i in 0..22 {
+        put(&j, format!("a{i:03}")).unwrap();
+        synced += 1;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while free(&j) == 0 {
+        assert!(std::time::Instant::now() < deadline, "no spare prepared");
+        std::thread::yield_now();
+    }
+    let newest = j.segments().iter().map(|s| s.segment).max().unwrap();
+    // The next directory sync of the journal is the roll's (activate: rename, header,
+    // sync_dir). It fails, and the journal latches with the rename still pending.
+    fs.inject(Fault::on(FsOp::SyncDir).path_prefix(dir));
+    let mut i = 0;
+    while put(&j, format!("b{i:03}")).is_ok() {
+        synced += 1;
+        i += 1;
+        assert!(i < 100, "the journal never rolled");
+    }
+    j.crash();
+    drop(j);
+
+    // The kill image: the process's view, with the rename not yet durable.
+    let killed = fs.kill();
+    let (j, _, sink) = open(Arc::new(killed.clone()), dir).unwrap();
+    assert_eq!(
+        sink.records().len(),
+        synced,
+        "the first open lost synced records"
+    );
+    // A few synced records in the active segment (under half of it, so the preparer does
+    // not run and sync the directory by chance).
+    for i in 0..3 {
+        put(&j, format!("c{i:03}")).unwrap();
+        synced += 1;
+    }
+    let active = j.segments().into_iter().find(|s| s.active).unwrap();
+    assert!(
+        active.segment > newest,
+        "the first open writes to the segment the roll activated: {active:?}"
+    );
+    j.crash();
+    drop(j);
+
+    // A crash right after: only durable state.
+    let (j, _, sink) = open(Arc::new(killed.crash()), dir).unwrap();
+    let got = sink.records().len();
+    let still = j
+        .segments()
+        .into_iter()
+        .any(|s| s.segment == active.segment && s.epoch == active.epoch);
+    j.crash();
+    assert!(
+        still,
+        "the active segment {active:?} of the first open is gone"
+    );
+    assert_eq!(got, synced, "records synced after the first open were lost");
+}

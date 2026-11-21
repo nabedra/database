@@ -991,8 +991,13 @@ impl WorkerRuntime {
     /// without a marker can only be answered by the queued path: its
     /// original result, a conflict, or 404 abandoned after a cold start.
     /// The scoped queue's admission calls this too.
+    ///
+    /// Gets are skipped: no settle, no `QueuedHistory` note (user decision
+    /// 2026-11-21, RV-FINAL M3). A read has no exactly-once identity; it
+    /// cannot apply twice, and running it again is a new read. Every
+    /// mutation guarantee above rests on mutation records only.
     pub(super) async fn settle_before_reserve(&self, body: &[u8]) -> Result<(), ProtocolError> {
-        if !super::application::direct::eligible(body) {
+        if !super::application::direct::settled_before_queue(body) {
             return Ok(());
         }
         let (Some(switch), Some(gateway)) = (self.direct_switch(), self.direct_gateway_handle())
@@ -1890,8 +1895,12 @@ impl HttpRuntime for WorkerRuntime {
                         "history_settling":switch.history_settling(),
                     })),
                     "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                    // Local lane refusals (NS11 finding 8).
+                    "transport":self.services.manager.client().lane_refusals(),
                     // RV-APPLY: transient retries and stopped cores.
                     "raft":self.services.manager.raft_health(),
+                    // PERF1: per-stage latency histograms of this process.
+                    "stage_timing":super::stage_timing::snapshot(),
                 }))
                 .map_err(|_| unknown())?,
             })

@@ -101,12 +101,13 @@ pub(crate) fn append_chunks(sizes: &[usize]) -> Vec<std::ops::Range<usize>> {
     chunks
 }
 
-#[derive(Clone)]
 pub struct TypedLogStore<C: TypedConfig> {
     store: GroupStore,
     writes: Arc<Mutex<()>>,
     _config: PhantomData<C>,
     pending: Arc<Pending>,
+    /// Appended entries not yet in a synced write (PERF2d).
+    overlay: Arc<overlay::Overlay<C::Command>>,
     resident: Option<super::multiplex::ReplicaLease>,
     node_id: u64,
     _writer: Arc<WriterState>,
@@ -114,6 +115,28 @@ pub struct TypedLogStore<C: TypedConfig> {
     retry: Arc<HostRetry>,
     #[cfg(test)]
     append_hook: Arc<std::sync::Mutex<Option<AppendHook>>>,
+    /// Test hook: the next append fails before its write.
+    #[cfg(test)]
+    fail_append: Arc<std::sync::atomic::AtomicBool>,
+}
+impl<C: TypedConfig> Clone for TypedLogStore<C> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            writes: self.writes.clone(),
+            _config: PhantomData,
+            pending: self.pending.clone(),
+            overlay: self.overlay.clone(),
+            resident: self.resident.clone(),
+            node_id: self.node_id,
+            _writer: self._writer.clone(),
+            retry: self.retry.clone(),
+            #[cfg(test)]
+            append_hook: self.append_hook.clone(),
+            #[cfg(test)]
+            fail_append: self.fail_append.clone(),
+        }
+    }
 }
 #[cfg(test)]
 type AppendHook = Arc<dyn Fn() + Send + Sync>;
@@ -121,6 +144,8 @@ type AppendHook = Arc<dyn Fn() + Send + Sync>;
 struct WriterState {
     order: Arc<Mutex<()>>,
     pending: Arc<Pending>,
+    /// The group's `overlay::Overlay<C::Command>`, shared by every handle.
+    overlay: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
 #[derive(Default)]
 struct Pending {
@@ -134,6 +159,18 @@ impl Pending {
     }
 }
 struct PendingGuard(Arc<Pending>);
+/// Spawns `task` as a pending operation. The guard is released only after the
+/// task's future, and with it everything the task holds (the group store, its
+/// charged entries, and through them the worker's resource owner), is dropped.
+/// A caller that `drain`s and then drops its handles may therefore reopen the
+/// worker's pools at once (KVfix4: a local binding of the guard dropped before
+/// the task's captured store, so `bind_worker` met the old owner).
+fn spawn_pending(pending: PendingGuard, task: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        task.await;
+        drop(pending);
+    });
+}
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         self.0
@@ -192,17 +229,26 @@ impl<C: TypedConfig> TypedLogStore<C> {
             })
             .await
             .map_err(disk)?;
+        let overlay = writer
+            .overlay
+            .get_or_init(|| Arc::new(overlay::Overlay::<C::Command>::default()))
+            .clone()
+            .downcast::<overlay::Overlay<C::Command>>()
+            .map_err(|_| invalid("Raft writer overlay has another entry type"))?;
         Ok(Self {
             store,
             writes: writer.order.clone(),
             _config: PhantomData,
             pending: writer.pending.clone(),
+            overlay,
             resident: None,
             node_id,
             _writer: writer,
             retry: Arc::default(),
             #[cfg(test)]
             append_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            fail_append: Arc::default(),
         })
     }
     pub fn group(&self) -> &GroupStore {
@@ -267,7 +313,70 @@ impl<C: TypedConfig> TypedLogStore<C> {
             .map_err(disk)?;
         Ok(())
     }
+    /// The first entry in `start..end`. A pending entry (PERF2d) is served
+    /// from the overlay, or with `durable` only once its synced write
+    /// finished: applying an entry never runs ahead of this replica's log.
     async fn next(
+        &self,
+        start: u64,
+        end: Option<u64>,
+        durable: bool,
+    ) -> io::Result<Option<(OwnedRaftEntry<C::Command>, usize)>> {
+        if durable {
+            let mut waited = None;
+            loop {
+                let settled = self.overlay.settled.notified();
+                tokio::pin!(settled);
+                settled.as_mut().enable();
+                if !self.overlay.contains(start) {
+                    break;
+                }
+                waited.get_or_insert_with(std::time::Instant::now);
+                settled.await;
+            }
+            let Some(waited) = waited else {
+                return self.next_stored(start, end).await;
+            };
+            crate::oltp_runtime::stage_timing::by_kind(
+                &self.store.identity().kind,
+                [
+                    "raft.data.read_durable_wait",
+                    "raft.ts.read_durable_wait",
+                    "raft.meta.read_durable_wait",
+                ],
+            )
+            .since(waited);
+            let found = self.next_stored(start, end).await?;
+            if found
+                .as_ref()
+                .is_none_or(|(entry, _)| entry.index() != start)
+            {
+                return Err(io::Error::other(
+                    "Raft append failed before the entry became durable",
+                ));
+            }
+            return Ok(found);
+        }
+        // Read the overlay first: an entry missing from it now is durable
+        // or not appended yet, so the store read below cannot miss it.
+        let pending = self.overlay.first_from(start, end);
+        if let Some(entry) = pending.as_ref().filter(|entry| entry.index() == start) {
+            return Ok(Some((entry.clone(), pending_bytes(entry))));
+        }
+        let stored = self.next_stored(start, end).await?;
+        Ok(match (stored, pending) {
+            (Some(stored), Some(pending)) if pending.index() < stored.0.index() => {
+                let bytes = pending_bytes(&pending);
+                Some((pending, bytes))
+            }
+            (None, Some(pending)) => {
+                let bytes = pending_bytes(&pending);
+                Some((pending, bytes))
+            }
+            (stored, _) => stored,
+        })
+    }
+    async fn next_stored(
         &self,
         start: u64,
         end: Option<u64>,
@@ -397,7 +506,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
         let mut out = Vec::with_capacity(max_entries);
         let mut cursor = start;
         let mut bytes = 0usize;
-        while let Some((entry, size)) = self.next(cursor, end).await? {
+        while let Some((entry, size)) = self.next(cursor, end, false).await? {
             if out.len() == max_entries
                 || (!out.is_empty() && bytes.checked_add(size).is_none_or(|n| n > max_bytes))
             {
@@ -412,7 +521,9 @@ impl<C: TypedConfig> TypedLogStore<C> {
             let final_entry = entry.index() == u64::MAX;
             bytes += size;
             out.push(entry);
-            if final_entry {
+            // Stop at the exclusive end without another native read (PERF2d:
+            // a replication read of pending entries needs no store read).
+            if final_entry || end.is_some_and(|end| cursor >= end) {
                 break;
             }
         }
@@ -422,6 +533,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
         &self,
         start: u64,
         end: Option<u64>,
+        durable: bool,
     ) -> Pin<Box<dyn Stream<Item = io::Result<OwnedRaftEntry<C::Command>>> + Send>> {
         Box::pin(futures_util::stream::try_unfold(
             (self.clone(), Some(start)),
@@ -429,7 +541,7 @@ impl<C: TypedConfig> TypedLogStore<C> {
                 let Some(cursor) = cursor else {
                     return Ok(None);
                 };
-                let Some((entry, _)) = reader.next(cursor, end).await? else {
+                let Some((entry, _)) = reader.next(cursor, end, durable).await? else {
                     return Ok(None);
                 };
                 // Stop at the exclusive end without another read: OpenRaft
@@ -470,7 +582,7 @@ impl<C: TypedConfig> RaftLogReader<C> for TypedLogStore<C> {
         range: R,
     ) -> impl Stream<Item = io::Result<OwnedRaftEntry<C::Command>>> + Send {
         match bounds(&range) {
-            Some((start, end)) => self.stream(start, end),
+            Some((start, end)) => self.stream(start, end, true),
             None => Box::pin(futures_util::stream::empty()),
         }
     }
@@ -481,7 +593,7 @@ impl<C: TypedConfig> RaftLogReader<C> for TypedLogStore<C> {
     ) -> impl Stream<Item = Result<OwnedRaftEntry<C::Command>, LeaderBoundedStreamError<C>>> + Send
     {
         let stream = match bounds(&range) {
-            Some((start, end)) => self.stream(start, end),
+            Some((start, end)) => self.stream(start, end, true),
             None => Box::pin(futures_util::stream::empty()),
         };
         futures_util::stream::try_unfold(
@@ -517,6 +629,16 @@ impl<C: TypedConfig> RaftLogReader<C> for TypedLogStore<C> {
 impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     type LogReader = Self;
     async fn get_log_state(&mut self) -> io::Result<LogState<C>> {
+        // A core reads the log state when it starts. With no write pending,
+        // it starts on the durable log, after an earlier failed append too.
+        if self
+            .pending
+            .count
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 0
+        {
+            self.overlay.reset();
+        }
         let bytes = self
             .store
             .log_read_metadata(META, |read| {
@@ -554,6 +676,12 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     }
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
         let vote = *vote;
+        // OpenRaft requires vote and log IO in submission order: a newer
+        // vote's flush marks every earlier IO flushed, so it waits for the
+        // appends still syncing (PERF2d). A queued commit marker lands
+        // first, so this synced write persists it too.
+        self.overlay.markers_written().await;
+        let _order = self.writes.lock().await;
         let (store, retry) = (&self.store, &self.retry);
         retry
             .retry(RaftWrite::Vote, move || async move {
@@ -584,33 +712,41 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
     /// raises it to the applied index on startup. The next synced write of
     /// this pool's WAL persists it.
     async fn save_committed(&mut self, id: Option<LogId>) -> io::Result<()> {
-        self.retry
-            .retry(RaftWrite::Committed, || {
-                self.store
-                    .log_transaction_metadata_unsynced(META, move |tx| {
-                        if let Some(raw) = tx.get(b"committed")? {
-                            let old: Option<LogId> = serde_json::from_slice(raw.as_slice())
-                                .map_err(|_| protocol("corrupt durable commit marker"))?;
-                            if old.is_some_and(|old| id.is_none_or(|next| next.index < old.index)) {
-                                return Err(protocol("commit marker moves backwards"));
-                            }
+        let _timer = crate::oltp_runtime::stage_timing::by_kind(
+            &self.store.identity().kind,
+            [
+                "raft.data.save_committed",
+                "raft.ts.save_committed",
+                "raft.meta.save_committed",
+            ],
+        )
+        .timer();
+        // A quorum of other replicas can commit an entry before this replica's
+        // own sync. Its writer records the marker after that sync (PERF2d).
+        if id.is_some_and(|id| self.overlay.defer_commit(id)) {
+            return Ok(());
+        }
+        // A durable entry's marker goes to the background writer, so the
+        // core hands this commit to the apply worker at once (PERF2d item 2).
+        if let Some(id) = id {
+            if self.overlay.queue_marker(id) {
+                let (store, retry, overlay) =
+                    (self.store.clone(), self.retry.clone(), self.overlay.clone());
+                let pending = self.pending.start();
+                spawn_pending(pending, async move {
+                    while let Some(id) = overlay.next_marker() {
+                        match save_commit_marker(&store, &retry, Some(id), true).await {
+                            Ok(()) => tracing::debug!(group=%store.identity().group_id,
+                                index=id.index, "typed Raft durable commit saved"),
+                            Err(error) => tracing::warn!(group=%store.identity().group_id,
+                                code=?error.code, index=id.index, "Raft commit marker not saved"),
                         }
-                        if let Some(id) = id {
-                            let exact = tx
-                                .get(&index_key(ID, id.index))?
-                                .or(tx.get(PURGED)?)
-                                .ok_or_else(|| protocol("commit marker is not durably retained"))?;
-                            let retained: LogId = serde_json::from_slice(exact.as_slice())
-                                .map_err(|_| protocol("corrupt retained commit boundary"))?;
-                            if retained != id {
-                                return Err(protocol("commit marker does not match retained log"));
-                            }
-                        }
-                        let bytes = tx.encode_value(&id)?;
-                        tx.put(b"committed", bytes.as_slice())?;
-                        Ok(Transition::Commit(tx.copy_output(b"")?))
-                    })
-            })
+                    }
+                });
+            }
+            return Ok(());
+        }
+        save_commit_marker(&self.store, &self.retry, id, false)
             .await
             .map_err(disk)?;
         if matches!(
@@ -623,6 +759,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         Ok(())
     }
     async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
+        self.overlay.markers_written().await;
         Ok(self
             .metadata::<Option<LogId>>(b"committed")
             .await?
@@ -633,6 +770,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         I: IntoIterator<Item = OwnedRaftEntry<C::Command>> + Send,
         I::IntoIter: Send,
     {
+        let submit = std::time::Instant::now();
         // Own a bounded append before the first write. The typed host config
         // admits at most `MAX_APPEND_ENTRIES` entries per append; the writer
         // splits them into synced batches of at most `MAX_APPEND_BYTES`.
@@ -677,23 +815,72 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             callback.io_completed(Ok(()));
             return Ok(());
         }
+        if self.overlay.failed() {
+            // An earlier append of this core failed: a later one would leave a hole.
+            let error = invalid("an earlier Raft append failed before its sync");
+            callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+            return Err(error);
+        }
         let batch = Arc::new(batch);
         let store = self.store.clone();
         let writer = self._writer.clone();
-        let writes = self.writes.clone();
         let retry = self.retry.clone();
+        let overlay = self.overlay.clone();
         // Dropping this method's awaiter cannot cancel the owned sync operation
         // or discard its completion callback. The host joins pending operations
         // before releasing replica residency and stopping its runtime.
         let pending = self.pending.start();
         #[cfg(test)]
         let append_hook = self.append_hook.lock().expect("append test hook").take();
-        tokio::spawn(async move {
-            let _retained_entries=batch.clone();
+        #[cfg(test)]
+        let fail_append = self.fail_append.clone();
+        // PERF2d: take this append's place in the writer order (Tokio's mutex
+        // is FIFO from the first poll), publish the entries and return, so
+        // replication reads them while the sync runs. Truncation, purge and
+        // votes queue behind the sync; `IOFlushed` fires only after it.
+        let mut order = Box::pin(self.writes.clone().lock_owned());
+        let held = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(match std::future::Future::poll(order.as_mut(), cx) {
+                std::task::Poll::Ready(guard) => Some(guard),
+                std::task::Poll::Pending => None,
+            })
+        })
+        .await;
+        overlay.publish(&batch);
+        let (first, last) = (batch[0].index(), batch[batch.len() - 1].index());
+        crate::oltp_runtime::stage_timing::by_kind(
+            &self.store.identity().kind,
+            [
+                "raft.data.append_submit",
+                "raft.ts.append_submit",
+                "raft.meta.append_submit",
+            ],
+        )
+        .since(submit);
+        spawn_pending(pending, async move {
+            use crate::oltp_runtime::stage_timing::by_kind;
+            let kind = store.identity().kind.clone();
+            let started = std::time::Instant::now();
+            let _retained_entries = batch.clone();
             let _writer = writer;
-            let _pending = pending;
-            let _order = writes.lock_owned().await;
+            let _order = match held {
+                Some(guard) => guard,
+                None => order.await,
+            };
+            by_kind(
+                &kind,
+                [
+                    "raft.data.append_order_wait",
+                    "raft.ts.append_order_wait",
+                    "raft.meta.append_order_wait",
+                ],
+            )
+            .since(started);
+            let ordered = std::time::Instant::now();
             let result: io::Result<()> = async {
+                if overlay.failed() {
+                    return Err(invalid("an earlier Raft append failed before its sync"));
+                }
                 let class = match store.identity().kind {
                     GroupKind::Control | GroupKind::Timestamps | GroupKind::Status { .. } => {
                         ExecutionClass::Control
@@ -729,6 +916,20 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     })
                     .await
                     .map_err(disk)?;
+                let written = std::time::Instant::now();
+                by_kind(
+                    &kind,
+                    [
+                        "raft.data.append_encode",
+                        "raft.ts.append_encode",
+                        "raft.meta.append_encode",
+                    ],
+                )
+                .since(ordered);
+                #[cfg(test)]
+                if fail_append.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    return Err(invalid("test append fault"));
+                }
                 // One synced WriteBatch per bounded chunk, in log order. A
                 // crash between chunks leaves a consecutive durable prefix.
                 for chunk in append_chunks(&sizes) {
@@ -736,56 +937,75 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                     // A full device voids the chunk: put the same entries again.
                     retry
                         .retry(RaftWrite::Append, || {
-                    let batch = batch.clone();
-                    let chunk = chunk.clone();
-                    #[cfg(test)]
-                    let append_hook = append_hook.clone();
-                    store
-                        .log_transaction(
-                            TransactionBudget {
-                                scratch_bytes: wire_bytes + (64 << 10),
-                                batch_bytes: wire_bytes + (64 << 10),
-                                output_bytes: 0,
-                            },
-                            move |tx| {
-                                #[cfg(test)]
-                                if let Some(hook) = append_hook {
-                                    hook();
-                                }
-                                for entry in &batch[chunk] {
-                                    entry.ensure_charged()?;
-                                    let index = entry.index();
-                                    let bytes = tx.encode_value(&entry)?;
-                                    let id = tx.encode_value(&entry.log_id)?;
-                                    // The entry body lives once, in the journal; the
-                                    // LSM keeps a 32-byte locator (NS7).
-                                    tx.put_journal(&index_key(ENTRY, index), bytes.as_slice())?;
-                                    tx.put(&index_key(ID, index), id.as_slice())?;
-                                    tx.put(TAIL, id.as_slice())?;
-                                }
-                                Ok(Transition::Commit(tx.copy_output(b"")?))
-                            },
-                        )
+                            let batch = batch.clone();
+                            let chunk = chunk.clone();
+                            #[cfg(test)]
+                            let append_hook = append_hook.clone();
+                            store.log_transaction(
+                                TransactionBudget {
+                                    scratch_bytes: wire_bytes + (64 << 10),
+                                    batch_bytes: wire_bytes + (64 << 10),
+                                    output_bytes: 0,
+                                },
+                                move |tx| {
+                                    #[cfg(test)]
+                                    if let Some(hook) = append_hook {
+                                        hook();
+                                    }
+                                    for entry in &batch[chunk] {
+                                        entry.ensure_charged()?;
+                                        let index = entry.index();
+                                        let bytes = tx.encode_value(&entry)?;
+                                        let id = tx.encode_value(&entry.log_id)?;
+                                        // The entry body lives once, in the journal; the
+                                        // LSM keeps a 32-byte locator (NS7).
+                                        tx.put_journal(&index_key(ENTRY, index), bytes.as_slice())?;
+                                        tx.put(&index_key(ID, index), id.as_slice())?;
+                                        tx.put(TAIL, id.as_slice())?;
+                                    }
+                                    Ok(Transition::Commit(tx.copy_output(b"")?))
+                                },
+                            )
                         })
                         .await
                         .map_err(disk)?;
                 }
+                by_kind(
+                    &kind,
+                    [
+                        "raft.data.append_write",
+                        "raft.ts.append_write",
+                        "raft.meta.append_write",
+                    ],
+                )
+                .since(written);
                 Ok(())
             }
             .await;
+            by_kind(
+                &kind,
+                ["raft.data.append", "raft.ts.append", "raft.meta.append"],
+            )
+            .since(started);
             if let Err(error) = &result {
                 tracing::error!(group=%store.identity().group_id,kind=?store.identity().kind,io_kind=?error.kind(),error=%error,"typed durable log append failed before IOFlushed");
             }
+            // Durable and visible in the store, or failed: leave the overlay
+            // before reporting, so a flushed entry is always read back stored.
+            let committed = overlay.settle(first, last, result.is_ok());
             callback.io_completed(
                 result
                     .as_ref()
                     .map(|_| ())
                     .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())),
             );
-            result
-        })
-        .await
-        .map_err(|_| invalid("owned Raft append task failed"))?
+            if let Some(id) = committed
+                && let Err(error) = save_commit_marker(&store, &retry, Some(id), true).await
+            {
+                tracing::warn!(group=%store.identity().group_id,code=?error.code,"deferred Raft commit marker not saved");
+            }
+        });
+        Ok(())
     }
 
     async fn truncate_after(&mut self, last: Option<LogId>) -> io::Result<()> {
@@ -874,6 +1094,54 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
         Ok(())
     }
 }
+/// Unsynced: OpenRaft treats the commit marker as a recovery hint and raises
+/// it to the applied index on startup. The next synced write of this pool's
+/// WAL persists it. `catch_up` writes a deferred marker, which a newer one
+/// may already cover.
+async fn save_commit_marker(
+    store: &GroupStore,
+    retry: &HostRetry,
+    id: Option<LogId>,
+    catch_up: bool,
+) -> Result<(), ProtocolError> {
+    retry
+        .retry(RaftWrite::Committed, || {
+            store.log_transaction_metadata_unsynced(META, move |tx| {
+                if let Some(raw) = tx.get(b"committed")? {
+                    let old: Option<LogId> = serde_json::from_slice(raw.as_slice())
+                        .map_err(|_| protocol("corrupt durable commit marker"))?;
+                    if old.is_some_and(|old| id.is_none_or(|next| next.index < old.index)) {
+                        if catch_up {
+                            return Ok(Transition::Commit(tx.copy_output(b"")?));
+                        }
+                        return Err(protocol("commit marker moves backwards"));
+                    }
+                }
+                if let Some(id) = id {
+                    let exact = tx
+                        .get(&index_key(ID, id.index))?
+                        .or(tx.get(PURGED)?)
+                        .ok_or_else(|| protocol("commit marker is not durably retained"))?;
+                    let retained: LogId = serde_json::from_slice(exact.as_slice())
+                        .map_err(|_| protocol("corrupt retained commit boundary"))?;
+                    if retained != id {
+                        return Err(protocol("commit marker does not match retained log"));
+                    }
+                }
+                let bytes = tx.encode_value(&id)?;
+                tx.put(b"committed", bytes.as_slice())?;
+                Ok(Transition::Commit(tx.copy_output(b"")?))
+            })
+        })
+        .await
+        .map(|_| ())
+}
+/// The replication byte bound for a pending entry, whose encoded size is not
+/// known before its write. The network encoder applies the exact bound.
+fn pending_bytes<D: super::entry::CommandData>(entry: &OwnedRaftEntry<D>) -> usize {
+    use crate::oltp_replication::owned::OwnedPayload;
+    entry.heap_bytes().unwrap_or(0)
+}
 fn index_key(prefix: u8, index: u64) -> [u8; 9] {
     let mut key = [0; 9];
     key[0] = prefix;
@@ -911,5 +1179,6 @@ fn changed() -> ProtocolError {
     protocol("uncommitted Raft range changed")
 }
 
+mod overlay;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

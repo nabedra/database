@@ -251,15 +251,25 @@ async fn o14_o22_c07_f03_hostname_lookup_owns_slots_across_cancellations() {
 }
 
 #[derive(Default)]
-struct TestDirectory(Mutex<BTreeMap<Uuid, WorkerEnrollment>>);
+struct TestDirectory(
+    Mutex<BTreeMap<Uuid, WorkerEnrollment>>,
+    Mutex<Vec<WorkerIdentity>>,
+);
 
 impl TestDirectory {
     fn install(&self, item: WorkerEnrollment) {
         self.0.lock().unwrap().insert(item.worker_id, item);
     }
+    fn install_api(&self, item: WorkerEnrollment) {
+        self.1.lock().unwrap().push(WorkerIdentity::from(&item));
+        self.install(item);
+    }
 }
 
 impl PeerDirectory for TestDirectory {
+    fn is_api(&self, peer: WorkerIdentity) -> bool {
+        self.1.lock().unwrap().contains(&peer)
+    }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
         self.0
             .lock()
@@ -865,4 +875,153 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
         transport.common.outgoing_class[class as usize].available_permits(),
         cap
     );
+}
+
+/// NS11 finding 8: local lane-full refusals are counted per class for
+/// `/v1/runtime/stats`; a waiting Authority probe that later succeeds is not.
+#[tokio::test]
+async fn ns11_f8_lane_full_refusals_are_counted_per_class() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("refusals-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 1);
+    let local = WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(local.clone());
+    let config = TransportConfig::default();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport =
+        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
+    let client = transport.client();
+    let empty = serde_json::json!({
+        "outgoing_lane_full": {"total": 0, "by_class": {}},
+        "handler_lane_full": {"total": 0, "by_class": {}},
+    });
+    assert_eq!(client.lane_refusals(), empty);
+    let class = TrafficClass::ApiObservation;
+    let target = Uuid::new_v4();
+    let held: Vec<_> = (0..config.handler_slots[class as usize])
+        .map(|_| client.try_outgoing(target, class).unwrap())
+        .collect();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.try_outgoing(target, class),
+            Err(RequestError::OutgoingLaneFull)
+        ));
+    }
+    // A probe that waits for its slot is not a refusal.
+    assert!(client.try_outgoing_slot(target, class).is_err());
+    let refusals = client.lane_refusals();
+    assert_eq!(refusals["outgoing_lane_full"]["total"], 2);
+    assert_eq!(
+        refusals["outgoing_lane_full"]["by_class"]["ApiObservation"],
+        2
+    );
+    assert_eq!(refusals["handler_lane_full"]["total"], 0);
+    drop(held);
+    assert!(client.try_outgoing(target, class).is_ok());
+    assert_eq!(client.lane_refusals()["outgoing_lane_full"]["total"], 2);
+}
+
+/// G6: after every worker cold-starts onto a new run with its certificate, a
+/// running API gateway still addresses each worker's previous incarnation.
+/// It may reach Control authority there, to learn the new enrollments; nothing
+/// else accepts a stale audience, and no worker sender gets it.
+#[test]
+fn g6_api_reaches_control_authority_at_a_newer_incarnation_only() {
+    let enrollment = |revision| WorkerEnrollment {
+        worker_id: Uuid::from_u128(7),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: revision,
+        certificate_sha256: Digest::from_bytes([3; 32]),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let local = WorkerIdentity::from(&enrollment(2));
+    let stale = WorkerIdentity::from(&enrollment(1));
+    let directory = TestDirectory::default();
+    let api = WorkerEnrollment {
+        worker_id: Uuid::from_u128(9),
+        ..enrollment(1)
+    };
+    let worker = WorkerEnrollment {
+        worker_id: Uuid::from_u128(11),
+        ..enrollment(1)
+    };
+    directory.install_api(api.clone());
+    directory.install(worker.clone());
+    let control = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("g6").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Control,
+        group_format_version: 1,
+    };
+    let catalog = GroupIdentity {
+        kind: GroupKind::Catalog,
+        ..control.clone()
+    };
+    let hello = |from: &WorkerEnrollment, to, purpose| Hello {
+        cluster_id: control.cluster_id,
+        group_id: control.group_id,
+        group_digest: Digest::from_bytes([0; 32]),
+        purpose,
+        from: WorkerIdentity::from(from),
+        to,
+        nonce: Uuid::new_v4(),
+        header_len: 0,
+    };
+    let reached = |hello: &Hello, group: &GroupIdentity| audience(&directory, hello, group, &local);
+    // The exact incarnation is always the audience.
+    assert!(reached(&hello(&worker, local, Purpose::Raft), &control));
+    // The API's Control authority calls reach the newer incarnation.
+    assert!(reached(&hello(&api, stale, Purpose::Authority), &control));
+    // Nothing else does: other purposes, other groups, workers, a newer or
+    // different worker, or another certificate.
+    assert!(!reached(&hello(&api, stale, Purpose::ApiIngress), &control));
+    assert!(!reached(
+        &hello(&api, stale, Purpose::ControlDelegation),
+        &control
+    ));
+    assert!(!reached(&hello(&api, stale, Purpose::Authority), &catalog));
+    assert!(!reached(
+        &hello(&worker, stale, Purpose::Authority),
+        &control
+    ));
+    let newer = WorkerIdentity::from(&enrollment(3));
+    assert!(!reached(&hello(&api, newer, Purpose::Authority), &control));
+    let other = WorkerIdentity {
+        worker_id: Uuid::from_u128(8),
+        ..stale
+    };
+    assert!(!reached(&hello(&api, other, Purpose::Authority), &control));
+    let rekeyed = WorkerIdentity {
+        certificate_sha256: Digest::from_bytes([4; 32]),
+        ..stale
+    };
+    assert!(!reached(
+        &hello(&api, rekeyed, Purpose::Authority),
+        &control
+    ));
+    // An API whose own incarnation differs from its enrollment is not one.
+    let impostor = WorkerEnrollment {
+        incarnation: Uuid::new_v4(),
+        ..api
+    };
+    assert!(!reached(
+        &hello(&impostor, stale, Purpose::Authority),
+        &control
+    ));
 }

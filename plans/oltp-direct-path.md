@@ -276,12 +276,13 @@ Targets, in order: serial update p50 at or below 15 ms; zero rejections through 
 Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing the Decisions table.
 
 - **A request ID that may have run directly is settled at its anchor before it goes queued.** Before any eligible
-  operation takes the queued path (a `Fallback` on an intent, a multi-range `insert_many` after a split, an oversized
+  mutation takes the queued path (a `Fallback` on an intent, a multi-range `insert_many` after a split, an oversized
   entry, `direct_oltp: false` while `data.direct.v1` is active), the anchor key's range leader commits
   `DirectForward { request_id, digest }`. If a dedup record already exists it returns `Replayed` instead. Otherwise it
   writes a *forward marker* under the same `'D'` key. A later direct attempt of that request ID sees the marker and
   returns `Fallback`, so it can never apply after the queued path accepted it. Markers expire with dedup records.
   When the anchor leader cannot be reached, the gateway returns `outcome_unknown` rather than going queued.
+  `table.get` is excluded (see the M3 item below).
 - **Backups.** Incremental backups export only Status-decided transactions, so they would miss direct commits. While
   `data.direct.v1` is active, incremental backups are refused and a full backup is taken instead, until incremental
   export scans images for changes since the previous backup.
@@ -291,13 +292,35 @@ Found in review of T4 (`RV-T4`). These refine section 4 and 6 without changing t
 - **Range clock.** A pending commit is bound to the leadership generation in which its timestamp was fetched, and a
   leadership change fails reads that were waiting on pending commits instead of releasing them.
 - **Activation boundary (T7c, 2026-11-20).** The queue owner applies the forward rule where it reserves the request
-  ID, gets included, whatever the sending gateway did. Before its switch observes activation, the owner first sends
+  ID of an eligible mutation, whatever the sending gateway did. Before its switch observes activation, the owner first sends
   Control `QueuedHistory`. Control then activates, and the owner settles the request, or it durably records that
   unsettled queued history exists. An activation with that history opens a window of one dedup retention. Inside
   it, a leader answers `Fallback{History}` for any ID with no record at its anchor, so the queued path answers
-  pre-activation IDs: the original result, a conflict, or `404` abandoned. A direct get also checks its key's
-  record.
-- **Marker lifetime against receipt lifetime (RV-FINAL M2, 2026-11-20).** A forward marker (and the T7c history
+  pre-activation IDs: the original result, a conflict, or `404` abandoned. The window applies to mutations only.
+- **Gets have no exactly-once identity (user decision 2026-11-21, RV-FINAL M3).** This follows ScyllaDB: a read
+  does not mutate, so serving a retried get again is safe. A get is never settled. The gateway (asynchronous,
+  `ForwardOnly`, after a direct `Fallback`) and the queue owner (`settle_before_reserve`, `ScopedSubmit`) send no
+  `DirectForward` for it and send no `QueuedHistory` note. A leader answers a get forward from an older gateway with
+  `Fallback{Ineligible}` and writes nothing. A queued get therefore costs no Data entry, dedup record or expiry key,
+  including in rollback mode (`direct_oltp: false` while `data.direct.v1` is active), where the earlier rule wrote one
+  marker per read and kept it 24 h. A direct get still reads its key's record, a local lookup with no RPC. A get
+  that reuses a mutation's ID on the same key is `409`, and a mutation's marker sends it to the queued path. Inside
+  the history window, gets run directly: a read cannot apply or hide a pre-activation mutation, and the window keeps
+  every mutation ID with no record on the queued path. Gateways in the window (`DirectMode::Settling`) still settle
+  mutations and send gets directly.
+  Consequences:
+  - A queued get abandoned by a cold start and retried through `/v1/operations` on the direct path gets a new
+    linearizable read (`200`), not `404`. Its old receipt still reports it abandoned. On the queued path, Status
+    still knows the ID and answers as before.
+  - A mutation that reuses a queued get's ID runs on the direct path instead of being refused. This is client
+    misuse, and the mutation still applies at most once.
+  - In rollback mode, a get that reuses the ID of a mutation committed directly on its key is not refused on the
+    queued path, which never sees that dedup record. It runs as a read. It reports only its own read and changes
+    nothing.
+
+  Mutation exactly-once rests only on mutation records (dedup records, mutation markers, the window), so all of it
+  stays as it was.
+- **Marker lifetime against receipt lifetime (RV-FINAL M2, 2026-11-20).** A forward marker (mutations only, since M3) (and the T7c history
   window) must outlive every queued receipt of the same request ID, or a direct retry after the marker expired would
   run the request again. A marker is stamped when the request is settled at its anchor and kept 24 h
   (`DEFAULT_DIRECT_DEDUP_RETENTION_MS`). The receipt is kept `result_retention_ms` after the request finishes. The

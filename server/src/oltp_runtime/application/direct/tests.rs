@@ -867,8 +867,9 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
     }
     assert_eq!(transport.sent.load(Ordering::Relaxed), sent);
     // `direct_oltp: false` while active: a mutation is settled at its
-    // anchor (a forward marker), then queued; so is a get (T7c), so its id
-    // cannot later be answered directly.
+    // anchor (a forward marker), then queued. A get is queued as is: no
+    // forward, no marker, no topology read (user decision 2026-11-21,
+    // RV-FINAL M3).
     switch.set_active(true);
     switch.set_direct_oltp(false);
     let id = Uuid::new_v4();
@@ -901,8 +902,50 @@ async fn o03_d01_gateway_routes_eligible_operations_with_zero_topology_reads_per
         .await,
         Answer::Queued
     );
-    assert!(transport.sent.load(Ordering::Relaxed) > sent, "a forward");
-    assert!(cluster.settled(group, 1, get).await, "get forward marker");
+    assert_eq!(transport.sent.load(Ordering::Relaxed), sent, "no forward");
+    assert!(!cluster.settled(group, 1, get).await, "no get marker");
+    // `POST /v1/requests` (asynchronous): the same for a get.
+    let get = Uuid::new_v4();
+    assert!(matches!(
+        gateway
+            .route(&cluster.body(get, "table.get", json!({"key": 1})), true)
+            .await,
+        Ok(Routed::Queued)
+    ));
+    assert_eq!(transport.sent.load(Ordering::Relaxed), sent, "no forward");
+    assert!(!cluster.settled(group, 1, get).await, "no get marker");
+    // The queued-history window (T7c): mutations are settled and queued,
+    // gets read directly.
+    switch.set_direct_oltp(true);
+    switch.set_history(true);
+    let update = Uuid::new_v4();
+    assert_eq!(
+        answer(
+            &gateway,
+            &cluster.body(
+                update,
+                "table.update",
+                json!({"key": 1, "values": {"value": 98}})
+            ),
+            update
+        )
+        .await,
+        Answer::Queued
+    );
+    assert!(cluster.settled(group, 1, update).await, "forward marker");
+    let get = Uuid::new_v4();
+    assert_eq!(
+        answer(
+            &gateway,
+            &cluster.body(get, "table.get", json!({"key": 1})),
+            get
+        )
+        .await,
+        Answer::Data(json!({"id": 1, "value": 11}))
+    );
+    assert!(!cluster.settled(group, 1, get).await, "no get marker");
+    switch.set_history(false);
+    switch.set_direct_oltp(false);
     // The same id directly later: the marker sends it queued again, and it
     // never applies directly.
     switch.set_direct_oltp(true);
@@ -1421,7 +1464,9 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
     let stats = gateway.stats();
     assert_eq!(stats.fallbacks, 8, "{stats:?}");
     assert_eq!(stats.forwards, 8, "{stats:?}");
-    // A get on the intent key also takes the queued path, settled first (T7c).
+    // A get on the intent key also takes the queued path, unsettled
+    // (RV-FINAL M3): no forward, no marker.
+    let sent = transport.sent.load(Ordering::Relaxed);
     let get = Uuid::new_v4();
     assert_eq!(
         answer(
@@ -1432,6 +1477,13 @@ async fn d08_direct_requests_fall_back_while_a_queued_intent_is_open() {
         .await,
         Answer::Queued
     );
+    assert_eq!(
+        transport.sent.load(Ordering::Relaxed),
+        sent + 1,
+        "one direct attempt, no forward"
+    );
+    assert_eq!(gateway.stats().forwards, 8);
+    assert!(!cluster.settled(group, 1, get).await, "no get marker");
     // The queued transaction commits.
     let queued_ts = cluster.timestamps.next();
     assert!(matches!(

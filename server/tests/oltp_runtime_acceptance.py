@@ -592,8 +592,36 @@ def failure_boundaries(test_executable):
                 assert server.run_id != old_run
                 db = Database(url=server.url, token=server.token, database='test', timeout=20)
                 table = db.table('recovery')
+                direct = None
+                if kind == 'read':
+                    # User decision 2026-11-21 (RV-FINAL M3): a get has no
+                    # exactly-once identity and leaves no forward marker.
+                    # Wait for the capability, so the retry's route is known.
+                    direct = wait_direct_active(server)['direct_oltp']
+                    deadline = time.monotonic() + 30
+                    while not server.stats().get('direct') and time.monotonic() < deadline:
+                        time.sleep(.05)
+                    assert server.stats().get('direct'), 'direct executor not installed'
                 status, retried = raw(server.url, '/v1/operations', operation, token=server.token)
-                if stage == 'committed':
+                if kind == 'read' and direct:
+                    # The retry runs directly: a new linearizable read. The
+                    # old receipt still reports the queued read abandoned.
+                    assert (status, retried) == (200, {'request_id': operation['request_id'], 'data': None}), retried
+                    status, receipt = raw(server.url, '/v1/requests/' + old_run + '/' + operation['request_id'],
+                                          token=server.token)
+                    assert status == 404 and receipt['error']['outcome'] == 'unknown', receipt
+                    assert 'abandon' in receipt['error']['message'], receipt
+                    assert table.get('target') is None
+                    assert table.query().count() == 1
+                    table.insert({'id': 'target', 'value': 9})
+                    # The queued path still knows the abandoned id.
+                    delayed = raw(server.url, '/v1/requests', operation, token=server.token)
+                    assert delayed[0] == 404, delayed
+                    # Reads again, never replays: the new row is visible.
+                    status, again = raw(server.url, '/v1/operations', operation, token=server.token)
+                    assert (status, again['data']) == (200, {'id': 'target', 'value': 9}), again
+                    assert (server.stats().get('direct') or {}).get('forward_markers_written', 0) == 0
+                elif stage == 'committed':
                     assert (status, retried) == (200, {'request_id': operation['request_id'], 'data': None}), retried
                     status, receipt = raw(server.url, '/v1/requests/' + old_run + '/' + operation['request_id'], token=server.token)
                     assert status == 200 and receipt['state'] == 'succeeded' and receipt.get('result') is None, receipt
@@ -615,7 +643,8 @@ def failure_boundaries(test_executable):
                 table.drop()
                 assert db.tables() == []
                 print(json.dumps(dict(variation=stage + '-' + kind, status='passed',
-                    scope='actual-run-http-native-rf1', child_reaped=True)), flush=True)
+                    scope='actual-run-http-native-rf1', child_reaped=True,
+                    **({'direct_oltp': direct} if kind == 'read' else {}))), flush=True)
             except BaseException:
                 server.log.flush()
                 with (server.root / 'server.log').open('rb') as diagnostics:

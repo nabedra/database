@@ -198,6 +198,13 @@ impl Writer {
             };
             let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
             live.push(segment::activate(fs, dir, spare, number, next_seq)?);
+        } else {
+            // The inventory saw the names of the process that stopped, which may not be
+            // durable yet: a Kill between a roll's rename and its directory sync leaves the
+            // new live name only in the OS. This open appends to that segment and the store
+            // records it in the manifest, so its name must be durable first (KVfix4).
+            // `activate` above syncs the directory itself.
+            fs.sync_dir(dir).map_err(segment::io)?;
         }
 
         let active = live.last().expect("an active segment").clone();
@@ -476,23 +483,31 @@ impl Writer {
             self.shared.durable.store(self.durable, Ordering::Release);
         }
 
+        // Count the group before any waiter wakes: a caller that reads the stats right
+        // after its commit returns must see that commit counted (ns08 saw 385 vs 384).
         let mut commits = 0;
         let mut synced_commits = 0;
+        for (i, item) in items.iter().enumerate() {
+            if let (Item::Write { sync, .. }, Status::Applied) = (item, self.status[i]) {
+                commits += 1;
+                synced_commits += u64::from(*sync);
+            }
+        }
+        stats.commits.fetch_add(commits, Ordering::Relaxed);
+        stats
+            .synced_commits
+            .fetch_add(synced_commits, Ordering::Relaxed);
+        if !self.placements.is_empty() {
+            stats.group_commits.fetch_add(1, Ordering::Relaxed);
+        }
         for (i, item) in items.drain(..).enumerate() {
             let result = match (&item, self.status[i]) {
                 (
                     Item::Write {
-                        batch,
-                        first_seq,
-                        sync,
-                        ..
+                        batch, first_seq, ..
                     },
                     Status::Applied,
-                ) => {
-                    commits += 1;
-                    synced_commits += u64::from(*sync);
-                    Ok(first_seq + u64::from(batch.count()) - 1)
-                }
+                ) => Ok(first_seq + u64::from(batch.count()) - 1),
                 (Item::Write { .. }, Status::NoSpace) => Err(Error::NoSpace),
                 (Item::Write { .. }, _) => Err(Error::RecoveryRequired),
                 (Item::Sync { target, .. }, _) => {
@@ -507,13 +522,6 @@ impl Writer {
                 }
             };
             complete(item, result);
-        }
-        stats.commits.fetch_add(commits, Ordering::Relaxed);
-        stats
-            .synced_commits
-            .fetch_add(synced_commits, Ordering::Relaxed);
-        if !self.placements.is_empty() {
-            stats.group_commits.fetch_add(1, Ordering::Relaxed);
         }
         if self.latched() {
             self.drain_queue_after_latch();

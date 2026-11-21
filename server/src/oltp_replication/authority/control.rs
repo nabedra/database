@@ -48,5 +48,6 @@ pub(crate) use service::{
     ControlHandle, InventoryPage, LocalOperatorPermit, OperatorPolicy, ReplicaInventoryPage,
     VerifiedExclusion, VerifiedMembership, VerifiedQueueCopy,
 };
+pub(crate) use service::IdlePasses;
 #[cfg(test)]
 mod tests;

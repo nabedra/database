@@ -390,6 +390,7 @@ impl ResourceScheduler {
                         }));
                 if must_grant {
                     state.pending.remove(&token);
+                    state.forget_if_idle(request);
                     return Err(resource());
                 }
             }
@@ -575,7 +576,9 @@ impl ResourceScheduler {
     }
     fn cancel(&self, token: u64) {
         let mut state = self.shared.state.lock().unwrap();
-        state.pending.remove(&token);
+        if let Some(pending) = state.pending.remove(&token) {
+            state.forget_if_idle(pending.request);
+        }
         state.release(token);
         state.schedule();
     }
@@ -622,6 +625,19 @@ impl State {
                 node.io_allocations -= 1;
             }
             node.bytes -= grant.bytes;
+            self.forget_if_idle(grant.request);
+        }
+    }
+    /// Grant order (`last_grant`) only ranks requests that wait or hold work. A
+    /// request with nothing pending or allocated drops its entry, so its next job
+    /// competes as a new request. Without this the map kept one entry per request
+    /// id for the life of the process; native executions take a fresh id each
+    /// (FLAKE1: about 4.5 MiB on an RF3 leader after 7 minutes of point writes).
+    fn forget_if_idle(&mut self, request: u64) {
+        if !self.pending.values().any(|p| p.request == request)
+            && !self.allocated.values().any(|a| a.request == request)
+        {
+            self.last_grant.remove(&request);
         }
     }
     fn request_usages(&self) -> BTreeMap<u64, RequestUsage> {
@@ -678,7 +694,9 @@ impl State {
             .map(|(&token, _)| token)
             .collect();
         for token in impossible {
-            self.pending.remove(&token);
+            if let Some(pending) = self.pending.remove(&token) {
+                self.forget_if_idle(pending.request);
+            }
         }
     }
     fn schedule_one(&mut self, usages: &BTreeMap<u64, RequestUsage>) -> bool {
@@ -950,6 +968,42 @@ mod tests {
             drop(reducer);
             assert!(scheduler.usage().iter().all(|(_, t, b)| *t == 0 && *b == 0));
         }
+    }
+    fn grant_order(scheduler: &ResourceScheduler) -> Vec<u64> {
+        let state = scheduler.shared.state.lock().unwrap();
+        state.last_grant.keys().copied().collect()
+    }
+    /// FLAKE1 regression: grant order is kept only for requests that wait or hold
+    /// work, so many single-use request ids leave no state behind.
+    #[tokio::test]
+    async fn c05_grant_order_is_bounded_by_live_requests() {
+        let scheduler = ResourceScheduler::new(vec![(0, limits(2, 1000))]).unwrap();
+        for request in 1..=1000 {
+            drop(scheduler.reserve(request, 1, 100).await.unwrap());
+        }
+        assert!(grant_order(&scheduler).is_empty());
+        // A request that still holds a grant keeps its order while a sibling waits.
+        let held = scheduler.reserve(7, 1, 100).await.unwrap();
+        let other = scheduler.reserve(8, 1, 100).await.unwrap();
+        let mut sibling = Box::pin(scheduler.reserve(7, 1, 100));
+        assert!(poll_once(sibling.as_mut()).is_pending());
+        drop(held);
+        assert_eq!(grant_order(&scheduler), vec![7, 8]);
+        let sibling = match poll_once(sibling.as_mut()) {
+            Poll::Ready(Ok(grant)) => grant,
+            _ => panic!("the sibling was not granted the freed slot"),
+        };
+        drop((sibling, other));
+        assert!(grant_order(&scheduler).is_empty());
+        // Cancelled waiters and impossible work leave nothing either.
+        let full = scheduler.reserve(9, 2, 100).await.unwrap();
+        let full2 = scheduler.reserve(10, 1, 100).await.unwrap();
+        let mut waiter = Box::pin(scheduler.reserve(11, 1, 100));
+        assert!(poll_once(waiter.as_mut()).is_pending());
+        drop(waiter);
+        assert!(scheduler.reserve(12, 1, 5000).await.is_err());
+        drop((full, full2));
+        assert!(grant_order(&scheduler).is_empty());
     }
     #[tokio::test]
     async fn c05_equal_peers_progress_with_one_slot_per_fair_round() {

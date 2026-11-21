@@ -216,7 +216,8 @@ impl Part {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WriteOutcome {
-    Written,
+    /// On the socket at this instant.
+    Written(Instant),
     NotSent,
     Failed,
 }
@@ -321,7 +322,7 @@ async fn write_frames(
         };
         if let Some(ack) = frame.ack {
             let _ = ack.send(if written {
-                WriteOutcome::Written
+                WriteOutcome::Written(Instant::now())
             } else {
                 WriteOutcome::Failed
             });
@@ -473,7 +474,7 @@ impl ClientSession {
                 _ = stop.wait_for(|closed| *closed) => break,
                 outcome = async { queued.as_mut().expect("ping queued").await }, if queued.is_some() => {
                     queued = None;
-                    if !matches!(outcome, Ok(WriteOutcome::Written)) {
+                    if !matches!(outcome, Ok(WriteOutcome::Written(_))) {
                         break;
                     }
                     written = Some((Instant::now(), self.received.load(Ordering::Relaxed)));
@@ -562,6 +563,7 @@ impl ClientSession {
             stream_id,
             queued: false,
             written: None,
+            outcome: None,
             settled: false,
         };
         let mut head = Vec::with_capacity(FRAME_BYTES + PROLOGUE_BYTES);
@@ -591,23 +593,35 @@ impl ClientSession {
             ack: Some(ack),
             release: None,
         };
+        // Bytes received before the frame was queued: nothing received
+        // since then means nothing received since it was written either.
+        let mark = self.received.load(Ordering::Relaxed);
         match timeout_at(deadline, self.outgoing.send(frame)).await {
             Ok(Ok(())) => guard.queued = true,
             Ok(Err(_)) => return Err(CallError::NotSent),
             Err(_) => return Err(CallError::Failed(RequestError::Unreachable)),
         }
-        match timeout_at(deadline, written).await {
-            Ok(Ok(WriteOutcome::Written)) => {
-                guard.written = Some((Instant::now(), self.received.load(Ordering::Relaxed)));
-            }
-            Ok(Ok(WriteOutcome::NotSent)) => {
-                guard.queued = false;
-                return Err(CallError::NotSent);
-            }
-            _ => return Err(CallError::Failed(RequestError::Unreachable)),
+        // PERF2b: wait for the reply only. The writer's ack is read once
+        // the reply (or its failure) is in, so the caller is not woken
+        // separately when its frame reaches the socket.
+        guard.written = Some((written, mark));
+        let response = timeout_at(deadline, response).await;
+        if let Ok(Ok(result @ Ok(_))) = response {
+            // A reply means the request was written.
+            *phase = RaftTransportPhase::ReceiveReply;
+            guard.settled = true;
+            return result.map_err(CallError::Failed);
         }
-        *phase = RaftTransportPhase::ReceiveReply;
-        match timeout_at(deadline, response).await {
+        let outcome = guard.write_outcome(deadline).await;
+        if matches!(outcome, Some(WriteOutcome::Written(_))) {
+            *phase = RaftTransportPhase::ReceiveReply;
+        }
+        match response {
+            _ if outcome == Some(WriteOutcome::NotSent) => {
+                guard.settled = true;
+                guard.queued = false;
+                Err(CallError::NotSent)
+            }
             Ok(Ok(result)) => {
                 guard.settled = true;
                 result.map_err(CallError::Failed)
@@ -636,9 +650,30 @@ struct StreamGuard<'a> {
     session: &'a Arc<ClientSession>,
     stream_id: u64,
     queued: bool,
-    /// When the request reached the socket, and the bytes received by then.
-    written: Option<(Instant, u64)>,
+    /// The writer's ack for the queued request, and the bytes received
+    /// before it was queued; the ack, once read, is kept in `outcome`.
+    written: Option<(oneshot::Receiver<WriteOutcome>, u64)>,
+    outcome: Option<WriteOutcome>,
     settled: bool,
+}
+impl StreamGuard<'_> {
+    /// The writer's ack, waiting for it only if it has not come yet (a
+    /// closed session fails the reply before its writer drains the queue).
+    async fn write_outcome(&mut self, deadline: Instant) -> Option<WriteOutcome> {
+        if self.outcome.is_none()
+            && let Some((written, _)) = self.written.as_mut()
+        {
+            self.outcome = match written.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(oneshot::error::TryRecvError::Empty) => timeout_at(deadline, written)
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+                Err(oneshot::error::TryRecvError::Closed) => None,
+            };
+        }
+        self.outcome
+    }
 }
 impl Drop for StreamGuard<'_> {
     fn drop(&mut self) {
@@ -652,7 +687,13 @@ impl Drop for StreamGuard<'_> {
                 .outgoing
                 .try_send(Outbound::cancel(self.stream_id));
         }
-        if let Some((at, mark)) = self.written
+        if self.outcome.is_none()
+            && let Some((written, _)) = self.written.as_mut()
+        {
+            self.outcome = written.try_recv().ok();
+        }
+        if let Some(WriteOutcome::Written(at)) = self.outcome
+            && let Some((_, mark)) = self.written
             && pending
             && at.elapsed() >= self.session.silent_limit
             && self.session.received.load(Ordering::Relaxed) == mark
@@ -1232,6 +1273,10 @@ pub(super) async fn serve(
     let config = &transport.common.config;
     let deadline = config.deadline;
     let writer = tokio::spawn(write_frames(write, queue, None, None, deadline));
+    // The writer closes the socket once every sender is gone. This one keeps it
+    // open until the slots below are given back, even after the reader (which
+    // owns the other sender) ends or is aborted.
+    let hold_open = outgoing.clone();
     let state = Arc::new(ServerSession::new(pending));
     let mut reader = tokio::spawn(serve_frames(
         transport.clone(),
@@ -1286,6 +1331,7 @@ pub(super) async fn serve(
     if lock(&state.active).is_empty() {
         lock(&state.lane).take();
     }
+    drop(hold_open);
     let _ = writer.await;
 }
 
@@ -1452,7 +1498,10 @@ async fn run_stream(
         let handler = common.handlers[class as usize]
             .clone()
             .try_acquire_owned()
-            .map_err(|_| overloaded("worker handler lane full"))?;
+            .map_err(|_| {
+                common.refusals.handler(class);
+                overloaded("worker handler lane full")
+            })?;
         trace.phase = RaftTransportPhase::ReadSections;
         if plan.section_lengths != lengths {
             return Err(malformed("worker section length differs from preflight"));
@@ -1549,7 +1598,7 @@ impl WorkerTransport {
             let group = lease.identity();
             if hello.cluster_id != group.cluster_id
                 || hello.group_digest != identity_digest(group)?
-                || hello.to != common.local
+                || !super::audience(&*common.directory, &hello, group, &common.local)
             {
                 return Err(malformed("foreign worker/group audience"));
             }
@@ -1790,7 +1839,7 @@ mod tests {
             free: free.clone(),
         };
         assert!(write_frames(probe, frames, None, None, Duration::from_secs(5)).await);
-        assert_eq!(written.await.unwrap(), WriteOutcome::Written);
+        assert!(matches!(written.await.unwrap(), WriteOutcome::Written(_)));
         let free = free.lock().unwrap().clone();
         assert!(!free.is_empty());
         assert!(

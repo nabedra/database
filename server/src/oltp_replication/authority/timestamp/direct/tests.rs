@@ -70,6 +70,9 @@ struct Cluster {
     /// While set, proposals never complete, like a leader partitioned after
     /// passing its read barrier.
     stalled: AtomicBool,
+    /// Barriers requested as ReadIndex and as lease reads (PERF1).
+    read_index: AtomicUsize,
+    lease_reads: AtomicUsize,
 }
 impl Cluster {
     async fn new(size: usize) -> Arc<Self> {
@@ -95,6 +98,8 @@ impl Cluster {
                 proposals: Vec::new(),
             }),
             stalled: AtomicBool::new(false),
+            read_index: AtomicUsize::new(0),
+            lease_reads: AtomicUsize::new(0),
         })
     }
     /// The handle gets its own `TimestampMachine` over the node's store, as
@@ -184,6 +189,14 @@ fn not_leader() -> ProtocolError {
     )
 }
 impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
+    /// The modelled leader, for the in-process leader hint (PERF2a).
+    fn current_leader(&self) -> Option<u64> {
+        let log = self.cluster.log.try_lock().ok()?;
+        Some(log.leader as u64 + 1)
+    }
+    fn local_node(&self) -> Option<u64> {
+        Some(self.node as u64 + 1)
+    }
     fn propose(
         &self,
         command: OwnedCommand<TimestampCommand>,
@@ -225,6 +238,16 @@ impl Consensus<TimestampCommand, TimestampReply> for ModelConsensus {
         })
     }
     fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.cluster.read_index.fetch_add(1, Ordering::SeqCst);
+        self.barrier()
+    }
+    fn ensure_linearizable_lease(&self) -> ConsensusFuture<'_, ReadBarrier> {
+        self.cluster.lease_reads.fetch_add(1, Ordering::SeqCst);
+        self.barrier()
+    }
+}
+impl ModelConsensus {
+    fn barrier(&self) -> ConsensusFuture<'_, ReadBarrier> {
         Box::pin(async move {
             let log = self.cluster.log.lock().await;
             if log.leader != self.node || !log.connected[self.node] {
@@ -571,7 +594,11 @@ struct Source {
     held: AtomicBool,
     fail: AtomicBool,
     panic: AtomicBool,
+    /// What `may_answer` reports (PERF2a).
+    leads: AtomicBool,
     entered: AtomicUsize,
+    /// The task each call ran on (PERF2a).
+    tasks: Mutex<Vec<Option<tokio::task::Id>>>,
 }
 impl Source {
     fn new(held: bool) -> Arc<Self> {
@@ -582,7 +609,9 @@ impl Source {
             held: AtomicBool::new(held),
             fail: AtomicBool::new(false),
             panic: AtomicBool::new(false),
+            leads: AtomicBool::new(true),
             entered: AtomicUsize::new(0),
+            tasks: Mutex::new(Vec::new()),
         })
     }
     fn calls(&self) -> Vec<u64> {
@@ -593,6 +622,7 @@ impl DirectTimestampSource for Source {
     fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(count);
+            self.tasks.lock().unwrap().push(tokio::task::try_id());
             self.entered.fetch_add(1, Ordering::SeqCst);
             if self.held.load(Ordering::SeqCst) {
                 self.hold.acquire().await.unwrap().forget();
@@ -607,6 +637,49 @@ impl DirectTimestampSource for Source {
             Ok(range)
         })
     }
+    fn may_answer(&self) -> bool {
+        self.leads.load(Ordering::SeqCst)
+    }
+}
+
+/// PERF2a: an in-process replica that names another leader is not called,
+/// so a follower worker pays no failed lease read and ReadIndex per call.
+/// Once it leads again it is called first, without waiting for a backoff.
+#[tokio::test]
+async fn o09_perf2a_colocated_follower_is_skipped_by_its_leader_hint() {
+    let local = Source::new(false);
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::new(Some(local.clone()), remote.clone());
+    local.leads.store(false, Ordering::SeqCst);
+    for _ in 0..3 {
+        client.commit_ts().await.unwrap();
+    }
+    assert_eq!(local.entered.load(Ordering::SeqCst), 0);
+    assert_eq!(remote.calls().len(), 3);
+    local.leads.store(true, Ordering::SeqCst);
+    client.commit_ts().await.unwrap();
+    assert_eq!(client.local_calls(), 1);
+    assert_eq!(remote.calls().len(), 3);
+}
+
+/// PERF2a: the real handle's hint follows its Raft leader.
+#[tokio::test]
+async fn o09_d06_perf2a_handle_leader_hint_follows_elections() {
+    let cluster = Cluster::new(2).await;
+    let handles: Vec<_> = (0..2).map(|node| cluster.handle(node)).collect();
+    initialize(&handles[0]).await;
+    assert!(handles[0].may_answer());
+    cluster.elect(1).await;
+    let watch = || async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handles[0].may_answer() || !handles[1].may_answer() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("leader hints follow the election")
+    };
+    watch().await;
 }
 async fn until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -889,10 +962,65 @@ async fn o09_coalescing_client_survives_callers_dropped_mid_batch() {
         .await
         .expect("no hang after dropped callers")
         .unwrap();
-    // Dropped callers' values are skipped, never handed to anyone else.
+    // Dropped callers' values are skipped, never handed to anyone else. The
+    // aborted first caller made its own call (PERF2a), so the abort cancelled
+    // that call before it issued anything; the queued three were handed to a
+    // driver at once.
     assert_eq!(remote.calls(), vec![1, 3, 1]);
-    assert_eq!((kept.first().get(), kept_too.first().get()), (2, 4));
-    assert_eq!(later.first().get(), 5);
+    assert_eq!((kept.first().get(), kept_too.first().get()), (1, 3));
+    assert_eq!(later.first().get(), 4);
+}
+
+/// PERF2a: a caller that finds the client idle calls on its own task, with
+/// no driver task hop; callers queued behind it still share the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o09_perf2a_idle_caller_calls_on_its_own_task() {
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::new(None, remote.clone());
+    let mut last = 0;
+    for _ in 0..3 {
+        let caller = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let value = client.commit_ts().await.unwrap().get();
+                (value, tokio::task::id())
+            }
+        });
+        let (value, task) = caller.await.unwrap();
+        assert!(value > last);
+        last = value;
+        assert_eq!(remote.tasks.lock().unwrap().last(), Some(&Some(task)));
+    }
+    // A caller that queues behind a call in flight is served by a driver.
+    remote.held.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move { (client.allocate(1).await.unwrap(), tokio::task::id()) }
+    });
+    until(|| remote.entered.load(Ordering::SeqCst) == 4).await;
+    let queued = tokio::spawn({
+        let client = client.clone();
+        async move { (client.allocate(2).await.unwrap(), tokio::task::id()) }
+    });
+    until(|| client.waiting() == 1).await;
+    remote.hold.add_permits(2);
+    let (first, first_task) = first.await.unwrap();
+    let (queued, queued_task) = queued.await.unwrap();
+    assert!(queued.first() > first.last());
+    let tasks = remote.tasks.lock().unwrap().clone();
+    assert_eq!(tasks[3], Some(first_task));
+    assert!(tasks[4].is_some() && tasks[4] != Some(queued_task));
+    assert_eq!(remote.calls(), vec![1, 1, 1, 1, 2]);
+    // The driver stops: the next idle caller calls on its own task again.
+    until(|| client.idle()).await;
+    remote.held.store(false, Ordering::SeqCst);
+    let (_, task) = tokio::spawn({
+        let client = client.clone();
+        async move { (client.commit_ts().await.unwrap(), tokio::task::id()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(remote.tasks.lock().unwrap().last(), Some(&Some(task)));
 }
 
 #[tokio::test]
@@ -942,4 +1070,81 @@ fn o09_coalescing_client_recovers_after_its_runtime_cancels_the_driver() {
     });
     assert_eq!(value.get(), 1, "the cancelled call issued nothing");
     assert_eq!(remote.calls(), vec![1, 1]);
+}
+
+/// PERF1, plan section 5: `AllocateDirect` passes a leader-lease barrier
+/// (ReadIndex only as the lease's own fallback), never a forced ReadIndex.
+#[tokio::test]
+async fn o09_d06_perf1_allocate_direct_uses_the_lease_barrier() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let before = cluster.read_index.load(Ordering::SeqCst);
+    let leases = cluster.lease_reads.load(Ordering::SeqCst);
+    let a = handle.allocate_direct(1).await.unwrap().first().get();
+    let b = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(b > a);
+    assert_eq!(cluster.read_index.load(Ordering::SeqCst), before);
+    assert_eq!(cluster.lease_reads.load(Ordering::SeqCst), leases + 2);
+    // The window rule still holds: a queued allocation in between is below
+    // the next direct value.
+    let q = queued(&handle, authority).await;
+    let c = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(c > q, "direct value {c} after queued {q} must be higher");
+}
+
+/// PERF1: after a queued allocation discards the window, the background task
+/// reserves the next one, so the next direct allocation proposes nothing and
+/// is still above the queued value (O09 real-time order).
+#[tokio::test]
+async fn o09_d06_perf1_discarded_window_is_reserved_again_in_the_background() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let prefill = handle.spawn_direct_prefill();
+    let a = handle.allocate_direct(1).await.unwrap().first().get();
+    assert_eq!(handle.direct_window_stats().reservations, 1);
+    let q = queued(&handle, authority).await;
+    assert_eq!(q, a + DEFAULT_DIRECT_WINDOW);
+    assert_eq!(handle.direct_window_stats().discards, 1);
+    until(|| handle.direct_window_stats().reservations == 2).await;
+    let proposals = cluster.reserve_window_proposals().await;
+    assert_eq!(proposals, 2);
+    let c = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(c > q, "direct value {c} after queued {q} must be higher");
+    let d = handle.allocate_direct(3).await.unwrap();
+    assert_eq!(d.first().get(), c + 1, "served from the prefilled window");
+    assert_eq!(cluster.reserve_window_proposals().await, proposals);
+    // A second discard is refilled too; values stay above every queued one.
+    let q2 = queued(&handle, authority).await;
+    until(|| handle.direct_window_stats().reservations == 3).await;
+    let e = handle.allocate_direct(1).await.unwrap().first().get();
+    assert!(e > q2, "direct value {e} after queued {q2} must be higher");
+    assert_eq!(cluster.reserve_window_proposals().await, 3);
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(5), prefill)
+        .await
+        .expect("the prefill task ends with its handle")
+        .unwrap();
+}
+
+/// PERF1: a queued-only node (no `AllocateDirect` served, no window) writes
+/// no background reservations.
+#[tokio::test]
+async fn o09_perf1_no_prefill_without_direct_allocations() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    let _prefill = handle.spawn_direct_prefill();
+    for _ in 0..3 {
+        queued(&handle, authority).await;
+    }
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(cluster.reserve_window_proposals().await, 0);
+    assert_eq!(handle.direct_window_stats().reservations, 0);
 }

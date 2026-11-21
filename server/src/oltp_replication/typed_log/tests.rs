@@ -136,7 +136,7 @@ fn blank(index: u64) -> OwnedRaftEntry<Command> {
 /// closed. It counts the syncs that entered and passed the gate, so a test can
 /// hold a commit inside the actual journal sync and observe what waits for it.
 #[derive(Clone)]
-struct GatedSync {
+pub(crate) struct GatedSync {
     inner: nabedra_kv::fs::FaultFs,
     gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
 }
@@ -151,7 +151,7 @@ struct GatedFile {
     gate: Arc<(std::sync::Mutex<GateState>, std::sync::Condvar)>,
 }
 impl GatedSync {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: nabedra_kv::fs::FaultFs::new(),
             gate: Default::default(),
@@ -161,6 +161,27 @@ impl GatedSync {
         let result = read(&mut self.gate.0.lock().unwrap());
         self.gate.1.notify_all();
         result
+    }
+    /// The same gate over another `FaultFs` (a restarted machine's disk).
+    pub(crate) fn over(&self, inner: nabedra_kv::fs::FaultFs) -> Self {
+        Self {
+            inner,
+            gate: self.gate.clone(),
+        }
+    }
+    /// Holds every later journal sync until [`Self::release`].
+    pub(crate) fn hold(&self) {
+        self.state(|gate| {
+            gate.closed = true;
+            gate.entered = 0;
+        });
+    }
+    pub(crate) fn release(&self) {
+        self.state(|gate| gate.closed = false);
+    }
+    /// Syncs that reached the closed gate since [`Self::hold`].
+    pub(crate) fn entered(&self) -> usize {
+        self.state(|gate| gate.entered)
     }
 }
 impl nabedra_kv::fs::Fs for GatedSync {
@@ -239,10 +260,10 @@ impl nabedra_kv::fs::FsFile for GatedFile {
 /// `FaultFs` under the pool's store) and observe the typed callback. Formerly a
 /// Linux-only test driven by a Python harness that gated the previous engine's WAL;
 /// it now runs everywhere. While the sync is held: the callback has not fired,
-/// a cancelled append keeps its owned write and order, the next append waits
-/// behind it, no executor thread waits for the fsync, and an unrelated pool's
-/// vote writes progress. After release both acks arrive in order, and only the
-/// bytes a completed sync covered survive a crash.
+/// the append already returned and its entry is readable (PERF2d), the next
+/// append's write waits behind it, no executor thread waits for the fsync, and
+/// an unrelated pool's vote writes progress. After release both acks arrive in
+/// order, and only the bytes a completed sync covered survive a crash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o06_o11_journal_sync_precedes_typed_append_ack() {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -328,19 +349,21 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             async move { log.append([blank(0)], IOFlushed::signal(sender)).await }
         });
         while gated.state(|gate| gate.entered) == 0 {
-            assert!(
-                !first.is_finished(),
-                "append finished without reaching its journal sync"
-            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(matches!(
             callback.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-
+        // PERF2d: the append returned before its sync, and replication reads
+        // the entry while the sync is held. Dropping the awaiter now changes
+        // nothing: the owned write and its callback stay in order.
         first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
+        first.await.unwrap().unwrap();
+        assert_eq!(
+            log.clone().limited_get_log_entries(0, 1).await.unwrap()[0].log_id,
+            id(0)
+        );
         let callback = Arc::new(Mutex::new(callback));
         let released = Arc::new(AtomicBool::new(false));
         let first_ack_observed = Arc::new(AtomicBool::new(false));
@@ -360,7 +383,6 @@ async fn o06_o11_journal_sync_precedes_typed_append_ack() {
             async move { log.append([blank(1)], IOFlushed::signal(sender)).await }
         });
         while log.pending.count.load(Ordering::Acquire) != 2 {
-            assert!(!second.is_finished());
             tokio::task::yield_now().await;
         }
         assert!(log.writes.try_lock().is_err());
@@ -468,6 +490,8 @@ async fn o05_o11_typed_wal_streams_beyond_collection_bound_and_atomically_trunca
             .await
             .unwrap();
     }
+    // `append` returns before the sync (PERF2d); this test reads the store.
+    f.log.drain().await;
     assert!(f.log.try_get_log_entries(..).await.is_err());
     let limited = f.log.limited_get_log_entries(0, 140).await.unwrap();
     assert_eq!(limited.len(), MAX_APPEND_ENTRIES);
@@ -489,6 +513,7 @@ async fn o05_o11_typed_wal_streams_beyond_collection_bound_and_atomically_trunca
     assert_eq!(f.log.read_committed().await.unwrap(), Some(id(10)));
     assert!(f.log.try_get_log_entries(..).await.unwrap().is_empty());
     f.log.append([blank(11)], IOFlushed::noop()).await.unwrap();
+    f.log.drain().await;
     assert_eq!(
         f.log.get_log_state().await.unwrap().last_log_id,
         Some(id(11))
@@ -566,6 +591,8 @@ async fn o05_m01_wide_entry_retains_extracted_payload_without_reply_or_apply_esc
         )
         .await
         .unwrap();
+    // Read the decoded store copy, not the pending entry (PERF2d).
+    f.log.drain().await;
     let decoded = f.log.try_get_log_entries(0..1).await.unwrap();
     assert_eq!(decoded.len(), 1);
     let Payload::Normal(command) = decoded[0].payload() else {
@@ -587,7 +614,8 @@ async fn o05_m01_wide_entry_retains_extracted_payload_without_reply_or_apply_esc
 }
 
 /// F03/O11: cancellation cannot abandon a live native write or its callback.
-/// A second append and replica drain stay behind the first actual sync.
+/// A second append's write and callback, and replica drain, stay behind the
+/// first actual sync. Both appends return before their writes (PERF2d).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settles() {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -617,25 +645,32 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
             tokio::task::yield_now().await;
         }
         first.abort();
-        assert!(first.await.unwrap_err().is_cancelled());
+        first.await.unwrap().unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut done)
                 .await
                 .is_err()
         );
         assert!(f.log.writes.try_lock().is_err());
+        let (sent, mut second_done) = TestConfig::oneshot();
         let mut second = f.log.clone();
-        let second =
-            tokio::spawn(async move { second.append([blank(1)], IOFlushed::noop()).await });
+        second
+            .append([blank(1)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
         let log = f.log.clone();
         let drain = tokio::spawn(async move { log.drain().await });
         tokio::task::yield_now().await;
-        assert!(!second.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second_done)
+                .await
+                .is_err()
+        );
         assert!(!drain.is_finished());
         assert!(f.log.group().resources().apply_bytes_used() > 0);
         drop(release);
         done.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
+        second_done.await.unwrap().unwrap();
         drain.await.unwrap();
         let mut log = f.log.clone();
         assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(1)));
@@ -651,34 +686,46 @@ async fn f03_cancelled_append_keeps_callback_order_and_drain_until_native_settle
 }
 
 /// C07/F03: pending append ownership starts before a native lease exists.
-/// All Query slots can remain held while Data-group vote metadata progresses.
+/// While all Query slots are held, the append has returned and holds no
+/// Control slot, and another group's vote metadata progresses. The same
+/// group's vote queues behind its pending append (OpenRaft orders vote and
+/// log IO, PERF2d) and completes after that append's sync and callback.
 #[tokio::test]
-async fn c07_f03_cancelled_append_waiting_for_native_slot_stays_tracked_while_votes_progress() {
+async fn c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let f = Fixture::new().await;
         let shared = f.log.group().resources();
         let query = shared.prepare(ExecutionClass::Query).await.unwrap();
         let (sent, mut callback) = TestConfig::oneshot();
         let mut append = f.log.clone();
-        let append =
-            tokio::spawn(async move { append.append([blank(0)], IOFlushed::signal(sent)).await });
-        while f
-            .log
-            .pending
-            .count
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
-        {
-            tokio::task::yield_now().await;
-        }
-        append.abort();
-        assert!(append.await.unwrap_err().is_cancelled());
-        let mut vote = f.log.clone();
-        vote.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
+        append
+            .append([blank(0)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
         assert_eq!(
-            vote.read_vote().await.unwrap(),
+            f.log
+                .pending
+                .count
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        let mut identity = f.log.group().identity().clone();
+        identity.group_id = Uuid::new_v4();
+        identity.kind = GroupKind::Control;
+        let mut other =
+            TypedLogStore::<ControlTestConfig>::new(f._pool.group(identity).await.unwrap(), 1)
+                .await
+                .unwrap();
+        other.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
+        assert_eq!(
+            other.read_vote().await.unwrap(),
             Some(Vote::new_committed(3, 1))
         );
+        let mut vote = f.log.clone();
+        let vote = tokio::spawn(async move {
+            vote.save_vote(&Vote::new_committed(3, 1)).await.unwrap();
+            vote
+        });
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut callback)
                 .await
@@ -688,10 +735,16 @@ async fn c07_f03_cancelled_append_waiting_for_native_slot_stays_tracked_while_vo
         let drain = tokio::spawn(async move { log.drain().await });
         tokio::task::yield_now().await;
         assert!(!drain.is_finished());
+        assert!(!vote.is_finished());
         assert_eq!(shared.scheduler().usage()[0].1, 0);
         drop(query);
         callback.await.unwrap().unwrap();
         drain.await.unwrap();
+        let mut vote = vote.await.unwrap();
+        assert_eq!(
+            vote.read_vote().await.unwrap(),
+            Some(Vote::new_committed(3, 1))
+        );
         let mut log = f.log.clone();
         assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(0)));
     })
@@ -742,6 +795,10 @@ async fn c07_m02_control_append_and_read_progress_with_all_data_memory_and_query
     .await
     .unwrap()
     .unwrap();
+    // Read the decoded store copy, not the pending entry (PERF2d).
+    tokio::time::timeout(Duration::from_secs(5), control.drain())
+        .await
+        .unwrap();
     let read = tokio::time::timeout(Duration::from_secs(5), control.try_get_log_entries(0..1))
         .await
         .unwrap()
@@ -810,4 +867,395 @@ async fn o01_live_append_uses_residency_with_progress_wire_completely_full() {
         panic!("normal")
     };
     assert_eq!(command.payload().unwrap().value, 73);
+}
+
+fn log_ids(entries: Vec<OwnedRaftEntry<Command>>) -> Vec<LogId> {
+    entries.iter().map(|entry| entry.log_id).collect()
+}
+/// A Catalog group's pool on a gated `FaultFs`, as in the O06/O11 test above.
+struct GatedLog {
+    _dir: Dir,
+    path: std::path::PathBuf,
+    gated: GatedSync,
+    shared: Arc<WorkerSharedResources>,
+    identity: PoolIdentity,
+    group: GroupIdentity,
+}
+impl GatedLog {
+    fn new() -> Self {
+        let dir = Dir(std::env::temp_dir().join(format!("typed-log-perf2d-{}", Uuid::new_v4())));
+        let path = dir.0.join("pool");
+        std::fs::create_dir_all(&path).unwrap();
+        let gated = GatedSync::new();
+        gated.inner.create_dir_all_durable(&path);
+        let shared = WorkerSharedResources::new(
+            2,
+            WorkerResources {
+                max_threads: 4,
+                ..Default::default()
+            },
+            SharedResourceConfig::default(),
+        )
+        .unwrap();
+        let identity = PoolIdentity {
+            engine: "oltp".into(),
+            pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
+            cluster_id: Uuid::new_v4(),
+            worker_id: Uuid::new_v4(),
+            pool_id: Uuid::new_v4(),
+        };
+        let group = GroupIdentity {
+            cluster_id: identity.cluster_id,
+            database: Text::try_from("default").unwrap(),
+            group_id: Uuid::new_v4(),
+            kind: GroupKind::Catalog,
+            group_format_version: 1,
+        };
+        Self {
+            _dir: dir,
+            path,
+            gated,
+            shared,
+            identity,
+            group,
+        }
+    }
+    async fn open(
+        &self,
+        fs: Arc<dyn nabedra_kv::fs::Fs>,
+        create: bool,
+    ) -> (OltpPool, TypedLogStore<TestConfig>) {
+        let pool = OltpPool::open_development_on(
+            &self.path,
+            self.identity.clone(),
+            self.shared.clone(),
+            fs,
+        )
+        .unwrap();
+        let group = if create {
+            pool.group(self.group.clone()).await
+        } else {
+            pool.retained_group(self.group.clone()).await
+        }
+        .unwrap();
+        let log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
+        (pool, log)
+    }
+    async fn entered(&self) {
+        while self.gated.state(|gate| gate.entered) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
+/// O29/NS10 (FaultFs crash and power-loss models), PERF2d: a crash between an
+/// append's overlay publish and its sync. Before the crash the entry is
+/// readable for replication but neither acknowledged, applied nor named by a
+/// durable commit marker. After it, every acknowledged entry survives, the
+/// unsynced one survives only as an unacknowledged tail, and the commit marker
+/// never names it. The held sync fails on the halted machine, so its callback
+/// reports an error, never a flush.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o29_ns10_perf2d_crash_between_overlay_publish_and_sync_keeps_only_acked_entries() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let rig = GatedLog::new();
+        let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(0)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        acked.await.unwrap().unwrap();
+        log.save_committed(Some(id(0))).await.unwrap();
+
+        rig.gated.state(|gate| gate.closed = true);
+        let (sent, mut pending) = TestConfig::oneshot();
+        log.append([blank(1)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        rig.entered().await;
+        assert_eq!(
+            log_ids(log.limited_get_log_entries(0, 2).await.unwrap()),
+            [id(0), id(1)]
+        );
+        assert_eq!(
+            log_ids(log.try_get_log_entries(..).await.unwrap()),
+            [id(0), id(1)]
+        );
+        let mut apply = Box::pin(log.entries_stream(1..2).await);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), apply.next())
+                .await
+                .is_err(),
+            "applying an entry must wait for its local sync"
+        );
+        drop(apply);
+        // A quorum of other replicas may commit it first: the marker waits.
+        log.save_committed(Some(id(1))).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+
+        // Power cut while the sync is held.
+        let crashed = rig.gated.inner.crash();
+        let losses = (0..8)
+            .map(|seed| rig.gated.inner.power_loss(seed))
+            .collect::<Vec<_>>();
+        rig.gated.inner.halt();
+        rig.gated.state(|gate| gate.closed = false);
+        assert!(
+            pending.await.unwrap().is_err(),
+            "a sync that failed must not report a flush"
+        );
+        let (sent, failed) = TestConfig::oneshot();
+        assert!(
+            log.append([blank(2)], IOFlushed::signal(sent))
+                .await
+                .is_err()
+        );
+        assert!(failed.await.unwrap().is_err());
+        log.drain().await;
+        drop(log);
+        drop(pool);
+
+        for (case, fs) in std::iter::once(crashed).chain(losses).enumerate() {
+            let (pool, mut log) = rig.open(Arc::new(fs), false).await;
+            let entries = log_ids(log.try_get_log_entries(..).await.unwrap());
+            if case == 0 {
+                assert_eq!(entries, [id(0)], "crash keeps exactly the synced log");
+            } else {
+                assert!(
+                    entries == [id(0)] || entries == [id(0), id(1)],
+                    "power loss {case}: {entries:?}"
+                );
+            }
+            assert_eq!(
+                log.get_log_state().await.unwrap().last_log_id,
+                entries.last().copied()
+            );
+            let committed = log.read_committed().await.unwrap();
+            assert!(
+                committed.is_none_or(|committed| committed == id(0)),
+                "case {case}: commit marker {committed:?} names an unsynced entry"
+            );
+            drop(log);
+            drop(pool);
+        }
+    })
+    .await
+    .expect("PERF2d crash watchdog");
+}
+
+/// O11/PERF2d: a commit of an entry whose local sync still runs is recorded
+/// after that sync, and applying it waits for the sync. Replication reads it
+/// meanwhile. A later marker still advances directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o11_perf2d_commit_marker_and_apply_follow_the_local_sync() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let rig = GatedLog::new();
+        let (_pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(0)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        acked.await.unwrap().unwrap();
+        log.save_committed(Some(id(0))).await.unwrap();
+
+        rig.gated.state(|gate| gate.closed = true);
+        let (sent, mut pending) = TestConfig::oneshot();
+        log.append([blank(1), blank(2)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        rig.entered().await;
+        let apply = tokio::spawn({
+            let mut log = log.clone();
+            async move {
+                let mut stream = Box::pin(log.entries_stream(1..3).await);
+                let mut applied = Vec::new();
+                while let Some(entry) = stream.next().await {
+                    applied.push(entry.unwrap().log_id);
+                }
+                applied
+            }
+        });
+        log.save_committed(Some(id(2))).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(0)));
+        assert_eq!(
+            log_ids(log.limited_get_log_entries(1, 3).await.unwrap()),
+            [id(1), id(2)]
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!apply.is_finished());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut pending)
+                .await
+                .is_err()
+        );
+
+        rig.gated.state(|gate| gate.closed = false);
+        pending.await.unwrap().unwrap();
+        assert_eq!(apply.await.unwrap(), [id(1), id(2)]);
+        while log.read_committed().await.unwrap() != Some(id(2)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(3)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        acked.await.unwrap().unwrap();
+        log.save_committed(Some(id(3))).await.unwrap();
+        assert_eq!(log.read_committed().await.unwrap(), Some(id(3)));
+        log.drain().await;
+    })
+    .await
+    .expect("PERF2d deferred commit watchdog");
+}
+
+/// O29/F03, PERF2d: a failed append drops its pending entries; appends queued
+/// behind it fail without writing (no hole), a later append fails at once,
+/// and a core that reads the log state again starts on the durable log.
+#[tokio::test]
+async fn o29_perf2d_failed_append_fails_queued_appends_until_the_log_state_is_read_again() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let mut log = f.log.clone();
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(0)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        acked.await.unwrap().unwrap();
+
+        let query = f
+            .log
+            .group()
+            .resources()
+            .prepare(ExecutionClass::Query)
+            .await
+            .unwrap();
+        log.fail_append
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (sent, first) = TestConfig::oneshot();
+        log.append([blank(1)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        let (sent, second) = TestConfig::oneshot();
+        log.append([blank(2)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        // Pending entries are read without a store read (the Query slot is held).
+        assert_eq!(
+            log_ids(log.limited_get_log_entries(1, 3).await.unwrap()),
+            [id(1), id(2)]
+        );
+        drop(query);
+        assert!(first.await.unwrap().is_err());
+        assert!(second.await.unwrap().is_err());
+        log.drain().await;
+        assert_eq!(
+            log_ids(log.limited_get_log_entries(0, 3).await.unwrap()),
+            [id(0)]
+        );
+        let (sent, refused) = TestConfig::oneshot();
+        assert!(
+            log.append([blank(1)], IOFlushed::signal(sent))
+                .await
+                .is_err()
+        );
+        assert!(refused.await.unwrap().is_err());
+
+        assert_eq!(log.get_log_state().await.unwrap().last_log_id, Some(id(0)));
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(1)], IOFlushed::signal(sent))
+            .await
+            .unwrap();
+        acked.await.unwrap().unwrap();
+        assert_eq!(
+            log_ids(log.try_get_log_entries(..).await.unwrap()),
+            [id(0), id(1)]
+        );
+    })
+    .await
+    .expect("PERF2d failed append watchdog");
+}
+
+/// O11/C07, PERF2d item 2: the commit marker of a durable entry is written in
+/// the background, so the Raft core hands a commit to the apply worker without
+/// a native write. With the only Control slot held, `save_committed` returns at
+/// once; reading the marker and draining the replica wait for the writer.
+#[tokio::test]
+async fn o11_c07_perf2d_commit_marker_is_written_off_the_commit_path() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new().await;
+        let mut log = f.log.clone();
+        let (sent, acked) = TestConfig::oneshot();
+        log.append([blank(0)], IOFlushed::signal(sent)).await.unwrap();
+        acked.await.unwrap().unwrap();
+        let control = f
+            .log
+            .group()
+            .resources()
+            .prepare(ExecutionClass::Control)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), log.save_committed(Some(id(0))))
+            .await
+            .expect("save_committed waited for a native write")
+            .unwrap();
+        let read = tokio::spawn({
+            let mut log = log.clone();
+            async move { log.read_committed().await.unwrap() }
+        });
+        let drain = tokio::spawn({
+            let log = log.clone();
+            async move { log.drain().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!read.is_finished());
+        assert!(!drain.is_finished());
+        drop(control);
+        assert_eq!(read.await.unwrap(), Some(id(0)));
+        drain.await.unwrap();
+    })
+    .await
+    .expect("PERF2d marker watchdog");
+}
+
+/// KVfix4, NS13/O05: once `drain` returns, no append task still holds what it
+/// captured (the group store, charged entries, the worker's resource owner).
+/// The hosted NS13 test drops its pool after a drain and reopens the worker at
+/// once; an append task that released its pending guard before dropping its
+/// captured store let `bind_worker` meet the old owner ("worker storage
+/// capacity unavailable"). The task's last copy of the hook drops slowly, so a
+/// guard released first is caught every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct SlowDrop(Arc<AtomicBool>);
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let mut f = Fixture::new().await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let slow = SlowDrop(dropped.clone());
+    *f.log.append_hook.lock().unwrap() = Some(Arc::new(move || {
+        let _ = &slow;
+    }));
+    let (sender, callback) = TestConfig::oneshot();
+    f.log
+        .append([blank(0)], IOFlushed::signal(sender))
+        .await
+        .unwrap();
+    callback.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.log.drain())
+        .await
+        .expect("drain");
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "drain returned while the append task still held its captured state"
+    );
 }

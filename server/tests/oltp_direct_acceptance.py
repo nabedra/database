@@ -4,7 +4,9 @@
 Topologies (see `oltp_direct_cluster.py`): RF3 = three registered workers plus enrolled
 API gateways, each a separate host process, mTLS between them; RF1 = `nabedra-db serve`.
 
-  --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison
+  --suite rf1        D01 (RF1, both ORMs, direct on/off) and the U01 program comparison,
+                     D11 index publication through the public CLI
+  --suite d11        only D11 index publication through the public CLI (RF1), for reruns
   --suite cluster    D01 (RF3, both ORMs, API and worker gateways, on/off), D03, D11 (drop),
                      D10 (gateway killed mid-stream)
   --suite d05        D05: one follower SIGSTOPped (and its rejoin), two SIGSTOPped, one SIGKILLed
@@ -275,13 +277,26 @@ def d09_rf1(server):
            gateway_after_cold_start=gateway)
 
 
+def stderr_wrapper(binary, path, log):
+    """The public CLI keeps only a bounded in-memory copy of its server's stderr, so a
+    CLI-launched server leaves no log (IDX1). This wrapper appends the server's stderr,
+    and that of the processes it starts, to `log`."""
+    import shlex
+    path.write_text('#!/bin/sh\nexec %s "$@" 2>>%s\n' % (shlex.quote(str(Path(binary).resolve())),
+                                                          shlex.quote(str(log))))
+    path.chmod(0o700)
+    return path
+
+
 def d11_rf1_cli(args, output):
     """D11 index publication through the public CLI's local topology (the RF1 server
     that serves index administration)."""
     from oltp_runtime_acceptance import RuntimeServer
     root = output / 'rf1-cli'
     root.mkdir(parents=True, exist_ok=True)
-    server = RuntimeServer(args.binary, root, cli=True)
+    binary = stderr_wrapper(args.binary, root / 'nabedra-db', root / 'server-stderr.log')
+    server = RuntimeServer(binary, root, cli=True)
+    trace = (root / 'admin-trace.log').open('a')
     try:
         server.start()
         auth = json.loads((root / 'auth.json').read_text())
@@ -291,12 +306,16 @@ def d11_rf1_cli(args, output):
             time.sleep(0.25)
 
         def admin(name, payload, request_id):
-            status, reply = call(server.url, '/v1/cluster/operations', operation(name, payload, request_id),
-                                 token=auth['admin_token'], timeout=60)
-            assert status == 200, (name, status, reply)
-            return reply['data']
+            body = operation(name, payload, request_id)
+            sent = time.time()
+            status, reply = call(server.url, '/v1/cluster/operations', body, token=auth['admin_token'], timeout=60)
+            trace.write(json.dumps(dict(sent=sent, elapsed=time.time() - sent, operation=name,
+                                        request_id=body['request_id'], status=status, reply=reply)) + '\n')
+            trace.flush()
+            return status, reply
         d11_index(server.url, server.token, None, admin, lambda: {'rf1': server.stats()})
     finally:
+        trace.close()
         server.stop()
         server.log.close()
 
@@ -322,6 +341,27 @@ def leader_of(cluster, request):
     return leaders[0]
 
 
+def api_gateway_stats(cluster, token, ca):
+    """NS11 finding 8: an API's /v1/runtime/stats reports the API's own gateway and lane
+    refusals (they read 0 before: the endpoint relayed the owner worker's), the worker's under
+    `owner`."""
+    observed = {}
+    for name, routed in (('api1', True), ('api2', False)):
+        status, stats = call(cluster.api_urls[name], '/v1/runtime/stats', token=token, ca=ca)
+        assert status == 200, (name, status, stats)
+        gateway, transport = stats.get('direct_gateway'), stats.get('transport')
+        assert gateway is not None and transport is not None, (name, sorted(stats))
+        assert set(stats.get('owner') or {}) == {'direct_gateway', 'transport'}, (name, stats.get('owner'))
+        for side in ('outgoing_lane_full', 'handler_lane_full'):
+            assert isinstance(transport[side]['total'], int), (name, transport)
+        if routed:
+            assert gateway['direct_done'] > 0 and gateway['requests'] >= gateway['direct_done'], (name, gateway)
+        else:
+            assert gateway['direct_done'] == 0, (name, gateway)
+        observed[name] = dict(direct_gateway=gateway, transport=transport)
+    return observed
+
+
 def insert_body(table_id, key, value, request_id=None, operation_name='table.insert'):
     return operation(operation_name, {'table_id': table_id, 'row': {'id': key, 'value': value}}, request_id)
 
@@ -344,6 +384,7 @@ def suite_cluster(args, output, rf1_reference):
         gateways = {'api1': (api_on, True), 'api2': (api_off, False),
                     owner: (cluster.urls[owner], cluster.direct[owner])}
         reference, sections = d01_programs('rf3', gateways, token, ca, cluster.all_stats, create)
+        api_stats = api_gateway_stats(cluster, token, ca)
         # Direct point operations through a non-owner worker gateway need no owner.
         db_owner = Database(url=api_on, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
         probe = db_owner.create_table('d01_non_owner', {'id': int, 'value': int}, key='id')
@@ -362,7 +403,7 @@ def suite_cluster(args, output, rf1_reference):
             non_owner[name] = dict(direct_oltp=cluster.direct[name], insert=inserted[0], get=got[0],
                                    queued_table_list=listed[0], queued_error=(listed[1].get('error') or {}).get('code'))
         report('D01-RF3', topology='3 registered workers + 2 API gateways, mTLS', capability=capability, queue_owner=owner,
-               non_owner_worker_gateways=non_owner,
+               non_owner_worker_gateways=non_owner, api_stats=api_stats,
                gateways={name: dict(url=url, direct_oltp=routed) for name, (url, routed) in gateways.items()},
                orms=['python', 'typescript'], steps=len(reference), direct_sections=sections)
         if rf1_reference is not None:
@@ -419,7 +460,23 @@ def dump(cluster):
 
 def d11_index(url, token, ca, admin, stats):
     """D11 index publication racing direct writers. `admin(operation, payload, request_id)`
-    runs an admin operation; `stats()` returns `{name: /v1/runtime/stats}`."""
+    runs an admin operation and returns `(status, reply)`; `stats()` returns
+    `{name: /v1/runtime/stats}`.
+
+    `storage.index.status` is a read. While the Ready publication's Catalog intent covers
+    the index record it may answer a typed retryable error (`not_applied`), which this
+    poll retries. Any other answer, `outcome_unknown` above all, fails the scenario (IDX1)."""
+    poll = float(os.environ.get('NABEDRA_D11_STATUS_POLL_SECONDS', '0.5'))
+    retried = []
+
+    def status(selector):
+        code, reply = admin('storage.index.status', selector, None)
+        if code in (429, 503) and reply['error']['outcome'] == 'not_applied' \
+                and reply['error']['code'] in ('storage_unavailable', 'overloaded'):
+            retried.append((code, reply['error']['code'], reply['error']['message']))
+            return None
+        assert code == 200, ('storage.index.status', code, reply)
+        return reply['data']['state']
     db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca) if ca else None, timeout=30)
     table = db.create_table('d11_index', {'id': int, 'category': int, 'label': str}, key='id')
     table.insert_many([{'id': i, 'category': i % 8, 'label': f'seed-{i}'} for i in range(64)])
@@ -466,15 +523,17 @@ def d11_index(url, token, ca, admin, stats):
             definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
                           'covering': ['label']}
             build_id = uid()
-            created = admin('storage.index.create', definition, build_id)
+            code, created = admin('storage.index.create', definition, build_id)
+            assert code == 200, ('storage.index.create', code, created)
+            created = created['data']
             selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
             deadline = time.monotonic() + 120
             state = created['state']
             while state != 'ready':
-                assert state in ('building', 'pending', 'backfilling', 'validating'), created
+                assert state in (None, 'building', 'pending', 'backfilling', 'validating'), created
                 assert time.monotonic() < deadline, f'index never became ready: {state}'
-                time.sleep(0.5)
-                state = admin('storage.index.status', selector, None)['state']
+                time.sleep(poll)
+                state = status(selector)
             time.sleep(1.0)
         finally:
             stop.set()
@@ -496,7 +555,8 @@ def d11_index(url, token, ca, admin, stats):
         assert 'by_category' in plans[category], plans[category]
         assert indexed == expected.get(category, set()), (category, indexed ^ expected.get(category, set()))
     report('D11-index', table=table.id, rows=len(rows), acknowledged_direct_writes=len(acknowledged),
-           not_applied_errors=len(errors), index_state=state,
+           not_applied_errors=len(errors), index_state=state, status_retried=retried[:8],
+           status_retries=len(retried),
            direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
            plan_uses_index=True, plan_sample=plans[0][:300])
@@ -846,6 +906,68 @@ def d09(cluster, token, ca, output):
            replayed=direct(after, 'replayed') - direct(before, 'replayed'), missing_acknowledged=0)
 
 
+def probe_point_get(url, token, ca, table_id, start, limit):
+    """Point gets through one gateway until one is served or `limit` seconds pass since `start`."""
+    attempts, last = 0, None
+    while time.monotonic() - start < limit:
+        attempts += 1
+        client = Http(url, token, 10, ca)
+        try:
+            body = operation('table.get', {'table_id': table_id, 'key': 1})
+            status, reply = client.exchange('/v1/operations', body)
+            last = dict(status=status, reply=reply)
+            if status == 200 and reply.get('request_id') == body['request_id']:
+                return dict(served_seconds=round(time.monotonic() - start, 2), attempts=attempts, last=last)
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            last = dict(error=f'{type(error).__name__}: {error}')
+        finally:
+            client.close()
+        time.sleep(0.25)
+    return dict(served_seconds=None, attempts=attempts, last=last)
+
+
+def g6(cluster, token, ca):
+    """G6 (NS11): SIGKILL every worker while the API gateways keep running, then cold-start them onto a
+    new run. When the workers keep their certificates (a restarted container), the running gateways
+    learn the new incarnations from Control and serve point gets again within a bounded time. When every
+    worker has a new certificate, no peer pinned in a running gateway remains, so it needs the new cluster
+    connection: the refusal is recorded and the gateways are restarted with it."""
+    db = Database(url=cluster.api_urls['api1'], token=token, database=DATABASE, ca_file=str(ca), timeout=30)
+    table = db.create_table('g6', {'id': int, 'value': int}, key='id')
+    status, reply = call(cluster.api_urls['api1'], '/v1/operations', insert_body(table.id, 1, 1), token=token, ca=ca)
+    assert status == 200, (status, reply)
+    phases = {}
+    for keep in (True, False):
+        label = 'same-certificates' if keep else 'new-certificates'
+        cluster.kill_workers()
+        start = time.monotonic()
+        cluster.cold_start(keep_certificates=keep)
+        workers_ready = round(time.monotonic() - start, 2)
+        cluster.wait_direct_active()
+        active = round(time.monotonic() - start, 2)
+        limit = 60 if keep else 30
+        probes = {name: probe_point_get(cluster.api_urls[name], token, ca, table.id, start, limit)
+                  for name in ('api1', 'api2')}
+        phases[label] = dict(workers_ready_seconds=workers_ready, direct_active_seconds=active, probes=probes)
+        if keep:
+            for name, probe in probes.items():
+                assert probe['served_seconds'] is not None, (label, name, probe)
+        else:
+            # Documented limitation: record the refusal, then give the gateways the new connection.
+            phases[label]['refusals'] = {name: probe['last'] for name, probe in probes.items()
+                                         if probe['served_seconds'] is None}
+            for name in ('api1', 'api2'):
+                cluster.kill_api(name)
+                cluster.start_api(name)
+            restarted = time.monotonic()
+            phases[label]['after_gateway_restart'] = {
+                name: probe_point_get(cluster.api_urls[name], token, ca, table.id, restarted, 60)
+                for name in ('api1', 'api2')}
+            for name, probe in phases[label]['after_gateway_restart'].items():
+                assert probe['served_seconds'] is not None, (label, name, probe)
+    report('G6', **phases)
+
+
 def suite_d09(args, output):
     """D09 at RF3: kill every worker and gateway under load, cold start, every
     acknowledged write present and every acknowledged ID replays. Cold start
@@ -859,6 +981,7 @@ def suite_d09(args, output):
         cluster.start()
         cluster.wait_direct_active()
         d09(cluster, cluster.auth['data_token'], cluster.ca, output)
+        g6(cluster, cluster.auth['data_token'], cluster.ca)
     except BaseException:
         dump(cluster)
         raise
@@ -1060,7 +1183,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path)
-    parser.add_argument('--suite', action='append', choices=('rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum'))
+    parser.add_argument('--suite', action='append', choices=('rf1', 'd11', 'cluster', 'd05', 'd09', 'barriers', 'quorum'))
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
@@ -1076,6 +1199,8 @@ def main():
             try:
                 if suite == 'rf1':
                     rf1_reference = suite_rf1(args, work)
+                elif suite == 'd11':
+                    d11_rf1_cli(args, work)
                 elif suite == 'cluster':
                     suite_cluster(args, work, rf1_reference)
                 elif suite == 'd05':

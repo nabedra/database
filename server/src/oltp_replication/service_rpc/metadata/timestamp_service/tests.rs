@@ -452,3 +452,234 @@ fn d01_t9_allocate_direct_admits_the_direct_leader_role() {
     ));
     assert!(!allocate_direct_permitted(&ServiceAction::ApiIngress));
 }
+
+struct OpenDirectGate;
+impl crate::oltp_replication::authority::timestamp::DirectTimestampGate for OpenDirectGate {
+    fn reserve_window_supported<'a>(
+        &'a self,
+        _timestamps: &'a GroupIdentity,
+    ) -> ConsensusFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+/// The real Timestamp endpoint behind a counter. Preflight skips the Control
+/// role check (the fixture's Control has no `data.direct.v1` grant); `handle`
+/// is the production path. `fail` answers that many calls with a leader-
+/// unavailable error; `hang` holds calls until released (a paused leader).
+struct CountingTimestamp {
+    endpoint: Arc<TimestampEndpoint>,
+    attempts: AtomicU64,
+    fail: AtomicU64,
+    hang: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+}
+impl Endpoint for CountingTimestamp {
+    fn preflight<'a>(
+        &'a self,
+        session: &'a AuthenticatedSession,
+        bytes: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async move {
+            let head = self.endpoint.parse(session, bytes)?;
+            assert_eq!(
+                head.method,
+                Method::TimestampCall {
+                    operation: 41,
+                    mutation: true
+                }
+            );
+            Ok(ReceivePlan {
+                class: head.method.class(),
+                section_lengths: [head.payload_bytes, 0, 0],
+                decode_budget_bytes: 0,
+            })
+        })
+    }
+    fn handle<'a>(
+        &'a self,
+        session: AuthenticatedSession,
+        bytes: ChargedBytes,
+        sections: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        Box::pin(async move {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.hang.load(Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            if self
+                .fail
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return reply(
+                    self.endpoint.handle.resources(),
+                    &session,
+                    self.endpoint.node,
+                    Err(unavailable()),
+                )
+                .await;
+            }
+            self.endpoint.handle(session, bytes, sections).await
+        })
+    }
+}
+
+/// PERF2a, O09/D06: a remote `AllocateDirect` is one round trip to the cached
+/// Timestamp leader once routes are known, and stays one round trip past the
+/// 5 s route-reuse bound because the warm-route task re-confirms them. A
+/// leader-unavailable answer forgets the leader and the member list and
+/// converges within the same call. A paused leader costs one bounded attempt
+/// and the call still ends within the convergence deadline; the next call
+/// skips the stalled leader's thin attempt (D05/LIVE1). Values only rise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o09_d06_perf2a_allocate_direct_takes_one_round_trip_on_warm_routes() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let directory = Directory(
+            std::env::temp_dir().join(format!("timestamp-thin-direct-{}", Uuid::new_v4())),
+        );
+        let services = LocalServices::open(
+            &directory.0,
+            "thin-direct",
+            WorkerResources {
+                max_threads: 1,
+                ..Default::default()
+            },
+            &ExecutionConfig {
+                max_pending_requests: 16,
+                max_queue_bytes_per_replica: 1 << 20,
+                max_retained_result_bytes_per_worker: 1 << 20,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        let group = services.timestamps.identity();
+        let routes = services.control_client.replica_routes(group).await.unwrap();
+        let [member] = routes.members.as_slice() else {
+            panic!("expected a sole Timestamp voter");
+        };
+        let node = member.node_id;
+        let pool = services.pools.get(member.pool_id).unwrap().unwrap();
+        let running = services
+            .manager
+            .start_timestamps(
+                pool.group(group.clone()).await.unwrap(),
+                member.clone(),
+                [(node, member.clone())].into_iter().collect(),
+                raft_config(),
+            )
+            .await
+            .unwrap();
+        drop(routes);
+        let handle = TimestampHandle::new(
+            TimestampMachine::new(running.state.store().clone()).unwrap(),
+            running.clone(),
+        );
+        handle.install_direct_gate(Arc::new(OpenDirectGate));
+        let transport = services.manager.client();
+        let topology = StatusTopology::new(vec![services.status.identity().clone()]).unwrap();
+        let endpoint = Arc::new(CountingTimestamp {
+            endpoint: TimestampEndpoint::new(
+                handle.clone(),
+                node,
+                services.control_client.clone(),
+                transport.clone(),
+                topology,
+            )
+            .unwrap(),
+            attempts: AtomicU64::new(0),
+            fail: AtomicU64::new(0),
+            hang: false.into(),
+            release: tokio::sync::Notify::new(),
+        });
+        services
+            .manager
+            .bind_service(group, node, endpoint.clone())
+            .unwrap();
+        let client = TimestampClient::new(
+            group.clone(),
+            services.shared.clone(),
+            transport,
+            services.control_client.clone(),
+            ServiceAction::DirectLeader,
+        )
+        .unwrap();
+        let stats = |thin, converged| {
+            let actual = client.direct_routing_stats();
+            assert_eq!(
+                (actual.thin, actual.converged),
+                (thin, converged),
+                "{actual:?}"
+            );
+            actual
+        };
+        let attempts = || endpoint.attempts.load(Ordering::SeqCst);
+
+        // No leader is known yet: the first call converges and learns it.
+        let first = client.allocate_direct(2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        stats(0, 1);
+        assert_eq!(attempts(), 1);
+        let mut last = first.last().get();
+        let mut next = |range: DirectTimestampRange| {
+            assert!(range.first().get() > last, "{range:?} after {last}");
+            last = range.last().get();
+        };
+        // Then one round trip each, no Control read.
+        for _ in 0..5 {
+            next(client.allocate_direct(1).await.unwrap());
+        }
+        stats(5, 1);
+        assert_eq!(attempts(), 6);
+
+        // Past the reuse bound, the warm-route task kept the routes confirmed.
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        next(client.allocate_direct(1).await.unwrap());
+        assert!(stats(6, 1).refreshes >= 1);
+        assert_eq!(attempts(), 7);
+
+        // A leader-unavailable answer drops the routes and converges at once.
+        let before = services
+            .control_client
+            .cached_replica_routes(group)
+            .unwrap();
+        endpoint.fail.store(1, Ordering::SeqCst);
+        next(client.allocate_direct(1).await.unwrap());
+        stats(6, 2);
+        assert_eq!(attempts(), 9);
+        let after = services
+            .control_client
+            .cached_replica_routes(group)
+            .unwrap();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the member list was read again"
+        );
+        next(client.allocate_direct(1).await.unwrap());
+        stats(7, 2);
+
+        // A paused leader: one bounded thin attempt, then the converging
+        // path, all within the 5 s convergence deadline.
+        endpoint.hang.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let error = client.allocate_direct(1).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(5500),
+            "{elapsed:?} {error:?}"
+        );
+        stats(7, 3);
+        endpoint.hang.store(false, Ordering::SeqCst);
+        endpoint.release.notify_waiters();
+        // The stalled leader gets no thin attempt until it answers again.
+        next(client.allocate_direct(1).await.unwrap());
+        stats(7, 4);
+        next(client.allocate_direct(1).await.unwrap());
+        stats(8, 4);
+        services.shutdown().await.unwrap();
+    })
+    .await
+    .expect("thin AllocateDirect watchdog");
+}

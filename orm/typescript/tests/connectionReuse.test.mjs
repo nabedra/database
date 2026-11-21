@@ -27,7 +27,7 @@ async function keepAliveServer(t) {
   if (generated.error?.code === "ENOENT") return null
   assert.equal(generated.status, 0, generated.stderr)
 
-  const state = { accepted: 0, seen: [], actions: [], closed: [] }
+  const state = { accepted: 0, seen: [], actions: [], closed: [], sockets: [] }
   const numbers = new WeakMap()
   const server = createServer({ key: await readFile(key), cert: await readFile(cert) }, async (request, response) => {
     const chunks = []
@@ -55,6 +55,7 @@ async function keepAliveServer(t) {
   })
   server.on("secureConnection", (socket) => {
     numbers.set(socket, ++state.accepted)
+    state.sockets.push(socket)
     socket.once("close", () => state.closed.push(numbers.get(socket)))
   })
   server.listen(0, "127.0.0.1")
@@ -137,16 +138,49 @@ test("O01 a failure on a reused connection surfaces once and drops that connecti
   }
 })
 
-test("O01 the default agent closes connections idle for two seconds", async (t) => {
+test("O01 PERF2e the default agent reuses a connection idle past two seconds, under the server's 30 s", async (t) => {
   const fixture = await keepAliveServer(t)
   if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
   const { url, cert, state } = fixture
   const transport = new Transport(url, "token", { caFile: cert })
   await transport.request("table.get", {})
-  await sleep(2_400)
+  // The pooled socket waits with the 25 s reuse bound (server/src/network.rs keeps it 30 s).
+  assert.equal(state.sockets.length, 1)
+  await sleep(2_500)   // past the former 2 s bound
+  await transport.request("table.insert", {})
+  assert.equal(state.accepted, 1)
+  assert.deepEqual(state.closed, [])
+  assert.deepEqual(state.seen.map(seen => [seen.connection, seen.operation]), [[1, "table.get"], [1, "table.insert"]])
+})
+
+test("O01 an agent closes connections idle past its reuse bound", async (t) => {
+  const fixture = await keepAliveServer(t)
+  if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
+  const { url, cert, state } = fixture
+  const base = new Transport(url, "token", { caFile: cert })
+  // The default agent's code path with a short bound.
+  const transport = new Transport(url, "token", { caFile: cert, agent: base.createAgent({ maxFreeSockets: 4 }, 300) })
+  await transport.request("table.get", {})
+  await sleep(700)
   assert.deepEqual(state.closed, [1])
   await transport.request("table.get", {})
   assert.equal(state.accepted, 2)
+})
+
+test("O01 PERF2e a connection the server evicted while idle is replaced before sending", async (t) => {
+  const fixture = await keepAliveServer(t)
+  if (fixture === null) return t.skip("openssl is needed to generate the local TLS fixture")
+  const { url, cert, state } = fixture
+  const transport = new Transport(url, "token", { caFile: cert })
+  await transport.request("table.get", {})
+  // A full OLTP listener closes its oldest idle connection cleanly some time after the response.
+  await sleep(200)
+  state.sockets[0].end()
+  while (!state.closed.includes(1)) await sleep(10)
+  await sleep(50)
+  assert.deepEqual(await transport.request("table.insert", {}), [])
+  // The mutation was sent once, on the new connection.
+  assert.deepEqual(state.seen.map(seen => [seen.connection, seen.operation]), [[1, "table.get"], [2, "table.insert"]])
 })
 
 test("O01 the default agent leaves DNS and connect under the request timeout", async (t) => {
@@ -155,14 +189,17 @@ test("O01 the default agent leaves DNS and connect under the request timeout", a
   const { url, cert, state } = fixture
   const lookup = dns.lookup
   t.after(() => { dns.lookup = lookup })
-  // A 3 s resolver is slower than the 2 s idle limit and faster than the 10 s request timeout.
+  // A 3 s resolver is slower than a 2 s idle limit and faster than the 10 s request timeout.
   dns.lookup = (hostname, options, callback) => {
     if (typeof options === "function") [callback, options] = [options, {}]
     setTimeout(() => options?.all
       ? callback(null, [{ address: "127.0.0.1", family: 4 }])
       : callback(null, "127.0.0.1", 4), 3_000)
   }
-  const transport = new Transport(url.replace("127.0.0.1", "localhost"), "token", { caFile: cert, timeout: 10 })
+  const host = url.replace("127.0.0.1", "localhost")
+  const base = new Transport(host, "token", { caFile: cert })
+  // The default agent's code path with a 2 s bound, below the resolver's delay.
+  const transport = new Transport(host, "token", { caFile: cert, timeout: 10, agent: base.createAgent({ maxFreeSockets: 4 }, 2_000) })
   assert.deepEqual(await transport.request("table.get", {}), [])
   assert.equal(state.accepted, 1)
 })

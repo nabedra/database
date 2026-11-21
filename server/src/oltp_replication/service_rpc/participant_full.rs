@@ -1070,8 +1070,11 @@ impl Endpoint for ParticipantEndpoint {
                     }
                     Method::Direct(header) | Method::DirectForward(header) => {
                         let forward = matches!(head.method, Method::DirectForward(_));
-                        direct::serve(&self.proof.handle, &session, header, forward, &sections)
-                            .await
+                        crate::oltp_runtime::stage_timing::timed(
+                            crate::oltp_runtime::stage_timing::perf_stage!("rpc.direct.serve"),
+                            direct::serve(&self.proof.handle, &session, header, forward, &sections),
+                        )
+                        .await
                     }
                     Method::ParticipantPropose { progress } => {
                         let shared = self.proof.shared.clone();

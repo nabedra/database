@@ -6,6 +6,7 @@ use super::{
     schema::{DirectSchema, DirectTable, SchemaLookup},
     stats::{DirectStats, DirectStatsSnapshot, ProposalFailure, RetryCause},
 };
+use crate::oltp_runtime::stage_timing::{perf_stage, timed};
 use crate::{
     oltp::{
         mvcc::{
@@ -130,6 +131,16 @@ enum Attempt<T> {
     Retry(RetryCause),
 }
 
+/// What steps 3 and 4 produced: a commit to propose, or the attempt's end.
+enum Prepared {
+    Commit {
+        epochs: ParticipantEpochs,
+        computed: Computed,
+        result: CanonicalJson,
+    },
+    Exit(Attempt<DirectResponse>),
+}
+
 impl DirectExecutor {
     pub(crate) fn new(
         resources: Arc<WorkerSharedResources>,
@@ -172,7 +183,10 @@ impl DirectExecutor {
         let started = std::time::Instant::now();
         self.stats.request();
         let mut get = false;
-        let response = match self.admit(handle, &request) {
+        let admit = std::time::Instant::now();
+        let admission = self.admit(handle, &request);
+        perf_stage!("leader.admit").since(admit);
+        let response = match admission {
             Err(response) => response,
             Ok((admitted, parsed)) => {
                 let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
@@ -190,8 +204,10 @@ impl DirectExecutor {
         };
         if get {
             self.stats.get_time(started.elapsed());
+            perf_stage!("leader.get.total").since(started);
         } else {
             self.stats.mutation_time(started.elapsed());
+            perf_stage!("leader.mutation.total").since(started);
         }
         self.count(&response);
         response
@@ -209,6 +225,15 @@ impl DirectExecutor {
         self.stats.forward();
         let response = match self.admit(handle, &request) {
             Err(response) => response,
+            // User decision 2026-11-21 (RV-FINAL M3): a get has no
+            // exactly-once identity, so it never leaves a marker. A gateway
+            // of an older build that still forwards one takes the queued
+            // path; nothing is proposed or read.
+            Ok((_, parsed)) if matches!(parsed.operation, Operation::Get(_)) => {
+                DirectResponse::Fallback {
+                    reason: FallbackReason::Ineligible,
+                }
+            }
             Ok((admitted, parsed)) => {
                 let deadline = Instant::now() + request.deadline.min(MAX_DIRECT_DEADLINE);
                 let response = self
@@ -338,6 +363,20 @@ impl DirectExecutor {
         deadline: Instant,
     ) -> Result<ParticipantEpochs, DirectResponse> {
         let epochs = handle.direct_epochs().await.map_err(failed)?;
+        self.checked_epochs(handle, clock, request, epochs, deadline)
+            .await
+    }
+
+    /// Step 2's checks on epochs already read: the request's epochs, the
+    /// group's activation and the table's drop fence.
+    async fn checked_epochs(
+        &self,
+        handle: &ParticipantHandle,
+        clock: &RangeClock,
+        request: &DirectRequest,
+        epochs: ParticipantEpochs,
+        deadline: Instant,
+    ) -> Result<ParticipantEpochs, DirectResponse> {
         if epochs.schema_epoch != request.schema_epoch
             || epochs.routing_epoch != request.routing_epoch
         {
@@ -546,24 +585,68 @@ impl DirectExecutor {
         let Operation::Get(payload) = &parsed.operation else {
             unreachable!("only gets reach get");
         };
-        let key = MvccKey::Row {
-            table_id: request.table_id,
-            primary_key: payload.key.clone(),
-        };
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, clock, request, deadline).await?;
-            self.table(request, &epochs, &parsed.operation, deadline)
-                .await?;
+            timed(
+                perf_stage!("leader.get.token"),
+                self.token(handle, clock, deadline),
+            )
+            .await?;
             loop {
-                if by(deadline, handle.direct_barrier()).await.is_err() {
+                // PERF2b: the barrier's applied check, the epochs, the
+                // newest version and the key's dedup record come from one
+                // snapshot (one Query-class native job, not four).
+                let Ok(barrier) = timed(
+                    perf_stage!("leader.get.barrier"),
+                    by(deadline, handle.direct_lease_index()),
+                )
+                .await
+                else {
                     if !self.pause(deadline, RetryCause::Leadership).await {
                         return Err(not_leader_or(handle, false));
                     }
                     continue;
-                }
-                match by(deadline, handle.direct_latest(key.clone())).await {
+                };
+                let snapshot = match timed(
+                    perf_stage!("leader.get.read"),
+                    by(
+                        deadline,
+                        handle.direct_snapshot(
+                            barrier,
+                            request.table_id,
+                            payload.key.clone(),
+                            request.request_id,
+                        ),
+                    ),
+                )
+                .await
+                {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => {
+                        if !self.pause(deadline, RetryCause::Leadership).await {
+                            return Err(not_leader_or(handle, false));
+                        }
+                        continue;
+                    }
+                    Err(error) if error.code == ErrorCode::StorageUnavailable => {
+                        if !self.pause(deadline, RetryCause::Unavailable).await {
+                            return Err(failed(error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(failed(error)),
+                };
+                let epochs = timed(
+                    perf_stage!("leader.get.epochs"),
+                    self.checked_epochs(handle, clock, request, snapshot.epochs, deadline),
+                )
+                .await?;
+                timed(
+                    perf_stage!("leader.get.table"),
+                    self.table(request, &epochs, &parsed.operation, deadline),
+                )
+                .await?;
+                match snapshot.latest {
                     Err(error) if error.code == ErrorCode::StorageUnavailable => {
                         if !self.pause(deadline, RetryCause::Unavailable).await {
                             return Err(failed(error));
@@ -571,22 +654,16 @@ impl DirectExecutor {
                     }
                     Err(error) => return Err(failed(error)),
                     Ok(read @ LatestRead::Value { .. }) => {
-                        // T7c: a get whose id the queued path accepted (a
-                        // forward marker at its key) is answered there:
-                        // after a cold start that is 404 abandoned, never a
-                        // fresh read. In the queued-history window an id
-                        // without a record may be such a request too.
-                        // Reads leave no record, so nothing else changes.
-                        match by(
-                            deadline,
-                            handle.direct_dedup_after_barrier(
-                                request.table_id,
-                                payload.key.clone(),
-                                request.request_id,
-                            ),
-                        )
-                        .await
-                        {
+                        // The key's record of this id: a get that reuses
+                        // the id of a mutation on its key conflicts (409),
+                        // and one whose id a queued mutation settled here (a
+                        // marker) goes queued, where Status answers it.
+                        // Gets themselves leave no record and have no
+                        // exactly-once identity (user decision 2026-11-21,
+                        // RV-FINAL M3), so the queued-history window does
+                        // not hold them back: a read cannot apply or hide a
+                        // pre-boundary mutation.
+                        match snapshot.dedup {
                             Err(error) if error.code == ErrorCode::StorageUnavailable => {
                                 if !self.pause(deadline, RetryCause::Unavailable).await {
                                     return Err(failed(error));
@@ -594,11 +671,6 @@ impl DirectExecutor {
                             }
                             Err(error) => return Err(failed(error)),
                             Ok(Some(found)) => return self.settled(found, request.digest),
-                            Ok(None) if self.gate.history_settling() => {
-                                return Err(DirectResponse::Fallback {
-                                    reason: FallbackReason::History,
-                                });
-                            }
                             Ok(None) => return self.get_result(read, &epochs),
                         }
                     }
@@ -661,8 +733,6 @@ impl DirectExecutor {
                 .collect(),
             Operation::Update(p) => vec![key(p.key.clone())],
             Operation::Delete(p) => vec![key(p.key.clone())],
-            // Only a forward reaches here with a get: its marker's anchor.
-            Operation::Get(p) => vec![key(p.key.clone())],
             _ => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Ineligible,
@@ -697,27 +767,39 @@ impl DirectExecutor {
     ) -> DirectResponse {
         let result = async {
             let clock = handle.direct_clock().map_err(failed)?;
-            self.token(handle, clock, deadline).await?;
-            let epochs = self.epochs(handle, clock, request, deadline).await?;
-            let table = self
-                .table(request, &epochs, &parsed.operation, deadline)
-                .await?;
+            timed(
+                perf_stage!("leader.mutation.token"),
+                self.token(handle, clock, deadline),
+            )
+            .await?;
+            let epochs = timed(
+                perf_stage!("leader.mutation.epochs"),
+                self.epochs(handle, clock, request, deadline),
+            )
+            .await?;
+            let table = timed(
+                perf_stage!("leader.mutation.table"),
+                self.table(request, &epochs, &parsed.operation, deadline),
+            )
+            .await?;
             let keys = self.row_keys(&table, &parsed.operation)?;
             let encoded: Vec<Vec<u8>> = keys
                 .iter()
                 .map(|key| serde_json::to_vec(key).map_err(|_| failed(corrupt())))
                 .collect::<Result<_, _>>()?;
-            let latched = self
-                .latches
-                .lock(encoded.iter().map(Vec::as_slice), deadline)
-                .await
-                .map_err(|_| {
-                    failed(ProtocolError::new(
-                        ErrorCode::StorageUnavailable,
-                        "deadline expired waiting for a key latch",
-                        Outcome::NotApplied,
-                    ))
-                })?;
+            let latched = timed(
+                perf_stage!("leader.mutation.latch"),
+                self.latches
+                    .lock(encoded.iter().map(Vec::as_slice), deadline),
+            )
+            .await
+            .map_err(|_| {
+                failed(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "deadline expired waiting for a key latch",
+                    Outcome::NotApplied,
+                ))
+            })?;
             if let Some(waited) = latched.waited {
                 self.stats.latch_wait(waited);
             }
@@ -767,92 +849,57 @@ impl DirectExecutor {
         uncertain: &mut bool,
     ) -> Result<Attempt<DirectResponse>, DirectResponse> {
         // T4fix F4: the token is taken before the timestamp is fetched.
-        let token = self.token(handle, clock, deadline).await?;
-        let epochs = self.epochs(handle, clock, request, deadline).await?;
-        if by(deadline, handle.direct_barrier()).await.is_err() {
-            if Instant::now() + RETRY_PAUSE >= deadline {
-                return Err(not_leader_or(handle, *uncertain));
-            }
-            return Ok(Attempt::Retry(RetryCause::Leadership));
-        }
-        let MvccKey::Row {
-            primary_key: anchor,
-            ..
-        } = &keys[0]
-        else {
-            unreachable!("row keys only");
-        };
-        // A cancelled earlier attempt of this request may still be pending
-        // on these keys (its latch is gone but its entry is not applied):
-        // wait for it, so the dedup lookup below sees its record.
-        for key in keys {
-            if by(deadline, clock.wait_latest(key)).await.is_err() {
-                return Ok(Attempt::Retry(RetryCause::Unavailable));
-            }
-        }
-        // The dedup record decides before any fallback (T4fix concern 1).
-        match by(
-            deadline,
-            handle.direct_dedup_after_barrier(request.table_id, anchor.clone(), request.request_id),
+        let token = timed(
+            perf_stage!("leader.attempt.token"),
+            self.token(handle, clock, deadline),
         )
-        .await
-        {
-            Err(error) if error.code == ErrorCode::StorageUnavailable => {
-                return Err(stale_route(Some(&epochs)));
+        .await?;
+        // PERF2b: the commit timestamp is fetched while steps 3 and 4 run,
+        // in this task. `mutate` already holds the latches (plan section 5,
+        // rule 1), and registration below still refuses a timestamp at or
+        // below `max_read_ts`. An attempt that ends before the commit drops
+        // the fetch; an unused timestamp is only a gap.
+        let fetch = timed(
+            perf_stage!("leader.attempt.timestamp_fetch"),
+            by(deadline, self.timestamps.commit_ts()),
+        );
+        let prepare = self.prepare(
+            handle, clock, request, table, operation, keys, deadline, *uncertain,
+        );
+        tokio::pin!(fetch, prepare);
+        let mut fetched = None;
+        let prepared = loop {
+            tokio::select! {
+                biased;
+                ts = &mut fetch, if fetched.is_none() => fetched = Some(ts),
+                prepared = &mut prepare => break prepared,
             }
-            Err(error) if error.code == ErrorCode::ValidationError => {
-                return Err(stale_route(Some(&epochs)));
-            }
-            Err(error) => return Err(failed(error)),
-            Ok(Some(found)) => return self.settled(found, request.digest).map(Attempt::Done),
-            // T7c: this id may belong to a queued request accepted before
-            // activation without a marker. Only the queued path knows it.
-            Ok(None) if self.gate.history_settling() => {
-                return Err(DirectResponse::Fallback {
-                    reason: FallbackReason::History,
-                });
-            }
-            Ok(None) => {}
-        }
-        let mut current = Vec::with_capacity(keys.len());
-        for key in keys {
-            match self.latest(handle, key.clone(), &epochs, deadline).await? {
-                Some((version, value)) => {
-                    // Row keys hold rows; index entries are read separately.
-                    let row = value
-                        .map(|raw| serde_json::from_str::<Row>(raw.get()))
-                        .transpose()
-                        .map_err(|_| failed(corrupt()))?;
-                    current.push((version, row));
-                }
-                None => return Ok(Attempt::Retry(RetryCause::Unavailable)),
-            }
-        }
-        let Some(computed) = self
-            .compute(handle, table, operation, keys, current, &epochs, deadline)
-            .await?
-        else {
-            return Ok(Attempt::Retry(RetryCause::Unavailable));
         };
-        let result = CanonicalJson::from_serializable(
-            &self.resources,
-            &computed.result,
-            MAX_DIRECT_RESULT_BYTES,
-        )
-        .map_err(|_| DirectResponse::Fallback {
-            reason: FallbackReason::ResourceLimit,
-        })?;
-        if computed.writes.is_empty() {
-            // A read-only outcome commits nothing and is recomputed on retry.
-            self.stats.read_only();
-            return Ok(Attempt::Done(DirectResponse::Done(
-                DirectData::from_json(result.as_str()).map_err(failed)?,
-            )));
-        }
-        let commit_ts = match by(deadline, self.timestamps.commit_ts()).await {
-            Ok(ts) => ts,
+        let (epochs, computed, result) = match prepared? {
+            Prepared::Commit {
+                epochs,
+                computed,
+                result,
+            } => (epochs, computed, result),
+            Prepared::Exit(exit) => return Ok(exit),
+        };
+        let waited = std::time::Instant::now();
+        let fetched = match fetched {
+            Some(fetched) => fetched,
+            None => fetch.await,
+        };
+        perf_stage!("leader.attempt.timestamp").since(waited);
+        let commit_ts = match fetched {
+            Ok(ts) if above_read_versions(ts, &computed.writes) => ts,
+            // A version newer than the overlapped fetch applied meanwhile:
+            // apply would reject the commit, so fetch again first.
+            Ok(_) => match by(deadline, self.timestamps.commit_ts()).await {
+                Ok(ts) => ts,
+                Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
+            },
             Err(_) => return Ok(Attempt::Retry(RetryCause::Unavailable)),
         };
+        let build = std::time::Instant::now();
         let commit = DirectCommit {
             authority: epochs.authority,
             table_id: request.table_id,
@@ -896,12 +943,18 @@ impl DirectExecutor {
                 return Err(failed(error));
             }
         };
+        perf_stage!("leader.attempt.build_command").since(build);
         self.stats.proposed(rows, index_changes);
         // T9 process barrier (D04 before quorum): timestamp registered, entry not
         // yet proposed.
         #[cfg(test)]
         crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id).await;
-        let applied = match by(deadline, handle.propose(command)).await {
+        let applied = match timed(
+            perf_stage!("leader.attempt.propose"),
+            by(deadline, handle.propose(command)),
+        )
+        .await
+        {
             Ok(applied) => applied,
             Err(error) => {
                 // T4: settle on any proposal error.
@@ -959,6 +1012,163 @@ impl DirectExecutor {
         }
     }
 
+    /// Steps 3 and 4 of one attempt: the barrier, the dedup record, the
+    /// current rows and the planned writes.
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare(
+        &self,
+        handle: &Arc<ParticipantHandle>,
+        clock: &RangeClock,
+        request: &DirectRequest,
+        table: &DirectTable,
+        operation: &Operation,
+        keys: &[MvccKey],
+        deadline: Instant,
+        uncertain: bool,
+    ) -> Result<Prepared, DirectResponse> {
+        let MvccKey::Row {
+            primary_key: anchor,
+            ..
+        } = &keys[0]
+        else {
+            unreachable!("row keys only");
+        };
+        let leadership = || {
+            if Instant::now() + RETRY_PAUSE >= deadline {
+                return Err(not_leader_or(handle, uncertain));
+            }
+            Ok(Prepared::Exit(Attempt::Retry(RetryCause::Leadership)))
+        };
+        let Ok(barrier) = timed(
+            perf_stage!("leader.attempt.barrier"),
+            by(deadline, handle.direct_lease_index()),
+        )
+        .await
+        else {
+            return leadership();
+        };
+        // A cancelled earlier attempt of this request may still be pending
+        // on these keys (its latch is gone but its entry is not applied):
+        // wait for it, so the dedup lookup below sees its record.
+        let waited = std::time::Instant::now();
+        for key in keys {
+            if by(deadline, clock.wait_latest(key)).await.is_err() {
+                return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Unavailable)));
+            }
+        }
+        perf_stage!("leader.attempt.wait_latest").since(waited);
+        // PERF2b: the barrier's applied check, the epochs, the dedup record
+        // and the anchor's newest version come from one snapshot (one
+        // Query-class native job, not four).
+        let snapshot = loop {
+            let snapshot = match timed(
+                perf_stage!("leader.attempt.read"),
+                by(
+                    deadline,
+                    handle.direct_snapshot(
+                        barrier,
+                        request.table_id,
+                        anchor.clone(),
+                        request.request_id,
+                    ),
+                ),
+            )
+            .await
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => return leadership(),
+                Err(error) if error.code == ErrorCode::StorageUnavailable => {
+                    return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Unavailable)));
+                }
+                Err(error) => return Err(failed(error)),
+            };
+            if snapshot.epochs.direct_schema.is_some() {
+                break snapshot;
+            }
+            // Not activated yet: activate (or fall back), then read again so
+            // every read follows the epochs it is checked against.
+            self.checked_epochs(handle, clock, request, snapshot.epochs, deadline)
+                .await?;
+        };
+        let epochs = timed(
+            perf_stage!("leader.attempt.epochs"),
+            self.checked_epochs(handle, clock, request, snapshot.epochs, deadline),
+        )
+        .await?;
+        // The dedup record decides before any fallback (T4fix concern 1).
+        match snapshot.dedup {
+            Err(error) if error.code == ErrorCode::StorageUnavailable => {
+                return Err(stale_route(Some(&epochs)));
+            }
+            Err(error) if error.code == ErrorCode::ValidationError => {
+                return Err(stale_route(Some(&epochs)));
+            }
+            Err(error) => return Err(failed(error)),
+            Ok(Some(found)) => {
+                return self
+                    .settled(found, request.digest)
+                    .map(|done| Prepared::Exit(Attempt::Done(done)));
+            }
+            // T7c: this id may belong to a queued request accepted before
+            // activation without a marker. Only the queued path knows it.
+            Ok(None) if self.gate.history_settling() => {
+                return Err(DirectResponse::Fallback {
+                    reason: FallbackReason::History,
+                });
+            }
+            Ok(None) => {}
+        }
+        let read = std::time::Instant::now();
+        let mut current = Vec::with_capacity(keys.len());
+        let mut first = Some(snapshot.latest);
+        for key in keys {
+            let latest = match first.take() {
+                Some(latest) => latest_value(latest, &epochs)?,
+                None => self.latest(handle, key.clone(), &epochs, deadline).await?,
+            };
+            match latest {
+                Some((version, value)) => {
+                    // Row keys hold rows; index entries are read separately.
+                    let row = value
+                        .map(|raw| serde_json::from_str::<Row>(raw.get()))
+                        .transpose()
+                        .map_err(|_| failed(corrupt()))?;
+                    current.push((version, row));
+                }
+                None => return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Unavailable))),
+            }
+        }
+        perf_stage!("leader.attempt.latest").since(read);
+        let Some(computed) = timed(
+            perf_stage!("leader.attempt.compute"),
+            self.compute(handle, table, operation, keys, current, &epochs, deadline),
+        )
+        .await?
+        else {
+            return Ok(Prepared::Exit(Attempt::Retry(RetryCause::Unavailable)));
+        };
+        let result = CanonicalJson::from_serializable(
+            &self.resources,
+            &computed.result,
+            MAX_DIRECT_RESULT_BYTES,
+        )
+        .map_err(|_| DirectResponse::Fallback {
+            reason: FallbackReason::ResourceLimit,
+        })?;
+        if computed.writes.is_empty() {
+            // A read-only outcome commits nothing and is recomputed on retry.
+            self.stats.read_only();
+            return Ok(Prepared::Exit(Attempt::Done(DirectResponse::Done(
+                DirectData::from_json(result.as_str()).map_err(failed)?,
+            ))));
+        }
+        Ok(Prepared::Commit {
+            epochs,
+            computed,
+            result,
+        })
+    }
+
     fn settled(
         &self,
         found: DedupLookup,
@@ -993,18 +1203,7 @@ impl DirectExecutor {
         epochs: &ParticipantEpochs,
         deadline: Instant,
     ) -> Result<Option<(Option<CommitTs>, Option<Box<RawValue>>)>, DirectResponse> {
-        match by(deadline, handle.direct_latest(key)).await {
-            Ok(LatestRead::Value { version, value }) => Ok(Some((version, value))),
-            Ok(LatestRead::Blocked) => Err(DirectResponse::Fallback {
-                reason: FallbackReason::Intent,
-            }),
-            Ok(LatestRead::SplitInProgress) => Err(DirectResponse::Fallback {
-                reason: FallbackReason::SplitInProgress,
-            }),
-            Ok(LatestRead::NotOwned) => Err(stale_route(Some(epochs))),
-            Err(error) if error.code == ErrorCode::StorageUnavailable => Ok(None),
-            Err(error) => Err(failed(error)),
-        }
+        latest_value(by(deadline, handle.direct_latest(key)).await, epochs)
     }
 
     /// Step 4 with the queued planner's row and index functions.
@@ -1469,6 +1668,44 @@ fn not_leader_or(handle: &ParticipantHandle, uncertain: bool) -> DirectResponse 
 /// `future`, or an unknown-outcome `StorageUnavailable` at `deadline`.
 /// Dropping a proposal at the deadline leaves its outcome to the dedup
 /// record, as for any proposal error.
+/// A key's newest version as `DirectExecutor::latest` reads it. `None` asks
+/// for a retry: a waiter was failed by a leadership change, or storage was
+/// briefly unavailable.
+#[allow(clippy::type_complexity)]
+fn latest_value(
+    read: Result<LatestRead, ProtocolError>,
+    epochs: &ParticipantEpochs,
+) -> Result<Option<(Option<CommitTs>, Option<Box<RawValue>>)>, DirectResponse> {
+    match read {
+        Ok(LatestRead::Value { version, value }) => Ok(Some((version, value))),
+        Ok(LatestRead::Blocked) => Err(DirectResponse::Fallback {
+            reason: FallbackReason::Intent,
+        }),
+        Ok(LatestRead::SplitInProgress) => Err(DirectResponse::Fallback {
+            reason: FallbackReason::SplitInProgress,
+        }),
+        Ok(LatestRead::NotOwned) => Err(stale_route(Some(epochs))),
+        Err(error) if error.code == ErrorCode::StorageUnavailable => Ok(None),
+        Err(error) => Err(failed(error)),
+    }
+}
+
+/// True when `commit_ts` is above every version the attempt read. A
+/// timestamp fetched while the reads ran (PERF2b) can be older than a
+/// version that applied meanwhile; apply would reject it with `Conflict`.
+fn above_read_versions(commit_ts: CommitTs, writes: &[DirectWrite]) -> bool {
+    writes.iter().all(|write| {
+        write
+            .expected_version
+            .is_none_or(|version| commit_ts > version)
+            && write.index.iter().all(|change| {
+                change
+                    .expected_version
+                    .is_none_or(|version| commit_ts > version)
+            })
+    })
+}
+
 async fn by<T>(
     deadline: Instant,
     future: impl std::future::Future<Output = Result<T, ProtocolError>>,

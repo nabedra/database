@@ -500,6 +500,8 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
         .map(|index| OwnedRaftEntry::<Bump>::new(id(index), Payload::Blank))
         .collect();
     log.append(entries, IOFlushed::noop()).await.unwrap();
+    // `append` returns before its sync (PERF2d); a host applies only after it.
+    log.drain().await;
     let _deferred = store.defer_apply_sync(log.group()).unwrap();
     let apply = |index: u64| {
         store.transaction(
@@ -625,6 +627,8 @@ async fn o06_o11_wide_append_writes_bounded_synced_batches() {
     }));
     let before = store.write_stats().synced_requests;
     log.append(entries, IOFlushed::noop()).await.unwrap();
+    // `append` returns before its synced writes (PERF2d).
+    log.drain().await;
     assert_eq!(
         store.write_stats().synced_requests - before,
         expected.len() as u64
@@ -737,6 +741,19 @@ impl LogRig {
         }
         Ok(Self { logs, pool, shared })
     }
+    /// Joins every pending log operation, then drops the pool, as the host does
+    /// before it releases a replica. An append task outlives its `IOFlushed`
+    /// callback (PERF2d) and holds the pool, so dropping without the join and
+    /// reopening at once can meet the old worker owner ("worker storage capacity
+    /// unavailable", KVfix4). Durable state is unchanged: the oracle holds only
+    /// synced entries.
+    async fn close(self) {
+        for log in &self.logs {
+            tokio::time::timeout(Duration::from_secs(30), log.drain())
+                .await
+                .expect("pending log operations finish");
+        }
+    }
     async fn append(&mut self, group: usize, oracle: &mut LogOracle) -> std::io::Result<()> {
         let index = oracle.next[group];
         let id = (group as u64) << 32 | index;
@@ -748,7 +765,14 @@ impl LogRig {
             OwnedCommand::new_owned(Bump { id, pad }, &self.shared, ByteClass::Data).unwrap();
         let entry = OwnedRaftEntry::new(ns13_id(index), Payload::Normal(command));
         let bytes = serde_json::to_vec(&entry).unwrap();
-        self.logs[group].append([entry], IOFlushed::noop()).await?;
+        // The oracle keeps acknowledged entries: wait for the sync (PERF2d).
+        let (flushed, synced) = <CounterConfig as openraft::type_config::TypeConfigExt>::oneshot();
+        self.logs[group]
+            .append([entry], IOFlushed::signal(flushed))
+            .await?;
+        synced
+            .await
+            .map_err(|_| std::io::Error::other("append callback dropped"))??;
         oracle.entries[group].insert(index, bytes);
         oracle.next[group] = index + 1;
         Ok(())
@@ -952,12 +976,12 @@ async fn ns13_o06_o11_lagging_group_pins_the_oldest_segment_until_gc_relocates_i
     // A last lagging entry stays unflushed in the memtable, then the machine
     // crashes: the reopen replays it and reads every entry back.
     rig.append(LAGGING, &mut oracle).await.unwrap();
-    drop(rig);
+    rig.close().await;
     let crashed = fault.crash();
     let mut rig = LogRig::open(&path, &layout, &crashed, true).await.unwrap();
     assert!(rig.pool.kv_store().quarantined().is_empty());
     rig.check(&oracle, "reopen").await;
-    drop(rig);
+    rig.close().await;
     let mut rig = LogRig::open(&path, &layout, &crashed.crash(), true)
         .await
         .unwrap();
@@ -1032,7 +1056,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             }
         }
         crashed_runs += usize::from(fault.is_crashed());
-        drop(rig);
+        rig.close().await;
         let context = format!("crash after window op {k}");
         let image = fault.crash();
         let mut rig = LogRig::open(&path, &layout, &image, true)
@@ -1040,7 +1064,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
         assert!(rig.pool.kv_store().quarantined().is_empty(), "{context}");
         rig.check(&oracle, &context).await;
-        drop(rig);
+        rig.close().await;
         let mut rig = LogRig::open(&path, &layout, &image.crash(), true)
             .await
             .unwrap_or_else(|error| panic!("{context}: second reopen: {error}"));
@@ -1116,6 +1140,7 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
                 log.purge(ns13_id(next - lag - 1)).await.unwrap();
             }
         }
+        log.drain().await;
         let flushed = pool.clone();
         tokio::task::spawn_blocking(move || {
             flushed.kv_store().flush().unwrap();
@@ -1157,3 +1182,23 @@ mod replicated;
 
 mod kv_crash;
 mod transient;
+
+/// PERF2b: the inline digest of a small entry hashes the same bytes as the
+/// native job's `serialized_digest`, and an entry over the bound goes to the
+/// native job instead (`None`).
+#[test]
+fn d01_perf2b_inline_digest_equals_the_native_digest() {
+    let small = serde_json::json!({"id": 1, "tag": "é𝄞", "values": [1, 2, 3]});
+    assert_eq!(
+        bounded_digest(&small, INLINE_BYTES).unwrap().unwrap(),
+        serialized_digest(&small).unwrap()
+    );
+    let exact = serde_json::to_vec(&small).unwrap().len();
+    assert_eq!(
+        bounded_digest(&small, exact).unwrap().unwrap(),
+        serialized_digest(&small).unwrap()
+    );
+    assert!(bounded_digest(&small, exact - 1).is_none());
+    let large = serde_json::json!({"blob": "x".repeat(INLINE_BYTES)});
+    assert!(bounded_digest(&large, INLINE_BYTES).is_none());
+}

@@ -42,6 +42,7 @@ class _KeepAliveTLSServer(ThreadingHTTPServer):
         self.lock = threading.Lock()
         self.accepted = 0
         self.seen = []          # (connection number, operation, request ID)
+        self.sockets = []       # server-side TLS sockets, in accept order
         self.actions = []       # per-request behavior, default 'ok'
         self.finished = threading.Semaphore(0)
         super().__init__(('127.0.0.1', 0), _Handler)
@@ -52,6 +53,7 @@ class _KeepAliveTLSServer(ThreadingHTTPServer):
         tls = self.context.wrap_socket(raw, server_side=True)
         with self.lock:
             self.accepted += 1
+            self.sockets.append(tls)
         return tls, address
 
     def shutdown_request(self, request):
@@ -194,6 +196,27 @@ class ConnectionReuseTests(unittest.TestCase):
         self.wait_for_server_close()
         self.assertIsNone(self.transport.request('table.insert', {}))
         self.assertEqual(self.server.accepted, 2)
+        self.assertEqual([(n, op) for n, op, _ in self.server.seen], [(1, 'table.get'), (2, 'table.insert')])
+
+    def test_o01_perf2e_reuse_bound_stays_under_the_server_idle_bound(self):
+        # The OLTP API keeps an idle connection 30 s (server/src/network.rs).
+        self.assertEqual(_http_pool.MAX_IDLE_SECONDS, 25.0)
+        self.transport.request('table.get', {})
+        time.sleep(2.5)   # past the former 2 s bound
+        self.transport.request('table.insert', {})
+        self.assertEqual(self.server.accepted, 1)
+        self.assertEqual([(n, op) for n, op, _ in self.server.seen], [(1, 'table.get'), (1, 'table.insert')])
+
+    def test_o01_perf2e_connection_evicted_while_idle_is_replaced_before_sending(self):
+        # A full OLTP listener evicts its oldest idle connection: the server closes
+        # it cleanly some time after the response, without reading another byte.
+        self.transport.request('table.get', {})
+        time.sleep(0.2)
+        self.server.sockets[0].shutdown(socket.SHUT_RDWR)
+        self.wait_for_server_close()
+        self.assertIsNone(self.transport.request('table.insert', {}))
+        self.assertEqual(self.server.accepted, 2)
+        # The mutation was sent once, on the new connection.
         self.assertEqual([(n, op) for n, op, _ in self.server.seen], [(1, 'table.get'), (2, 'table.insert')])
 
     def test_o01_hangup_after_send_surfaces_without_retry_and_drops_connection(self):

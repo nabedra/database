@@ -68,6 +68,23 @@ pub enum TrafficClass {
     RaftProgress,
 }
 impl TrafficClass {
+    pub(crate) const ALL: [Self; 15] = [
+        Self::ControlConsensus,
+        Self::DataConsensus,
+        Self::Authority,
+        Self::QueueControl,
+        Self::QueueData,
+        Self::Snapshot,
+        Self::Storage,
+        Self::ControlSnapshot,
+        Self::ServiceAuthority,
+        Self::ApiIngress,
+        Self::ApiObservation,
+        Self::Settlement,
+        Self::ServiceMutation,
+        Self::ControlDelegation,
+        Self::RaftProgress,
+    ];
     pub fn byte_class(self) -> ByteClass {
         match self {
             Self::ControlConsensus
