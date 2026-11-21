@@ -186,7 +186,8 @@ where
         learner: ReplicatedLearner,
         removed: u64,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
-        self.replace_voter_applied(learner, removed, None).await
+        self.replace_voter_applied(learner, removed, None, true)
+            .await
     }
 
     async fn replace_voter_applied(
@@ -194,6 +195,7 @@ where
         learner: ReplicatedLearner,
         removed: u64,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         let _change = self.membership_changes.lock().await;
         let current = self.observe_membership().await?;
@@ -216,11 +218,23 @@ where
         next.sort_by_key(|member| member.node_id);
         validate_voters(&next).map_err(|_| invalid())?;
         let next = Page::new(next).map_err(|_| invalid())?;
-        self.finish_replacement(&current.replicas, &next, &learner.target, target_applied)
-            .await
+        self.finish_replacement(
+            &current.replicas,
+            &next,
+            &learner.target,
+            target_applied,
+            retain_removed,
+        )
+        .await
     }
     /// Drive or resume the exact durable replacement plan. A stable voter set
     /// is evidence for this plan only if it replaces the specified voter.
+    ///
+    /// `retain_removed` keeps the removed voter as a learner in the final
+    /// membership. A live removed replica needs that: it must apply the final
+    /// membership to retire (`verify_removed`), and the leader stops
+    /// replicating to a node the final membership no longer names. Only a
+    /// lost voter, which never retires (system replacement), is dropped.
     pub(crate) async fn reconcile_voter_replacement(
         &self,
         old: &[ReplicaMember],
@@ -228,6 +242,7 @@ where
         target: &ReplicaMember,
         removed: u64,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         validate_voters(old).map_err(|_| invalid())?;
         validate_voters(next).map_err(|_| invalid())?;
@@ -246,14 +261,14 @@ where
         if let Ok(observed) = self.observe_membership().await {
             if observed.replicas() == old {
                 let learner = self.replicate_learner(observed, target.clone()).await?;
-                self.replace_voter_applied(learner, removed, target_applied)
+                self.replace_voter_applied(learner, removed, target_applied, retain_removed)
                     .await?;
             } else if observed.replicas() != next {
                 return Err(invalid());
             }
         } else {
             let _change = self.membership_changes.lock().await;
-            self.finish_replacement(old, next, target, target_applied)
+            self.finish_replacement(old, next, target, target_applied, retain_removed)
                 .await?;
         }
         let observed = self.observe_stable_membership().await?;
@@ -269,6 +284,7 @@ where
         next: &[ReplicaMember],
         target: &ReplicaMember,
         target_applied: Option<&PlacementCatchUp<'_>>,
+        retain_removed: bool,
     ) -> Result<GroupMembershipObservation, ProtocolError> {
         self.ensure_linearizable().await?;
         let old_ids = expected
@@ -350,7 +366,7 @@ where
                 Duration::from_secs(30),
                 self.raft.change_membership_if(
                     new_ids,
-                    false,
+                    retain_removed,
                     [Precondition::LastMembershipLogId {
                         last_membership_log_id: guarded_id,
                     }],
@@ -702,7 +718,8 @@ where
             return Err(invalid());
         }
         let membership = self
-            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None)
+            // As before REP5: the removed voter stays a learner.
+            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None, true)
             .await?;
         let proof = GroupDamageReplacement {
             group: membership.group.clone(),

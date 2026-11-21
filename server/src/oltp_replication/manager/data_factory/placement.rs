@@ -697,6 +697,8 @@ async fn native_vote(
         ReplicaMovePhase::Moving if member != &plan.request.target => {
             running.reconcile_voter_replacement(
                 &plan.old, &plan.next, &plan.request.target, plan.request.remove_node, target_applied,
+                // The source replica retires after applying the final membership.
+                true,
             ).await
         }
         ReplicaMovePhase::Moving | ReplicaMovePhase::Published { .. } => {
