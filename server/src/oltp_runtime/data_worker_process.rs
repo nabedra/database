@@ -423,6 +423,14 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                     },
                 )
                 .await;
+            // GC2: likewise for every enabled cluster feature this build
+            // supports (`data.direct.batch`).
+            control
+                .advertise_direct_feature(
+                    crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE,
+                    local,
+                )
+                .await;
             match startup_read(
                 deadline,
                 &last_error,

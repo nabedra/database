@@ -2,6 +2,7 @@
 //! `DirectForward` and dedup expiry. See the module doc in `mod.rs`.
 use super::{
     admission::{Admitted, DirectAdmission},
+    batcher::{Batchers, Committed},
     latches::{DEFAULT_STRIPES, KeyLatches},
     schema::{DirectSchema, DirectTable, SchemaLookup},
     stats::{DirectStats, DirectStatsSnapshot, ProposalFailure, RetryCause},
@@ -66,6 +67,12 @@ pub(crate) trait DirectGate: Send + Sync {
     fn history_settling(&self) -> bool {
         false
     }
+    /// GC2: Control enabled `data.direct.batch`, so concurrent commits to one
+    /// range may share a `DirectBatch` entry. False proposes one entry per
+    /// commit.
+    fn direct_batch(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,7 +104,9 @@ pub(crate) struct DirectExecutor {
     timestamps: DirectTimestampClient,
     admission: DirectAdmission,
     latches: KeyLatches,
-    stats: DirectStats,
+    stats: Arc<DirectStats>,
+    /// GC2: per-range `DirectBatch` batching, used while the gate allows.
+    batchers: Batchers,
     /// Ranges this worker served as leader, for the expiry task.
     served: Mutex<HashMap<Uuid, Weak<ParticipantHandle>>>,
     /// RD1: each group's epochs from its newest direct snapshot on this
@@ -156,12 +165,14 @@ impl DirectExecutor {
         Arc::new(Self {
             admission: DirectAdmission::new(resources.clone(), config.max_in_flight),
             latches: KeyLatches::new(config.latch_stripes),
+            // The members' encoded bytes, with room for the batch framing.
+            batchers: Batchers::new(resources.clone(), MAX_DIRECT_ENTRY_BYTES - (4 << 10)),
             resources,
             config,
             gate,
             schema,
             timestamps,
-            stats: DirectStats::default(),
+            stats: Arc::default(),
             served: Mutex::default(),
             known_epochs: Mutex::default(),
         })
@@ -1008,7 +1019,8 @@ impl DirectExecutor {
             result: result.clone(),
             applied_unix_ms: unix_ms(),
         };
-        if encoded_len(&commit) > MAX_DIRECT_ENTRY_BYTES {
+        let bytes = encoded_len(&commit);
+        if bytes > MAX_DIRECT_ENTRY_BYTES {
             return Err(DirectResponse::Fallback {
                 reason: FallbackReason::ResourceLimit,
             });
@@ -1025,30 +1037,48 @@ impl DirectExecutor {
                 return Err(failed(invalid("direct commit key cannot be encoded")));
             }
         }
-        let command = match OwnedCommand::new_owned(
-            ParticipantCommand::Direct(commit),
-            &self.resources,
-            ByteClass::Data,
-        ) {
-            Ok(command) => command,
-            Err(error) => {
-                clock.settle(commit_ts);
-                return Err(failed(error));
-            }
+        let proposed = if self.gate.direct_batch() {
+            perf_stage!("leader.attempt.build_command").since(build);
+            self.stats.proposed(rows, index_changes);
+            #[cfg(test)]
+            crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id)
+                .await;
+            // GC2: alone at once, or in the next `DirectBatch` of this range
+            // while its proposal is in flight.
+            timed(
+                perf_stage!("leader.attempt.propose"),
+                self.batchers
+                    .propose(&self.stats, handle, commit, bytes, deadline),
+            )
+            .await
+        } else {
+            let command = match OwnedCommand::new_owned(
+                ParticipantCommand::Direct(commit),
+                &self.resources,
+                ByteClass::Data,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    clock.settle(commit_ts);
+                    return Err(failed(error));
+                }
+            };
+            perf_stage!("leader.attempt.build_command").since(build);
+            self.stats.proposed(rows, index_changes);
+            // T9 process barrier (D04 before quorum): timestamp registered, entry not
+            // yet proposed.
+            #[cfg(test)]
+            crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id)
+                .await;
+            timed(
+                perf_stage!("leader.attempt.propose"),
+                by(deadline, handle.propose(command)),
+            )
+            .await
+            .map(|applied| Committed::of(applied.reply))
         };
-        perf_stage!("leader.attempt.build_command").since(build);
-        self.stats.proposed(rows, index_changes);
-        // T9 process barrier (D04 before quorum): timestamp registered, entry not
-        // yet proposed.
-        #[cfg(test)]
-        crate::oltp_runtime::recovery_tests::pause("direct-proposing", request.request_id).await;
-        let applied = match timed(
-            perf_stage!("leader.attempt.propose"),
-            by(deadline, handle.propose(command)),
-        )
-        .await
-        {
-            Ok(applied) => applied,
+        let committed = match proposed {
+            Ok(committed) => committed,
             Err(error) => {
                 // T4: the proposal no longer holds its local pending slot.
                 clock.settle(commit_ts);
@@ -1056,8 +1086,8 @@ impl DirectExecutor {
                 return Ok(Attempt::Retry(RetryCause::Unavailable));
             }
         };
-        let fault = match applied.reply {
-            ParticipantReply::Direct(DirectReply::Applied { .. }) => {
+        let fault = match committed {
+            Committed::Applied => {
                 self.stats.applied();
                 #[cfg(test)]
                 crate::oltp_runtime::recovery_tests::transaction_checkpoint(
@@ -1075,20 +1105,22 @@ impl DirectExecutor {
                     DirectData::from_json(result.as_str()).map_err(failed)?,
                 )));
             }
-            ParticipantReply::Direct(DirectReply::Replayed { result }) => {
+            Committed::Replayed(Some(result)) => {
                 self.stats.replayed();
                 return Ok(Attempt::Done(DirectResponse::Done(
                     DirectData::from_json(result.get()).map_err(failed)?,
                 )));
             }
-            ParticipantReply::Direct(DirectReply::Forwarded) => {
+            // GC2: a batch member's record existed. The next attempt reads
+            // it (step 3) and replays its result.
+            Committed::Replayed(None) => return Ok(Attempt::Retry(RetryCause::Conflict)),
+            Committed::Forwarded => {
                 return Err(DirectResponse::Fallback {
                     reason: FallbackReason::Forwarded,
                 });
             }
-            ParticipantReply::Direct(DirectReply::Rejected(fault))
-            | ParticipantReply::Rejected(fault) => fault,
-            _ => return Err(failed(corrupt())),
+            Committed::Rejected(fault) => fault,
+            Committed::Corrupt => return Err(failed(corrupt())),
         };
         // A definite rejection: this entry wrote nothing.
         match fault {

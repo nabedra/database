@@ -967,6 +967,13 @@ impl GatedLog {
         let log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
         (pool, log)
     }
+    /// Waits until a sync reached the closed gate (GC1; lost in the merge
+    /// of GC1 into `nabedra/hardening`, restored by GC2).
+    async fn entered(&self) {
+        while self.gated.state(|gate| gate.entered) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 /// O29/NS10 (FaultFs crash and power-loss models), PERF2d: a crash between an

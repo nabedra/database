@@ -61,8 +61,11 @@ pub(crate) struct DirectStats {
     gets: AtomicU64,
     mutations: AtomicU64,
     forwards: AtomicU64,
-    /// `DirectCommit` entries proposed.
+    /// `DirectCommit`s proposed (alone or as a `DirectBatch` member).
     proposed: AtomicU64,
+    /// GC2: `DirectBatch` entries proposed, and the commits they carried.
+    batch_entries: AtomicU64,
+    batched_commits: AtomicU64,
     applied: AtomicU64,
     replayed: AtomicU64,
     rows_proposed: AtomicU64,
@@ -121,6 +124,12 @@ impl DirectStats {
             .position(|bound| rows as u64 <= *bound)
             .unwrap_or(BATCH_BUCKETS.len());
         bump(&self.batch_buckets[bucket]);
+    }
+    /// GC2: one `DirectBatch` entry of `members` commits was proposed.
+    pub(crate) fn batch_entry(&self, members: usize) {
+        bump(&self.batch_entries);
+        self.batched_commits
+            .fetch_add(members as u64, Ordering::Relaxed);
     }
     pub(crate) fn applied(&self) {
         bump(&self.applied);
@@ -223,6 +232,8 @@ impl DirectStats {
             forwards: load(&self.forwards),
             entries_proposed: load(&self.proposed),
             entries_applied: load(&self.applied),
+            batch_entries: load(&self.batch_entries),
+            batched_commits: load(&self.batched_commits),
             replayed: load(&self.replayed),
             read_only: load(&self.read_only),
             pre_latch_epoch_reads: load(&self.epoch_reads),
@@ -261,6 +272,10 @@ pub(crate) struct DirectStatsSnapshot {
     pub forwards: u64,
     pub entries_proposed: u64,
     pub entries_applied: u64,
+    /// GC2: `DirectBatch` entries proposed; `batched_commits` of the
+    /// `entries_proposed` commits rode in them.
+    pub batch_entries: u64,
+    pub batched_commits: u64,
     pub replayed: u64,
     pub read_only: u64,
     /// RD1: mutations that read the group's epochs before latching.

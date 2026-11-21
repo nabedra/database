@@ -356,3 +356,258 @@ async fn o15_t7c_queued_history_note_opens_the_window_only_before_activation() {
     assert!(!activation.queued_history, "{activation:?}");
     assert_eq!(activation.history_until(1_000), None);
 }
+
+// ---------------------------------------------------------------------------
+// GC2: the `data.direct.batch` cluster feature
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// `actor`'s `data.direct.batch` advert, exactly as a feature-aware
+    /// worker sends it.
+    async fn advertise_batch(&mut self, actor: WorkerIdentity) -> ControlReply {
+        self.apply(ControlCommand::DirectCapability {
+            operation_id: crate::oltp_replication::authority::control::feature_operation_id(
+                crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE,
+                actor,
+            ),
+            actor,
+            action: DirectCapabilityOperation::Advertise {
+                version: DIRECT_VERSION,
+            },
+            unix_ms: crate::oltp_replication::authority::control::direct::wall_ms(),
+        })
+        .await
+    }
+    async fn batch_enabled(
+        &self,
+    ) -> Option<crate::oltp_replication::authority::control::FeatureActivation> {
+        let raw = self
+            .machine
+            .store()
+            .read(BUDGET, |view| {
+                let enabled: Option<
+                    crate::oltp_replication::authority::control::FeatureActivation,
+                > = view
+                    .get(super::super::machine::direct::batch_key())?
+                    .map(|raw| decode(raw.as_ref()))
+                    .transpose()?;
+                view.encode(&enabled)
+            })
+            .await
+            .unwrap();
+        decode(raw.as_ref()).unwrap()
+    }
+}
+
+/// The mixed-version proof for the feature's advert channel: a Control
+/// replica of the build before cluster features applies every entry a
+/// feature-aware cluster produces until the enablement (adverts, repeated
+/// adverts, re-evaluations, an old member joining) with the same reply and
+/// byte-identical state, so no Control replica diverges. The enablement
+/// needs every enrolled worker's advert, that is a cluster in which every
+/// Control voter (an enrolled worker) runs a feature-aware build.
+#[tokio::test]
+async fn o02_gc2_feature_adverts_apply_identically_on_a_pre_feature_control_replica() {
+    let directory = Directory::new();
+    let legacy = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
+    fixture.mirror_legacy(&legacy, scope, pool).await;
+    let workers = fixture.ready_cluster(3).await;
+    for worker in &workers {
+        fixture.advertise(*worker).await;
+    }
+    // Two members run the new build: their feature adverts are ordinary
+    // `Advertise { version: 1 }` entries to the old replica.
+    for worker in &workers[..2] {
+        assert!(matches!(
+            fixture.advertise_batch(*worker).await,
+            ControlReply::DirectCapability(DirectCapability {
+                advertised: true,
+                activation: Some(_),
+                ..
+            })
+        ));
+    }
+    // A repeated advert hits its receipt (another wall clock: a conflict)
+    // and re-evaluation is a no-op, on both builds alike.
+    assert_eq!(
+        fixture.advertise_batch(workers[0]).await,
+        ControlReply::Rejected(Fault::Conflict)
+    );
+    fixture
+        .direct(workers[1], DirectCapabilityOperation::Activate)
+        .await;
+    assert_eq!(fixture.batch_enabled().await, None, "workers[2] is old");
+    // A worker of the old build enrolls, advertises `data.direct.v1` and
+    // joins the ready set and a Data group: admitted on both builds.
+    let old = fixture.enroll(4).await;
+    fixture.advertise(old).await;
+    let mut members = workers.clone();
+    members.sort_by_key(|worker| worker.worker_id);
+    fixture.add_ready(old, &mut members).await;
+    let generation = fixture.begin_group().await;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    // workers[2] upgrades: still not every enrolled worker (`old`).
+    fixture.advertise_batch(workers[2]).await;
+    fixture
+        .direct(workers[0], DirectCapabilityOperation::Activate)
+        .await;
+    assert_eq!(fixture.batch_enabled().await, None);
+    // The last member upgrades. From here every enrolled worker, so every
+    // Control voter and learner, runs a feature-aware build: no pre-feature
+    // replica is left to mirror.
+    fixture.mirror = None;
+    assert!(matches!(
+        fixture.advertise_batch(old).await,
+        ControlReply::DirectCapability(DirectCapability {
+            advertised: true,
+            ..
+        })
+    ));
+    let enabled = fixture
+        .batch_enabled()
+        .await
+        .expect("the last advert enables");
+    assert_eq!(enabled.activated_at.index, fixture.next - 1);
+}
+
+/// Enablement is unanimous over enrolled workers, sticky and durable, and
+/// afterwards a joiner whose current identity did not advertise the feature
+/// is refused as a ready-set member and as a Data replica.
+#[tokio::test]
+async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope.clone(), pool.clone()).await;
+    let workers = fixture.ready_cluster(3).await;
+    // A feature advert is also a `data.direct.v1` advert. Before activation
+    // it is recorded but cannot enable the feature.
+    for worker in &workers[..2] {
+        fixture.advertise_batch(*worker).await;
+    }
+    assert_eq!(fixture.batch_enabled().await, None);
+    // The last member advertises only `data.direct.v1`: that activates, but
+    // the feature waits for its advert.
+    assert!(fixture.advertise(workers[2]).await.activation.is_some());
+    assert_eq!(fixture.batch_enabled().await, None);
+    assert!(matches!(
+        fixture.advertise_batch(workers[2]).await,
+        ControlReply::DirectCapability(DirectCapability {
+            activation: Some(_),
+            ..
+        })
+    ));
+    let enabled = fixture.batch_enabled().await.expect("unanimous");
+    // A new worker of the old build: it advertises only `data.direct.v1`.
+    let old = fixture.enroll(4).await;
+    fixture.advertise(old).await;
+    assert_eq!(fixture.batch_enabled().await, Some(enabled), "sticky");
+    let state = fixture.state().await;
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: state.ready.view,
+                target: old,
+            })
+            .await,
+        ControlReply::Rejected(Fault::DirectCapabilityRequired)
+    );
+    let generation = fixture.begin_group().await;
+    assert_eq!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
+            })
+            .await,
+        ControlReply::Rejected(Fault::DirectCapabilityRequired)
+    );
+    // A member that re-enrolls with a new process (a downgrade, say) must
+    // advertise again: the advert's operation id named its old identity.
+    let restarted = WorkerEnrollment {
+        worker_id: workers[2].worker_id,
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: workers[2].certificate_sha256,
+        endpoint: Text::try_from("127.0.0.1:1").unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+        enrollment_revision: 2,
+    };
+    let reply = fixture
+        .apply(ControlCommand::Enroll {
+            operation_id: Uuid::new_v4(),
+            expected: Some(workers[2]),
+            next: restarted,
+            authorization: authorization(),
+            previous_process: Some(ExclusionStamp {
+                worker: workers[2],
+                authorization: authorization(),
+                ownership_fence: hash(b"previous process"),
+            }),
+        })
+        .await;
+    if let ControlReply::Enrolled(restarted) = reply {
+        fixture.advertise(restarted).await;
+        let generation = fixture.begin_group().await;
+        assert_eq!(
+            fixture
+                .apply(ControlCommand::GroupPage {
+                    operation_id: Uuid::new_v4(),
+                    generation,
+                    replicas: Page::new(vec![replica(1, restarted)]).unwrap(),
+                })
+                .await,
+            ControlReply::Rejected(Fault::DirectCapabilityRequired)
+        );
+        fixture.advertise_batch(restarted).await;
+        assert!(matches!(
+            fixture
+                .apply(ControlCommand::GroupPage {
+                    operation_id: Uuid::new_v4(),
+                    generation,
+                    replicas: Page::new(vec![replica(1, restarted)]).unwrap(),
+                })
+                .await,
+            ControlReply::GroupBuilding { .. }
+        ));
+    }
+    // Once it upgrades and advertises, it joins.
+    fixture.advertise_batch(old).await;
+    let generation = fixture.begin_group().await;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::GroupPage {
+                operation_id: Uuid::new_v4(),
+                generation,
+                replicas: Page::new(vec![replica(1, workers[0]), replica(2, old)]).unwrap(),
+            })
+            .await,
+        ControlReply::GroupBuilding { .. }
+    ));
+    let state = fixture.state().await;
+    assert!(matches!(
+        fixture
+            .apply(ControlCommand::BeginJoin {
+                operation_id: Uuid::new_v4(),
+                expected: state.ready.view,
+                target: old,
+            })
+            .await,
+        ControlReply::JoinBegun { .. }
+    ));
+    // Durable: a reopened Control store keeps the enablement.
+    drop(fixture);
+    let reopened = Fixture::open(&directory, scope, pool).await;
+    assert_eq!(reopened.batch_enabled().await, Some(enabled));
+}
