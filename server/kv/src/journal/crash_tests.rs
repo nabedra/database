@@ -1278,11 +1278,8 @@ fn ns04_kvfix4_kill_before_a_rolls_dir_sync_then_crash_after_reopen_keeps_synced
     // sync_dir). It fails, and the journal latches with the rename still pending.
     fs.inject(Fault::on(FsOp::SyncDir).path_prefix(dir));
     let mut i = 0;
-    loop {
-        match put(&j, format!("b{i:03}")) {
-            Ok(_) => synced += 1,
-            Err(_) => break,
-        }
+    while put(&j, format!("b{i:03}")).is_ok() {
+        synced += 1;
         i += 1;
         assert!(i < 100, "the journal never rolled");
     }

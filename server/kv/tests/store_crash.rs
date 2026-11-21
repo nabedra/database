@@ -282,7 +282,7 @@ fn ns04_kvfix4_kill_inside_a_roll_then_crash_after_reopen_keeps_the_manifests_se
     let store = Store::open(&dir, options(&fs)).unwrap().store;
     let at_open = journal_dir_syncs(&fs);
     let mut model = Model::new();
-    let mut put = |store: &Store, model: &mut Model, i: usize| {
+    let put = |store: &Store, model: &mut Model, i: usize| {
         let key = format!("k{i:04}").into_bytes();
         let mut b = nabedra_kv::WriteBatch::new();
         b.put(&key, &[i as u8; 1000]);
