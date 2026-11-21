@@ -680,13 +680,13 @@ async fn backfill_and_retirement() -> (usize, usize) {
             false,
         )
         .await;
-    assert!(timestamps.advance_floor(authority).await.unwrap() <= read_ts.get());
+    assert!(timestamps.advance_floor(authority, None).await.unwrap() <= read_ts.get());
     assert_eq!(ready_snapshot.result().await, changed(7));
     let plan = ready_plan.result().await;
     assert!(plan.as_str().unwrap().contains(INDEX), "{plan}");
     let retained = fixture.stored_index_rows(backup.read_ts, 7).await.len();
     assert_eq!(retained, 2, "the backup retained the old covering entries");
-    assert!(timestamps.advance_floor(authority).await.unwrap() <= backup.read_ts.get());
+    assert!(timestamps.advance_floor(authority, None).await.unwrap() <= backup.read_ts.get());
     let reclaim =
         index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Reclaim);
     timestamps
@@ -886,7 +886,7 @@ async fn acceptance_o12() {
         marker("never-plan-incomplete-index", "passed", json!("queued query plans, exact results and configured point-read path while Building; typed status at validation and the Prepared Ready transaction"));
         marker("concurrent-writes-exactly-once", "passed", json!("same-ID retries on synchronous and queued insert, move and delete; exact covering query results, counts and native index entries"));
         marker("recovery-and-retired-snapshots", "passed", json!("same-run actor recovery, cold worker restart, interrupted Ready reconciliation and held queries spanning publication and retirement"));
-        let (before_run_bytes, after_run_bytes) = crate::oltp::mvcc::store::tests::index_reclamation_storage_evidence().await;
+        let (before_run_bytes, after_run_bytes) = crate::oltp::mvcc::store::index_reclamation_storage_evidence().await;
         marker("bounded-resources", "passed", json!({
             "backfill_page_and_cursor_bytes":page_peak, "bound_bytes":128 << 20,
             "retained_entries_at_backup_cut":retained, "remaining_retired_namespaces":0,

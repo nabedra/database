@@ -1783,4 +1783,6 @@ impl OwnedPayload for ParticipantCommand {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;
+#[cfg(test)]
+pub(crate) use tests::index_reclamation_storage_evidence;

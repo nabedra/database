@@ -47,12 +47,15 @@ impl Fixture {
             pool_id: Uuid::new_v4(),
         };
         let pool = match fs {
-            Some(fs) => OltpPool::open_development_on(
-                &dir.0,
-                identity.clone(),
-                shared.clone(),
-                Arc::new(fs.clone()),
-            ),
+            Some(fs) => {
+                fs.create_dir_all_durable(&dir.0);
+                OltpPool::open_development_on(
+                    &dir.0,
+                    identity.clone(),
+                    shared.clone(),
+                    Arc::new(fs.clone()),
+                )
+            }
             None => OltpPool::open_development(&dir.0, identity.clone(), shared.clone()),
         }
         .unwrap();
@@ -540,6 +543,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
     let reclaim = index_reclaim::ReclaimIndex {
         authority: f.authority,
         catalog_group_id: f.catalog_group_id,
+        table_id: f.table,
         index_id: retired,
         retired_at: ts(15),
         safe_ts: ts(16),
@@ -563,6 +567,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
             complete: false
         }
     );
+    fs.halt();
     let fs = fs.crash();
     let identity = f.machine.store.pool().identity().clone();
     let group = f.machine.store.identity().clone();
@@ -580,7 +585,7 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
         OltpPool::open_development_on(&_dir.0, identity, shared.clone(), Arc::new(fs.clone()))
             .unwrap();
     let mut f = Fixture {
-        machine: ParticipantMachine::new(pool.group(group).await.unwrap()).unwrap(),
+        machine: ParticipantMachine::new(pool.retained_group(group).await.unwrap()).unwrap(),
         shared,
         authority,
         index,
@@ -590,12 +595,13 @@ pub(crate) async fn index_reclamation_storage_evidence() -> (u64, u64) {
     };
     let mut deleted = 0;
     for _ in 0..4 {
+        let reply = f.submit(command.clone()).await;
         let ParticipantReply::IndexReclaimed {
             deleted: count,
             complete,
-        } = f.submit(command.clone()).await
+        } = reply
         else {
-            panic!("reclamation did not resume after reopening the durable cut");
+            panic!("reclamation did not resume after reopening the durable cut: {reply:?}");
         };
         assert!(count <= 32);
         deleted += count;
@@ -914,6 +920,7 @@ async fn o16_o21_o28_split_images_preserve_versions_indexes_and_exact_page_retry
     let reclaim = index_reclaim::ReclaimIndex {
         authority: f.authority,
         catalog_group_id: f.catalog_group_id,
+        table_id: f.table,
         index_id,
         retired_at: ts(11),
         safe_ts: ts(12),

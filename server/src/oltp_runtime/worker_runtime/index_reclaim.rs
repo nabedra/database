@@ -100,7 +100,11 @@ impl WorkerRuntime {
             CatalogRead::Value { version, .. } => version,
             CatalogRead::Blocked(_) => return Ok(true),
         };
-        let safe_ts = self.services.timestamps.advance_floor(authority).await?;
+        let safe_ts = self
+            .services
+            .timestamps
+            .advance_floor(authority, Some(retired_at))
+            .await?;
         if safe_ts <= retired_at.get() {
             return Ok(true);
         }
@@ -108,6 +112,7 @@ impl WorkerRuntime {
             ParticipantCommand::ReclaimIndex(ReclaimIndex {
                 authority,
                 catalog_group_id: pin.catalog.group_id,
+                table_id,
                 index_id,
                 retired_at,
                 safe_ts: ReadTs::new(safe_ts).map_err(|_| unknown())?,

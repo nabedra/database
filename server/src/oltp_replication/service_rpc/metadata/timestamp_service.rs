@@ -211,6 +211,7 @@ enum Request {
     },
     AdvanceFloor {
         authority: Authority,
+        retired_at: Option<CommitTs>,
     },
 }
 impl Request {
@@ -901,8 +902,15 @@ impl TimestampEndpoint {
             Request::AllocateDirect { count } => {
                 encode(shared, self.handle.allocate_direct(count).await?).await
             }
-            Request::AdvanceFloor { authority } => {
-                encode(shared, self.handle.advance_floor(authority).await?).await
+            Request::AdvanceFloor {
+                authority,
+                retired_at,
+            } => {
+                encode(
+                    shared,
+                    self.handle.advance_floor(authority, retired_at).await?,
+                )
+                .await
             }
             Request::Allocation { permit } => {
                 let statement = permit.statement();
@@ -2058,8 +2066,15 @@ impl DirectTimestampSource for TimestampClient {
     }
 }
 impl TimestampService for TimestampClient {
-    fn advance_floor(&self, authority: Authority) -> ConsensusFuture<'_, u64> {
-        Box::pin(self.value(Request::AdvanceFloor { authority }))
+    fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> ConsensusFuture<'_, u64> {
+        Box::pin(self.value(Request::AdvanceFloor {
+            authority,
+            retired_at,
+        }))
     }
     fn native_archive_page<'a>(&'a self,closure:&'a VerifiedArchiveClosure,after:Option<Vec<u8>>)->ConsensusFuture<'a,crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage>{
         Box::pin(async move {

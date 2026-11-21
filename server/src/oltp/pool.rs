@@ -1919,6 +1919,14 @@ impl<'a> GroupTransaction<'a> {
     ) -> Result<ScanProgress, ProtocolError> {
         self.read.scan_page(prefix, after, max_items, visit)
     }
+    pub(crate) fn scan_page_until(
+        &mut self,
+        prefix: &[u8],
+        max_items: usize,
+        visit: impl FnMut(&[u8], &[u8]) -> Result<bool, ProtocolError>,
+    ) -> Result<ScanProgress, ProtocolError> {
+        self.read.scan_page_until(prefix, None, max_items, visit)
+    }
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
         if key.len() > MAX_KEY_BYTES {
             return Err(capacity());

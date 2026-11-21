@@ -17,7 +17,11 @@ use crate::oltp_replication::{
 use std::sync::Arc;
 use uuid::Uuid;
 pub(crate) trait TimestampService: Send + Sync {
-    fn advance_floor(&self, authority: Authority) -> ConsensusFuture<'_, u64>;
+    fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> ConsensusFuture<'_, u64>;
     fn native_archive_page<'a>(&'a self, closure: &'a VerifiedArchiveClosure, after: Option<Vec<u8>>) -> ConsensusFuture<'a, crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage>;
     fn archive_closure<'a>(
         &'a self,
@@ -172,8 +176,12 @@ pub(crate) trait TimestampService: Send + Sync {
     ) -> ConsensusFuture<'a, Applied<TimestampReply>>;
 }
 impl TimestampService for TimestampHandle {
-    fn advance_floor(&self, authority: Authority) -> ConsensusFuture<'_, u64> {
-        Box::pin(TimestampHandle::advance_floor(self, authority))
+    fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> ConsensusFuture<'_, u64> {
+        Box::pin(TimestampHandle::advance_floor(self, authority, retired_at))
     }
     fn native_archive_page<'a>(&'a self, closure: &'a VerifiedArchiveClosure, after: Option<Vec<u8>>) -> ConsensusFuture<'a, crate::oltp_replication::authority::status::identity::transaction::archive_images::MetadataArchivePage>{
         Box::pin(TimestampHandle::native_archive_page(self, closure, after))

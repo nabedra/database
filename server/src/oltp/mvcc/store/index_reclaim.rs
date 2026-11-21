@@ -1,6 +1,7 @@
 use super::*;
 
 const PAGE_ITEMS: usize = 32;
+const PAGE_BYTES: usize = 512 << 10;
 
 impl ParticipantHandle {
     pub(crate) async fn next_stored_index(
@@ -54,6 +55,7 @@ impl ParticipantHandle {
 pub(crate) struct ReclaimIndex {
     pub authority: Authority,
     pub catalog_group_id: Uuid,
+    pub table_id: Uuid,
     pub index_id: Uuid,
     pub retired_at: CommitTs,
     pub safe_ts: ReadTs,
@@ -95,6 +97,7 @@ pub(super) fn apply(
         return reject(tx, Fault::StaleAuthority);
     }
     if command.catalog_group_id != config.catalog_group_id
+        || command.table_id != table_id
         || command.index_id.is_nil()
         || command.safe_ts <= command.retired_at
     {
@@ -152,7 +155,11 @@ fn remove_page(
     limit: usize,
 ) -> Result<(usize, bool), ProtocolError> {
     let prefix = index_prefix(tag, table_id, index_id);
-    let progress = tx.scan_page(&prefix, None, limit, |_, _| Ok(()))?;
+    let mut bytes = 0usize;
+    let progress = tx.scan_page_until(&prefix, limit, |key, value| {
+        bytes += key.len() + value.len();
+        Ok(bytes >= PAGE_BYTES)
+    })?;
     if progress.visited != 0 {
         // The next key after a fully encoded entry is outside the deleted
         // range. The prefix end also covers UUIDs that end in 0xff.
