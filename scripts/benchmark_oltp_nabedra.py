@@ -71,6 +71,15 @@ def worker_cpu_quotas(value):
     return nanocpus
 
 
+def api_cpu_quota(value):
+    """PERF1: the API container's CPU quota, or `none` for no quota."""
+    if value == 'none':
+        return None
+    if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]{1,9})?|\.[0-9]{1,9})', value) or Decimal(value) <= 0:
+        raise argparse.ArgumentTypeError('supply a positive decimal CPU quota or none')
+    return format(Decimal(value).normalize(), 'f')
+
+
 def uid():
     return str(uuid4())
 
@@ -622,6 +631,7 @@ class Cluster:
     def launch(self, alias, cpu, memory, entry, arguments, *, options=()):
         name = f'{self.prefix}-{alias}'
         self.containers.append(name)
+        cpus = [] if cpu is None else ['--cpus', cpu]
         mounts = ['--mount', f'type=bind,source={self.directory},target=/fixture,readonly',
                   '--mount', f'type=bind,source={ROOT},target=/source,readonly',
                   '--mount', f'type=bind,source={self.args.orm_source},target=/orm,readonly']
@@ -632,7 +642,7 @@ class Cluster:
             log_options = ['--log-driver', 'json-file', '--log-opt', 'max-size=16m', '--log-opt', 'max-file=1',
                            '-e', 'NABEDRA_OLTP_RPC_TRACE=1']
         self.docker('run', '-d', '--pull=never', '--name', name, '--network', self.prefix, '--network-alias', alias,
-                    '--cpus', cpu, '--memory', str(memory), '--memory-swap', str(memory), '--pids-limit', '96',
+                    *cpus, '--memory', str(memory), '--memory-swap', str(memory), '--pids-limit', '96',
                     *log_options, '--user', '0:0', '-e', 'PYTHONDONTWRITEBYTECODE=1',
                     '-e', 'PYTHONPATH=/orm', *mounts, *options, '--entrypoint', entry,
                     self.image, *arguments)
@@ -747,8 +757,10 @@ cp "/fixture/$1-volume.json" /data/.nabedra-docker-volume.json
 ''' + launch + '''"$2" worker --bootstrap "/tmp/config/$1.json"
 '''
             cpu = format(Decimal(self.worker_nano_cpus[name]).scaleb(-9).normalize(), 'f')
+            hold = ('-e', 'NABEDRA_BENCH_HOLD_COMPACTION=1') if self.args.hold_compaction else ()
             self.launch(name, cpu, WORKER_MEMORY, 'sh', ['-c', script, 'worker', name, self.binary],
-                        options=('-p', '127.0.0.1::8000', '--mount', f'type=volume,source={volume},target=/data'))
+                        options=('-p', '127.0.0.1::8000', '--mount', f'type=volume,source={volume},target=/data',
+                                 *hold))
         worker_urls = {name: self.host_url(name) for name in WORKERS}
         print('Waiting for three OLTP workers', flush=True)
         self.metadata['ready'] = self.worker_ready(worker_urls)
@@ -795,7 +807,7 @@ TRACE_WRAPPER
 fi
 exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
 '''
-        self.launch('api', API_CPU, API_MEMORY, 'sh', ['-c', script, 'api', self.binary], options=('-p', '127.0.0.1::8000'))
+        self.launch('api', self.args.api_cpus, API_MEMORY, 'sh', ['-c', script, 'api', self.binary], options=('-p', '127.0.0.1::8000'))
         print('Waiting for the remote OLTP API', flush=True)
         self.metadata['ready'].update(self.worker_ready({'api': self.host_url('api', 'https')},
                                      ca=ssl.create_default_context(cafile=str(self.directory / 'ca.pem')), deadline_seconds=40))
@@ -1044,8 +1056,9 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         self.metadata['docker_environment'] = {key: host.get(key) for key in (
             'ServerVersion', 'OperatingSystem', 'Architecture', 'KernelVersion', 'NCPU', 'MemTotal', 'CgroupVersion')}
         self.metadata['allocations'] = {'worker_bytes': WORKER_MEMORY,
-            'api_cpu': float(API_CPU), 'api_bytes': API_MEMORY, 'driver_cpu': float(DRIVER_CPU),
-            'driver_bytes': DRIVER_MEMORY, 'total_cpu': 4, 'total_bytes': 7_900_000_000}
+            'api_cpu': None if args.api_cpus is None else float(args.api_cpus), 'api_bytes': API_MEMORY, 'driver_cpu': float(DRIVER_CPU),
+            'driver_bytes': DRIVER_MEMORY, 'total_cpu': 4, 'total_bytes': 7_900_000_000,
+            'hold_compaction': bool(args.hold_compaction)}
         allocations = self.metadata['allocations']
         if args.worker_cpus == DEFAULT_WORKER_CPUS:
             allocations['worker_cpu'] = 1.0
@@ -1115,7 +1128,7 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
         try:
             time.sleep(args.perf_delay)
             pids = {name: self.docker('inspect', '--format', '{{.State.Pid}}', f'{self.prefix}-{name}').strip()
-                    for name in WORKERS}
+                    for name in (*WORKERS, 'api')}
             write_json(args.output / 'perf-pids.json', pids)
             data = args.output / 'perf.data'
             # The workers run as root in their containers: perf needs root to attach.
@@ -1147,7 +1160,7 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                     stack.append(re.sub(r'\+0x[0-9a-f]+$', '', symbol).replace(';', ':'))
             script.wait(timeout=900)
             names = {pid: name for name, pid in pids.items()}
-            for name in WORKERS:
+            for name in pids:
                 with (args.output / f'perf-folded-{name}.txt').open('w') as stream:
                     for (pid, stack), count in sorted(folded.items()):
                         if names.get(pid) == name:
@@ -1232,7 +1245,8 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             except (RuntimeError, subprocess.SubprocessError) as error:
                 errors.append(str(error))
         limits = {worker: (cpu, WORKER_MEMORY) for worker, cpu in self.worker_nano_cpus.items()}
-        limits.update(api=(350_000_000, API_MEMORY), driver=(650_000_000, DRIVER_MEMORY))
+        api_nano = 0 if self.args.api_cpus is None else int(Decimal(self.args.api_cpus) * NANO_CPUS)
+        limits.update(api=(api_nano, API_MEMORY), driver=(650_000_000, DRIVER_MEMORY))
         cap_errors = []
         for name, record in runtime.items():
             role = name.rsplit('-', 1)[-1]
@@ -1241,8 +1255,10 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
                 cap_errors.append(f'{name} did not have the requested CPU, memory and swap caps')
         total_cpu = sum(item['nano_cpus'] for item in runtime.values())
         total_memory = sum(item['memory'] for item in runtime.values())
+        # PERF1: an API quota other than NS11's 0.35 is a factor run outside the 4-CPU budget.
+        cpu_budget = 4_000_000_000 if self.args.api_cpus == API_CPU else float('inf')
         budget_verified = (not cap_errors and len(runtime) == len(WORKERS) + 2
-                           and total_cpu <= 4_000_000_000 and total_memory <= 8_000_000_000)
+                           and total_cpu <= cpu_budget and total_memory <= 8_000_000_000)
         errors.extend(cap_errors)
         if not budget_verified:
             errors.append('could not verify the complete cluster and driver resource budget')
@@ -1261,6 +1277,10 @@ def main():
     parser.add_argument('--image', help='locally available Docker image containing Python 3.11 and nabedra-db')
     parser.add_argument('--binary', type=Path, help='use this release Linux binary with the image instead')
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--api-cpus', type=api_cpu_quota, default=API_CPU,
+                        help='PERF1: API container CPU quota (default %(default)s, NS11), or none')
+    parser.add_argument('--hold-compaction', action='store_true',
+                        help='PERF1, benchmark only: hold compaction off on every worker (L0 triggers out of reach)')
     parser.add_argument('--worker-cpus', type=worker_cpu_quotas, default=DEFAULT_WORKER_CPUS,
                         help='comma-separated CPU quotas for w1, w2 and w3 (default: 1,1,1)')
     parser.add_argument('--status-seed-worker', choices=WORKERS,

@@ -776,7 +776,8 @@ jobs:
   # PERF1: CPU profile of the RF3 direct path. Opt-in with [ci perf]: builds a release binary with
   # frame pointers (for perf call graphs; the bench job's binary stays the comparison build), runs
   # the benchmark driver on this runner with the NS11 caps, records per-stage timings from
-  # /v1/runtime/stats and samples every worker with perf at idle (serial pair) and at 50 updates/s.
+  # /v1/runtime/stats and samples every worker and the API with perf at idle (serial pair), at 50 and at
+  # 150 updates/s.
   perf:
     name: direct path CPU profile and stage timings (PERF1)
     if: contains(github.event.head_commit.message, '[ci perf]')
@@ -813,6 +814,15 @@ jobs:
           cd scripts
           python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/rate50" --rates 50 --seconds 60 --warmup-seconds 5 --repetitions 1 \
+            --clients 32 --rows 5000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
+      # PERF1 (hardening): per-update CPU at the API (perf now samples it too) and the leader at 150/s,
+      # above the old two-worker API admission ceiling.
+      - name: 150 updates/s with perf
+        run: |
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/rate150" --rates 150 --seconds 60 --warmup-seconds 5 --repetitions 1 \
             --clients 32 --rows 5000 --seed 20261118 --timeout 10 --perf-record 25 --perf-delay 25 --perf-frequency 999 --perf-call-graph fp
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/perf-out" || true
       - if: always()
