@@ -647,6 +647,9 @@ jobs:
     needs: features
     runs-on: ubuntu-24.04
     timeout-minutes: 300
+    # RD2 TEMPORARY A/B (revert before merge): role checks not kept warm.
+    env:
+      NABEDRA_BENCH_NO_GRANT_WARM: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
