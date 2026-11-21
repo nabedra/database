@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::OnceLock, time::Duration};
 use uuid::Uuid;
 
 pub(crate) mod index_faults;
+pub(crate) mod index_holds;
 
 struct Barrier {
     stage: String,

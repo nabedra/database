@@ -154,7 +154,9 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
             if code == StatusCode::OK && observed["data"]["state"] == "ready" {
                 break;
             }
-            assert!(code == StatusCode::SERVICE_UNAVAILABLE || (code == StatusCode::OK && observed["data"]["state"] == "building"), "{code} {observed}");
+            // A status read answers its state or a typed retryable error (IDX1).
+            assert!((code == StatusCode::SERVICE_UNAVAILABLE && observed["error"]["outcome"] == "not_applied")
+                || (code == StatusCode::OK && observed["data"]["state"] == "building"), "{code} {observed}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
@@ -198,6 +200,110 @@ async fn o12_u01_protected_index_management_uses_exact_catalog_job() {
         assert!(!data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
         assert_eq!(data(&app, "query.collect", query).await, rows);
         drop((app, live_closure, ready));
+        runtime.stop_accepting();
+        runtime.drain().await.unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
+    }).await.unwrap();
+}
+
+/// IDX1 (D11, O12): `storage.index.status` is a read. The real build actor is held
+/// after Prepare and after the commit decision of each metadata transaction, while
+/// its Catalog intents are unresolved. Every status poll at a hold answers the
+/// current state, or a typed retryable `not_applied` error while the Ready
+/// publication is undecided, and returns promptly. It never answers outcome_unknown.
+/// After the Ready decision it helps the decided intent and answers `ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d11_o12_index_status_during_ready_publication_is_never_outcome_unknown() {
+    use crate::oltp_runtime::recovery_tests::index_holds::{self, Stage};
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let path = std::env::temp_dir().join(format!("nabedra-index-status-{}", Uuid::new_v4()));
+        let runtime = WorkerRuntime::open(
+            &path, DATABASE, DATA,
+            ExecutionConfig {
+                max_pending_requests: 32,
+                max_queue_bytes_per_replica: 8 << 20,
+                max_retained_result_bytes_per_worker: 8 << 20,
+                ..Default::default()
+            },
+            WorkerResources { max_threads: 2, memory_limit_bytes: 2 << 30, ..Default::default() },
+        ).await.unwrap();
+        let app = runtime.application_with_admin(DATA.into(), ADMIN.into()).unwrap();
+        let table = data(&app, "table.create", json!({
+            "name":"items", "schema":{"id":"int64", "category":"int64", "label":"utf8"},
+            "key":"id", "format":"parquet",
+        })).await["id"].clone();
+        assert_eq!(data(&app, "table.insert_many", json!({"table_id":table,"rows":[
+            {"id":1,"category":7,"label":"one"}, {"id":2,"category":3,"label":"two"},
+        ]})).await, json!(2));
+        let build_id = Uuid::new_v4();
+        let index_id = Uuid::new_v4();
+        let definition = json!({"table_id":table,"index_id":index_id,"name":"by_category","columns":["category"],"covering":["label"]});
+        let selector = json!({"table_id":table,"index_id":index_id,"build_id":build_id,"attempt":1});
+        // Declare without an actor, then hold every later metadata commit of this Catalog.
+        let occupied = runtime.index_builds.try_admit().unwrap();
+        let (code, created) = admin(&app, build_id, "storage.index.create", definition).await;
+        assert_eq!(code, StatusCode::OK, "{created}");
+        assert_eq!(created["data"]["state"], "building");
+        let catalog = runtime.services.catalog.participant().identity().group_id;
+        let mut holds = index_holds::register(catalog);
+        drop(occupied);
+        let resume = tokio::spawn({
+            let (app, selector) = (app.clone(), selector.clone());
+            async move { admin(&app, Uuid::new_v4(), "storage.index.resume", selector).await }
+        });
+
+        let (mut retryable, mut held_ready) = (Vec::new(), None);
+        while held_ready.is_none() {
+            let held = tokio::time::timeout(Duration::from_secs(60), holds.recv())
+                .await.expect("the build actor reached no further metadata commit")
+                .expect("hold channel closed");
+            let started = tokio::time::Instant::now();
+            let (code, reply) = admin(&app, Uuid::new_v4(), "storage.index.status", selector.clone()).await;
+            let observed = format!("{:?} {:?}: {code} {reply}", held.stage, held.txn);
+            assert!(started.elapsed() < Duration::from_secs(5), "status waited for the held actor: {observed}");
+            assert_ne!(reply["error"]["code"], "outcome_unknown", "{observed}");
+            assert_ne!(reply["error"]["outcome"], "unknown", "{observed}");
+            match code {
+                StatusCode::OK if reply["data"]["state"] == "ready" => {
+                    // Only a decided Ready publication can be helped to visibility.
+                    assert_eq!(held.stage, Stage::Decided, "{observed}");
+                    held_ready = Some(held.txn);
+                }
+                StatusCode::OK => assert_eq!(reply["data"]["state"], "building", "{observed}"),
+                StatusCode::SERVICE_UNAVAILABLE => {
+                    assert_eq!(reply["error"]["code"], "storage_unavailable", "{observed}");
+                    assert_eq!(reply["error"]["outcome"], "not_applied", "{observed}");
+                    // An undecided intent cannot be helped; a decided one always can.
+                    assert_eq!(held.stage, Stage::Prepared, "{observed}");
+                    retryable.push(held.txn);
+                }
+                _ => panic!("unexpected status answer: {observed}"),
+            }
+            held.release.send(()).ok();
+        }
+        index_holds::unregister(catalog);
+        drop(holds);
+        // The poll that was answered retryable is the Ready publication it then helped.
+        assert_eq!(retryable, held_ready.into_iter().collect::<Vec<_>>());
+        let (code, resumed) = resume.await.unwrap();
+        assert_eq!(code, StatusCode::OK, "{resumed}");
+        let owner = MaintenanceOwnerRef {
+            catalog_group_id: catalog,
+            table_id: serde_json::from_value(table.clone()).unwrap(), index_id, build_id, attempt: 1,
+        };
+        let closed = runtime.services.catalog.participant().strong_index_attempt_closed(owner).await.unwrap();
+        assert_eq!(closed.statement().kind, IndexClosedKind::Ready);
+        assert_eq!(Some(closed.archive_evidence().txn), held_ready);
+        let (code, observed) = admin(&app, Uuid::new_v4(), "storage.index.status", selector).await;
+        assert_eq!((code, observed["data"]["state"].clone()), (StatusCode::OK, json!("ready")), "{observed}");
+        let query = json!({"table_id":table,"query":{
+            "select":["id","label"],"filter":{"column":"category","op":"eq","value":7},
+            "order_by":null,"limit":null,
+        }});
+        assert!(data(&app, "query.explain", query.clone()).await.as_str().unwrap().contains("by_category"));
+        assert_eq!(data(&app, "query.collect", query).await, json!([{"id":1,"label":"one"}]));
+        drop((app, closed));
         runtime.stop_accepting();
         runtime.drain().await.unwrap();
         drop(runtime);
