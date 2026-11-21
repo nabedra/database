@@ -3,50 +3,50 @@
   "run": "soak100-before",
   "offered": 30000,
   "statuses": {
-   "client_capacity": 1010,
-   "succeeded": 28990
+   "client_capacity": 1019,
+   "succeeded": 28981
   },
-  "refused_pct": 3.37,
-  "p50_ms": 2.25,
-  "p99_ms": 20.69,
-  "max_ms": 3278.1,
+  "refused_pct": 3.4,
+  "p50_ms": 2.31,
+  "p99_ms": 29.91,
+  "max_ms": 2762.6,
   "phase_p99_ms": [
-   29.4,
-   17.6,
-   6.3,
-   36.7,
-   15.4
+   40.3,
+   30.8,
+   4.5,
+   47.4,
+   28.3
   ],
   "stall_windows": [
    {
-    "start_s": 43.9,
-    "end_s": 44.1,
+    "start_s": 44.4,
+    "end_s": 44.7,
     "requests": 32,
-    "max_ms": 1428.8
+    "max_ms": 2664.6
    },
    {
-    "start_s": 95.8,
-    "end_s": 96.0,
+    "start_s": 98.0,
+    "end_s": 98.3,
     "requests": 32,
-    "max_ms": 2119.8
+    "max_ms": 1888.0
    },
    {
-    "start_s": 146.1,
-    "end_s": 146.4,
+    "start_s": 149.1,
+    "end_s": 149.4,
     "requests": 32,
-    "max_ms": 2579.0
+    "max_ms": 2313.7
    },
    {
-    "start_s": 199.1,
-    "end_s": 199.4,
+    "start_s": 202.5,
+    "end_s": 202.8,
     "requests": 32,
-    "max_ms": 2213.5
+    "max_ms": 2057.4
    },
    {
-    "start_s": 251.1,
-    "end_s": 252.0,
-    "requests": 33,
-    "max_ms": 3278.1
+    "start_s": 254.8,
+    "end_s": 255.1,
+    "requests": 32,
+    "max_ms": 2762.6
    }
   ],
   "verification": 0,
@@ -57,19 +57,19 @@
     "max_sample_burst_mb": 0.0
    },
    "w1": {
-    "wbytes_mb": 5259.3,
-    "per_5000_entries_mb": 907.1,
-    "max_sample_burst_mb": 846.7
+    "wbytes_mb": 5338.9,
+    "per_5000_entries_mb": 921.1,
+    "max_sample_burst_mb": 703.0
    },
    "w2": {
-    "wbytes_mb": 5274.6,
-    "per_5000_entries_mb": 909.7,
-    "max_sample_burst_mb": 846.7
+    "wbytes_mb": 5330.5,
+    "per_5000_entries_mb": 919.7,
+    "max_sample_burst_mb": 689.4
    },
    "w3": {
-    "wbytes_mb": 5316.3,
-    "per_5000_entries_mb": 916.9,
-    "max_sample_burst_mb": 846.8
+    "wbytes_mb": 5260.6,
+    "per_5000_entries_mb": 907.6,
+    "max_sample_burst_mb": 674.5
    }
   }
  },
@@ -80,15 +80,15 @@
    "succeeded": 30000
   },
   "refused_pct": 0.0,
-  "p50_ms": 2.3,
-  "p99_ms": 10.22,
-  "max_ms": 73.3,
+  "p50_ms": 2.39,
+  "p99_ms": 10.75,
+  "max_ms": 55.5,
   "phase_p99_ms": [
-   17.9,
-   12.3,
-   10.2,
-   3.9,
-   9.2
+   18.2,
+   12.5,
+   11.9,
+   4.5,
+   11.8
   ],
   "stall_windows": [],
   "verification": 0,
@@ -99,19 +99,19 @@
     "max_sample_burst_mb": 0.0
    },
    "w1": {
-    "wbytes_mb": 3215.0,
-    "per_5000_entries_mb": 535.8,
-    "max_sample_burst_mb": 524.8
+    "wbytes_mb": 3254.7,
+    "per_5000_entries_mb": 542.4,
+    "max_sample_burst_mb": 524.6
    },
    "w2": {
-    "wbytes_mb": 3192.0,
-    "per_5000_entries_mb": 532.0,
-    "max_sample_burst_mb": 524.8
+    "wbytes_mb": 3159.8,
+    "per_5000_entries_mb": 526.6,
+    "max_sample_burst_mb": 524.7
    },
    "w3": {
-    "wbytes_mb": 3180.6,
-    "per_5000_entries_mb": 530.1,
-    "max_sample_burst_mb": 524.8
+    "wbytes_mb": 3193.9,
+    "per_5000_entries_mb": 532.3,
+    "max_sample_burst_mb": 524.7
    }
   }
  },
@@ -119,50 +119,50 @@
   "run": "soak50-before",
   "offered": 15000,
   "statuses": {
-   "client_capacity": 363,
-   "succeeded": 14637
+   "client_capacity": 349,
+   "succeeded": 14651
   },
-  "refused_pct": 2.42,
-  "p50_ms": 2.98,
-  "p99_ms": 140.41,
-  "max_ms": 3518.1,
+  "refused_pct": 2.33,
+  "p50_ms": 2.95,
+  "p99_ms": 189.1,
+  "max_ms": 3566.5,
   "phase_p99_ms": [
-   112.8,
-   2594.5,
-   5.6,
-   2448.0,
-   2897.6
+   161.1,
+   2511.7,
+   5.7,
+   2499.5,
+   2998.8
   ],
   "stall_windows": [
    {
-    "start_s": 34.8,
-    "end_s": 34.9,
-    "requests": 13,
-    "max_ms": 378.8
-   },
-   {
-    "start_s": 87.6,
-    "end_s": 88.2,
-    "requests": 32,
-    "max_ms": 3065.8
-   },
-   {
-    "start_s": 189.8,
-    "end_s": 190.5,
-    "requests": 32,
-    "max_ms": 2960.2
-   },
-   {
-    "start_s": 195.9,
-    "end_s": 196.5,
+    "start_s": 33.6,
+    "end_s": 34.7,
     "requests": 9,
-    "max_ms": 322.7
+    "max_ms": 330.3
    },
    {
-    "start_s": 292.0,
-    "end_s": 292.7,
+    "start_s": 88.6,
+    "end_s": 89.3,
     "requests": 32,
-    "max_ms": 3518.1
+    "max_ms": 3019.2
+   },
+   {
+    "start_s": 191.2,
+    "end_s": 191.9,
+    "requests": 32,
+    "max_ms": 2995.9
+   },
+   {
+    "start_s": 196.4,
+    "end_s": 197.0,
+    "requests": 11,
+    "max_ms": 318.6
+   },
+   {
+    "start_s": 294.6,
+    "end_s": 295.2,
+    "requests": 32,
+    "max_ms": 3566.5
    }
   ],
   "verification": 0,
@@ -173,19 +173,19 @@
     "max_sample_burst_mb": 0.0
    },
    "w1": {
-    "wbytes_mb": 1549.3,
-    "per_5000_entries_mb": 529.2,
-    "max_sample_burst_mb": 349.8
+    "wbytes_mb": 1610.0,
+    "per_5000_entries_mb": 549.4,
+    "max_sample_burst_mb": 305.5
    },
    "w2": {
-    "wbytes_mb": 1539.3,
-    "per_5000_entries_mb": 525.8,
-    "max_sample_burst_mb": 349.8
+    "wbytes_mb": 1572.1,
+    "per_5000_entries_mb": 536.5,
+    "max_sample_burst_mb": 267.7
    },
    "w3": {
-    "wbytes_mb": 1538.1,
-    "per_5000_entries_mb": 525.4,
-    "max_sample_burst_mb": 279.5
+    "wbytes_mb": 1559.0,
+    "per_5000_entries_mb": 532.1,
+    "max_sample_burst_mb": 254.6
    }
   }
  },
@@ -196,28 +196,28 @@
    "succeeded": 15000
   },
   "refused_pct": 0.0,
-  "p50_ms": 3.1,
-  "p99_ms": 31.29,
-  "max_ms": 351.0,
+  "p50_ms": 3.15,
+  "p99_ms": 29.64,
+  "max_ms": 327.8,
   "phase_p99_ms": [
-   139.6,
-   6.1,
+   97.9,
    5.9,
-   136.2,
-   5.9
+   6.0,
+   145.3,
+   6.0
   ],
   "stall_windows": [
    {
-    "start_s": 34.8,
+    "start_s": 34.9,
     "end_s": 34.9,
-    "requests": 9,
-    "max_ms": 351.0
+    "requests": 1,
+    "max_ms": 321.5
    },
    {
-    "start_s": 191.7,
-    "end_s": 191.8,
-    "requests": 11,
-    "max_ms": 304.3
+    "start_s": 191.8,
+    "end_s": 193.8,
+    "requests": 12,
+    "max_ms": 327.8
    }
   ],
   "verification": 0,
@@ -228,19 +228,19 @@
     "max_sample_burst_mb": 0.0
    },
    "w1": {
-    "wbytes_mb": 1023.3,
-    "per_5000_entries_mb": 341.1,
-    "max_sample_burst_mb": 323.9
+    "wbytes_mb": 979.0,
+    "per_5000_entries_mb": 326.3,
+    "max_sample_burst_mb": 279.7
    },
    "w2": {
-    "wbytes_mb": 1022.6,
-    "per_5000_entries_mb": 340.9,
-    "max_sample_burst_mb": 323.4
+    "wbytes_mb": 965.8,
+    "per_5000_entries_mb": 321.9,
+    "max_sample_burst_mb": 266.6
    },
    "w3": {
-    "wbytes_mb": 974.8,
-    "per_5000_entries_mb": 324.9,
-    "max_sample_burst_mb": 275.5
+    "wbytes_mb": 952.6,
+    "per_5000_entries_mb": 317.5,
+    "max_sample_burst_mb": 253.4
    }
   }
  }
