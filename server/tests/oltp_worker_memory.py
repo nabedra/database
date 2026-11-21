@@ -12,8 +12,9 @@ idle), and samples every worker each second on Linux:
 
 The data group's leader is found by which worker's direct executor ran a probe update. Writes
 `--output/memory.json` and prints one summary line per phase and worker. With `--heaptrack`, the
-workers run under `heaptrack` and the profiles are left in `--output` (memory samples then
-include heaptrack's own overhead and are not comparable).
+workers are profiled by `heaptrack` and the profiles are left in `--output` (memory samples then
+include heaptrack's own overhead and are not comparable). heaptrack attaches to the running workers
+(`heaptrack -p`, needs gdb and `kernel.yama.ptrace_scope=0`) once the table is loaded.
 
 Linux only. Example:
   MALLOC_ARENA_MAX=2 python server/tests/oltp_worker_memory.py --binary server/target/release/nabedra-db \
@@ -27,7 +28,7 @@ import os
 from pathlib import Path
 import random
 import signal
-import stat
+import subprocess
 import sys
 import threading
 import time
@@ -40,7 +41,8 @@ from nabedra import Database  # noqa: E402
 HEAP = 64 << 20
 # (name, offered rate per second or None for idle, seconds, clients)
 PHASES = (('idle', None, 15, 0), ('serial', 0.2, 30, 1), ('rate-1', 1, 30, 32), ('rate-20', 20, 30, 32),
-          ('rate-50', 50, 60, 32), ('rate-50b', 50, 60, 32), ('idle-after', None, 30, 0))
+          ('rate-50', 50, 60, 32), ('rate-50b', 50, 60, 32),
+          ('rate-50c', 50, 120, 32), ('idle-after', None, 30, 0))
 
 
 def kib_fields(path, names):
@@ -136,18 +138,6 @@ def drive(url, token, ca, table_id, rows, rate, seconds, clients, results):
             pool.submit(client)
 
 
-def wrapper(output, binary):
-    """A worker launcher that runs `nabedra-db worker ...` under heaptrack."""
-    path = output / 'heaptrack-nabedra-db'
-    path.write_text('#!/bin/sh\n'
-                    'if [ "$1" = worker ]; then\n'
-                    f'  exec heaptrack -o "{output}/heaptrack.$(basename "$3" .json)" "{binary}" "$@"\n'
-                    'fi\n'
-                    f'exec "{binary}" "$@"\n')
-    path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return path
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--binary', required=True)
@@ -159,7 +149,6 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     binary = os.path.realpath(args.binary)
-    launcher = wrapper(output, binary) if args.heaptrack else binary
     settings = {}
     for name in ('enabled', 'defrag'):
         try:
@@ -168,8 +157,8 @@ def main():
             settings['thp_' + name] = None
     settings.update(malloc_arena_max=os.environ.get('MALLOC_ARENA_MAX'), nproc=os.cpu_count(),
                     glibc_tunables=os.environ.get('GLIBC_TUNABLES'), heaptrack=args.heaptrack, label=args.label)
-    # The gateway gets the launcher too; it runs the real binary for anything but `worker`.
-    cluster = Rf3Cluster(launcher, output / 'cluster', api_direct=(True,))
+    cluster = Rf3Cluster(binary, output / 'cluster', api_direct=(True,))
+    tracers = {}
     samples, phases = [], []
     try:
         cluster.start()
@@ -194,6 +183,16 @@ def main():
         leader = leaders[0]
         pids = {name: real_pid(cluster.workers[name].pid, binary) for name in WORKERS}
         assert all(pids.values()), pids
+        if args.heaptrack:
+            # Attached after startup (a worker started under heaptrack misses its bootstrap
+            # deadline), so the profiles cover the load phases.
+            for name, pid in pids.items():
+                log = open(output / f'heaptrack.{name}.log', 'wb')
+                tracers[name] = subprocess.Popen(['heaptrack', '-o', str(output / f'heaptrack.{name}'), '-p', str(pid)],
+                                                 stdout=log, stderr=log)
+            time.sleep(20)
+            for name, tracer in tracers.items():
+                assert tracer.poll() is None, (name, (output / f'heaptrack.{name}.log').read_text())
         stop = threading.Event()
         current = ['setup']
 
@@ -229,11 +228,11 @@ def main():
         thread.join()
         final_stats = {name: cluster.stats(name) for name in WORKERS}
         if args.heaptrack:
-            # Stop each worker alone so heaptrack, outside its signal, finishes the profile.
+            # Stop each worker alone, then let heaptrack finish its profile.
             for name, pid in pids.items():
                 os.kill(pid, signal.SIGTERM)
-            for name in WORKERS:
-                cluster.workers[name].popen.wait(timeout=120)
+            for name, tracer in tracers.items():
+                tracer.wait(timeout=300)
     finally:
         cluster.close()
     summary = {}
