@@ -33,6 +33,8 @@ struct Entry {
 }
 struct SystemTrust {
     revision: u64,
+    hardened: bool,
+    deferred_data: bool,
     operators: BTreeMap<Uuid, WorkerEnrollment>,
     candidate: Option<(ReplacementRecord, bool)>,
     _charge: ScratchLease,
@@ -69,6 +71,8 @@ pub(crate) struct AppliedPeerDirectory {
     revocation_memory: std::sync::OnceLock<ScratchLease>,
     remote_revocations: std::sync::OnceLock<std::sync::Weak<ControlClient>>,
     refresh: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    pub(crate) fail_replacement_trust_install: AtomicBool,
 }
 impl AppliedPeerDirectory {
     /// Bootstrap pins are an explicit operator-supplied Control peer set. They
@@ -100,6 +104,8 @@ impl AppliedPeerDirectory {
             revocation_memory: std::sync::OnceLock::new(),
             remote_revocations: std::sync::OnceLock::new(),
             refresh: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            fail_replacement_trust_install: AtomicBool::new(false),
         });
         for peer in peers {
             if directory
@@ -114,8 +120,13 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
-    pub(crate) fn check_remote_revocations(&self, control: &Arc<ControlClient>) -> Result<(), ProtocolError> {
-        self.remote_revocations.set(Arc::downgrade(control)).map_err(|_| invalid())
+    pub(crate) fn check_remote_revocations(
+        &self,
+        control: &Arc<ControlClient>,
+    ) -> Result<(), ProtocolError> {
+        self.remote_revocations
+            .set(Arc::downgrade(control))
+            .map_err(|_| invalid())
     }
 
     pub(crate) async fn exclude_replaced_bootstrap_peers(
@@ -133,7 +144,10 @@ impl AppliedPeerDirectory {
 
     fn remove_replaced(&self, peer: WorkerIdentity) -> Result<(), ProtocolError> {
         let mut entries = self.entries.write().map_err(|_| unavailable())?;
-        if entries.get(&peer.worker_id).is_some_and(|entry| WorkerIdentity::from(&entry.enrollment) == peer) {
+        if entries
+            .get(&peer.worker_id)
+            .is_some_and(|entry| WorkerIdentity::from(&entry.enrollment) == peer)
+        {
             entries.remove(&peer.worker_id);
         }
         Ok(())
@@ -180,15 +194,23 @@ impl AppliedPeerDirectory {
         revision: u64,
         operators: Vec<WorkerEnrollment>,
         candidate: Option<(ReplacementRecord, bool)>,
+        hardened: bool,
+        deferred_data: bool,
     ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        if self.fail_replacement_trust_install.load(Ordering::Acquire) {
+            return Err(unavailable());
+        }
         let charge = self.shared.reserve_scratch(
             crate::oltp::pool::ByteClass::Progress,
             4096 + candidate
-                    .as_ref()
-                    .map_or(0, |(record, _)| record.groups.len() * 2048),
+                .as_ref()
+                .map_or(0, |(record, _)| record.groups.len() * 2048),
         )?;
         *self.system.write().map_err(|_| unavailable())? = Some(SystemTrust {
             revision,
+            hardened,
+            deferred_data,
             operators: operators
                 .into_iter()
                 .map(|entry| (entry.worker_id, entry))
@@ -201,7 +223,9 @@ impl AppliedPeerDirectory {
 
     pub(crate) fn reserve_revocations(&self, limit: usize) -> Result<(), ProtocolError> {
         if self.revocation_memory.get().is_none() {
-            let lease = self.shared.reserve_scratch(crate::oltp::pool::ByteClass::Progress, limit * 128)?;
+            let lease = self
+                .shared
+                .reserve_scratch(crate::oltp::pool::ByteClass::Progress, limit * 128)?;
             let _ = self.revocation_memory.set(lease);
         }
         Ok(())
@@ -224,7 +248,10 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn record_revocation(&self, worker: WorkerIdentity) {
-        let mut revoked = self.revocations.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut revoked = self
+            .revocations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         revoked.workers.insert(worker.worker_id);
         revoked.certificates.insert(worker.certificate_sha256);
     }
@@ -232,6 +259,18 @@ impl AppliedPeerDirectory {
     fn trust_available(&self) -> bool {
         self.revocations_ready.load(Ordering::Acquire)
             && !self.reloading_revocations.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn replacement_hardening_active(&self) -> bool {
+        self.system
+            .read()
+            .is_ok_and(|system| system.as_ref().is_some_and(|state| state.hardened))
+    }
+
+    pub(crate) fn has_deferred_data_repairs(&self) -> bool {
+        self.system
+            .read()
+            .is_ok_and(|system| system.as_ref().is_some_and(|state| state.deferred_data))
     }
 
     pub(crate) fn has_mounted_replacement(&self) -> bool {
@@ -246,7 +285,9 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn system_placement_changed(&self) -> bool {
-        self.revocations.read().is_ok_and(|revoked| !revoked.workers.is_empty())
+        self.revocations
+            .read()
+            .is_ok_and(|revoked| !revoked.workers.is_empty())
     }
 
     pub(crate) fn replacement_capability_active(&self) -> bool {
@@ -254,20 +295,21 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
-        if !self.trust_available() {
+        if !self.trust_available()
+            || self.denied(identity.worker_id, Some(identity.certificate_sha256))
+        {
             return Some(false);
         }
         match self.system.read() {
             Ok(state) => state.as_ref().map(|state| {
-                !self.denied( identity.worker_id, Some(identity.certificate_sha256))
-                    && state
-                        .operators
-                        .get(&identity.worker_id)
-                        .is_some_and(|entry| {
-                            WorkerIdentity::from(entry) == identity
-                                || self.cold_peer(entry).as_ref().map(WorkerIdentity::from)
-                                    == Some(identity)
-                        })
+                state
+                    .operators
+                    .get(&identity.worker_id)
+                    .is_some_and(|entry| {
+                        WorkerIdentity::from(entry) == identity
+                            || self.cold_peer(entry).as_ref().map(WorkerIdentity::from)
+                                == Some(identity)
+                    })
             }),
             Err(_) => Some(false),
         }

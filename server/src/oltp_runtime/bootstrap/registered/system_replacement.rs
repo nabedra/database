@@ -74,15 +74,25 @@ pub(super) async fn join(
                     Err(error) if error.code == ErrorCode::Conflict => {
                         // A first mount may have committed while its response was lost.
                         // This process still owns the exact directory it opened.
-                        if worker.manager.check_replacement_mount(
-                            control.identity(), WorkerIdentity::from(enrollment), &proof, true,
-                        ).await.is_ok_and(|mounted| mounted) {
+                        if worker
+                            .manager
+                            .check_replacement_mount(
+                                control.identity(),
+                                WorkerIdentity::from(enrollment),
+                                &proof,
+                                true,
+                            )
+                            .await
+                            .is_ok_and(|mounted| mounted)
+                        {
                             mount_committed = true;
                             break;
                         }
                         return Err(error);
                     }
-                    Err(error) if error.code == ErrorCode::UnsupportedOperation => return Err(error),
+                    Err(error) if error.code == ErrorCode::UnsupportedOperation => {
+                        return Err(error);
+                    }
                     Err(error) => {
                         tracing::debug!(code=?error.code, message=error.message, "system replacement mount waits")
                     }
@@ -109,7 +119,7 @@ pub(super) fn spawn(
                 _ = stop.changed() => return,
                 _ = tick.tick() => {}
             }
-            if directory.has_mounted_replacement() {
+            if directory.has_mounted_replacement() || directory.has_deferred_data_repairs() {
                 tokio::select! {
                     _ = stop.changed() => return,
                     result = manager.advance_system_replacement(&control, &running, &operator) => {

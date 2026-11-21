@@ -166,6 +166,10 @@ pub(crate) enum SystemRecoveryCommand {
         id: Uuid,
         authorization: AuthorizationStamp,
     },
+    QueueLostData {
+        after: Option<Uuid>,
+        authorization: AuthorizationStamp,
+    },
     Mount {
         proof: ReplacementMountProof,
         ready: ReadyMembership,
@@ -191,7 +195,10 @@ pub(crate) enum SystemRecoveryCommand {
 impl SystemRecoveryCommand {
     pub(super) fn heap_bytes(&self) -> usize {
         match self {
-            Self::Mount { .. } | Self::Publish { .. } | Self::Abandon { .. } => 0,
+            Self::Mount { .. }
+            | Self::Publish { .. }
+            | Self::Abandon { .. }
+            | Self::QueueLostData { .. } => 0,
             Self::Enable { group, .. } => {
                 size_of::<GroupRecord>() + group.identity.database.capacity_bytes()
             }

@@ -588,7 +588,11 @@ async fn ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released()
         assert!(!voters.contains(&damaged_node));
         assert_eq!(voters.len(), 3);
         assert!(
-            !cluster.host(leader).raft.learner_ids().any(|id| id == damaged_node),
+            !cluster
+                .host(leader)
+                .raft
+                .learner_ids()
+                .any(|id| id == damaged_node),
             "the removed voter still receives learner replication"
         );
         assert_eq!(replaced.proof.removed, cluster.member(damaged));

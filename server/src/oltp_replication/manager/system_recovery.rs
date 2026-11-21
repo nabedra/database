@@ -6,7 +6,8 @@ use crate::{
     oltp_replication::{
         authority::control::{
             ControlHandle, LocalOperatorPermit, ReplacementGroup, ReplacementMountProof,
-            ReplacementRecord, SYSTEM_REPLACEMENT_CAPABILITY, SYSTEM_REPLACEMENT_EXECUTION, SYSTEM_REPLACEMENT_HARDENING,
+            ReplacementRecord, SYSTEM_REPLACEMENT_CAPABILITY, SYSTEM_REPLACEMENT_EXECUTION,
+            SYSTEM_REPLACEMENT_HARDENING,
         },
         multiplex::{
             AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture,
@@ -51,7 +52,10 @@ enum Request {
     Advertise,
     AdvertiseExecution,
     AdvertiseHardening,
-    CheckMount { proof: ReplacementMountProof, retained: bool },
+    CheckMount {
+        proof: ReplacementMountProof,
+        retained: bool,
+    },
     Mount(ReplacementMountProof),
     Reconcile { id: Uuid, group: Uuid },
 }
@@ -213,8 +217,12 @@ impl HostedGroupManager {
         target: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
         self.verify_recovery_advert(
-            control, target, Request::AdvertiseHardening, SYSTEM_REPLACEMENT_HARDENING,
-        ).await
+            control,
+            target,
+            Request::AdvertiseHardening,
+            SYSTEM_REPLACEMENT_HARDENING,
+        )
+        .await
     }
 
     pub(crate) async fn verify_recovery_execution(
@@ -327,8 +335,15 @@ impl HostedGroupManager {
         proof: &ReplacementMountProof,
         retained: bool,
     ) -> Result<bool, ProtocolError> {
-        self.recovery_call(scope, target, &Request::CheckMount { proof: proof.clone(), retained })
-            .await
+        self.recovery_call(
+            scope,
+            target,
+            &Request::CheckMount {
+                proof: proof.clone(),
+                retained,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn send_mount_proof(
@@ -382,7 +397,7 @@ impl HostedGroupManager {
             return Ok(());
         }
         let Some((record, remaining)) = control.active_system_replacement().await? else {
-            return Ok(());
+            return control.queue_lost_data_repairs(running, permit).await;
         };
         // The candidate stays outside Control elections until the other groups
         // have their stable memberships recorded.
@@ -543,9 +558,13 @@ impl QuorumEndpoint {
             if mounted {
                 return Err(mounted_conflict());
             }
-            self.manager.verify_recovery_hardening(control.identity(), proof.worker).await?;
+            self.manager
+                .verify_recovery_hardening(control.identity(), proof.worker)
+                .await?;
         } else {
-            self.manager.verify_recovery_execution(control.identity(), proof.worker).await?;
+            self.manager
+                .verify_recovery_execution(control.identity(), proof.worker)
+                .await?;
         }
         let state = control.inspect().await?.ok_or_else(unavailable)?;
         if !mounted {
@@ -615,7 +634,11 @@ impl QuorumEndpoint {
             .await
     }
 
-    async fn check_mount(&self, proof: ReplacementMountProof, retained: bool) -> Result<bool, ProtocolError> {
+    async fn check_mount(
+        &self,
+        proof: ReplacementMountProof,
+        retained: bool,
+    ) -> Result<bool, ProtocolError> {
         let control = &self.control;
         let (record, mounted) = control.check_replacement_mount(&proof).await?;
         if mounted && !retained {
@@ -692,10 +715,13 @@ impl Endpoint for QuorumEndpoint {
                     HEADER,
                 )?,
                 Request::CheckMount { proof, retained } => self.manager.shared.encode_in(
-                    ByteClass::Progress, &self.check_mount(proof, retained).await, HEADER,
+                    ByteClass::Progress,
+                    &self.check_mount(proof, retained).await,
+                    HEADER,
                 )?,
-                Request::Advertise | Request::AdvertiseExecution | Request::AdvertiseHardening =>
-                    capability_reply(&self.manager.shared, &request)?,
+                Request::Advertise | Request::AdvertiseExecution | Request::AdvertiseHardening => {
+                    capability_reply(&self.manager.shared, &request)?
+                }
             };
             Ok(ChargedReply {
                 header,
@@ -711,12 +737,18 @@ pub(crate) struct ReplacementCapabilityEndpoint {
 }
 
 impl ReplacementCapabilityEndpoint {
-    fn parse(&self, session: &AuthenticatedSession, header: &[u8]) -> Result<Request, ProtocolError> {
+    fn parse(
+        &self,
+        session: &AuthenticatedSession,
+        header: &[u8],
+    ) -> Result<Request, ProtocolError> {
         if session.group() != &self.group || session.purpose() != Purpose::SystemRecovery {
             return Err(invalid());
         }
         match serde_json::from_slice::<Request>(header).map_err(|_| invalid())? {
-            request @ (Request::Advertise | Request::AdvertiseExecution | Request::AdvertiseHardening) => Ok(request),
+            request @ (Request::Advertise
+            | Request::AdvertiseExecution
+            | Request::AdvertiseHardening) => Ok(request),
             _ => Err(invalid()),
         }
     }
@@ -779,7 +811,11 @@ fn capability_reply(
 }
 
 fn mounted_conflict() -> ProtocolError {
-    ProtocolError::new(ErrorCode::Conflict, "replacement mount already committed", Outcome::NotApplied)
+    ProtocolError::new(
+        ErrorCode::Conflict,
+        "replacement mount already committed",
+        Outcome::NotApplied,
+    )
 }
 
 pub(crate) fn reachable() -> ProtocolError {

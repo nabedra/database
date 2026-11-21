@@ -172,7 +172,9 @@ impl WorkerRuntime {
         if request.operation == "worker.system_replacement.abandon" {
             let abandon: super::worker_runtime::system_recovery::ReplacementAbandon =
                 serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
-            return self.abandon_system_replacement(request.request_id, abandon.id).await;
+            return self
+                .abandon_system_replacement(request.request_id, abandon.id)
+                .await;
         }
         if request.operation == "worker.system_replacement.prepare" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;

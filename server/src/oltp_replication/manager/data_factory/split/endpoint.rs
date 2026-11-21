@@ -334,7 +334,11 @@ impl SplitEndpoint {
         }
         let children = attempt.children()?;
         let table_id = children[0].guard.binding().table_id;
-        let Host::System { catalog: Some(catalog), .. } = &self.host else {
+        let Host::System {
+            catalog: Some(catalog),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let pin = catalog.snapshot(request.at, self.current().await?)?;
@@ -489,7 +493,11 @@ impl SplitEndpoint {
         if command.authority() != self.current().await? {
             return Err(unauthorized());
         }
-        let Host::System { timestamps: Some(timestamps), .. } = &self.host else {
+        let Host::System {
+            timestamps: Some(timestamps),
+            ..
+        } = &self.host
+        else {
             return Err(unauthorized());
         };
         let authority = ServiceAction::TimestampProof {
@@ -663,7 +671,11 @@ impl SplitEndpoint {
                 output!(LocalUsageScan::observe(&self.usage, request, machine).await?)
             }
             Operation::Job | Operation::FailureSettlement => {
-                let Host::System { timestamps: Some(timestamps), .. } = &self.host else {
+                let Host::System {
+                    timestamps: Some(timestamps),
+                    ..
+                } = &self.host
+                else {
                     return Err(unauthorized());
                 };
                 if operation == Operation::Job {

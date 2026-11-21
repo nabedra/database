@@ -43,7 +43,10 @@ impl ControlMachine {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self { store, replacement_trust: None })
+        Ok(Self {
+            store,
+            replacement_trust: None,
+        })
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -72,11 +75,19 @@ impl ControlMachine {
             },
             _ => None,
         };
-        let directory = self.replacement_trust.as_ref().map(|trust| trust.directory.as_ref());
-        let reload = directory.filter(|_| mount.is_some()).map(|directory| directory.reloading_revocations());
-        let revoked = reload.as_ref().map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
+        let directory = self
+            .replacement_trust
+            .as_ref()
+            .map(|trust| trust.directory.as_ref());
+        let reload = directory
+            .filter(|_| mount.is_some())
+            .map(|directory| directory.reloading_revocations());
+        let revoked = reload
+            .as_ref()
+            .map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
         let revoke = revoked.clone();
-        let result = self.store
+        let result = self
+            .store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
@@ -84,8 +95,10 @@ impl ControlMachine {
                 let transition = apply(tx, &scope, position, digest, command.payload()?)?;
                 if let (Some(id), Some(revoke)) = (mount, revoke)
                     && let Transition::Commit(reply) = &transition
-                    && decode::<ControlReply>(reply.as_ref())? == ControlReply::SystemReplacementMounted
-                    && let Some(record) = load::<super::ReplacementRecord>(tx, &system_recovery::by_id(id))?
+                    && decode::<ControlReply>(reply.as_ref())?
+                        == ControlReply::SystemReplacementMounted
+                    && let Some(record) =
+                        load::<super::ReplacementRecord>(tx, &system_recovery::by_id(id))?
                 {
                     let _ = revoke.set(record.intent.previous);
                 }
@@ -1670,7 +1683,9 @@ impl crate::oltp_replication::hosted::TypedMachine<super::super::config::Control
     for ControlMachine
 {
     fn installing_snapshot(&self) -> impl Send {
-        self.replacement_trust.as_ref().map(|trust| trust.directory.reloading_revocations())
+        self.replacement_trust
+            .as_ref()
+            .map(|trust| trust.directory.reloading_revocations())
     }
     async fn snapshot_installed(&self) -> Result<(), ProtocolError> {
         if let Some(trust) = &self.replacement_trust {

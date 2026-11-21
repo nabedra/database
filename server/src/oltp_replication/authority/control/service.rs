@@ -930,9 +930,16 @@ impl ControlHandle {
     ) -> Result<bool, ProtocolError> {
         let raw = self
             .read(move |view| {
-                if view.get(&machine::system_recovery::revoked_id(worker.worker_id))?.is_some()
-                    || view.get(&machine::system_recovery::revoked_certificate(worker.certificate_sha256))?.is_some()
-                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))? == Some(worker)
+                if view
+                    .get(&machine::system_recovery::revoked_id(worker.worker_id))?
+                    .is_some()
+                    || view
+                        .get(&machine::system_recovery::revoked_certificate(
+                            worker.certificate_sha256,
+                        ))?
+                        .is_some()
+                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
+                        == Some(worker)
                 {
                     return view.encode(&true);
                 }

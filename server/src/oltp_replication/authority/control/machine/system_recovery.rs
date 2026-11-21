@@ -12,6 +12,8 @@ pub(in crate::oltp_replication::authority::control) const EXECUTION: &[u8] =
     b"ct/system-replacement-execution";
 pub(in crate::oltp_replication::authority::control) const HARDENING: &[u8] =
     b"ct/system-replacement-hardening";
+pub(in crate::oltp_replication::authority::control) const DEFERRED_DATA: &[u8] =
+    b"ct/system-replacement-deferred-data";
 pub(super) const MAX_REVOCATIONS: usize = 1024;
 pub(super) const PREPARING: &[u8] = b"ct/system-replacement-preparing";
 pub(super) const REVOKED_WORKERS: &[u8] = b"ct/system-replacement-revoked-worker/";
@@ -91,8 +93,17 @@ pub(super) fn apply(
                 *group_inventory_revision,
             );
         }
-        SystemRecoveryCommand::Abandon { id, authorization } =>
-            (authorization, serialized_digest(&(b"abandon-system-replacement".as_slice(), id))?),
+        SystemRecoveryCommand::Abandon { id, authorization } => (
+            authorization,
+            serialized_digest(&(b"abandon-system-replacement".as_slice(), id))?,
+        ),
+        SystemRecoveryCommand::QueueLostData {
+            after,
+            authorization,
+        } => (
+            authorization,
+            serialized_digest(&(b"queue-lost-data".as_slice(), after))?,
+        ),
         SystemRecoveryCommand::Publish {
             id,
             group,
@@ -153,13 +164,16 @@ pub(super) fn apply(
                 return fault(Fault::NotFound);
             };
             if load::<Uuid>(tx, &by_worker(record.intent.previous.worker_id))? != Some(*id)
-                || tx.get(&revoked_id(record.intent.previous.worker_id))?.is_some()
+                || tx
+                    .get(&revoked_id(record.intent.previous.worker_id))?
+                    .is_some()
             {
                 return fault(Fault::Conflict);
             }
             retire(tx, &record)?;
             Ok(ControlReply::SystemReplacementAbandoned)
         }
+        SystemRecoveryCommand::QueueLostData { after, .. } => queue_lost_data(tx, position, *after),
         SystemRecoveryCommand::Publish {
             id, group, applied, ..
         } => publish(tx, state, *id, *group, *applied),
@@ -171,7 +185,13 @@ pub(super) fn apply(
             enrollment_revision,
             ..
         } => {
-            let capability = if *hardening { HARDENING } else if *execution { EXECUTION } else { ACTIVATION };
+            let capability = if *hardening {
+                HARDENING
+            } else if *execution {
+                EXECUTION
+            } else {
+                ACTIVATION
+            };
             if let Some(existing) = load(tx, capability)? {
                 return Ok(ControlReply::SystemReplacementEnabled(existing));
             }
@@ -225,7 +245,9 @@ pub(super) fn apply(
                 }
                 if tx.get(HARDENING)?.is_none()
                     || record.intent.run_id == state.ready.view.run_id
-                    || tx.get(&revoked_id(record.intent.previous.worker_id))?.is_some()
+                    || tx
+                        .get(&revoked_id(record.intent.previous.worker_id))?
+                        .is_some()
                 {
                     return fault(Fault::Conflict);
                 }
@@ -453,6 +475,7 @@ fn mount(
             fault(Fault::Stale)
         };
     }
+    let defer_data = hardened && state.group_count > MAX_SYSTEM_REPLACEMENT_GROUPS as u64;
     if state.ready != ready
         || state.enrollment_revision != enrollment_revision
         || state.group_inventory_revision != group_inventory_revision
@@ -474,14 +497,17 @@ fn mount(
         || tx.get(&key(APIS, proof.worker.worker_id))?.is_some()
         || !certificate_unused(tx, proof.worker.certificate_sha256)?
         || !validate_groups(tx, scope, &record.intent, &record.groups)?
-        || !covers_every_group(tx, &record)?
+        || !covers_every_group(tx, &record, defer_data)?
     {
         return fault(Fault::Stale);
     }
     if hardened && !revocation_capacity_available(tx)? {
         return fault(Fault::Busy);
     }
-    let next_revision = state.enrollment_revision.checked_add(1).ok_or_else(unknown)?;
+    let next_revision = state
+        .enrollment_revision
+        .checked_add(1)
+        .ok_or_else(unknown)?;
     for plan in &record.groups {
         save(
             tx,
@@ -490,6 +516,9 @@ fn mount(
         )?;
     }
     save(tx, ACTIVE, &proof.id)?;
+    if defer_data {
+        save(tx, DEFERRED_DATA, &None::<Uuid>)?;
+    }
     save(tx, &revoked_id(old.worker_id), &old)?;
     save(tx, &revoked_certificate(old.certificate_sha256), &old)?;
     tx.delete(&key(WORKERS, old.worker_id))?;
@@ -508,6 +537,7 @@ fn mount(
 fn covers_every_group(
     tx: &mut GroupTransaction<'_>,
     record: &ReplacementRecord,
+    defer_data: bool,
 ) -> Result<bool, ProtocolError> {
     let lost = record.intent.previous.worker_id;
     let mut after = None;
@@ -516,7 +546,9 @@ fn covers_every_group(
         let mut candidates = Vec::new();
         let page = tx.scan_page(GROUPS, after.as_deref(), 128, |key, bytes| {
             let group = decode::<GroupRecord>(bytes)?;
-            candidates.push((group.generation, group.identity.group_id));
+            if !defer_data || !matches!(group.identity.kind, GroupKind::Data { .. }) {
+                candidates.push((group.generation, group.identity.group_id));
+            }
             next = Some(key.to_vec());
             Ok(())
         })?;
@@ -535,6 +567,69 @@ fn covers_every_group(
         }
         after = next;
     }
+}
+
+// After the system voters are restored, hand Data replicas to NS14 through
+// a durable cursor. Leadership changes resume the next bounded apply page.
+fn queue_lost_data(
+    tx: &mut GroupTransaction<'_>,
+    position: AppliedPosition,
+    after: Option<Uuid>,
+) -> Result<ControlReply, ProtocolError> {
+    use super::super::group_damage::{
+        GroupDamagePhase, GroupDamageReason, GroupDamageRecord, GroupDamageReport, record_key,
+    };
+    if load::<Option<Uuid>>(tx, DEFERRED_DATA)? != Some(after) || tx.get(ACTIVE)?.is_some() {
+        return fault(Fault::Stale);
+    }
+    let mut groups = Vec::new();
+    let mut next = after;
+    let cursor = after.map(|id| key(GROUPS, id));
+    let page = tx.scan_page(GROUPS, cursor.as_deref(), 32, |_, bytes| {
+        let group = decode::<GroupRecord>(bytes)?;
+        next = Some(group.identity.group_id);
+        if matches!(group.identity.kind, GroupKind::Data { .. }) {
+            groups.push(group);
+        }
+        Ok(())
+    })?;
+    for group in groups {
+        let mut members = Vec::new();
+        tx.scan_page(&member_prefix(group.generation), None, 128, |_, bytes| {
+            members.push(decode::<ReplicaMember>(bytes)?);
+            Ok(())
+        })?;
+        for replica in members {
+            let Some(worker) = load::<WorkerIdentity>(tx, &revoked_id(replica.worker_id))? else {
+                continue;
+            };
+            let record = record_key(group.identity.group_id, replica.node_id);
+            if tx.get(&record)?.is_none() {
+                save(
+                    tx,
+                    &record,
+                    &GroupDamageRecord {
+                        report: GroupDamageReport {
+                            group: group.identity.clone(),
+                            replica,
+                            reason: GroupDamageReason::PoolRefused,
+                            first_bad_seq: None,
+                            refusal: None,
+                        },
+                        worker,
+                        reported_at: position,
+                        phase: GroupDamagePhase::Reported,
+                    },
+                )?;
+            }
+        }
+    }
+    if page.exhausted {
+        tx.delete(DEFERRED_DATA)?;
+    } else {
+        save(tx, DEFERRED_DATA, &next)?;
+    }
+    Ok(ControlReply::SystemReplacementDataQueued)
 }
 
 pub(in crate::oltp_replication::authority::control) fn published(id: Uuid, group: Uuid) -> Vec<u8> {

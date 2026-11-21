@@ -662,7 +662,12 @@ async fn replacement_peer_probe(config: PathBuf) {
         config::WorkerResources,
         oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
         oltp_replication::{
-            multiplex::{AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport},
+            authority::control::{ControlClient, ControlRoutes},
+            manager::system_recovery::ReplacementCapabilityEndpoint,
+            multiplex::{
+                AppliedPeerDirectory, EndpointRegistry, PeerDirectory, Purpose, TransportConfig,
+                WorkerTransport,
+            },
             types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},
         },
     };
@@ -677,6 +682,23 @@ async fn replacement_peer_probe(config: PathBuf) {
         private_key: PathBuf,
         authority_ca: PathBuf,
         directory: PathBuf,
+        #[serde(default)]
+        control_actor: Option<WorkerEnrollment>,
+        #[serde(default)]
+        revoked_bootstrap_peer: Option<Uuid>,
+    }
+    struct Routes(Vec<Uuid>);
+    impl ControlRoutes for Routes {
+        fn next(
+            &self,
+            after: Option<Uuid>,
+        ) -> Result<Option<Uuid>, crate::protocol::ProtocolError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|id| after.is_none_or(|after| **id > after))
+                .copied())
+        }
     }
     let config: Config = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
     let tls = crate::oltp_replication::TlsMaterial::from_pem(
@@ -686,10 +708,78 @@ async fn replacement_peer_probe(config: PathBuf) {
     ).unwrap();
     let shared = WorkerSharedResources::new(1, WorkerResources::default(), SharedResourceConfig::default()).unwrap();
     let directory = AppliedPeerDirectory::from_bootstrap(
-        config.group.clone(), config.targets.clone(), shared.clone(),
-    ).unwrap();
-    let client = WorkerTransport::new(&config.from, &tls, shared.clone(), directory,
-        Arc::new(EndpointRegistry::new(shared.clone())), TransportConfig::default()).unwrap().client();
+        config.group.clone(),
+        config.targets.clone(),
+        shared.clone(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport = Arc::new(
+        WorkerTransport::new(
+            &config.from,
+            &tls,
+            shared.clone(),
+            directory.clone(),
+            registry.clone(),
+            TransportConfig::default(),
+        )
+        .unwrap(),
+    );
+    let client = transport.client();
+    if let Some(actor) = config.control_actor {
+        registry
+            .reserve(config.group.clone())
+            .unwrap()
+            .bind(
+                Purpose::SystemRecovery,
+                Arc::new(ReplacementCapabilityEndpoint {
+                    group: config.group.clone(),
+                    shared: shared.clone(),
+                }),
+            )
+            .unwrap();
+        let mut voters: Vec<_> = config.targets.iter().map(|peer| peer.worker_id).collect();
+        voters.sort_unstable();
+        let authority = WorkerTransport::new(
+            &actor,
+            &tls,
+            shared.clone(),
+            directory.clone(),
+            registry,
+            TransportConfig::default(),
+        )
+        .unwrap()
+        .client();
+        let control = ControlClient::new(
+            authority,
+            shared,
+            config.group.clone(),
+            Arc::new(Routes(voters)),
+        )
+        .unwrap();
+        if std::env::var_os("NABEDRA_REP5_REFRESH_BOOTSTRAP").is_some() {
+            let peers: Vec<_> = config.targets.iter().map(WorkerIdentity::from).collect();
+            directory
+                .exclude_replaced_bootstrap_peers(&control, &peers)
+                .await
+                .unwrap();
+            assert!(
+                directory
+                    .resolve(config.revoked_bootstrap_peer.unwrap())
+                    .is_err()
+            );
+        }
+        directory.check_remote_revocations(&control).unwrap();
+        let listener = tokio::net::TcpListener::bind(config.from.endpoint.as_str())
+            .await
+            .unwrap();
+        std::fs::write(config.directory.join("listening"), b"ready").unwrap();
+        transport
+            .run(listener, std::future::pending())
+            .await
+            .unwrap();
+        return;
+    }
     let probe = |target: WorkerIdentity| {
         let header = shared.encode_in(ByteClass::Progress, &"advertise", 4096).unwrap();
         let client = client.clone();
@@ -699,7 +789,7 @@ async fn replacement_peer_probe(config: PathBuf) {
                 [None, None, None], 16 << 10).await.is_ok()
         }
     };
-    for phase in ["before", "after"] {
+    for phase in ["before", "after", "restarted"] {
         let marker = config.directory.join(format!("probe-{phase}"));
         tokio::time::timeout(Duration::from_secs(240), async {
             while !marker.exists() {

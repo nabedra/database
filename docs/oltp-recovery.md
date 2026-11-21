@@ -101,17 +101,22 @@ a new run and recovers data through the archived cut.
 1. Before losing a voter, upgrade every Control voter and send
    `worker.system_replacement.enable` with an empty payload to the Control
    leader. The leader checks the authenticated
-   `control.system-replacement.execute.v1` advert from every Control voter
-   before it enables execution. This also activates
-   `control.system-replacement.v1` if it was inactive. Use execution-capable
-   binaries for future worker enrollment.
+   `control.system-replacement.hardening.v1` advert from every Control voter
+   before it enables the procedure. Reissue this operation after upgrading a
+   cluster that already enabled replacement. Use binaries that advertise the
+   same capability for future worker enrollment.
 2. Fence the lost process outside the cluster. Keep both surviving voters
    and their mounts running. Wait for Control to remove the lost incarnation
    from the ready set. Send `worker.system_replacement.check` to a survivor
    with the current `run_id` and the lost `previous` identity. The same identity
    fields apply as for a retained restart. Control checks for authenticated
    activity from the lost worker and requires fresh evidence from both
-   survivors in every affected group. The operation supports up to 64 groups.
+   survivors in the planned groups. When the inventory has up to 64 groups,
+   the procedure includes all affected groups. With a larger inventory, the
+   procedure first restores system groups. Control then scans the inventory in
+   bounded pages and queues the revoked worker's Data replicas for the
+   existing damage replacement procedure. Check those ranges separately for
+   stable RF3.
 3. Provision a fresh worker ID, incarnation, TLS certificate, and Docker-profile
    pool. Use revision 1 and mount generation 1. Provision an independent
    Ed25519 signing key on that mount at `NABEDRA_RESTART_KEY` with mode
@@ -134,7 +139,13 @@ a new run and recovers data through the archived cut.
    `run_id`, `previous`, `id` equal to the request UUID, `next` with the new
    enrollment, `mount` with the Docker mount expectation, and
    `mount_public_key`. The response contains the committed intent and exact
-   group plan. An identical retry returns the same record.
+   group plan. An identical retry returns the same record. To retire an
+   unmounted intent, send `worker.system_replacement.abandon` with
+   `{"id":"<intent UUID>"}`. An identical retry confirms abandonment. Prepare
+   a fresh candidate with a new worker ID and certificate. When a cold fence
+   publishes a new run, Control releases the unmounted execution slot. A
+   legacy keyless intent from an earlier run is retired when a new
+   preparation replaces it.
 5. In the new worker's bootstrap file, put the returned record in
    `node.system_replacement`. Set `node.enrollment`, `node.mount`,
    `node.directory`, `node.pool_id`, `node.scheduler_node_id`, TLS paths, and
@@ -149,8 +160,15 @@ a new run and recovers data through the archived cut.
    `run_id` and `previous` as in the check. `mounted` means Control checked
    the signed mount proof, revoked the lost worker ID and certificate, and
    claimed the planned groups. `complete` means Control published every stable
-   voter set. Each group uses Raft's joint transition and requires learner
-   catch-up. Group changes wait for the necessary quorum if a survivor pauses.
+   planned voter set. Each group uses Raft's joint transition and requires
+   learner catch-up. Group changes wait for the necessary quorum if a
+   survivor pauses. A mounted intent can resume with the original mount,
+   identity file, and pool contents. Startup checks Control before opening
+   the pool, and a wiped mount is refused even if the signing key survived.
+   Once the procedure completes, a later permanent loss uses a fresh intent
+   naming the replacement worker. If the replacement mount is lost while
+   promotion is still in progress, preserve the survivors and their quorum.
+   Abandonment applies only before mount commits.
 7. Check `GET /health/ready` on the replacement. Before it serves requests, it
    verifies its applied Raft voter sets and completes the replicated RAM queue
    join. Poll outstanding receipts in the original run and retry uncertain
@@ -161,9 +179,17 @@ a new run and recovers data through the archived cut.
    requires the normal retained-mount procedure with a new incarnation.
 
 Send the admin operations to `POST /v1/cluster/operations` with the admin
-token. A prepared intent authorizes only its exact candidate. Raft peers
-recheck the certificate against applied Control revocations on each request,
-including on an existing connection.
+token. A prepared intent authorizes only its exact candidate. Workers check
+each peer request against applied Control revocations, including on an
+existing connection. Control hosts check their local view. A Data-only
+worker reads Control before dispatch and refuses the request if the read
+fails. Update Data workers' Control placements and enrollments before their
+next restart. A confirmed revocation removes the stale bootstrap trust.
+
+Control retains up to 1,024 committed worker revocations. It refuses the
+next mount before enrolling the candidate or changing any placement. The
+fixed bound keeps the revocation index charged to the Control workers'
+progress memory and makes peer verification independent of inventory scans.
 
 For a quarantined Data replica or refused secondary pool, check
 `quarantined_groups` under `storage` and `refused_pools` in

@@ -401,9 +401,14 @@ impl RegisteredWorker {
             return Err(invalid());
         }
         // A system voter must have an authenticated Control enrollment.
-        if replacement.is_none() && config.placements.all().any(|placement| {
-            placement.voters.iter().any(|voter| !enrolled.contains(&voter.worker_id))
-        }) {
+        if replacement.is_none()
+            && config.placements.all().any(|placement| {
+                placement
+                    .voters
+                    .iter()
+                    .any(|voter| !enrolled.contains(&voter.worker_id))
+            })
+        {
             return Err(invalid());
         }
         let bootstrap = config.bootstrap_placements.as_ref().unwrap_or(&config.placements);
@@ -566,18 +571,28 @@ impl RegisteredWorker {
             let mount = restart::RestartMount::open(&ownership, primary_mount.as_ref(), true)?
                 .ok_or_else(invalid)?;
             let proof = crate::oltp_replication::authority::control::ReplacementMountProof::sign(
-                &control_identity, record, &record.intent.mount, &mount.key,
+                &control_identity,
+                record,
+                &record.intent.mount,
+                &mount.key,
             )?;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
             replacement_mount_committed = tokio::time::timeout_at(deadline, async {
                 loop {
-                    for peer in config.control_enrollments.iter()
+                    for peer in config
+                        .control_enrollments
+                        .iter()
                         .filter(|peer| peer.worker_id != record.intent.previous.worker_id)
                     {
-                        match manager.check_replacement_mount(
-                            &control_identity, WorkerIdentity::from(peer), &proof,
-                            previous_process.is_some(),
-                        ).await {
+                        match manager
+                            .check_replacement_mount(
+                                &control_identity,
+                                WorkerIdentity::from(peer),
+                                &proof,
+                                previous_process.is_some(),
+                            )
+                            .await
+                        {
                             Ok(mounted) => return Ok(mounted),
                             Err(error) if error.code == ErrorCode::Conflict => return Err(error),
                             Err(_) => {}
@@ -585,7 +600,9 @@ impl RegisteredWorker {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-            }).await.map_err(|_| unavailable())??;
+            })
+            .await
+            .map_err(|_| unavailable())??;
             restart_mount = Some(mount);
         }
         let mut restored = None;
@@ -632,12 +649,20 @@ impl RegisteredWorker {
         };
         let bootstrap_policy = retained.restore_policy.unwrap_or(policy);
         if replacement.is_none() {
-            restart_mount = restart::RestartMount::open(
-                &ownership, primary_mount.as_ref(), rolling.is_some(),
-            )?;
+            restart_mount =
+                restart::RestartMount::open(&ownership, primary_mount.as_ref(), rolling.is_some())?;
         }
-        let pools = WorkerPools::new(pool.clone(), WorkerIdentity::from(&config.enrollment), primary_mount)?;
-        let secondary = config.secondary_pools.into_inner().into_iter().zip(secondary_anchors).collect();
+        let pools = WorkerPools::new(
+            pool.clone(),
+            WorkerIdentity::from(&config.enrollment),
+            primary_mount,
+        )?;
+        let secondary = config
+            .secondary_pools
+            .into_inner()
+            .into_iter()
+            .zip(secondary_anchors)
+            .collect();
         if cold.is_none() && rolling.is_none() {
             retain_identity(&ownership, &retained)?;
         }
@@ -853,6 +878,80 @@ mod status_tests {
     use super::*;
 
     #[test]
+    fn o17_replacement_leaves_system_groups_without_the_lost_worker_unchanged() {
+        use crate::oltp_replication::authority::control::ReplacementIntent;
+        let lost = Uuid::new_v4();
+        let cluster_id = Uuid::new_v4();
+        let enrolled = |worker_id| WorkerEnrollment {
+            worker_id,
+            incarnation: Uuid::new_v4(),
+            enrollment_revision: 1,
+            certificate_sha256: Digest::from_bytes([1; 32]),
+            endpoint: Text::try_from("127.0.0.1:1").unwrap(),
+            server_name: Text::try_from("localhost").unwrap(),
+        };
+        let next = enrolled(Uuid::new_v4());
+        let mut group = GroupPlacement {
+            identity: GroupIdentity {
+                cluster_id,
+                database: Text::try_from("routing").unwrap(),
+                group_id: Uuid::new_v4(),
+                kind: GroupKind::Catalog,
+                group_format_version: GROUP_FORMAT_VERSION,
+            },
+            voters: Page::new(
+                (1..=3)
+                    .map(|node_id| ReplicaMember {
+                        node_id,
+                        worker_id: Uuid::new_v4(),
+                        pool_id: Uuid::new_v4(),
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        };
+        let record = ReplacementRecord {
+            applied_at: AppliedPosition {
+                term: 1,
+                node_id: 1,
+                index: 3,
+            },
+            intent: ReplacementIntent {
+                id: Uuid::new_v4(),
+                run_id: Uuid::new_v4(),
+                previous: WorkerIdentity::from(&enrolled(lost)),
+                mount_public_key: None,
+                mount: PoolMountExpectation {
+                    profile: PoolMountProfile::Docker {
+                        volume_marker: Uuid::new_v4(),
+                    },
+                    identity: PoolIdentity {
+                        engine: "oltp".into(),
+                        pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
+                        cluster_id,
+                        worker_id: next.worker_id,
+                        pool_id: Uuid::new_v4(),
+                    },
+                    worker: WorkerIdentity::from(&next),
+                    generation: 1,
+                    mount_path: "/test/replacement".into(),
+                    provider_volume_id: "docker-volume:replacement".into(),
+                    filesystem_uuid: String::new(),
+                },
+                next,
+            },
+            groups: Vec::new(),
+        };
+        let original = group.clone();
+        install_replacement_group(&mut group, &record).unwrap();
+        assert_eq!(group, original);
+        let mut voters = group.voters.to_vec();
+        voters[0].worker_id = lost;
+        group.voters = Page::new(voters).unwrap();
+        assert!(install_replacement_group(&mut group, &record).is_err());
+    }
+
+    #[test]
     fn o10_o11_r05_retained_system_topology_keeps_historical_status_ownership() {
         let local = ReplicaMember {
             node_id: 1,
@@ -920,32 +1019,39 @@ fn install_replacement_placements(
     {
         return Err(invalid());
     }
-    let lost = intent.previous.worker_id;
-    let update = |group: &mut GroupPlacement| -> Result<(), ProtocolError> {
-        let plan = record.groups.iter().find(|plan| plan.expected.identity == group.identity);
-        let Some(plan) = plan else {
-            return if group.voters.iter().any(|voter| voter.worker_id == lost)
-                || group.identity.kind == GroupKind::Control
-            {
-                Err(invalid())
-            } else {
-                Ok(())
-            };
-        };
-        if group.voters.as_ref() != plan.old.as_slice() {
-            return Err(invalid());
-        }
-        group.voters = Page::new(plan.next(lost)?.to_vec()).map_err(|_| invalid())?;
-        Ok(())
-    };
-    update(&mut placements.control)?;
-    update(&mut placements.timestamps)?;
-    update(&mut placements.status)?;
+    install_replacement_group(&mut placements.control, record)?;
+    install_replacement_group(&mut placements.timestamps, record)?;
+    install_replacement_group(&mut placements.status, record)?;
     let mut partitions = placements.status_partitions.to_vec();
     for group in &mut partitions {
-        update(group)?;
+        install_replacement_group(group, record)?;
     }
     placements.status_partitions = Page::new(partitions).map_err(|_| invalid())?;
-    update(&mut placements.catalog)?;
+    install_replacement_group(&mut placements.catalog, record)?;
     placements.validate(3)
+}
+
+fn install_replacement_group(
+    group: &mut GroupPlacement,
+    record: &ReplacementRecord,
+) -> Result<(), ProtocolError> {
+    let lost = record.intent.previous.worker_id;
+    let plan = record
+        .groups
+        .iter()
+        .find(|plan| plan.expected.identity == group.identity);
+    let Some(plan) = plan else {
+        return if group.voters.iter().any(|voter| voter.worker_id == lost)
+            || group.identity.kind == GroupKind::Control
+        {
+            Err(invalid())
+        } else {
+            Ok(())
+        };
+    };
+    if group.voters.as_ref() != plan.old.as_slice() {
+        return Err(invalid());
+    }
+    group.voters = Page::new(plan.next(lost)?.to_vec()).map_err(|_| invalid())?;
+    Ok(())
 }

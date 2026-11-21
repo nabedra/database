@@ -20,16 +20,24 @@ impl ControlMachine {
         let control_id = self.store.identity().group_id;
         let raw = self
             .store
-            .read_metadata(BUDGET, move |view| {
-                let Some(state) = super::super::service::load::<State>(view, STATE)? else {
-                    return view.encode(&None::<Trust>);
-                };
-                if view.get(system_recovery::ACTIVATION)?.is_none() {
-                    return view.encode(&None::<Trust>);
-                }
-                let active = super::super::service::load::<Uuid>(view, system_recovery::ACTIVE)?;
-                let candidate =
-                    match super::super::service::load::<Uuid>(view, system_recovery::PREPARING)? {
+            .read_metadata(
+                TransactionBudget {
+                    output_bytes: 512 << 10,
+                    ..BUDGET
+                },
+                move |view| {
+                    let Some(state) = super::super::service::load::<State>(view, STATE)? else {
+                        return view.encode(&None::<Trust>);
+                    };
+                    if view.get(system_recovery::ACTIVATION)?.is_none() {
+                        return view.encode(&None::<Trust>);
+                    }
+                    let active =
+                        super::super::service::load::<Uuid>(view, system_recovery::ACTIVE)?;
+                    let candidate = match super::super::service::load::<Uuid>(
+                        view,
+                        system_recovery::PREPARING,
+                    )? {
                         Some(id) => Some((
                             super::super::service::load::<ReplacementRecord>(
                                 view,
@@ -40,17 +48,43 @@ impl ControlMachine {
                         )),
                         None => None,
                     };
-                let mut revoked = Vec::new();
-                let mut after = None;
-                loop {
-                    let mut next = None;
-                    let page = view.scan_page(
-                        system_recovery::REVOKED_WORKERS,
-                        after.as_deref(),
-                        128,
-                        |key, bytes| {
-                            if revoked.len() == system_recovery::MAX_REVOCATIONS {
-                                return Err(unknown());
+                    let mut revoked = Vec::new();
+                    let mut after = None;
+                    loop {
+                        let mut next = None;
+                        let page = view.scan_page(
+                            system_recovery::REVOKED_WORKERS,
+                            after.as_deref(),
+                            128,
+                            |key, bytes| {
+                                if revoked.len() == system_recovery::MAX_REVOCATIONS {
+                                    return Err(unknown());
+                                }
+                                revoked.push(decode::<WorkerIdentity>(bytes)?);
+                                next = Some(key.to_vec());
+                                Ok(())
+                            },
+                        )?;
+                        if page.exhausted {
+                            break;
+                        }
+                        after = next;
+                    }
+                    let mut operators = Vec::new();
+                    let group =
+                        super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;
+                    if let Some(group) = group {
+                        let mut members = Vec::new();
+                        view.scan_page(&member_prefix(group.generation), None, 16, |_, bytes| {
+                            members.push(decode::<ReplicaMember>(bytes)?);
+                            Ok(())
+                        })?;
+                        for member in members {
+                            if let Some(worker) = super::super::service::load::<WorkerRecord>(
+                                view,
+                                &key(WORKERS, member.worker_id),
+                            )? {
+                                operators.push(worker.enrollment);
                             }
                             revoked.push(decode::<WorkerIdentity>(bytes)?);
                             next = Some(key.to_vec());
@@ -79,20 +113,30 @@ impl ControlMachine {
                             operators.push(worker.enrollment);
                         }
                     }
-                }
-                view.encode(&Some(Trust {
-                    revision: state.enrollment_revision,
-                    operators,
-                    revoked,
-                    candidate,
-                }))
-            })
+                    let hardened = view.get(system_recovery::HARDENING)?.is_some();
+                    let deferred_data = view.get(system_recovery::DEFERRED_DATA)?.is_some();
+                    view.encode(&Some(Trust {
+                        revision: state.enrollment_revision,
+                        hardened,
+                        deferred_data,
+                        operators,
+                        revoked,
+                        candidate,
+                    }))
+                },
+            )
             .await?;
         if let Some(trust) = decode::<Option<Trust>>(raw.as_ref())? {
             // The revocation set has its own reservation. Installing it must
             // succeed even when rebuilding the candidate/operator view cannot.
             directory.install_revocations(trust.revoked);
-            directory.install_system_trust(trust.revision, trust.operators, trust.candidate)?;
+            directory.install_system_trust(
+                trust.revision,
+                trust.operators,
+                trust.candidate,
+                trust.hardened,
+                trust.deferred_data,
+            )?;
         } else {
             directory.install_revocations(Vec::new());
         }
@@ -103,6 +147,8 @@ impl ControlMachine {
 #[derive(Serialize, serde::Deserialize)]
 struct Trust {
     revision: u64,
+    hardened: bool,
+    deferred_data: bool,
     operators: Vec<WorkerEnrollment>,
     revoked: Vec<WorkerIdentity>,
     candidate: Option<(ReplacementRecord, bool)>,
@@ -110,7 +156,9 @@ struct Trust {
 
 impl ControlMachine {
     pub(super) async fn refresh_or_retry(&self) {
-        let Some(trust) = &self.replacement_trust else { return };
+        let Some(trust) = &self.replacement_trust else {
+            return;
+        };
         let _order = trust.order.lock().await;
         if let Err(error) = self.refresh_replacement_trust(&trust.directory).await {
             tracing::warn!(code=?error.code, message=%error.message, "Control replacement trust refresh deferred");
@@ -137,7 +185,9 @@ impl ControlMachine {
                     if pending.is_closed() {
                         return;
                     }
-                    let Some(directory) = weak.upgrade() else { return };
+                    let Some(directory) = weak.upgrade() else {
+                        return;
+                    };
                     let _order = retry_order.lock().await;
                     if reader.refresh_replacement_trust(&directory).await.is_ok() {
                         break;
@@ -146,7 +196,11 @@ impl ControlMachine {
                 }
             }
         });
-        self.replacement_trust = Some(ReplacementTrust { directory, order, retry });
+        self.replacement_trust = Some(ReplacementTrust {
+            directory,
+            order,
+            retry,
+        });
         self.refresh_or_retry().await;
         Ok(self)
     }

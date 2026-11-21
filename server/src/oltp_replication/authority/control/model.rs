@@ -600,6 +600,7 @@ pub(crate) enum ControlReply {
     SystemReplacementEnabled(AppliedPosition),
     SystemReplacementMounted,
     SystemReplacementAbandoned,
+    SystemReplacementDataQueued,
     SystemReplacementPublished(GroupRecord),
     SystemReplacementPrepared(Box<super::ReplacementRecord>),
     DirectCapability(super::DirectCapability),

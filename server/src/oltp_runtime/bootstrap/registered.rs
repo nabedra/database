@@ -802,9 +802,11 @@ impl LocalServices {
                     scope,
                     local,
                     replication_factor,
-                    direct_timestamps: native_timestamps.map(|handle| handle as Arc<
+                    direct_timestamps: native_timestamps.map(|handle| {
+                        handle as Arc<
                         dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
-                    >),
+                    >
+                    }),
                     cold_history: Some(
                         super::super::worker_runtime::cold_history::Sources::Registered {
                             timestamps: timestamps.clone(),

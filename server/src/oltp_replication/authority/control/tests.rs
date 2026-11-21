@@ -37,6 +37,7 @@ mod group_damage;
 mod growth;
 mod pool_drain;
 mod restart;
+mod system_recovery;
 
 struct Directory(PathBuf);
 impl Directory {

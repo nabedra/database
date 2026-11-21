@@ -257,7 +257,7 @@ jobs:
           status=0
           suites=(rollback restart replacement-check)
           if [[ "${{ contains(github.event.head_commit.message, '[ci rep5]') }}" == true ]]; then
-            suites+=(replacement-abandon replacement-wipe)
+            suites+=(replacement-abandon replacement-wipe replacement-data-trust)
           fi
           for suite in "${suites[@]}"; do
             python3 server/tests/oltp_recovery_operations.py --binary server/target/debug/nabedra-db \

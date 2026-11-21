@@ -96,9 +96,15 @@ impl WorkerRuntime {
         id: Uuid,
     ) -> Result<EncodedResponse, ProtocolError> {
         self.require_system_replacement_operator()?;
-        self.services.control.abandon_system_replacement(
-            &self.services.manager, &self.services.operator, request_id, id,
-        ).await?;
+        self.services
+            .control
+            .abandon_system_replacement(
+                &self.services.manager,
+                &self.services.operator,
+                request_id,
+                id,
+            )
+            .await?;
         Ok(response::encode_success(
             request_id,
             &serde_json::json!({"id": id, "abandoned": true}),
@@ -253,6 +259,8 @@ impl WorkerRuntime {
             .shared
             .reserve_scratch(ByteClass::Progress, MAX_SYSTEM_REPLACEMENT_GROUPS * 2048)?;
         let mut groups = Vec::new();
+        let defer_data = state.group_count > MAX_SYSTEM_REPLACEMENT_GROUPS as u64
+            && control.replacement_hardening_active().await?;
         let mut after = None;
         loop {
             let raw = control
@@ -274,6 +282,9 @@ impl WorkerRuntime {
                     .await?
             };
             for record in page.items.iter() {
+                if defer_data && matches!(record.identity.kind, GroupKind::Data { .. }) {
+                    continue;
+                }
                 let route = self
                     .services
                     .control_client
