@@ -621,6 +621,8 @@ impl NativePlanner {
             self.catalog.participant().identity().group_id,
             txn.request_id,
         );
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::pool_sync::observe_create_plan(txn.request_id, id);
         let descriptor = TableDescriptor {
             id,
             name: payload.name,

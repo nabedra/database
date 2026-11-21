@@ -1968,6 +1968,7 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
 }
 
 mod kv;
+pub(crate) use kv::o29_pool_recovery;
 
 pub(crate) fn acceptance_damaged_checkpoints() {
     o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_active_state();

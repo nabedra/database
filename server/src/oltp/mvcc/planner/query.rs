@@ -372,6 +372,12 @@ impl NativePlanner {
                             break;
                         }
                         if let Some(cursor) = cursor {
+                            #[cfg(test)]
+                            crate::oltp_runtime::recovery_tests::transaction_checkpoint(
+                                "scan-page",
+                                binding.request_id,
+                                &state.matched,
+                            ).await;
                             pages.start(self.clone().scan_next(
                                 input.clone(), ScanShard::Continue(participant, cursor),
                             ));
