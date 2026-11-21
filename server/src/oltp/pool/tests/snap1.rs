@@ -122,9 +122,12 @@ async fn snap1_o11_applies_proceed_while_a_snapshot_file_is_written() {
         applied
     );
     let probed = copy
-        .read(budget(), |view| view.get(b"probe"))
+        .read(budget(), |view| {
+            view.get(b"probe")
+                .and_then(|value| value.ok_or_else(capacity))
+        })
         .await
-        .unwrap()
+        .ok()
         .map(|value| u64::from_be_bytes(value.as_slice().try_into().unwrap()));
     assert_eq!(probed, (applied >= BATCHES).then_some(applied));
     assert_eq!(get(&copy, b"\0\0\0\0\0\0\0\0").await, [0u8; 4096]);
