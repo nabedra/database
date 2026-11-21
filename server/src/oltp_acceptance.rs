@@ -6,6 +6,8 @@ use std::{path::PathBuf, process::Command};
 mod o07;
 #[path = "oltp_acceptance/o10.rs"]
 mod o10;
+#[path = "oltp_acceptance/growth.rs"]
+mod growth;
 
 fn transaction_scenario(scenario: &str) {
     let Some(binary) = std::env::var_os("NABEDRA_OLTP_BINARY") else {

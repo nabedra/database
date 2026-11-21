@@ -310,8 +310,8 @@ class Rf3Cluster:
         return sys.platform.startswith('linux') and subprocess.run(
             ['sudo', '-n', 'true'], capture_output=True, timeout=30).returncode == 0
 
-    def mount_pool(self, name, pool_id, enrollment):
-        directory = self.root / name / 'data'
+    def mount_pool(self, name, pool_id, enrollment, *, directory=None):
+        directory = directory or self.root / name / 'data'
         directory.mkdir(parents=True, exist_ok=True)
         subprocess.run(['sudo', '-n', 'mount', '-t', 'tmpfs', '-o',
                         f'size=2g,mode=0700,uid={os.getuid()},gid={os.getgid()}', 'tmpfs', str(directory)],
