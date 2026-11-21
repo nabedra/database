@@ -232,12 +232,37 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         acknowledged = insert(table, 1, 77)
         original = send_op(acknowledged)
         assert success(*original) is None
+        queued = insert(table, 2, 88)
+        queued_id = queued['request_id']
+        for name in WORKERS:
+            write_json(cluster.barrier_dir(name) / 'gates.json', {queued_id: 'queued'})
+            write_json(cluster.barrier_dir(name) / 'inspect.json', [queued_id])
+        admitted = send(cluster.api_urls['api1'], cluster.auth['data_token'], queued,
+                        ca=cluster.ca, path='/v1/requests')
+        assert admitted == (202, dict(request_id=queued_id, run_id=cluster.run_id, state='queued')), admitted
+        for name in survivors:
+            cluster.stats(name)
+            saved = json.loads((cluster.barrier_dir(name) / f'record-{queued_id}.json').read_text())
+            assert saved['accepted'] and json.loads(saved['body']) == queued, saved
+
+        stopped_at = time.monotonic()
         cluster.workers[victim].kill()
         mount = Path(cluster.config[victim]['node']['directory'])
         subprocess.run(['sudo', '-n', 'umount', str(mount)], check=True, timeout=60)
         cluster.mounted.remove(mount)
         assert not (mount / 'pool').exists()
         wait_for(lambda: two_ready(cluster, survivors), 'surviving ready workers')
+        for name in survivors:
+            write_json(cluster.barrier_dir(name) / 'gates.json', {})
+
+        def reading():
+            status, reply = send_op(get(table, 1))
+            if status in (429, 503, 504):
+                return None
+            assert success(status, reply) == dict(id=1, value=77)
+            return time.monotonic()
+
+        first_read = wait_for(reading, 'read an acknowledged row after Control failover', PROBE_WINDOW)
 
         cluster.workers[survivors[1]].pause()
         try:
@@ -281,9 +306,24 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             assert status == 409, (status, reply)
         assert send_op(acknowledged) == original
         assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
+        receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
+
+        def receipt():
+            status, reply = call(cluster.api_urls['api1'], receipt_path,
+                                 token=cluster.auth['data_token'], ca=cluster.ca, timeout=5)
+            if status in (429, 503, 504):
+                return None
+            assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
+            return reply if reply['state'] == 'succeeded' else None
+
+        settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
+                               result=None, error=None), settled
+        assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
         report('O06/O17 system replacement preflight', lost_control_leader=victim,
                groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
-               refused_missing_advert=True, replayed_intent=True)
+               refused_missing_advert=True, replayed_intent=True, settled_receipts=1,
+               probe_recovery_seconds=round(first_read - stopped_at, 3))
     finally:
         cluster.close()
 

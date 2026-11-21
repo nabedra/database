@@ -13,7 +13,10 @@ impl ControlHandle {
         &self,
     ) -> Result<Option<AppliedPosition>, ProtocolError> {
         let raw = self
-            .read(|view| view.encode(&load::<AppliedPosition>(view, ACTIVATION)?))
+            .read(|view| {
+                let activation = load::<AppliedPosition>(view, ACTIVATION)?;
+                view.encode(&activation)
+            })
             .await?;
         machine::decode(raw.as_ref())
     }
