@@ -442,6 +442,9 @@ impl StatusHandle {
                 }
                 let mut items = Vec::new();
                 let mut used = 4096usize;
+                // The authenticated RPC reserves decoded memory before parsing.
+                // Keep space for the page envelope, cursor and reply headers.
+                let mut decoded = 64usize << 10;
                 let mut next = after;
                 for _ in 0..64 {
                     let Some(row) = view.first_from(IDENTITIES, &cursor)? else {
@@ -505,13 +508,35 @@ impl StatusHandle {
                         owner: None,
                     };
                     let bytes = serialized_length(&item)?;
-                    if used
+                    let exceeds_wire = used
                         .checked_add(bytes)
-                        .is_none_or(|n| n > ARCHIVE_BUDGET.output_bytes - 4096)
-                    {
+                        .is_none_or(|n| n > ARCHIVE_BUDGET.output_bytes - 4096);
+                    let cost = if exceeds_wire {
+                        None
+                    } else {
+                        Some(view.with_scratch_buffer(bytes, |_, scratch| {
+                            let mut destination = &mut *scratch;
+                            serde_json::to_writer(&mut destination, &item).map_err(|_| unknown())?;
+                            if !destination.is_empty() {
+                                return Err(unknown());
+                            }
+                            crate::oltp::mvcc::json_decode_budget(scratch)
+                        })?)
+                    };
+                    let Some(next_decoded) = cost
+                        .and_then(|cost| decoded.checked_add(cost))
+                        .filter(|bytes| *bytes <= crate::oltp::pool::DEFAULT_REPLY_DECODE_BYTES)
+                    else {
+                        if items.is_empty() {
+                            return Err(crate::oltp::failure(
+                                crate::protocol::ErrorCode::LimitExceeded,
+                                "one archived identity exceeds a page budget",
+                            ));
+                        }
                         break;
-                    }
+                    };
                     used += bytes;
+                    decoded = next_decoded;
                     next = Some(IdentityArchiveCursor {
                         archive_id,
                         data_cut: cut,

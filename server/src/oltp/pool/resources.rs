@@ -24,6 +24,8 @@ const GROUP_HANDLE_BYTES: usize = 64 << 10;
 const GROUP_ENDPOINT_BYTES: usize = 64 << 10;
 pub(crate) const RAFT_REPLICA_BYTES: usize = 8 << 20;
 
+pub(crate) const DEFAULT_REPLY_DECODE_BYTES: usize = 1 << 20;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SharedResourceConfig {
     pub query_threads: usize,
@@ -58,7 +60,7 @@ impl Default for SharedResourceConfig {
             apply_bytes_per_slot: 65 << 20,
             query_reply_bytes: 8 << 20,
             control_reply_bytes: 1 << 20,
-            reply_decode_bytes: 1 << 20,
+            reply_decode_bytes: DEFAULT_REPLY_DECODE_BYTES,
             data_apply_reply_bytes: 1 << 20,
             max_open_pools: 8,
             max_group_handles: 128,
