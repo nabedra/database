@@ -206,6 +206,9 @@ fn rolling_test() -> Option<(PathBuf, Uuid)> {
     Some((directory, input.trim().parse().expect("rolling fixture UUID")))
 }
 pub(crate) async fn pause(stage: &str, request: Uuid) {
+    if stage == "queued" {
+        index_holds::checkpoint(request, index_holds::Checkpoint::ReadPin, || None).await;
+    }
     if let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") {
         let directory = PathBuf::from(directory);
         if let Ok(raw) = std::fs::read(directory.join("gates.json")) {

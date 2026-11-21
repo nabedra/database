@@ -142,7 +142,12 @@ impl NativePlanner {
                             .into());
                         }
                         #[cfg(test)]
-                        if crate::oltp_runtime::recovery_tests::index_faults::checkpoint(
+                        if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                            maintenance.index_id,
+                            crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Validation,
+                            || None,
+                        )
+                        .await || crate::oltp_runtime::recovery_tests::index_faults::checkpoint(
                             "validation",
                             maintenance.index_id,
                             &serde_json::json!({

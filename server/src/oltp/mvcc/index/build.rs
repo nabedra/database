@@ -497,6 +497,19 @@ impl IndexService {
                                 .await?;
                         }
                         ScanPage::Records { records, exhausted } => {
+                            #[cfg(test)]
+                            if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                                maintenance.index_id,
+                                crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Backfill,
+                                || Some(crate::oltp_runtime::recovery_tests::index_holds::PageBuffers {
+                                    rows: records.len(),
+                                    page_bytes: response.decode_owner().unwrap().bytes(),
+                                    cursor_bytes: after_owner.as_ref().map_or(0, |owner| owner.bytes()),
+                                    exhausted: *exhausted,
+                                }),
+                            ).await {
+                                return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted backfill"));
+                            }
                             blocked = 0;
                             for record in records.iter() {
                                 if record.value.is_some() {
@@ -511,6 +524,14 @@ impl IndexService {
                                     self.backend
                                         .refresh(maintenance.table_id, primary_key.clone(), job)
                                         .await?;
+                                    #[cfg(test)]
+                                    if crate::oltp_runtime::recovery_tests::index_holds::checkpoint(
+                                        maintenance.index_id,
+                                        crate::oltp_runtime::recovery_tests::index_holds::Checkpoint::Refresh,
+                                        || None,
+                                    ).await {
+                                        return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted refresh"));
+                                    }
                                 }
                             }
                             if *exhausted {
