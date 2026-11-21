@@ -2505,3 +2505,226 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
     assert!(value.unwrap().contains(r#""value":11"#));
     cluster.shutdown().await;
 }
+
+/// RD1 (O06, D05): the leader's reads are served only under a live lease.
+/// The lease is now checked on the request's task against the leader state
+/// openraft publishes, with no RaftCore round trip, and a mutation no longer
+/// reads its group's epochs before it latches. Neither may let a leader that
+/// lost its quorum answer from local state: not a get, not an `update` on a
+/// missing row (`false`, which commits nothing) and not an `insert` on an
+/// existing row (a conflict, which commits nothing either). The unsafe
+/// versions (a read without the barrier, or a read-only outcome answered
+/// before it) return `Done` or the conflict here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_d05_rd1_a_leader_without_a_quorum_serves_no_read() {
+    let mut cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let followers: Vec<usize> = (0..3).filter(|v| *v != leader).collect();
+    let row = serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}});
+    assert_eq!(
+        cluster.op(leader, "table.insert", row.clone()).await,
+        done("null")
+    );
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done(r#"{"id":1,"score":0.0,"tag":"a","value":1}"#),
+        "served under the lease"
+    );
+    cluster.converge(leader).await;
+    let consensus = cluster.voters[leader].consensus.clone();
+    // The Timestamp leader's barrier: its applied position from consensus
+    // memory is the store's applied position once the replica is idle.
+    let position = consensus.lease_read_position().await.unwrap();
+    let barrier = consensus.ensure_linearizable_lease().await.unwrap();
+    assert_eq!(position, barrier.applied);
+    assert_eq!(position.index, cluster.last_index(leader));
+    cluster.stop(followers[0]).await;
+    cluster.stop(followers[1]).await;
+    // Past the lease (election_timeout_max, 3 s in this fixture).
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let reads = [
+        ("table.get", serde_json::json!({"key": 1})),
+        (
+            "table.update",
+            serde_json::json!({"key": 99, "values": {"value": 2}}),
+        ),
+        ("table.insert", row),
+    ];
+    for (operation, payload) in reads {
+        let id = Uuid::new_v4();
+        let body = cluster.body(id, operation, payload);
+        let request = cluster.request_at(leader, &body, id, 1, Duration::from_millis(1500));
+        let started = std::time::Instant::now();
+        let response = cluster.voters[leader]
+            .executor
+            .execute(&cluster.voters[leader].handle, request)
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{operation}: bounded by the deadline"
+        );
+        assert!(
+            !matches!(response, DirectResponse::Done(_)),
+            "{operation} answered without a quorum: {response:?}"
+        );
+        assert_ne!(
+            code(&response),
+            Some((ErrorCode::Conflict, Outcome::NotApplied)),
+            "{operation} answered from local state without a quorum"
+        );
+    }
+    assert!(
+        !matches!(
+            tokio::time::timeout(Duration::from_secs(5), consensus.lease_read_position()).await,
+            Ok(Ok(_))
+        ),
+        "no lease position without a quorum"
+    );
+    cluster.shutdown().await;
+}
+
+/// RD1 (O12, D11, O08): a mutation picks its descriptor with the epochs of
+/// the group's previous snapshot, before it latches, and checks them in the
+/// attempt's own snapshot. A DDL fence that applied in between (an index
+/// publication) restarts the mutation with the new epochs: while the Catalog
+/// has not published, it falls back with nothing proposed; once it has, the
+/// write includes the new index. The unsafe version commits the old
+/// descriptor's writes under the new epoch, which apply accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o12_d11_rd1_a_fence_after_the_descriptor_lookup_restarts_the_mutation() {
+    use crate::oltp::mvcc::store::direct::DirectSchemaChange;
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let handle = cluster.voters[leader].handle.clone();
+    let executor = cluster.voters[leader].executor.clone();
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.insert",
+                serde_json::json!({"row": {"id": 1, "value": 1, "tag": "a", "score": 0.0}}),
+            )
+            .await,
+        done("null")
+    );
+    assert_eq!(executor.stats().pre_latch_epoch_reads, 1);
+    // The DDL coordinator fences before the Catalog publishes `published`.
+    let published = Uuid::new_v4();
+    handle
+        .change_direct_schema(DirectSchemaChange::Fence {
+            lifecycle: Some(published),
+        })
+        .await
+        .unwrap();
+    let update = serde_json::json!({"key": 1, "values": {"tag": "b"}});
+    let before = cluster.last_index(leader);
+    let blocked = cluster.op(leader, "table.update", update.clone()).await;
+    assert_eq!(
+        blocked,
+        DirectResponse::Fallback {
+            reason: FallbackReason::Schema
+        },
+        "the old descriptor must not commit under the new epoch"
+    );
+    assert_eq!(cluster.last_index(leader), before, "nothing proposed");
+    let stats = executor.stats();
+    assert_eq!(stats.retries["schema"], 1, "{stats:?}");
+    // The Catalog publishes a descriptor with a second index, on `tag`.
+    let by_tag = Uuid::new_v4();
+    cluster.schema.insert(DirectTable {
+        descriptor: descriptor(cluster.table),
+        schema_epoch: 1,
+        lifecycle_id: published,
+        indexes: vec![
+            IndexDefinition {
+                index_id: cluster.index,
+                table_id: cluster.table,
+                name: Text::try_from("by_value").unwrap(),
+                columns: Page::new(vec![Text::try_from("value").unwrap()]).unwrap(),
+                covering: Page::new(Vec::new()).unwrap(),
+            },
+            IndexDefinition {
+                index_id: by_tag,
+                table_id: cluster.table,
+                name: Text::try_from("by_tag").unwrap(),
+                columns: Page::new(vec![Text::try_from("tag").unwrap()]).unwrap(),
+                covering: Page::new(Vec::new()).unwrap(),
+            },
+        ],
+    });
+    assert_eq!(
+        cluster.op(leader, "table.update", update).await,
+        done("true")
+    );
+    let tag_entry = MvccKey::IndexEntry {
+        table_id: cluster.table,
+        index_id: by_tag,
+        values: Page::new(vec![IndexValue::Utf8("b".into())]).unwrap(),
+        primary_key: Key::Int64(1),
+    };
+    assert!(
+        cluster.latest(leader, tag_entry).await.0.is_some(),
+        "the write used the published descriptor"
+    );
+    cluster.shutdown().await;
+}
+
+/// RD1 (D01): after the first mutation on a group, the leader's mutations
+/// take their table lookup from the epochs of the previous snapshot: no
+/// store read (one native job) before the latch. A get's snapshot counts too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d01_rd1_mutations_read_no_epochs_before_the_latch() {
+    let cluster = Cluster::new(Options::default()).await;
+    let leader = cluster.leader().await;
+    let executor = cluster.voters[leader].executor.clone();
+    assert_eq!(
+        cluster
+            .op(leader, "table.get", serde_json::json!({"key": 1}))
+            .await,
+        done("null")
+    );
+    let row =
+        |id: i64| serde_json::json!({"row": {"id": id, "value": id, "tag": "a", "score": 0.0}});
+    assert_eq!(
+        cluster.op(leader, "table.insert", row(1)).await,
+        done("null")
+    );
+    assert_eq!(
+        cluster.op(leader, "table.upsert", row(2)).await,
+        done("null")
+    );
+    for value in 0..20 {
+        assert_eq!(
+            cluster
+                .op(
+                    leader,
+                    "table.update",
+                    serde_json::json!({"key": 1, "values": {"value": value}}),
+                )
+                .await,
+            done("true")
+        );
+    }
+    assert_eq!(
+        cluster
+            .op(leader, "table.delete", serde_json::json!({"key": 2}))
+            .await,
+        done("true")
+    );
+    assert_eq!(
+        cluster
+            .op(
+                leader,
+                "table.update",
+                serde_json::json!({"key": 2, "values": {"value": 1}}),
+            )
+            .await,
+        done("false")
+    );
+    let stats = executor.stats();
+    assert_eq!(stats.pre_latch_epoch_reads, 0, "{stats:?}");
+    assert_eq!(stats.retries["schema"], 0, "{stats:?}");
+    cluster.shutdown().await;
+}
