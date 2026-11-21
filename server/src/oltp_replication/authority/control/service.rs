@@ -930,8 +930,8 @@ impl ControlHandle {
     ) -> Result<bool, ProtocolError> {
         let raw = self
             .read(move |view| {
-                if load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))?
-                    == Some(worker)
+                if view.get(&machine::system_recovery::revoked_id(worker.worker_id))?.is_some()
+                    || load::<WorkerIdentity>(view, &machine::process_exclusion_key(worker))? == Some(worker)
                 {
                     return view.encode(&true);
                 }

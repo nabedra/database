@@ -154,11 +154,12 @@ impl LocalServices {
                 }),
             )?;
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
-            let hosted_control = HostedControlEndpoint::new(
+            let hosted_control = HostedControlEndpoint::registered(
                 control_endpoint.clone(),
                 raw_control.clone(),
                 shared.clone(),
                 pins.clone(),
+                manager.clone(),
             )?;
             registration.bind(Purpose::Authority, hosted_control.clone())?;
             registration.bind(Purpose::ControlDelegation, hosted_control)?;

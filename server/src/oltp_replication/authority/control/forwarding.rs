@@ -467,7 +467,7 @@ pub(crate) struct HostedControlEndpoint {
     reads: Arc<ControlEndpoint>,
     local: ManagedControl,
     shared: Arc<WorkerSharedResources>,
-    pins: BTreeSet<Digest>,
+    manager: Option<Arc<HostedGroupManager>>,
     _owner: Arc<ScratchLease>,
 }
 impl HostedControlEndpoint {
@@ -488,10 +488,34 @@ impl HostedControlEndpoint {
             reads,
             local,
             shared,
-            pins,
+            manager: None,
             _owner: owner,
         }))
     }
+    pub(crate) fn registered(
+        reads: Arc<ControlEndpoint>,
+        local: ManagedControl,
+        shared: Arc<WorkerSharedResources>,
+        pins: BTreeSet<Digest>,
+        manager: Arc<HostedGroupManager>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        let mut endpoint = Self::new(reads, local, shared, pins)?;
+        Arc::get_mut(&mut endpoint).ok_or_else(invalid)?.manager = Some(manager);
+        Ok(endpoint)
+    }
+
+    async fn check_worker_capability(&self, command: &ControlCommand) -> Result<(), ProtocolError> {
+        let Some(manager) = &self.manager else { return Ok(()) };
+        let worker = match command {
+            ControlCommand::Enroll { next, .. } => WorkerIdentity::from(next),
+            ControlCommand::CompleteRestart { intent, .. } => WorkerIdentity::from(&intent.next),
+            ControlCommand::CompleteDataWorker { intent, .. } => intent.worker(),
+            ControlCommand::CompleteEksWorkerReplacement { worker, .. } => *worker,
+            _ => return Ok(()),
+        };
+        self.reads.control().check_replacement_enrollment_capability(manager, worker).await
+    }
+
     fn request(
         &self,
         session: &AuthenticatedSession,
@@ -512,8 +536,7 @@ impl HostedControlEndpoint {
             || session.purpose() != Purpose::ControlDelegation
             || (!scoped_data_worker && !self.reads.is_operator(session.remote())
                 && !(session.recovery_only()
-                    && matches!(request.control_consensus, Operation::CompleteRestart)
-                    && self.pins.contains(&session.remote().certificate_sha256)))
+                    && matches!(request.control_consensus, Operation::CompleteRestart)))
             || (scoped_data_worker && self.reads.is_operator(session.remote()))
             || request.to_node != self.local.state.resident().node_id()
             || match request.control_consensus {
@@ -667,6 +690,7 @@ impl Endpoint for HostedControlEndpoint {
                                 if authorization.subject != session.remote().certificate_sha256 => return Err(invalid()),
                             _ => {}
                         }
+                        self.check_worker_capability(command.payload()?).await?;
                         let applied = self.local.propose(command).await?;
                         self.shared
                             .encode_in(ByteClass::Progress, &applied, PAYLOAD)

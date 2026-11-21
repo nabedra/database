@@ -212,6 +212,10 @@ struct ScopedQueueFenceReaders {
     control: Arc<ControlClient>,
 }
 impl ControlEndpoint {
+    pub(super) fn control(&self) -> &ControlHandle {
+        &self.handle
+    }
+
     pub(super) fn is_operator(&self, worker: WorkerIdentity) -> bool {
         self.handle.is_operator(&worker)
     }

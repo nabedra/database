@@ -32,15 +32,17 @@ impl ControlMachine {
                 let mut revoked = Vec::new();
                 let mut after = None;
                 loop {
+                    let mut next = None;
                     let page = view.scan_page(system_recovery::REVOKED_WORKERS, after.as_deref(), 128, |key, bytes| {
                         if revoked.len() == 1024 {
                             return Err(unknown());
                         }
                         revoked.push(decode::<WorkerIdentity>(bytes)?);
-                        after = Some(key.to_vec());
+                        next = Some(key.to_vec());
                         Ok(())
                     })?;
                     if page.exhausted { break; }
+                    after = next;
                 }
                 let mut operators = Vec::new();
                 let group = super::super::service::load::<GroupRecord>(view, &key(GROUPS, control_id))?;

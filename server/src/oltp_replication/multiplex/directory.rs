@@ -292,9 +292,7 @@ impl AppliedPeerDirectory {
         self.entries
             .write()
             .map_err(|_| unavailable())?
-            .retain(|_, entry| {
-                entry.seen == epoch || matches!(entry.role, Role::BootstrapControl(_))
-            });
+            .retain(|_, entry| entry.seen == epoch);
         self.revision.store(revision, Ordering::Release);
         Ok(revision)
     }
@@ -484,7 +482,7 @@ impl PeerDirectory for AppliedPeerDirectory {
                 if group == control
                     && matches!(
                         purpose,
-                        Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
+                        Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery
                     ) =>
             {
                 Ok(TransportTrust::BootstrapControl)

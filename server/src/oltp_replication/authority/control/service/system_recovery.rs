@@ -178,6 +178,21 @@ impl ControlHandle {
         }
     }
 
+    pub(in crate::oltp_replication::authority::control) async fn check_replacement_enrollment_capability(
+        &self,
+        manager: &HostedGroupManager,
+        next: WorkerIdentity,
+    ) -> Result<(), ProtocolError> {
+        if !self.registered_directory.get().is_some_and(|directory| directory.replacement_capability_active()) {
+            return Ok(());
+        }
+        if self.system_replacement_execution().await?.is_some() {
+            manager.verify_recovery_execution(self.identity(), next).await
+        } else {
+            manager.verify_recovery_capability(self.identity(), next).await
+        }
+    }
+
     async fn system_replacement_execution(&self) -> Result<Option<AppliedPosition>, ProtocolError> {
         let raw = self.read(|view| {
             let activation = load::<AppliedPosition>(view, EXECUTION)?;

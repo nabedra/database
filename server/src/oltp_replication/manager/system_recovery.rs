@@ -455,6 +455,10 @@ impl QuorumEndpoint {
             return Err(unavailable());
         }
         let (record, mounted, _) = control.replacement_record_local(proof.id).await?.ok_or_else(unavailable)?;
+        if proof.worker != WorkerIdentity::from(&record.intent.next) {
+            return Err(invalid());
+        }
+        self.manager.verify_recovery_execution(control.identity(), proof.worker).await?;
         let state = control.inspect().await?.ok_or_else(unavailable)?;
         if !mounted {
             // Check liveness again just before the transaction that revokes
@@ -551,23 +555,7 @@ impl Endpoint for QuorumEndpoint {
                     ByteClass::Progress, &self.reconcile(id, group).await, HEADER,
                 )?,
                 Request::Advertise | Request::AdvertiseExecution => {
-                    #[cfg(test)]
-                    if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|path| {
-                        std::path::Path::new(&path)
-                            .join("hold-system-replacement-advert")
-                            .exists()
-                    }) {
-                        return Err(unsupported());
-                    }
-                    self.manager.shared.encode_in(
-                        ByteClass::Progress,
-                        &if matches!(request, Request::AdvertiseExecution) {
-                            SYSTEM_REPLACEMENT_EXECUTION
-                        } else {
-                            SYSTEM_REPLACEMENT_CAPABILITY
-                        },
-                        HEADER,
-                    )?
+                    capability_reply(&self.manager.shared, matches!(request, Request::AdvertiseExecution))?
                 }
             };
             Ok(ChargedReply {
@@ -576,6 +564,72 @@ impl Endpoint for QuorumEndpoint {
             })
         })
     }
+}
+
+pub(crate) struct ReplacementCapabilityEndpoint {
+    pub group: GroupIdentity,
+    pub shared: Arc<WorkerSharedResources>,
+}
+
+impl ReplacementCapabilityEndpoint {
+    fn parse(&self, session: &AuthenticatedSession, header: &[u8]) -> Result<bool, ProtocolError> {
+        if session.group() != &self.group || session.purpose() != Purpose::SystemRecovery {
+            return Err(invalid());
+        }
+        match serde_json::from_slice::<Request>(header).map_err(|_| invalid())? {
+            Request::Advertise => Ok(false),
+            Request::AdvertiseExecution => Ok(true),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+impl Endpoint for ReplacementCapabilityEndpoint {
+    fn preflight<'a>(
+        &'a self,
+        session: &'a AuthenticatedSession,
+        header: &'a [u8],
+    ) -> EndpointFuture<'a, ReceivePlan> {
+        Box::pin(async move {
+            self.parse(session, header)?;
+            Ok(ReceivePlan {
+                class: TrafficClass::Settlement,
+                section_lengths: [0; 3],
+                decode_budget_bytes: 0,
+            })
+        })
+    }
+
+    fn handle<'a>(
+        &'a self,
+        session: AuthenticatedSession,
+        header: ChargedBytes,
+        sections: ChargedSections,
+    ) -> EndpointFuture<'a, ChargedReply> {
+        Box::pin(async move {
+            let execution = self.parse(&session, header.as_slice())?;
+            if (0..3).any(|index| sections.section(index).is_some()) {
+                return Err(invalid());
+            }
+            Ok(ChargedReply {
+                header: capability_reply(&self.shared, execution)?,
+                sections: [None, None, None],
+            })
+        })
+    }
+}
+
+fn capability_reply(shared: &WorkerSharedResources, execution: bool) -> Result<ChargedBytes, ProtocolError> {
+    #[cfg(test)]
+    if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|path| {
+        std::path::Path::new(&path)
+            .join("hold-system-replacement-advert")
+            .exists()
+    }) {
+        return Err(unsupported());
+    }
+    let capability = if execution { SYSTEM_REPLACEMENT_EXECUTION } else { SYSTEM_REPLACEMENT_CAPABILITY };
+    shared.encode_in(ByteClass::Progress, &capability, HEADER)
 }
 
 pub(crate) fn reachable() -> ProtocolError {

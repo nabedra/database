@@ -78,7 +78,7 @@ fn admit_trust(
         && (group.kind != GroupKind::Control
             || !matches!(
                 purpose,
-                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
+                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery
             ))
     {
         return Err(malformed(
