@@ -213,6 +213,11 @@ impl RangeRoute {
     pub(crate) fn leader_hint(&self) -> Option<u64> {
         Some(self.leader_hint.load(Ordering::Relaxed)).filter(|node| *node != 0)
     }
+    fn forget_leader(&self, node: u64) {
+        let _ = self
+            .leader_hint
+            .compare_exchange(node, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
     fn cached_voters(&self) -> Option<Arc<[Voter]>> {
         self.voters
             .lock()
@@ -811,7 +816,10 @@ impl DirectGateway {
             } else {
                 deadline
             };
-            let left = attempt.saturating_duration_since(now);
+            // A leader waiting for Timestamp or Raft can finish within the
+            // operation budget even after we give another voter a chance.
+            // The old attempt and every retry use the same dedup identity.
+            let left = deadline.saturating_duration_since(now);
             request.deadline = left
                 .saturating_sub(LEADER_MARGIN)
                 .max(left / 2)
@@ -856,7 +864,7 @@ impl DirectGateway {
                     return Ok(Terminal::Fallback(reason));
                 }
                 Ok(DirectResponse::Failed(error)) => {
-                    if error.code == ErrorCode::OutcomeUnknown && attempt == deadline {
+                    if error.code == ErrorCode::OutcomeUnknown {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
@@ -869,12 +877,7 @@ impl DirectGateway {
                         // decides.
                         *uncertain = true;
                         GatewayStats::bump(&self.stats.resends);
-                        let _ = range.leader_hint.compare_exchange(
-                            voter.node_id,
-                            0,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
+                        range.forget_leader(voter.node_id);
                         if !pause(deadline, &mut delay).await {
                             return Err(deadline_error(true));
                         }
@@ -929,12 +932,7 @@ impl DirectGateway {
                             let _ = self.voters(&range, true, deadline).await;
                         }
                         None => {
-                            let _ = range.leader_hint.compare_exchange(
-                                voter.node_id,
-                                0,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            );
+                            range.forget_leader(voter.node_id);
                             // No leader known (an election): back off.
                             if !pause(deadline, &mut delay).await {
                                 return Err(deadline_error(*uncertain));
@@ -949,12 +947,7 @@ impl DirectGateway {
                     if error.code == ErrorCode::Overloaded && !*uncertain {
                         return Err(error);
                     }
-                    let _ = range.leader_hint.compare_exchange(
-                        voter.node_id,
-                        0,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+                    range.forget_leader(voter.node_id);
                     if error.code == ErrorCode::ValidationError {
                         // The receiver refused this replica identity: read
                         // the placement again.
@@ -969,12 +962,7 @@ impl DirectGateway {
                     // record decides whether the first attempt committed.
                     *uncertain = true;
                     GatewayStats::bump(&self.stats.resends);
-                    let _ = range.leader_hint.compare_exchange(
-                        voter.node_id,
-                        0,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
+                    range.forget_leader(voter.node_id);
                     if !pause(deadline, &mut delay).await {
                         return Err(deadline_error(true));
                     }
