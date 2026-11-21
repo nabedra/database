@@ -1,0 +1,11 @@
+NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM              STORAGECLASS      VOLUMEATTRIBUTESCLASS   REASON   AGE    VOLUMEMODE
+persistentvolume/pvc-4715c3d9-16d2-4f5d-b259-1c4a9597ef6f   1Gi        RWOP           Delete           Bound    live3/w3-primary   rawfile-localpv   <unset>                          101s   Filesystem
+persistentvolume/pvc-cab80fd8-f396-4b1b-926b-4b0e0045f5da   2Gi        RWOP           Delete           Bound    live3/w2-primary   rawfile-localpv   <unset>                          102s   Filesystem
+persistentvolume/pvc-d9ad310b-6a6b-4545-a49a-785e79637b40   1Gi        RWOP           Delete           Bound    live3/w3-extra     rawfile-localpv   <unset>                          53s    Filesystem
+persistentvolume/pvc-f850766d-1c65-4343-8ccc-0f077ec45aac   1Gi        RWOP           Delete           Bound    live3/w1-primary   rawfile-localpv   <unset>                          102s   Filesystem
+
+NAMESPACE   NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      VOLUMEATTRIBUTESCLASS   AGE    VOLUMEMODE
+live3       persistentvolumeclaim/w1-primary   Bound    pvc-f850766d-1c65-4343-8ccc-0f077ec45aac   1Gi        RWOP           rawfile-localpv   <unset>                 104s   Filesystem
+live3       persistentvolumeclaim/w2-primary   Bound    pvc-cab80fd8-f396-4b1b-926b-4b0e0045f5da   2Gi        RWOP           rawfile-localpv   <unset>                 103s   Filesystem
+live3       persistentvolumeclaim/w3-extra     Bound    pvc-d9ad310b-6a6b-4545-a49a-785e79637b40   1Gi        RWOP           rawfile-localpv   <unset>                 73s    Filesystem
+live3       persistentvolumeclaim/w3-primary   Bound    pvc-4715c3d9-16d2-4f5d-b259-1c4a9597ef6f   1Gi        RWOP           rawfile-localpv   <unset>                 102s   Filesystem

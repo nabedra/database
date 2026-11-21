@@ -1206,7 +1206,7 @@ def oltp(cluster, binary, image, scenario, test_executable):
             after = topology.admin('storage.replica.placement', {'group': group})
             assert after == prior and len(after['members']) == after['record']['replica_count'] == 3, after
             cluster.evidence.record('O18 Data placement RF3', group=group, placement=after)
-        if scenario == 'lifecycle' and test_executable:
+        if scenario in ('lifecycle', 'rolling') and test_executable:
             last_queue_holder(topology, traffic)
         assert not failures, failures
 

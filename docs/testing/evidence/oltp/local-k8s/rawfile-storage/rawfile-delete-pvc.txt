@@ -1,0 +1,4 @@
+persistentvolumeclaim "w1-primary" deleted from live3 namespace
+persistentvolumeclaim "w2-primary" deleted from live3 namespace
+persistentvolumeclaim "w3-extra" deleted from live3 namespace
+persistentvolumeclaim "w3-primary" deleted from live3 namespace

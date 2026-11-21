@@ -43,9 +43,10 @@ host-path PVC and CSI error checks. Use `--scenario scale` for the local
 Docker data worker and drain permit check. Use `--scenario rolling` or
 `--scenario zone` for either lifecycle check on its own. The zone check
 places Kubernetes DNS on the control plane before stopping any data node.
-With the inspection executable, the lifecycle scenario finishes with the
-R02 check. It reads both a queued and a running record from the surviving
-worker's RAM after sequentially stopping the other two workers.
+With the inspection executable, the lifecycle and rolling scenarios
+finish with the R02 check. It reads both a queued and a running record
+from the surviving worker's RAM after sequentially stopping the other
+two workers.
 To try the independent ext4
 volumes, render the pinned chart with Helm and replace `--csi-source` with
 `--rawfile-manifest "$LIVE3_WORK/rawfile.yaml"` for the storage run. Use
@@ -103,6 +104,13 @@ successful-read gap was 41.994 s including the stop. For requests started
 while the node was down, nearest-rank p99 across all attempts was
 7,017.585 ms for reads and 7,001.494 ms for direct writes.
 
+A repeat with both DNS pods still on the control plane acknowledged 105
+direct writes during the 65.703 s node outage. Its independent reads all
+failed or timed out before the node was restored. The repeat stopped at
+the read watchdog before the final audit.
+[Repeated zone trace](repeated-zone/trace.jsonl) ·
+[Repeat DNS placement](repeated-zone/coredns-placement.txt)
+
 The same run attached a second PVC, checked its mount before publishing
 the pool, and replayed the mount receipt. A host-path resize reported 2 GiB
 without a filesystem size change. Nabedra kept its growth claim in
@@ -122,6 +130,25 @@ probe expanded an ext4 PVC from 256 MiB to 512 MiB without replacing the Pod.
 the volume returned ENOSPC on the subsequent allocation. [Filesystem trace](rawfile-filesystem/trace.jsonl) ·
 [CSI expansion calls](rawfile-filesystem/driver-resize.txt) ·
 [Earlier driver output](rawfile-attempts/invalid-capacity-driver.txt)
+
+The native OLTP Rawfile run attached a secondary PVC on a distinct ext4
+device and registered it once after replay. Filling that pool reduced
+reported available capacity from 882,802,688 to 61,440 bytes, and a further
+allocation failed with ENOSPC. The primary PVC expanded online from 1 GiB
+to 2 GiB with the same Pod UID and a 1,031,612 KiB filesystem increase.
+Nabedra published 2,077,073,408 mounted bytes only after the filesystem grew.
+The duplicate mount request returned the original growth claim with one
+attempt. The direct-write audit passed for 259 acknowledgments. The queued
+audit stopped at a request that had received HTTP 202 and later settled
+with `conflict/not_applied` after its original execution authority was fenced.
+[Native Rawfile trace](rawfile-storage/trace.jsonl)
+
+The first Docker scale attempt reached native preparation but the new
+worker refused its mounted volume. The fixture seeded the system-worker
+key filename. The data worker requires `.nabedra-data-worker-key`, and
+the fixture now writes that file with owner-only permissions.
+[Data worker output](scale-attempt/worker-output.txt) ·
+[Scale attempt trace](scale-attempt/trace.jsonl)
 
 The Linux process tests reran after the hardening merge. Retained restart
 verified 78 acknowledged writes, two settled receipts and three applied

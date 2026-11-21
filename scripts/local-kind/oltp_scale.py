@@ -50,11 +50,11 @@ def scale(topology, growth_claim, run, traffic):
     hosts_file = f'type=bind,source={(config_dir / "hosts").resolve()},target=/etc/hosts,readonly'
     run('docker', 'volume', 'create', '--name', volume)
     try:
-        script = """import json, pathlib, sys
+        script = """import json, os, pathlib, sys
+os.umask(0o077)
 raw = json.load(sys.stdin)
-with pathlib.Path('/pool/NABEDRA_RESTART_KEY').open('xb') as f:
+with pathlib.Path('/pool/.nabedra-data-worker-key').open('xb') as f:
     f.write(bytes.fromhex(raw.pop('seed')))
-pathlib.Path('/pool/NABEDRA_RESTART_KEY').chmod(0o600)
 pathlib.Path('/pool/.nabedra-docker-volume.json').write_text(json.dumps(raw))
 """
         # Seed the freshly created named volume before constructing the worker.

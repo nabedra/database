@@ -1,0 +1,7 @@
+statefulset.apps "w1" deleted from live3 namespace
+statefulset.apps "w2" deleted from live3 namespace
+statefulset.apps "w3" deleted from live3 namespace
+pod "api" deleted from live3 namespace
+pod "w1-0" deleted from live3 namespace
+pod "w2-0" deleted from live3 namespace
+pod "w3-0" deleted from live3 namespace
