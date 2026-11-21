@@ -730,7 +730,7 @@ def reject_live_enrollments(cluster):
     assert after == before and after['ready_workers'] == 3, (before, after)
 
 
-def saturated_history(db, exchange, worker_stats, directories, run, *, membership_faults=None):
+def saturated_history(db, exchange, worker_stats, directories, run, memory_limits, *, membership_faults=None):
     table = db.create_table('o22_saturation', {'id': int, 'value': int}, key='id')
     rows = [dict(id=key, value=key) for key in range(8)]
     assert table.insert_many(rows) == len(rows)
@@ -745,6 +745,14 @@ def saturated_history(db, exchange, worker_stats, directories, run, *, membershi
         write_json(directory / 'transaction-gates.json',
                    {request['request_id']: {'snapshot': True} for request, _ in held})
 
+    def parked_usage():
+        stats = worker_stats()
+        for worker, sample in stats.items():
+            for _, _, charged in sample['scheduler']:
+                assert 0 <= charged <= memory_limits[worker], (worker, charged, memory_limits[worker])
+        return stats if all(occupied == 0 for sample in stats.values()
+                            for _, occupied, _ in sample['scheduler']) else None
+
     def release_snapshot(request):
         for directory in directories:
             (directory / f"release-transaction-{request['request_id']}-snapshot").touch()
@@ -756,17 +764,18 @@ def saturated_history(db, exchange, worker_stats, directories, run, *, membershi
             wait_until(lambda: any((directory / f"transaction-{request['request_id']}-snapshot.json").is_file()
                                    for directory in directories),
                        f"{request['request_id']} did not pin a running snapshot", timeout=15)
-        before = worker_stats()
+        before = wait_until(parked_usage, 'four parked snapshots release their compute slots', timeout=5)
         assert all(stats['queue']['running_records'] == 4 for stats in before.values()), before
         if membership_faults is not None:
             membership_faults()
         status, refused = exchange(REQUESTS, overflow)
         assert status == 429 and refused['request_id'] == overflow['request_id'], (status, refused)
         assert refused['error']['code'] == 'overloaded' and refused['error']['outcome'] == 'not_applied', refused
-        after = worker_stats()
+        after = wait_until(parked_usage, 'refused operations release their compute slots', timeout=5)
+        # Queue/result charges belong to the held requests. Total worker
+        # memory also includes concurrent maintenance and cache activity.
         for worker, stats in after.items():
             assert stats['queue'] == before[worker]['queue'], (worker, stats['queue'])
-            assert stats['scheduler'] == before[worker]['scheduler'], (worker, stats['scheduler'])
             assert stats['native_thread_budget'] == before[worker]['native_thread_budget']
         for request, result in held:
             release_snapshot(request)
@@ -919,7 +928,10 @@ def o22(binary, test_executable):
                      preadmission_overloads=overloads)
 
         with closing(gateway(cluster)) as client:
+            memory_limits = {name: config['resources']['memory_limit_bytes']
+                             for name, config in cluster.config.items()}
             distributed = saturated_history(db, client.exchange, cluster.all_stats, directories, cluster.run_id,
+                                            memory_limits,
                                             membership_faults=lambda: reject_live_enrollments(cluster))
 
     with tempfile.TemporaryDirectory(prefix='nabedra-o22-u01-') as root:
@@ -941,14 +953,16 @@ def o22(binary, test_executable):
                     assert_accepted(client.exchange(REQUESTS, count), ready['run_id'], count)
                     exact_receipt(client.exchange, ready['run_id'], count, len(rows))
                     standalone = saturated_history(db, client.exchange, lambda: {'local': local.stats()},
-                                                   [Path(root)], ready['run_id'])
+                                                   [Path(root)], ready['run_id'],
+                                                   {'local': local.resources['memory_limit_bytes']})
     assert standalone == distributed, (standalone, distributed)
     evidence('O22', 'C02-U01-live-admission-saturation', rf1=standalone, rf3=distributed)
     assertion('O22', 'scheduler-contract',
               'C01–C07/F01–F03/U01–U03 native and process assertions ran. RF1 and RF3 agreed on four '
               'held requests and the fifth overload. Under RF3 saturation, Control rejected a supplied '
-              'capacity claim and the live mTLS queue lane refused a stale incarnation. Readiness and '
-              'charges stayed unchanged.'
+              'capacity claim and the live mTLS queue lane refused a stale incarnation. Readiness and the '
+              'held queue/result charges agreed before and after refusal. Every observed worker stayed '
+              'within its memory ceiling and the parked requests released compute.'
               if mounts else 'C03 retained reconfiguration requires Linux loopback pool mounts with passwordless sudo.',
               'passed' if mounts else 'not-run')
 
