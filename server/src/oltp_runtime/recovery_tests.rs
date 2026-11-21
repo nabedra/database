@@ -853,7 +853,15 @@ async fn replacement_peer_probe(config: PathBuf) {
                     .is_err()
             );
         }
-        directory.check_remote_revocations(&control).unwrap();
+        // REP6: the Data-only worker's view, seeded from a Control majority
+        // and refreshed by its own task, as in `data_worker_process`.
+        directory.seed_remote_revocations(&*control).await.unwrap();
+        let (_refresh_stop, refresh_stopped) = tokio::sync::watch::channel(false);
+        tokio::spawn(
+            directory
+                .clone()
+                .run_revocation_refresh(control.clone(), refresh_stopped),
+        );
         // D01-style budget evidence: this process's Control reads, by kind.
         let stats = config.directory.join("stats.json");
         tokio::spawn(async move {

@@ -481,3 +481,61 @@ async fn o17_ns14_system_mount_hands_more_than_64_data_groups_to_the_damage_path
         assert!(saved.pending());
     }
 }
+
+/// O17 (REP6): the page read that seeds and refreshes Data-only workers'
+/// revocation views lists every committed system revocation, the set
+/// Control hosts enforce, in worker order across pages.
+#[tokio::test]
+async fn o17_rep6_revocation_pages_list_every_committed_revocation() {
+    let directory = Directory::new();
+    let mut recovery = Recovery::open(&directory).await;
+    let (record, key) = recovery.prepare(recovery.voters[2], 4).await;
+    assert_eq!(
+        recovery.mount(&record, &key).await,
+        ControlReply::SystemReplacementMounted
+    );
+    let historical: Vec<WorkerIdentity> = (0..130)
+        .map(|number| WorkerIdentity::from(&worker(5000 + number)))
+        .collect();
+    let seeded = historical.clone();
+    recovery
+        .seed(move |tx| {
+            for worker in &seeded {
+                let raw = tx.encode_value(worker)?;
+                tx.put(&revoked_id(worker.worker_id), raw.as_ref())?;
+            }
+            Ok(())
+        })
+        .await;
+    let handle = ControlHandle::new(
+        recovery.fixture.machine.clone(),
+        Arc::new(NativeModelConsensus {
+            machine: recovery.fixture.machine.clone(),
+            next: AtomicU64::new(recovery.fixture.next),
+            reads: AtomicU64::new(0),
+        }),
+        OperatorPolicy {
+            policy: authorization().policy,
+            certificate_pins: Default::default(),
+        },
+    );
+    let mut listed = Vec::new();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let raw = handle.revocations(after).await.unwrap();
+        let page: InventoryPage<WorkerIdentity> = serde_json::from_slice(raw.as_ref()).unwrap();
+        pages += 1;
+        listed.extend(page.items.iter().copied());
+        assert_eq!(page.after, listed.last().map(|worker| worker.worker_id));
+        after = page.after;
+        if page.done {
+            break;
+        }
+    }
+    let mut expected = historical;
+    expected.push(record.intent.previous);
+    expected.sort_by_key(|worker| worker.worker_id);
+    assert_eq!(listed, expected);
+    assert_eq!(pages, 2);
+}

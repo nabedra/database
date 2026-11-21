@@ -263,7 +263,8 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
-    registered_directory: std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    registered_directory:
+        std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     /// NS14 mixed-version gate for the group damage commands.
     group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
@@ -285,10 +286,14 @@ impl ControlHandle {
         &self,
         directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     ) -> Result<(), ProtocolError> {
-        self.registered_directory.set(directory).map_err(|_| unauthorized())
+        self.registered_directory
+            .set(directory)
+            .map_err(|_| unauthorized())
     }
     pub(crate) fn system_placement_changed(&self) -> bool {
-        self.registered_directory.get().is_some_and(|directory| directory.system_placement_changed())
+        self.registered_directory
+            .get()
+            .is_some_and(|directory| directory.system_placement_changed())
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
         self.machine.store().resources()
@@ -338,9 +343,7 @@ impl ControlHandle {
         operation_id: Uuid,
         evidence: Digest,
     ) -> Result<AuthorizationStamp, ProtocolError> {
-        if !Arc::ptr_eq(&permit.shared, self.resources())
-            || !self.is_operator(&permit.local)
-        {
+        if !Arc::ptr_eq(&permit.shared, self.resources()) || !self.is_operator(&permit.local) {
             return Err(unauthorized());
         }
         Ok(AuthorizationStamp {
@@ -967,6 +970,41 @@ impl ControlHandle {
             .await?;
         machine::decode(raw.as_ref())
     }
+    /// REP6: one page of committed system revocations, the set Control
+    /// hosts enforce (`system_trust`). `revision` is the enrollment revision
+    /// the page was read at; callers agree on the items only.
+    pub(crate) async fn revocations(
+        &self,
+        after: Option<Uuid>,
+    ) -> Result<ChargedBytes, ProtocolError> {
+        self.read(move |view| {
+            let state = state(view)?;
+            let prefix = machine::system_recovery::REVOKED_WORKERS;
+            let mut items = Vec::new();
+            let mut cursor = after;
+            let progress = view.scan_page(
+                prefix,
+                after.map(|id| machine::key(prefix, id)).as_deref(),
+                crate::oltp_replication::types::MAX_PAGE_ITEMS,
+                |key, bytes| {
+                    let worker: WorkerIdentity = machine::decode(bytes)?;
+                    if key[prefix.len()..] != *worker.worker_id.as_bytes() {
+                        return Err(stale());
+                    }
+                    cursor = Some(worker.worker_id);
+                    items.push(worker);
+                    Ok(())
+                },
+            )?;
+            view.encode(&InventoryPage {
+                revision: state.enrollment_revision,
+                items: Page::new(items).map_err(|_| stale())?,
+                after: cursor,
+                done: progress.exhausted,
+            })
+        })
+        .await
+    }
     pub(crate) async fn worker(
         &self,
         worker_id: Uuid,
@@ -1461,10 +1499,8 @@ impl ControlHandle {
                         return Err(unauthorized());
                     }
                     ServiceAction::DirectLeader => {
-                        let advertised = load::<WorkerIdentity>(
-                            view,
-                            &machine::direct::reader_key(remote),
-                        )?;
+                        let advertised =
+                            load::<WorkerIdentity>(view, &machine::direct::reader_key(remote))?;
                         if view.get(machine::direct::activation_key())?.is_none()
                             || advertised != Some(remote)
                             || !matches!(
