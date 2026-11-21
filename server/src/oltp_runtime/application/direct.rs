@@ -853,7 +853,9 @@ impl DirectGateway {
                         if !*uncertain {
                             return Err(error);
                         }
-                    } else if error.code != ErrorCode::StorageUnavailable {
+                    } else if error.code != ErrorCode::StorageUnavailable
+                        || crate::oltp::pool::is_disk_reservation_refusal(&error)
+                    {
                         range.leader_hint.store(voter.node_id, Ordering::Relaxed);
                         return Ok(Terminal::Failed(error));
                     }

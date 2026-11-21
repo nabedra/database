@@ -63,7 +63,10 @@ pub(crate) trait TypedMachine<C: TypedConfig>: Clone + Send + Sync + 'static {
         &self,
         raft: &HostRaft<C, Self>,
         command: OwnedCommand<C::Command>,
-    ) -> impl Future<Output = Result<ClientWriteResponse<C>, ProtocolError>> + Send {
+    ) -> impl Future<Output = Result<ClientWriteResponse<C>, ProtocolError>> + Send
+    where
+        C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
+    {
         async move {
             raft.client_write(command)
                 .await
