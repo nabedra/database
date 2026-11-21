@@ -9,6 +9,7 @@
 //! Timestamp authority is one shared counter; "the queued path" is
 //! `Routed::Queued`, whose forward marker the tests inspect.
 use super::*;
+use crate::oltp::mvcc::MvccKey;
 use crate::{
     config::WorkerResources,
     oltp::{
@@ -690,7 +691,11 @@ impl Source {
     }
 }
 impl TopologySource for Source {
-    fn table(&self, _table_id: Uuid) -> EndpointFuture<'_, Option<TableFill>> {
+    fn point<'a>(
+        &'a self,
+        _table_id: Uuid,
+        key: Option<&'a Key>,
+    ) -> EndpointFuture<'a, Option<PointFill>> {
         self.table_reads.fetch_add(1, Ordering::SeqCst);
         let mut fills = self.fills.lock().unwrap();
         let fill = if fills.len() > 1 {
@@ -698,7 +703,7 @@ impl TopologySource for Source {
         } else {
             fills.front().cloned()
         };
-        Box::pin(async move { Ok(fill) })
+        Box::pin(async move { Ok(fill.and_then(|fill| fill.select(key))) })
     }
     fn placement<'a>(
         &'a self,
@@ -1030,8 +1035,11 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
         Answer::Data(Value::Null)
     );
     assert_eq!(gateway.stats().not_leader, 1);
-    let table = gateway.cache().get(cluster.table).unwrap();
-    assert_eq!(table.ranges[0].leader_hint(), Some(2));
+    let table = gateway
+        .cache()
+        .get(cluster.table, Some(&Key::Int64(7)))
+        .unwrap();
+    assert_eq!(table.range.leader_hint(), Some(2));
     // A lost reply: the leader committed, the gateway resends the same id
     // and body and gets the original result; one version.
     transport.lose.store(1, Ordering::SeqCst);
@@ -1449,9 +1457,9 @@ async fn d07_o16_split_and_leader_move_under_load_give_one_outcome_per_request()
     }
     let stats = gateway.stats();
     assert!(stats.stale_routes >= 1, "{stats:?}");
-    // One fill plus exactly one refresh, however many requests saw it.
-    assert_eq!(stats.catalog_reads, 2, "{stats:?}");
-    assert_eq!(source.reads().0, 2);
+    // The pre-split interval and its two children are each read once.
+    assert_eq!(stats.catalog_reads, 3, "{stats:?}");
+    assert_eq!(source.reads().0, 3);
     eprintln!("d07 phase 1: {stats:?}; left leader moved away from node {moved}");
 
     // Phase 2: the split barrier holds the right range. Its requests fall
@@ -1815,15 +1823,18 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
         key_column: "id".into(),
         key_type: ColumnType::Int64,
         schema_epoch: 1,
-        ranges: vec![
-            Arc::new(RangeRoute::new(group(None, Some(10)))),
-            Arc::new(RangeRoute::new(group(Some(10), None))),
-        ],
+        range: Arc::new(RangeRoute::new(group(None, Some(10)))),
         _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
     };
     let keys = |bytes: &[u8]| {
         let scanned = scan(bytes).unwrap();
-        route_keys(&scanned, &route).map(|k| (k.first, k.anchor, k.one_range))
+        let keys = match scanned.op {
+            Op::Get | Op::Delete | Op::Update => point_key(&scanned)
+                .filter(|key| key.validate(route.key_type).is_ok())
+                .map(RouteKeys::single),
+            _ => row_keys(&scanned, &route),
+        }?;
+        Some((keys.anchor, keys.last))
     };
     let many = body(
         "table.insert_many",
@@ -1831,16 +1842,16 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
     );
     assert_eq!(
         keys(&many),
-        Some((Key::Int64(7), Key::Int64(3), true)),
+        Some((Key::Int64(3), Key::Int64(9))),
         "a nested `id` is not the key"
     );
     let across = body(
         "table.insert_many",
         json!({"rows": [{"id": 12}, {"id": -1}]}),
     );
-    assert_eq!(keys(&across), Some((Key::Int64(12), Key::Int64(-1), false)));
+    assert_eq!(keys(&across), Some((Key::Int64(-1), Key::Int64(12))));
     let upsert = body("table.upsert", json!({"row": {"value": 2, "id": 11}}));
-    assert_eq!(keys(&upsert), Some((Key::Int64(11), Key::Int64(11), true)));
+    assert_eq!(keys(&upsert), Some((Key::Int64(11), Key::Int64(11))));
     // Keys that cannot route: a missing or duplicate key column, the wrong
     // type, a get with values, an update without them.
     for bad in [
@@ -1876,27 +1887,45 @@ fn o03_scan_and_route_keys_follow_the_route_key_column() {
 }
 
 #[test]
-fn o03_topology_cache_is_a_bounded_lru() {
+fn o28_topology_cache_is_a_byte_bounded_range_lru() {
     let shared = resources();
-    let cache = TopologyCache::new(2);
-    let route = |table_id| {
+    let cache = TopologyCache::new();
+    let table_id = Uuid::new_v4();
+    let route = |lo| {
+        let shard = ShardRoute {
+            group: GroupIdentity {
+                cluster_id: Uuid::new_v4(),
+                database: Text::try_from("t6").unwrap(),
+                group_id: Uuid::new_v4(),
+                kind: GroupKind::Data {
+                    table_id,
+                    shard_id: Uuid::new_v4(),
+                },
+                group_format_version: 1,
+            },
+            span: span(Some(lo), Some(lo + 1)),
+            schema_epoch: 1,
+            routing_epoch: 1,
+        };
         Arc::new(TableRoute {
             table_id,
             key_column: "id".into(),
             key_type: ColumnType::Int64,
             schema_epoch: 1,
-            ranges: Vec::new(),
-            _charge: shared.reserve_scratch(ByteClass::Progress, 1).unwrap(),
+            range: Arc::new(RangeRoute::new(shard)),
+            _charge: shared
+                .reserve_scratch(ByteClass::Progress, CACHE_BYTES / 2)
+                .unwrap(),
         })
     };
-    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-    cache.insert(route(a));
-    cache.insert(route(b));
-    assert!(cache.get(a).is_some(), "a is now the most recent");
-    cache.insert(route(c));
-    assert_eq!(cache.len(), 2);
-    assert!(cache.get(b).is_none(), "b was least recently used");
-    assert!(cache.get(a).is_some() && cache.get(c).is_some());
+    cache.insert(route(0));
+    cache.insert(route(1));
+    let get = |key| cache.get(table_id, Some(&Key::Int64(key)));
+    assert!(get(0).is_some(), "range 0 is now the most recent");
+    cache.insert(route(2));
+    assert_eq!(cache.usage(), (2, CACHE_BYTES, CACHE_BYTES));
+    assert!(get(1).is_none(), "range 1 was least recently used");
+    assert!(get(0).is_some() && get(2).is_some());
     assert_eq!(mode(false, true), DirectMode::Off);
     assert_eq!(mode(true, false), DirectMode::ForwardOnly);
     assert_eq!(mode(true, true), DirectMode::Direct);

@@ -291,9 +291,9 @@ async fn d10_o10_bug1_reply_capacity_after_apply_cannot_report_not_applied() {
             .direct_gateway_handle()
             .unwrap()
             .cache()
-            .get(table_id)
+            .get(table_id, Some(&crate::protocol::Key::Int64(7)))
             .unwrap();
-        let range = &route.ranges[0];
+        let range = &route.range;
         let shared = &runtime.services.shared;
         let id = Uuid::new_v4();
         let insert = body(

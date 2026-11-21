@@ -4,9 +4,10 @@
 //! topology cache from.
 use super::*;
 use crate::oltp_runtime::application::direct::{
-    self, DirectGateway, DirectMode, DirectRouting, TableFill, TopologySource, Voter, WireTransport,
+    self, DirectGateway, DirectMode, DirectRouting, PointFill, TableFill, TopologySource, Voter,
+    WireTransport,
 };
-use crate::oltp_runtime::worker_endpoint::AuthorityReader;
+use crate::{oltp_runtime::worker_endpoint::AuthorityReader, protocol::Key};
 
 /// The gateway reads T7's switch, which the runtime installs after the
 /// gateway exists: off until it is there.
@@ -26,7 +27,11 @@ struct WorkerTopology {
     runtime: Weak<WorkerRuntime>,
 }
 impl TopologySource for WorkerTopology {
-    fn table(&self, table_id: Uuid) -> EndpointFuture<'_, Option<TableFill>> {
+    fn point<'a>(
+        &'a self,
+        table_id: Uuid,
+        key: Option<&'a Key>,
+    ) -> EndpointFuture<'a, Option<PointFill>> {
         Box::pin(async move {
             let runtime = self.runtime.upgrade().ok_or_else(unavailable)?;
             let current = runtime
@@ -42,11 +47,12 @@ impl TopologySource for WorkerTopology {
                 .and_then(|switch| switch.direct_catalog())
             {
                 Some(catalog) => {
-                    direct::catalog_fill(&catalog, current.ready.view.authority(), table_id).await
+                    direct::catalog_point(&catalog, current.ready.view.authority(), table_id, key)
+                        .await
                 }
                 None => {
                     runtime
-                        .direct_table_fill(current.ready.view.authority(), table_id)
+                        .direct_point_fill(current.ready.view.authority(), table_id, key)
                         .await
                 }
             }
@@ -88,6 +94,15 @@ impl WorkerRuntime {
     pub(crate) fn direct_gateway_handle(&self) -> Option<&Arc<DirectGateway>> {
         self.direct_gateway.get()
     }
+    pub(crate) async fn direct_point_fill(
+        &self,
+        authority: Authority,
+        table_id: Uuid,
+        key: Option<&Key>,
+    ) -> Result<Option<PointFill>, ProtocolError> {
+        direct::catalog_point(&self.services.catalog, authority, table_id, key).await
+    }
+
     /// One Catalog read for a gateway's topology cache.
     pub(crate) async fn direct_table_fill(
         &self,

@@ -82,8 +82,7 @@ pub(crate) struct RoutingRoot {
     pub schema_epoch: u64,
     pub routing_epoch: u64,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ShardRoute {
     pub group: GroupIdentity,
@@ -371,7 +370,7 @@ impl CatalogHandle {
         )
         .await
     }
-    pub(super) async fn route_pages(
+    pub(crate) async fn route_pages(
         &self,
         snapshot: &PinnedCatalog,
         table_id: Uuid,

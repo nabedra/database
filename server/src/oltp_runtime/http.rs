@@ -534,7 +534,7 @@ impl hyper::body::Body for ChargedBody {
 mod tests {
     use super::super::{
         application::direct::{
-            DirectGateway, DirectTransport, GatewaySwitch, SendFuture, TableFill, TopologySource,
+            DirectGateway, DirectTransport, GatewaySwitch, PointFill, SendFuture, TopologySource,
             Voter,
         },
         http_runtime::DIRECT_INGRESS_SLOTS,
@@ -719,10 +719,14 @@ mod tests {
 
     /// One Data range over every key, led by node 1.
     struct OneRange {
-        fill: TableFill,
+        fill: PointFill,
     }
     impl TopologySource for OneRange {
-        fn table(&self, _table_id: Uuid) -> EndpointFuture<'_, Option<TableFill>> {
+        fn point<'a>(
+            &'a self,
+            _table_id: Uuid,
+            _key: Option<&'a crate::protocol::Key>,
+        ) -> EndpointFuture<'a, Option<PointFill>> {
             let fill = self.fill.clone();
             Box::pin(async move { Ok(Some(fill)) })
         }
@@ -764,12 +768,12 @@ mod tests {
     fn gateway(leader: Arc<SlowLeader>, table: Uuid) -> Arc<DirectGateway> {
         let switch = Arc::new(GatewaySwitch::default());
         switch.set_active(true);
-        let fill = TableFill {
+        let fill = PointFill {
             table_id: table,
             key_column: "id".into(),
             key_type: crate::protocol::ColumnType::Int64,
             schema_epoch: 1,
-            shards: vec![crate::oltp::mvcc::catalog::ShardRoute {
+            shard: crate::oltp::mvcc::catalog::ShardRoute {
                 group: GroupIdentity {
                     cluster_id: Uuid::new_v4(),
                     database: Text::try_from(DATABASE).unwrap(),
@@ -786,7 +790,7 @@ mod tests {
                 },
                 schema_epoch: 1,
                 routing_epoch: 1,
-            }],
+            },
         };
         let shared = crate::oltp::pool::WorkerSharedResources::new(
             2,
