@@ -149,14 +149,25 @@ D05 "row unchanged" applies to a `not_applied` answer. When the gateway answers
 retry of the same ID and body then returns the one result, and the row holds either the
 old or the new value, never both and never twice.
 
-The activation boundary is part of O15 and D03. A queued eligible request, a get
-included, reserved before `data.direct.v1` activated has no forward marker. Two cases
+The activation boundary is part of O15 and D03. A queued eligible mutation reserved
+before `data.direct.v1` activated has no forward marker. Two cases
 are required. In the first, the request is in flight at activation and is retried with
 the same ID after it: it runs once and returns the original result, and the same ID with
 another body is a conflict. In the second, a cold start abandons the request before
 activation and it is retried after: the answer is `404` abandoned, and the retry never
 runs. Run both with `direct_oltp` on and off: `server/tests/oltp_runtime_acceptance.py
 --scenario activation-boundary`, which `failure-boundaries` (O15) also runs.
+
+Gets have no exactly-once identity (user decision 2026-11-21, RV-FINAL M3). A get is
+never settled at an anchor and writes no forward marker. The history window does not
+hold gets back either. For O15's `queued-read` variation, the old receipt reports the
+abandoned get. A retry of the same ID through `/v1/operations` is a new read: `200`
+with the current row when it runs directly, and `404` abandoned when it takes the
+queued path. The scenario stays, and so does its `abandoned` assertion on the receipt.
+Only the direct retry's expected answer changed. For D03, a get that reuses a
+mutation's ID on the same key is still a conflict on the direct path. A rollback-mode
+queued get (`direct_oltp: false` while active) proposes no Data entry and writes no
+dedup record or expiry key (`o15_d03_m3_rollback_queued_gets_propose_no_data_entry`).
 
 A paused follower is TCP-alive but answers nothing, unlike a killed one. D05 regressions
 (LIVE1) also require these:
