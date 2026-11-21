@@ -1069,6 +1069,31 @@ impl Client {
         worker: RequestTarget,
         placement_generation: Option<uuid::Uuid>,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
+        self.call_member_reserved(
+            action,
+            method,
+            payload,
+            node,
+            worker,
+            placement_generation,
+            None,
+        )
+        .await
+    }
+
+    /// `call_member_at` on an outgoing slot the caller already holds
+    /// ([`WorkerClient::reserve_outgoing`]); `None` takes one or refuses.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_member_reserved(
+        &self,
+        action: ServiceAction,
+        method: Method,
+        payload: &Option<ChargedBytes>,
+        node: u64,
+        worker: RequestTarget,
+        placement_generation: Option<uuid::Uuid>,
+        reservation: Option<crate::oltp_replication::multiplex::OutgoingReservation>,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
         let header = self.shared.encode_in(
             method.class().byte_class(),
             &Header {
@@ -1086,18 +1111,35 @@ impl Client {
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
-        let reply = self
-            .transport
-            .request_classified(
-                &self.group,
-                worker,
-                method.purpose(),
-                header,
-                [payload.clone(), None, None],
-                64 << 10,
-            )
-            .await
-            .map_err(|error| {
+        let sections = [payload.clone(), None, None];
+        let reply = match reservation {
+            None => {
+                self.transport
+                    .request_classified(
+                        &self.group,
+                        worker,
+                        method.purpose(),
+                        header,
+                        sections,
+                        64 << 10,
+                    )
+                    .await
+            }
+            Some(reservation) => {
+                self.transport
+                    .request_reserved(
+                        reservation,
+                        &self.group,
+                        worker,
+                        method.purpose(),
+                        header,
+                        sections,
+                        64 << 10,
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| {
                 tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
                 CallError::Transport(error)
             })?;

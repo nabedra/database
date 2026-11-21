@@ -877,6 +877,101 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
     );
 }
 
+/// PERF1 (O03, D01): a direct request that finds its leader's lane full
+/// waits for a slot, in arrival order, until its deadline, instead of being
+/// refused at once; the lane keeps its bound, and a wait that times out is a
+/// local, not-applied `OutgoingLaneFull`.
+#[tokio::test]
+async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
+    let temp = TestDirectoryPath(std::env::temp_dir().join(format!("lanes-{}", Uuid::new_v4())));
+    std::fs::create_dir(&temp.0).unwrap();
+    let tls = tls::certificates(&temp.0, 1);
+    let local = WorkerEnrollment {
+        worker_id: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        enrollment_revision: 1,
+        certificate_sha256: Digest::parse(tls[0].certificate_sha256()).unwrap(),
+        endpoint: Text::new("127.0.0.1:1".to_owned()).unwrap(),
+        server_name: Text::try_from("localhost").unwrap(),
+    };
+    let peers = Arc::new(TestDirectory::default());
+    peers.install(local.clone());
+    let config = TransportConfig::default();
+    let shared = WorkerSharedResources::new(
+        1,
+        WorkerResources::default(),
+        SharedResourceConfig::default(),
+    )
+    .unwrap();
+    let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    let transport =
+        WorkerTransport::new(&local, &tls[0], shared, peers, registry, config.clone()).unwrap();
+    let client = transport.client();
+    let group = GroupIdentity {
+        cluster_id: Uuid::new_v4(),
+        database: Text::try_from("direct").unwrap(),
+        group_id: Uuid::new_v4(),
+        kind: GroupKind::Data {
+            table_id: Uuid::new_v4(),
+            shard_id: Uuid::new_v4(),
+        },
+        group_format_version: 1,
+    };
+    let class = TrafficClass::ApiIngress;
+    let lane = config.handler_slots[class as usize];
+    let leader = Uuid::new_v4();
+    let reserve = |until| client.reserve_outgoing(&group, leader, Purpose::ApiIngress, until);
+    // The lane admits `lane` requests at once, without waiting.
+    let mut held = Vec::new();
+    for _ in 0..lane {
+        held.push(reserve(Instant::now()).await.unwrap());
+    }
+    // A full lane: refused at the deadline, counted as a local refusal.
+    let refused = transport.common.refusals.snapshot();
+    let start = Instant::now();
+    assert!(matches!(
+        reserve(start + Duration::from_millis(50)).await,
+        Err(RequestError::OutgoingLaneFull)
+    ));
+    assert!(start.elapsed() >= Duration::from_millis(50));
+    assert_ne!(transport.common.refusals.snapshot(), refused);
+    // A waiter gets the slot a finished request frees.
+    let waiter = tokio::spawn({
+        let client = client.clone();
+        let group = group.clone();
+        async move {
+            client
+                .reserve_outgoing(
+                    &group,
+                    leader,
+                    Purpose::ApiIngress,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .await
+                .map(|_| ())
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiter.is_finished(),
+        "the waiter must wait while the lane is full"
+    );
+    held.pop();
+    tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the freed slot admits the waiter")
+        .unwrap()
+        .unwrap();
+    // The bound holds: still `lane` slots at most.
+    held.push(reserve(Instant::now()).await.unwrap());
+    assert!(matches!(
+        client.try_outgoing(leader, class),
+        Err(RequestError::OutgoingLaneFull)
+    ));
+    drop(held);
+    assert!(client.try_outgoing(leader, class).is_ok());
+}
+
 /// NS11 finding 8: local lane-full refusals are counted per class for
 /// `/v1/runtime/stats`; a waiting Authority probe that later succeeds is not.
 #[tokio::test]

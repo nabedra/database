@@ -72,6 +72,8 @@ pub(crate) struct WorkerRuntime {
     transactions: TransactionCoordinator,
     scoped: Option<Arc<super::scoped_worker::ScopedWorker>>,
     ingress: Executor,
+    /// HTTP admission for direct-gateway requests (PERF1).
+    direct_ingress: Executor,
     actors: Executor,
     control_ingress: Executor,
     index_builds: Executor,
@@ -215,6 +217,7 @@ impl WorkerRuntime {
             planner,
             transactions,
             ingress,
+            direct_ingress: Executor::new(super::http_runtime::DIRECT_INGRESS_SLOTS, 0)?,
             control_ingress: Executor::new(2, 0)?,
             index_builds: Executor::new(1, 0)?,
             supervision: Executor::new(1, 0)?,
@@ -936,6 +939,7 @@ impl WorkerRuntime {
         }
         self.admission_cleanup.stop();
         self.ingress.stop_accepting();
+        self.direct_ingress.stop_accepting();
         self.actors.stop_accepting();
         self.control_ingress.stop_accepting();
         self.index_builds.stop_accepting();
@@ -947,6 +951,7 @@ impl WorkerRuntime {
             scoped.drain().await;
         }
         self.admission_cleanup.stop();
+        self.direct_ingress.drain().await;
         self.ingress.drain().await;
         self.actors.drain().await;
         self.control_ingress.drain().await;
@@ -1771,6 +1776,9 @@ impl WorkerRuntime {
 impl HttpRuntime for WorkerRuntime {
     fn ingress(&self) -> &Executor {
         &self.ingress
+    }
+    fn direct_ingress(&self) -> &Executor {
+        &self.direct_ingress
     }
     fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {
         self.direct_gateway_handle().cloned()

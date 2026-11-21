@@ -421,12 +421,6 @@ impl DirectLink {
         {
             return Err(DirectSendError::NotApplied(invalid_request()));
         }
-        let header = request.header();
-        let method = if forward {
-            Method::DirectForward(header)
-        } else {
-            Method::Direct(header)
-        };
         let by_outcome = |error: ProtocolError| {
             if error.outcome == Outcome::NotApplied {
                 DirectSendError::NotApplied(error)
@@ -434,17 +428,53 @@ impl DirectLink {
                 DirectSendError::Uncertain(error)
             }
         };
-        let payload = Some(request.body.clone());
         let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
+        // PERF1: wait for a slot on the leader's lane instead of refusing a
+        // request that finds it full. The lane keeps its bound (the leader's
+        // handler slots); requests over it queue here, in arrival order, for
+        // at most the request's own deadline, which the gateway set below its
+        // deadline. Nothing is written while waiting, so a timeout stays
+        // `not_applied`, and the leader gets only the time left.
+        let start = tokio::time::Instant::now();
+        let reservation = {
+            let _timer =
+                crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.lane_wait").timer();
+            self.client
+                .transport
+                .reserve_outgoing(
+                    &self.client.group,
+                    worker,
+                    super::Purpose::ApiIngress,
+                    start + request.deadline,
+                )
+                .await
+        };
+        // Only local refusals come from here: a full lane, or a charge.
+        let reservation = reservation.map_err(|error| by_outcome(error.into()))?;
+        let mut header = request.header();
+        let left = request.deadline.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return Err(DirectSendError::NotApplied(
+                RequestError::OutgoingLaneFull.into(),
+            ));
+        }
+        header.deadline_ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
+        let method = if forward {
+            Method::DirectForward(header)
+        } else {
+            Method::Direct(header)
+        };
+        let payload = Some(request.body.clone());
         match self
             .client
-            .call_member_at(
+            .call_member_reserved(
                 self.client.action,
                 method,
                 &payload,
                 node,
                 RequestTarget::WorkerId(worker),
                 None,
+                Some(reservation),
             )
             .await
         {

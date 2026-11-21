@@ -212,10 +212,6 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
     if !content_type(request.headers()) {
         return failure(None, invalid("Content-Type must be application/json"));
     }
-    let admitted = match state.runtime.ingress().try_admit() {
-        Ok(value) => value,
-        Err(error) => return failure(None, error),
-    };
     // While `data.direct.v1` is active, a request with a declared length is
     // charged twice that length; the queued path still charges its full
     // parsing budget before it decodes anything (plan section 6).
@@ -224,23 +220,22 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         .direct_gateway()
         .filter(|gateway| gateway.mode() != super::application::direct::DirectMode::Off)
         .zip(declared_length(request.headers()));
+    // PERF1: a routed request waits on its leader, not on this process, so it
+    // is admitted on its own lane instead of the queued lane's two workers.
+    let lane = if direct.is_some() {
+        state.runtime.direct_ingress()
+    } else {
+        state.runtime.ingress()
+    };
+    let admitted = match lane.try_admit() {
+        Ok(value) => value,
+        Err(error) => return failure(None, error),
+    };
     let operation = admitted.spawn(move || async move {
         super::stage_timing::perf_stage!("http.dispatch.spawn_wait").since(spawned);
-        let charge = |bytes: u64| {
-            state
-                .runtime
-                .scheduler()
-                .charge_memory(state.runtime.scheduler_node_id(), bytes)
-                .map_err(|_| {
-                    ProtocolError::new(
-                        ErrorCode::Overloaded,
-                        "request parsing memory capacity exhausted",
-                        Outcome::NotApplied,
-                    )
-                })
-        };
         let full = (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64;
-        let mut staging = charge(
+        let mut staging = parsing_charge(
+            &state,
             direct
                 .as_ref()
                 .map_or(full, |(_, length)| 2 * *length as u64),
@@ -251,29 +246,31 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
             None => body(request.into_body()).await?,
         };
         super::stage_timing::perf_stage!("http.dispatch.body").since(read);
-        if let Some((gateway, _)) = direct {
-            use super::application::direct::Routed;
-            match super::stage_timing::timed(
-                super::stage_timing::perf_stage!("gw.route"),
-                gateway.route(&bytes, asynchronous),
-            )
-            .await
-            {
-                Ok(Routed::Done(encoded)) => return Ok((state, None, Err(Ok(encoded)))),
-                Err(error) => return Ok((state, scan_request_id(&bytes), Err(Err(error)))),
-                Ok(Routed::Queued) => staging = charge(full)?,
+        let Some((gateway, _)) = direct else {
+            return Ok(enqueue(state, bytes, staging).await);
+        };
+        use super::application::direct::Routed;
+        match super::stage_timing::timed(
+            super::stage_timing::perf_stage!("gw.route"),
+            gateway.route(&bytes, asynchronous),
+        )
+        .await
+        {
+            Ok(Routed::Done(encoded)) => Ok((state, None, Err(Ok(encoded)))),
+            Err(error) => Ok((state, scan_request_id(&bytes), Err(Err(error)))),
+            Ok(Routed::Queued) => {
+                // The queued remainder keeps the queued lane's bound. Nothing
+                // has been applied yet (the gateway answered `Queued`), so a
+                // full lane is a `not_applied` refusal like any other.
+                let queued = state.runtime.ingress().try_admit()?;
+                drop(staging);
+                staging = parsing_charge(&state, full)?;
+                queued
+                    .spawn(move || async move { Ok(enqueue(state, bytes, staging).await) })?
+                    .receive()
+                    .await
             }
         }
-        let parsed = match protocol::parse_request(&bytes) {
-            Ok(parsed) => parsed,
-            Err(error) => return Ok((state, scan_request_id(&bytes), Ok(Err(error)))),
-        };
-        let id = Some(parsed.request_id);
-        let point =
-            super::application::PointRequest::from_operation(parsed.request_id, &parsed.operation);
-        drop(parsed);
-        let record = state.runtime.clone().submit(bytes, staging, point).await;
-        Ok((state, id, Ok(record)))
     });
     let (state, id, record) = match operation {
         Ok(operation) => match operation.receive().await {
@@ -305,6 +302,52 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         Ok(value) => complete(value),
         Err(error) => failure(id, accepted_failure(error)),
     }
+}
+
+/// What a dispatch operation returns: the state, the request id when known,
+/// and either the queued path's record or a direct answer.
+type Dispatched = (
+    Arc<ApiState>,
+    Option<Uuid>,
+    Result<
+        Result<crate::request_queue::RequestRecord, ProtocolError>,
+        Result<EncodedResponse, ProtocolError>,
+    >,
+);
+
+fn parsing_charge(
+    state: &ApiState,
+    bytes: u64,
+) -> Result<crate::scheduling::MemoryCharge, ProtocolError> {
+    state
+        .runtime
+        .scheduler()
+        .charge_memory(state.runtime.scheduler_node_id(), bytes)
+        .map_err(|_| {
+            ProtocolError::new(
+                ErrorCode::Overloaded,
+                "request parsing memory capacity exhausted",
+                Outcome::NotApplied,
+            )
+        })
+}
+
+/// The queued path: parse, then install the request in the RAM queue.
+async fn enqueue(
+    state: Arc<ApiState>,
+    bytes: Vec<u8>,
+    staging: crate::scheduling::MemoryCharge,
+) -> Dispatched {
+    let parsed = match protocol::parse_request(&bytes) {
+        Ok(parsed) => parsed,
+        Err(error) => return (state, scan_request_id(&bytes), Ok(Err(error))),
+    };
+    let id = Some(parsed.request_id);
+    let point =
+        super::application::PointRequest::from_operation(parsed.request_id, &parsed.operation);
+    drop(parsed);
+    let record = state.runtime.clone().submit(bytes, staging, point).await;
+    (state, id, Ok(record))
 }
 
 /// The queue accepted the request, so a failed wait never shows that it was not
@@ -485,7 +528,18 @@ impl hyper::body::Body for ChargedBody {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        application::direct::{
+            DirectGateway, DirectTransport, GatewaySwitch, SendFuture, TableFill, TopologySource,
+            Voter,
+        },
+        http_runtime::DIRECT_INGRESS_SLOTS,
+    };
     use super::*;
+    use crate::oltp_replication::{
+        service_rpc::direct::{DirectData, DirectRequest, DirectResponse},
+        types::{GroupIdentity, GroupKind, Text},
+    };
     use crate::{
         executor::Executor,
         oltp_replication::multiplex::{EndpointFuture, RequestError},
@@ -493,6 +547,7 @@ mod tests {
         scheduling::{MemoryCharge, ResourceScheduler},
     };
     use axum::http::Request as HttpRequest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt as _;
 
     const TOKEN: &str = "g1-data-token";
@@ -501,13 +556,42 @@ mod tests {
     /// Accepts every request and fails the wait or the submission as told.
     struct Script {
         ingress: Executor,
+        direct_ingress: Executor,
+        direct: Option<Arc<DirectGateway>>,
+        /// Submissions wait for a permit here when set.
+        submit_gate: Option<Arc<tokio::sync::Semaphore>>,
+        submits: AtomicUsize,
         scheduler: ResourceScheduler,
         submit: Result<(), ProtocolError>,
         wait: ProtocolError,
     }
+    impl Script {
+        fn new(submit: Result<(), ProtocolError>, wait: ProtocolError) -> Self {
+            Self {
+                ingress: Executor::new(2, 2).unwrap(),
+                direct_ingress: Executor::new(DIRECT_INGRESS_SLOTS, 0).unwrap(),
+                direct: None,
+                submit_gate: None,
+                submits: AtomicUsize::new(0),
+                scheduler: ResourceScheduler::new(vec![(
+                    0,
+                    crate::config::WorkerResources::default(),
+                )])
+                .unwrap(),
+                submit,
+                wait,
+            }
+        }
+    }
     impl HttpRuntime for Script {
         fn ingress(&self) -> &Executor {
             &self.ingress
+        }
+        fn direct_ingress(&self) -> &Executor {
+            &self.direct_ingress
+        }
+        fn direct_gateway(&self) -> Option<Arc<DirectGateway>> {
+            self.direct.clone()
         }
         fn scheduler(&self) -> ResourceScheduler {
             self.scheduler.clone()
@@ -522,6 +606,10 @@ mod tests {
             _point: Option<super::super::application::PointRequest>,
         ) -> EndpointFuture<'static, RequestRecord> {
             Box::pin(async move {
+                self.submits.fetch_add(1, Ordering::SeqCst);
+                if let Some(gate) = &self.submit_gate {
+                    let _permit = gate.acquire().await.unwrap();
+                }
                 self.submit.clone()?;
                 Ok(RequestRecord {
                     context: None,
@@ -560,13 +648,7 @@ mod tests {
     }
 
     async fn post(submit: Result<(), ProtocolError>, wait: ProtocolError) -> (u16, ProtocolError) {
-        let runtime = Arc::new(Script {
-            ingress: Executor::new(2, 2).unwrap(),
-            scheduler: ResourceScheduler::new(vec![(0, crate::config::WorkerResources::default())])
-                .unwrap(),
-            submit,
-            wait,
-        });
+        let runtime = Arc::new(Script::new(submit, wait));
         let app = router_for(runtime, TOKEN.into(), DATABASE.into()).unwrap();
         let body = format!(
             r#"{{"request_id":"{}","operation":"table.list","payload":{{}}}}"#,
@@ -629,5 +711,218 @@ mod tests {
         // A refusal before the queue accepted the request stays not_applied.
         let (status, error) = post(Err(lane_full.clone()), lane_full.clone()).await;
         assert_eq!((status, error), (429, lane_full));
+    }
+
+    /// One Data range over every key, led by node 1.
+    struct OneRange {
+        fill: TableFill,
+    }
+    impl TopologySource for OneRange {
+        fn table(&self, _table_id: Uuid) -> EndpointFuture<'_, Option<TableFill>> {
+            let fill = self.fill.clone();
+            Box::pin(async move { Ok(Some(fill)) })
+        }
+        fn placement<'a>(
+            &'a self,
+            _group: &'a GroupIdentity,
+            _refresh: bool,
+        ) -> EndpointFuture<'a, Vec<Voter>> {
+            Box::pin(async {
+                Ok(vec![Voter {
+                    node_id: 1,
+                    worker_id: Uuid::nil(),
+                }])
+            })
+        }
+    }
+    /// A leader that holds every request until `release` has a permit, the
+    /// way a real one holds it for its Raft commit.
+    struct SlowLeader {
+        in_flight: AtomicUsize,
+        release: tokio::sync::Semaphore,
+    }
+    impl DirectTransport for SlowLeader {
+        fn send<'a>(
+            &'a self,
+            _group: &'a GroupIdentity,
+            _voter: Voter,
+            _request: &'a DirectRequest,
+            _forward: bool,
+        ) -> SendFuture<'a> {
+            Box::pin(async move {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                self.release.acquire().await.unwrap().forget();
+                Ok(DirectResponse::Done(DirectData::from_json("true").unwrap()))
+            })
+        }
+    }
+
+    fn gateway(leader: Arc<SlowLeader>, table: Uuid) -> Arc<DirectGateway> {
+        let switch = Arc::new(GatewaySwitch::default());
+        switch.set_active(true);
+        let fill = TableFill {
+            table_id: table,
+            key_column: "id".into(),
+            key_type: crate::protocol::ColumnType::Int64,
+            schema_epoch: 1,
+            shards: vec![crate::oltp::mvcc::catalog::ShardRoute {
+                group: GroupIdentity {
+                    cluster_id: Uuid::new_v4(),
+                    database: Text::try_from(DATABASE).unwrap(),
+                    group_id: Uuid::new_v4(),
+                    kind: GroupKind::Data {
+                        table_id: table,
+                        shard_id: Uuid::new_v4(),
+                    },
+                    group_format_version: 1,
+                },
+                span: crate::oltp::mvcc::store::KeySpan {
+                    start: None,
+                    end: None,
+                },
+                schema_epoch: 1,
+                routing_epoch: 1,
+            }],
+        };
+        let shared = crate::oltp::pool::WorkerSharedResources::new(
+            2,
+            crate::config::WorkerResources {
+                max_threads: 4,
+                ..Default::default()
+            },
+            crate::oltp::pool::SharedResourceConfig::default(),
+        )
+        .unwrap();
+        DirectGateway::new(
+            shared,
+            Text::try_from(DATABASE).unwrap(),
+            switch,
+            Arc::new(OneRange { fill }),
+            leader,
+        )
+    }
+
+    async fn send(app: axum::Router, body: String) -> (u16, serde_json::Value) {
+        let reply = app
+            .oneshot(
+                HttpRequest::post("/v1/operations")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .header("content-length", body.len().to_string())
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = reply.status().as_u16();
+        let bytes = axum::body::to_bytes(reply.into_body(), protocol::MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// PERF1 (BENCH2 limit 1; O03, D01): direct requests waiting on their
+    /// leader's commit do not hold the queued lane's two workers. Before the
+    /// fix, two in flight held both workers, two more waited and the fifth
+    /// got 429 `executor admission capacity exhausted`, so a 12 ms commit
+    /// capped updates near 170/s and 2 x the commit time at any rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perf1_direct_requests_waiting_on_the_leader_do_not_hold_the_queued_lane() {
+        let table = Uuid::new_v4();
+        let leader = Arc::new(SlowLeader {
+            in_flight: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut script = Script::new(Ok(()), ProtocolError::from(RequestError::Unreachable));
+        script.direct = Some(gateway(leader.clone(), table));
+        let app = router_for(Arc::new(script), TOKEN.into(), DATABASE.into()).unwrap();
+        const REQUESTS: usize = 12;
+        let requests: Vec<_> = (0..REQUESTS)
+            .map(|key| {
+                let body = serde_json::json!({
+                    "request_id": Uuid::new_v4(),
+                    "operation": "table.update",
+                    "payload": {"table_id": table, "key": key, "values": {"value": 1}},
+                })
+                .to_string();
+                tokio::spawn(send(app.clone(), body))
+            })
+            .collect();
+        // Every request reaches the leader while none has been answered.
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while leader.in_flight.load(Ordering::SeqCst) < REQUESTS {
+                if let Some(done) = requests.iter().find(|task| task.is_finished()) {
+                    let _ = done;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let in_flight = leader.in_flight.load(Ordering::SeqCst);
+        leader.release.add_permits(REQUESTS);
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(request.await.unwrap());
+        }
+        assert!(
+            reached.is_ok(),
+            "only {in_flight} of {REQUESTS} reached the leader"
+        );
+        assert_eq!(in_flight, REQUESTS, "{answers:?}");
+        for (status, body) in answers {
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(body["data"], serde_json::json!(true), "{body}");
+        }
+    }
+
+    /// PERF1: a request admitted on the direct lane that the gateway sends
+    /// queued takes a queued-lane slot too, so the queued path keeps its
+    /// bound and refuses beyond it with `not_applied`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn perf1_direct_lane_fallback_keeps_the_queued_lane_bound() {
+        let table = Uuid::new_v4();
+        let leader = Arc::new(SlowLeader {
+            in_flight: AtomicUsize::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut script = Script::new(Ok(()), ProtocolError::from(RequestError::Unreachable));
+        script.direct = Some(gateway(leader.clone(), table));
+        script.submit_gate = Some(gate.clone());
+        // Two workers and no waiting room, so the two held requests fill it.
+        script.ingress = Executor::new(2, 0).unwrap();
+        let script = Arc::new(script);
+        let app = router_for(script.clone(), TOKEN.into(), DATABASE.into()).unwrap();
+        // `table.list` is not eligible: the gateway answers `Queued`.
+        let list = || {
+            format!(
+                r#"{{"request_id":"{}","operation":"table.list","payload":{{}}}}"#,
+                Uuid::new_v4()
+            )
+        };
+        let held: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(send(app.clone(), list())))
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while script.submits.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the queued lane fills");
+        let (status, body) = send(app.clone(), list()).await;
+        assert_eq!(status, 429, "{body}");
+        assert_eq!(body["error"]["outcome"], "not_applied", "{body}");
+        assert_eq!(
+            body["error"]["message"], "executor admission capacity exhausted",
+            "{body}"
+        );
+        assert_eq!(leader.in_flight.load(Ordering::SeqCst), 0);
+        gate.add_permits(2);
+        for request in held {
+            let (status, body) = request.await.unwrap();
+            assert_eq!(status, 503, "{body}");
+        }
     }
 }

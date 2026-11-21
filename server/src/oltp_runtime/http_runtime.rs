@@ -32,8 +32,23 @@ impl std::ops::Deref for OwnedReceipt {
     }
 }
 
+/// Direct requests one HTTP runtime admits at once (PERF1). A direct request
+/// spends its time waiting for its leader's commit, not on this process's
+/// CPU, so the queued lane's two workers capped a 12 ms commit near 170/s and
+/// turned every rise in leader latency into 429s (BENCH2). Memory stays bounded
+/// by the per-request charge of twice the body; requests to one leader also
+/// wait for that leader's lane slots in the transport.
+pub(crate) const DIRECT_INGRESS_SLOTS: usize = 64;
+
 pub(crate) trait HttpRuntime: Send + Sync + 'static {
+    /// Admission for queued requests: queue installs, receipts, the queued
+    /// remainder of a direct fallback.
     fn ingress(&self) -> &Executor;
+    /// Admission for requests the direct gateway routes (`DIRECT_INGRESS_SLOTS`).
+    /// One that goes queued after routing takes an `ingress` slot as well.
+    fn direct_ingress(&self) -> &Executor {
+        self.ingress()
+    }
     /// The direct-path gateway (T6), if this runtime has one. It routes
     /// nothing while `data.direct.v1` is inactive.
     fn direct_gateway(&self) -> Option<Arc<super::application::direct::DirectGateway>> {

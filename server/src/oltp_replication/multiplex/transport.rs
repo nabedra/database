@@ -1056,6 +1056,99 @@ impl WorkerClient {
             header,
             sections,
             response_decode_bytes,
+            None,
+        )
+        .await
+    }
+    /// Waits until `until` for one caller slot on the lane to `target` for
+    /// the class `group` and `purpose` select, instead of refusing at once
+    /// when the lane is full (PERF1). Nothing is written while waiting, so a
+    /// timeout is still a not-applied `OutgoingLaneFull`. The slot keeps the
+    /// lane's bound: no more streams in flight to `target` than its handler
+    /// admits. Pass it to [`Self::request_reserved`].
+    pub(crate) async fn reserve_outgoing(
+        &self,
+        group: &GroupIdentity,
+        target: Uuid,
+        purpose: Purpose,
+        until: Instant,
+    ) -> Result<OutgoingReservation, RequestError> {
+        group
+            .validate()
+            .map_err(|_| malformed("invalid target group"))?;
+        let class = traffic(group, purpose)?;
+        if let Ok(slot) = self.try_outgoing_slot(target, class) {
+            return Ok(OutgoingReservation {
+                target,
+                class,
+                slot,
+            });
+        }
+        let index = class as usize;
+        let lane = self
+            .common
+            .outgoing
+            .lane(target, class, &self.common.config);
+        let class_slots = self.common.outgoing_class[index].clone();
+        let acquire = timeout_at(until, async {
+            #[cfg(test)]
+            let held = self.common.outgoing_hold[index]
+                .clone()
+                .acquire_owned()
+                .await?;
+            let slot = lane.acquire_owned().await?;
+            let class_slot = class_slots.acquire_owned().await?;
+            Ok::<_, tokio::sync::AcquireError>(OutgoingSlot {
+                _slot: slot,
+                _class: class_slot,
+                #[cfg(test)]
+                _held: held,
+            })
+        });
+        // Charge the pending acquisition and timer, as `authority_slots` does.
+        let _memory = self
+            .common
+            .shared
+            .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
+        match acquire.await {
+            Ok(Ok(slot)) => Ok(OutgoingReservation {
+                target,
+                class,
+                slot,
+            }),
+            _ => {
+                self.common.refusals.outgoing(class);
+                Err(RequestError::OutgoingLaneFull)
+            }
+        }
+    }
+    /// [`Self::request_classified`] on a slot from [`Self::reserve_outgoing`]
+    /// for the same target and class.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_reserved(
+        &self,
+        reservation: OutgoingReservation,
+        group: &GroupIdentity,
+        target: impl Into<RequestTarget>,
+        purpose: Purpose,
+        header: ChargedBytes,
+        sections: [Option<ChargedBytes>; MAX_SECTIONS],
+        response_decode_bytes: usize,
+    ) -> Result<ReceivedReply, RequestError> {
+        let target = target.into();
+        if reservation.target != target.worker_id()
+            || traffic(group, purpose).ok() != Some(reservation.class)
+        {
+            return Err(malformed("outgoing reservation is for another lane").into());
+        }
+        self.request_with_timeout(
+            group,
+            target,
+            (purpose, None),
+            header,
+            sections,
+            response_decode_bytes,
+            Some(reservation.slot),
         )
         .await
     }
@@ -1074,9 +1167,11 @@ impl WorkerClient {
             header,
             [None, None, None],
             response_decode_bytes,
+            None,
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn request_with_timeout(
         &self,
         group: &GroupIdentity,
@@ -1085,12 +1180,16 @@ impl WorkerClient {
         header: ChargedBytes,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         response_decode_bytes: usize,
+        reserved: Option<OutgoingSlot>,
     ) -> Result<ReceivedReply, RequestError> {
         group
             .validate()
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
-        let _slot = self.try_outgoing(target.worker_id(), class)?;
+        let _slot = match reserved {
+            Some(slot) => slot,
+            None => self.try_outgoing(target.worker_id(), class)?,
+        };
         let deadline = self.common.config.deadline;
         let mut resolving = false;
         timeout(
@@ -1497,6 +1596,14 @@ fn outgoing_class_slots(handler_slots: usize) -> usize {
     handler_slots
         .saturating_mul(OUTGOING_CLASS_LANES)
         .min(Semaphore::MAX_PERMITS)
+}
+
+/// A caller slot taken ahead of its request by
+/// [`WorkerClient::reserve_outgoing`]. Dropping it frees the slot.
+pub(crate) struct OutgoingReservation {
+    target: Uuid,
+    class: TrafficClass,
+    slot: OutgoingSlot,
 }
 
 /// A caller slot on one peer lane and in its class. Dropping it frees both.
