@@ -562,3 +562,74 @@ async fn o15_d03_m3_rollback_queued_gets_propose_no_data_entry() {
     .await
     .expect("m3 rollback watchdog");
 }
+
+/// D01 (PERF2b item 3) on one worker over mTLS: the leader frames a small
+/// direct reply, and the gateway checks and decodes it, on their own tasks.
+/// Before, these were three Control-class native jobs per request (the
+/// leader's reply frame, the gateway's header decode and its digest and
+/// decode budget); the leader's get is one Query-class job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs() {
+    use crate::oltp::pool::ExecutionClass;
+    const GETS: u64 = 20;
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let directory = TestDirectory(
+            std::env::temp_dir().join(format!("nabedra-perf2b-gw-{}", Uuid::new_v4())),
+        );
+        let runtime = open(&directory.0, true).await;
+        activated(&runtime).await;
+        let app = runtime.application(TOKEN.into()).unwrap();
+        let table = create(&app).await;
+        let (status, inserted) = call(
+            &app,
+            body(
+                Uuid::new_v4(),
+                "table.insert",
+                json!({"table_id": table, "row": {"id": 1, "value": 10, "tag": "a"}}),
+            ),
+            true,
+        )
+        .await;
+        assert_eq!(status, 200, "{inserted}");
+        let get = || {
+            body(
+                Uuid::new_v4(),
+                "table.get",
+                json!({"table_id": table, "key": 1}),
+            )
+        };
+        // Warm the topology cache and the session.
+        assert_eq!(call(&app, get(), true).await.0, 200);
+        let gateway = runtime.direct_gateway_handle().unwrap().clone();
+        let done = gateway.stats().direct_done;
+        let shared = runtime.services.shared.clone();
+        let jobs = || {
+            (
+                shared.native_jobs(ExecutionClass::Query),
+                shared.native_jobs(ExecutionClass::Control),
+            )
+        };
+        let (query, control) = jobs();
+        for _ in 0..GETS {
+            let (status, envelope) = call(&app, get(), true).await;
+            assert_eq!(status, 200, "{envelope}");
+            assert_eq!(envelope["data"]["value"], json!(10), "{envelope}");
+        }
+        let (query_after, control_after) = jobs();
+        assert_eq!(gateway.stats().direct_done - done, GETS);
+        eprintln!(
+            "perf2b rf1: {GETS} gets took {} Query and {} Control jobs",
+            query_after - query,
+            control_after - control
+        );
+        // Background Control work on an idle RF1 worker is allowed for.
+        assert!(
+            control_after - control < GETS / 2,
+            "Control jobs for {GETS} gets: {}",
+            control_after - control
+        );
+        runtime.drain().await.unwrap();
+    })
+    .await
+    .expect("rf1 gateway watchdog");
+}
