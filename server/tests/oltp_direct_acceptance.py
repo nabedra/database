@@ -322,6 +322,27 @@ def leader_of(cluster, request):
     return leaders[0]
 
 
+def api_gateway_stats(cluster, token, ca):
+    """NS11 finding 8: an API's /v1/runtime/stats reports the API's own gateway and lane
+    refusals (they read 0 before: the endpoint relayed the owner worker's), the worker's under
+    `owner`."""
+    observed = {}
+    for name, routed in (('api1', True), ('api2', False)):
+        status, stats = call(cluster.api_urls[name], '/v1/runtime/stats', token=token, ca=ca)
+        assert status == 200, (name, status, stats)
+        gateway, transport = stats.get('direct_gateway'), stats.get('transport')
+        assert gateway is not None and transport is not None, (name, sorted(stats))
+        assert set(stats.get('owner') or {}) == {'direct_gateway', 'transport'}, (name, stats.get('owner'))
+        for side in ('outgoing_lane_full', 'handler_lane_full'):
+            assert isinstance(transport[side]['total'], int), (name, transport)
+        if routed:
+            assert gateway['direct_done'] > 0 and gateway['requests'] >= gateway['direct_done'], (name, gateway)
+        else:
+            assert gateway['direct_done'] == 0, (name, gateway)
+        observed[name] = dict(direct_gateway=gateway, transport=transport)
+    return observed
+
+
 def insert_body(table_id, key, value, request_id=None, operation_name='table.insert'):
     return operation(operation_name, {'table_id': table_id, 'row': {'id': key, 'value': value}}, request_id)
 
@@ -344,6 +365,7 @@ def suite_cluster(args, output, rf1_reference):
         gateways = {'api1': (api_on, True), 'api2': (api_off, False),
                     owner: (cluster.urls[owner], cluster.direct[owner])}
         reference, sections = d01_programs('rf3', gateways, token, ca, cluster.all_stats, create)
+        api_stats = api_gateway_stats(cluster, token, ca)
         # Direct point operations through a non-owner worker gateway need no owner.
         db_owner = Database(url=api_on, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
         probe = db_owner.create_table('d01_non_owner', {'id': int, 'value': int}, key='id')
@@ -362,7 +384,7 @@ def suite_cluster(args, output, rf1_reference):
             non_owner[name] = dict(direct_oltp=cluster.direct[name], insert=inserted[0], get=got[0],
                                    queued_table_list=listed[0], queued_error=(listed[1].get('error') or {}).get('code'))
         report('D01-RF3', topology='3 registered workers + 2 API gateways, mTLS', capability=capability, queue_owner=owner,
-               non_owner_worker_gateways=non_owner,
+               non_owner_worker_gateways=non_owner, api_stats=api_stats,
                gateways={name: dict(url=url, direct_oltp=routed) for name, (url, routed) in gateways.items()},
                orms=['python', 'typescript'], steps=len(reference), direct_sections=sections)
         if rf1_reference is not None:
@@ -846,6 +868,68 @@ def d09(cluster, token, ca, output):
            replayed=direct(after, 'replayed') - direct(before, 'replayed'), missing_acknowledged=0)
 
 
+def probe_point_get(url, token, ca, table_id, start, limit):
+    """Point gets through one gateway until one is served or `limit` seconds pass since `start`."""
+    attempts, last = 0, None
+    while time.monotonic() - start < limit:
+        attempts += 1
+        client = Http(url, token, 10, ca)
+        try:
+            body = operation('table.get', {'table_id': table_id, 'key': 1})
+            status, reply = client.exchange('/v1/operations', body)
+            last = dict(status=status, reply=reply)
+            if status == 200 and reply.get('request_id') == body['request_id']:
+                return dict(served_seconds=round(time.monotonic() - start, 2), attempts=attempts, last=last)
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            last = dict(error=f'{type(error).__name__}: {error}')
+        finally:
+            client.close()
+        time.sleep(0.25)
+    return dict(served_seconds=None, attempts=attempts, last=last)
+
+
+def g6(cluster, token, ca):
+    """G6 (NS11): SIGKILL every worker while the API gateways keep running, then cold-start them onto a
+    new run. When the workers keep their certificates (a restarted container), the running gateways
+    learn the new incarnations from Control and serve point gets again within a bounded time. When every
+    worker has a new certificate, no peer pinned in a running gateway remains, so it needs the new cluster
+    connection: the refusal is recorded and the gateways are restarted with it."""
+    db = Database(url=cluster.api_urls['api1'], token=token, database=DATABASE, ca_file=str(ca), timeout=30)
+    table = db.create_table('g6', {'id': int, 'value': int}, key='id')
+    status, reply = call(cluster.api_urls['api1'], '/v1/operations', insert_body(table.id, 1, 1), token=token, ca=ca)
+    assert status == 200, (status, reply)
+    phases = {}
+    for keep in (True, False):
+        label = 'same-certificates' if keep else 'new-certificates'
+        cluster.kill_workers()
+        start = time.monotonic()
+        cluster.cold_start(keep_certificates=keep)
+        workers_ready = round(time.monotonic() - start, 2)
+        cluster.wait_direct_active()
+        active = round(time.monotonic() - start, 2)
+        limit = 60 if keep else 30
+        probes = {name: probe_point_get(cluster.api_urls[name], token, ca, table.id, start, limit)
+                  for name in ('api1', 'api2')}
+        phases[label] = dict(workers_ready_seconds=workers_ready, direct_active_seconds=active, probes=probes)
+        if keep:
+            for name, probe in probes.items():
+                assert probe['served_seconds'] is not None, (label, name, probe)
+        else:
+            # Documented limitation: record the refusal, then give the gateways the new connection.
+            phases[label]['refusals'] = {name: probe['last'] for name, probe in probes.items()
+                                         if probe['served_seconds'] is None}
+            for name in ('api1', 'api2'):
+                cluster.kill_api(name)
+                cluster.start_api(name)
+            restarted = time.monotonic()
+            phases[label]['after_gateway_restart'] = {
+                name: probe_point_get(cluster.api_urls[name], token, ca, table.id, restarted, 60)
+                for name in ('api1', 'api2')}
+            for name, probe in phases[label]['after_gateway_restart'].items():
+                assert probe['served_seconds'] is not None, (label, name, probe)
+    report('G6', **phases)
+
+
 def suite_d09(args, output):
     """D09 at RF3: kill every worker and gateway under load, cold start, every
     acknowledged write present and every acknowledged ID replays. Cold start
@@ -859,6 +943,7 @@ def suite_d09(args, output):
         cluster.start()
         cluster.wait_direct_active()
         d09(cluster, cluster.auth['data_token'], cluster.ca, output)
+        g6(cluster, cluster.auth['data_token'], cluster.ca)
     except BaseException:
         dump(cluster)
         raise

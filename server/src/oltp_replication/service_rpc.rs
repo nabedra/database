@@ -362,14 +362,23 @@ impl Client {
         let mut possibly_applied = false;
         self.call_round(action, method, &payload, &mut possibly_applied, None)
             .await
-            .map_err(Into::into)
+            .map_err(|error| {
+                let error = ProtocolError::from(error);
+                // An earlier replica may have executed the call before this
+                // round met a local refusal on the next one (G1).
+                if possibly_applied && !method.can_repeat_read() {
+                    return mutation_uncertain(error);
+                }
+                error
+            })
     }
     async fn converge(
         &self,
         method: Method,
         payload: ChargedBytes,
     ) -> Result<ServiceResponse, ProtocolError> {
-        self.converge_as(self.action, method, Some(payload), false).await
+        self.converge_as(self.action, method, Some(payload), false)
+            .await
     }
 
     /// Call only for a repeatable read or an exact, idempotent command.
@@ -390,7 +399,8 @@ impl Client {
         bound_mutation_attempt: bool,
     ) -> Result<ServiceResponse, ProtocolError> {
         let deadline = Instant::now() + SERVICE_CONVERGENCE;
-        let peer_deadline = (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
+        let peer_deadline =
+            (bound_mutation_attempt || method.can_repeat_read()).then_some(deadline);
         let mut delay = Duration::from_millis(50);
         let mut possibly_applied = false;
         loop {
@@ -814,13 +824,33 @@ impl Client {
                 CallError::Transport(error)
             })?;
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport completed");
+        self.member_reply(method, node, worker, reply)
+            .await
+            .map_err(|error| {
+                // The peer answered, so it may have executed the call before
+                // this side failed to check or charge the reply (G1).
+                CallError::Local(if method.can_repeat_read() {
+                    error
+                } else {
+                    mutation_uncertain(error)
+                })
+            })
+    }
+
+    async fn member_reply(
+        &self,
+        method: Method,
+        node: u64,
+        worker: RequestTarget,
+        reply: ReceivedReply,
+    ) -> Result<Result<ServiceResponse, ProtocolError>, ProtocolError> {
         if reply.remote_identity().worker_id != worker.worker_id()
             || reply.group() != &self.group
             || reply.purpose() != method.purpose()
             || reply.sections[1].is_some()
             || reply.sections[2].is_some()
         {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         let raw = reply.header.clone();
         let shared = self.shared.clone();
@@ -840,7 +870,7 @@ impl Client {
             )
             .await?;
         if decoded.node != node || decoded.nonce != reply.nonce() {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         if let Some(error) = decoded.error {
             tracing::debug!(group=%self.group.group_id, method=?method, node=node, code=?error.code, outcome=?error.outcome, "service peer returned error");
@@ -848,7 +878,7 @@ impl Client {
         }
         let input = reply.sections[0].as_ref().ok_or_else(invalid)?.clone();
         if input.len() as u64 != decoded.bytes {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         let (digest, bytes) = self
             .shared
@@ -872,7 +902,7 @@ impl Client {
             )
             .await?;
         if digest != decoded.digest {
-            return Err(invalid().into());
+            return Err(invalid());
         }
         tracing::debug!(group=%self.group.group_id, method=?method, node=node, decode_bytes=bytes, "service reply decode reserve start");
         let reply = if method.purpose() == Purpose::Storage {

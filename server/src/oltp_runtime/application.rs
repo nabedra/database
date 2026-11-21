@@ -473,6 +473,7 @@ impl ApplicationClient {
             } | Method::ScopedObserve { .. }
         );
         let purpose = method.purpose();
+        let submits = matches!(method, Method::Submit { .. } | Method::ScopedSubmit { .. });
         let header = self.shared.encode_in(
             ByteClass::Progress,
             &Header {
@@ -494,21 +495,30 @@ impl ApplicationClient {
             )
             .await
             .map_err(ProtocolError::from)?;
+        // The worker answered: a submission may be queued even when its reply
+        // fails these checks (G1).
+        let after_reply = |error: ProtocolError| {
+            if submits {
+                submission_unknown(error)
+            } else {
+                error
+            }
+        };
         if reply.remote_identity() != worker
             || reply.group() != &self.group
             || reply.purpose() != purpose
             || (!accepts_inline && reply.sections[1].is_some())
             || reply.sections[2].is_some()
         {
-            return Err(invalid());
+            return Err(after_reply(invalid()));
         }
-        let observed = reply.decode_header::<ReplyHeader>()?;
+        let observed = reply.decode_header::<ReplyHeader>().map_err(after_reply)?;
         if observed.nonce != reply.nonce()
             || observed.bytes != reply.sections[0].as_ref().map_or(0, |b| b.len() as u64)
             || observed.inline_bytes != reply.sections[1].as_ref().map_or(0, |b| b.len() as u64)
             || observed.inline_bytes > INLINE_RECEIPT_BYTES as u64
         {
-            return Err(invalid());
+            return Err(after_reply(invalid()));
         }
         if let Some(error) = &observed.error {
             return Err(error.clone());
@@ -528,14 +538,16 @@ impl ApplicationClient {
         Self::submitted_record(reply)
     }
     fn submitted_record(reply: ReceivedReply) -> Result<RequestRecord, ProtocolError> {
-        let record = reply.decode_section::<RequestRecord>(0)?;
+        let record = reply
+            .decode_section::<RequestRecord>(0)
+            .map_err(submission_unknown)?;
         if !record.accepted
             || !record.body.is_empty()
             || record.pinned_catalog.is_some()
             || record.response_body.is_some()
             || !record.replicas.is_empty()
         {
-            return Err(invalid());
+            return Err(submission_unknown(invalid()));
         }
         Ok(record.clone())
     }
@@ -581,6 +593,10 @@ impl ApplicationClient {
             metadata: observed.clone(),
             body: reply.sections[1].clone(),
         })
+    }
+    /// This process's local lane refusals.
+    pub(crate) fn lane_refusals(&self) -> serde_json::Value {
+        self.transport.lane_refusals()
     }
     pub(crate) async fn stats(&self) -> Result<ChargedBytes, ProtocolError> {
         let reply = self.call(Method::Stats, None).await?;
@@ -666,6 +682,12 @@ fn unavailable() -> ProtocolError {
         "worker API authority unavailable",
         Outcome::Unknown,
     )
+}
+/// A submission the worker answered may be queued, whatever this side then
+/// fails to check.
+pub(super) fn submission_unknown(mut error: ProtocolError) -> ProtocolError {
+    error.outcome = Outcome::Unknown;
+    error
 }
 
 #[cfg(test)]

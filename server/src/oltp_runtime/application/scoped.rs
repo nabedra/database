@@ -224,7 +224,9 @@ pub(in crate::oltp_runtime) fn stale_route() -> ProtocolError {
 
 impl ApplicationClient {
     pub(in crate::oltp_runtime) fn has_scoped_receipt(&self, run: Uuid, id: Uuid) -> bool {
-        self.scoped.as_ref().is_some_and(|routes| routes.receipt(run, id).is_some())
+        self.scoped
+            .as_ref()
+            .is_some_and(|routes| routes.receipt(run, id).is_some())
     }
 
     pub(in crate::oltp_runtime) async fn submit_routed(
@@ -297,14 +299,15 @@ impl ApplicationClient {
                         if record.request_id != point.request_id
                             || record.run_id != target.view.run_id
                         {
-                            return Err(invalid());
+                            return Err(super::submission_unknown(invalid()));
                         }
                         routes.remember_receipt(
                             record.run_id,
                             record.request_id,
                             ScopedReceiptRoute {
                                 target,
-                                digest: Digest::parse(&record.digest).map_err(|_| invalid())?,
+                                digest: Digest::parse(&record.digest)
+                                    .map_err(|_| super::submission_unknown(invalid()))?,
                             },
                         );
                         return Ok(record);

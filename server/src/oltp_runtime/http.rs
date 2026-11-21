@@ -293,8 +293,23 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
     }
     match state.runtime.wait(&record).await {
         Ok(value) => complete(value),
-        Err(error) => failure(id, error),
+        Err(error) => failure(id, accepted_failure(error)),
     }
+}
+
+/// The queue accepted the request, so a failed wait never shows that it was not
+/// applied: a refusal here (for example a full outgoing lane on an observation
+/// call) concerns the observation only (G1). The request's own terminal errors
+/// arrive as a completed response, not through this path.
+fn accepted_failure(error: ProtocolError) -> ProtocolError {
+    if error.outcome == Outcome::Unknown {
+        return error;
+    }
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        format!("request accepted; outcome unavailable: {}", error.message),
+        Outcome::Unknown,
+    )
 }
 
 async fn receipt(
@@ -455,5 +470,154 @@ impl hyper::body::Body for ChargedBody {
     }
     fn size_hint(&self) -> hyper::body::SizeHint {
         self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        executor::Executor,
+        oltp_replication::multiplex::{EndpointFuture, RequestError},
+        request_queue::{RequestRecord, RequestState},
+        scheduling::{MemoryCharge, ResourceScheduler},
+    };
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt as _;
+
+    const TOKEN: &str = "g1-data-token";
+    const DATABASE: &str = "g1db";
+
+    /// Accepts every request and fails the wait or the submission as told.
+    struct Script {
+        ingress: Executor,
+        scheduler: ResourceScheduler,
+        submit: Result<(), ProtocolError>,
+        wait: ProtocolError,
+    }
+    impl HttpRuntime for Script {
+        fn ingress(&self) -> &Executor {
+            &self.ingress
+        }
+        fn scheduler(&self) -> ResourceScheduler {
+            self.scheduler.clone()
+        }
+        fn scheduler_node_id(&self) -> u64 {
+            0
+        }
+        fn submit(
+            self: Arc<Self>,
+            _body: Vec<u8>,
+            _charge: MemoryCharge,
+            _point: Option<super::super::application::PointRequest>,
+        ) -> EndpointFuture<'static, RequestRecord> {
+            Box::pin(async move {
+                self.submit.clone()?;
+                Ok(RequestRecord {
+                    context: None,
+                    run_id: Uuid::new_v4(),
+                    scheduler_term: 1,
+                    membership_revision: 1,
+                    request_id: Uuid::new_v4(),
+                    digest: String::new(),
+                    sequence: 1,
+                    version: 1,
+                    body: Vec::new(),
+                    accepted: true,
+                    state: RequestState::Queued,
+                    pinned_catalog: None,
+                    response_status: None,
+                    response_body: None,
+                    completed_at_ms: None,
+                    result_expired: false,
+                    replicas: Default::default(),
+                })
+            })
+        }
+        fn receipt(
+            &self,
+            _run: Uuid,
+            _id: Uuid,
+        ) -> EndpointFuture<'_, super::super::http_runtime::OwnedReceipt> {
+            Box::pin(async { Err(self.wait.clone()) })
+        }
+        fn wait<'a>(&'a self, _record: &'a RequestRecord) -> EndpointFuture<'a, EncodedResponse> {
+            Box::pin(async { Err(self.wait.clone()) })
+        }
+        fn health(&self) -> EndpointFuture<'_, EncodedResponse> {
+            Box::pin(async { Err(self.wait.clone()) })
+        }
+    }
+
+    async fn post(submit: Result<(), ProtocolError>, wait: ProtocolError) -> (u16, ProtocolError) {
+        let runtime = Arc::new(Script {
+            ingress: Executor::new(2, 2).unwrap(),
+            scheduler: ResourceScheduler::new(vec![(0, crate::config::WorkerResources::default())])
+                .unwrap(),
+            submit,
+            wait,
+        });
+        let app = router_for(runtime, TOKEN.into(), DATABASE.into()).unwrap();
+        let body = format!(
+            r#"{{"request_id":"{}","operation":"table.list","payload":{{}}}}"#,
+            Uuid::new_v4()
+        );
+        let reply = app
+            .oneshot(
+                HttpRequest::post("/v1/operations")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = reply.status().as_u16();
+        let bytes = axum::body::to_bytes(reply.into_body(), protocol::MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let reply: protocol::ErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        (status, reply.error)
+    }
+
+    /// G1: a full outgoing lane met while observing an accepted request (the
+    /// NS11 queued-path 429 whose update had committed) is an unknown outcome.
+    #[tokio::test]
+    async fn g1_lane_full_after_acceptance_reports_outcome_unknown() {
+        let lane_full = ProtocolError::from(RequestError::OutgoingLaneFull);
+        assert_eq!(lane_full.outcome, Outcome::NotApplied);
+        let (status, error) = post(Ok(()), lane_full.clone()).await;
+        assert_eq!(status, 503, "{error:?}");
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(error.outcome, Outcome::Unknown);
+        assert!(
+            error.message.contains("worker outgoing lane full"),
+            "{error:?}"
+        );
+
+        // Any other not_applied refusal of the observation is the same.
+        let invalid_reply = ProtocolError::new(
+            ErrorCode::ValidationError,
+            "invalid authenticated API request",
+            Outcome::NotApplied,
+        );
+        let (status, error) = post(Ok(()), invalid_reply).await;
+        assert_eq!(
+            (status, error.code, error.outcome),
+            (503, ErrorCode::OutcomeUnknown, Outcome::Unknown)
+        );
+
+        // An already uncertain failure is kept as it is.
+        let unknown = ProtocolError::new(
+            ErrorCode::StorageUnavailable,
+            "worker transport unavailable",
+            Outcome::Unknown,
+        );
+        let (status, error) = post(Ok(()), unknown.clone()).await;
+        assert_eq!((status, error), (503, unknown));
+
+        // A refusal before the queue accepted the request stays not_applied.
+        let (status, error) = post(Err(lane_full.clone()), lane_full.clone()).await;
+        assert_eq!((status, error), (429, lane_full));
     }
 }

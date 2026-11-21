@@ -1232,6 +1232,10 @@ pub(super) async fn serve(
     let config = &transport.common.config;
     let deadline = config.deadline;
     let writer = tokio::spawn(write_frames(write, queue, None, None, deadline));
+    // The writer closes the socket once every sender is gone. This one keeps it
+    // open until the slots below are given back, even after the reader (which
+    // owns the other sender) ends or is aborted.
+    let hold_open = outgoing.clone();
     let state = Arc::new(ServerSession::new(pending));
     let mut reader = tokio::spawn(serve_frames(
         transport.clone(),
@@ -1286,6 +1290,7 @@ pub(super) async fn serve(
     if lock(&state.active).is_empty() {
         lock(&state.lane).take();
     }
+    drop(hold_open);
     let _ = writer.await;
 }
 
@@ -1452,7 +1457,10 @@ async fn run_stream(
         let handler = common.handlers[class as usize]
             .clone()
             .try_acquire_owned()
-            .map_err(|_| overloaded("worker handler lane full"))?;
+            .map_err(|_| {
+                common.refusals.handler(class);
+                overloaded("worker handler lane full")
+            })?;
         trace.phase = RaftTransportPhase::ReadSections;
         if plan.section_lengths != lengths {
             return Err(malformed("worker section length differs from preflight"));
@@ -1549,7 +1557,7 @@ impl WorkerTransport {
             let group = lease.identity();
             if hello.cluster_id != group.cluster_id
                 || hello.group_digest != identity_digest(group)?
-                || hello.to != common.local
+                || !super::audience(&*common.directory, &hello, group, &common.local)
             {
                 return Err(malformed("foreign worker/group audience"));
             }

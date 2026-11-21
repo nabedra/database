@@ -1194,3 +1194,47 @@ fn ns12_replay_of_64_mib_journal() {
     assert_eq!(report.replayed_records, i);
     assert_eq!(sink.0.load(Ordering::Relaxed), i);
 }
+
+/// NS08: a commit is counted in the stats before its waiter wakes, so a caller that
+/// reads the stats right after its commit returns sees it (the pool-level ns08 test
+/// counted a commit acknowledged before its `before` read: 385 vs 384 on CI).
+#[test]
+fn ns08_commit_is_counted_before_its_waiter_wakes() {
+    let fs = crate::fs::FaultFs::new();
+    fs.create_dir_all_durable(Path::new("/db"));
+    let (journal, _, _) = open(Arc::new(fs), Path::new("/db/journal"), small(), 0).unwrap();
+    let journal = Arc::new(journal);
+    let writers: Vec<_> = (0..4u8)
+        .map(|t| {
+            let journal = journal.clone();
+            thread::spawn(move || {
+                for i in 0..1500u32 {
+                    let before = journal.stats();
+                    let durability = if i % 2 == 0 {
+                        Durability::Sync
+                    } else {
+                        Durability::NoSync
+                    };
+                    let mut b = WriteBatch::new();
+                    b.put(&[b'k', t], &i.to_be_bytes());
+                    journal
+                        .submit(b, durability, Box::new(()))
+                        .unwrap()
+                        .wait()
+                        .unwrap();
+                    let after = journal.stats();
+                    assert!(after.commits > before.commits, "{before:?} -> {after:?}");
+                    if durability == Durability::Sync {
+                        assert!(
+                            after.synced_commits > before.synced_commits,
+                            "{before:?} -> {after:?}"
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+}
