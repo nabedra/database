@@ -514,11 +514,27 @@ impl HostedControlEndpoint {
                     && !(34..=(MAX_TOKEN as u64 + 2)).contains(&request.credential_bytes),
                 _ => request.credential_bytes != 0,
             }
-            || session.recovery_only()
-                && !matches!(request.control_consensus, Operation::CompleteRestart | Operation::CompleteDataWorker
-                    | Operation::ReadEksWorkerReplacement | Operation::CompleteEksWorkerReplacement)
         {
             return Err(invalid());
+        }
+        if session.recovery_only() {
+            match request.control_consensus {
+                Operation::CompleteRestart
+                | Operation::CompleteDataWorker
+                | Operation::ReadEksWorkerReplacement
+                | Operation::CompleteEksWorkerReplacement => {}
+                Operation::Barrier | Operation::Propose => {
+                    // A retained worker can finish enrollment through one
+                    // voter before another refreshes its prepared-only role.
+                    // Defer delegation until that voter sees the promotion.
+                    return Err(ProtocolError::new(
+                        ErrorCode::StorageUnavailable,
+                        "retained worker enrollment is not yet applied at this voter",
+                        Outcome::NotApplied,
+                    ));
+                }
+                _ => return Err(invalid()),
+            }
         }
         Ok(Some(request))
     }
