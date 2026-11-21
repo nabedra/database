@@ -222,8 +222,10 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
     let direct = state
         .runtime
         .direct_gateway()
-        .filter(|gateway| gateway.mode() != super::application::direct::DirectMode::Off)
-        .zip(declared_length(request.headers()));
+        .filter(|gateway| gateway.mode() != super::application::direct::DirectMode::Off);
+    let length = direct
+        .as_ref()
+        .and_then(|_| declared_length(request.headers()));
     let operation = admitted.spawn(move || async move {
         super::stage_timing::perf_stage!("http.dispatch.spawn_wait").since(spawned);
         let charge = |bytes: u64| {
@@ -240,28 +242,27 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
                 })
         };
         let full = (3 * protocol::MAX_BODY_BYTES + super::MAX_DECODED_REQUEST_BYTES) as u64;
-        let mut staging = charge(
-            direct
-                .as_ref()
-                .map_or(full, |(_, length)| 2 * *length as u64),
-        )?;
+        let mut staging = charge(length.map_or(full, |length| 2 * length as u64))?;
         let read = std::time::Instant::now();
-        let bytes = match &direct {
-            Some((_, length)) => bounded_body(request.into_body(), *length).await?,
+        let bytes = match length {
+            Some(length) => bounded_body(request.into_body(), length).await?,
             None => body(request.into_body()).await?,
         };
         super::stage_timing::perf_stage!("http.dispatch.body").since(read);
-        if let Some((gateway, _)) = direct {
+        if let Some(gateway) = direct {
             use super::application::direct::Routed;
             match super::stage_timing::timed(
                 super::stage_timing::perf_stage!("gw.route"),
-                gateway.route(&bytes, asynchronous),
+                // A streamed body takes the queued path, but the gateway
+                // must first replay a result already committed at the anchor.
+                gateway.route(&bytes, asynchronous || length.is_none()),
             )
             .await
             {
                 Ok(Routed::Done(encoded)) => return Ok((state, None, Err(Ok(encoded)))),
                 Err(error) => return Ok((state, scan_request_id(&bytes), Err(Err(error)))),
-                Ok(Routed::Queued) => staging = charge(full)?,
+                Ok(Routed::Queued) if length.is_some() => staging = charge(full)?,
+                Ok(Routed::Queued) => {}
             }
         }
         let parsed = match protocol::parse_request(&bytes) {

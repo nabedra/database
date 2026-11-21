@@ -789,6 +789,7 @@ impl Client {
             0 if convergence_deadline.is_some() => routes.last_successful_node().unwrap_or(0),
             node => node,
         };
+        let mut forwarded = None;
         // Prefer the observed leader, but let other replicas answer before
         // spending another transport deadline on a failed cached receiver.
         for pass in 0..3 {
@@ -837,6 +838,9 @@ impl Client {
                         }
                         return Ok(response);
                     }
+                    Ok(Err(error)) if error == super::hosted::proposal_forwarded() => {
+                        forwarded = Some(error);
+                    }
                     Ok(Err(error)) if route_unavailable(&error) => {
                         *possibly_applied = true;
                         continue;
@@ -867,6 +871,9 @@ impl Client {
         // Local saturation and definitive errors already returned above. On
         // exhaustion the next call must verify the membership pages again.
         self.control.invalidate_replica_routes(routes);
+        if !*possibly_applied && let Some(error) = forwarded {
+            return Err(error.into());
+        }
         Err(unavailable().into())
     }
 
@@ -997,6 +1004,10 @@ impl Client {
             call.await
         };
         let route_failure = match attempt {
+            Ok(Err(error)) if error == super::hosted::proposal_forwarded() => {
+                self.control.invalidate_replica_routes(&routes);
+                return None;
+            }
             Ok(Ok(response)) => {
                 routes.record_successful_node(member.node_id);
                 return Some(Ok(response));

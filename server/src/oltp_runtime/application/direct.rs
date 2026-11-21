@@ -607,6 +607,11 @@ impl DirectGateway {
                 self.settle(&anchor, &mut request, deadline, &mut uncertain)
                     .await
             }
+            Err(error) if get && error.outcome == Outcome::Unknown => Err(ProtocolError::new(
+                ErrorCode::StorageUnavailable,
+                "direct read result unavailable",
+                Outcome::NotApplied,
+            )),
             Err(error) => Err(self.final_error(error)),
         }
     }
@@ -861,7 +866,7 @@ impl DirectGateway {
                 }
                 Err(DirectSendError::NotApplied(error)) => {
                     if error.code == ErrorCode::Unauthorized {
-                        return Err(error);
+                        return Err(if *uncertain { unknown() } else { error });
                     }
                     if error.code == ErrorCode::Overloaded && !*uncertain {
                         return Err(error);

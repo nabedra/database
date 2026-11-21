@@ -27,7 +27,7 @@ use crate::{
     oltp_replication::{
         authority::{
             config::DataConfig,
-            consensus::{Consensus, ConsensusFuture},
+            consensus::{Applied, Consensus, ConsensusFuture, ReadBarrier},
             timestamp::{DirectTimestampClient, DirectTimestampRange, DirectTimestampSource},
         },
         hosted::{HostedState, RaftConsensus, batched_config, direct_leadership},
@@ -1770,6 +1770,127 @@ async fn d07_o16_rv_final_h1_restarted_core_serves_direct_commits_again() {
     cluster.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d04_o10_bug1_leader_shutdown_after_apply_preserves_proposal_uncertainty() {
+    struct LoseAppliedReply {
+        inner: Arc<RaftConsensus<DataConfig, ParticipantMachine>>,
+        clock: Arc<RangeClock>,
+    }
+    impl Consensus<ParticipantCommand, ParticipantReply> for LoseAppliedReply {
+        fn propose(
+            &self,
+            command: crate::oltp_replication::owned::OwnedCommand<ParticipantCommand>,
+        ) -> ConsensusFuture<'_, Applied<ParticipantReply>> {
+            Box::pin(async move {
+                let applied = self.inner.propose(command).await?;
+                assert!(matches!(
+                    applied.reply,
+                    ParticipantReply::Direct(
+                        crate::oltp::mvcc::store::direct::DirectReply::Applied { .. }
+                    )
+                ));
+                self.inner.shutdown().await.unwrap();
+                self.clock.step_down();
+                Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "lost the Raft response after apply",
+                    Outcome::Unknown,
+                ))
+            })
+        }
+
+        fn ensure_linearizable(&self) -> ConsensusFuture<'_, ReadBarrier> {
+            self.inner.ensure_linearizable()
+        }
+
+        fn lease_read_index(&self) -> ConsensusFuture<'_, u64> {
+            self.inner.lease_read_index()
+        }
+
+        fn current_leader(&self) -> Option<u64> {
+            self.inner.current_leader()
+        }
+
+        fn local_node(&self) -> Option<u64> {
+            self.inner.local_node()
+        }
+    }
+
+    let mut cluster = Cluster::new(Options {
+        electors: vec![1, 2, 3],
+        ..Default::default()
+    })
+    .await;
+    let leader = cluster.leader().await;
+    let voter = &cluster.voters[leader];
+    let handle = Arc::new(ParticipantHandle::new(
+        ParticipantMachine::new(voter.store.clone()).unwrap(),
+        Arc::new(LoseAppliedReply {
+            inner: voter.consensus.clone(),
+            clock: cluster.clock(leader),
+        }),
+    ));
+    let id = Uuid::new_v4();
+    let insert = cluster.body(
+        id,
+        "table.insert",
+        serde_json::json!({
+            "row": {"id": 7, "value": 1, "tag": "a", "score": 0.0},
+        }),
+    );
+    let response = voter
+        .executor
+        .execute(&handle, cluster.request(leader, &insert, id))
+        .await;
+    let (version, row) = cluster.latest(leader, cluster.row_key(7)).await;
+    assert!(version.is_some());
+    assert!(row.is_some());
+    tokio::time::timeout(Duration::from_secs(20), cluster.stop(leader))
+        .await
+        .expect("old leader shutdown watchdog");
+    let next = cluster.leader().await;
+    assert_ne!(next, leader);
+    cluster.serving(next).await;
+    let voter = &cluster.voters[next];
+    assert_eq!(
+        voter
+            .executor
+            .execute(&voter.handle, cluster.request(next, &insert, id))
+            .await,
+        done("null"),
+    );
+    assert_eq!(cluster.latest(next, cluster.row_key(7)).await.0, version);
+    let changed = cluster
+        .run(
+            next,
+            id,
+            "table.insert",
+            serde_json::json!({
+                "row": {"id": 7, "value": 2, "tag": "a", "score": 0.0},
+            }),
+        )
+        .await;
+    assert!(matches!(
+        changed,
+        DirectResponse::Failed(ProtocolError {
+            code: ErrorCode::Conflict,
+            outcome: Outcome::NotApplied,
+            ..
+        })
+    ));
+    cluster.shutdown().await;
+    assert!(
+        matches!(
+            response,
+            DirectResponse::Failed(ProtocolError {
+                outcome: Outcome::Unknown,
+                ..
+            })
+        ),
+        "{response:?}"
+    );
+}
+
 /// RV-FINAL M1, U01, F01/F03: a leader whose device is full refuses the
 /// proposal before Raft sees it. The direct update answers that refusal at
 /// once (`storage_unavailable`, `not_applied`, the no-space message), as the
@@ -1792,7 +1913,10 @@ async fn f01_u01_rv_final_m1_full_leader_answers_not_applied_at_once() {
     let v = &cluster.voters[leader];
     let before = v.executor.stats();
     let refused = v.consensus.health().snapshot().proposals_refused_no_space;
-    v.consensus.retry().mark_no_space();
+    v.consensus
+        .retry()
+        .force_no_space
+        .store(true, Ordering::Release);
     let started = std::time::Instant::now();
     let response = cluster
         .op(

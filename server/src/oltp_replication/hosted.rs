@@ -20,6 +20,7 @@ use crate::{
 use futures_util::{Stream, StreamExt};
 use openraft::{
     OptionalSend, Raft, RaftSnapshotBuilder, ReadPolicy,
+    errors::{ClientWriteError, RaftError},
     storage::{EntryResponder, RaftStateMachine},
     type_config::alias::{SnapshotMetaOf, SnapshotOf, StoredMembershipOf},
     vote::RaftLeaderId,
@@ -798,7 +799,14 @@ where
                 .await
                 .map_err(|error| {
                     tracing::error!(group=%self.state.store().identity().group_id,kind=?self.state.store().identity().kind,node=self.state._resident.node_id(),error=%error,"typed client_write failed");
-                    unavailable()
+                    match error {
+                        // OpenRaft sends this response before it appends the entry.
+                        // LogEntryDiscarded and Fatal can also follow an append.
+                        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => {
+                            proposal_forwarded()
+                        }
+                        _ => unavailable(),
+                    }
                 })?;
             let (position, reply, owner) = response.data.into_parts()?;
             Ok(Applied::owned(
@@ -977,6 +985,14 @@ fn unavailable() -> ProtocolError {
         ErrorCode::StorageUnavailable,
         "typed Raft quorum, application or leader authority unavailable",
         Outcome::Unknown,
+    )
+}
+
+pub(super) fn proposal_forwarded() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::StorageUnavailable,
+        "typed Raft leader refused the proposal before append",
+        Outcome::NotApplied,
     )
 }
 

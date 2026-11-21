@@ -50,7 +50,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicBool, AtomicUsize},
 };
 use tokio::{net::TcpListener, sync::oneshot};
 
@@ -485,6 +485,7 @@ impl Cluster {
         Arc::new(InProcess {
             routes: Mutex::new(routes),
             down: Mutex::default(),
+            deny: AtomicBool::new(false),
             lose: AtomicUsize::new(0),
             after_lose: Mutex::default(),
             sent: AtomicU64::new(0),
@@ -588,6 +589,7 @@ type Replicas = HashMap<(Uuid, u64), (Arc<DirectExecutor>, Arc<ParticipantHandle
 struct InProcess {
     routes: Mutex<Replicas>,
     down: Mutex<HashSet<u64>>,
+    deny: AtomicBool,
     lose: AtomicUsize,
     /// Runs once, when a reply is lost (before the gateway resends).
     after_lose: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -603,6 +605,13 @@ impl DirectTransport for InProcess {
     ) -> SendFuture<'a> {
         Box::pin(async move {
             self.sent.fetch_add(1, Ordering::Relaxed);
+            if self.deny.load(Ordering::SeqCst) {
+                return Err(DirectSendError::NotApplied(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "fixture worker denied the caller",
+                    Outcome::NotApplied,
+                )));
+            }
             let unreachable = || {
                 DirectSendError::Uncertain(ProtocolError::new(
                     ErrorCode::StorageUnavailable,
@@ -1091,6 +1100,108 @@ async fn d02_q05_rv_final_l2_uncertain_resend_never_reports_a_definite_failure()
     assert!(version.is_some());
     assert_eq!(row, Some(json!({"id": 7, "value": 1})));
     cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d02_o10_bug1_refusal_after_lost_reply_preserves_the_commit_outcome() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = cluster.transport();
+    let switch = direct_on();
+    let gateway = cluster.gateway(switch.clone(), source, transport.clone());
+    let id = Uuid::new_v4();
+    let insert = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+    let deny = Arc::downgrade(&transport);
+    *transport.after_lose.lock().unwrap() = Some(Box::new(move || {
+        deny.upgrade().unwrap().deny.store(true, Ordering::SeqCst);
+    }));
+    transport.lose.store(1, Ordering::SeqCst);
+
+    let lost_reply = answer(&gateway, &insert, id).await;
+    let (version, row) = cluster.latest(group, 0, 7).await;
+    assert!(version.is_some());
+    assert_eq!(row, Some(json!({"id": 7, "value": 1})));
+    let refused_id = Uuid::new_v4();
+    let refused = cluster.body(
+        refused_id,
+        "table.insert",
+        json!({"row": {"id": 8, "value": 2}}),
+    );
+    assert_eq!(
+        answer(&gateway, &refused, refused_id).await,
+        Answer::Error(ErrorCode::Unauthorized, Outcome::NotApplied)
+    );
+    assert_eq!(cluster.latest(group, 0, 8).await, (None, None));
+    transport.deny.store(false, Ordering::SeqCst);
+    switch.set_direct_oltp(false);
+    assert_eq!(
+        answer(&gateway, &insert, id).await,
+        Answer::Data(Value::Null)
+    );
+    let changed = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 2}}));
+    assert_eq!(
+        answer(&gateway, &changed, id).await,
+        Answer::Error(ErrorCode::Conflict, Outcome::NotApplied)
+    );
+    assert_eq!(cluster.latest(group, 0, 7).await.0, version);
+    cluster.shutdown().await;
+    assert_eq!(
+        lost_reply,
+        Answer::Error(ErrorCode::OutcomeUnknown, Outcome::Unknown)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d10_o03_bug1_get_without_a_reply_has_no_unknown_mutation_outcome() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1]).await;
+    let source = Source::new(vec![cluster.fill(&[group])], cluster.voters());
+    let transport = cluster.transport();
+    let gateway = cluster
+        .gateway(direct_on(), source, transport.clone())
+        .with_deadline(Duration::from_millis(250));
+    transport.down.lock().unwrap().extend([1, 2, 3]);
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 7}));
+
+    let missing_reply = answer(&gateway, &get, id).await;
+    assert!(gateway.stats().resends > 0);
+    assert!(!cluster.settled(group, 7, id).await);
+    transport.down.lock().unwrap().clear();
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    cluster.shutdown().await;
+    assert_eq!(
+        missing_reply,
+        Answer::Error(ErrorCode::StorageUnavailable, Outcome::NotApplied)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d04_o13_bug1_raft_follower_refuses_the_proposal_before_append() {
+    let mut cluster = Cluster::new().await;
+    let group = cluster.add_group(span(None, None), 1, &[1]).await;
+    let follower = &cluster.groups[group].replicas[1];
+    let command = ParticipantCommand::Fence {
+        transition_id: Uuid::new_v4(),
+        expected: Some(cluster.authority),
+        next: cluster.authority,
+        schema_epoch: 1,
+        routing_epoch: 1,
+        span: span(None, None),
+        catalog_group_id: cluster.catalog,
+    };
+    let command =
+        OwnedCommand::new_owned(command, follower.handle.resources(), ByteClass::Progress).unwrap();
+    let error = follower
+        .handle
+        .propose(command)
+        .await
+        .err()
+        .expect("follower forwarded write");
+    cluster.shutdown().await;
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+    assert_eq!(error.outcome, Outcome::NotApplied);
 }
 
 /// D04/D05 at the gateway with elections: the leader stops, the request

@@ -181,11 +181,27 @@ impl ApplicationEndpoint {
             .ok_or_else(stale_route)
     }
 
+    fn encode_submission(
+        shared: &WorkerSharedResources,
+        record: &RequestRecord,
+    ) -> Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError> {
+        let bytes = shared
+            .encode_in(ByteClass::Data, record, 16 << 10)
+            .map_err(submission_reply_unavailable)?;
+        Ok((bytes, None))
+    }
+
     fn finish_reply(
         shared: &WorkerSharedResources,
         session: &AuthenticatedSession,
+        submits: bool,
         result: Result<(ChargedBytes, Option<ChargedBytes>), ProtocolError>,
     ) -> Result<ChargedReply, ProtocolError> {
+        let possibly_accepted = submits
+            && result
+                .as_ref()
+                .err()
+                .is_none_or(|error| error.outcome == Outcome::Unknown);
         let (body, inline, error) = match result {
             Ok((body, inline)) => (Some(body), inline, None),
             Err(error) => (None, None, Some(error)),
@@ -197,15 +213,23 @@ impl ApplicationEndpoint {
             error,
         };
         Ok(ChargedReply {
-            header: shared.encode_in(
-                if session.purpose() == Purpose::ApiIngress {
-                    ByteClass::Data
-                } else {
-                    ByteClass::Progress
-                },
-                &reply,
-                MAX_HEADER_BYTES,
-            )?,
+            header: shared
+                .encode_in(
+                    if session.purpose() == Purpose::ApiIngress {
+                        ByteClass::Data
+                    } else {
+                        ByteClass::Progress
+                    },
+                    &reply,
+                    MAX_HEADER_BYTES,
+                )
+                .map_err(|error| {
+                    if possibly_accepted {
+                        submission_reply_unavailable(error)
+                    } else {
+                        error
+                    }
+                })?,
             sections: [body, inline, None],
         })
     }
@@ -253,6 +277,10 @@ impl Endpoint for ApplicationEndpoint {
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
             let request = self.parse(&session, header.as_ref())?;
+            let submits = matches!(
+                request.method,
+                Method::Submit { .. } | Method::ScopedSubmit { .. }
+            );
             if let Some((target, request_id)) = request.method.scoped_request() {
                 let worker = self.scoped_worker()?;
                 let shared = worker.resources();
@@ -271,7 +299,7 @@ impl Endpoint for ApplicationEndpoint {
                                 .settle_before_reserve(body.as_ref())
                                 .await?;
                             let record = worker.submit(placement, body, session.remote()).await?;
-                            Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                            Self::encode_submission(shared, &record)
                         }
                         Method::ScopedObserve {
                             run_id,
@@ -301,7 +329,7 @@ impl Endpoint for ApplicationEndpoint {
                     }
                 }
                 .await;
-                return Self::finish_reply(shared, &session, result);
+                return Self::finish_reply(shared, &session, submits, result);
             }
             let runtime = self.runtime.upgrade().ok_or_else(unavailable)?;
             // Bind the terminal version before the Control role check. A
@@ -328,7 +356,7 @@ impl Endpoint for ApplicationEndpoint {
                     Method::Submit { bytes } => {
                         let body = request_body(bytes, &sections)?;
                         let record = runtime.submit_charged(body, session.remote()).await?;
-                        Ok((shared.encode_in(ByteClass::Data, &record, 16 << 10)?, None))
+                        Self::encode_submission(&shared, &record)
                     }
                     Method::Observe {
                         run_id,
@@ -396,7 +424,7 @@ impl Endpoint for ApplicationEndpoint {
                 }
             }
             .await;
-            Self::finish_reply(&shared, &session, result)
+            Self::finish_reply(&shared, &session, submits, result)
         })
     }
 }
@@ -688,6 +716,110 @@ fn unavailable() -> ProtocolError {
 pub(super) fn submission_unknown(mut error: ProtocolError) -> ProtocolError {
     error.outcome = Outcome::Unknown;
     error
+}
+
+fn submission_reply_unavailable(error: ProtocolError) -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        format!(
+            "request receipt unavailable after submission: {}",
+            error.message
+        ),
+        Outcome::Unknown,
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn q05_o13_bug1_submission_encoding_failure_preserves_accepted_identity() {
+    use crate::oltp::pool::SharedResourceConfig;
+    use crate::request_queue::{QueueLimits, RequestQueue};
+
+    let member = Uuid::new_v4();
+    let id = Uuid::new_v4();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request_id": id, "operation": "table.create",
+        "payload": {"name": "items", "schema": {"id": "int64"}, "key": "id", "format": "parquet"},
+    }))
+    .unwrap();
+    let mut queue = RequestQueue::new(
+        Uuid::new_v4(),
+        1,
+        1,
+        QueueLimits {
+            max_pending_requests: 4,
+            max_queue_bytes_per_replica: 1 << 20,
+            max_retained_result_bytes_per_worker: 1 << 20,
+            result_retention_ms: 1_000,
+        },
+        [member].into(),
+    )
+    .unwrap();
+    let staged = queue.propose(body.clone(), 0).unwrap();
+    let accepted = queue.acknowledge(staged.identity(), member).unwrap();
+    assert!(accepted.accepted);
+    let shared = WorkerSharedResources::new(
+        1,
+        crate::config::WorkerResources::default(),
+        SharedResourceConfig {
+            control_bytes: (4 << 20) + 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let held = shared.allocate_bytes(ByteClass::Data, 4096).unwrap();
+    let error = ApplicationEndpoint::encode_submission(&shared, &accepted)
+        .err()
+        .unwrap();
+    let identity = WorkerIdentity {
+        worker_id: member,
+        incarnation: Uuid::new_v4(),
+        certificate_sha256: Digest::from_bytes([1; 32]),
+        enrollment_revision: 1,
+    };
+    let session = AuthenticatedSession::for_test(
+        identity,
+        identity,
+        GroupIdentity {
+            database: Text::try_from("bug1").unwrap(),
+            cluster_id: Uuid::new_v4(),
+            group_id: Uuid::new_v4(),
+            group_format_version: 1,
+            kind: GroupKind::Control,
+        },
+        Purpose::ApiIngress,
+        Uuid::new_v4(),
+    );
+    let retained = shared
+        .encode_in(ByteClass::Progress, &accepted, 16 << 10)
+        .unwrap();
+    let header_error =
+        ApplicationEndpoint::finish_reply(&shared, &session, true, Ok((retained, None)))
+            .err()
+            .unwrap();
+    drop(held);
+    let retry = queue.propose(body, 0).unwrap();
+    assert_eq!(retry, accepted);
+    assert_eq!(queue.pending(), 1);
+    let (reply, _) = ApplicationEndpoint::encode_submission(&shared, &retry).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RequestRecord>(reply.as_ref()).unwrap(),
+        accepted
+    );
+    let mut changed: serde_json::Value = serde_json::from_slice(&accepted.body).unwrap();
+    changed["payload"]["name"] = serde_json::json!("other");
+    let conflict = queue
+        .propose(serde_json::to_vec(&changed).unwrap(), 0)
+        .unwrap_err()
+        .protocol();
+    assert_eq!(
+        (conflict.code, conflict.outcome),
+        (ErrorCode::Conflict, Outcome::NotApplied)
+    );
+    for error in [error, header_error] {
+        assert_eq!(error.outcome, Outcome::Unknown);
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    }
 }
 
 #[cfg(test)]
