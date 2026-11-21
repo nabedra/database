@@ -15,7 +15,7 @@ import time
 from uuid import UUID
 
 from oltp_direct_cluster import (CHILD, DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Process,
-                                 Rf1Serve, Rf3Cluster, call, free_port, operation, uid, write_json)
+                                 Rf1Serve, Rf3Cluster, call, free_port, operation, resources, uid, write_json)
 
 # Includes a Control election and ready-set removal on the CI runner.
 PROBE_WINDOW = 60
@@ -917,12 +917,18 @@ def o17_a02_scale(binary, test_executable, root):
         queued = insert(table, 1, 7)
         request_id = queued['request_id']
         for worker_name in WORKERS:
-            write_json(cluster.barrier_dir(worker_name) / 'gates.json', {request_id: 'queued'})
+            barrier = cluster.barrier_dir(worker_name)
+            write_json(barrier / 'gates.json', {request_id: 'queued'})
+            write_json(barrier / 'inspect.json', [request_id])
         status, receipt = send(api, token, queued, ca=cluster.ca, path='/v1/requests')
         assert (status, receipt) == (202, dict(request_id=request_id, run_id=cluster.run_id,
                                                state='queued')), (status, receipt)
-        wait_for(lambda: any((cluster.barrier_dir(w) / f'reached-{request_id}').exists() for w in WORKERS),
-                 'original queued request parked')
+        owner = wait_for(lambda: next((w for w in WORKERS
+                         if (cluster.barrier_dir(w) / f'reached-{request_id}').exists()), None),
+                         'original queued request parked')
+        cluster.stats(owner)
+        original = json.loads((cluster.barrier_dir(owner) / f'record-{request_id}.json').read_text())
+        assert original['accepted'] and original['state'] == 'queued'
 
         enrollment = cluster.certificate(name)
         worker = {key: enrollment[key] for key in IDENTITY_FIELDS}
@@ -956,7 +962,6 @@ def o17_a02_scale(binary, test_executable, root):
         bind = f'127.0.0.1:{free_port()}'
         auth = root / 'data-worker-auth.json'
         write_json(auth, {key: cluster.auth[key] for key in ('admin_token', 'data_token')}, 0o600)
-        # The native data-worker process does not use the test executable.
         cfg = dict(version=1, bind=bind, auth_file=str(auth),
                    resources=resources(1024 << 20), execution=EXECUTION,
                    node=dict(intent=intent, bind=enrollment['endpoint'], scheduler_node_id=4,
@@ -965,9 +970,15 @@ def o17_a02_scale(binary, test_executable, root):
                              control_enrollments=cluster.admin('cluster.connection', {})['control_peers']))
         config = root / f'{name}.json'
         write_json(config, cfg, 0o600)
+        barrier = cluster.barrier_dir(name)
+        barrier.mkdir()
+        write_json(barrier / 'inspect.json', [request_id])
+        missed_advert = barrier / f'lose-batch-advert-{worker["worker_id"]}'
+        missed_advert.touch()
         log = root / f'{name}.log'
-        process = Process(name, [cluster.binary, 'data-worker', '--bootstrap', str(config)],
-                          os.environ | {'RUST_LOG': 'warn'}, log)
+        process = Process(name, [cluster.test_executable, '--exact', CHILD, '--ignored', '--nocapture'],
+                          os.environ | {'NABEDRA_OLTP_TEST_DATA_WORKER_CONFIG': str(config),
+                                        'NABEDRA_OLTP_TEST_BARRIER_DIR': str(barrier)}, log)
         cluster.workers[name] = process
 
         def joined():
@@ -977,7 +988,13 @@ def o17_a02_scale(binary, test_executable, root):
 
         ready = wait_for(joined, 'fourth worker becomes ready with a complete queue copy')
         assert ready['run_id'] == cluster.run_id and ready['worker'] == worker, ready
-        assert ready['queue']['accepted_records'] >= 1 and ready['system_groups_hosted'] == 0, ready
+        assert ready['system_groups_hosted'] == 0, ready
+        assert not missed_advert.exists()
+        assert 'fault=DirectCapabilityRequired' in log.read_text(), log.read_text()
+        copied = json.loads((barrier / f'record-{request_id}.json').read_text())
+        assert copied['accepted'] and copied['state'] == 'queued' and copied['worker'] == worker, copied
+        assert copied['run_id'] == cluster.run_id and json.loads(copied['body']) == queued, copied
+        assert (copied['body_hash'], copied['context_hash']) == (original['body_hash'], original['context_hash'])
         assert cluster.admin('storage.growth.status', {'claim_id': claim})['phase'] == 'complete'
 
         drain = dict(worker=worker, run_id=cluster.run_id, docker_container_id='a1' * 32)
@@ -1015,7 +1032,9 @@ def o17_a02_scale(binary, test_executable, root):
         assert success(*send_op(get(table, 1))) == {'id': 1, 'value': 7}
         assert len(cluster.admin('storage.replica.placement', {'group': initial_range(cluster, table)})['members']) == 3
         report('O17/A02/Q03/R03 RF3 data worker scale and drain', ready=[3, 4, 3],
-               request_id=request_id, drain_id=drain_id, run_id=cluster.run_id)
+               request_id=request_id, drain_id=drain_id, run_id=cluster.run_id,
+               refused_before_advert='DirectCapabilityRequired', body_hash=copied['body_hash'],
+               context_hash=copied['context_hash'])
     finally:
         cluster.close()
 

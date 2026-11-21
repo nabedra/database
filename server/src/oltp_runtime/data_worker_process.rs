@@ -427,6 +427,13 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE,
                 crate::oltp_replication::authority::control::QUEUED_SNAPSHOT_RETRY_FEATURE,
             ] {
+                #[cfg(test)]
+                if feature == crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE
+                    && super::recovery_tests::take_fault("lose-batch-advert", local.worker_id)
+                        .is_some()
+                {
+                    continue;
+                }
                 control.advertise_direct_feature(feature, local).await;
             }
             match startup_read(
