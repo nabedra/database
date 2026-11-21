@@ -484,13 +484,30 @@ def d11_index(url, token, ca, admin, stats):
     acknowledged, errors, counter = {}, [], [64]
     lock = threading.Lock()
 
+    # The writers insert at most this many keys, so one per-category collect stays inside the
+    # replica's result capacity however fast the direct path is (SNAP1 removed the snapshot
+    # stalls that throttled them; run 44915229646 then outgrew it). Past the cap they keep
+    # racing the publication with covering-column updates of their own earlier rows.
+    keys = int(os.environ.get('NABEDRA_D11_KEYS', '16000'))
+
     def writer(index):
         client = Http(url, token, 30, ca)
+        relabel = 0
         try:
             while not stop.is_set():
                 with lock:
                     key = counter[0]
-                    counter[0] += 1
+                    if key < keys:
+                        counter[0] += 1
+                if key >= keys:
+                    # A covering-column change: categories, and so the expected sets, stay put.
+                    target = 64 + index + 4 * (relabel % ((keys - 64) // 4))
+                    relabel += 1
+                    status, reply = client.exchange('/v1/operations', operation('table.update', {
+                        'table_id': table.id, 'key': target, 'values': {'label': f'r{index}-{relabel}'}}))
+                    if status != 200:
+                        errors.append((status, reply))
+                    continue
                 category = key % 8
                 body = operation('table.insert', {'table_id': table.id, 'row': {'id': key, 'category': category,
                                                                                   'label': f'w{index}-{key}'}})

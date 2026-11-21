@@ -5,7 +5,7 @@ usage: analyze_snap1.py <soak-run-dir>... [--json out.json]
 
 A stall window is a run of updates whose latency (settled - scheduled) exceeds 250 ms, with
 scheduled times less than 1 s apart. Bytes written come from each worker's cgroup io.stat
-(wbytes summed over devices) between the end of the seed and the end of the last phase;
+(wbytes summed over devices) between the end of the seed and the last sample of the soak;
 "per 5,000 entries" divides by the updates acknowledged in that window (one Data entry each).
 """
 import json
@@ -63,12 +63,13 @@ def run(path):
         for worker in sorted({r['worker'] for r in rows if 'unix_ns' in r}):
             mine = [r for r in rows if r.get('worker') == worker and 'unix_ns' in r]
             before = [r for r in mine if r['unix_ns'] <= start_unix]
-            after = [r for r in mine if r['unix_ns'] >= end_unix]
-            inside = [r for r in mine if start_unix <= r['unix_ns'] <= end_unix]
-            if not before or not after:
+            # The 5 s sampler stops with the driver, a few seconds before the last drain:
+            # the window ends at the last sample.
+            inside = [r for r in mine if start_unix < r['unix_ns']]
+            if not before or not inside:
                 continue
-            total = wbytes(after[0]) - wbytes(before[-1])
-            series = [before[-1]] + inside + [after[0]]
+            total = wbytes(inside[-1]) - wbytes(before[-1])
+            series = [before[-1]] + inside
             bursts = [wbytes(b) - wbytes(a) for a, b in zip(series, series[1:])]
             io[worker] = {'wbytes_mb': round(total / 1e6, 1),
                           'per_5000_entries_mb': round(total / max(1, len(ok)) * 5000 / 1e6, 1),

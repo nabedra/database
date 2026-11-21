@@ -1,0 +1,247 @@
+[
+ {
+  "run": "soak100-before",
+  "offered": 30000,
+  "statuses": {
+   "client_capacity": 1010,
+   "succeeded": 28990
+  },
+  "refused_pct": 3.37,
+  "p50_ms": 2.25,
+  "p99_ms": 20.69,
+  "max_ms": 3278.1,
+  "phase_p99_ms": [
+   29.4,
+   17.6,
+   6.3,
+   36.7,
+   15.4
+  ],
+  "stall_windows": [
+   {
+    "start_s": 43.9,
+    "end_s": 44.1,
+    "requests": 32,
+    "max_ms": 1428.8
+   },
+   {
+    "start_s": 95.8,
+    "end_s": 96.0,
+    "requests": 32,
+    "max_ms": 2119.8
+   },
+   {
+    "start_s": 146.1,
+    "end_s": 146.4,
+    "requests": 32,
+    "max_ms": 2579.0
+   },
+   {
+    "start_s": 199.1,
+    "end_s": 199.4,
+    "requests": 32,
+    "max_ms": 2213.5
+   },
+   {
+    "start_s": 251.1,
+    "end_s": 252.0,
+    "requests": 33,
+    "max_ms": 3278.1
+   }
+  ],
+  "verification": 0,
+  "io": {
+   "api": {
+    "wbytes_mb": 0.0,
+    "per_5000_entries_mb": 0.0,
+    "max_sample_burst_mb": 0.0
+   },
+   "w1": {
+    "wbytes_mb": 5259.3,
+    "per_5000_entries_mb": 907.1,
+    "max_sample_burst_mb": 846.7
+   },
+   "w2": {
+    "wbytes_mb": 5274.6,
+    "per_5000_entries_mb": 909.7,
+    "max_sample_burst_mb": 846.7
+   },
+   "w3": {
+    "wbytes_mb": 5316.3,
+    "per_5000_entries_mb": 916.9,
+    "max_sample_burst_mb": 846.8
+   }
+  }
+ },
+ {
+  "run": "soak100-after",
+  "offered": 30000,
+  "statuses": {
+   "succeeded": 30000
+  },
+  "refused_pct": 0.0,
+  "p50_ms": 2.3,
+  "p99_ms": 10.22,
+  "max_ms": 73.3,
+  "phase_p99_ms": [
+   17.9,
+   12.3,
+   10.2,
+   3.9,
+   9.2
+  ],
+  "stall_windows": [],
+  "verification": 0,
+  "io": {
+   "api": {
+    "wbytes_mb": 0.0,
+    "per_5000_entries_mb": 0.0,
+    "max_sample_burst_mb": 0.0
+   },
+   "w1": {
+    "wbytes_mb": 3215.0,
+    "per_5000_entries_mb": 535.8,
+    "max_sample_burst_mb": 524.8
+   },
+   "w2": {
+    "wbytes_mb": 3192.0,
+    "per_5000_entries_mb": 532.0,
+    "max_sample_burst_mb": 524.8
+   },
+   "w3": {
+    "wbytes_mb": 3180.6,
+    "per_5000_entries_mb": 530.1,
+    "max_sample_burst_mb": 524.8
+   }
+  }
+ },
+ {
+  "run": "soak50-before",
+  "offered": 15000,
+  "statuses": {
+   "client_capacity": 363,
+   "succeeded": 14637
+  },
+  "refused_pct": 2.42,
+  "p50_ms": 2.98,
+  "p99_ms": 140.41,
+  "max_ms": 3518.1,
+  "phase_p99_ms": [
+   112.8,
+   2594.5,
+   5.6,
+   2448.0,
+   2897.6
+  ],
+  "stall_windows": [
+   {
+    "start_s": 34.8,
+    "end_s": 34.9,
+    "requests": 13,
+    "max_ms": 378.8
+   },
+   {
+    "start_s": 87.6,
+    "end_s": 88.2,
+    "requests": 32,
+    "max_ms": 3065.8
+   },
+   {
+    "start_s": 189.8,
+    "end_s": 190.5,
+    "requests": 32,
+    "max_ms": 2960.2
+   },
+   {
+    "start_s": 195.9,
+    "end_s": 196.5,
+    "requests": 9,
+    "max_ms": 322.7
+   },
+   {
+    "start_s": 292.0,
+    "end_s": 292.7,
+    "requests": 32,
+    "max_ms": 3518.1
+   }
+  ],
+  "verification": 0,
+  "io": {
+   "api": {
+    "wbytes_mb": 0.0,
+    "per_5000_entries_mb": 0.0,
+    "max_sample_burst_mb": 0.0
+   },
+   "w1": {
+    "wbytes_mb": 1549.3,
+    "per_5000_entries_mb": 529.2,
+    "max_sample_burst_mb": 349.8
+   },
+   "w2": {
+    "wbytes_mb": 1539.3,
+    "per_5000_entries_mb": 525.8,
+    "max_sample_burst_mb": 349.8
+   },
+   "w3": {
+    "wbytes_mb": 1538.1,
+    "per_5000_entries_mb": 525.4,
+    "max_sample_burst_mb": 279.5
+   }
+  }
+ },
+ {
+  "run": "soak50-after",
+  "offered": 15000,
+  "statuses": {
+   "succeeded": 15000
+  },
+  "refused_pct": 0.0,
+  "p50_ms": 3.1,
+  "p99_ms": 31.29,
+  "max_ms": 351.0,
+  "phase_p99_ms": [
+   139.6,
+   6.1,
+   5.9,
+   136.2,
+   5.9
+  ],
+  "stall_windows": [
+   {
+    "start_s": 34.8,
+    "end_s": 34.9,
+    "requests": 9,
+    "max_ms": 351.0
+   },
+   {
+    "start_s": 191.7,
+    "end_s": 191.8,
+    "requests": 11,
+    "max_ms": 304.3
+   }
+  ],
+  "verification": 0,
+  "io": {
+   "api": {
+    "wbytes_mb": 0.0,
+    "per_5000_entries_mb": 0.0,
+    "max_sample_burst_mb": 0.0
+   },
+   "w1": {
+    "wbytes_mb": 1023.3,
+    "per_5000_entries_mb": 341.1,
+    "max_sample_burst_mb": 323.9
+   },
+   "w2": {
+    "wbytes_mb": 1022.6,
+    "per_5000_entries_mb": 340.9,
+    "max_sample_burst_mb": 323.4
+   },
+   "w3": {
+    "wbytes_mb": 974.8,
+    "per_5000_entries_mb": 324.9,
+    "max_sample_burst_mb": 275.5
+   }
+  }
+ }
+]
