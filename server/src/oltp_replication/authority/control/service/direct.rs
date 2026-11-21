@@ -3,7 +3,7 @@ use super::*;
 use crate::oltp_replication::authority::control::{
     DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
     DirectCapabilityOperation, DirectFeatures, FeatureActivation, feature_operation_id,
-    machine::direct::{activation_key, batch_key, reader_key},
+    machine::direct::{SNAPSHOT_RETRY_ENABLED, activation_key, batch_key, reader_key},
 };
 
 impl ControlHandle {
@@ -45,6 +45,16 @@ impl ControlHandle {
                     batch,
                     batch_advertised,
                 })
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
+    pub(crate) async fn queued_snapshot_retry_enabled(&self) -> Result<bool, ProtocolError> {
+        let raw = self
+            .read(|view| {
+                let enabled = view.get(SNAPSHOT_RETRY_ENABLED)?.is_some();
+                view.encode(&enabled)
             })
             .await?;
         machine::decode(raw.as_ref())

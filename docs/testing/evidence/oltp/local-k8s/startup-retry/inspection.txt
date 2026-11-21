@@ -1,0 +1,2 @@
+Three zone-matched ReadWriteOncePod PVCs bound and attached under the pinned CSI drivers.
+The separate API never passed readiness. Zero observed kind nodes after cleanup.

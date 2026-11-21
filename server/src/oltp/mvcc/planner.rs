@@ -762,6 +762,31 @@ impl NativePlanner {
         let (result, _guard) = native.run_with_guard((owner, cpu), work).await?;
         result
     }
+    /// Reconstruct the exact binding of a settled queued attempt to release
+    /// its guard after a coordinator interruption.
+    pub(crate) async fn queued_lifecycle_binding(
+        &self,
+        operation: &Operation,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        granted_under: crate::oltp_replication::types::Authority,
+    ) -> Result<LifecycleBinding, PlanError> {
+        let (id, version, schema_epoch) = if matches!(operation, Operation::Create(_)) {
+            let id = derived_uuid(
+                b"nabedra/table-id/v1",
+                self.catalog.participant().identity().group_id,
+                txn.request_id,
+            );
+            (id, None, 1)
+        } else {
+            let id = table_id(operation).ok_or_else(not_found)?;
+            let (version, record) = value(self.catalog.describe(pin, id).await?)?;
+            (id, version, record.ok_or_else(not_found)?.schema_epoch)
+        };
+        Ok(self.lifecycle_binding(pin, txn, request, id, version, schema_epoch, granted_under))
+    }
+
     async fn guard(
         &self,
         pin: &PinnedCatalog,

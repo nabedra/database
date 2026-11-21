@@ -1,0 +1,4 @@
+NAME                       READY   STATUS        RESTARTS   AGE   IP           NODE                                   NOMINATED NODE   READINESS GATES
+coredns-5685f85f44-mdddd   1/1     Running       0          6s    10.244.0.6   nabedra-live3-a15b555b-control-plane   <none>           <none>
+coredns-5685f85f44-mjzmq   1/1     Running       0          6s    10.244.0.5   nabedra-live3-a15b555b-control-plane   <none>           <none>
+coredns-66bc5c9577-72gz7   1/1     Terminating   0          34s   10.244.0.2   nabedra-live3-a15b555b-control-plane   <none>           <none>

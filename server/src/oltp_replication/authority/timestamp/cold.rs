@@ -329,6 +329,7 @@ pub(super) fn release(
     }
     record.state = PinState::ColdReleased;
     record.scoped_copy_proof = None;
+    retry_snapshot::release(tx, &mut record)?;
     put(tx, &key, &record)?;
     tx.delete(&active)?;
     commit(tx, &TimestampReply::Released)

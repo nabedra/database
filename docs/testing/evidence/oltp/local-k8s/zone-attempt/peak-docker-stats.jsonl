@@ -1,0 +1,4 @@
+{"BlockIO":"49MB / 1.25GB","CPUPerc":"201.84%","Container":"nabedra-live3-43dc0734-control-plane","ID":"da61d91b07e0","MemPerc":"12.29%","MemUsage":"963.3MiB / 7.656GiB","Name":"nabedra-live3-43dc0734-control-plane","NetIO":"866kB / 4.3MB","PIDs":"215"}
+{"BlockIO":"185MB / 1.09GB","CPUPerc":"159.67%","Container":"nabedra-live3-43dc0734-worker","ID":"e868138ec816","MemPerc":"8.82%","MemUsage":"691.8MiB / 7.656GiB","Name":"nabedra-live3-43dc0734-worker","NetIO":"1.41MB / 284kB","PIDs":"259"}
+{"BlockIO":"177MB / 929MB","CPUPerc":"193.01%","Container":"nabedra-live3-43dc0734-worker2","ID":"3e4ff3aec32b","MemPerc":"6.76%","MemUsage":"529.8MiB / 7.656GiB","Name":"nabedra-live3-43dc0734-worker2","NetIO":"1.15MB / 232kB","PIDs":"175"}
+{"BlockIO":"172MB / 1GB","CPUPerc":"135.44%","Container":"nabedra-live3-43dc0734-worker3","ID":"b9bdcb6f9881","MemPerc":"6.81%","MemUsage":"533.6MiB / 7.656GiB","Name":"nabedra-live3-43dc0734-worker3","NetIO":"1.15MB / 229kB","PIDs":"169"}

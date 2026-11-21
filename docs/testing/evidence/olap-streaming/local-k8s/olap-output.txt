@@ -1,0 +1,2 @@
+PASS A01/A02: public policies, configured callbacks, inventory failure retains 8 accepted IDs, 4 accepted IDs survive safe removal, committed row retained; explicit-zero=True
+PASS ST05/A02: same stream replayed batch 0 byte for byte after provider removal, then yielded batch 1 and EOF

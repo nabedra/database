@@ -30,7 +30,9 @@ use crate::{
 use std::sync::Arc;
 
 mod point;
-use super::replica::QueueReadToken;
+use super::{replica::QueueReadToken, worker_runtime::direct_capability::DirectSwitch};
+
+pub(super) const RETRY_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 use point::PointAdmission;
 
 struct ParticipantBatch {
@@ -44,6 +46,13 @@ struct PreparedMutation {
     result: CanonicalJson,
     original: MutationPlan,
 }
+enum CommitMode<'a> {
+    Standard,
+    Recoverable,
+    Scoped(&'a PointAdmission<'a>),
+    Queued(Option<&'a DirectSwitch>),
+}
+
 pub(crate) struct TransactionCoordinator {
     shared: Arc<WorkerSharedResources>,
     status: Arc<dyn StatusService>,
@@ -110,6 +119,11 @@ impl TransactionCoordinator {
             return Err(scope_mismatch());
         }
         participant.participant = Arc::new(participant.participant.with_scoped_execution(scope)?);
+        let admission = PointAdmission {
+            reservation,
+            read,
+            epoch,
+        };
         coordinator
             .commit_inner(
                 authority,
@@ -117,12 +131,7 @@ impl TransactionCoordinator {
                 scope.request,
                 scope.read_ts,
                 operation,
-                true,
-                Some(PointAdmission {
-                    reservation,
-                    read,
-                    epoch,
-                }),
+                CommitMode::Scoped(&admission),
             )
             .await
     }
@@ -188,8 +197,15 @@ impl TransactionCoordinator {
         read_ts: ReadTs,
         operation: MutationPlan,
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
-        self.commit_inner(authority, txn, request, read_ts, operation, false, None)
-            .await
+        self.commit_inner(
+            authority,
+            txn,
+            request,
+            read_ts,
+            operation,
+            CommitMode::Standard,
+        )
+        .await
     }
     pub(super) async fn commit_recoverable(
         &self,
@@ -199,9 +215,36 @@ impl TransactionCoordinator {
         read_ts: ReadTs,
         operation: MutationPlan,
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
-        self.commit_inner(authority, txn, request, read_ts, operation, true, None)
-            .await
+        self.commit_inner(
+            authority,
+            txn,
+            request,
+            read_ts,
+            operation,
+            CommitMode::Recoverable,
+        )
+        .await
     }
+    pub(super) async fn commit_queued(
+        &self,
+        authority: Authority,
+        txn: TxnId,
+        request: RequestBinding,
+        read_ts: ReadTs,
+        operation: MutationPlan,
+        switch: Option<&DirectSwitch>,
+    ) -> Result<VerifiedStatusDecision, ProtocolError> {
+        self.commit_inner(
+            authority,
+            txn,
+            request,
+            read_ts,
+            operation,
+            CommitMode::Queued(switch),
+        )
+        .await
+    }
+
     async fn commit_inner(
         &self,
         authority: Authority,
@@ -209,9 +252,14 @@ impl TransactionCoordinator {
         request: RequestBinding,
         read_ts: ReadTs,
         mut operation: MutationPlan,
-        recoverable: bool,
-        admission: Option<PointAdmission<'_>>,
+        mode: CommitMode<'_>,
     ) -> Result<VerifiedStatusDecision, ProtocolError> {
+        let recoverable = matches!(mode, CommitMode::Scoped(_) | CommitMode::Recoverable);
+        let (admission, retry_switch) = match mode {
+            CommitMode::Scoped(admission) => (Some(admission), None),
+            CommitMode::Queued(switch) => (None, switch),
+            _ => (None, None),
+        };
         let resources = self.shared.clone();
         let status_group = self.status.group_for_request(txn.request_id).group_id;
         let prepared = self
@@ -352,8 +400,14 @@ impl TransactionCoordinator {
             (manifest, draft.result_digest)
         };
         #[cfg(test)]
+        let retry_participants = format!("retry-participants-{}", txn.attempt);
+        #[cfg(test)]
         super::recovery_tests::transaction_checkpoint(
-            "participants",
+            if txn.attempt == 1 {
+                "participants"
+            } else {
+                &retry_participants
+            },
             txn.request_id,
             &prepared
                 .participants
@@ -362,6 +416,7 @@ impl TransactionCoordinator {
                 .collect::<Vec<_>>(),
         )
         .await;
+        let mut stale_prepare = false;
         let preparation = async {
             let mut point_permit = None;
             for participant in &prepared.participants {
@@ -384,6 +439,10 @@ impl TransactionCoordinator {
                     )?;
                     let reply = participant.participant.prepare_page(command).await?;
                     if !matches!(reply.reply, ParticipantReply::PreparedPage { .. }) {
+                        stale_prepare = matches!(
+                            reply.reply,
+                            ParticipantReply::Rejected(store::Fault::Conflict)
+                        );
                         return Err(conflict());
                     }
                     #[cfg(test)]
@@ -472,20 +531,25 @@ impl TransactionCoordinator {
                     "nabedra-db: transaction {} preparation failed: {:?}: {}",
                     txn.request_id, error.code, error.message
                 );
-                self.status
-                    .abort(
-                        authority,
-                        txn,
-                        if error.code == ErrorCode::Overloaded
-                            || error.code == ErrorCode::LimitExceeded
-                        {
-                            AbortReason::ResourceLimit
-                        } else {
-                            AbortReason::Conflict
-                        },
-                        error,
-                    )
-                    .await?
+                let mut reason = match error.code {
+                    ErrorCode::Overloaded | ErrorCode::LimitExceeded => AbortReason::ResourceLimit,
+                    _ => AbortReason::Conflict,
+                };
+                let mut error = error;
+                if stale_prepare && let Some(switch) = retry_switch {
+                    if txn.attempt < MAX_QUEUED_MUTATION_ATTEMPTS {
+                        if switch.queued_snapshot_retry_enabled().await {
+                            reason = AbortReason::RetrySnapshot;
+                        }
+                    } else {
+                        error = ProtocolError::new(
+                            ErrorCode::Conflict,
+                            "transaction preparation conflicted after exhausting snapshot retries",
+                            Outcome::NotApplied,
+                        );
+                    }
+                }
+                self.status.abort(authority, txn, reason, error).await?
             }
             Ok(point_permit) => {
                 let permit = match point_permit {
@@ -518,9 +582,12 @@ impl TransactionCoordinator {
         if statement.txn != txn || statement.request != request || statement.manifest != manifest {
             return Err(unknown());
         }
+        let retry = statement.decision.retries_snapshot();
+        #[cfg(test)]
+        let retry_aborted = format!("retry-aborted-{}", txn.attempt);
         #[cfg(test)]
         super::recovery_tests::transaction_checkpoint(
-            "decision",
+            if retry { &retry_aborted } else { "decision" },
             txn.request_id,
             decision.statement(),
         )
@@ -537,14 +604,19 @@ impl TransactionCoordinator {
         // A failed Resolve never changes COMMIT into an application failure.
         let resolved = async {
             for participant in &prepared.participants {
-                self.resolve_participant(authority, &decision, &participant.participant)
-                    .await?;
+                self.resolve_participant(
+                    authority,
+                    &decision,
+                    &participant.participant,
+                    participant.plan.write_count,
+                )
+                .await?;
             }
             Ok::<(), ProtocolError>(())
         }
         .await;
         if let Err(error) = &resolved
-            && self.scope.is_some()
+            && (self.scope.is_some() || retry)
         {
             let mut error = error.clone();
             error.outcome = Outcome::Unknown;
@@ -557,7 +629,7 @@ impl TransactionCoordinator {
                     .catalog
                     .release_lifecycle(authority, guard, settled.clone())
                     .await?;
-                if self.scope.is_some()
+                if (self.scope.is_some() || retry)
                     && !matches!(
                         released.reply,
                         ParticipantReply::Lifecycle(store::lifecycle::LifecycleReply::Released)
@@ -680,7 +752,7 @@ impl TransactionCoordinator {
                 .await?;
             for plan in page.items.iter() {
                 let participant = self.resolver.participant(&plan.group).await?;
-                self.resolve_participant(authority, decision, &participant)
+                self.resolve_participant(authority, decision, &participant, plan.write_count)
                     .await?;
             }
             if page.done {
@@ -695,17 +767,30 @@ impl TransactionCoordinator {
         authority: Authority,
         decision: &VerifiedStatusDecision,
         participant: &ParticipantHandle,
+        write_count: u64,
     ) -> Result<(), ProtocolError> {
         let statement = decision.statement();
+        let retry = statement.decision.retries_snapshot();
+        let mut last_ordinal = 0;
         loop {
-            let result = participant
-                .resolve(authority, decision.clone(), 128)
-                .await?;
+            // Each applied page persists its ordinal. A slow page has a
+            // deadline, while a large valid batch may continue making progress.
+            let page = participant.resolve(authority, decision.clone(), 128);
+            let result = if retry {
+                tokio::time::timeout(RETRY_PROGRESS_TIMEOUT, page)
+                    .await
+                    .map_err(|_| unknown())??
+            } else {
+                page.await?
+            };
             match result.reply {
                 ParticipantReply::Resolved { complete: true, .. } => break,
                 ParticipantReply::Resolved {
-                    complete: false, ..
-                } => {}
+                    complete: false,
+                    next_ordinal,
+                } if next_ordinal > last_ordinal && next_ordinal < write_count => {
+                    last_ordinal = next_ordinal;
+                }
                 _ => return Err(unknown()),
             }
         }

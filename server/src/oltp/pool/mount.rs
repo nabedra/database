@@ -68,10 +68,6 @@ impl VerifiedMountAnchor {
         &self.observation
     }
 
-    pub(crate) fn retained_worker(&self) -> Result<WorkerIdentity, ProtocolError> {
-        self.retained_worker_if_initialized()?.ok_or_else(invalid)
-    }
-
     pub(crate) fn retained_worker_if_initialized(
         &self,
     ) -> Result<Option<WorkerIdentity>, ProtocolError> {
@@ -101,6 +97,7 @@ impl PoolMountExpectation {
         }
     }
     pub(crate) fn validate(&self) -> Result<(), ProtocolError> {
+        self.refuse_legacy_format()?;
         self.identity.validate()?;
         self.worker.validate().map_err(|_| invalid())?;
         if self.identity.worker_id != self.worker.worker_id
@@ -127,6 +124,16 @@ impl PoolMountExpectation {
             }
         {
             return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refuse_legacy_format(&self) -> Result<(), ProtocolError> {
+        if self.identity.engine == "oltp" && self.identity.pool_format_version == 1 {
+            return Err(super::storage::unsupported_format(&format!(
+                "{}: pool_format_version 1",
+                self.mount_path.display()
+            )));
         }
         Ok(())
     }
@@ -544,6 +551,7 @@ mod linux {
                 }
                 let old: PoolMountExpectation =
                     serde_json::from_slice(&bounded(&path, LIMIT)?).map_err(|_| invalid())?;
+                old.refuse_legacy_format()?;
                 if &old != expected {
                     if old.identity != expected.identity
                         || old.profile != expected.profile

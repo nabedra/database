@@ -1,0 +1,17 @@
+NAME                                                        CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM              STORAGECLASS   VOLUMEATTRIBUTESCLASS   REASON   AGE     VOLUMEMODE
+persistentvolume/pvc-482ef8ab-156a-4b7b-acbe-754572a7e70c   2Gi        RWOP           Delete           Bound    live3/w2-primary   live3-b        <unset>                          7m13s   Filesystem
+persistentvolume/pvc-4c2f7ea9-a6c3-4098-8d76-17ef2f6a47d6   1Gi        RWOP           Delete           Bound    live3/w3-extra     live3-c        <unset>                          3m9s    Filesystem
+persistentvolume/pvc-94edd985-8226-4871-9e21-85309fbffa2e   1Gi        RWOP           Delete           Bound    live3/w3-primary   live3-c        <unset>                          7m11s   Filesystem
+persistentvolume/pvc-ea5ded17-2e1a-4f07-b3f1-ecb3d8384bfb   1Gi        RWOP           Delete           Bound    live3/w1-primary   live3-a        <unset>                          7m14s   Filesystem
+
+NAMESPACE   NAME                               STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE     VOLUMEMODE
+live3       persistentvolumeclaim/w1-primary   Bound    pvc-ea5ded17-2e1a-4f07-b3f1-ecb3d8384bfb   1Gi        RWOP           live3-a        <unset>                 7m15s   Filesystem
+live3       persistentvolumeclaim/w2-primary   Bound    pvc-482ef8ab-156a-4b7b-acbe-754572a7e70c   2Gi        RWOP           live3-b        <unset>                 7m13s   Filesystem
+live3       persistentvolumeclaim/w3-extra     Bound    pvc-4c2f7ea9-a6c3-4098-8d76-17ef2f6a47d6   1Gi        RWOP           live3-c        <unset>                 3m33s   Filesystem
+live3       persistentvolumeclaim/w3-primary   Bound    pvc-94edd985-8226-4871-9e21-85309fbffa2e   1Gi        RWOP           live3-c        <unset>                 7m12s   Filesystem
+
+NAMESPACE   NAME                                                                                                   ATTACHER                      PV                                         NODE                             ATTACHED   AGE
+            volumeattachment.storage.k8s.io/csi-0eb979655ff37ad33359ed5209e641c2a39c0bba5cfa7aa5492f606d3976ad90   hostpath-a.live3.csi.k8s.io   pvc-ea5ded17-2e1a-4f07-b3f1-ecb3d8384bfb   nabedra-live3-be313a34-worker    true       6m11s
+            volumeattachment.storage.k8s.io/csi-56122fbfa41f29f9cb4ba15872bc3fdc376c87d92313229185d9745018b2c7d1   hostpath-c.live3.csi.k8s.io   pvc-94edd985-8226-4871-9e21-85309fbffa2e   nabedra-live3-be313a34-worker3   true       3m7s
+            volumeattachment.storage.k8s.io/csi-6ca3eca1b9f0ac8b5d5b5f502637c0ccfb5c06b62ab805481ccd81ea74c22d03   hostpath-c.live3.csi.k8s.io   pvc-4c2f7ea9-a6c3-4098-8d76-17ef2f6a47d6   nabedra-live3-be313a34-worker3   true       3m7s
+            volumeattachment.storage.k8s.io/csi-912c1b8fca6574d583ac7f0aec36bb48cac67dd437711c6e8c373abe5d463fd0   hostpath-b.live3.csi.k8s.io   pvc-482ef8ab-156a-4b7b-acbe-754572a7e70c   nabedra-live3-be313a34-worker2   true       5m39s

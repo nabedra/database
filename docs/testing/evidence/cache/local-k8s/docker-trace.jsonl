@@ -1,0 +1,11 @@
+{"check": "docker-checks", "elapsed_seconds": 0.16, "scenario": "cache", "server_source": "20c102659f058c6a512cb1b924087032ea07a44d", "sha256": "0bf5217080559f904ee1ecb9220add10664aa27061d1cb0ac0352ebd21d42d26"}
+{"check": "docker-lane", "elapsed_seconds": 0.214, "status": "acquired"}
+{"check": "cache-lifecycle", "container": "nabedra-live3-cache-lifecycle-554307da", "elapsed_seconds": 0.222, "image": "mirror.gcr.io/library/python:3.11-trixie", "status": "started"}
+{"check": "cache-lifecycle", "elapsed_seconds": 101.049, "exit_code": 1, "status": "failed", "vm_peak_used_bytes": 1334583296}
+{"check": "container-cleanup", "elapsed_seconds": 101.943, "name": "nabedra-live3-cache-lifecycle-554307da", "remaining": false}
+{"check": "valkey-reference", "elapsed_seconds": 112.727, "image": "valkey/valkey:8.1.11-trixie", "image_digests": "[\"valkey/valkey@sha256:8f836008e0986c36adf50da714c7060cf689dbb335f61fe077939d90fa650809\"]", "sha256": "1bf3407a5194c24117ddc353620037241209acd9fba9e18f5b7520eba68c9bf3"}
+{"check": "container-cleanup", "elapsed_seconds": 113.474, "name": "nabedra-live3-valkey-d411b150", "remaining": false}
+{"check": "cache-pair", "container": "nabedra-live3-cache-pair-9898ee0c", "elapsed_seconds": 113.489, "image": "mirror.gcr.io/library/python:3.11-trixie", "status": "started"}
+{"check": "cache-pair", "elapsed_seconds": 441.943, "exit_code": 0, "status": "passed", "vm_peak_used_bytes": 1157931008}
+{"check": "container-cleanup", "elapsed_seconds": 442.46, "name": "nabedra-live3-cache-pair-9898ee0c", "remaining": false}
+{"check": "docker-lane", "elapsed_seconds": 442.71, "status": "released"}

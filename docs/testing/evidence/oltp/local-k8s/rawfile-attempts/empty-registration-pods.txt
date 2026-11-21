@@ -1,0 +1,2 @@
+default              live3-rawfile-rawfile-localpv-controller-f54b544c8-k8dvx       2/2     Running   0          5s     10.244.2.3   nabedra-live3-cbd387fa-worker          <none>           <none>
+default              live3-rawfile-rawfile-localpv-node-gwj5k                       3/3     Running   0          5s     10.244.2.2   nabedra-live3-cbd387fa-worker          <none>           <none>

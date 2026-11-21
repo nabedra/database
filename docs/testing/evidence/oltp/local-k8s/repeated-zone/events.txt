@@ -1,0 +1,271 @@
+NAMESPACE            LAST SEEN   TYPE      REASON                    OBJECT                                                    MESSAGE
+default              5m44s       Normal    Starting                  node/nabedra-live3-a6155b84-worker2
+default              5m49s       Normal    Starting                  node/nabedra-live3-a6155b84-control-plane
+default              5m44s       Normal    Starting                  node/nabedra-live3-a6155b84-worker3
+default              5m43s       Normal    Starting                  node/nabedra-live3-a6155b84-worker
+default              5m58s       Normal    NodeAllocatableEnforced   node/nabedra-live3-a6155b84-control-plane                 Updated Node Allocatable limit across pods
+default              5m58s       Normal    Starting                  node/nabedra-live3-a6155b84-control-plane                 Starting kubelet.
+default              5m58s       Normal    NodeHasSufficientMemory   node/nabedra-live3-a6155b84-control-plane                 Node nabedra-live3-a6155b84-control-plane status is now: NodeHasSufficientMemory
+default              5m58s       Normal    NodeHasNoDiskPressure     node/nabedra-live3-a6155b84-control-plane                 Node nabedra-live3-a6155b84-control-plane status is now: NodeHasNoDiskPressure
+default              5m58s       Normal    NodeHasSufficientPID      node/nabedra-live3-a6155b84-control-plane                 Node nabedra-live3-a6155b84-control-plane status is now: NodeHasSufficientPID
+kube-system          5m58s       Warning   Unhealthy                 pod/kube-scheduler-nabedra-live3-a6155b84-control-plane   Readiness probe failed: HTTP probe failed with statuscode: 500
+kube-system          5m57s       Normal    LeaderElection            lease/kube-scheduler                                      nabedra-live3-a6155b84-control-plane_ae2605fd-0857-47b4-9a3c-ee60821f6643 became leader
+kube-system          5m57s       Normal    LeaderElection            lease/kube-controller-manager                             nabedra-live3-a6155b84-control-plane_674bd1d0-0c85-464a-a05a-0749547c7e11 became leader
+default              5m52s       Normal    RegisteredNode            node/nabedra-live3-a6155b84-control-plane                 Node nabedra-live3-a6155b84-control-plane event: Registered Node nabedra-live3-a6155b84-control-plane in Controller
+local-path-storage   5m51s       Normal    ScalingReplicaSet         deployment/local-path-provisioner                         Scaled up replica set local-path-provisioner-57f858859 from 0 to 1
+kube-system          5m51s       Normal    Pulled                    pod/kindnet-wx9lz                                         Container image "docker.io/kindest/kindnetd:v20260820-69b56db7" already present on machine
+kube-system          5m51s       Normal    SuccessfulCreate          replicaset/coredns-66bc5c9577                             Created pod: coredns-66bc5c9577-fpk7b
+kube-system          5m51s       Normal    Pulled                    pod/kube-proxy-rvckh                                      Container image "registry.k8s.io/kube-proxy:v1.34.11" already present on machine
+kube-system          5m51s       Normal    Scheduled                 pod/kube-proxy-rvckh                                      Successfully assigned kube-system/kube-proxy-rvckh to nabedra-live3-a6155b84-control-plane
+kube-system          5m51s       Normal    SuccessfulCreate          daemonset/kindnet                                         Created pod: kindnet-wx9lz
+kube-system          5m51s       Normal    Scheduled                 pod/kindnet-wx9lz                                         Successfully assigned kube-system/kindnet-wx9lz to nabedra-live3-a6155b84-control-plane
+kube-system          5m51s       Normal    SuccessfulCreate          replicaset/coredns-66bc5c9577                             Created pod: coredns-66bc5c9577-xvr2x
+kube-system          5m51s       Normal    ScalingReplicaSet         deployment/coredns                                        Scaled up replica set coredns-66bc5c9577 from 0 to 2
+kube-system          5m51s       Warning   FailedScheduling          pod/coredns-66bc5c9577-fpk7b                              0/1 nodes are available: 1 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.
+kube-system          5m51s       Normal    SuccessfulCreate          daemonset/kube-proxy                                      Created pod: kube-proxy-rvckh
+local-path-storage   5m51s       Normal    SuccessfulCreate          replicaset/local-path-provisioner-57f858859               Created pod: local-path-provisioner-57f858859-zsq2b
+kube-system          5m51s       Warning   FailedScheduling          pod/coredns-66bc5c9577-xvr2x                              0/1 nodes are available: 1 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.
+local-path-storage   5m51s       Warning   FailedScheduling          pod/local-path-provisioner-57f858859-zsq2b                0/1 nodes are available: 1 node(s) had untolerated taint(s). no new claims to deallocate, preemption: 0/1 nodes are available: 1 Preemption is not helpful for scheduling.
+kube-system          5m50s       Normal    Created                   pod/kube-proxy-rvckh                                      Created container: kube-proxy
+kube-system          5m50s       Normal    Created                   pod/kindnet-wx9lz                                         Created container: kindnet-cni
+kube-system          5m50s       Normal    Started                   pod/kube-proxy-rvckh                                      Started container kube-proxy
+kube-system          5m50s       Normal    Started                   pod/kindnet-wx9lz                                         Started container kindnet-cni
+default              5m49s       Normal    Starting                  node/nabedra-live3-a6155b84-worker3                       Starting kubelet.
+kube-system          5m48s       Normal    Scheduled                 pod/kube-proxy-wgc8n                                      Successfully assigned kube-system/kube-proxy-wgc8n to nabedra-live3-a6155b84-worker
+default              5m48s       Normal    NodeHasNoDiskPressure     node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasNoDiskPressure
+kube-system          5m48s       Normal    Scheduled                 pod/kube-proxy-j9pxx                                      Successfully assigned kube-system/kube-proxy-j9pxx to nabedra-live3-a6155b84-worker3
+default              5m48s       Normal    NodeAllocatableEnforced   node/nabedra-live3-a6155b84-worker                        Updated Node Allocatable limit across pods
+kube-system          5m48s       Normal    Scheduled                 pod/kindnet-sn94f                                         Successfully assigned kube-system/kindnet-sn94f to nabedra-live3-a6155b84-worker2
+default              5m48s       Normal    NodeHasSufficientPID      node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasSufficientPID
+kube-system          5m48s       Normal    Scheduled                 pod/kindnet-j4pk5                                         Successfully assigned kube-system/kindnet-j4pk5 to nabedra-live3-a6155b84-worker3
+default              5m48s       Normal    NodeHasNoDiskPressure     node/nabedra-live3-a6155b84-worker2                       Node nabedra-live3-a6155b84-worker2 status is now: NodeHasNoDiskPressure
+kube-system          5m48s       Normal    Scheduled                 pod/kindnet-hvhdf                                         Successfully assigned kube-system/kindnet-hvhdf to nabedra-live3-a6155b84-worker
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kindnet                                         Created pod: kindnet-sn94f
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kindnet                                         Created pod: kindnet-hvhdf
+default              5m48s       Normal    Starting                  node/nabedra-live3-a6155b84-worker                        Starting kubelet.
+default              5m48s       Normal    NodeHasSufficientMemory   node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasSufficientMemory
+kube-system          5m48s       Normal    Scheduled                 pod/kube-proxy-h26gd                                      Successfully assigned kube-system/kube-proxy-h26gd to nabedra-live3-a6155b84-worker2
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kube-proxy                                      Created pod: kube-proxy-j9pxx
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kube-proxy                                      Created pod: kube-proxy-wgc8n
+default              5m48s       Normal    NodeAllocatableEnforced   node/nabedra-live3-a6155b84-worker3                       Updated Node Allocatable limit across pods
+default              5m48s       Normal    NodeHasSufficientPID      node/nabedra-live3-a6155b84-worker3                       Node nabedra-live3-a6155b84-worker3 status is now: NodeHasSufficientPID
+default              5m48s       Normal    NodeHasNoDiskPressure     node/nabedra-live3-a6155b84-worker3                       Node nabedra-live3-a6155b84-worker3 status is now: NodeHasNoDiskPressure
+default              5m48s       Normal    NodeHasSufficientMemory   node/nabedra-live3-a6155b84-worker3                       Node nabedra-live3-a6155b84-worker3 status is now: NodeHasSufficientMemory
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kindnet                                         Created pod: kindnet-j4pk5
+kube-system          5m48s       Normal    SuccessfulCreate          daemonset/kube-proxy                                      Created pod: kube-proxy-h26gd
+default              5m48s       Normal    NodeHasSufficientMemory   node/nabedra-live3-a6155b84-worker2                       Node nabedra-live3-a6155b84-worker2 status is now: NodeHasSufficientMemory
+default              5m48s       Normal    NodeAllocatableEnforced   node/nabedra-live3-a6155b84-worker2                       Updated Node Allocatable limit across pods
+default              5m48s       Normal    NodeHasSufficientPID      node/nabedra-live3-a6155b84-worker2                       Node nabedra-live3-a6155b84-worker2 status is now: NodeHasSufficientPID
+kube-system          5m47s       Normal    Pulled                    pod/kindnet-j4pk5                                         Container image "docker.io/kindest/kindnetd:v20260820-69b56db7" already present on machine
+kube-system          5m47s       Normal    Pulled                    pod/kube-proxy-j9pxx                                      Container image "registry.k8s.io/kube-proxy:v1.34.11" already present on machine
+default              5m47s       Normal    RegisteredNode            node/nabedra-live3-a6155b84-worker3                       Node nabedra-live3-a6155b84-worker3 event: Registered Node nabedra-live3-a6155b84-worker3 in Controller
+default              5m47s       Normal    RegisteredNode            node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker event: Registered Node nabedra-live3-a6155b84-worker in Controller
+default              5m47s       Normal    RegisteredNode            node/nabedra-live3-a6155b84-worker2                       Node nabedra-live3-a6155b84-worker2 event: Registered Node nabedra-live3-a6155b84-worker2 in Controller
+kube-system          5m46s       Normal    Created                   pod/kube-proxy-j9pxx                                      Created container: kube-proxy
+kube-system          5m46s       Normal    Pulled                    pod/kube-proxy-h26gd                                      Container image "registry.k8s.io/kube-proxy:v1.34.11" already present on machine
+kube-system          5m46s       Normal    Pulled                    pod/kindnet-sn94f                                         Container image "docker.io/kindest/kindnetd:v20260820-69b56db7" already present on machine
+kube-system          5m46s       Normal    Pulled                    pod/kindnet-hvhdf                                         Container image "docker.io/kindest/kindnetd:v20260820-69b56db7" already present on machine
+kube-system          5m46s       Normal    Pulled                    pod/kube-proxy-wgc8n                                      Container image "registry.k8s.io/kube-proxy:v1.34.11" already present on machine
+kube-system          5m45s       Normal    Created                   pod/kube-proxy-h26gd                                      Created container: kube-proxy
+kube-system          5m45s       Normal    Started                   pod/kube-proxy-h26gd                                      Started container kube-proxy
+kube-system          5m45s       Normal    Started                   pod/kube-proxy-j9pxx                                      Started container kube-proxy
+kube-system          5m45s       Normal    Created                   pod/kube-proxy-wgc8n                                      Created container: kube-proxy
+kube-system          5m45s       Normal    Started                   pod/kube-proxy-wgc8n                                      Started container kube-proxy
+kube-system          5m43s       Normal    Created                   pod/kindnet-hvhdf                                         Created container: kindnet-cni
+kube-system          5m43s       Normal    Started                   pod/kindnet-sn94f                                         Started container kindnet-cni
+kube-system          5m43s       Normal    Created                   pod/kindnet-j4pk5                                         Created container: kindnet-cni
+kube-system          5m43s       Normal    Created                   pod/kindnet-sn94f                                         Created container: kindnet-cni
+kube-system          5m43s       Normal    Started                   pod/kindnet-j4pk5                                         Started container kindnet-cni
+kube-system          5m43s       Normal    Started                   pod/kindnet-hvhdf                                         Started container kindnet-cni
+local-path-storage   5m39s       Normal    Scheduled                 pod/local-path-provisioner-57f858859-zsq2b                Successfully assigned local-path-storage/local-path-provisioner-57f858859-zsq2b to nabedra-live3-a6155b84-control-plane
+local-path-storage   5m39s       Normal    Pulled                    pod/local-path-provisioner-57f858859-zsq2b                Container image "docker.io/kindest/local-path-provisioner:v20260820-69b56db7" already present on machine
+kube-system          5m39s       Normal    Pulled                    pod/coredns-66bc5c9577-fpk7b                              Container image "registry.k8s.io/coredns/coredns:v1.12.1" already present on machine
+kube-system          5m39s       Normal    Scheduled                 pod/coredns-66bc5c9577-fpk7b                              Successfully assigned kube-system/coredns-66bc5c9577-fpk7b to nabedra-live3-a6155b84-control-plane
+default              5m39s       Normal    NodeReady                 node/nabedra-live3-a6155b84-control-plane                 Node nabedra-live3-a6155b84-control-plane status is now: NodeReady
+kube-system          5m39s       Normal    Scheduled                 pod/coredns-66bc5c9577-xvr2x                              Successfully assigned kube-system/coredns-66bc5c9577-xvr2x to nabedra-live3-a6155b84-control-plane
+kube-system          5m39s       Normal    Pulled                    pod/coredns-66bc5c9577-xvr2x                              Container image "registry.k8s.io/coredns/coredns:v1.12.1" already present on machine
+local-path-storage   5m37s       Normal    Created                   pod/local-path-provisioner-57f858859-zsq2b                Created container: local-path-provisioner
+local-path-storage   5m37s       Normal    Started                   pod/local-path-provisioner-57f858859-zsq2b                Started container local-path-provisioner
+kube-system          5m37s       Normal    Created                   pod/coredns-66bc5c9577-fpk7b                              Created container: coredns
+kube-system          5m37s       Normal    Created                   pod/coredns-66bc5c9577-xvr2x                              Created container: coredns
+kube-system          5m36s       Normal    Pulled                    pod/coredns-5dd56b4858-t6vt4                              Container image "registry.k8s.io/coredns/coredns:v1.12.1" already present on machine
+kube-system          5m36s       Normal    Created                   pod/coredns-5dd56b4858-t6vt4                              Created container: coredns
+kube-system          5m36s       Normal    SuccessfulDelete          replicaset/coredns-66bc5c9577                             Deleted pod: coredns-66bc5c9577-fpk7b
+kube-system          5m36s       Normal    Started                   pod/coredns-66bc5c9577-fpk7b                              Started container coredns
+kube-system          5m36s       Normal    Started                   pod/coredns-66bc5c9577-xvr2x                              Started container coredns
+kube-system          5m36s       Normal    ScalingReplicaSet         deployment/coredns                                        Scaled up replica set coredns-5dd56b4858 from 0 to 1
+kube-system          5m36s       Normal    ScalingReplicaSet         deployment/coredns                                        Scaled up replica set coredns-5dd56b4858 from 1 to 2
+kube-system          5m36s       Normal    SuccessfulCreate          replicaset/coredns-5dd56b4858                             Created pod: coredns-5dd56b4858-gphqc
+kube-system          5m36s       Normal    ScalingReplicaSet         deployment/coredns                                        Scaled down replica set coredns-66bc5c9577 from 2 to 1
+kube-system          5m36s       Normal    SuccessfulCreate          replicaset/coredns-5dd56b4858                             Created pod: coredns-5dd56b4858-t6vt4
+kube-system          5m36s       Normal    Scheduled                 pod/coredns-5dd56b4858-gphqc                              Successfully assigned kube-system/coredns-5dd56b4858-gphqc to nabedra-live3-a6155b84-control-plane
+kube-system          5m36s       Normal    Pulled                    pod/coredns-5dd56b4858-gphqc                              Container image "registry.k8s.io/coredns/coredns:v1.12.1" already present on machine
+kube-system          5m36s       Normal    Created                   pod/coredns-5dd56b4858-gphqc                              Created container: coredns
+kube-system          5m36s       Normal    Started                   pod/coredns-5dd56b4858-t6vt4                              Started container coredns
+kube-system          5m36s       Normal    Scheduled                 pod/coredns-5dd56b4858-t6vt4                              Successfully assigned kube-system/coredns-5dd56b4858-t6vt4 to nabedra-live3-a6155b84-control-plane
+kube-system          5m35s       Normal    SuccessfulDelete          replicaset/coredns-66bc5c9577                             Deleted pod: coredns-66bc5c9577-xvr2x
+kube-system          5m35s       Normal    Killing                   pod/coredns-66bc5c9577-fpk7b                              Stopping container coredns
+kube-system          5m35s       Normal    Started                   pod/coredns-5dd56b4858-gphqc                              Started container coredns
+kube-system          5m35s       Normal    ScalingReplicaSet         deployment/coredns                                        Scaled down replica set coredns-66bc5c9577 from 1 to 0
+default              5m33s       Normal    NodeReady                 node/nabedra-live3-a6155b84-worker3                       Node nabedra-live3-a6155b84-worker3 status is now: NodeReady
+kube-system          5m33s       Normal    Killing                   pod/coredns-66bc5c9577-xvr2x                              Stopping container coredns
+default              5m32s       Normal    NodeReady                 node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeReady
+default              5m32s       Normal    NodeReady                 node/nabedra-live3-a6155b84-worker2                       Node nabedra-live3-a6155b84-worker2 status is now: NodeReady
+kube-system          5m26s       Warning   Unhealthy                 pod/coredns-66bc5c9577-xvr2x                              Readiness probe failed: Get "http://10.244.0.2:8181/ready": dial tcp 10.244.0.2:8181: connect: connection refused
+kube-system          5m26s       Warning   Unhealthy                 pod/coredns-66bc5c9577-fpk7b                              Readiness probe failed: Get "http://10.244.0.4:8181/ready": dial tcp 10.244.0.4:8181: connect: connection refused
+default              5m1s        Normal    Scheduled                 pod/csi-hostpathplugin-b-0                                Successfully assigned default/csi-hostpathplugin-b-0 to nabedra-live3-a6155b84-worker2
+default              5m1s        Normal    SuccessfulCreate          statefulset/csi-hostpathplugin-c                          create Pod csi-hostpathplugin-c-0 in StatefulSet csi-hostpathplugin-c successful
+default              5m1s        Normal    Scheduled                 pod/csi-hostpathplugin-a-0                                Successfully assigned default/csi-hostpathplugin-a-0 to nabedra-live3-a6155b84-worker
+default              5m1s        Normal    SuccessfulCreate          statefulset/csi-hostpathplugin-b                          create Pod csi-hostpathplugin-b-0 in StatefulSet csi-hostpathplugin-b successful
+default              5m1s        Normal    Scheduled                 pod/csi-hostpathplugin-c-0                                Successfully assigned default/csi-hostpathplugin-c-0 to nabedra-live3-a6155b84-worker3
+default              5m1s        Normal    SuccessfulCreate          statefulset/csi-hostpathplugin-a                          create Pod csi-hostpathplugin-a-0 in StatefulSet csi-hostpathplugin-a successful
+default              5m          Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container hostpath
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/hostpathplugin:v1.19.0" already present on machine
+default              5m          Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: hostpath
+default              5m          Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: hostpath
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/hostpathplugin:v1.19.0" already present on machine
+default              5m          Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container hostpath
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0" already present on machine
+default              5m          Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: node-driver-registrar
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0" already present on machine
+default              5m          Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: node-driver-registrar
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/hostpathplugin:v1.19.0" already present on machine
+default              5m          Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: hostpath
+default              5m          Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: node-driver-registrar
+default              5m          Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0" already present on machine
+default              5m          Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container hostpath
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: liveness-probe
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container csi-attacher
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container node-driver-registrar
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/livenessprobe:v2.20.0" already present on machine
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container liveness-probe
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container node-driver-registrar
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/csi-attacher:v4.13.0" already present on machine
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: csi-attacher
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/livenessprobe:v2.20.0" already present on machine
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: liveness-probe
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/csi-provisioner:v6.4.0" already present on machine
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container csi-attacher
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: csi-attacher
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/csi-attacher:v4.13.0" already present on machine
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container liveness-probe
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: liveness-probe
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/livenessprobe:v2.20.0" already present on machine
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container node-driver-registrar
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container liveness-probe
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/csi-attacher:v4.13.0" already present on machine
+default              4m59s       Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: csi-attacher
+default              4m59s       Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container csi-attacher
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/csi-provisioner:v6.4.0" already present on machine
+default              4m59s       Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/csi-provisioner:v6.4.0" already present on machine
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: csi-provisioner
+default              4m58s       Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container csi-resizer
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: csi-resizer
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-a-0                                Created container: csi-resizer
+default              4m58s       Normal    Pulled                    pod/csi-hostpathplugin-a-0                                Container image "registry.k8s.io/sig-storage/csi-resizer:v2.3.0" already present on machine
+default              4m58s       Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container csi-provisioner
+default              4m58s       Normal    Pulled                    pod/csi-hostpathplugin-c-0                                Container image "registry.k8s.io/sig-storage/csi-resizer:v2.3.0" already present on machine
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: csi-provisioner
+default              4m58s       Normal    Pulled                    pod/csi-hostpathplugin-b-0                                Container image "registry.k8s.io/sig-storage/csi-resizer:v2.3.0" already present on machine
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-b-0                                Created container: csi-provisioner
+default              4m58s       Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container csi-provisioner
+default              4m58s       Normal    Started                   pod/csi-hostpathplugin-c-0                                Started container csi-provisioner
+default              4m58s       Normal    Created                   pod/csi-hostpathplugin-c-0                                Created container: csi-resizer
+default              4m57s       Normal    Started                   pod/csi-hostpathplugin-b-0                                Started container csi-resizer
+default              4m57s       Normal    Started                   pod/csi-hostpathplugin-a-0                                Started container csi-resizer
+live3                3m42s       Normal    WaitForFirstConsumer      persistentvolumeclaim/w1-primary                          waiting for first consumer to be created before binding
+live3                3m41s       Normal    Provisioning              persistentvolumeclaim/w2-primary                          External provisioner is provisioning volume for claim "live3/w2-primary"
+live3                3m41s       Normal    ProvisioningSucceeded     persistentvolumeclaim/w1-primary                          Successfully provisioned volume pvc-380c9483-4f66-4c67-bec6-c305e450f8b2
+live3                3m41s       Normal    WaitForFirstConsumer      persistentvolumeclaim/w2-primary                          waiting for first consumer to be created before binding
+live3                3m41s       Normal    ExternalProvisioning      persistentvolumeclaim/w2-primary                          Waiting for a volume to be created either by the external provisioner 'hostpath-b.live3.csi.k8s.io' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+live3                3m41s       Normal    ProvisioningSucceeded     persistentvolumeclaim/w2-primary                          Successfully provisioned volume pvc-6ea65e81-6f60-47ac-abd6-9721321e7186
+live3                3m41s       Normal    ExternalProvisioning      persistentvolumeclaim/w1-primary                          Waiting for a volume to be created either by the external provisioner 'hostpath-a.live3.csi.k8s.io' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+live3                3m41s       Normal    Provisioning              persistentvolumeclaim/w1-primary                          External provisioner is provisioning volume for claim "live3/w1-primary"
+live3                3m40s       Normal    Scheduled                 pod/w2-0                                                  Successfully assigned live3/w2-0 to nabedra-live3-a6155b84-worker2
+live3                3m40s       Normal    WaitForFirstConsumer      persistentvolumeclaim/w3-primary                          waiting for first consumer to be created before binding
+live3                3m40s       Normal    Scheduled                 pod/w1-0                                                  Successfully assigned live3/w1-0 to nabedra-live3-a6155b84-worker
+live3                3m40s       Normal    SuccessfulAttachVolume    pod/w1-0                                                  AttachVolume.Attach succeeded for volume "pvc-380c9483-4f66-4c67-bec6-c305e450f8b2"
+live3                3m40s       Normal    ProvisioningSucceeded     persistentvolumeclaim/w3-primary                          Successfully provisioned volume pvc-3d0d4b44-f329-4521-a9f6-b2d62343d1ea
+live3                3m40s       Normal    ExternalProvisioning      persistentvolumeclaim/w3-primary                          Waiting for a volume to be created either by the external provisioner 'hostpath-c.live3.csi.k8s.io' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+live3                3m40s       Normal    Provisioning              persistentvolumeclaim/w3-primary                          External provisioner is provisioning volume for claim "live3/w3-primary"
+live3                3m39s       Normal    Scheduled                 pod/w3-0                                                  Successfully assigned live3/w3-0 to nabedra-live3-a6155b84-worker3
+live3                3m39s       Normal    SuccessfulAttachVolume    pod/w2-0                                                  AttachVolume.Attach succeeded for volume "pvc-6ea65e81-6f60-47ac-abd6-9721321e7186"
+live3                3m38s       Normal    SuccessfulAttachVolume    pod/w3-0                                                  AttachVolume.Attach succeeded for volume "pvc-3d0d4b44-f329-4521-a9f6-b2d62343d1ea"
+live3                3m35s       Normal    Pulled                    pod/w3-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m35s       Normal    Pulled                    pod/w1-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m34s       Normal    Created                   pod/w3-0                                                  Created container: prepare
+live3                3m34s       Normal    Started                   pod/w1-0                                                  Started container prepare
+live3                3m34s       Normal    Created                   pod/w1-0                                                  Created container: prepare
+live3                3m34s       Normal    Started                   pod/w3-0                                                  Started container prepare
+live3                3m32s       Normal    Created                   pod/w3-0                                                  Created container: w3
+live3                3m32s       Normal    Pulled                    pod/w3-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m32s       Normal    Pulled                    pod/w2-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m32s       Normal    Pulled                    pod/w1-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m32s       Normal    Created                   pod/w1-0                                                  Created container: w1
+live3                3m31s       Normal    Created                   pod/w2-0                                                  Created container: prepare
+live3                3m31s       Normal    Started                   pod/w1-0                                                  Started container w1
+live3                3m31s       Normal    Started                   pod/w2-0                                                  Started container prepare
+live3                3m31s       Normal    Pulled                    pod/w2-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m31s       Normal    Started                   pod/w2-0                                                  Started container w2
+live3                3m31s       Normal    Created                   pod/w2-0                                                  Created container: w2
+live3                3m31s       Normal    Started                   pod/w3-0                                                  Started container w3
+live3                3m28s       Warning   Unhealthy                 pod/w1-0                                                  Readiness probe failed: dial tcp 10.244.2.3:8080: connect: connection refused
+live3                3m26s       Warning   Unhealthy                 pod/w3-0                                                  Readiness probe failed: dial tcp 10.244.1.3:8080: connect: connection refused
+live3                3m23s       Normal    Scheduled                 pod/api                                                   Successfully assigned live3/api to nabedra-live3-a6155b84-control-plane
+live3                3m22s       Normal    Started                   pod/api                                                   Started container prepare
+live3                3m22s       Normal    Pulled                    pod/api                                                   Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m22s       Normal    Created                   pod/api                                                   Created container: prepare
+live3                3m21s       Normal    Started                   pod/api                                                   Started container api
+live3                3m21s       Normal    Created                   pod/api                                                   Created container: api
+live3                3m21s       Normal    Pulled                    pod/api                                                   Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                3m11s       Warning   FailedScheduling          pod/second-writer                                         0/4 nodes are available: 1 node(s) had untolerated taint(s), 1 node(s) unavailable due to PersistentVolumeClaim with ReadWriteOncePod access mode already in-use by another pod, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 1 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling.
+live3                3m9s        Normal    Killing                   pod/w1-0                                                  Stopping container w1
+live3                3m7s        Normal    SuccessfulDelete          statefulset/w1                                            delete Pod w1-0 in StatefulSet w1 successful
+live3                3m7s        Normal    Scheduled                 pod/w1-0                                                  Successfully assigned live3/w1-0 to nabedra-live3-a6155b84-worker
+live3                2m48s       Normal    SuccessfulCreate          statefulset/w1                                            create Pod w1-0 in StatefulSet w1 successful
+live3                2m48s       Normal    Scheduled                 pod/w1-0                                                  Successfully assigned live3/w1-0 to nabedra-live3-a6155b84-worker
+live3                2m47s       Normal    SuccessfulAttachVolume    pod/w1-0                                                  AttachVolume.Attach succeeded for volume "pvc-380c9483-4f66-4c67-bec6-c305e450f8b2"
+live3                2m44s       Normal    Started                   pod/w1-0                                                  Started container prepare
+live3                2m44s       Normal    Pulled                    pod/w1-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                2m44s       Normal    Created                   pod/w1-0                                                  Created container: prepare
+live3                2m43s       Normal    Created                   pod/w1-0                                                  Created container: w1
+live3                2m43s       Normal    Started                   pod/w1-0                                                  Started container w1
+live3                2m43s       Normal    Pulled                    pod/w1-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                2m41s       Warning   Unhealthy                 pod/w1-0                                                  Readiness probe failed: dial tcp 10.244.2.4:8080: connect: connection refused
+live3                2m35s       Normal    SuccessfulDelete          statefulset/w2                                            delete Pod w2-0 in StatefulSet w2 successful
+live3                2m35s       Warning   Unhealthy                 pod/w2-0                                                  Readiness probe failed: dial tcp 10.244.3.3:8080: connect: connection refused
+live3                2m35s       Normal    Killing                   pod/w2-0                                                  Stopping container w2
+live3                2m18s       Normal    SuccessfulCreate          statefulset/w2                                            create Pod w2-0 in StatefulSet w2 successful
+live3                2m18s       Normal    Scheduled                 pod/w2-0                                                  Successfully assigned live3/w2-0 to nabedra-live3-a6155b84-worker2
+live3                2m17s       Normal    SuccessfulAttachVolume    pod/w2-0                                                  AttachVolume.Attach succeeded for volume "pvc-6ea65e81-6f60-47ac-abd6-9721321e7186"
+live3                2m10s       Normal    Pulled                    pod/w2-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                2m10s       Normal    Started                   pod/w2-0                                                  Started container prepare
+live3                2m10s       Normal    Created                   pod/w2-0                                                  Created container: prepare
+live3                2m9s        Normal    Pulled                    pod/w2-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                2m9s        Normal    Created                   pod/w2-0                                                  Created container: w2
+live3                2m9s        Normal    Started                   pod/w2-0                                                  Started container w2
+live3                2m7s        Warning   Unhealthy                 pod/w2-0                                                  Readiness probe failed: dial tcp 10.244.3.4:8080: connect: connection refused
+live3                2m2s        Normal    SuccessfulDelete          statefulset/w3                                            delete Pod w3-0 in StatefulSet w3 successful
+live3                2m2s        Normal    Killing                   pod/w3-0                                                  Stopping container w3
+live3                102s        Normal    SuccessfulCreate          statefulset/w3                                            create Pod w3-0 in StatefulSet w3 successful
+live3                101s        Normal    Scheduled                 pod/w3-0                                                  Successfully assigned live3/w3-0 to nabedra-live3-a6155b84-worker3
+live3                101s        Warning   FailedMount               pod/w3-0                                                  Unable to attach or mount volumes: unmounted volumes=[barrier config input primary], unattached volumes=[], failed to process volumes=[primary]: error processing PVC live3/w3-primary: failed to fetch PVC from API server: persistentvolumeclaims "w3-primary" is forbidden: User "system:node:nabedra-live3-a6155b84-worker3" cannot get resource "persistentvolumeclaims" in API group "" in the namespace "live3": no relationship found between node 'nabedra-live3-a6155b84-worker3' and this object
+live3                101s        Normal    SuccessfulAttachVolume    pod/w3-0                                                  AttachVolume.Attach succeeded for volume "pvc-3d0d4b44-f329-4521-a9f6-b2d62343d1ea"
+live3                88s         Normal    Pulled                    pod/w3-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                88s         Normal    Created                   pod/w3-0                                                  Created container: prepare
+live3                88s         Normal    Started                   pod/w3-0                                                  Started container prepare
+live3                87s         Normal    Created                   pod/w3-0                                                  Created container: w3
+live3                87s         Normal    Started                   pod/w3-0                                                  Started container w3
+live3                87s         Normal    Pulled                    pod/w3-0                                                  Container image "nabedra-live3-a6155b84-oltp:local" already present on machine
+live3                81s         Warning   Unhealthy                 pod/w3-0                                                  Readiness probe failed: dial tcp 10.244.1.4:8080: connect: connection refused
+kube-system          25s         Warning   NodeNotReady              pod/kindnet-hvhdf                                         Node is not ready
+kube-system          25s         Warning   NodeNotReady              pod/kube-proxy-wgc8n                                      Node is not ready
+live3                25s         Warning   NodeNotReady              pod/w1-0                                                  Node is not ready
+default              25s         Normal    NodeNotReady              node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeNotReady
+default              25s         Warning   NodeNotReady              pod/csi-hostpathplugin-a-0                                Node is not ready
+default              1s          Normal    NodeReady                 node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeReady
+default              1s          Normal    NodeHasSufficientPID      node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasSufficientPID
+default              1s          Normal    NodeHasNoDiskPressure     node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasNoDiskPressure
+default              1s          Normal    NodeHasSufficientMemory   node/nabedra-live3-a6155b84-worker                        Node nabedra-live3-a6155b84-worker status is now: NodeHasSufficientMemory
+default              1s          Normal    NodeAllocatableEnforced   node/nabedra-live3-a6155b84-worker                        Updated Node Allocatable limit across pods
+default              1s          Normal    Starting                  node/nabedra-live3-a6155b84-worker                        Starting kubelet.

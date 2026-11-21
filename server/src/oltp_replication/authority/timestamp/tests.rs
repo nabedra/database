@@ -1250,3 +1250,134 @@ async fn o16_o21_o26_o27_o28_automatic_split_keeps_bound_placement_on_exact_retr
     assert!(old_encoding.get("placement").is_none());
     assert_eq!(serde_json::from_value::<ImageCut>(old_encoding).unwrap(), old);
 }
+
+#[tokio::test]
+async fn o08_q06_retry_pin_keeps_original_context_and_releases_with_receipt() {
+    use crate::oltp_replication::authority::status::{
+        CommitPermitStatement, SealedCommitPermit, SettlementStatement, VerifiedSettlement,
+    };
+
+    let mut f = Fixture::new().await;
+    let member = worker();
+    let ready = ready(member);
+    f.initialize(ready).await;
+    let (identity, request) = binding(ready.view);
+    let mut begin = begin(ready, &identity, request);
+    if let TimestampCommand::BeginSnapshot { reservation, .. } = &mut begin {
+        reservation.kind = RequestKind::Mutation;
+    }
+    let TimestampReply::Snapshot(original) = f.apply(begin).await else {
+        panic!("expected original pin");
+    };
+    f.apply(bind_context(ready, &identity, original, request))
+        .await;
+    let txn = TxnId {
+        request_id: request.request_id,
+        attempt: 1,
+    };
+    let manifest = ManifestRef {
+        status_group_id: Uuid::new_v4(),
+        digest: Digest::from_bytes([9; 32]),
+        participant_count: 1,
+    };
+    let position = AppliedPosition {
+        term: 1,
+        node_id: 1,
+        index: 9,
+    };
+    let settlement = |request, reason| {
+        let decision = DecisionStatement {
+            txn,
+            request,
+            manifest,
+            decided_at: position,
+            decision: TxnDecision::Abort { reason },
+        };
+        VerifiedSettlement::model_for_test(SettlementStatement {
+            txn,
+            request,
+            manifest,
+            decision,
+            resolved_count: 1,
+            settled_at: position,
+        })
+        .unwrap()
+        .into_sealed()
+    };
+    let retry = |view, request, reason| TimestampCommand::RetrySnapshot {
+        view,
+        identity: identity.clone(),
+        previous: settlement(request, reason),
+        pin_id: Uuid::new_v4(),
+    };
+    assert_eq!(
+        f.apply(retry(ready.view, request, AbortReason::Conflict))
+            .await,
+        TimestampReply::Rejected(Fault::InvalidBinding)
+    );
+    let changed = RequestBinding {
+        accepted_context: Digest::from_bytes([7; 32]),
+        ..request
+    };
+    assert_eq!(
+        f.apply(retry(ready.view, changed, AbortReason::RetrySnapshot))
+            .await,
+        TimestampReply::Rejected(Fault::InvalidBinding)
+    );
+    let TimestampReply::Snapshot(fresh) = f
+        .apply(retry(ready.view, request, AbortReason::RetrySnapshot))
+        .await
+    else {
+        panic!("expected fresh pin");
+    };
+    assert!(fresh.read_ts > original.read_ts && fresh.pin_id != original.pin_id);
+    let floor = TimestampCommand::AdvanceFloor {
+        authority: ready.view.authority(),
+    };
+    assert!(
+        matches!(f.apply(floor.clone()).await, TimestampReply::Retention { safe_ts, .. }
+                     if safe_ts == original.read_ts.get())
+    );
+    assert_eq!(
+        f.apply(retry(ready.view, request, AbortReason::RetrySnapshot))
+            .await,
+        TimestampReply::Snapshot(fresh)
+    );
+
+    let allocate = |attempt, read_ts| TimestampCommand::AllocateCommit {
+        permit: SealedCommitPermit::for_test(CommitPermitStatement {
+            authority: ready.view.authority(),
+            txn: TxnId { attempt, ..txn },
+            request,
+            manifest,
+            read_ts,
+            prepared_count: 1,
+            prepared_at: position,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        f.apply(allocate(3, fresh.read_ts)).await,
+        TimestampReply::Rejected(Fault::UnknownPin)
+    );
+    assert!(
+        matches!(f.apply(allocate(2, fresh.read_ts)).await, TimestampReply::Commit(stamp)
+                     if stamp.commit_ts > fresh.read_ts)
+    );
+    assert_eq!(
+        f.apply(TimestampCommand::Release {
+            proof: proof(member, ready, identity.clone(), request, original),
+        })
+        .await,
+        TimestampReply::Released
+    );
+    assert_eq!(
+        f.apply(retry(ready.view, request, AbortReason::RetrySnapshot))
+            .await,
+        TimestampReply::Rejected(Fault::InvalidBinding)
+    );
+    assert!(
+        matches!(f.apply(floor).await, TimestampReply::Retention { safe_ts, .. }
+                     if safe_ts > fresh.read_ts.get())
+    );
+}

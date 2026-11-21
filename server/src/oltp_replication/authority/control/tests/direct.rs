@@ -611,3 +611,62 @@ async fn o02_gc2_batch_feature_is_sticky_and_refuses_joiners_without_the_advert(
     let reopened = Fixture::open(&directory, scope, pool).await;
     assert_eq!(reopened.batch_enabled().await, Some(enabled));
 }
+
+#[tokio::test]
+async fn o02_o08_snapshot_retry_waits_for_every_worker_and_refuses_old_joiners() {
+    use crate::oltp_replication::authority::control::{
+        QUEUED_SNAPSHOT_RETRY_FEATURE, feature_operation_id,
+        machine::direct::SNAPSHOT_RETRY_ENABLED,
+    };
+
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    let workers = fixture.ready_cluster(3).await;
+    let advert = |actor| ControlCommand::DirectCapability {
+        operation_id: feature_operation_id(QUEUED_SNAPSHOT_RETRY_FEATURE, actor),
+        actor,
+        action: DirectCapabilityOperation::Advertise {
+            version: DIRECT_VERSION,
+        },
+        unix_ms: 100,
+    };
+    for worker in &workers[..2] {
+        fixture.apply(advert(*worker)).await;
+    }
+    // The third worker supports DirectBatch and so can run the previous
+    // build. Its presence prevents queued retry activation.
+    fixture.advertise_batch(workers[2]).await;
+    let enabled = |machine: ControlMachine| async move {
+        let raw = machine
+            .store()
+            .read(BUDGET, |view| {
+                let active = view.get(SNAPSHOT_RETRY_ENABLED)?.is_some();
+                view.encode(&active)
+            })
+            .await
+            .unwrap();
+        decode::<bool>(raw.as_ref()).unwrap()
+    };
+    assert!(!enabled(fixture.machine.clone()).await);
+    fixture.apply(advert(workers[2])).await;
+    assert!(enabled(fixture.machine.clone()).await);
+
+    let old = fixture.enroll(4).await;
+    fixture.advertise_batch(old).await;
+    let ready = fixture.state().await.ready.view;
+    let join = || ControlCommand::BeginJoin {
+        operation_id: Uuid::new_v4(),
+        expected: ready,
+        target: old,
+    };
+    assert_eq!(
+        fixture.apply(join()).await,
+        ControlReply::Rejected(Fault::DirectCapabilityRequired)
+    );
+    fixture.apply(advert(old)).await;
+    assert!(matches!(
+        fixture.apply(join()).await,
+        ControlReply::JoinBegun { .. }
+    ));
+}

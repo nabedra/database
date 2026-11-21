@@ -6,7 +6,8 @@
 use super::*;
 use crate::oltp_replication::authority::control::direct::{
     DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
-    DirectCapabilityOperation, FeatureActivation, feature_operation_id,
+    DirectCapabilityOperation, FeatureActivation, QUEUED_SNAPSHOT_RETRY_FEATURE,
+    feature_operation_id,
 };
 
 const ACTIVATION: &[u8] = b"ct/direct-capability";
@@ -17,6 +18,8 @@ const QUEUED_HISTORY: &[u8] = b"ct/direct-queued-history";
 /// GC2: `data.direct.batch` is enabled (a `FeatureActivation`). Written only
 /// by a feature-aware build, never deleted.
 const BATCH_ENABLED: &[u8] = b"ct/feature/data.direct.batch";
+pub(in crate::oltp_replication::authority::control) const SNAPSHOT_RETRY_ENABLED: &[u8] =
+    b"ct/feature/status.queued-snapshot-retry";
 
 pub(in crate::oltp_replication::authority::control) fn batch_key() -> &'static [u8] {
     BATCH_ENABLED
@@ -102,9 +105,18 @@ pub(super) fn apply(
     // produces for this entry. A feature-aware build may add only the
     // enablement, and only when every enrolled worker advertised it.
     if activation.is_some() && !legacy_v1() {
-        let batch_advert = matches!(action, DirectCapabilityOperation::Advertise { .. })
-            && operation_id == feature_operation_id(DIRECT_BATCH_FEATURE, actor);
-        maybe_enable_batch(tx, state, position, batch_advert.then_some(actor))?;
+        for (feature, enabled_key) in FEATURES {
+            let advert = matches!(action, DirectCapabilityOperation::Advertise { .. })
+                && operation_id == feature_operation_id(feature, actor);
+            maybe_enable(
+                tx,
+                state,
+                position,
+                feature,
+                enabled_key,
+                advert.then_some(actor),
+            )?;
+        }
     }
     Ok(ControlReply::DirectCapability(DirectCapability {
         version: DIRECT_VERSION,
@@ -131,28 +143,33 @@ pub(super) fn active(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolErro
     Ok(tx.get(ACTIVATION)?.is_some())
 }
 
-/// `worker`'s current identity advertised `data.direct.batch`: the receipt of
-/// its feature advert exists (see `control::direct`).
-pub(super) fn supports_batch(
+const FEATURES: [(&str, &[u8]); 2] = [
+    (DIRECT_BATCH_FEATURE, BATCH_ENABLED),
+    (QUEUED_SNAPSHOT_RETRY_FEATURE, SNAPSHOT_RETRY_ENABLED),
+];
+
+fn supports_feature(
     tx: &mut GroupTransaction<'_>,
+    feature: &str,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    let receipt = key(
-        b"ct/op/",
-        feature_operation_id(DIRECT_BATCH_FEATURE, worker),
-    );
+    let receipt = key(b"ct/op/", feature_operation_id(feature, worker));
     Ok(load::<super::Receipt>(tx, &receipt)?
         .is_some_and(|receipt| matches!(receipt.reply, ControlReply::DirectCapability(_))))
 }
 
-/// After enablement, only a worker whose current identity advertised
-/// `data.direct.batch` may join: an older build cannot decode `DirectBatch`.
-/// A pre-feature Control build has no enablement, so it never refuses here.
-fn batch_admits(
+fn features_admit(
     tx: &mut GroupTransaction<'_>,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    Ok(legacy_v1() || tx.get(BATCH_ENABLED)?.is_none() || supports_batch(tx, worker)?)
+    if !legacy_v1() {
+        for (feature, enabled_key) in FEATURES {
+            if tx.get(enabled_key)?.is_some() && !supports_feature(tx, feature, worker)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// After activation, only a worker that advertised its current identity may
@@ -163,7 +180,7 @@ pub(super) fn admits(
     tx: &mut GroupTransaction<'_>,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    Ok((!active(tx)? || supports(tx, worker)?) && batch_admits(tx, worker)?)
+    Ok((!active(tx)? || supports(tx, worker)?) && features_admit(tx, worker)?)
 }
 
 /// `admits` for a replica named only by its worker id: the enrolled
@@ -179,7 +196,7 @@ pub(super) fn admits_worker_id(
         return Ok(false);
     };
     let worker = WorkerIdentity::from(&record.enrollment);
-    Ok(supports(tx, worker)? && batch_admits(tx, worker)?)
+    Ok(supports(tx, worker)? && features_admit(tx, worker)?)
 }
 
 /// Test processes (T7c): while the file named by
@@ -222,19 +239,17 @@ fn can_activate(
     })?)
 }
 
-/// GC2: enables `data.direct.batch` once every enrolled worker's current
-/// identity advertised it (`advertising` is this entry's own advert, whose
-/// receipt this transaction cannot read yet). Every Control voter and
-/// learner is an enrolled worker, so they all run a feature-aware build and
-/// apply this write alike. API ingresses hold no replica and are not
-/// required. Mirrors `can_activate`'s membership guards.
-fn maybe_enable_batch(
+/// A feature's activation covers every enrolled worker, including voters
+/// and learners. The current advert has yet to be stored as a receipt.
+fn maybe_enable(
     tx: &mut GroupTransaction<'_>,
     state: &State,
     position: AppliedPosition,
+    feature: &str,
+    enabled_key: &[u8],
     advertising: Option<WorkerIdentity>,
 ) -> Result<(), ProtocolError> {
-    if tx.get(BATCH_ENABLED)?.is_some()
+    if tx.get(enabled_key)?.is_some()
         || state.pending.is_some()
         || state.restart.is_some()
         || state.ready.ready_count == 0
@@ -245,14 +260,14 @@ fn maybe_enable_batch(
     }
     let advertised =
         |tx: &mut GroupTransaction<'_>, worker: WorkerIdentity| -> Result<bool, ProtocolError> {
-            Ok(advertising == Some(worker) || supports_batch(tx, worker)?)
+            Ok(advertising == Some(worker) || supports_feature(tx, feature, worker)?)
         };
     if all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
         WorkerIdentity::from(&entry.enrollment)
     })? {
         save(
             tx,
-            BATCH_ENABLED,
+            enabled_key,
             &FeatureActivation {
                 activated_at: position,
                 enrollment_revision: state.enrollment_revision,

@@ -39,6 +39,7 @@ pub(crate) const DIRECT_VERSION: u32 = 1;
 /// GC2: Data leaders may pack several direct commits to one range into one
 /// `DirectBatch` entry.
 pub(crate) const DIRECT_BATCH_FEATURE: &str = "data.direct.batch";
+pub(crate) const QUEUED_SNAPSHOT_RETRY_FEATURE: &str = "status.queued-snapshot-retry";
 
 /// The operation id of `actor`'s advert of `feature` (see the module doc).
 /// It covers the exact enrolled identity, so a new incarnation (possibly an
