@@ -167,7 +167,8 @@ impl<C: TypedConfig> TypedNetwork<C> {
         let send = async {
             let shared = self.factory.shared.clone();
             let class = traffic(&self.factory.resident.identity().kind);
-            let file = snapshot.snapshot.file.clone();
+            // SNAP1: a cut writes its file here, on this replication task.
+            let file = snapshot.snapshot.file().await?;
             let description_owner = self.factory.resident.metadata(METADATA)?;
             let description = Description {
                 header: file.header.clone(),

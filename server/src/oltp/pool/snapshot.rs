@@ -31,11 +31,25 @@ pub struct GroupSnapshot {
 /// cancelled native transfer still excludes closing/detaching its volume.
 pub struct PoolSnapshotFile {
     file: File,
+    /// An outgoing file (SNAP1) is transient: its name goes with its last
+    /// handle, and pool reopen removes a name a crash left behind.
+    unlink: Option<PathBuf>,
     _pool: OltpPool,
 }
 impl PoolSnapshotFile {
     pub(crate) fn new(file: File, pool: OltpPool) -> Arc<Self> {
-        Arc::new(Self { file, _pool: pool })
+        Arc::new(Self {
+            file,
+            unlink: None,
+            _pool: pool,
+        })
+    }
+}
+impl Drop for PoolSnapshotFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.unlink.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 impl std::ops::Deref for PoolSnapshotFile {
@@ -47,6 +61,129 @@ impl std::ops::Deref for PoolSnapshotFile {
 impl std::fmt::Debug for PoolSnapshotFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolSnapshotFile").finish_non_exhaustive()
+    }
+}
+
+/// SNAP1. A point-in-time cut of one group, taken under the application
+/// order after the applied state it names was synced: the header, and for a
+/// transferable cut the pinned `nabedra-kv` view it was read from. Taking it
+/// rewrites nothing, as a ScyllaDB snapshot hard-links immutable sstables
+/// instead of copying them. The state machine itself is the durable snapshot:
+/// its applied index never falls below a purged one. The file a follower
+/// receives is written from the view only when one needs it ([`Self::file`]),
+/// in bounded native jobs off the state-machine task, and the view is
+/// released once the file exists.
+pub struct SnapshotCut {
+    pub header: GroupSnapshotHeader,
+    /// Stored membership at the cut, charged to the Control reply budget.
+    pub membership: Option<ChargedBytes>,
+    group: GroupStore,
+    view: std::sync::Mutex<Option<Snapshot>>,
+    file: tokio::sync::OnceCell<GroupSnapshot>,
+}
+impl std::fmt::Debug for SnapshotCut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotCut")
+            .field("header", &self.header)
+            .finish_non_exhaustive()
+    }
+}
+impl SnapshotCut {
+    /// The transferable file of this cut, written once and shared by clones.
+    /// A cut taken without a view has none.
+    pub async fn file(&self, budget: TransactionBudget) -> Result<GroupSnapshot, ProtocolError> {
+        self.file
+            .get_or_try_init(|| async {
+                let view = self
+                    .view
+                    .lock()
+                    .map_err(|_| storage_error_message())?
+                    .clone()
+                    .ok_or_else(storage_error_message)?;
+                let file = self.group.materialize(&self.header, view, budget).await?;
+                // The file holds the cut now: release the pinned sequence,
+                // memtables and runs.
+                if let Ok(mut view) = self.view.lock() {
+                    *view = None;
+                }
+                Ok(file)
+            })
+            .await
+            .cloned()
+    }
+    /// True while the cut still pins its view (test probe).
+    #[cfg(test)]
+    pub(crate) fn pins_view(&self) -> bool {
+        self.view.lock().map(|view| view.is_some()).unwrap_or(false)
+    }
+}
+/// Records one materialization job writes before it yields its native slot.
+const MATERIALIZE_CHUNK_BYTES: usize = 1 << 20;
+const MATERIALIZE_BUFFER_BYTES: usize = 64 << 10;
+/// A write buffer of up to [`MATERIALIZE_BUFFER_BYTES`] from a job's scratch.
+fn write_buffer(
+    scratch: &mut ByteReservation,
+) -> Result<super::resources::ScratchBuffer<'_>, ProtocolError> {
+    let len = MATERIALIZE_BUFFER_BYTES.min(scratch.remaining());
+    if len < 4096 {
+        return Err(capacity());
+    }
+    scratch.buffer(len)
+}
+/// An outgoing file being written from a cut, moved through bounded jobs.
+struct Materializing {
+    file: Arc<PoolSnapshotFile>,
+    path: PathBuf,
+    iter: RawIter,
+    prefix: Vec<u8>,
+    checksum: Sha256,
+}
+enum Step {
+    More(Materializing),
+    Done(GroupSnapshot),
+}
+/// Buffered, hashed writes into a charged scratch buffer.
+struct HashedOut<'a> {
+    file: &'a File,
+    hash: &'a mut Sha256,
+    buffer: &'a mut [u8],
+    used: usize,
+}
+impl HashedOut<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
+        self.hash.update(bytes);
+        self.raw(bytes)
+    }
+    fn raw(&mut self, bytes: &[u8]) -> Result<(), ProtocolError> {
+        if self.used + bytes.len() > self.buffer.len() {
+            self.flush()?;
+        }
+        if bytes.len() >= self.buffer.len() {
+            return (&*self.file).write_all(bytes).map_err(file_error);
+        }
+        self.buffer[self.used..self.used + bytes.len()].copy_from_slice(bytes);
+        self.used += bytes.len();
+        Ok(())
+    }
+    fn record(&mut self, tag: u8, key: &[u8], value: &[u8]) -> Result<(), ProtocolError> {
+        self.put(&[tag])?;
+        self.put(
+            &u32::try_from(key.len())
+                .map_err(|_| capacity())?
+                .to_be_bytes(),
+        )?;
+        self.put(&(value.len() as u64).to_be_bytes())?;
+        self.put(key)?;
+        self.put(value)
+    }
+    fn flush(&mut self) -> Result<(), ProtocolError> {
+        if self.used > 0 {
+            (&*self.file)
+                .write_all(&self.buffer[..self.used])
+                .map_err(file_error)?;
+            self.used = 0;
+        }
+        Ok(())
     }
 }
 
@@ -330,43 +467,58 @@ impl GroupStore {
             })
             .await
     }
+    /// SNAP1: a cut and its transferable file at once (tests and tools; Raft
+    /// hosts take the cut and write the file separately).
     pub async fn export_snapshot(
         &self,
         budget: TransactionBudget,
     ) -> Result<GroupSnapshot, ProtocolError> {
+        self.cut_snapshot(budget, true).await?.file(budget).await
+    }
+    /// SNAP1: the cut a Raft snapshot names. Under the application order every
+    /// applied write of this group has completed; any unsynced one is synced
+    /// before the cut can name its index (plan section 2: purge and snapshots
+    /// only up to an applied index a later synced write made durable), without
+    /// holding a compute permit while storage syncs. The header and, with
+    /// `pin`, the view come from one `nabedra-kv` snapshot, so the rows a later
+    /// [`SnapshotCut::file`] writes match the header's applied position
+    /// exactly. Applies pause only for this: a sync and three point reads.
+    pub async fn cut_snapshot(
+        &self,
+        budget: TransactionBudget,
+        pin: bool,
+    ) -> Result<SnapshotCut, ProtocolError> {
         let owner = self.inner.order.clone().lock_owned().await;
-        // The application order is held, so every applied write of this group
-        // has completed. Sync any unsynced one before a snapshot can name its
-        // index, without holding a compute permit while storage syncs.
         self.sync_deferred_applies().await?;
-        let group = self.clone();
-        let output = self
+        let mut output = self
+            .resources()
+            .reply_budget(ExecutionClass::Control, budget.output_bytes)
+            .await?;
+        let unused = self
             .resources()
             .reply_budget(ExecutionClass::Control, 0)
             .await?;
         let prepared = self.resources().prepare(self.execution_class()).await?;
-        let reservations = prepared
+        let (mut scratch, _batch, _unused) = prepared
             .buffers(
                 TransactionBudget {
                     output_bytes: 0,
+                    batch_bytes: 0,
                     ..budget
                 },
-                output,
+                unused,
             )
             .await?;
+        let group = self.clone();
         prepared
             .execute(0, 0, move || {
                 let _owner = owner;
-                let (mut scratch, _batch, _output) = reservations;
                 group.pool().healthy()?;
-                let native = group.pool().snapshot();
-                let applied = group.read_applied(&native, &mut scratch)?;
-                let membership = native
-                    .get(&group_key(group.identity().group_id, b'm', &[]))
-                    .map_err(storage_error)?;
-                let response = native
-                    .get(&group_key(group.identity().group_id, b'r', &[]))
-                    .map_err(storage_error)?;
+                let view = group.pool().snapshot();
+                let id = group.identity().group_id;
+                let applied = group.read_applied(&view, &mut scratch)?;
+                let membership = view.get(&group_key(id, b'm', &[])).map_err(storage_error)?;
+                let response = view.get(&group_key(id, b'r', &[])).map_err(storage_error)?;
                 let header = GroupSnapshotHeader {
                     identity: group.identity().clone(),
                     applied: applied.as_ref().map(|v| v.position),
@@ -374,91 +526,186 @@ impl GroupStore {
                     membership_digest: membership.as_ref().map(|v| hash(v)),
                     response_digest: response.as_ref().map(|v| hash(v)),
                 };
-                let encoded = scratch.encode_value(&header)?;
+                drop(applied);
+                let membership = membership
+                    .map(|value| {
+                        if value.len() > HEADER_LIMIT {
+                            return Err(capacity());
+                        }
+                        output.copy(&value)
+                    })
+                    .transpose()?;
+                Ok(SnapshotCut {
+                    header,
+                    membership,
+                    group: group.clone(),
+                    view: std::sync::Mutex::new(pin.then_some(view)),
+                    file: tokio::sync::OnceCell::new(),
+                })
+            })
+            .await
+    }
+    /// Writes the file of a cut into `snapshots/<group>/outgoing/` in native
+    /// jobs of at most [`MATERIALIZE_CHUNK_BYTES`] of records, so a large
+    /// group never holds an executor slot (often the worker's only query
+    /// thread) for more than one chunk, and applies of every group interleave
+    /// with it. No fsync: the file is transient sender state; the receiver
+    /// syncs its copy before it installs, and the name goes with the last
+    /// handle (pool reopen removes one a crash left behind). It holds no lock
+    /// of the group, so applies, installs and membership changes proceed.
+    async fn materialize(
+        &self,
+        header: &GroupSnapshotHeader,
+        view: Snapshot,
+        budget: TransactionBudget,
+    ) -> Result<GroupSnapshot, ProtocolError> {
+        let class = self.execution_class();
+        let group = self.clone();
+        let header = header.clone();
+        let encode = header.clone();
+        let mut state = self
+            .materialize_job(class, budget, move |scratch| {
+                group.pool().healthy()?;
+                let encoded = scratch.encode_value(&encode)?;
                 if encoded.len() > HEADER_LIMIT {
                     return Err(capacity());
                 }
-                let path = new_snapshot_path(&group)?;
-                let mut published = false;
-                let result = (|| {
-                    let mut file = OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .map_err(file_error)?;
-                    let mut checksum = Sha256::new();
-                    write_hashed(&mut file, &mut checksum, MAGIC)?;
-                    write_hashed(
-                        &mut file,
-                        &mut checksum,
-                        &(encoded.len() as u32).to_be_bytes(),
-                    )?;
-                    write_hashed(&mut file, &mut checksum, encoded.as_slice())?;
+                let path = new_outgoing_path(&group)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(file_error)?;
+                let file = Arc::new(PoolSnapshotFile {
+                    file,
+                    unlink: Some(path.clone()),
+                    _pool: group.pool().clone(),
+                });
+                let prefix = group.prefix(&view, false)?;
+                let mut iter = RawIter::bounded(&view, &prefix, &prefix_end(&prefix), false);
+                iter.seek(&prefix);
+                let mut checksum = Sha256::new();
+                {
+                    let mut buffer = write_buffer(scratch)?;
+                    let mut out = HashedOut {
+                        file: &file,
+                        hash: &mut checksum,
+                        buffer: buffer.as_mut_slice(),
+                        used: 0,
+                    };
+                    out.put(MAGIC)?;
+                    out.put(&(encoded.len() as u32).to_be_bytes())?;
+                    out.put(encoded.as_slice())?;
                     for (tag, key) in [(1, b'p'), (2, b'm'), (3, b'r')] {
-                        if let Some(value) = native
+                        if let Some(value) = view
                             .get(&group_key(group.identity().group_id, key, &[]))
                             .map_err(storage_error)?
                         {
-                            write_record(&mut file, &mut checksum, tag, &[], &value)?;
+                            out.record(tag, &[], &value)?;
                         }
                     }
-                    let prefix = group.prefix(&native, false)?;
-                    let mut iterator =
-                        RawIter::bounded(&native, &prefix, &prefix_end(&prefix), false);
-                    iterator.seek(&prefix);
-                    while iterator.valid() {
-                        let key = iterator.key().ok_or_else(recovery_unknown)?;
+                    out.flush()?;
+                }
+                Ok(Materializing {
+                    file,
+                    path,
+                    iter,
+                    prefix,
+                    checksum,
+                })
+            })
+            .await?;
+        loop {
+            let group = self.clone();
+            let header = header.clone();
+            let step = self
+                .materialize_job(class, budget, move |scratch| {
+                    group.pool().healthy()?;
+                    let mut buffer = write_buffer(scratch)?;
+                    let Materializing {
+                        file,
+                        path,
+                        mut iter,
+                        prefix,
+                        mut checksum,
+                    } = state;
+                    let mut out = HashedOut {
+                        file: &file,
+                        hash: &mut checksum,
+                        buffer: buffer.as_mut_slice(),
+                        used: 0,
+                    };
+                    let mut written = 0usize;
+                    let mut done = true;
+                    while iter.valid() {
+                        if written >= MATERIALIZE_CHUNK_BYTES {
+                            done = false;
+                            break;
+                        }
+                        let key = iter.key().ok_or_else(recovery_unknown)?;
                         if !key.starts_with(&prefix) {
                             break;
                         }
-                        write_record(
-                            &mut file,
-                            &mut checksum,
-                            4,
-                            &key[prefix.len()..],
-                            &iterator.value()?,
-                        )?;
-                        iterator.next();
+                        let value = iter.value()?;
+                        out.record(4, &key[prefix.len()..], &value)?;
+                        written += key.len() + value.len() + 13;
+                        iter.next();
                     }
-                    iterator.status()?;
-                    file.write_all(&[255])
-                        .and_then(|_| file.write_all(&checksum.finalize()))
-                        .and_then(|_| file.sync_all())
-                        .map_err(file_error)?;
-                    sync_directory(path.parent().ok_or_else(storage_error_message)?)?;
-                    let name = path
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .ok_or_else(storage_error_message)?;
-                    let mut batch = WriteBatch::new();
-                    batch.put(
-                        &group_key(group.identity().group_id, b'f', &[]),
-                        name.as_bytes(),
-                    );
-                    published = true;
-                    group
-                        .pool()
-                        .durable_write(&group_scope(group.identity().group_id), batch)?;
-                    cleanup_files(
-                        &group.pool().inner.path,
-                        group.identity().group_id,
-                        Some(name),
-                    )?;
-                    let bytes = file.metadata().map_err(|_| storage_error_message())?.len();
-                    Ok(GroupSnapshot {
-                        file: PoolSnapshotFile::new(file, group.pool().clone()),
-                        path: path.clone(),
-                        bytes,
-                        header,
-                    })
-                })();
-                if result.is_err() && !published {
-                    let _ = fs::remove_file(&path);
-                }
-                result
-            })
-            .await
+                    if done {
+                        iter.status()?;
+                        out.raw(&[255])?;
+                        out.flush()?;
+                        (&**file)
+                            .write_all(&checksum.finalize())
+                            .map_err(file_error)?;
+                        let bytes = file.metadata().map_err(|_| storage_error_message())?.len();
+                        return Ok(Step::Done(GroupSnapshot {
+                            file,
+                            path,
+                            bytes,
+                            header,
+                        }));
+                    }
+                    out.flush()?;
+                    Ok(Step::More(Materializing {
+                        file,
+                        path,
+                        iter,
+                        prefix,
+                        checksum,
+                    }))
+                })
+                .await?;
+            match step {
+                Step::More(next) => state = next,
+                Step::Done(file) => return Ok(file),
+            }
+        }
+    }
+    /// One bounded materialization job with its own scratch charge.
+    async fn materialize_job<T: Send + 'static>(
+        &self,
+        class: ExecutionClass,
+        budget: TransactionBudget,
+        work: impl FnOnce(&mut ByteReservation) -> Result<T, ProtocolError> + Send + 'static,
+    ) -> Result<T, ProtocolError> {
+        let unused = self
+            .resources()
+            .reply_budget(ExecutionClass::Control, 0)
+            .await?;
+        let prepared = self.resources().prepare(class).await?;
+        let (mut scratch, _batch, _unused) = prepared
+            .buffers(
+                TransactionBudget {
+                    output_bytes: 0,
+                    batch_bytes: 0,
+                    ..budget
+                },
+                unused,
+            )
+            .await?;
+        prepared.execute(0, 0, move || work(&mut scratch)).await
     }
 
     pub async fn install_snapshot(
@@ -840,35 +1087,39 @@ fn new_snapshot_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
     }
     Ok(directory.join(format!("snap-{}.bin", Uuid::new_v4())))
 }
-fn write_hashed(file: &mut File, hash: &mut Sha256, bytes: &[u8]) -> Result<(), ProtocolError> {
-    file.write_all(bytes).map_err(file_error)?;
-    hash.update(bytes);
-    Ok(())
+/// SNAP1: a create_new name under `snapshots/<group>/outgoing/`, each level a
+/// real directory (no symlink), like the incoming side.
+fn new_outgoing_path(group: &GroupStore) -> Result<PathBuf, ProtocolError> {
+    let mut directory = group.pool().inner.path.clone();
+    for component in [
+        "snapshots".to_owned(),
+        group.identity().group_id.to_string(),
+        OUTGOING.to_owned(),
+    ] {
+        directory.push(component);
+        match fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(storage_error_message()),
+        }
+        let metadata = fs::symlink_metadata(&directory).map_err(|_| storage_error_message())?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(storage_error_message());
+        }
+    }
+    Ok(directory.join(format!("send-{}.bin", Uuid::new_v4())))
+}
+const OUTGOING: &str = "outgoing";
+fn valid_outgoing_name(name: &str) -> bool {
+    name.strip_prefix("send-")
+        .and_then(|value| value.strip_suffix(".bin"))
+        .is_some_and(|value| Uuid::parse_str(value).is_ok())
 }
 fn read_hashed(file: &mut File, hash: &mut Sha256, bytes: &mut [u8]) -> Result<(), ProtocolError> {
     file.read_exact(bytes)
         .map_err(|_| storage_error_message())?;
     hash.update(bytes);
     Ok(())
-}
-fn write_record(
-    file: &mut File,
-    hash: &mut Sha256,
-    tag: u8,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), ProtocolError> {
-    write_hashed(file, hash, &[tag])?;
-    write_hashed(
-        file,
-        hash,
-        &u32::try_from(key.len())
-            .map_err(|_| capacity())?
-            .to_be_bytes(),
-    )?;
-    write_hashed(file, hash, &(value.len() as u64).to_be_bytes())?;
-    write_hashed(file, hash, key)?;
-    write_hashed(file, hash, value)
 }
 fn sync_directory(path: &Path) -> Result<(), ProtocolError> {
     File::open(path)
@@ -940,6 +1191,32 @@ pub(super) fn recover_group(
             fs::remove_file(item.path()).map_err(|_| storage_error_message())?;
         }
         sync_directory(&incoming)?;
+    }
+    // SNAP1: outgoing files are transient sender state that a crash left.
+    let outgoing = pool
+        .inner
+        .path
+        .join("snapshots")
+        .join(identity.group_id.to_string())
+        .join(OUTGOING);
+    match fs::symlink_metadata(&outgoing) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            for item in fs::read_dir(&outgoing).map_err(|_| storage_error_message())? {
+                let item = item.map_err(|_| storage_error_message())?;
+                let name = item.file_name();
+                if !name.to_str().is_some_and(valid_outgoing_name)
+                    || !item
+                        .file_type()
+                        .map_err(|_| storage_error_message())?
+                        .is_file()
+                {
+                    return Err(storage_error_message());
+                }
+                fs::remove_file(item.path()).map_err(|_| storage_error_message())?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(storage_error_message()),
     }
 
     if pool

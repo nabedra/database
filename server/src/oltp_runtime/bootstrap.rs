@@ -15,6 +15,7 @@ use crate::{
         },
         pool::{ByteClass, OltpPool, SharedResourceConfig, WorkerSharedResources},
     },
+    oltp_deployment::inventory::WorkerPools,
     oltp_replication::{
         authority::{
             consensus::{Applied, Consensus},
@@ -36,7 +37,6 @@ use crate::{
         typed_log::TypedConfig,
         types::*,
     },
-    oltp_deployment::inventory::WorkerPools,
     protocol::{ErrorCode, Outcome, ProtocolError, TableDescriptor},
     request_queue::{QueueError, QueueLimits},
 };
@@ -1092,6 +1092,10 @@ pub(super) fn registered_raft_config() -> openraft::Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            crate::oltp_replication::hosted::SNAPSHOT_LOGS_SINCE_LAST,
+        ),
+        max_in_snapshot_log_to_keep: crate::oltp_replication::hosted::SNAPSHOT_LOGS_TO_KEEP,
         ..Default::default()
     }
 }
@@ -1101,6 +1105,10 @@ fn raft_config() -> openraft::Config {
         heartbeat_interval: 100,
         election_timeout_min: 200,
         election_timeout_max: 400,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+            crate::oltp_replication::hosted::SNAPSHOT_LOGS_SINCE_LAST,
+        ),
+        max_in_snapshot_log_to_keep: crate::oltp_replication::hosted::SNAPSHOT_LOGS_TO_KEEP,
         ..Default::default()
     }
 }

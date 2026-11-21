@@ -620,7 +620,9 @@ async fn o11_o16_group_snapshot_activates_atomically_preserves_other_groups_and_
     .await
     .unwrap();
     let second = a.export_snapshot(budget()).await.unwrap();
-    assert!(!first.path.exists());
+    // SNAP1: each export is a transient outgoing file owned by its handles.
+    assert!(first.path.exists());
+    let first_path = first.path.clone();
     assert!(first.file.metadata().unwrap().len() > 0);
     let old = target.snapshot();
     let old_prefix = b.prefix(&old, false).unwrap();
@@ -629,6 +631,10 @@ async fn o11_o16_group_snapshot_activates_atomically_preserves_other_groups_and_
     b.install_snapshot(second, budget()).await.unwrap();
     assert_eq!(get(&b, b"key").await, b"second");
     assert!(b.install_snapshot(first, budget()).await.is_err());
+    assert!(
+        !first_path.exists(),
+        "the last handle left its outgoing file"
+    );
     let current = b.current_snapshot(budget()).await.unwrap().unwrap();
     assert_eq!(current.header.applied.unwrap().index, 2);
     assert_eq!(get(&b, b"new").await, b"added");
@@ -1766,7 +1772,6 @@ async fn o11_snapshot_membership_comes_from_immutable_cut_and_rejects_corrupt_re
         .await
         .unwrap();
     let _current = group.export_snapshot(budget()).await.unwrap();
-    assert!(!original.path.exists());
     let exact = group
         .snapshot_membership(original.clone(), budget())
         .await
