@@ -734,7 +734,10 @@ async fn r04_o15_fence_abort_cleanup_preserves_abandoned_but_not_prior_failures(
     })
     .await;
     let StatusReply::ManifestSealed(manifest) = f
-        .apply(StatusCommand::SealManifest { authority: old, txn })
+        .apply(StatusCommand::SealManifest {
+            authority: old,
+            txn,
+        })
         .await
     else {
         panic!("expected sealed manifest")

@@ -1053,18 +1053,17 @@ def load_conservation(test_executable):
                 else:
                     request = operation('query.count', dict(table_id=source.id, query=query))
                     expected = len(rows)
-                jobs.append((request, expected))
+                jobs.append((index, request, expected))
             baseline = server.stats()['queue']
             accepted = {}
             outcomes = {}
             connection_errors = []
-            refused = 0
+            refused = set()
             lock = threading.Lock()
 
             def consume(batch):
-                nonlocal refused
                 with closing(Http(server.url, server.token, timeout=30)) as client:
-                    for request, expected in batch:
+                    for index, request, expected in batch:
                         request_id = request['request_id']
 
                         def exchange(path, body=None):
@@ -1086,7 +1085,11 @@ def load_conservation(test_executable):
                                 assert body['error']['outcome'] == 'not_applied', body
                                 assert time.monotonic() < deadline, body
                                 with lock:
-                                    refused += 1
+                                    refused.add(request_id)
+                                # Status can durably remember a rejection.
+                                # Only a definite refusal permits a fresh ID.
+                                request_id = str(uuid.uuid4())
+                                request = dict(request, request_id=request_id)
                                 time.sleep(delay)
                                 delay = min(.1, delay * 2)
                         except TRANSPORT_ERRORS:
@@ -1096,7 +1099,7 @@ def load_conservation(test_executable):
                         assert_accepted((status, body), server.run_id, request)
                         with lock:
                             assert request_id not in accepted, request
-                            accepted[request_id] = expected
+                            accepted[request_id] = (index, request)
                         receipt = exact_receipt(exchange, server.run_id, request, expected,
                                                 timeout=30, allow_lane_overload=True)
                         with lock:
@@ -1117,13 +1120,15 @@ def load_conservation(test_executable):
                     time.sleep(.05)
                 for future in futures:
                     future.result()
-            assert accepted == {request['request_id']: expected for request, expected in jobs}, connection_errors
+            assert len(accepted) == len(jobs) and {index for index, _ in accepted.values()} == set(range(len(jobs))), connection_errors
+            assert not refused.intersection(accepted), 'a definitive admission refusal was counted as accepted'
             assert set(outcomes) == set(accepted)
             queue = server.stats()['queue']
             assert queue['accepted_records'] == baseline['accepted_records'] + len(jobs), queue
             assert queue['terminal_records'] == baseline['terminal_records'] + len(jobs), queue
             assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
-            succeeded = [request for request, _ in jobs if outcomes[request['request_id']] == 'succeeded']
+            succeeded = [request for _, request in sorted(accepted.values())
+                         if outcomes[request['request_id']] == 'succeeded']
             assert {request['operation'] for request in succeeded} == {'table.insert', 'table.get', 'query.count'}
             expected_rows = [request['payload']['row'] for request in succeeded
                              if request['operation'] == 'table.insert']
@@ -1133,7 +1138,7 @@ def load_conservation(test_executable):
             if proc_status.is_file():
                 rss_high_water = next(int(line.split()[1]) * 1024 for line in
                                       proc_status.read_text().splitlines() if line.startswith('VmHWM:'))
-            return dict(accepted=len(accepted), succeeded=len(succeeded), preaccept_refusals=refused,
+            return dict(accepted=len(accepted), succeeded=len(succeeded), preaccept_refusals=len(refused),
                         accepted_terminal_overloads=len(accepted) - len(succeeded),
                         connection_errors=connection_errors, peak_compute=peak_compute,
                         peak_charged_bytes=peak_charged, peak_queue_bytes=peak_queue, peak_rss_bytes=rss_high_water)
