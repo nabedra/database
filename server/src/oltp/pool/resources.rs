@@ -340,7 +340,7 @@ impl WorkerSharedResources {
     /// The one physical queue owner contains every database scope under shared
     /// count/byte/result ceilings. A scoped wrapper must not create another owner.
     pub fn claim_queue(self: &Arc<Self>) -> Result<QueueLease, ProtocolError> {
-        if self.worker_id().is_none() || self.leases.lock().map_err(|_| capacity())?.closed {
+        if self.worker_id().is_none() || self.leases.state.lock().map_err(|_| capacity())?.closed {
             return Err(capacity());
         }
         self.queue_claim
