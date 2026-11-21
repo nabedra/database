@@ -1937,7 +1937,8 @@ impl HttpRuntime for WorkerRuntime {
             #[cfg(test)]
             {
                 if let Some(dir) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")
-                    && std::fs::remove_file(std::path::Path::new(&dir).join("reset-growth-decode")).is_ok()
+                    && std::fs::remove_file(std::path::Path::new(&dir).join("reset-growth-decode"))
+                        .is_ok()
                 {
                     self.services.shared.reset_working_decode_peak();
                 }

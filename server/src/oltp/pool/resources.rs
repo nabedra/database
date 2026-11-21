@@ -549,7 +549,8 @@ impl WorkerSharedResources {
     fn account_decode(&self, bytes: usize) {
         let previous = self.decode_bytes.fetch_add(bytes, Ordering::AcqRel);
         #[cfg(test)]
-        self.peak_decode_bytes.fetch_max(previous + bytes, Ordering::Relaxed);
+        self.peak_decode_bytes
+            .fetch_max(previous + bytes, Ordering::Relaxed);
         #[cfg(not(test))]
         let _ = previous;
     }

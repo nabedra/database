@@ -69,7 +69,10 @@ impl ArchivePageBudget {
         item: &impl Serialize,
     ) -> Result<bool, ProtocolError> {
         let fits = || {
-            failure(ErrorCode::LimitExceeded, "one archive record exceeds a page budget")
+            failure(
+                ErrorCode::LimitExceeded,
+                "one archive record exceeds a page budget",
+            )
         };
         let bytes = encoded_length(item, ARCHIVE_PAGE_WIRE_BYTES).map_err(|_| fits())?;
         let wire = self.wire.checked_add(bytes + 1).ok_or_else(fits)?;
