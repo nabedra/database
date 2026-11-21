@@ -23,6 +23,12 @@ def select(directory, request):
     (directory / 'post-sync-status').write_text(request)
 
 
+def arm(directory, command, request):
+    pending = directory / 'post-sync-arm.tmp'
+    pending.write_text(f'{command} {request}')
+    pending.rename(directory / 'post-sync-arm')
+
+
 def plan_ids(directories, request):
     paths = [directory / f'create-plan-{request}' for directory in directories]
     return [table for path in paths if path.exists() for table in path.read_text().splitlines()]
@@ -57,7 +63,7 @@ def unknown_before_decision(binary, test_executable):
             wait_until(reached.is_file, 'table.create planned and reached Prepare', timeout=20)
             original = plan_ids([directory], request)
             assert len(original) == 1, original
-            (directory / 'post-sync-arm').write_text(f'prepare_page {request}')
+            arm(directory, 'prepare_page', request)
             (directory / f'release-{reached.stem}').touch()
 
             fault = wait_fault(directory, 'prepare_page', request, server.stats)
@@ -108,7 +114,7 @@ def authoritative_after_decision(binary, test_executable):
             leader = data_leader(fixture, catalog)
             target = next(worker for worker in WORKERS if worker not in (owner, leader))
             directory = cluster.barrier_dir(target)
-            (directory / 'post-sync-arm').write_text(f'resolve {request}')
+            arm(directory, 'resolve', request)
             fixture.release(request, 'decision')
             wait_fault(directory, 'resolve', request, lambda: cluster.stats(target))
 

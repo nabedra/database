@@ -368,6 +368,7 @@ class Acc6Cluster(Rf3Cluster):
         if maintenance:
             self.index_fault_dir = self.root / 'index-gates'
             self.index_fault_dir.mkdir(mode=0o700)
+            (self.index_fault_dir / 'commands').mkdir()
             self.worker_env['NABEDRA_OLTP_TEST_INDEX_FAULT_DIR'] = str(self.index_fault_dir)
 
     def launch_worker(self, name):
