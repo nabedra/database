@@ -866,7 +866,7 @@ impl DirectGateway {
         let mut refreshed_unknown_table = false;
         loop {
             if Instant::now() >= deadline {
-                return Err(deadline_error(*uncertain));
+                return Err(deadline_error(&table, *uncertain));
             }
             if last.is_some_and(|last| !table.range.shard.contains_key(last)) {
                 return Ok(Terminal::Fallback(FallbackReason::Ineligible));
@@ -876,7 +876,7 @@ impl DirectGateway {
                 Ok(voters) if !voters.is_empty() => voters,
                 _ => {
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(*uncertain));
+                        return Err(deadline_error(&table, *uncertain));
                     }
                     continue;
                 }
@@ -914,8 +914,7 @@ impl DirectGateway {
                 // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
                     *uncertain = true;
-                    table.unavailable.store(true, Ordering::Relaxed);
-                    return Err(deadline_error(true));
+                    return Err(deadline_error(&table, true));
                 }
                 Ok(reply) => reply,
             };
@@ -954,7 +953,7 @@ impl DirectGateway {
                         range.leader_hint.store(0, Ordering::Relaxed);
                         rotation += 1;
                         if !pause(deadline, &mut delay).await {
-                            return Err(deadline_error(true));
+                            return Err(deadline_error(&table, true));
                         }
                         continue;
                     }
@@ -982,7 +981,7 @@ impl DirectGateway {
                     }
                     // Not applied and transient: retry within the deadline.
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(*uncertain));
+                        return Err(deadline_error(&table, *uncertain));
                     }
                 }
                 Ok(DirectResponse::StaleRoute { .. }) => {
@@ -1003,7 +1002,7 @@ impl DirectGateway {
                         Err(_) => false,
                     };
                     if !changed && !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(*uncertain));
+                        return Err(deadline_error(&table, *uncertain));
                     }
                 }
                 Ok(DirectResponse::NotLeader { hint }) => {
@@ -1023,7 +1022,7 @@ impl DirectGateway {
                             rotation += 1;
                             // No leader known (an election): back off.
                             if !pause(deadline, &mut delay).await {
-                                return Err(deadline_error(*uncertain));
+                                return Err(deadline_error(&table, *uncertain));
                             }
                         }
                     }
@@ -1043,7 +1042,7 @@ impl DirectGateway {
                         let _ = self.voters(range, true).await;
                     }
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(*uncertain));
+                        return Err(deadline_error(&table, *uncertain));
                     }
                 }
                 Err(DirectSendError::Uncertain(_)) => {
@@ -1054,7 +1053,7 @@ impl DirectGateway {
                     range.leader_hint.store(0, Ordering::Relaxed);
                     rotation += 1;
                     if !pause(deadline, &mut delay).await {
-                        return Err(deadline_error(true));
+                        return Err(deadline_error(&table, true));
                     }
                 }
             }
@@ -1442,7 +1441,10 @@ fn digest(body: &[u8]) -> Digest {
     Digest::from_bytes(Sha256::digest(body).into())
 }
 
-fn deadline_error(uncertain: bool) -> ProtocolError {
+fn deadline_error(route: &TableRoute, uncertain: bool) -> ProtocolError {
+    // A retired range may never answer StaleRoute. Let an exact retry
+    // refill the range without discarding its primary key descriptor.
+    route.unavailable.store(true, Ordering::Relaxed);
     if uncertain {
         unknown()
     } else {

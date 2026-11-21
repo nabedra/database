@@ -1105,45 +1105,61 @@ async fn o28_gateway_routes_a_key_past_the_former_table_fill_cap() {
 }
 
 /// O28/D07: a cached parent cannot report a newer epoch after its voters
-/// retire. Settle the queued mutation at the child from a refreshed Catalog.
+/// retire. The next exact retry routes directly or settles at the child.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn o28_d07_queue_settlement_refreshes_a_retired_split_parent() {
+async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
     let mut cluster = Cluster::new().await;
     let parent = cluster.add_group(span(None, None), 1, &[1]).await;
     let left = cluster.add_group(span(None, Some(5)), 2, &[1]).await;
     let right = cluster.add_group(span(Some(5), None), 2, &[1]).await;
-    let source = Source::new(
-        vec![cluster.fill(&[parent]), cluster.fill(&[left, right])],
-        cluster.voters(),
-    );
-    let transport = cluster.transport();
-    let gateway = cluster
-        .gateway(direct_on(), source.clone(), transport.clone())
-        .with_deadline(Duration::from_secs(2));
-    let id = Uuid::new_v4();
-    let get = cluster.body(id, "table.get", json!({"key": 7}));
-    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
-    assert_eq!(source.reads(), (1, 1));
-    transport
-        .retired
-        .lock()
-        .unwrap()
-        .insert(cluster.shard(parent).group.group_id);
+    for asynchronous in [true, false] {
+        let source = Source::new(
+            vec![cluster.fill(&[parent]), cluster.fill(&[left, right])],
+            cluster.voters(),
+        );
+        let transport = cluster.transport();
+        let gateway = cluster
+            .gateway(direct_on(), source.clone(), transport.clone())
+            .with_deadline(Duration::from_secs(2));
+        let id = Uuid::new_v4();
+        let get = cluster.body(id, "table.get", json!({"key": 7}));
+        assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+        assert_eq!(source.reads(), (1, 1));
+        transport
+            .retired
+            .lock()
+            .unwrap()
+            .insert(cluster.shard(parent).group.group_id);
 
-    let id = Uuid::new_v4();
-    let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
-    let error = gateway.route(&mutation, true).await.err().unwrap();
-    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
-    assert_eq!(error.outcome, Outcome::Unknown);
-    assert_eq!(source.reads(), (1, 1));
+        let id = Uuid::new_v4();
+        let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+        let error = gateway.route(&mutation, asynchronous).await.err().unwrap();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(error.outcome, Outcome::Unknown);
+        assert_eq!(source.reads(), (1, 1));
 
-    assert!(matches!(
-        gateway.route(&mutation, true).await,
-        Ok(Routed::Queued)
-    ));
-    assert_eq!(source.reads(), (2, 2));
-    assert_eq!(answer(&gateway, &mutation, id).await, Answer::Queued);
-    assert_eq!(cluster.latest(right, 0, 7).await.1, None);
+        if asynchronous {
+            assert!(matches!(
+                gateway.route(&mutation, true).await,
+                Ok(Routed::Queued)
+            ));
+            assert_eq!(answer(&gateway, &mutation, id).await, Answer::Queued);
+            assert_eq!(cluster.latest(right, 0, 7).await.1, None);
+        } else {
+            assert_eq!(
+                answer(&gateway, &mutation, id).await,
+                Answer::Data(Value::Null)
+            );
+            let applied = cluster.latest(right, 0, 7).await;
+            assert_eq!(applied.1, Some(json!({"id": 7, "value": 1})));
+            assert_eq!(
+                answer(&gateway, &mutation, id).await,
+                Answer::Data(Value::Null)
+            );
+            assert_eq!(cluster.latest(right, 0, 7).await, applied);
+        }
+        assert_eq!(source.reads(), (2, 2));
+    }
     cluster.shutdown().await;
 }
 
