@@ -207,36 +207,29 @@ def snapshot_recovery(facade):
         owner = queue_owner(test, table, [row(0)])
         source = initial_range(cluster, table.id)
         victim = next(worker for worker in WORKERS if worker != owner)
-        survivors = stop_worker(cluster, victim)
-        for key in range(1, 81):
-            request = operation('table.insert', dict(table_id=table.id, row=row(key)))
-            assert test.data(request) is None
-
         group = source['group_id']
         barrier = cluster.barrier_dir(victim)
         control = barrier / f'native-snapshot-{group}.mode'
         staged = barrier / f'native-snapshot-{group}-staged.json'
         activated = barrier / f'native-snapshot-{group}-activated.json'
         control.write_text('pause')
-        config = retained_config(cluster, victim, survivors)
-        cluster.config[victim] = config
-        cluster.enrollments[victim] = config['node']['enrollment']
-        cluster.launch_worker(victim)
+        survivors = [worker for worker in WORKERS if worker != victim]
+        # Keep the original enrolled voter alive while it falls behind. Its
+        # first snapshot install then has no rolling enrollment in flight.
+        cluster.workers[victim].pause()
+        wait_for(lambda: two_ready(cluster, survivors), 'paused follower removed from queue readiness', 90)
+        for key in range(1, 81):
+            request = operation('table.insert', dict(table_id=table.id, row=row(key)))
+            assert test.data(request) is None
+        cluster.workers[victim].resume()
         first = wait_for(lambda: json.loads(staged.read_text()) if staged.exists() else None,
                          'native install staged on the lagging follower', 120)
         assert first['staged_generation'] == first['generation'] + 1, first
         assert first['applied']['index'] < first['incoming']['index'] and not activated.exists(), first
-        cluster.workers[victim].kill()
-        cluster.workers[victim].stop()
+        stop_worker(cluster, victim)
         staged.unlink()
         control.write_text('observe')
-        local = Path(config['node']['directory']) / 'NABEDRA_REGISTERED_WORKER.json'
-        if json.loads(local.read_text())['previous'] == config['node']['mount']['worker']:
-            # A crash can happen after the rolling intent was consumed. Each
-            # completed incarnation needs its own next enrollment.
-            wait_for(lambda: two_ready(cluster, survivors), 'staged follower removed after SIGKILL', 90)
-            config = retained_config(cluster, victim, survivors)
-        launch_retained(cluster, victim, config)
+        launch_retained(cluster, victim, retained_config(cluster, victim, survivors))
         second = wait_for(lambda: json.loads(activated.read_text()) if activated.exists() else None,
                           'retry activated the staged Data snapshot', 90)
         restarted = json.loads(staged.read_text())
@@ -605,6 +598,7 @@ def check_capacity_deficit(facade):
     constrained = Transactions(cluster, facade.direct)
     try:
         constrained.start()
+        configure_growth(cluster)
         table = constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id')
         rows = [dict(id=key, data='x' * (8 << 10)) for key in range(16)]
         assert constrained.data(batch(table, rows)) == len(rows)
@@ -613,12 +607,16 @@ def check_capacity_deficit(facade):
                                       'mounted volume split capacity outcome', 90)
         assert observation['transition']['error'] == 'limit_exceeded', observation
         assert observation['sample']['observed_committed_bytes'] > observation['target_bytes'], observation
-        configure_growth(cluster)
-        pin = cluster.admin('storage.growth.snapshot', {})['pin']
-        sample = cluster.admin('storage.growth.sample', {
-            'pin': pin, 'worker': worker_identity(cluster, owner),
-        }, owner)
-        deficit = sample['split_deficit']
+
+        def capacity_sample():
+            pin = cluster.admin('storage.growth.snapshot', {})['pin']
+            request = operation('storage.growth.sample', {'pin': pin, 'worker': worker_identity(cluster, owner)})
+            status, reply = admin(cluster, owner, request, timeout=10)
+            if status in (429, 503, 504):
+                return None
+            return success(status, reply).get('split_deficit')
+
+        deficit = wait_for(capacity_sample, 'capacity deficit under the current placement policy', 60)
         assert deficit['source']['record']['identity'] == source, deficit
         assert deficit['required_bytes'] >= 3 << 30 and deficit['pools'], deficit
         assert all(pool['available_bytes'] < pool['required_bytes'] for pool in deficit['pools']), deficit
