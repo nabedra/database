@@ -48,6 +48,7 @@ pub trait TypedConfig:
         LeaderId = LeaderId,
         Vote = Vote,
         Membership = Membership,
+        MembershipEdit = openraft::impls::ChangeMembers<u64, ReplicaMember>,
         D = OwnedCommand<Self::Command>,
         Payload = Payload<Self::Command>,
         Entry = OwnedRaftEntry<Self::Command>,

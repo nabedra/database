@@ -275,6 +275,26 @@ impl DataGroupFactory {
         ).await?;
         self.wire_participant(group, self.local.node_id, running)
     }
+    pub(crate) async fn host_replacement_data(
+        &self,
+        record: &crate::oltp_replication::authority::control::ReplacementRecord,
+    ) -> Result<(), ProtocolError> {
+        for plan in &record.groups {
+            let group = &plan.expected.identity;
+            if !matches!(group.kind, GroupKind::Data { .. }) {
+                continue;
+            }
+            let running = self.manager.start_data(
+                self.pool.group(group.clone()).await?,
+                plan.learner.clone(),
+                plan.old.iter().chain(std::iter::once(&plan.learner))
+                    .map(|member| (member.node_id, member.clone())).collect(),
+                self.config.clone(),
+            ).await?;
+            self.wire_participant(group, plan.learner.node_id, running)?;
+        }
+        Ok(())
+    }
     fn wire_participant(
         &self,
         group: &GroupIdentity,

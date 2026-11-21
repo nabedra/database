@@ -4,7 +4,10 @@ use super::*;
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes},
     oltp_replication::{
-        authority::control::{ControlHandle, SYSTEM_REPLACEMENT_CAPABILITY},
+        authority::control::{
+            ControlHandle, LocalOperatorPermit, ReplacementGroup, ReplacementMountProof,
+            ReplacementRecord, SYSTEM_REPLACEMENT_CAPABILITY, SYSTEM_REPLACEMENT_EXECUTION,
+        },
         multiplex::{
             AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture,
             ReceivePlan, TrafficClass,
@@ -46,7 +49,13 @@ pub(crate) struct SurvivingQuorum {
 enum Request {
     Quorum(Box<QuorumRequest>),
     Advertise,
+    AdvertiseExecution,
+    Mount(ReplacementMountProof),
+    Reconcile { id: Uuid, group: Uuid },
 }
+
+pub(super) type PositionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AppliedPosition, ProtocolError>> + Send + 'a>>;
 
 pub(super) type QuorumFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SurvivingQuorum, ProtocolError>> + Send + 'a>>;
@@ -196,14 +205,30 @@ impl HostedGroupManager {
         Ok(control)
     }
 
-    pub(crate) async fn verify_recovery_advert(
+    pub(crate) async fn verify_recovery_execution(
         &self,
         control: &GroupIdentity,
         target: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
-        let header = self
-            .shared
-            .encode_in(ByteClass::Progress, &Request::Advertise, HEADER)?;
+        self.verify_recovery_advert(control, target, Request::AdvertiseExecution, SYSTEM_REPLACEMENT_EXECUTION).await
+    }
+
+    pub(crate) async fn verify_recovery_capability(
+        &self,
+        control: &GroupIdentity,
+        target: WorkerIdentity,
+    ) -> Result<(), ProtocolError> {
+        self.verify_recovery_advert(control, target, Request::Advertise, SYSTEM_REPLACEMENT_CAPABILITY).await
+    }
+
+    async fn verify_recovery_advert(
+        &self,
+        control: &GroupIdentity,
+        target: WorkerIdentity,
+        request: Request,
+        capability: &str,
+    ) -> Result<(), ProtocolError> {
+        let header = self.shared.encode_in(ByteClass::Progress, &request, HEADER)?;
         let reply = self
             .client
             .request_classified(
@@ -220,11 +245,110 @@ impl HostedGroupManager {
             || reply.group() != control
             || reply.purpose() != Purpose::SystemRecovery
             || reply.sections.iter().any(Option::is_some)
-            || reply.decode_header::<String>()?.as_str() != SYSTEM_REPLACEMENT_CAPABILITY
+            || reply.decode_header::<String>()?.as_str() != capability
         {
             return Err(unsupported());
         }
         Ok(())
+    }
+
+    fn replacement_replica(
+        &self,
+        plan: &ReplacementGroup,
+        local: &ReplicaMember,
+    ) -> Result<Arc<dyn Running>, ProtocolError> {
+        let routes = self.routes.lock().map_err(|_| unavailable())?;
+        routes.get(&plan.expected.identity.group_id)
+            .and_then(|routes| routes.replicas.get(&local.node_id))
+            .filter(|replica| !replica.retiring && replica.member == *local)
+            .map(|replica| replica.running.clone())
+            .ok_or_else(unavailable)
+    }
+
+    pub(crate) async fn replacement_applied(
+        &self,
+        record: &ReplacementRecord,
+    ) -> Result<(), ProtocolError> {
+        for plan in &record.groups {
+            self.replacement_replica(plan, &plan.learner)?
+                .verify_replacement_applied(plan, record.intent.previous.worker_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_replacement_local(
+        &self,
+        plan: &ReplacementGroup,
+        lost: Uuid,
+    ) -> Result<AppliedPosition, ProtocolError> {
+        let local = self.client.local_identity().worker_id;
+        let members = plan.next(lost)?;
+        let member = members.iter().find(|member| member.worker_id == local).ok_or_else(invalid)?;
+        self.replacement_replica(plan, member)?.reconcile_system_replacement(plan, lost).await
+    }
+
+    pub(crate) async fn send_mount_proof(
+        &self,
+        scope: &GroupIdentity,
+        target: WorkerIdentity,
+        proof: &ReplacementMountProof,
+    ) -> Result<(), ProtocolError> {
+        self.recovery_call::<()>(scope, target, &Request::Mount(proof.clone())).await
+    }
+
+    async fn recovery_call<T: serde::de::DeserializeOwned + Clone + Send + 'static>(
+        &self,
+        scope: &GroupIdentity,
+        target: WorkerIdentity,
+        request: &Request,
+    ) -> Result<T, ProtocolError> {
+        let header = self.shared.encode_in(ByteClass::Progress, request, HEADER)?;
+        let reply = self.client.request_classified(scope, target, Purpose::SystemRecovery,
+            header, [None, None, None], REPLY_DECODE_BYTES).await?;
+        if reply.remote_identity() != target || reply.group() != scope
+            || reply.purpose() != Purpose::SystemRecovery || reply.sections.iter().any(Option::is_some)
+        {
+            return Err(invalid());
+        }
+        let decoded = reply.decode_header::<Result<T, ProtocolError>>()?;
+        (*decoded).clone()
+    }
+
+    pub(crate) async fn advance_system_replacement(
+        &self,
+        control: &ControlHandle,
+        running: &ManagedControl,
+        permit: &LocalOperatorPermit,
+    ) -> Result<(), ProtocolError> {
+        if running.raft.current_leader().await != Some(running.state.resident().node_id()) {
+            return Ok(());
+        }
+        let Some((record, remaining)) = control.active_system_replacement().await? else {
+            return Ok(());
+        };
+        // The candidate stays outside Control elections until the other groups
+        // have their stable memberships recorded.
+        let plan = record.groups.iter().filter(|plan| remaining.contains(&plan.expected.identity.group_id))
+            .min_by_key(|plan| plan.expected.identity.kind == GroupKind::Control).ok_or_else(invalid)?;
+        let group = plan.expected.identity.group_id;
+        let lost = record.intent.previous.worker_id;
+        let local = self.client.local_identity();
+        let request = Request::Reconcile { id: record.intent.id, group };
+        let next = plan.next(lost)?;
+        let mut last = unavailable();
+        for member in next {
+            let result = if member.worker_id == local.worker_id {
+                self.reconcile_replacement_local(plan, lost).await
+            } else {
+                let target = control.worker(member.worker_id).await?.ok_or_else(unavailable)?;
+                self.recovery_call(control.identity(), WorkerIdentity::from(&target), &request).await
+            };
+            match result {
+                Ok(applied) => return control.publish_system_replacement_group(running, permit, &record, group, applied).await,
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
     }
 
     pub(crate) async fn surviving_quorum(
@@ -297,7 +421,6 @@ impl QuorumEndpoint {
         if session.group() != self.control.identity()
             || session.purpose() != Purpose::SystemRecovery
             || session.recovery_only()
-            || !self.control.is_operator(&session.remote())
         {
             return Err(ProtocolError::new(
                 ErrorCode::Unauthorized,
@@ -307,12 +430,86 @@ impl QuorumEndpoint {
         }
         crate::protocol::json_input(header, HEADER).map_err(|_| invalid())?;
         let request: Request = serde_json::from_slice(header).map_err(|_| invalid())?;
-        if let Request::Quorum(request) = &request {
-            request.validate(self.control.identity())?;
+        match &request {
+            Request::Mount(proof) if proof.worker == session.remote() => {}
+            Request::Mount(_) => return Err(invalid()),
+            Request::Advertise | Request::AdvertiseExecution => {}
+            Request::Quorum(request) if self.control.is_operator(&session.remote()) => {
+                request.validate(self.control.identity())?;
+            }
+            Request::Reconcile { .. } if self.control.is_operator(&session.remote()) => {}
+            _ => return Err(invalid()),
         }
         Ok(request)
     }
 }
+impl QuorumEndpoint {
+    async fn mount(&self, proof: ReplacementMountProof) -> Result<(), ProtocolError> {
+        use crate::oltp_runtime::{
+            replica::QueueScope,
+            worker_endpoint::{PeerReachability, QueuePeerClient},
+        };
+        let control = &self.control;
+        let running = self.manager.local_control(control.identity())?;
+        if running.raft.current_leader().await != Some(running.state.resident().node_id()) {
+            return Err(unavailable());
+        }
+        let (record, mounted, _) = control.replacement_record_local(proof.id).await?.ok_or_else(unavailable)?;
+        let state = control.inspect().await?.ok_or_else(unavailable)?;
+        if !mounted {
+            // Check liveness again just before the transaction that revokes
+            // the original identity. Never treat a failed authentication as loss.
+            let scope = QueueScope {
+                cluster_id: control.identity().cluster_id,
+                database: control.identity().database.clone(),
+            };
+            let peer = QueuePeerClient::new(self.manager.client(), self.manager.shared.clone(), control.identity().clone())?;
+            let lost = record.intent.previous;
+            match peer.probe(lost, scope, state.ready).await {
+                PeerReachability::Unreachable => {}
+                PeerReachability::Reachable => return Err(reachable()),
+                PeerReachability::Indeterminate => return Err(unavailable()),
+            }
+            for plan in &record.groups {
+                let mut checked = false;
+                for survivor in plan.old.iter().filter(|member| member.worker_id != lost.worker_id) {
+                    let request = QuorumRequest {
+                        group: plan.expected.identity.clone(),
+                        voters: plan.old.clone(),
+                        lost: lost.worker_id,
+                        leader: survivor.node_id,
+                        minimum: plan.expected.membership_position,
+                    };
+                    let result = if survivor.worker_id == self.manager.client.local_identity().worker_id {
+                        self.manager.surviving_quorum(&request).await
+                    } else {
+                        let enrollment = control.worker(survivor.worker_id).await?.ok_or_else(unavailable)?;
+                        self.manager.remote_surviving_quorum(control.identity(), WorkerIdentity::from(&enrollment), &request).await
+                    };
+                    match result {
+                        Ok(_) => { checked = true; break; }
+                        Err(error) if error.code == ErrorCode::Conflict => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+                if !checked {
+                    return Err(unavailable());
+                }
+            }
+        }
+        control.mount_system_replacement(&running, proof, &state).await
+    }
+
+    async fn reconcile(&self, id: Uuid, group: Uuid) -> Result<AppliedPosition, ProtocolError> {
+        let (record, mounted, _) = self.control.replacement_record_local(id).await?.ok_or_else(unavailable)?;
+        if !mounted {
+            return Err(unavailable());
+        }
+        let plan = record.groups.iter().find(|plan| plan.expected.identity.group_id == group).ok_or_else(invalid)?;
+        self.manager.reconcile_replacement_local(plan, record.intent.previous.worker_id).await
+    }
+}
+
 impl Endpoint for QuorumEndpoint {
     fn preflight<'a>(
         &'a self,
@@ -347,7 +544,13 @@ impl Endpoint for QuorumEndpoint {
                         .shared
                         .encode_in(ByteClass::Progress, &proof, HEADER)?
                 }
-                Request::Advertise => {
+                Request::Mount(proof) => self.manager.shared.encode_in(
+                    ByteClass::Progress, &self.mount(proof).await, HEADER,
+                )?,
+                Request::Reconcile { id, group } => self.manager.shared.encode_in(
+                    ByteClass::Progress, &self.reconcile(id, group).await, HEADER,
+                )?,
+                Request::Advertise | Request::AdvertiseExecution => {
                     #[cfg(test)]
                     if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|path| {
                         std::path::Path::new(&path)
@@ -358,7 +561,11 @@ impl Endpoint for QuorumEndpoint {
                     }
                     self.manager.shared.encode_in(
                         ByteClass::Progress,
-                        &SYSTEM_REPLACEMENT_CAPABILITY,
+                        &if matches!(request, Request::AdvertiseExecution) {
+                            SYSTEM_REPLACEMENT_EXECUTION
+                        } else {
+                            SYSTEM_REPLACEMENT_CAPABILITY
+                        },
                         HEADER,
                     )?
                 }

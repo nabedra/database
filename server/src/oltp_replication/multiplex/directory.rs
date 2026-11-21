@@ -7,12 +7,12 @@ use crate::oltp::{
     pool::{ExecutionClass, WorkerSharedResources},
 };
 use crate::oltp_replication::{
-    authority::control::{ApiEnrollment, ControlClient, InventoryPage},
-    types::{GroupKind, WorkerEnrollment},
+    authority::control::{ApiEnrollment, ControlClient, InventoryPage, ReplacementRecord},
+    types::{Digest, GroupKind, WorkerEnrollment},
 };
 use serde::de::DeserializeOwned;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         RwLock,
         atomic::{AtomicU64, Ordering},
@@ -31,12 +31,22 @@ struct Entry {
     seen: u64,
     _charge: Arc<ScratchLease>,
 }
+struct SystemTrust {
+    operators: BTreeSet<WorkerIdentity>,
+    revoked_workers: BTreeSet<Uuid>,
+    revoked_certificates: BTreeSet<Digest>,
+    candidate: Option<(ReplacementRecord, bool)>,
+    _charge: ScratchLease,
+}
+
 pub(crate) struct AppliedPeerDirectory {
     cluster: Uuid,
     control: GroupIdentity,
     shared: Arc<WorkerSharedResources>,
     entries: RwLock<BTreeMap<Uuid, Entry>>,
     prepared: RwLock<Option<Entry>>,
+    system: RwLock<Option<SystemTrust>>,
+    learner_groups: RwLock<BTreeMap<Uuid, BTreeSet<Uuid>>>,
     revision: AtomicU64,
     epoch: AtomicU64,
     refresh: tokio::sync::Mutex<()>,
@@ -60,6 +70,8 @@ impl AppliedPeerDirectory {
             shared,
             entries: RwLock::new(BTreeMap::new()),
             prepared: RwLock::new(None),
+            system: RwLock::new(None),
+            learner_groups: RwLock::new(BTreeMap::new()),
             revision: AtomicU64::new(0),
             epoch: AtomicU64::new(1),
             refresh: tokio::sync::Mutex::new(()),
@@ -77,6 +89,61 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
+    pub(crate) fn allow_replacement_bootstrap(
+        &self,
+        record: &ReplacementRecord,
+    ) -> Result<(), ProtocolError> {
+        let mut groups = self.learner_groups.write().map_err(|_| unavailable())?;
+        for plan in &record.groups {
+            for member in &plan.old {
+                if member.worker_id != record.intent.previous.worker_id {
+                    groups.entry(member.worker_id).or_default().insert(plan.expected.identity.group_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_system_trust(
+        &self,
+        _revision: u64,
+        operators: Vec<WorkerIdentity>,
+        revoked: Vec<WorkerIdentity>,
+        candidate: Option<(ReplacementRecord, bool)>,
+    ) -> Result<(), ProtocolError> {
+        let charge = self.shared.reserve_scratch(crate::oltp::pool::ByteClass::Progress,
+            4096 + revoked.len() * 128 + candidate.as_ref().map_or(0, |(record, _)| record.groups.len() * 2048))?;
+        *self.system.write().map_err(|_| unavailable())? = Some(SystemTrust {
+            operators: operators.into_iter().collect(),
+            revoked_workers: revoked.iter().map(|worker| worker.worker_id).collect(),
+            revoked_certificates: revoked.iter().map(|worker| worker.certificate_sha256).collect(),
+            candidate,
+            _charge: charge,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn has_mounted_replacement(&self) -> bool {
+        self.system.read().is_ok_and(|system| system.as_ref().is_some_and(|state|
+            state.candidate.as_ref().is_some_and(|(_, mounted)| *mounted)))
+    }
+
+    pub(crate) fn replacement_capability_active(&self) -> bool {
+        self.system.read().is_ok_and(|system| system.is_some())
+    }
+
+    pub(crate) fn current_operator(&self, identity: WorkerIdentity) -> Option<bool> {
+        match self.system.read() {
+            Ok(state) => state.as_ref().map(|state| state.operators.contains(&identity)),
+            Err(_) => Some(false),
+        }
+    }
+
+    fn denied(state: &SystemTrust, worker: Uuid, certificate: Option<Digest>) -> bool {
+        state.revoked_workers.contains(&worker)
+            || certificate.is_some_and(|digest| state.revoked_certificates.contains(&digest))
+    }
+
     fn install(
         &self,
         enrollment: WorkerEnrollment,
@@ -284,6 +351,16 @@ impl PeerDirectory for AppliedPeerDirectory {
         })
     }
     fn resolve(&self, worker: Uuid) -> Result<WorkerEnrollment, ProtocolError> {
+        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
+            if Self::denied(state, worker, None) {
+                return Err(unavailable());
+            }
+            if let Some((record, _)) = &state.candidate
+                && record.intent.next.worker_id == worker
+            {
+                return Ok(record.intent.next.clone());
+            }
+        }
         if let Some(candidate) = self.prepared.read().map_err(|_| unavailable())?
             .as_ref().filter(|candidate| candidate.enrollment.worker_id == worker)
         {
@@ -305,6 +382,23 @@ impl PeerDirectory for AppliedPeerDirectory {
         if group.cluster_id != self.cluster {
             return Err(invalid());
         }
+        if let Some(state) = self.system.read().map_err(|_| unavailable())?.as_ref() {
+            if Self::denied(state, peer.worker_id, Some(peer.certificate_sha256)) {
+                return Err(invalid());
+            }
+            if let Some((record, mounted)) = &state.candidate
+                && record.intent.next.worker_id == peer.worker_id
+            {
+                if WorkerIdentity::from(&record.intent.next) != peer {
+                    return Err(invalid());
+                }
+                let admitted = (group == &self.control && purpose == Purpose::SystemRecovery)
+                    || (*mounted && purpose == Purpose::Raft
+                        && record.groups.iter().any(|plan| plan.expected.identity == *group))
+                    || (*mounted && state.operators.contains(&peer));
+                return if admitted { Ok(TransportTrust::AppliedEnrollment) } else { Err(unavailable()) };
+            }
+        }
         if let Some(candidate) = self
             .prepared
             .read()
@@ -317,6 +411,8 @@ impl PeerDirectory for AppliedPeerDirectory {
             }
             return if group == &self.control && purpose == Purpose::ControlDelegation {
                 Ok(TransportTrust::PreparedControl)
+            } else if group == &self.control && purpose == Purpose::SystemRecovery {
+                Ok(TransportTrust::AppliedEnrollment)
             } else {
                 // The worker's voter placements still point here during a
                 // retained restart. Until enrollment, route callers must
@@ -349,6 +445,13 @@ impl PeerDirectory for AppliedPeerDirectory {
                 if matches!(group.kind, GroupKind::Data { .. })
                     && group.database == *database
                     && purpose == Purpose::ApiIngress =>
+            {
+                Ok(TransportTrust::AppliedEnrollment)
+            }
+            Role::BootstrapControl(_)
+                if (purpose == Purpose::Raft || (group == &self.control && purpose == Purpose::SystemRecovery))
+                    && self.learner_groups.read().map_err(|_| unavailable())?
+                        .get(&peer.worker_id).is_some_and(|groups| groups.contains(&group.group_id)) =>
             {
                 Ok(TransportTrust::AppliedEnrollment)
             }

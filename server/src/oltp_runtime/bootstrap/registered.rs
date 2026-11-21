@@ -21,6 +21,7 @@ use crate::oltp_replication::{
 mod cold;
 mod data_worker;
 mod restart;
+mod system_replacement;
 
 impl LocalServices {
     pub(crate) async fn open_registered(
@@ -73,7 +74,8 @@ impl LocalServices {
         )
         .await?;
         let local = WorkerIdentity::from(&worker.enrollment);
-        let scoped_operator = operator_pins.contains(&local.certificate_sha256);
+        let replacing = worker.system_replacement.is_some();
+        let scoped_operator = replacing || operator_pins.contains(&local.certificate_sha256);
         let placements = worker.placements.clone();
         let status_topology = placements.status_topology()?;
         let seed = placements.control.voters[0].worker_id;
@@ -99,7 +101,7 @@ impl LocalServices {
         eprintln!(
             "nabedra-db: registered consensus heartbeat_ms=500 election_min_ms=1500 election_max_ms=3000"
         );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if rolling { 120 } else { 60 });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if replacing { 240 } else if rolling { 120 } else { 60 });
         let last_error = Arc::new(Mutex::new(None::<ProtocolError>));
         let error_trace = last_error.clone();
         let scope = QueueScope {
@@ -134,12 +136,13 @@ impl LocalServices {
             let policy = worker.bootstrap_policy;
             let control = ControlHandle::new(
                 ControlMachine::new(raw_control.state.store().clone())?,
-                ForwardedControl::new(manager.clone(), raw_control.clone(), pins.clone())?,
+                ForwardedControl::registered(manager.clone(), raw_control.clone(), pins.clone(), directory.clone())?,
                 OperatorPolicy {
                     policy,
                     certificate_pins: pins.clone(),
                 },
             );
+            control.use_registered_directory(directory.clone())?;
             let registration = manager
                 .registry()
                 .reserve(placements.control.identity.clone())?;
@@ -240,7 +243,9 @@ impl LocalServices {
                 )?,
             )?;
             let operator = &worker.operator;
-            let recovery = if worker.cold.is_some() {
+            let recovery = if replacing {
+                None
+            } else if worker.cold.is_some() {
                 Some(cold::begin(&worker, &control, seed, deadline, &error_trace).await?)
             } else if rolling {
                 restart::enroll(&worker, &control, deadline, &error_trace).await?;
@@ -294,10 +299,12 @@ impl LocalServices {
                 }
                 None
             };
-            worker.open_secondary_pools(&control, pins).await?;
+            if !replacing {
+                worker.open_secondary_pools(&control, pins).await?;
+            }
             let operator = &worker.operator;
             // A rolling restart reads the directory below instead of waiting for every enrollment.
-            if !rolling {
+            if !rolling && !replacing {
                 loop {
                     let mut complete = true;
                     for enrollment in &enrollments {
@@ -310,13 +317,18 @@ impl LocalServices {
                     wait_startup(deadline).await?;
                 }
             }
-            startup_read(deadline, &error_trace, "peer directory", || async {
-                worker.directory.refresh(&rpc).await.map_err(|error| {
-                    if rolling && error.code == ErrorCode::Unauthorized { unavailable() } else { error }
-                })
-            }).await?;
-            eprintln!("nabedra-db: registered {} enrolled", local.worker_id);
-            if recovery.is_some() {
+            if !replacing {
+                startup_read(deadline, &error_trace, "peer directory", || async {
+                    worker.directory.refresh(&rpc).await.map_err(|error| {
+                        if rolling && error.code == ErrorCode::Unauthorized { unavailable() } else { error }
+                    })
+                }).await?;
+                eprintln!("nabedra-db: registered {} enrolled", local.worker_id);
+            }
+            if replacing {
+                // The fresh system replicas opened as learners. Their
+                // membership is established together with the Data learners.
+            } else if recovery.is_some() {
                 startup_read(deadline, &error_trace, "fixed cold worker inventory", || {
                     cold::verify_workers(&worker, &control)
                 })
@@ -459,7 +471,14 @@ impl LocalServices {
                     status_topology.clone(),
                     registered_raft_config(),
                 )?;
-            if rolling {
+            if let Some(record) = &worker.system_replacement {
+                factory.host_replacement_data(record).await?;
+                system_replacement::join(&worker, &control, &raw_control, &enrollments, deadline).await?;
+                startup_read(deadline, &error_trace, "replacement peer directory", || async {
+                    directory.refresh(&rpc).await.map_err(|error|
+                        if error.code == ErrorCode::Unauthorized { unavailable() } else { error })
+                }).await?;
+            } else if rolling {
                 startup_read(deadline, &error_trace, "rolling retained Data groups", || factory.rehost_retained(&pools)).await?;
             } else if worker.restored.is_none() {
                 if worker.restart_mount.is_some() {
@@ -497,6 +516,14 @@ impl LocalServices {
                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
             }
             let operator = Arc::new(worker.operator);
+            system_replacement::spawn(
+                manager.clone(),
+                control.clone(),
+                raw_control.clone(),
+                directory.clone(),
+                operator.clone(),
+                stop.subscribe(),
+            );
             // NS14b: Control replaces damaged Data replicas on its own, from the
             // process whose Control replica leads.
             DamageScheduler::new(

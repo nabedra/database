@@ -217,6 +217,7 @@ pub(crate) struct ForwardedControl {
     manager: Arc<HostedGroupManager>,
     local: ManagedControl,
     pins: Arc<BTreeSet<Digest>>,
+    directory: Option<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     read_batch: read_batch::ReadBatch,
     _owner: Arc<ScratchLease>,
 }
@@ -244,10 +245,22 @@ impl ForwardedControl {
             manager,
             local,
             pins,
+            directory: None,
             read_batch: read_batch::ReadBatch::default(),
             _owner: owner,
         }))
     }
+    pub(crate) fn registered(
+        manager: Arc<HostedGroupManager>,
+        local: ManagedControl,
+        pins: BTreeSet<Digest>,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        let mut forwarding = Self::new(manager, local, pins)?;
+        Arc::get_mut(&mut forwarding).ok_or_else(invalid)?.directory = Some(directory);
+        Ok(forwarding)
+    }
+
     async fn forwarded<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
         operation: Operation,
@@ -307,9 +320,9 @@ impl ForwardedControl {
             if received.group() != group
                 || received.purpose() != Purpose::ControlDelegation
                 || received.remote_identity().worker_id != member.worker_id
-                || !self
-                    .pins
-                    .contains(&received.remote_identity().certificate_sha256)
+                || !self.directory.as_ref()
+                    .and_then(|directory| directory.current_operator(received.remote_identity()))
+                    .unwrap_or_else(|| self.pins.contains(&received.remote_identity().certificate_sha256))
                 || received.sections[1].is_some()
                 || received.sections[2].is_some()
             {
@@ -497,8 +510,11 @@ impl HostedControlEndpoint {
         );
         if session.group() != self.local.state.store().identity()
             || session.purpose() != Purpose::ControlDelegation
-            || (!scoped_data_worker && !self.pins.contains(&session.remote().certificate_sha256))
-            || (scoped_data_worker && self.pins.contains(&session.remote().certificate_sha256))
+            || (!scoped_data_worker && !self.reads.is_operator(session.remote())
+                && !(session.recovery_only()
+                    && matches!(request.control_consensus, Operation::CompleteRestart)
+                    && self.pins.contains(&session.remote().certificate_sha256)))
+            || (scoped_data_worker && self.reads.is_operator(session.remote()))
             || request.to_node != self.local.state.resident().node_id()
             || match request.control_consensus {
                 Operation::Propose | Operation::CompleteRestart | Operation::CompleteDataWorker

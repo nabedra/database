@@ -263,6 +263,7 @@ pub(crate) struct ControlHandle {
     machine: ControlMachine,
     consensus: Arc<dyn Consensus<ControlCommand, ControlReply>>,
     policy: OperatorPolicy,
+    registered_directory: std::sync::OnceLock<Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
     /// NS14 mixed-version gate for the group damage commands.
     group_damage_gate: std::sync::RwLock<Option<Arc<dyn super::group_damage::GroupDamageGate>>>,
 }
@@ -276,8 +277,15 @@ impl ControlHandle {
             machine,
             consensus,
             policy,
+            registered_directory: Default::default(),
             group_damage_gate: std::sync::RwLock::new(None),
         })
+    }
+    pub(crate) fn use_registered_directory(
+        &self,
+        directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
+    ) -> Result<(), ProtocolError> {
+        self.registered_directory.set(directory).map_err(|_| unauthorized())
     }
     pub(crate) fn resources(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
         self.machine.store().resources()
@@ -310,10 +318,7 @@ impl ControlHandle {
         if session.group() != self.identity()
             || session.purpose() != Purpose::Authority
             || session.recovery_only()
-            || !self
-                .policy
-                .certificate_pins
-                .contains(&session.remote().certificate_sha256)
+            || !self.is_operator(&session.remote())
         {
             return Err(unauthorized());
         }
@@ -331,10 +336,7 @@ impl ControlHandle {
         evidence: Digest,
     ) -> Result<AuthorizationStamp, ProtocolError> {
         if !Arc::ptr_eq(&permit.shared, self.resources())
-            || !self
-                .policy
-                .certificate_pins
-                .contains(&permit.local.certificate_sha256)
+            || !self.is_operator(&permit.local)
         {
             return Err(unauthorized());
         }
@@ -1344,10 +1346,7 @@ impl ControlHandle {
         }
         let control = self.identity().clone();
         let database = scope.database.clone();
-        let operator = self
-            .policy
-            .certificate_pins
-            .contains(&remote.certificate_sha256);
+        let operator = self.is_operator(&remote);
         let raw = self
             .read(move |view| {
                 let state = state(view)?;
