@@ -589,23 +589,50 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                                  if member['worker_id'] != previous['worker_id']] + [control_plan['learner']],
                                 key=lambda member: member['node_id'])
 
-        for name in (*survivors, 'replacement'):
+        live_workers = {cluster.enrollments[name]['worker_id']: name for name in survivors}
+        live_workers[fresh['worker_id']] = 'replacement'
+
+        def parked_queue_owner():
+            cluster.stats('replacement')
+            record = json.loads((candidate_barrier / f'record-{queued_id}.json').read_text())
+            authority = record['authority']
+            if authority['ready']['ready_count'] != 3:
+                return None
+            name = live_workers[authority['owner']['worker_id']]
+            reached = cluster.barrier_dir(name) / f'reached-{queued_id}'
+            if not reached.exists() or reached.read_text() != 'queued':
+                return None
+            assert record['accepted'] and record['state'] == 'queued', record
+            return name
+
+        # A parked executor waits for its release file even after gates.json changes.
+        queue_owner = wait_for(parked_queue_owner, 'current queue owner parked before release', PROBE_WINDOW)
+        print(f'Accepted request {queued_id} parked at queued gate on {queue_owner}', flush=True)
+        released_at = time.monotonic()
+        for name in live_workers.values():
             (cluster.barrier_dir(name) / f'release-{queued_id}').touch()
         for body, acknowledged_result in acknowledged_writes:
             row = body['payload']['row']
             assert send_op(body) == acknowledged_result
             assert success(*send_op(get(table, row['id']))) == row
         receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
+        last_receipt = None
 
         def receipt():
+            nonlocal last_receipt
             status, reply = call(cluster.api_urls['api1'], receipt_path,
                                  token=cluster.auth['data_token'], ca=cluster.ca, timeout=5)
+            last_receipt = (status, reply)
             if status in (429, 503, 504):
                 return None
             assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
             return reply if reply['state'] == 'succeeded' else None
 
-        settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        try:
+            settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        except AssertionError as error:
+            raise AssertionError(f'{error}. Parked on {queue_owner}. Last receipt response {last_receipt!r}') from error
+        release_to_receipt = time.monotonic() - released_at
         assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
                                result=None, error=None), settled
         assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
@@ -618,6 +645,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
                refused_missing_advert=True, refused_candidate_missing_advert=True,
                refused_data_quorum=True, refused_reused_certificate=True,
                replayed_intent=True, settled_receipts=1, revoked_old_certificate=True,
+               queued_gate_owner=queue_owner, elapsed_queue_release_to_receipt_seconds=round(release_to_receipt, 3),
                acknowledged_direct_writes=len(acknowledged_writes),
                probe_recovery_seconds=round(first_read - stopped_at, 3),
                elapsed_loss_to_rf3_seconds=round(rf3_restored - stopped_at, 3),

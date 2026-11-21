@@ -110,6 +110,11 @@ impl Background {
         self.shared.compaction_threads + 1
     }
 
+    pub(crate) fn queued(&self) -> (usize, usize) {
+        let queues = lock(&self.shared.queues);
+        (queues.flush.len(), queues.compaction.len())
+    }
+
     pub(crate) fn schedule_flush(&self, job: Weak<dyn Job>, delay: Duration) {
         self.schedule(Kind::Flush, job, delay);
     }

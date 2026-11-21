@@ -382,7 +382,7 @@ impl WorkerRuntime {
                         end: None,
                     },
                 },
-                pin.read_ts,
+                &catalog,
             )
             .await?;
             self.export_native_routes(&catalog, &mut export).await?;
@@ -564,9 +564,9 @@ impl WorkerRuntime {
         export: &mut Export,
         participant: Arc<ParticipantHandle>,
         scope: GroupImageScope,
-        cut: CommitTs,
+        pin: &PinnedCatalog,
     ) -> Result<(), ProtocolError> {
-        self.export_native_image_stream(export, participant, scope, cut, false)
+        self.export_native_image_stream(export, participant, scope, pin.read_ts, Some(pin))
             .await
     }
 
@@ -576,16 +576,17 @@ impl WorkerRuntime {
         participant: Arc<ParticipantHandle>,
         scope: GroupImageScope,
         cut: CommitTs,
-        split_baseline: bool,
+        catalog_cut: Option<&PinnedCatalog>,
     ) -> Result<(), ProtocolError> {
-        let mut root = if split_baseline {
-            None
-        } else {
+        let mut root = if catalog_cut.is_some() {
             export
                 .frame(HistoryFrame::BeginGroup(scope.clone()))
                 .await?;
             Some(serialized_digest(&(b"nabedra/history-group/v1", &scope))?)
+        } else {
+            None
         };
+        let mut index = None;
         let mut count = 0u64;
         let mut after = None;
         let mut after_owner = None;
@@ -647,6 +648,36 @@ impl WorkerRuntime {
                         return Err(unknown());
                     }
                     for image in images.iter() {
+                        if let (
+                            Some(pin),
+                            MvccKey::IndexEntry {
+                                table_id, index_id, ..
+                            },
+                        ) = (catalog_cut, &image.key)
+                        {
+                            // Index images sort by UUID. At a full backup cut
+                            // after retirement, their presence in Data can
+                            // change while pages are being exported.
+                            if index.is_none_or(|(prior, _)| prior != *index_id) {
+                                use crate::oltp::mvcc::index::{IndexPhase, IndexRecord};
+                                let retired = self
+                                    .native_catalog::<IndexRecord>(
+                                        pin,
+                                        MvccKey::CatalogIndex {
+                                            table_id: *table_id,
+                                            index_id: *index_id,
+                                        },
+                                    )
+                                    .await?
+                                    .is_some_and(|record| {
+                                        matches!(record.phase, IndexPhase::Retired { .. })
+                                    });
+                                index = Some((*index_id, retired));
+                            }
+                            if index.is_some_and(|(_, retired)| retired) {
+                                continue;
+                            }
+                        }
                         if let Some(prior) = root {
                             root = Some(serialized_digest(&(
                                 b"nabedra/history-image/v1",
@@ -808,7 +839,7 @@ impl WorkerRuntime {
                                         routing_epoch: route.routing_epoch,
                                         span: route.span.clone(),
                                     },
-                                    pin.read_ts,
+                                    pin,
                                 )
                                 .await?;
                             }

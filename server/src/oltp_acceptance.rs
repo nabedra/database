@@ -2,6 +2,8 @@
 //! in their owning modules. Run these explicitly through the central runner.
 use std::{path::PathBuf, process::Command};
 
+#[path = "oltp_acceptance/acc6.rs"]
+mod acc6;
 #[path = "oltp_acceptance/o07.rs"]
 mod o07;
 #[path = "oltp_acceptance/o10.rs"]
@@ -94,6 +96,18 @@ fn acceptance_o09() {
 fn acceptance_o11() {
     crate::oltp_replication::hosted::acceptance_o11_storage();
     process_scenario("O11", "oltp_hardening_acceptance.py");
+}
+
+#[tokio::test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+async fn acceptance_o29() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::oltp::pool::o29_pool_recovery(),
+    )
+    .await
+    .expect("O29 pool recovery watchdog");
+    process_scenario("O29", "oltp_o29_acceptance.py");
 }
 
 pub(crate) fn clause(scenario: &str, assertion: &str, status: &str, detail: &str) {

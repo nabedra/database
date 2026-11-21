@@ -37,6 +37,9 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 pub(crate) struct ControlMachine {
     store: GroupStore,
     replacement_trust: Option<system_trust::ReplacementTrust>,
+    /// GC2 mixed-version tests: apply as the build before cluster features.
+    #[cfg(test)]
+    legacy_v1: bool,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
@@ -46,7 +49,15 @@ impl ControlMachine {
         Ok(Self {
             store,
             replacement_trust: None,
+            #[cfg(test)]
+            legacy_v1: false,
         })
+    }
+    /// GC2: this replica applies every entry as a pre-feature build would.
+    #[cfg(test)]
+    pub(crate) fn legacy_v1_for_test(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -86,13 +97,22 @@ impl ControlMachine {
             .as_ref()
             .map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
         let revoke = revoked.clone();
+        #[cfg(test)]
+        let legacy_v1 = self.legacy_v1;
         let result = self
             .store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
                 }
-                let transition = apply(tx, &scope, position, digest, command.payload()?)?;
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(legacy_v1));
+                let transition = command
+                    .payload()
+                    .and_then(|payload| apply(tx, &scope, position, digest, payload));
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(false));
+                let transition = transition?;
                 if let (Some(id), Some(revoke)) = (mount, revoke)
                     && let Transition::Commit(reply) = &transition
                     && decode::<ControlReply>(reply.as_ref())?
@@ -292,11 +312,11 @@ fn apply_initialized(
         SystemRecovery { operation_id, command } =>
             system_recovery::apply(tx, scope, state, position, *operation_id, command),
         DirectCapability {
+            operation_id,
             actor,
             action,
             unix_ms,
-            ..
-        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
+        } => direct::apply(tx, state, position, *operation_id, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }

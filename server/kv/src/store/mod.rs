@@ -802,6 +802,16 @@ impl Store {
         self.inner.memory_usage()
     }
 
+    /// Pending flush and compaction jobs on the shared pool and pending
+    /// journal items and bytes on this store, for maintenance acceptance.
+    #[doc(hidden)]
+    pub fn queued_io(&self) -> ((usize, usize), (usize, usize)) {
+        (
+            self.inner.background.queued(),
+            self.inner.journal().queued(),
+        )
+    }
+
     /// Closes the store: waits for its background work, then closes the journal (clean
     /// close record) and releases the directory lock. Dropping does the same.
     ///

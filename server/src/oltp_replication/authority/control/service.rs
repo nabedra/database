@@ -553,6 +553,18 @@ impl ControlHandle {
                 unix_ms: super::direct::wall_ms(),
             })
             .await?;
+            // GC2: the `data.direct.batch` advert (see `control::direct`). A
+            // repeat finds its receipt and answers a conflict: ignored.
+            let _ = self
+                .submit(ControlCommand::DirectCapability {
+                    operation_id: super::feature_operation_id(super::DIRECT_BATCH_FEATURE, target),
+                    actor: target,
+                    action: super::DirectCapabilityOperation::Advertise {
+                        version: super::DIRECT_VERSION,
+                    },
+                    unix_ms: super::direct::wall_ms(),
+                })
+                .await;
         }
         self.submit(ControlCommand::BeginJoin {
             operation_id,

@@ -215,6 +215,7 @@ struct Fixture {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Release {
     Current,
+    SessionV2,
     OneShotOnly,
 }
 
@@ -262,10 +263,16 @@ impl Fixture {
             .unwrap();
             let registry = Arc::new(EndpointRegistry::new(shared.clone()));
             let build = match release {
-                Release::Current => WorkerTransport::new,
+                Release::Current | Release::SessionV2 => WorkerTransport::new,
                 Release::OneShotOnly => WorkerTransport::one_shot_for_test,
             };
-            build(local, &tls[index], shared, peers.clone(), registry, config).unwrap()
+            let mut transport =
+                build(local, &tls[index], shared, peers.clone(), registry, config).unwrap();
+            if release == Release::SessionV2 {
+                let common = Arc::get_mut(&mut transport.common).unwrap();
+                (common.connector, common.acceptor) = tls[index].transports(&[SESSION_ALPN, ALPN]);
+            }
+            transport
         };
         let group = GroupIdentity {
             cluster_id: Uuid::new_v4(),
@@ -602,6 +609,49 @@ async fn d10_old_one_shot_peer_interoperates_in_both_directions() {
         .await
         .unwrap();
         fixture.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d10_index_reclamation_frames_require_the_negotiated_capability() {
+    for release in [Release::SessionV2, Release::Current] {
+        let (f, _) = Fixture::start(
+            Release::Current,
+            release,
+            TransportConfig::default(),
+            TransportConfig::default(),
+            false,
+        )
+        .await;
+        echoed(
+            f.call(&f.data_group, Purpose::Raft, "old append").await,
+            "old append",
+        );
+        let header = f
+            .client
+            .common
+            .shared
+            .encode_in(ByteClass::Data, &"reclaim", 128)
+            .unwrap();
+        let response = f
+            .client
+            .request_classified(
+                &f.data_group,
+                RequestTarget::Feature(f.target.worker_id, PeerFeature::IndexReclamation),
+                Purpose::Raft,
+                header,
+                [None, None, None],
+                0,
+            )
+            .await;
+        if release == Release::SessionV2 {
+            assert!(matches!(response, Err(RequestError::Unreachable)));
+            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 1);
+        } else {
+            echoed(response, "reclaim");
+            assert_eq!(f.endpoint.handled.load(Ordering::Acquire), 2);
+        }
+        f.stop().await;
     }
 }
 
@@ -1120,7 +1170,7 @@ async fn d10_c07_full_session_pools_reject_typed_and_keep_raft_progress() {
             .connect(ServerName::try_from("localhost").unwrap(), socket)
             .await
             .unwrap();
-        assert_eq!(idle.get_ref().1.alpn_protocol(), Some(SESSION_ALPN));
+        assert!(session_alpn(idle.get_ref().1.alpn_protocol()));
         // A new lane now handshakes without sessions and still works.
         let before = other.client.connections_for_test();
         echoed(

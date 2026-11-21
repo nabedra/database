@@ -58,6 +58,9 @@ pub trait TypedConfig:
     fn accepts(_kind: &GroupKind) -> bool {
         false
     }
+    fn requires_index_reclamation(_command: &Self::Command) -> bool {
+        false
+    }
     const MAX_REPLY_DECODE_BYTES: usize = 256 << 10;
     type Reply: Serialize + DeserializeOwned + Clone + Debug + Send + Sync + 'static;
 }
@@ -263,6 +266,18 @@ impl Pending {
     }
 }
 struct PendingGuard(Arc<Pending>);
+/// Spawns `task` as a pending operation. The guard is released only after the
+/// task's future, and with it everything the task holds (the group store, its
+/// charged entries, and through them the worker's resource owner), is dropped.
+/// A caller that `drain`s and then drops its handles may therefore reopen the
+/// worker's pools at once (KVfix4: a local binding of the guard dropped before
+/// the task's captured store, so `bind_worker` met the old owner).
+fn spawn_pending(pending: PendingGuard, task: impl Future<Output = ()> + Send + 'static) {
+    tokio::spawn(async move {
+        task.await;
+        drop(pending);
+    });
+}
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         self.0
@@ -833,8 +848,7 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
                 let (store, retry, overlay) =
                     (self.store.clone(), self.retry.clone(), self.overlay.clone());
                 let pending = self.pending.start();
-                tokio::spawn(async move {
-                    let _pending = pending;
+                spawn_pending(pending, async move {
                     while let Some(id) = overlay.next_marker() {
                         match save_commit_marker(&store, &retry, Some(id), true).await {
                             Ok(()) => tracing::debug!(group=%store.identity().group_id,
@@ -969,7 +983,11 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             ],
         )
         .since(submit);
-        tokio::spawn(async move {
+        // KVfix4 + GC1: the job's guard (above) keeps `drain` waiting for a
+        // queued append that another task writes; this task's own guard is
+        // released only after the task has dropped everything it captured
+        // (the store, the merged jobs' entries, the worker's resource owner).
+        spawn_pending(self.pending.start(), async move {
             use crate::oltp_runtime::stage_timing::by_kind;
             let kind = store.identity().kind.clone();
             let started = std::time::Instant::now();

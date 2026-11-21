@@ -1,8 +1,9 @@
 //! `data.direct.v1` reads and the accepting leader's advert path.
 use super::*;
 use crate::oltp_replication::authority::control::{
-    DIRECT_VERSION, DirectActivation, DirectCapability, DirectCapabilityOperation,
-    machine::direct::{activation_key, reader_key},
+    DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
+    DirectCapabilityOperation, DirectFeatures, FeatureActivation, feature_operation_id,
+    machine::direct::{activation_key, batch_key, reader_key},
 };
 
 impl ControlHandle {
@@ -20,6 +21,29 @@ impl ControlHandle {
                     version: DIRECT_VERSION,
                     activation,
                     advertised,
+                })
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
+    /// GC2: the cluster features of the direct family and whether `remote`'s
+    /// current identity advertised them. A strong (linearizable) read.
+    pub(crate) async fn direct_features(
+        &self,
+        remote: WorkerIdentity,
+    ) -> Result<DirectFeatures, ProtocolError> {
+        let raw = self
+            .read(move |view| {
+                let batch: Option<FeatureActivation> = load(view, batch_key())?;
+                let receipt = machine::key(
+                    b"ct/op/",
+                    feature_operation_id(DIRECT_BATCH_FEATURE, remote),
+                );
+                let batch_advertised = view.get(&receipt)?.is_some();
+                view.encode(&DirectFeatures {
+                    batch,
+                    batch_advertised,
                 })
             })
             .await?;

@@ -741,6 +741,19 @@ impl LogRig {
         }
         Ok(Self { logs, pool, shared })
     }
+    /// Joins every pending log operation, then drops the pool, as the host does
+    /// before it releases a replica. An append task outlives its `IOFlushed`
+    /// callback (PERF2d) and holds the pool, so dropping without the join and
+    /// reopening at once can meet the old worker owner ("worker storage capacity
+    /// unavailable", KVfix4). Durable state is unchanged: the oracle holds only
+    /// synced entries.
+    async fn close(self) {
+        for log in &self.logs {
+            tokio::time::timeout(Duration::from_secs(30), log.drain())
+                .await
+                .expect("pending log operations finish");
+        }
+    }
     async fn append(&mut self, group: usize, oracle: &mut LogOracle) -> std::io::Result<()> {
         let index = oracle.next[group];
         let id = (group as u64) << 32 | index;
@@ -963,12 +976,12 @@ async fn ns13_o06_o11_lagging_group_pins_the_oldest_segment_until_gc_relocates_i
     // A last lagging entry stays unflushed in the memtable, then the machine
     // crashes: the reopen replays it and reads every entry back.
     rig.append(LAGGING, &mut oracle).await.unwrap();
-    drop(rig);
+    rig.close().await;
     let crashed = fault.crash();
     let mut rig = LogRig::open(&path, &layout, &crashed, true).await.unwrap();
     assert!(rig.pool.kv_store().quarantined().is_empty());
     rig.check(&oracle, "reopen").await;
-    drop(rig);
+    rig.close().await;
     let mut rig = LogRig::open(&path, &layout, &crashed.crash(), true)
         .await
         .unwrap();
@@ -1043,7 +1056,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             }
         }
         crashed_runs += usize::from(fault.is_crashed());
-        drop(rig);
+        rig.close().await;
         let context = format!("crash after window op {k}");
         let image = fault.crash();
         let mut rig = LogRig::open(&path, &layout, &image, true)
@@ -1051,7 +1064,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
         assert!(rig.pool.kv_store().quarantined().is_empty(), "{context}");
         rig.check(&oracle, &context).await;
-        drop(rig);
+        rig.close().await;
         let mut rig = LogRig::open(&path, &layout, &image.crash(), true)
             .await
             .unwrap_or_else(|error| panic!("{context}: second reopen: {error}"));

@@ -40,6 +40,11 @@ use tokio::{
 use tokio_rustls::{client, server};
 
 pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
+pub(super) const INDEX_RECLAIM_ALPN: &[u8] = b"nabedra-otp/3";
+
+pub(super) fn session_alpn(alpn: Option<&[u8]>) -> bool {
+    matches!(alpn, Some(SESSION_ALPN | INDEX_RECLAIM_ALPN))
+}
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
 const FRAME_BYTES: usize = 13;
 const REQUEST: u8 = 1;
@@ -89,6 +94,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) enum PeerFeature {
     /// AppendEntries frames carrying more than one entry.
     MultiEntryAppend,
+    IndexReclamation,
 }
 
 /// Counts bytes read, so liveness checks see progress inside large frames.
@@ -391,6 +397,7 @@ struct Waiters {
 struct ClientSession {
     enrollment: WorkerEnrollment,
     identity: WorkerIdentity,
+    index_reclamation: bool,
     outgoing: mpsc::Sender<Outbound>,
     waiters: Mutex<Waiters>,
     closed: watch::Sender<bool>,
@@ -403,18 +410,27 @@ struct ClientSession {
     silent_limit: Duration,
 }
 impl ClientSession {
+    fn supports(&self, feature: PeerFeature) -> bool {
+        match feature {
+            PeerFeature::MultiEntryAppend => true,
+            PeerFeature::IndexReclamation => self.index_reclamation,
+        }
+    }
+
     fn start(
         stream: client::TlsStream<TcpStream>,
         enrollment: WorkerEnrollment,
         class: TrafficClass,
         common: &Common,
     ) -> Arc<Self> {
+        let index_reclamation = stream.get_ref().1.alpn_protocol() == Some(INDEX_RECLAIM_ALPN);
         let (read, write) = tokio::io::split(stream);
         let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
         let (closed, stop) = watch::channel(false);
         let received = Arc::new(AtomicU64::new(0));
         let session = Arc::new(Self {
             identity: WorkerIdentity::from(&enrollment),
+            index_reclamation,
             enrollment,
             outgoing,
             waiters: Mutex::new(Waiters {
@@ -863,8 +879,7 @@ impl Drop for PeerSessions {
 }
 impl PeerSessions {
     /// Whether the live session to this peer incarnation on `class` offers
-    /// `feature`. Every `nabedra-otp/2` session supports every feature listed
-    /// in [`PeerFeature`]; one-shot peers support none.
+    /// `feature`. One-shot peers support none.
     pub(super) fn supports(
         &self,
         peer: &WorkerEnrollment,
@@ -875,12 +890,9 @@ impl PeerSessions {
         let Some(slot) = lock(&self.slots).get(&key).cloned() else {
             return false;
         };
-        let live = lock(&slot.current)
-            .as_ref()
-            .is_some_and(|session| session.alive() && session.enrollment == *peer);
-        match feature {
-            PeerFeature::MultiEntryAppend => live,
-        }
+        lock(&slot.current).as_ref().is_some_and(|session| {
+            session.alive() && session.enrollment == *peer && session.supports(feature)
+        })
     }
     /// Streams waiting for replies on this caller's sessions.
     #[cfg(test)]
@@ -996,7 +1008,7 @@ impl PeerSessions {
             }
         };
         self.connections.fetch_add(1, Ordering::Relaxed);
-        if stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN) {
+        if session_alpn(stream.get_ref().1.alpn_protocol()) {
             let session = ClientSession::start(stream, peer.clone(), class, common);
             if let Some(old) = lock(&slot.current).replace(session.clone()) {
                 old.close();
@@ -1024,6 +1036,7 @@ impl PeerSessions {
         header: ChargedBytes,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         deadline: Instant,
+        required: Option<PeerFeature>,
         mut probe_resolving: Option<&mut bool>,
         phase: &mut RaftTransportPhase,
     ) -> Result<RawReply, RequestError> {
@@ -1040,10 +1053,14 @@ impl PeerSessions {
                 .await?
             {
                 Route::Session(session) => session,
+                Route::OneShot(_) if required.is_some() => return Err(RequestError::Unreachable),
                 Route::OneShot(stream) => {
                     return one_shot(*stream, hello, header, sections, class, common, phase).await;
                 }
             };
+            if required.is_some_and(|feature| !session.supports(feature)) {
+                return Err(RequestError::Unreachable);
+            }
             match session
                 .call(hello, &header, &sections, deadline, phase)
                 .await
@@ -1107,7 +1124,7 @@ async fn connect(
         .await
         .map_err(|_| RequestError::Unreachable)?;
     let alpn = stream.get_ref().1.alpn_protocol();
-    let supported = alpn == Some(ALPN) || common.sessions_enabled && alpn == Some(SESSION_ALPN);
+    let supported = alpn == Some(ALPN) || common.sessions_enabled && session_alpn(alpn);
     if !supported || peer_digest(stream.get_ref().1.peer_certificates())? != peer.certificate_sha256
     {
         return Err(malformed("target certificate or ALPN differs").into());

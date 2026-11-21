@@ -475,6 +475,9 @@ impl LocalServices {
             } else {
                 &placements.control
             };
+            let data_raft = registered_raft_config();
+            #[cfg(test)]
+            let data_raft = crate::oltp_growth_acceptance::snapshot_test_config(data_raft);
             let factory = DataGroupFactory::new(
                     manager.clone(),
                     worker.pool.clone(),
@@ -484,7 +487,7 @@ impl LocalServices {
                     control.clone(),
                     rpc.clone(),
                     status_topology.clone(),
-                    registered_raft_config(),
+                    data_raft,
                 )?;
             if let Some(record) = &worker.system_replacement {
                 factory.host_replacement_data(record).await?;

@@ -1,14 +1,16 @@
 # Events SDK and OLAP sink acceptance
 
-Run the SDK wire tests and the sink process fixture inside Docker. The sink
-fixture takes Linux binaries for Events and the OLAP-enabled `nabedra-db`. It
-runs a real Events broker plus the database API and workers on loopback. The
-database uses the repository's local SQLite conditional object store.
+These tests cover the Python Events client's wire protocol and the OLAP sink.
+Both run inside Docker. The sink test starts a real Events broker and a
+database API with its workers, all on loopback, from Linux builds of
+`nabedra-events` and the OLAP `nabedra-db`. The database stores its objects in
+the repository's local SQLite object store, which supports conditional writes.
 
-From the repository root, set `EVENTS_BIN_DIR` and `OLAP_BIN_DIR` to absolute
-paths to directories containing `nabedra-events` and `nabedra-db`, respectively.
-Adjust the CPU and memory limits to fit the current Docker host. Use an output
-directory separate from the read-only repository mount.
+From the repository root, set `EVENTS_BIN_DIR` to an absolute path to the
+directory that holds `nabedra-events`, and `OLAP_BIN_DIR` to the one that holds
+`nabedra-db`. Change the CPU and memory limits to fit your Docker host. The
+repository is mounted read-only, so write the evidence to a separate
+directory:
 
 ```sh
 mkdir -p /tmp/nabedra-events-sink
@@ -24,9 +26,9 @@ docker run --rm --network none --cpus 1.5 --memory 768m --memory-swap 768m \
   '
 ```
 
-Use a Python image with the runtime libraries required by the two binaries.
-The fixture writes binary hashes and completed assertions to the evidence
-file, including when a later assertion fails.
+The Python image must have the runtime libraries the two binaries need. The
+evidence file records the hash of each binary and every assertion that
+passed, even when a later one fails.
 
 | Test | Required observations |
 | --- | --- |
@@ -35,10 +37,13 @@ file, including when a later assertion fails.
 | EV04 worker recovery | Observe an accepted write at a worker-side barrier. Restart the API and recover the same receipt after losing the scheduler worker. Stop the last worker with another accepted write held and check its abandonment, prior durable decisions and the sink's fresh request. |
 | EV04 sink limit and destination checks | Hold the global permit while another partition polls. When released, both writes complete. A replaced table UUID, incompatible schema or conflicting row identity leaves the affected checkpoint unchanged. |
 
-The worker recovery case targets the API restart and surviving-copy behavior
-of Q04 and R01, and the complete shutdown behavior of R04. The lost OLAP
-reply is at the public API boundary after commit. The sink limits its own
-submissions. The scheduler's queue count and byte saturation, multi-API
-identity races, receipt-result expiration, object-store catalog response
-loss, stale-run catalog PUT fencing, same-process and distributed parity,
-and malformed traffic during scheduler saturation require distinct fixtures.
+The worker recovery case covers the API restart and surviving-copy behavior
+of scenarios Q04 and R01, and the full-shutdown behavior of R04. The lost OLAP
+reply happens at the public API, after the commit. The sink limit here is the
+sink's own limit on its submissions, not the scheduler's.
+
+These tests don't cover the following, which each need their own fixture:
+scheduler saturation by queue count and bytes, identity races between several
+APIs, receipt results expiring, lost object store responses for the catalog,
+fencing of catalog PUTs from a stale run, parity between same-process and
+distributed runs, and malformed traffic while the scheduler is saturated.

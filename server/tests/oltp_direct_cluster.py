@@ -199,7 +199,7 @@ def announcement(process, timeout=60):
 class Rf3Cluster:
     def __init__(self, binary, root, *, test_executable=None, direct=None, api_direct=(True,),
                  worker_env=None, key_type='ed25519', worker_memory=2048 * MIB, mounts=False,
-                 status_partitions=1):
+                 status_partitions=1, test_child=CHILD):
         self.binary = str(Path(binary).resolve())
         # Cold start (D09) requires each pool on its own Docker-profile mount
         # (`cold::validate`). With `mounts`, every worker directory is a tmpfs
@@ -207,6 +207,7 @@ class Rf3Cluster:
         self.mounts = mounts
         self.mounted = []
         self.test_executable = str(Path(test_executable).resolve()) if test_executable else None
+        self.test_child = test_child
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.direct = dict(direct or {name: True for name in WORKERS})
@@ -320,8 +321,8 @@ class Rf3Cluster:
         return sys.platform.startswith('linux') and subprocess.run(
             ['sudo', '-n', 'true'], capture_output=True, timeout=30).returncode == 0
 
-    def mount_pool(self, name, pool_id, enrollment):
-        directory = self.root / name / 'data'
+    def mount_pool(self, name, pool_id, enrollment, *, directory=None):
+        directory = directory or self.root / name / 'data'
         directory.mkdir(parents=True, exist_ok=True)
         subprocess.run(['sudo', '-n', 'mount', '-t', 'tmpfs', '-o',
                         f'size=2g,mode=0700,uid={os.getuid()},gid={os.getgid()}', 'tmpfs', str(directory)],
@@ -349,7 +350,7 @@ class Rf3Cluster:
             barriers = self.root / 'barriers' / name
             barriers.mkdir(parents=True, exist_ok=True)
             env.update(NABEDRA_OLTP_TEST_REGISTERED_CONFIG=str(path), NABEDRA_OLTP_TEST_BARRIER_DIR=str(barriers))
-            command = [self.test_executable, '--exact', CHILD, '--ignored', '--nocapture']
+            command = [self.test_executable, '--exact', self.test_child, '--ignored', '--nocapture']
         else:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
         self.workers[name] = Process(name, command, env, self.root / f'{name}.log')

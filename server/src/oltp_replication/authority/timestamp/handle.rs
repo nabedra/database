@@ -29,6 +29,31 @@ struct ReleasePause {
     resume: Arc<tokio::sync::Notify>,
 }
 impl TimestampHandle {
+    pub(crate) async fn advance_floor(
+        &self,
+        authority: Authority,
+        retired_at: Option<CommitTs>,
+    ) -> Result<u64, ProtocolError> {
+        let safe_ts = self.advance_floor_once(authority).await?;
+        if retired_at.is_some_and(|retired_at| retired_at.get() == safe_ts) {
+            // An idle cluster's last allocation can be the retirement itself.
+            // Move the watermark through the existing, capability-gated allocator.
+            self.allocate_direct(1).await?;
+            return self.advance_floor_once(authority).await;
+        }
+        Ok(safe_ts)
+    }
+
+    async fn advance_floor_once(&self, authority: Authority) -> Result<u64, ProtocolError> {
+        match self
+            .submit(TimestampCommand::AdvanceFloor { authority })
+            .await?
+            .reply
+        {
+            TimestampReply::Retention { safe_ts, .. } => Ok(safe_ts),
+            reply => Err(rejected(reply)),
+        }
+    }
     pub(crate) async fn begin_import_metadata(
         &self,
         authority: Authority,

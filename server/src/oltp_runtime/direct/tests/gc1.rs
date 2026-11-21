@@ -13,6 +13,10 @@
 //! ```
 //!
 //! Every line printed with the `GC1 ` prefix is one JSON record.
+//!
+//! GC2: `GC1_BATCH=off,on` runs every phase without and with
+//! `data.direct.batch` (one `DirectBatch` entry for the commits that arrive
+//! while a range's proposal is in flight), on the same runner and binary.
 use super::*;
 use std::collections::{BTreeSet, HashMap};
 
@@ -41,6 +45,8 @@ pub(super) struct Measure {
     table: Uuid,
     _dir: Dir,
     driver_threads: BTreeSet<u32>,
+    /// GC2: flips `data.direct.batch` on the leader's executor.
+    gate: Arc<Gate>,
 }
 
 /// The tids of this process (Linux only; empty elsewhere).
@@ -159,7 +165,11 @@ impl Measure {
                 .map(|worker| (worker.worker_id, worker.clone()))
                 .collect(),
         ));
-        let gate: Arc<Gate> = Arc::new(Gate(AtomicBool::new(true), AtomicBool::new(false)));
+        let gate: Arc<Gate> = Arc::new(Gate(
+            AtomicBool::new(true),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ));
         let schema = Arc::new(StaticSchema::default());
         schema.insert(DirectTable {
             descriptor: descriptor(table),
@@ -302,6 +312,7 @@ impl Measure {
             });
         }
         let measure = Self {
+            gate: gate.clone(),
             voters,
             groups,
             spans,
@@ -668,6 +679,9 @@ async fn phase(
         },
         "entries_per_append": if appends == 0 { 0.0 } else { applied as f64 / appends as f64 },
         "direct_entries_proposed": direct_after.entries_proposed - direct_before.entries_proposed,
+        "direct_batch_entries": direct_after.batch_entries - direct_before.batch_entries,
+        "direct_batched_commits": direct_after.batched_commits - direct_before.batched_commits,
+        "data_entries_per_write": if ok == 0 { 0.0 } else { applied as f64 / 3.0 / requests as f64 },
         "stages": stages,
         "storage": storage,
     })
@@ -701,11 +715,21 @@ fn gc1_measure_direct_write_cost() {
         .split(',')
         .map(|mode| mode.trim() == "on")
         .collect();
+    let batches: Vec<bool> = std::env::var("GC1_BATCH")
+        .unwrap_or_else(|_| "off".to_owned())
+        .split(',')
+        .map(|mode| mode.trim() == "on")
+        .collect();
+    let modes: Vec<(bool, bool)> = modes
+        .iter()
+        .flat_map(|coalesce| batches.iter().map(move |batch| (*coalesce, *batch)))
+        .collect();
     runtime.block_on(async {
-        for coalesce in modes {
+        for (coalesce, batch) in modes {
             crate::oltp_replication::typed_log::COALESCE_APPENDS.store(coalesce, Ordering::Relaxed);
             for &ranges in &ranges {
                 let measure = Measure::new(ranges as usize, rows).await;
+                measure.gate.2.store(batch, Ordering::Release);
                 measure.seed(rows).await;
                 // Warm up the sessions, caches and the timestamp client.
                 let _ = phase(&measure, 50.0, 2.0, 0, rows, 0).await;
@@ -726,6 +750,7 @@ fn gc1_measure_direct_write_cost() {
                 }
                 for mut record in records {
                     record["coalesce_appends"] = serde_json::json!(coalesce);
+                    record["direct_batch"] = serde_json::json!(batch);
                     println!("\nGC1 {record}");
                 }
                 measure.shutdown().await;

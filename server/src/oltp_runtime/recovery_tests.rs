@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 pub(crate) mod index_faults;
 pub(crate) mod index_holds;
+pub(crate) mod maintenance;
+pub(crate) mod pool_sync;
 
 struct Barrier {
     stage: String,
@@ -698,6 +700,8 @@ async fn replacement_peer_probe(config: PathBuf) {
         control_actor: Option<WorkerEnrollment>,
         #[serde(default)]
         revoked_bootstrap_peer: Option<Uuid>,
+        #[serde(default)]
+        queue_view: Option<crate::oltp_replication::types::AuthorityView>,
     }
     struct Routes(Vec<Uuid>);
     impl ControlRoutes for Routes {
@@ -731,6 +735,62 @@ async fn replacement_peer_probe(config: PathBuf) {
         shared.clone(),
     )
     .unwrap();
+    if let Some(view) = config.queue_view {
+        use super::{replica::QueueScope, worker_endpoint::QueueRequest};
+        use crate::oltp_replication::multiplex::RequestError;
+
+        let [target] = config.targets.as_slice() else {
+            panic!("queue enrollment probe requires one target");
+        };
+        // The fixture pins the outbound receiver. The real receiver checks
+        // the caller against its applied Control enrollment.
+        directory
+            .install_system_trust(1, config.targets.clone(), None, false, false)
+            .unwrap();
+        for stale in [false, true] {
+            let mut enrollment = config.from.clone();
+            if stale {
+                enrollment.incarnation = Uuid::new_v4();
+            }
+            let client = WorkerTransport::new(
+                &enrollment,
+                &tls,
+                shared.clone(),
+                directory.clone(),
+                Arc::new(EndpointRegistry::new(shared.clone())),
+                TransportConfig::default(),
+            )
+            .unwrap()
+            .client();
+            let ping = QueueRequest::Ping {
+                scope: QueueScope {
+                    cluster_id: config.group.cluster_id,
+                    database: config.group.database.clone(),
+                },
+                view,
+            };
+            let header = shared.encode_in(ByteClass::Progress, &ping, 4096).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                client.request_classified(
+                    &config.group,
+                    WorkerIdentity::from(target),
+                    Purpose::QueueControl,
+                    header,
+                    [None, None, None],
+                    16 << 10,
+                ),
+            )
+            .await
+            .expect("queue peer probe watchdog");
+            if stale {
+                assert!(matches!(result, Err(RequestError::Unreachable)));
+            } else {
+                assert!(result.is_ok(), "current enrollment's queue ping failed");
+            }
+        }
+        return;
+    }
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
     let transport = Arc::new(
         WorkerTransport::new(
