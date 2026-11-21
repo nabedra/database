@@ -25,10 +25,10 @@ PYTHONDONTWRITEBYTECODE=1 python3.11 scripts/local-kind/docker_checks.py olap \
 | ST05/A02 | Passed | The original stream replayed batch zero byte for byte after the drain. It then returned the exact next row and EOF. |
 | AWS provider topology | Not run | LIVE3 uses local Docker with an isolated network. |
 
-The Linux OLAP release binary at `a5ebd056de0cafba437637f657c90ed724246ba7`
-had SHA-256 `98da8fc1616168f3de6c8a7b47373e3f8f3a2eee03292394ee501f8a5a77ede9`.
-The container exited zero after 20.35 seconds. Peak observed Docker VM use was
-787,861,504 bytes. Cleanup confirmed the container was absent before the
+The Linux OLAP release binary at `20c102659f058c6a512cb1b924087032ea07a44d`
+had SHA-256 `d1258ad5f7d28020dd3b9d5de36e10971317bfaf699120d539975ce94485abb9`.
+The container exited zero after 49.82 seconds. Peak observed Docker VM use was
+1,038,258,176 bytes. Cleanup confirmed the container was absent before the
 Docker lane was released.
 [Raw assertions](olap-output.txt) · [Session trace](trace.jsonl) ·
-[Linux build](https://github.com/zPy52/nabedra-database/actions/runs/44923954740)
+[Linux build](https://github.com/zPy52/nabedra-database/actions/runs/44929728236)

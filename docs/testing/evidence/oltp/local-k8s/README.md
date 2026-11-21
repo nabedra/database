@@ -1,9 +1,9 @@
 # LIVE3 local kind OLTP
 
-The local cluster uses one control plane and three worker nodes on Docker
-Desktop. The worker nodes have zone labels `a`, `b`, and `c`. The API runs
-separately. Each registered system voter has a dedicated StatefulSet and a
-`ReadWriteOncePod` PVC. The experiment uses the Docker mount profile and the
+The driver creates one control plane and three worker nodes on Docker
+Desktop. The worker nodes have zone labels `a`, `b`, and `c`. The driver
+starts the API separately and gives each registered system voter a dedicated
+StatefulSet and a `ReadWriteOncePod` PVC. It uses the Docker mount profile and the
 [retained-worker restart procedure](../../../../oltp-recovery.md).
 
 The pinned Kubernetes host-path CSI setup gives each zone its own instance of
@@ -42,7 +42,9 @@ Run again with `--scenario storage` and a fresh output directory for the
 host-path PVC and CSI error checks. Use `--scenario scale` for the local
 Docker data worker and drain permit check. To try the independent ext4
 volumes, render the pinned chart with Helm and replace `--csi-source` with
-`--rawfile-manifest "$LIVE3_WORK/rawfile.yaml"` for the storage run.
+`--rawfile-manifest "$LIVE3_WORK/rawfile.yaml"` for the storage run. Use
+`--scenario preflight` with that manifest to exercise one CSI volume before
+starting Nabedra.
 
 ```sh
 scripts/local-kind/prepare-rawfile.sh "$LIVE3_WORK"
@@ -52,3 +54,23 @@ The driver uses a dedicated kubeconfig and a unique kind cluster name,
 collects timing and storage observations, and removes the cluster before
 releasing the lane. The standard OLTP acceptance runner leaves O18 and O27
 incomplete when their real-cloud clauses are unavailable.
+
+## Recorded attempts
+
+The first local control plane reached RF3 worker startup with three bound
+PVCs and three attached `VolumeAttachment` records, one per zone. The
+separate API failed to open because its peer and HTTP bind settings overlapped.
+The fixture now assigns separate ports. This attempt preceded the hardening
+merge at `bb6dc32`. [Startup output](startup-retry/trace.jsonl) ·
+[Storage snapshot](startup-retry/storage.txt)
+
+The post-merge attempt used the release and test artifacts at
+`20c102659f058c6a512cb1b924087032ea07a44d`. Kubeadm timed out creating
+the administrator ClusterRoleBinding before any CSI or Nabedra workload
+started. The run removed all nodes and released the lane. Peak sampled VM
+use was 1,372,762,112 bytes. [Bootstrap output](post-merge-bootstrap/kind-create.txt) ·
+[Cleanup trace](post-merge-bootstrap/trace.jsonl)
+
+Two Rawfile probes also stopped during infrastructure setup. Neither
+created a PVC. [Rawfile attempts](rawfile-attempts/) ·
+[CI test transcripts](ci-test-results.txt)

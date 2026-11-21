@@ -49,7 +49,7 @@ def validated(view, primaries=None):
     return True
 
 
-def read(fleet, node, key, expected, stopped=()):
+def read(fleet, node, key, expected, stopped=(), transport_errors=None):
     ports = {port: member for member, (port, _) in fleet.workers.items()}
     while node not in stopped:
         stopped = (*stopped, node)
@@ -59,15 +59,16 @@ def read(fleet, node, key, expected, stopped=()):
         except MovedError as error:
             node = ports[error.port]
             continue
-        except fixture.TRANSPORT:
+        except fixture.TRANSPORT as error:
+            if transport_errors is not None:
+                transport_errors.append(type(error).__name__)
             return False
         assert value == expected, (node, key, value, expected)
         return True
     return False
 
 
-def zone_loss(fleet, path, topology):
-    survivor_names = ['c2', 'c3', 'w2', 'w3']
+def seed_rows(fleet, topology):
     keys = fixture.keys_for(topology)
     values = {node: f'zone-test-{node}'.encode() for node in keys}
     for node, key in keys.items():
@@ -80,6 +81,11 @@ def zone_loss(fleet, path, topology):
         fixture.wait('replica has writing prefix', lambda: (
             (progress := fleet.progress(replica, slot)) and progress['baseline']
             and progress['epoch'] == primary['epoch'] and progress['sequence'] >= primary['sequence']))
+    return keys, values
+
+
+def zone_loss(fleet, path, topology, keys, values):
+    survivor_names = ['c2', 'c3', 'w2', 'w3']
     stop = threading.Event()
     times, errors = [], []
 
@@ -128,7 +134,15 @@ def zone_loss(fleet, path, topology):
             record(path, 'K04b zone resume issued', zone='az-1')
             fleet.resume('c1')
             fleet.resume('w1')
-        fleet.wait_placement(validated, seconds=60)
+        try:
+            fleet.wait_placement(validated, seconds=60)
+        except AssertionError:
+            final = fleet.status() or {}
+            record(path, 'K04b replica restoration timeout',
+                   ready_primaries=final.get('ready_primaries'), ready_replicas=final.get('ready_replicas'),
+                   members={name: dict(zone=member['zone'], incarnation=member['id']['incarnation'])
+                            for name, member in final.get('workers', {}).items()})
+            raise
     finally:
         stop.set()
         worker.join(timeout=12)
@@ -185,17 +199,19 @@ def grow_and_drain(fleet, path, keys, values, count):
 
 def repeated_growth_under_load(fleet, path, keys, values):
     stop = threading.Event()
-    observed, failures = [], []
+    observed, failures, cycles = [], [], []
 
     def load():
         try:
             while not stop.is_set():
                 for node, key in keys.items():
                     started = time.monotonic()
-                    ok = read(fleet, node, key, values[node])
+                    errors = []
+                    ok = read(fleet, node, key, values[node], transport_errors=errors)
                     observed.append(ok)
                     record(path, 'K05 live read', owner=node, success=ok,
-                           latency_ms=round((time.monotonic() - started) * 1000, 3))
+                           latency_ms=round((time.monotonic() - started) * 1000, 3),
+                           transport_errors=errors)
                     if stop.wait(0.25):
                         return
         except BaseException as error:
@@ -209,20 +225,23 @@ def repeated_growth_under_load(fleet, path, keys, values):
             before = len(observed)
             grow_and_drain(fleet, path, keys, values, count)
             during = observed[before:]
-            assert during and all(during), (count, len(during), failures)
-            record(path, 'K05 exact live reads across growth and drain', groups=count, reads=len(during))
+            result = dict(groups=count, reads=len(during), failed_reads=during.count(False))
+            cycles.append(result)
+            record(path, 'K05 live reads across growth and drain', **result)
     finally:
         stop.set()
         worker.join(timeout=12)
     assert not worker.is_alive()
     if failures:
         raise failures[0]
+    assert all(cycle['reads'] and not cycle['failed_reads'] for cycle in cycles), cycles
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--phase', choices=('all', 'zone', 'growth'), default='all')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as temp, ExitStack() as scope:
@@ -236,8 +255,11 @@ def main():
             UUID(member['id']['incarnation']).int for member in view['workers'].values()))
         fleet.apply('init', '--groups', '3')
         topology = fleet.wait_placement(lambda view: validated(view, 3), seconds=70)
-        keys, values = zone_loss(fleet, args.output, topology)
-        repeated_growth_under_load(fleet, args.output, keys, values)
+        keys, values = seed_rows(fleet, topology)
+        if args.phase in ('all', 'zone'):
+            zone_loss(fleet, args.output, topology, keys, values)
+        if args.phase in ('all', 'growth'):
+            repeated_growth_under_load(fleet, args.output, keys, values)
 
 
 if __name__ == '__main__':

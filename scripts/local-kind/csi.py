@@ -5,7 +5,6 @@ import yaml
 
 ZONES = 'abc'
 ZONE_LABEL = 'topology.kubernetes.io/zone'
-RELEASE = '6fab18ae4fc4f486193b618114eeb817d9929242'
 CSI_LIMIT = '10737418240'
 
 

@@ -20,7 +20,7 @@ from csi import CSI_LIMIT, ZONES, ZONE_LABEL, documents, driver_for, manifests
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / 'server/tests'))
-from oltp_direct_cluster import (CHILD, DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Rf3Cluster,
+from oltp_direct_cluster import (CHILD, DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Http, Rf3Cluster,
                                  call, operation, resources, uid, write_json)
 from oltp_recovery_operations import (TRANSPORT_ERRORS, create, get, initial_range, insert, send,
                                       success, wait_for)
@@ -36,10 +36,22 @@ RETRYABLE = (429, 503, 504)
 
 
 def run(*args, input=None, timeout=45, check=True):
-    result = subprocess.run(args, check=False, text=True, capture_output=True, input=input, timeout=timeout)
+    with subprocess.Popen(args, text=True, stdin=subprocess.PIPE if input is not None else None,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
+        try:
+            stdout, stderr = child.communicate(input, timeout=timeout)
+        except BaseException:
+            # kind invokes docker as a child. Reap the whole command group on timeout.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate()
+            raise
+    result = subprocess.CompletedProcess(args, child.returncode, stdout, stderr)
     if check and result.returncode:
-        raise RuntimeError(f'{args!r} exited {result.returncode}\n{result.stdout}{result.stderr}')
-    return result.stdout if check else result
+        raise RuntimeError(f'{args!r} exited {result.returncode}\n{stdout}{stderr}')
+    return stdout if check else result
 
 
 class Evidence:
@@ -109,31 +121,39 @@ class Kind:
         self.kube('apply', '-f', '-', input=json.dumps(dict(apiVersion='v1', kind='List',
                                                            items=definitions)))
 
-    def start(self, csi_source, node_image, archives, csi_images):
+    def start(self, csi_source, node_image, archives, csi_images, *, preflight=False):
         for archive in archives:
             self.evidence.file(archive.name + '.load.txt', run('docker', 'load', '-i', str(archive), timeout=180))
         self.evidence.record('kind-create', cluster=self.name, node_image=node_image)
         result = run('kind', 'create', 'cluster', '--name', self.name, '--kubeconfig', str(self.kubeconfig),
                      '--config', str(HERE / 'kind.yaml'), '--image', node_image, '--wait', '150s',
+                     '--retain',
                      timeout=420, check=False)
         self.evidence.file('kind-create.txt', result.stdout + result.stderr)
-        assert result.returncode == 0, (result.stdout, result.stderr)
+        if result.returncode:
+            self.bootstrap_diagnostics()
+            raise RuntimeError(f'kind create exited {result.returncode}, see kind-create.txt')
         self.kube('create', 'namespace', NS)
         nodes = self.obj('nodes', namespaced=False)['items']
         self.nodes = {node['metadata']['labels'][ZONE_LABEL]: node['metadata']['name'] for node in nodes
                       if ZONE_LABEL in node['metadata']['labels']}
         assert set(self.nodes) == set(ZONES) and len(nodes) == 4, self.nodes
         self.evidence.file('kind-nodes.txt', self.kube('get', 'nodes', '-o', 'wide', '-L', ZONE_LABEL))
+        probe_node = self.nodes['a'] if self.rawfile and preflight else None
         for archive in csi_images:
-            result = run('kind', 'load', 'image-archive', str(archive), '--name', self.name,
-                         check=False, timeout=150)
+            target = ('--nodes', probe_node) if probe_node else ()
+            result = run('kind', 'load', 'image-archive', str(archive), '--name', self.name, *target,
+                         check=False, timeout=300)
             self.evidence.file(archive.name + '.import.txt', result.stdout + result.stderr)
             assert result.returncode == 0, (archive, result.stderr)
         if self.rawfile:
             definitions = [item for item in documents(self.rawfile) if item]
+            workloads = [item for item in definitions if item['kind'] in ('DaemonSet', 'Deployment')]
+            if probe_node:
+                for workload in workloads:
+                    workload['spec']['template']['spec']['nodeSelector'] = {ZONE_LABEL: 'a'}
             self.apply(*definitions)
-            targets = [f"{item['kind'].lower()}/{item['metadata']['name']}" for item in definitions
-                       if item['kind'] in ('DaemonSet', 'Deployment')]
+            targets = [f"{item['kind'].lower()}/{item['metadata']['name']}" for item in workloads]
         else:
             self.apply(*manifests(csi_source))
             targets = [f'statefulset/csi-hostpathplugin-{zone}' for zone in ZONES]
@@ -151,7 +171,7 @@ class Kind:
         self.images.append(tag)
         self.evidence.file(f'{engine}-image.txt', run('docker', 'build', '--pull=false', '-t', tag,
             '--build-arg', 'RUNTIME_IMAGE=' + base_image, '-f', str(HERE / 'Dockerfile'), str(stage), timeout=120))
-        run('kind', 'load', 'docker-image', '--name', self.name, tag, timeout=150)
+        run('kind', 'load', 'docker-image', '--name', self.name, tag, timeout=300)
         return tag
 
     def watch_memory(self, stop):
@@ -188,6 +208,19 @@ class Kind:
         for name in (*[f'{worker}-0' for worker in WORKERS], 'api'):
             result = self.in_namespace('logs', name, '--all-containers=true', '--tail=120', check=False)
             self.evidence.file(f'{name}.log', result.stdout + result.stderr)
+
+    def bootstrap_diagnostics(self):
+        result = run('docker', 'exec', self.control, 'journalctl', '-u', 'kubelet',
+                     '--no-pager', '-n', '100', timeout=20, check=False)
+        self.evidence.file('kubelet-bootstrap.log', result.stdout + result.stderr)
+        for component in ('etcd', 'kube-apiserver'):
+            containers = run('docker', 'exec', self.control, 'crictl', 'ps', '-a', '-q',
+                             '--name', component, timeout=15, check=False)
+            if containers.returncode == 0 and containers.stdout.strip():
+                container_id = containers.stdout.split()[0]
+                result = run('docker', 'exec', self.control, 'crictl', 'logs', '--tail=80',
+                             container_id, timeout=15, check=False)
+                self.evidence.file(f'{component}-bootstrap.log', result.stdout + result.stderr)
 
     def close(self):
         if self.rawfile and self.kubeconfig.exists():
@@ -693,10 +726,10 @@ class Traffic:
     def op(self, body):
         return self.topology.exchange('/v1/operations', body)
 
-    def invoke(self, kind, path, body):
+    def invoke(self, client, kind, path, body):
         started = time.monotonic()
         try:
-            status, reply = self.topology.exchange(path, body, timeout=7)
+            status, reply = client.exchange(path, body)
         except TRANSPORT_ERRORS as error:
             status, reply = None, {'transport': repr(error)}
         finished = time.monotonic()
@@ -706,32 +739,32 @@ class Traffic:
         assert status in (200, 202, None, *RETRYABLE), (status, reply)
         return finished, status, reply
 
-    def write_load(self):
+    def write_load(self, client):
         for key in range(1, 20000):
             if self.stop.is_set():
                 return
             body = insert(self.table, key, key * 3)
             started = time.monotonic()
-            _, status, reply = self.invoke('write', '/v1/operations', body)
+            _, status, reply = self.invoke(client, 'write', '/v1/operations', body)
             if status == 200:
                 assert reply == {'request_id': body['request_id'], 'data': None}, reply
             self.writes.append((body, reply if status == 200 else None, started))
             self.stop.wait(0.2)
 
-    def read_load(self):
+    def read_load(self, client):
         while not self.stop.is_set():
-            end, status, reply = self.invoke('read', '/v1/operations', get(self.probe_table, 0))
+            end, status, reply = self.invoke(client, 'read', '/v1/operations', get(self.probe_table, 0))
             if status == 200:
                 assert reply['data'] == {'id': 0, 'value': 777}, reply
                 self.read_times.append(end)
             self.stop.wait(0.25)
 
-    def queue_load(self):
+    def queue_load(self, client):
         for key in range(-1, -2000, -1):
             if self.stop.is_set():
                 return
             body = insert(self.table, key, key * 3)
-            _, status, reply = self.invoke('queued-write', '/v1/requests', body)
+            _, status, reply = self.invoke(client, 'queued-write', '/v1/requests', body)
             if status == 202:
                 assert reply == dict(request_id=body['request_id'], run_id=self.topology.run_id, state='queued'), reply
             self.receipts.append((body, status))
@@ -739,8 +772,16 @@ class Traffic:
 
     @contextmanager
     def load(self):
+        def persistent(action):
+            client = Http(self.topology.api_urls['api1'], self.topology.auth['data_token'],
+                          timeout=7, ca=self.topology.ca)
+            try:
+                action(client)
+            finally:
+                client.close()
+
         with ThreadPoolExecutor(3) as pool:
-            tasks = [pool.submit(action) for action in (self.write_load, self.read_load, self.queue_load)]
+            tasks = [pool.submit(persistent, action) for action in (self.write_load, self.read_load, self.queue_load)]
             try:
                 wait_for(lambda: self.writes and self.read_times and any(status == 202 for _, status in self.receipts),
                          'write, independent read and receipt before lifecycle fault', 30)
@@ -1087,6 +1128,49 @@ def oltp(cluster, binary, image, scenario, test_executable):
             cluster.evidence.record('O18 Data placement RF3', group=group, placement=after)
 
 
+def preflight_filesystem(cluster, image):
+    # This provider probe needs no Nabedra binary. It checks the kernel and CSI
+    # prerequisites before an isolated filesystem is used for the storage run.
+    run('kind', 'load', 'docker-image', '--name', cluster.name, '--nodes', cluster.nodes['a'], image, timeout=300)
+    name = 'ext4-preflight'
+    claim = object_meta('PersistentVolumeClaim', name, spec=dict(
+        accessModes=['ReadWriteOncePod'], storageClassName='rawfile-localpv',
+        resources={'requests': {'storage': '256Mi'}}))
+    pod = object_meta('Pod', name, spec=dict(restartPolicy='Never', nodeSelector={ZONE_LABEL: 'a'},
+        containers=[dict(name='probe', image=image, command=['sleep', '600'],
+                         volumeMounts=[dict(name='volume', mountPath='/probe')])],
+        volumes=[dict(name='volume', persistentVolumeClaim={'claimName': name})]))
+    cluster.apply(claim, pod)
+    cluster.in_namespace('wait', f'pod/{name}', '--for=condition=Ready', '--timeout=100s', timeout=110)
+
+    def exec_probe(*args, **options):
+        return cluster.in_namespace('exec', name, '--', *args, **options)
+
+    def size():
+        return int(exec_probe('df', '-kP', '/probe').splitlines()[-1].split()[1])
+
+    original = cluster.obj('pod', name)['metadata']['uid']
+    before = size()
+    exec_probe('sh', '-ec', 'echo live3-ext4 > /probe/sentinel && sync /probe/sentinel')
+    patch = json.dumps({'spec': {'resources': {'requests': {'storage': '512Mi'}}}})
+    for _ in range(2):
+        cluster.in_namespace('patch', f'pvc/{name}', '--type=merge', '-p', patch)
+    wait_for(lambda: cluster.obj('pvc', name)['status']['capacity']['storage'] == '512Mi',
+             'CSI published the expanded capacity', 110)
+    after = size()
+    assert after - before > 240_000 and cluster.obj('pod', name)['metadata']['uid'] == original
+    assert exec_probe('cat', '/probe/sentinel').strip() == 'live3-ext4'
+    free = int(exec_probe('df', '-kP', '/probe').splitlines()[-1].split()[3])
+    exec_probe('fallocate', '-l', str((free - 64) * 1024), '/probe/fill')
+    overflow = exec_probe('fallocate', '-l', '64MiB', '/probe/overflow', check=False)
+    assert overflow.returncode != 0 and 'No space left on device' in overflow.stderr, overflow.stderr
+    assert exec_probe('cat', '/probe/sentinel').strip() == 'live3-ext4'
+    exec_probe('rm', '-f', '/probe/fill', '/probe/overflow')
+    cluster.evidence.record('O27 rawfile provider filesystem probe', status='passed', pod_uid=original,
+                            filesystem_before_kib=before, filesystem_after_kib=after,
+                            pvc_before='256Mi', pvc_after='512Mi', overflow=overflow.stderr.strip())
+
+
 def interrupted(signum, _frame):
     if signum == signal.SIGUSR1:
         raise RuntimeError('Docker VM topped the 7 GiB budget')
@@ -1138,9 +1222,12 @@ def main():
             observer.start()
             try:
                 csi_images = sorted(args.csi_archive_dir.glob('*.tar')) if args.csi_archive_dir else ()
-                cluster.start(args.csi_source, args.node_image, args.load_archive, csi_images)
+                cluster.start(args.csi_source, args.node_image, args.load_archive, csi_images,
+                              preflight=args.scenario == 'preflight')
                 if args.scenario == 'preflight':
                     evidence.record('kind CSI preflight', status='passed', zones=cluster.nodes)
+                    if cluster.rawfile:
+                        preflight_filesystem(cluster, args.base_image)
                     return
                 image = cluster.load('oltp', args.binary, args.test_executable, args.base_image)
                 oltp(cluster, args.binary, image, args.scenario, args.test_executable)

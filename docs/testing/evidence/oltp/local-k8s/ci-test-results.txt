@@ -89,3 +89,69 @@ Events job 136914196497
 test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 140.68s
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+GitHub Actions 44929728236 20c102659f058c6a512cb1b924087032ea07a44d
+KV job 136923480852
+test result: ok. 140 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 7.26s
+test result: ok. 6 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 13.00s
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.70s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 24.37s
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 10.53s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+OLTP job 136923481064
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 2.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 1.89s
+assertion `left == right` failed
+left: 2
+right: 1
+perf2b rf1: 20 gets took 21 Query and 22 Control jobs
+Control jobs for 20 gets: 22
+test result: FAILED. 498 passed; 2 failed; 31 ignored; 0 measured; 2 filtered out; finished in 167.12s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.53s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+Events job 136923481097
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 96.79s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+GitHub Actions 44932147881 at f3a0c1e after the C07/F03 assertion correction
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+test oltp::pool::resources::tests::m03_c07_f03_immediate_progress_preserves_fitting_waiter_headroom ... ok
+test oltp::pool::tests::c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_cancelled_native_charges ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 2.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 0.89s
+test oltp_replication::hosted::tests::d01_perf2b_inline_digest_equals_the_native_digest ... ok
+test oltp_replication::multiplex::transport::tests::o14_o22_c07_f03_hostname_lookup_owns_slots_across_cancellations ... ok
+test oltp_replication::multiplex::transport::tests::o14_o22_c07_f03_mtls_progress_survives_held_hostname_lookups ... ok
+test oltp_replication::typed_log::tests::c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_group_vote ... ok
+test oltp_runtime::direct::tests::d01_perf2b_leader_reads_share_one_native_job ... ok
+test oltp_runtime::direct::tests::c07_f03_rv_final_l3_catalog_reads_end_at_the_request_deadline ... ok
+test oltp_runtime::worker_endpoint::tests::c07_f03_o23_read_grant_copy_keeps_transport_outcomes_distinct ... ok
+test oltp_runtime::worker_runtime::direct_gateway::tests::d01_perf2b_rf1_gateway_decodes_a_small_reply_without_native_jobs ... ok
+test scheduling::tests::c07_f03_memory_only_io_and_cancelled_grants_settle_once ... ok
+test result: ok. 500 passed; 0 failed; 31 ignored; 0 measured; 2 filtered out; finished in 182.52s
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 8.49s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement
+  OLTP_BASELINE_SKIPS: --skip c07_m02_native_authority_read_progresses_while_query_owns_all_unreserved_memory --skip o22_c07_f03_failed_receipt_retains_read_pin_until_grant_settlement

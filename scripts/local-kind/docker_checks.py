@@ -72,11 +72,12 @@ def container(scenario, args, evidence, extra, base, command, timeout):
 
 def cache(args, evidence):
     wheels = mount(args.redis_wheel, '/redis-6.4.0-py3-none-any.whl')
-    lifecycle = container('cache-lifecycle', args, evidence, wheels, 'rust:1.94.1-bookworm', '''
+    lifecycle = container('cache-lifecycle', args, evidence,
+                          [*wheels, '-e', 'PHASE=' + args.cache_phase], args.bench_image, '''
         export PYTHONPATH=/redis-6.4.0-py3-none-any.whl
         cp /nabedra-db /tmp/nabedra-db
         chmod 755 /tmp/nabedra-db
-        exec python3 /source/scripts/local-kind/cache_lifecycle.py --binary /tmp/nabedra-db --output /result/history
+        exec python3 /source/scripts/local-kind/cache_lifecycle.py --binary /tmp/nabedra-db --output /result/history --phase "$PHASE"
     ''', 1200)
     if args.scenario == 'cache-lifecycle':
         return lifecycle
@@ -97,8 +98,10 @@ def pair(args, evidence):
         finally:
             remove(name, evidence)
         return container('cache-pair', args, evidence, [
-            *wheels, *mount(reference, '/valkey-server'), '-e', 'REV=' + args.revision,
+            *wheels, *mount(reference, '/valkey-server'), *mount(args.hiredis_wheel, '/wheels/' + args.hiredis_wheel.name),
+            '-e', 'REV=' + args.revision,
         ], args.bench_image, '''
+            python3 -m pip install --no-index --no-deps --disable-pip-version-check /wheels/hiredis-*.whl
             export PYTHONPATH=/redis-6.4.0-py3-none-any.whl
             exec python3 /source/scripts/cache-benchmark/run.py --environment docker \
               --nabedra /nabedra-db --valkey /valkey-server --source-revision "$REV" \
@@ -116,11 +119,15 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--lane', required=True, type=Path)
     parser.add_argument('--redis-wheel', type=Path)
+    parser.add_argument('--hiredis-wheel', type=Path)
     parser.add_argument('--bench-image', default=BENCH)
+    parser.add_argument('--cache-phase', choices=('all', 'zone', 'growth'), default='all')
     parser.add_argument('--load-archive', type=Path)
     args = parser.parse_args()
     if args.scenario.startswith('cache') and not args.redis_wheel:
         parser.error('Cache requires the redis 6.4.0 wheel')
+    if args.scenario in ('cache', 'cache-pair') and not args.hiredis_wheel:
+        parser.error('The paired run requires a Linux x86-64 hiredis 3.2.1 wheel')
     for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1):
         signal.signal(signum, acceptance.interrupted)
     evidence = acceptance.Evidence(args.output)
@@ -132,7 +139,7 @@ def main():
     with acceptance.lane(args.lane, evidence, label):
         if args.load_archive:
             evidence.file('image-load.txt', acceptance.run(
-                'docker', 'load', '-i', str(args.load_archive), timeout=180))
+                'docker', 'load', '-i', str(args.load_archive), timeout=300))
         if args.scenario == 'olap':
             return container('olap', args, evidence, [], PYTHON, '''
                 cp /nabedra-db /tmp/nabedra-db
