@@ -15,7 +15,7 @@ import time
 from uuid import UUID
 
 from oltp_direct_cluster import (DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Rf1Serve,
-                                 Rf3Cluster, call, operation, uid, write_json)
+                                 Rf3Cluster, call, free_port, operation, uid, write_json)
 
 # Includes a Control election and ready-set removal on the CI runner.
 PROBE_WINDOW = 60
@@ -326,6 +326,22 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             status, reply = operator(leader, operation('worker.system_replacement.prepare',
                                                        conflicting, conflicting['id']))
             assert status == 409, (status, reply)
+        replacement = deepcopy(cluster.config[victim])
+        replacement['bind'] = f'127.0.0.1:{free_port()}'
+        replacement['node'].update(
+            directory=fresh_mount['mount_path'], pool_id=fresh_mount['identity']['pool_id'],
+            scheduler_node_id=4, enrollment=fresh, bind=fresh['endpoint'], mount=fresh_mount,
+            certificate=str(cluster.root / 'replacement.pem'),
+            private_key=str(cluster.root / 'replacement.key'), system_replacement=prepared,
+        )
+        cluster.config['replacement'] = replacement
+        cluster.launch_worker('replacement')
+        cluster.wait_workers(names=('replacement',))
+        for plan in prepared['groups']:
+            route = cluster.admin('storage.replica.placement', {'group': plan['expected']['identity']},
+                                  worker='replacement')
+            assert len(route['members']) == 3 and plan['learner'] in route['members'], route
+            assert all(member['worker_id'] != previous['worker_id'] for member in route['members']), route
         assert send_op(acknowledged) == original
         assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
         receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
