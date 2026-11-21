@@ -2,7 +2,7 @@
 # See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
 # pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
 # Opt-in checks: put [ci docker], [ci campaign], [ci acceptance], [ci direct], [ci rep1]
-# or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
+# [ci migrate] or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
 # [ci rep1] to build the pre-execution worker and test mixed-version enrollment.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
@@ -41,6 +41,10 @@ on:
         default: false
       direct:
         description: Direct point path D01-D12 and suites with direct_oltp on/off (T9)
+        type: boolean
+        default: false
+      migrate:
+        description: RocksDB-era RF3 archive export and RF3 restore (MIG2)
         type: boolean
         default: false
 
@@ -637,6 +641,63 @@ jobs:
         with:
           name: oltp-acceptance
           path: artifacts/oltp-acceptance
+          retention-days: 14
+
+  migrate:
+    name: RocksDB-era OLTP archive upgrade (MIG2)
+    if: inputs.migrate || contains(github.event.head_commit.message, '[ci migrate]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: b29a17847d6861040234d767396e6cceb10187f4
+          path: legacy-release
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Legacy export retry regression
+        run: python server/tests/test_oltp_upgrade_export.py -v
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build the native OLTP binary
+        run: cargo build --manifest-path server/Cargo.toml --locked --release --no-default-features --features oltp --bin nabedra-db
+      - name: Build the pinned old OLTP binary in its own checkout
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev cmake
+          cd legacy-release
+          git rev-parse HEAD
+          cargo build --manifest-path server/Cargo.toml --locked --release --no-default-features --features oltp --bin nabedra-db
+      - name: Build the unmodified ORMs
+        run: |
+          python -m pip install --quiet 'httpx>=0.27,<1'
+          cd orm/typescript
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Export and restore the RF3 cluster
+        timeout-minutes: 80
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          mkdir -p artifacts/migration
+          python server/tests/oltp_upgrade_acceptance.py \
+            --old-binary legacy-release/server/target/release/nabedra-db \
+            --new-binary server/target/release/nabedra-db --output artifacts/migration \
+            2>&1 | tee artifacts/migration/run.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mig2-evidence
+          path: artifacts/migration
           retention-days: 14
 
   # T9: direct point path scenarios D01-D12 on real processes, and the existing suites with
