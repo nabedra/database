@@ -403,6 +403,9 @@ impl Consensus<ControlCommand, ControlReply> for ForwardedControl {
             self.read_barrier(deadline).await
         })
     }
+    fn applied_index(&self) -> Option<u64> {
+        self.local.applied_index()
+    }
 }
 impl ForwardedControl {
     async fn read_barrier(&self, deadline: Instant) -> Result<ReadBarrier, ProtocolError> {
