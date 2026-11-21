@@ -78,7 +78,10 @@ fn admit_trust(
         && (group.kind != GroupKind::Control
             || !matches!(
                 purpose,
-                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery
+                Purpose::Raft
+                    | Purpose::Authority
+                    | Purpose::ControlDelegation
+                    | Purpose::SystemRecovery
             ))
     {
         return Err(malformed(
@@ -109,12 +112,16 @@ pub trait PeerDirectory: Send + Sync + 'static {
         None
     }
     /// Revocations are checked again after asynchronous endpoint preflight.
+    /// This is an in-memory lookup on every worker: a Data-only worker checks
+    /// its cached Control revocation view and calls no Control voter per
+    /// exchange (REP6, `plans/oltp-direct-path.md` section 3).
     fn revoked(&self, _peer: WorkerIdentity) -> bool {
         false
     }
-    /// Data-only workers have no applied Control replica. They can validate
-    /// each inbound exchange through a separate Control authority lane.
-    fn check_inbound(&self, _peer: WorkerIdentity) -> Option<EndpointFuture<'_, ()>> {
+    /// Changes whenever the directory learns a revocation. Sessions recheck
+    /// their peer at once, so a revoked peer's sessions close when the view
+    /// learns it rather than at their next periodic directory check.
+    fn trust_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
     /// Whether `peer` is an enrolled API gateway (not a worker).
@@ -124,7 +131,11 @@ pub trait PeerDirectory: Send + Sync + 'static {
 }
 
 fn revoked_peer() -> ProtocolError {
-    ProtocolError::new(ErrorCode::Unauthorized, "worker certificate or identity was revoked", Outcome::NotApplied)
+    ProtocolError::new(
+        ErrorCode::Unauthorized,
+        "worker certificate or identity was revoked",
+        Outcome::NotApplied,
+    )
 }
 
 /// Whether this worker is the hello's audience. Every audience names this
@@ -609,6 +620,9 @@ struct Common {
     pending_sessions: Arc<Semaphore>,
     /// Local lane refusals, reported in `/v1/runtime/stats` (NS11 finding 8).
     refusals: LaneRefusals,
+    /// Accepted sessions this worker closed when its directory learned their
+    /// peer's revocation (REP6 push).
+    revoked_closes: AtomicU64,
     #[cfg(test)]
     outgoing_lane_full: [tokio::sync::Notify; CLASSES],
     /// Tests close a whole class with `hold_outgoing_for_test`.
@@ -842,6 +856,7 @@ impl WorkerTransport {
                 }),
                 pending_sessions: Arc::new(Semaphore::new(config.pending_sessions)),
                 refusals: LaneRefusals::default(),
+                revoked_closes: AtomicU64::new(0),
                 #[cfg(test)]
                 outgoing_lane_full: std::array::from_fn(|_| tokio::sync::Notify::new()),
                 #[cfg(test)]
@@ -856,6 +871,10 @@ impl WorkerTransport {
             }),
             registry,
         })
+    }
+    /// Sessions closed when the directory learned their peer's revocation.
+    pub(crate) fn revoked_session_closes(&self) -> u64 {
+        self.common.revoked_closes.load(Ordering::Relaxed)
     }
     pub fn client(&self) -> WorkerClient {
         WorkerClient {
@@ -1011,9 +1030,6 @@ impl WorkerTransport {
             trace.phase = RaftTransportPhase::Handle;
             if self.common.directory.revoked(hello.from) {
                 return Err(revoked_peer());
-            }
-            if let Some(check) = self.common.directory.check_inbound(hello.from) {
-                check.await?;
             }
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
@@ -1742,7 +1758,8 @@ fn traffic(group: &GroupIdentity, purpose: Purpose) -> Result<TrafficClass, Prot
         }
         Purpose::GroupLifecycle if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),
         Purpose::ReplicaPlacement | Purpose::GroupDamage | Purpose::SystemRecovery
-            if group.kind == GroupKind::Control => {
+            if group.kind == GroupKind::Control =>
+        {
             Ok(TrafficClass::Settlement)
         }
         Purpose::ShardSplit if group.kind == GroupKind::Control => Ok(TrafficClass::Settlement),

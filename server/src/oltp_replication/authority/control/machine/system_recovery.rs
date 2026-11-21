@@ -16,7 +16,8 @@ pub(in crate::oltp_replication::authority::control) const DEFERRED_DATA: &[u8] =
     b"ct/system-replacement-deferred-data";
 pub(super) const MAX_REVOCATIONS: usize = 1024;
 pub(super) const PREPARING: &[u8] = b"ct/system-replacement-preparing";
-pub(super) const REVOKED_WORKERS: &[u8] = b"ct/system-replacement-revoked-worker/";
+pub(in crate::oltp_replication::authority::control) const REVOKED_WORKERS: &[u8] =
+    b"ct/system-replacement-revoked-worker/";
 pub(in crate::oltp_replication::authority::control) const ACTIVE: &[u8] =
     b"ct/system-replacement-active";
 
