@@ -139,8 +139,8 @@ struct Materializing {
     checksum: Sha256,
 }
 enum Step {
-    More(Materializing),
-    Done(GroupSnapshot),
+    More(Box<Materializing>),
+    Done(Box<GroupSnapshot>),
 }
 /// Buffered, hashed writes into a charged scratch buffer.
 struct HashedOut<'a> {
@@ -660,26 +660,26 @@ impl GroupStore {
                             .write_all(&checksum.finalize())
                             .map_err(file_error)?;
                         let bytes = file.metadata().map_err(|_| storage_error_message())?.len();
-                        return Ok(Step::Done(GroupSnapshot {
+                        return Ok(Step::Done(Box::new(GroupSnapshot {
                             file,
                             path,
                             bytes,
                             header,
-                        }));
+                        })));
                     }
                     out.flush()?;
-                    Ok(Step::More(Materializing {
+                    Ok(Step::More(Box::new(Materializing {
                         file,
                         path,
                         iter,
                         prefix,
                         checksum,
-                    }))
+                    })))
                 })
                 .await?;
             match step {
-                Step::More(next) => state = next,
-                Step::Done(file) => return Ok(file),
+                Step::More(next) => state = *next,
+                Step::Done(file) => return Ok(*file),
             }
         }
     }

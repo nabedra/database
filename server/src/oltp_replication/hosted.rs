@@ -124,13 +124,13 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
         self.typed(
             &header,
             raw.as_ref().map(ChargedBytes::as_slice),
-            SnapshotSource::File(file),
+            SnapshotSource::File(Box::new(file)),
         )
         .await
     }
     /// SNAP1: the Raft snapshot of a cut; its metadata comes from the cut's
     /// header and membership, which one `nabedra-kv` view produced.
-    async fn from_cut(&self, cut: SnapshotCut) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
+    async fn of_cut(&self, cut: SnapshotCut) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
         let cut = Arc::new(cut);
         let header = cut.header.clone();
         self.typed(
@@ -205,7 +205,7 @@ pub(crate) struct TypedSnapshot {
 #[derive(Clone)]
 enum SnapshotSource {
     /// A received file, or one written from a cut elsewhere.
-    File(GroupSnapshot),
+    File(Box<GroupSnapshot>),
     /// SNAP1: a cut; its file is written on first use.
     Cut(Arc<SnapshotCut>),
 }
@@ -215,7 +215,7 @@ impl TypedSnapshot {
     /// task, so applies do not wait for it.
     pub(crate) async fn file(&self) -> Result<GroupSnapshot, ProtocolError> {
         match &self.source {
-            SnapshotSource::File(file) => Ok(file.clone()),
+            SnapshotSource::File(file) => Ok((**file).clone()),
             SnapshotSource::Cut(cut) => cut.file(MATERIALIZE).await,
         }
     }
@@ -238,7 +238,7 @@ impl<C: TypedConfig, M: TypedMachine<C>> RaftSnapshotBuilder<C> for TypedSnapsho
             Some(cut) => cut?,
             None => self.owner.cut().await.map_err(disk)?,
         };
-        self.owner.from_cut(cut).await
+        self.owner.of_cut(cut).await
     }
 }
 impl<C, M> RaftStateMachine<C> for HostedState<C, M>
@@ -495,7 +495,7 @@ where
         if cut.header.applied.is_none() {
             return Ok(None);
         }
-        self.from_cut(cut).await.map(Some)
+        self.of_cut(cut).await.map(Some)
     }
 }
 

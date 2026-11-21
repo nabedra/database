@@ -1043,7 +1043,7 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
           cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
           mkdir -p ../snap1-bin && cp target/release/nabedra-db ../snap1-bin/nabedra-db-${{ matrix.side }}
-          git rev-parse HEAD; sha256sum ../snap1-bin/*
+          echo "built ${{ matrix.side }}"; sha256sum ../snap1-bin/*
       - uses: actions/upload-artifact@v4
         with:
           name: snap1-binary-${{ matrix.side }}
