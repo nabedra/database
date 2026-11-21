@@ -224,8 +224,12 @@ def restart_during_split(cluster, send_op):
             cluster.config[victim] = config
             cluster.enrollments[victim] = config['node']['enrollment']
             cluster.launch_worker(victim)
-            wait_for(lambda: (barrier / f'reached-{preparation}').exists(),
-                     'worker enrolled while split remained unpublished', PROBE_WINDOW)
+
+            def enrolled():
+                assert cluster.workers[victim].alive(), cluster.tail(victim)
+                return (barrier / f'reached-{preparation}').exists()
+
+            wait_for(enrolled, 'worker enrolled while split remained unpublished', PROBE_WINDOW)
             assert not pending.done()
         finally:
             for name in WORKERS:

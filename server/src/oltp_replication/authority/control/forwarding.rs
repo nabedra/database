@@ -514,11 +514,20 @@ impl HostedControlEndpoint {
                     && !(34..=(MAX_TOKEN as u64 + 2)).contains(&request.credential_bytes),
                 _ => request.credential_bytes != 0,
             }
-            || session.recovery_only()
-                && !matches!(request.control_consensus, Operation::CompleteRestart | Operation::CompleteDataWorker
-                    | Operation::ReadEksWorkerReplacement | Operation::CompleteEksWorkerReplacement)
         {
             return Err(invalid());
+        }
+        if session.recovery_only() {
+            match request.control_consensus {
+                Operation::CompleteRestart
+                | Operation::CompleteDataWorker
+                | Operation::ReadEksWorkerReplacement
+                | Operation::CompleteEksWorkerReplacement => {}
+                // The receiving voter's directory may still show a prepared
+                // incarnation just after Control commits its enrollment.
+                Operation::Propose | Operation::Barrier => return Err(unavailable()),
+                _ => return Err(invalid()),
+            }
         }
         Ok(Some(request))
     }

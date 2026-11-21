@@ -246,6 +246,7 @@ jobs:
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
       - name: REP1 worker recovery and direct-mode rollback
+        id: rep1
         if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]') || contains(github.event.head_commit.message, '[ci rep1]')
         run: |
           set -o pipefail
@@ -258,6 +259,12 @@ jobs:
               --test-executable "$test_executable" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || status=1
           done
           exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() && (steps.rep1.outcome == 'success' || steps.rep1.outcome == 'failure') }}
+        with:
+          name: oltp-rep1-process-logs
+          path: oltp-rep1-*.log
+          retention-days: 14
       - name: Library suite
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
@@ -278,7 +285,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: oltp-test-logs
-          path: oltp-*.log
+          path: |
+            oltp-lib.log
+            oltp-integration.log
           retention-days: 14
 
   events:
