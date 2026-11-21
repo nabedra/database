@@ -502,6 +502,8 @@ impl HttpRuntime for RemoteRuntime {
             );
             worker.insert("transport".into(), self.client.lane_refusals());
             worker.insert("owner".into(), owner);
+            // PERF1: this process's own stage timings next to the worker's.
+            worker.insert("api_stage_timing".into(), super::stage_timing::snapshot());
             Ok(EncodedResponse {
                 status: 200,
                 body: serde_json::to_vec(&stats).map_err(|_| unavailable())?,

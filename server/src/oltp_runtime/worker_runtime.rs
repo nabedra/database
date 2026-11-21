@@ -1899,6 +1899,8 @@ impl HttpRuntime for WorkerRuntime {
                     "transport":self.services.manager.client().lane_refusals(),
                     // RV-APPLY: transient retries and stopped cores.
                     "raft":self.services.manager.raft_health(),
+                    // PERF1: per-stage latency histograms of this process.
+                    "stage_timing":super::stage_timing::snapshot(),
                 }))
                 .map_err(|_| unknown())?,
             })

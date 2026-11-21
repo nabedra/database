@@ -206,6 +206,15 @@ where
     {
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
+            let _timer = crate::oltp_runtime::stage_timing::by_kind(
+                &self.store().identity().kind,
+                [
+                    "raft.data.apply_entry",
+                    "raft.ts.apply_entry",
+                    "raft.meta.apply_entry",
+                ],
+            )
+            .timer();
             entry.ensure_charged().map_err(disk)?;
             #[cfg(test)]
             if self.retry.take_apply_fault() {
@@ -245,11 +254,16 @@ where
                 // A transient failure voided the write; the replay check in
                 // `GroupStore::mutate` makes a repeated entry idempotent (F1).
                 Payload::Normal(command) => Some(
-                    self.retry
-                        .retry(RaftWrite::Apply, || {
+                    crate::oltp_runtime::stage_timing::timed(
+                        crate::oltp_runtime::stage_timing::by_kind(
+                            &self.store().identity().kind,
+                            ["raft.data.apply_machine", "raft.ts.apply_machine", "raft.meta.apply_machine"],
+                        ),
+                        self.retry.retry(RaftWrite::Apply, || {
                             self.machine.apply(meta.clone(), command.clone())
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                         .map_err(|error| {
                             tracing::error!(group=%self.store().identity().group_id,kind=?self.store().identity().kind,node=self._resident.node_id(),index=position.index,code=?error.code,outcome=?error.outcome,"typed state application failed");
                             disk(error)
@@ -702,6 +716,16 @@ where
                 &self.state._resident,
                 super::entry::OwnedRaftEntry::<C::Command>::normal_metadata_bytes(),
             )?;
+            let kind = self.state.store().identity().kind.clone();
+            let _timer = crate::oltp_runtime::stage_timing::by_kind(
+                &kind,
+                [
+                    "raft.data.client_write",
+                    "raft.ts.client_write",
+                    "raft.meta.client_write",
+                ],
+            )
+            .timer();
             let response = self
                 .raft
                 .client_write(command)
@@ -754,6 +778,33 @@ where
     async fn read_barrier(&self, policy: ReadPolicy) -> Result<ReadBarrier, ProtocolError> {
         {
             let lease = matches!(policy, ReadPolicy::LeaseRead);
+            let kind = self.state.store().identity().kind.clone();
+            crate::oltp_runtime::stage_timing::variant(
+                if lease {
+                    "raft.lease_read_by_kind."
+                } else {
+                    "raft.read_index_by_kind."
+                },
+                &kind,
+            )
+            .record(std::time::Duration::ZERO);
+            let _timer = crate::oltp_runtime::stage_timing::by_kind(
+                &kind,
+                if lease {
+                    [
+                        "raft.data.lease_read",
+                        "raft.ts.lease_read",
+                        "raft.meta.lease_read",
+                    ]
+                } else {
+                    [
+                        "raft.data.read_index",
+                        "raft.ts.read_index",
+                        "raft.meta.read_index",
+                    ]
+                },
+            )
+            .timer();
             let barrier = self
                 .raft
                 .ensure_linearizable(policy)

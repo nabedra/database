@@ -1275,6 +1275,10 @@ impl ControlClient {
         let header = self
             .shared
             .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
+        // PERF1: Control reads this process issues, by request kind.
+        let _timer =
+            crate::oltp_runtime::stage_timing::json_variant("control.read.", header.as_slice())
+                .timer();
         let placement_role = matches!(request, ReadRequest::ServiceRoleAtReplica { .. });
         let role_dependency = placement_role || matches!(request, ReadRequest::ServiceRole { .. });
         let exact_sample = matches!(request, ReadRequest::OwnGrowthSample { .. });
@@ -1674,9 +1678,25 @@ struct ReplicaRouteHint {
     last_successful_node: Option<u64>,
     receiver: Option<(u64, WorkerIdentity)>,
     probe_after: Option<Instant>,
+    /// When a strong Control read last confirmed this record (PERF1).
+    confirmed_at: Option<Instant>,
 }
 
 impl VerifiedReplicaRoutes {
+    fn confirmed(&self) {
+        if let Ok(mut hint) = self.hint.lock() {
+            hint.confirmed_at = Some(Instant::now());
+        }
+    }
+
+    fn confirmed_within(&self, max_age: Duration) -> bool {
+        self.hint
+            .lock()
+            .ok()
+            .and_then(|hint| hint.confirmed_at)
+            .is_some_and(|at| at.elapsed() <= max_age)
+    }
+
     pub(crate) fn last_successful_node(&self) -> Option<u64> {
         self.hint.lock().ok()?.last_successful_node
     }
@@ -1858,6 +1878,7 @@ impl ControlClient {
             }
         };
         if let Some(route) = cached {
+            route.confirmed();
             tracing::debug!(
                 target: "nabedra_database_server::oltp_replication::service_rpc",
                 cache = "hit",
@@ -1924,7 +1945,10 @@ impl ControlClient {
         let route = Arc::new(VerifiedReplicaRoutes {
             record,
             members,
-            hint: Mutex::new(ReplicaRouteHint::default()),
+            hint: Mutex::new(ReplicaRouteHint {
+                confirmed_at: Some(Instant::now()),
+                ..ReplicaRouteHint::default()
+            }),
             _owner: owner,
         });
         let cacheable = retain && retained <= ROUTE_CACHE_ENTRY_BYTES;
@@ -1941,6 +1965,20 @@ impl ControlClient {
             Some(mut cache) if cacheable => cache.store(route),
             _ => route,
         })
+    }
+
+    /// The cached routes of `expected` if a strong Control read confirmed
+    /// their record within `max_age`; no Control read. Only for calls whose
+    /// outcome does not depend on routing: a stale member list can only make
+    /// the call fail, never answer it wrongly (PERF1).
+    pub(crate) fn recent_replica_routes(
+        &self,
+        expected: &GroupIdentity,
+        max_age: Duration,
+    ) -> Option<ReplicaRoutes> {
+        let mut cache = self.route_cache()?;
+        let route = cache.slot(expected)?.clone()?;
+        route.confirmed_within(max_age).then_some(route)
     }
 
     pub(crate) fn invalidate_replica_routes(&self, route: &ReplicaRoutes) {

@@ -204,6 +204,8 @@ async fn submit(State(state): State<Arc<ApiState>>, request: Request) -> Respons
     dispatch(state, request, true).await
 }
 async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) -> Response {
+    let _timer = super::stage_timing::perf_stage!("http.dispatch.total").timer();
+    let spawned = std::time::Instant::now();
     if let Err(error) = authorize(&request, &state) {
         return failure(None, error);
     }
@@ -223,6 +225,7 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
         .filter(|gateway| gateway.mode() != super::application::direct::DirectMode::Off)
         .zip(declared_length(request.headers()));
     let operation = admitted.spawn(move || async move {
+        super::stage_timing::perf_stage!("http.dispatch.spawn_wait").since(spawned);
         let charge = |bytes: u64| {
             state
                 .runtime
@@ -242,13 +245,20 @@ async fn dispatch(state: Arc<ApiState>, request: Request, asynchronous: bool) ->
                 .as_ref()
                 .map_or(full, |(_, length)| 2 * *length as u64),
         )?;
+        let read = std::time::Instant::now();
         let bytes = match &direct {
             Some((_, length)) => bounded_body(request.into_body(), *length).await?,
             None => body(request.into_body()).await?,
         };
+        super::stage_timing::perf_stage!("http.dispatch.body").since(read);
         if let Some((gateway, _)) = direct {
             use super::application::direct::Routed;
-            match gateway.route(&bytes, asynchronous).await {
+            match super::stage_timing::timed(
+                super::stage_timing::perf_stage!("gw.route"),
+                gateway.route(&bytes, asynchronous),
+            )
+            .await
+            {
                 Ok(Routed::Done(encoded)) => return Ok((state, None, Err(Ok(encoded)))),
                 Err(error) => return Ok((state, scan_request_id(&bytes), Err(Err(error)))),
                 Ok(Routed::Queued) => staging = charge(full)?,

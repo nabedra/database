@@ -1189,6 +1189,7 @@ impl Endpoint for TimestampEndpoint {
         sections: ChargedSections,
     ) -> EndpointFuture<'a, ChargedReply> {
         Box::pin(async move {
+            let _timer = crate::oltp_runtime::stage_timing::perf_stage!("ts.serve.total").timer();
             let head = self.parse(&session, bytes.as_slice())?;
             if let Method::TimestampPointDecisionRead { route, source_digest, locator_digest } = head.method {
                 let result = self.read_point_decision(
@@ -1344,6 +1345,14 @@ impl TimestampClient {
         // AllocateDirect repeats safely (values above every completed
         // allocation), so a stalled leader gets a per-replica deadline and
         // the call moves on to the new leader (D05/LIVE1).
+        // AllocateDirect is answered only by the Timestamp leader after its
+        // read barrier, whichever member the route names: reuse a recently
+        // confirmed member list instead of reading Control per call (PERF1).
+        if let Request::AllocateDirect { .. } = request {
+            // Boxed: every Timestamp call awaits `response`, so this branch
+            // must not grow its future (debug-build stack depth).
+            return Box::pin(self.allocate_direct_response(request)).await;
+        }
         if matches!(
             request,
             Request::AllocateDirect { .. }
@@ -1371,6 +1380,24 @@ impl TimestampClient {
                 | Request::Released { .. }
         );
         self.client.named(request.method(), request, converge).await
+    }
+    async fn allocate_direct_response(
+        &self,
+        request: Request,
+    ) -> Result<ServiceResponse, ProtocolError> {
+        use crate::oltp_runtime::stage_timing::{perf_stage, timed};
+        let method = request.method();
+        let payload = timed(
+            perf_stage!("ts.rpc.encode"),
+            encode(&self.client.shared, request),
+        )
+        .await?;
+        timed(
+            perf_stage!("ts.rpc.converge"),
+            self.client
+                .repeat_reusing_routes_as(self.client.action, method, Some(payload)),
+        )
+        .await
     }
     async fn value<T: serde::de::DeserializeOwned + Send + 'static>(
         &self,
@@ -1627,7 +1654,12 @@ impl TimestampClient {
         if count == 0 || count > MAX_DIRECT_COUNT {
             return Err(invalid());
         }
-        let range: DirectTimestampRange = self.value(Request::AllocateDirect { count }).await?;
+        let response = self.response(Request::AllocateDirect { count }).await?;
+        let (range, _): (DirectTimestampRange, _) = crate::oltp_runtime::stage_timing::timed(
+            crate::oltp_runtime::stage_timing::perf_stage!("ts.rpc.decode"),
+            response.decoded(&self.client.shared),
+        )
+        .await?;
         range.expect_len(count)
     }
     pub(crate) async fn confirmed_allocation(

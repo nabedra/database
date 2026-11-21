@@ -435,6 +435,7 @@ impl DirectLink {
             }
         };
         let payload = Some(request.body.clone());
+        let _timer = crate::oltp_runtime::stage_timing::perf_stage!("gw.direct.send").timer();
         match self
             .client
             .call_member_at(
