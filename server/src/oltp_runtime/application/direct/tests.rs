@@ -1134,8 +1134,14 @@ async fn o28_d07_same_id_retry_refreshes_a_retired_split_parent() {
         let id = Uuid::new_v4();
         let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
         let error = gateway.route(&mutation, asynchronous).await.err().unwrap();
-        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
-        assert_eq!(error.outcome, Outcome::Unknown);
+        // The fixture's retired voters explicitly refuse leadership. A
+        // forward still needs settlement of any prior direct attempt.
+        let expected = if asynchronous {
+            (ErrorCode::OutcomeUnknown, Outcome::Unknown)
+        } else {
+            (ErrorCode::StorageUnavailable, Outcome::NotApplied)
+        };
+        assert_eq!((error.code, error.outcome), expected);
         assert_eq!(source.reads(), (1, 1));
 
         if asynchronous {
