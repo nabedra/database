@@ -1,0 +1,17 @@
+Teardown infrastructure mutations submitted: 0
+Teardown S3 prefix: complete
+EC2 instances: unverified (UnauthorizedOperation)
+EBS volumes: unverified (UnauthorizedOperation)
+EC2 ENIs: unverified (UnauthorizedOperation)
+EC2 EIPs: unverified (UnauthorizedOperation)
+EC2 security groups: 0
+EC2 key pairs: unverified (UnauthorizedOperation)
+EC2 launch templates: unverified (UnauthorizedOperation)
+EKS: unverified (AccessDeniedException)
+CloudFormation stacks: unverified (AccessDenied)
+Classic load balancers: unverified (AccessDenied)
+ELBv2 load balancers: unverified (AccessDenied)
+Resource Groups Tagging API: 0
+S3 current objects: 0
+S3 versions and delete markers: 0
+S3 multipart uploads: 0

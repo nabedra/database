@@ -329,6 +329,28 @@ mod live_context_probe {
         let loaded = storage.load_cluster_catalog().await.unwrap();
         assert_eq!(loaded.catalog().fence, Some(fence));
         assert!(loaded.catalog().tables.is_empty());
+        eprintln!("live-context-probe phase=catalog-compare-and-swap");
+        let takeover = super::super::CatalogFence {
+            scheduler_term: 2,
+            ..fence
+        };
+        storage
+            .fence_cluster_catalog(&loaded, takeover, super::super::FenceTransition::Takeover)
+            .await
+            .unwrap();
+        let stale = super::super::CatalogFence {
+            scheduler_term: 3,
+            ..fence
+        };
+        assert!(matches!(
+            storage
+                .fence_cluster_catalog(&loaded, stale, super::super::FenceTransition::Takeover)
+                .await,
+            Err(StorageError::Conflict)
+        ));
+        let current = storage.load_cluster_catalog().await.unwrap();
+        assert_eq!(current.catalog().fence, Some(takeover));
+        assert_eq!(current.catalog().owner_cluster, Some(owner));
         eprintln!("live-context-probe phase=complete");
     }
 }

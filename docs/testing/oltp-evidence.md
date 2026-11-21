@@ -121,3 +121,8 @@ The new process cases use fixture authority and pinned reads; the multiplex test
 The single-group consensus dependency spike still logs deterministic application operations. Its local ordered-fence tests do not establish the target rule that cold start applies only prepared committed state without reevaluating abandoned user operations. P4/P5's typed prepare/decision/resolution implementation and its multi-shard/cold-start assertions remain required before production remote execution.
 
 Later shared changes must rerun affected assertions. Distributed worker queue survival with actual authority services, multi-shard MVCC/commit, timestamp services, storage growth, backup/restore, migration and automatic provisioning remain pending implementation or acceptance. Local Linux and minimum-toolchain checks are recorded above. No AWS/EBS/EKS assertion, GitHub CI run or matched PostgreSQL comparison has executed here. Do not infer full scheduler or OLTP contract acceptance from test counts.
+
+## LIVE2 real AWS evidence
+
+[LIVE2](evidence/oltp/live-aws/README.md) records the real S3 backup transport
+probe and the provider permissions that blocked O18 and O27.
