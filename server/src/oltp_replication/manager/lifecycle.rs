@@ -233,8 +233,9 @@ where
     /// `retain_removed` keeps the removed voter as a learner in the final
     /// membership. A live removed replica needs that: it must apply the final
     /// membership to retire (`verify_removed`), and the leader stops
-    /// replicating to a node the final membership no longer names. Only a
-    /// lost voter, which never retires (system replacement), is dropped.
+    /// replicating to a node the final membership no longer names. A voter
+    /// that never applies again (lost in system replacement, or quarantined
+    /// by NS14) is dropped.
     pub(crate) async fn reconcile_voter_replacement(
         &self,
         old: &[ReplicaMember],
@@ -718,8 +719,9 @@ where
             return Err(invalid());
         }
         let membership = self
-            // As before REP5: the removed voter stays a learner.
-            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None, true)
+            // A quarantined voter never applies again; its removal is proven
+            // by `DamagedReplicaRemoved`, so it is dropped (REP5, ns23).
+            .reconcile_voter_replacement(old, next, &fresh, damaged.node_id, None, false)
             .await?;
         let proof = GroupDamageReplacement {
             group: membership.group.clone(),

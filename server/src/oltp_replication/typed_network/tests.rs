@@ -500,7 +500,7 @@ async fn o06_o16_o17_rf3_lost_timestamp_voter_replacement() {
         // O16/O26 (REP6 merge regression): a same-ID move's source replica
         // retires only after applying this membership, so the final
         // membership keeps the removed voter as a learner the leader still
-        // replicates to. Only system replacement drops a lost voter.
+        // replicates to. System replacement and NS14 repair drop theirs.
         {
             let metrics = hosts[leader].raft.metrics();
             let metrics = metrics.borrow_watched();
