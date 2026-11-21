@@ -32,6 +32,7 @@ BATCH_ROWS = 4_096
 VERIFY_ROWS = 4_096
 DELETED = {7, BOUNDARY + 7}
 ORM_TABLE = 'migration_orm'
+LOCATION_SPLIT = 'city-128'
 
 
 class MigrationCluster(Rf3Cluster):
@@ -148,23 +149,49 @@ def seed_legacy_indexes(binary, root):
     legacy.execution.pop('direct_oltp', None)
     with legacy as server:
         token = json.loads((local / 'auth.json').read_text())['admin_token']
-        with Database(url=server.url, token=server.token, database=DATABASE) as db:
+        with Database(url=server.url, token=server.token, database=DATABASE, timeout=180) as db:
             ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
             locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
             indexes = (create_index(server.url, token, ledger, 'by_bucket', 'bucket', ['label']),
                        create_index(server.url, token, locations, 'by_region', 'region', ['score']))
+            # A single-node legacy backup can export this bulk-load history
+            # locally. RF3 re-exports it as restored identity history, without
+            # the original per-request point projections in its RPC pages.
+            seed_ledger(ledger)
+            db.create_table('migration_empty', {'id': int}, key='id')
+            for orm in ('python', 'typescript'):
+                db.create_table(f'{ORM_TABLE}_{orm}', {'id': int, 'name': str, 'score': float, 'active': bool}, key='id')
         manifest = admin_request([server.url], token, 'archive.create',
                                  dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
     return archive, manifest['scope'], indexes
 
 
+def seed_ledger(ledger):
+    batch_rows = BATCH_ROWS
+    start = 0
+    while start < ROW_COUNT:
+        batch = [ledger_row(key) for key in range(start, min(start + batch_rows, ROW_COUNT))]
+        try:
+            assert ledger.insert_many(batch) == len(batch), start
+        except LimitExceededError as error:
+            if (batch_rows != BATCH_ROWS or error.outcome != 'not_applied'
+                    or str(error) != 'worker storage capacity unavailable'):
+                raise
+            batch_rows //= 2
+            print(f'MIG2 legacy worker refused a {len(batch)}-row batch; using {batch_rows} rows', flush=True)
+            continue
+        start += len(batch)
+
+
 def seed(cluster, db, indexes):
     ledger = db.table('migration_ledger')
-    keys_at_boundary = list(range(BOUNDARY - 4, BOUNDARY + 4))
-    assert ledger.insert_many([ledger_row(key) for key in keys_at_boundary]) == len(keys_at_boundary)
-    source = initial_group(cluster, ledger.id)
+    locations = db.table('migration_locations')
+    location_rows = [dict(id=f'city-{key:03d}', region='east' if key % 7 == 0 else 'west', score=key + 0.5)
+                     for key in range(257)]
+    assert locations.insert_many(location_rows) == len(location_rows)
+    source = initial_group(cluster, locations.id)
     split_id = uid()
-    split = dict(source=source, boundary=BOUNDARY, page_bytes=256 << 10)
+    split = dict(source=source, boundary=LOCATION_SPLIT, page_bytes=256 << 10)
     deadline = time.monotonic() + 180
     while True:
         result = cluster.operator('storage.shard.split', split, split_id)
@@ -173,48 +200,26 @@ def seed(cluster, db, indexes):
             break
         assert result['state'] == 'importing' and time.monotonic() < deadline, result
     assert len({group['group_id'] for group in children}) == 2, children
-    verify_rf3(cluster, children)
+    verify_rf3(cluster, [initial_group(cluster, ledger.id), *children])
     ledger_index, location_index = indexes
-    batch_rows = BATCH_ROWS
-    for lower, upper in ((0, keys_at_boundary[0]), (keys_at_boundary[-1] + 1, ROW_COUNT)):
-        start = lower
-        while start < upper:
-            batch = [ledger_row(key) for key in range(start, min(start + batch_rows, upper))]
-            try:
-                assert ledger.insert_many(batch) == len(batch), start
-            except LimitExceededError as error:
-                if (batch_rows != BATCH_ROWS or error.outcome != 'not_applied'
-                        or str(error) != 'worker storage capacity unavailable'):
-                    raise
-                batch_rows //= 2
-                print(f'MIG2 legacy worker refused a {len(batch)}-row batch; using {batch_rows} rows', flush=True)
-                continue
-            start += len(batch)
     for key in sorted(DELETED):
         assert ledger.delete(key) is True, key
-
-    locations = db.table('migration_locations')
-    location_rows = [dict(id=f'city-{key:03d}', region='east' if key % 7 == 0 else 'west', score=key + 0.5)
-                     for key in range(257)]
-    assert locations.insert_many(location_rows) == len(location_rows)
     assert locations.delete('city-000') is True
-    empty = db.create_table('migration_empty', {'id': int}, key='id')
     tables = {
         ledger.name: ([ledger_row(key) for key in range(ROW_COUNT) if key not in DELETED],
                       (ledger_index, 7)),
         locations.name: (location_rows[1:], (location_index, 'east')),
-        empty.name: ([], None),
+        'migration_empty': ([], None),
+        f'{ORM_TABLE}_python': ([], None),
+        f'{ORM_TABLE}_typescript': ([], None),
     }
-    for orm in ('python', 'typescript'):
-        table = db.create_table(f'{ORM_TABLE}_{orm}', {'id': int, 'name': str, 'score': float, 'active': bool}, key='id')
-        tables[table.name] = ([], None)
     return tables, children
 
 
 def apply_concurrent_writes(cluster, tables):
     changes = {
         'migration_ledger': [(key, dict(bucket=7, label=f'updated-{key}')) for key in (0, BOUNDARY)],
-        'migration_locations': [(f'city-{key:03d}', dict(region='east', score=0.25)) for key in (1, 2)],
+        'migration_locations': [(f'city-{key:03d}', dict(region='east', score=0.25)) for key in (1, 129)],
     }
 
     def update(name, updates):
@@ -406,7 +411,7 @@ def main():
         clusters = []
         timings = {}
         try:
-            with phase(timings, 'legacy index setup'):
+            with phase(timings, 'legacy bulk seed and index setup'):
                 seed_archive, seed_scope, indexes = seed_legacy_indexes(args.old_binary, root)
             source = MigrationCluster(args.old_binary, root / 'old', repository=repository,
                                       archive=seed_archive, scope=seed_scope)
@@ -415,7 +420,7 @@ def main():
             with phase(timings, 'old RF3 startup'):
                 source.start()
             with source.database() as db:
-                with phase(timings, 'bulk seed and split'):
+                with phase(timings, 'RF3 writes and split'):
                     expected, ranges = seed(source, db, indexes)
                 with phase(timings, 'bounded concurrent writes'):
                     writes = apply_concurrent_writes(source, expected)

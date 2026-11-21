@@ -66,6 +66,10 @@ available until you finish verification.
 
 The write outage lasts from the pause in step 2 through export, restore and
 verification. Rehearse those steps with representative data to size the outage.
+Include representative request history in the rehearsal. The RocksDB-era RF3
+exporter can return HTTP 413 `worker storage capacity unavailable` when a
+Status identity page exceeds its fixed 1 MiB reply decode budget. Keep the old
+cluster authoritative if the export fails. A fresh pin uses the same budget.
 Before re-enabling writes, you can roll back by keeping clients on the old
 cluster. Writes made after cutover require a separate rollback plan.
 
