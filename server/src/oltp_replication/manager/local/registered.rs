@@ -9,7 +9,7 @@ use crate::oltp::backup::restore::{
 use crate::oltp::pool::mount::{PoolMountExpectation, PoolMountProfile, VerifiedPoolMount};
 use crate::oltp_backup_repository::{ArchiveEncryptionConfig, ArchiveKeys};
 use crate::oltp_deployment::inventory::{SecondaryPoolConfig, WorkerPools};
-use crate::oltp_replication::authority::{control::OperatorPolicy, status::StatusTopology};
+use crate::oltp_replication::authority::{control::{OperatorPolicy, ReplacementRecord}, status::StatusTopology};
 use crate::oltp_replication::types::{Page, validate_voters};
 use std::{collections::BTreeSet, net::SocketAddr};
 mod cold;
@@ -137,6 +137,10 @@ pub(crate) struct RegisteredConfig {
     pub cold: Option<cold::ColdStart>,
     #[serde(default)]
     pub rolling: Option<restart::RollingStart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_replacement: Option<ReplacementRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_placements: Option<SystemPlacement>,
 }
 
 fn disabled(value: &bool) -> bool {
@@ -155,6 +159,10 @@ struct RetainedIdentity {
     lock_dev: u64,
     lock_inode: u64,
     previous: WorkerIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_replacement: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "disabled")]
+    replacement_requires_restart: bool,
     #[serde(default)]
     restore_policy: Option<Digest>,
     #[serde(default)]
@@ -176,6 +184,8 @@ pub(crate) struct RegisteredWorker {
     pub previous_process: Option<WorkerIdentity>,
     pub cold: Option<cold::OpenedCold>,
     pub rolling: Option<restart::OpenedRestart>,
+    pub system_replacement: Option<ReplacementRecord>,
+    replacement_retained: Option<(Arc<DirectoryOwner>, RetainedIdentity)>,
     pub restart_mount: Option<restart::RestartMount>,
     pub operator: LocalOperatorPermit,
     pub transport: Arc<WorkerTransport>,
@@ -194,6 +204,16 @@ pub(crate) struct RegisteredSystemGroups {
     pub catalog: Option<ManagedCatalog>,
 }
 impl RegisteredWorker {
+    pub(crate) fn seal_replacement_identity(&mut self) -> Result<(), ProtocolError> {
+        if let Some((owner, mut record)) = self.replacement_retained.take() {
+            // Once this incarnation may join the queue, a process restart
+            // must use the regular retained-mount protocol and a new identity.
+            record.replacement_requires_restart = true;
+            retain_identity(&owner, &record)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn open_secondary_pools(
         &mut self,
         control: &crate::oltp_replication::authority::control::ControlHandle,
@@ -229,6 +249,9 @@ impl RegisteredWorker {
         C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
         M: TypedMachine<C>,
     {
+        if self.system_replacement.is_some() {
+            return Ok(());
+        }
         if self.cold.is_none() && self.rolling.is_none() {
             return initialize_seed(running, placement, local).await;
         }
@@ -253,11 +276,12 @@ impl RegisteredWorker {
             let group = &self.placements.control;
             let running = self
                 .manager
-                .start_control(
+                .start_registered_control(
                     self.open_system_store(group.identity.clone()).await?,
                     local.clone(),
                     group.members(),
                     config.clone(),
+                    self.directory.clone(),
                 )
                 .await?;
             self.check_system_group(&running, group, &local).await?;
@@ -319,7 +343,7 @@ impl RegisteredWorker {
         })
     }
     pub(crate) async fn open_development(
-        config: RegisteredConfig,
+        mut config: RegisteredConfig,
         limits: WorkerResources,
         resources: SharedResourceConfig,
         execution: &ExecutionConfig,
@@ -343,6 +367,11 @@ impl RegisteredWorker {
             .placements
             .validate(config.required_voters as usize)?;
         config.enrollment.validate().map_err(|_| invalid())?;
+        let replacement = config.system_replacement.clone();
+        let mut placements = config.placements.clone();
+        if let Some(record) = &replacement {
+            install_replacement_placements(&config, record, &mut placements)?;
+        }
         let control = &config.placements.control;
         let mut enrolled = BTreeSet::new();
         for enrollment in config.control_enrollments.iter() {
@@ -357,7 +386,7 @@ impl RegisteredWorker {
             }
         }
         if enrolled.len() != control.voters.len()
-            || !config
+            || (replacement.is_none() && !config
                 .control_enrollments
                 .iter()
                 .any(|member| {
@@ -366,7 +395,7 @@ impl RegisteredWorker {
                     } else {
                         member == &config.enrollment
                     }
-                })
+                }))
         {
             return Err(invalid());
         }
@@ -374,6 +403,11 @@ impl RegisteredWorker {
         if config.placements.all().any(|placement| {
             placement.voters.iter().any(|voter| !enrolled.contains(&voter.worker_id))
         }) {
+            return Err(invalid());
+        }
+        let bootstrap = config.bootstrap_placements.as_ref().unwrap_or(&config.placements);
+        bootstrap.validate(config.required_voters as usize)?;
+        if !bootstrap.all().map(|group| &group.identity).eq(config.placements.all().map(|group| &group.identity)) {
             return Err(invalid());
         }
         let policy = if config.format == 1 {
@@ -385,11 +419,11 @@ impl RegisteredWorker {
             crate::oltp_replication::owned::serialized_digest(&(
                 b"nabedra/registered-policy/v2",
                 config.bootstrap_id,
-                &config.placements,
+                bootstrap,
             ))?
         };
         let mut local_groups = 0;
-        for placement in config.placements.all() {
+        for placement in placements.all() {
             if let Some(local) = placement.local(config.enrollment.worker_id) {
                 if local.pool_id != config.pool_id {
                     return Err(invalid());
@@ -399,6 +433,9 @@ impl RegisteredWorker {
         }
         if local_groups == 0 {
             return Err(invalid());
+        }
+        if let Some(record) = &replacement {
+            local_groups = record.groups.len();
         }
         let tls = TlsMaterial::from_pem(
             &bounded_read(&config.certificate, 64 << 10).map_err(storage)?,
@@ -417,7 +454,7 @@ impl RegisteredWorker {
             .copied()
             .collect::<BTreeSet<_>>();
         if operator_pins.len() != config.operator_pins.len()
-            || !operator_pins.contains(&config.enrollment.certificate_sha256)
+            || (replacement.is_none() && !operator_pins.contains(&config.enrollment.certificate_sha256))
         {
             return Err(invalid());
         }
@@ -468,6 +505,8 @@ impl RegisteredWorker {
         if let Some(anchor) = &anchor {
             verify_directory_anchor(&ownership, anchor.observation())?;
         }
+        let control_identity = control.identity.clone();
+        config.placements = placements.clone();
         let (previous_process, mut retained) = inspect_identity(&ownership, &config, &identity)?;
         if restore.is_some() && previous_process.is_some() {
             return Err(invalid());
@@ -482,7 +521,7 @@ impl RegisteredWorker {
         let mut restored = None;
         let pool = if let Some(anchor) = anchor {
             let exclusion = match (previous_process, anchor.observation().expected.profile) {
-                (Some(_), PoolMountProfile::Docker { .. }) => {
+                (Some(_), PoolMountProfile::Docker { .. }) if replacement.is_none() => {
                     // The mount manifest can advance before Control is
                     // reached. Recover the last opened mount separately
                     // from the journal of eligible queue holders.
@@ -522,12 +561,13 @@ impl RegisteredWorker {
             OltpPool::open_development(ownership.path.join("pool"), identity, shared.clone())?
         };
         let bootstrap_policy = retained.restore_policy.unwrap_or(policy);
-        let restart_mount = restart::RestartMount::open(&ownership, primary_mount.as_ref(), rolling.is_some())?;
+        let restart_mount = restart::RestartMount::open(&ownership, primary_mount.as_ref(), rolling.is_some() || replacement.is_some())?;
         let pools = WorkerPools::new(pool.clone(), WorkerIdentity::from(&config.enrollment), primary_mount)?;
         let secondary = config.secondary_pools.into_inner().into_iter().zip(secondary_anchors).collect();
         if cold.is_none() && rolling.is_none() {
             retain_identity(&ownership, &retained)?;
         }
+        let replacement_retained = replacement.as_ref().map(|_| (ownership.clone(), retained));
         let listener = TcpListener::bind(config.bind).await.map_err(storage)?;
         if listener.local_addr().map_err(storage)?.port() != config.bind.port()
             || config.bind.port() == 0
@@ -539,11 +579,18 @@ impl RegisteredWorker {
         if rolling.is_some() {
             bootstrap_peers.retain(|peer| peer.worker_id != config.enrollment.worker_id);
         }
+        if let Some(record) = &replacement {
+            bootstrap_peers.retain(|peer| peer.worker_id != record.intent.previous.worker_id);
+        }
         let directory = crate::oltp_replication::multiplex::AppliedPeerDirectory::from_bootstrap(
-            control.identity.clone(),
+            control_identity,
             bootstrap_peers,
             shared.clone(),
         )?;
+        directory.set_cold_bootstrap(cold.is_some());
+        if let Some(record) = &replacement {
+            directory.allow_replacement_bootstrap(record)?;
+        }
         let transport = Arc::new(WorkerTransport::new(
             &config.enrollment,
             &tls,
@@ -578,6 +625,8 @@ impl RegisteredWorker {
             previous_process,
             cold,
             rolling,
+            system_replacement: replacement,
+            replacement_retained,
             restart_mount,
             operator,
             transport,
@@ -630,6 +679,10 @@ fn inspect_identity(
     let (previous, restore_policy, cold) = match bounded_read(&path, 128 << 10) {
         Ok(bytes) => {
             let old: RetainedIdentity = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            let resume = config.system_replacement.as_ref().is_some_and(|record|
+                old.system_replacement == Some(record.intent.id)
+                    && !old.replacement_requires_restart
+                    && old.previous == WorkerIdentity::from(&config.enrollment));
             if old.format != 1
                 || old.bootstrap_id != config.bootstrap_id
                 || old.worker != config.enrollment.worker_id
@@ -651,8 +704,8 @@ fn inspect_identity(
                 // `pool/CURRENT` refused every registered worker restart on `nabedra-kv`.
                 || !(owner.path.join("pool/kv/CURRENT").is_file()
                     || owner.path.join("pool/CURRENT").is_file())
-                || config.enrollment.enrollment_revision <= old.previous.enrollment_revision
-                || config.enrollment.incarnation == old.previous.incarnation
+                || (!resume && (config.enrollment.enrollment_revision <= old.previous.enrollment_revision
+                    || config.enrollment.incarnation == old.previous.incarnation))
             {
                 return Err(invalid());
             }
@@ -703,6 +756,8 @@ fn inspect_identity(
             lock_dev,
             lock_inode,
             previous: WorkerIdentity::from(&config.enrollment),
+            system_replacement: config.system_replacement.as_ref().map(|record| record.intent.id),
+            replacement_requires_restart: false,
             restore_policy,
             cold,
         },
@@ -805,4 +860,50 @@ mod status_tests {
         assert!(changed.validate(1).is_ok());
         assert!(!same_local_roots(&multi, &changed, local.worker_id));
     }
+}
+
+fn install_replacement_placements(
+    config: &RegisteredConfig,
+    record: &ReplacementRecord,
+    placements: &mut SystemPlacement,
+) -> Result<(), ProtocolError> {
+    let intent = &record.intent;
+    intent.validate()?;
+    if config.required_voters != 3
+        || config.cold.is_some() || config.rolling.is_some() || config.restore.is_some()
+        || !config.secondary_pools.is_empty()
+        || config.enrollment != intent.next
+        || config.mount.as_ref() != Some(&intent.mount)
+        || config.initial_run != intent.run_id
+        || intent.mount_public_key.is_none()
+        || record.groups.is_empty()
+        || record.groups.len() > crate::oltp_replication::authority::control::MAX_SYSTEM_REPLACEMENT_GROUPS
+        || record.groups.iter().any(|plan| plan.expected.identity.validate().is_err()
+            || plan.expected.identity.cluster_id != placements.control.identity.cluster_id
+            || plan.expected.identity.database != placements.control.identity.database
+            || plan.learner.worker_id != config.enrollment.worker_id
+            || plan.learner.pool_id != config.pool_id)
+    {
+        return Err(invalid());
+    }
+    let lost = intent.previous.worker_id;
+    let update = |group: &mut GroupPlacement| -> Result<(), ProtocolError> {
+        let plan = record.groups.iter().find(|plan| plan.expected.identity == group.identity)
+            .ok_or_else(invalid)?;
+        if group.voters.as_ref() != plan.old.as_slice() {
+            return Err(invalid());
+        }
+        group.voters = Page::new(plan.next(lost)?.to_vec()).map_err(|_| invalid())?;
+        Ok(())
+    };
+    update(&mut placements.control)?;
+    update(&mut placements.timestamps)?;
+    update(&mut placements.status)?;
+    let mut partitions = placements.status_partitions.to_vec();
+    for group in &mut partitions {
+        update(group)?;
+    }
+    placements.status_partitions = Page::new(partitions).map_err(|_| invalid())?;
+    update(&mut placements.catalog)?;
+    placements.validate(3)
 }

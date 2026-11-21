@@ -612,6 +612,12 @@ fn actual_runtime_child() {
                 ),
         )
         .try_init();
+    if let Some(config) = std::env::var_os("NABEDRA_OLTP_TEST_REPLACEMENT_PEER") {
+        super::standalone_network_runtime()
+            .unwrap()
+            .block_on(replacement_peer_probe(config.into()));
+        return;
+    }
     if let Some(config) = std::env::var_os("NABEDRA_OLTP_TEST_DATA_WORKER_CONFIG") {
         super::standalone_network_runtime()
             .unwrap()
@@ -649,6 +655,75 @@ fn actual_runtime_child() {
         .unwrap()
         .block_on(super::run(options))
         .unwrap();
+}
+
+async fn replacement_peer_probe(config: PathBuf) {
+    use crate::{
+        config::WorkerResources,
+        oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
+        oltp_replication::{
+            multiplex::{AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport},
+            types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},
+        },
+    };
+    use std::sync::Arc;
+
+    #[derive(serde::Deserialize)]
+    struct Config {
+        group: GroupIdentity,
+        from: WorkerEnrollment,
+        targets: Vec<WorkerEnrollment>,
+        certificate: PathBuf,
+        private_key: PathBuf,
+        authority_ca: PathBuf,
+        directory: PathBuf,
+    }
+    let config: Config = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    let tls = crate::oltp_replication::TlsMaterial::from_pem(
+        &std::fs::read(config.certificate).unwrap(),
+        &std::fs::read(config.private_key).unwrap(),
+        &std::fs::read(config.authority_ca).unwrap(),
+    ).unwrap();
+    let shared = WorkerSharedResources::new(1, WorkerResources::default(), SharedResourceConfig::default()).unwrap();
+    let directory = AppliedPeerDirectory::from_bootstrap(
+        config.group.clone(), config.targets.clone(), shared.clone(),
+    ).unwrap();
+    let client = WorkerTransport::new(&config.from, &tls, shared.clone(), directory,
+        Arc::new(EndpointRegistry::new(shared.clone())), TransportConfig::default()).unwrap().client();
+    let probe = |target: WorkerIdentity| {
+        let header = shared.encode_in(ByteClass::Progress, &"advertise", 4096).unwrap();
+        let client = client.clone();
+        let group = config.group.clone();
+        async move {
+            client.request_classified(&group, target, Purpose::SystemRecovery, header,
+                [None, None, None], 16 << 10).await.is_ok()
+        }
+    };
+    for phase in ["before", "after"] {
+        let marker = config.directory.join(format!("probe-{phase}"));
+        tokio::time::timeout(Duration::from_secs(240), async {
+            while !marker.exists() {
+                if phase == "after" {
+                    // Keep the original sessions open until Control revokes
+                    // their identity. Both sessions use the same client below.
+                    for target in &config.targets {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), probe(WorkerIdentity::from(target))).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }).await.unwrap();
+        let mut observed = Vec::new();
+        for target in &config.targets {
+            observed.push(probe(WorkerIdentity::from(target)).await);
+        }
+        let output = config.directory.join(format!("probe-{phase}.json"));
+        let temporary = output.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&observed).unwrap()).unwrap();
+        std::fs::rename(temporary, output).unwrap();
+    }
 }
 
 #[test]

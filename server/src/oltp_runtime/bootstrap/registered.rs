@@ -21,6 +21,7 @@ use crate::oltp_replication::{
 mod cold;
 mod data_worker;
 mod restart;
+mod system_replacement;
 
 impl LocalServices {
     pub(crate) async fn open_registered(
@@ -73,7 +74,8 @@ impl LocalServices {
         )
         .await?;
         let local = WorkerIdentity::from(&worker.enrollment);
-        let scoped_operator = operator_pins.contains(&local.certificate_sha256);
+        let replacing = worker.system_replacement.is_some();
+        let scoped_operator = replacing || operator_pins.contains(&local.certificate_sha256);
         let placements = worker.placements.clone();
         let status_topology = placements.status_topology()?;
         let seed = placements.control.voters[0].worker_id;
@@ -99,7 +101,7 @@ impl LocalServices {
         eprintln!(
             "nabedra-db: registered consensus heartbeat_ms=500 election_min_ms=1500 election_max_ms=3000"
         );
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if rolling { 120 } else { 60 });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(if replacing { 240 } else if rolling { 120 } else { 60 });
         let last_error = Arc::new(Mutex::new(None::<ProtocolError>));
         let error_trace = last_error.clone();
         let scope = QueueScope {
@@ -134,12 +136,13 @@ impl LocalServices {
             let policy = worker.bootstrap_policy;
             let control = ControlHandle::new(
                 ControlMachine::new(raw_control.state.store().clone())?,
-                ForwardedControl::new(manager.clone(), raw_control.clone(), pins.clone())?,
+                ForwardedControl::registered(manager.clone(), raw_control.clone(), pins.clone(), directory.clone())?,
                 OperatorPolicy {
                     policy,
                     certificate_pins: pins.clone(),
                 },
             );
+            control.use_registered_directory(directory.clone())?;
             let registration = manager
                 .registry()
                 .reserve(placements.control.identity.clone())?;
@@ -151,11 +154,12 @@ impl LocalServices {
                 }),
             )?;
             let control_endpoint = ControlEndpoint::new(control.clone(), shared.clone())?;
-            let hosted_control = HostedControlEndpoint::new(
+            let hosted_control = HostedControlEndpoint::registered(
                 control_endpoint.clone(),
                 raw_control.clone(),
                 shared.clone(),
                 pins.clone(),
+                manager.clone(),
             )?;
             registration.bind(Purpose::Authority, hosted_control.clone())?;
             registration.bind(Purpose::ControlDelegation, hosted_control)?;
@@ -240,7 +244,9 @@ impl LocalServices {
                 )?,
             )?;
             let operator = &worker.operator;
-            let recovery = if worker.cold.is_some() {
+            let recovery = if replacing {
+                None
+            } else if worker.cold.is_some() {
                 Some(cold::begin(&worker, &control, seed, deadline, &error_trace).await?)
             } else if rolling {
                 restart::enroll(&worker, &control, deadline, &error_trace).await?;
@@ -294,10 +300,12 @@ impl LocalServices {
                 }
                 None
             };
-            worker.open_secondary_pools(&control, pins).await?;
+            if !replacing {
+                worker.open_secondary_pools(&control, pins).await?;
+            }
             let operator = &worker.operator;
             // A rolling restart reads the directory below instead of waiting for every enrollment.
-            if !rolling {
+            if !rolling && !replacing {
                 loop {
                     let mut complete = true;
                     for enrollment in &enrollments {
@@ -310,13 +318,18 @@ impl LocalServices {
                     wait_startup(deadline).await?;
                 }
             }
-            startup_read(deadline, &error_trace, "peer directory", || async {
-                worker.directory.refresh(&rpc).await.map_err(|error| {
-                    if rolling && error.code == ErrorCode::Unauthorized { unavailable() } else { error }
-                })
-            }).await?;
-            eprintln!("nabedra-db: registered {} enrolled", local.worker_id);
-            if recovery.is_some() {
+            if !replacing {
+                startup_read(deadline, &error_trace, "peer directory", || async {
+                    worker.directory.refresh(&rpc).await.map_err(|error| {
+                        if rolling && error.code == ErrorCode::Unauthorized { unavailable() } else { error }
+                    })
+                }).await?;
+                eprintln!("nabedra-db: registered {} enrolled", local.worker_id);
+            }
+            if replacing {
+                // The fresh system replicas opened as learners. Their
+                // membership is established together with the Data learners.
+            } else if recovery.is_some() {
                 startup_read(deadline, &error_trace, "fixed cold worker inventory", || {
                     cold::verify_workers(&worker, &control)
                 })
@@ -459,7 +472,14 @@ impl LocalServices {
                     status_topology.clone(),
                     registered_raft_config(),
                 )?;
-            if rolling {
+            if let Some(record) = &worker.system_replacement {
+                factory.host_replacement_data(record).await?;
+                system_replacement::join(&worker, &control, &raw_control, &enrollments, deadline).await?;
+                startup_read(deadline, &error_trace, "replacement peer directory", || async {
+                    directory.refresh(&rpc).await.map_err(|error|
+                        if error.code == ErrorCode::Unauthorized { unavailable() } else { error })
+                }).await?;
+            } else if rolling {
                 startup_read(deadline, &error_trace, "rolling retained Data groups", || factory.rehost_retained(&pools)).await?;
             } else if worker.restored.is_none() {
                 if worker.restart_mount.is_some() {
@@ -469,7 +489,8 @@ impl LocalServices {
                 }
             }
             registration.bind(Purpose::GroupLifecycle, factory.clone())?;
-            let split = SplitClient::new(data.clone(), rpc.clone(), placements.timestamps.identity.clone());
+            let split = SplitClient::new(data.clone(), rpc.clone(),
+                placements.timestamps.identity.clone(), placements.catalog.identity.clone());
             let split_endpoint = SplitEndpoint::new(factory.clone(), pools.clone(), split.clone(), native_timestamps.clone(), native_catalog.clone(), status_topology.clone())?;
             registration.bind(Purpose::ShardSplit, split_endpoint.clone())?;
             registration.bind(Purpose::ShardSplitProof, split_endpoint.clone())?;
@@ -477,10 +498,12 @@ impl LocalServices {
             if let Some(recovery) = &recovery {
                 cold::finish(recovery, &worker, &control, &rpc, seed, deadline, &error_trace)
                     .await?;
+                directory.set_cold_bootstrap(false);
             }
             if !rolling {
                 restart::register_mount(&worker, &control, deadline, &error_trace).await?;
             }
+            worker.seal_replacement_identity()?;
             let restart_mount = worker
                 .restart_mount
                 .take()
@@ -497,6 +520,14 @@ impl LocalServices {
                 super::super::recovery_tests::pause("rolling_before_join", restart.intent.id).await;
             }
             let operator = Arc::new(worker.operator);
+            system_replacement::spawn(
+                manager.clone(),
+                control.clone(),
+                raw_control.clone(),
+                directory.clone(),
+                operator.clone(),
+                stop.subscribe(),
+            );
             // NS14b: Control replaces damaged Data replicas on its own, from the
             // process whose Control replica leads.
             DamageScheduler::new(
@@ -518,6 +549,14 @@ impl LocalServices {
             });
             let catalog =
                 CatalogHandle::new(startup_read(deadline, &error_trace, "Catalog participant", || resolver.participant(&placements.catalog.identity)).await?)?;
+            if replacing {
+                use crate::oltp_replication::authority::control::{DIRECT_VERSION, DirectCapabilityOperation};
+                startup_read(deadline, &error_trace, "replacement direct capability", || async {
+                    rpc.change_direct_capability(Uuid::new_v4(), DirectCapabilityOperation::Advertise {
+                        version: DIRECT_VERSION,
+                    }).await.map(|_| ())
+                }).await?;
+            }
             let (state, ticket, bootstrap) = restart::begin_queue_join(
                 &control, &operator, local, seed, deadline, &error_trace,
             ).await?;
@@ -1083,6 +1122,7 @@ impl ParticipantResolver for RegisteredParticipants {
                     end: None,
                 },
             };
+            let voters = self.data.initial_voters(&self.control, &self.rpc).await?;
             let started = tokio::time::Instant::now();
             let hosted = async {
                 let current = self
@@ -1096,13 +1136,13 @@ impl ParticipantResolver for RegisteredParticipants {
                     return Err(unavailable());
                 }
                 let ready = ready_members(&self.control, current.ready).await?;
-                self.data.host_all(spec.clone(), &self.control, &ready).await
+                self.data.host_all(spec.clone(), &self.control, &ready, &voters).await
             }
             .await;
             tracing::debug!(group_id = %group.group_id, stage = "data_host", ms = started.elapsed().as_millis(), ok = hosted.is_ok(), "initial Data group");
             hosted?;
             let started = tokio::time::Instant::now();
-            let activated = self.data.activate(spec).await;
+            let activated = self.data.activate(spec, &voters).await;
             tracing::debug!(group_id = %group.group_id, stage = "data_activate", ms = started.elapsed().as_millis(), ok = activated.is_ok(), "initial Data group");
             let observation = activated?;
             let generation = id(group.group_id, b"control-membership");
