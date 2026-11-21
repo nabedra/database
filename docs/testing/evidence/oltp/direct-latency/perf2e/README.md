@@ -15,7 +15,7 @@ Runs:
 - **cand:** binary `nabedra-db-5dc696f` (sha256 `ab2371e4…`), driven by the PERF2e driver.
 - **cand, base driver:** the candidate binary driven by the `734c815` driver, which keeps the 2 s reuse rule and the snapshot between phases.
 
-The five runs went back to back in one lane session, 05:11–05:21Z (`load.log`). The lock was taken at a 1-minute load of 2.58; load then rose to 5–7 during the runs. Every run had `correctness_verified: true`.
+The five runs went back to back in one lane session, 05:11–05:21Z (`load.txt`). The lock was taken at a 1-minute load of 2.58; load then rose to 5–7 during the runs. Every run had `correctness_verified: true`.
 
 Latencies are in ms over the 10 measured updates. CPU is container CPU inside the measured phase windows.
 
@@ -50,6 +50,6 @@ The PERF2c column comes from another runner on another day. Runner-to-runner var
 - `analyze.py`: the per-run summary above. Usage: `analyze.py <run dir>...`.
 - `serial-controlled-host.jsonl`, `serial-runner.jsonl`: its output.
 - `runs/*.json`: compact records (settings, statuses, latency distributions, snapshot reports, verification).
-- `load.log`: the session's lane and load log.
+- `load.txt`: the session's lane and load log.
 
 Raw outputs, including samples and cgroup samples, are kept in the ledger (`perf2e/runs/`), not in the repository.

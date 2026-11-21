@@ -1,0 +1,12 @@
+lock taken 2026-11-21T05:11:01Z load: { 2.58 3.84 4.30 }
+=== serial-base1 start 2026-11-21T05:11:01Z load: { 2.58 3.84 4.30 }
+=== serial-base1 end 2026-11-21T05:13:23Z rc=0 seconds=142 load: { 7.63 5.42 4.86 }
+=== serial-cand1 start 2026-11-21T05:13:24Z load: { 7.63 5.42 4.86 }
+=== serial-cand1 end 2026-11-21T05:14:55Z rc=0 seconds=91 load: { 7.33 6.01 5.15 }
+=== serial-candbasedriver start 2026-11-21T05:14:55Z load: { 7.33 6.01 5.15 }
+=== serial-candbasedriver end 2026-11-21T05:17:11Z rc=0 seconds=136 load: { 5.12 5.73 5.18 }
+=== serial-base2 start 2026-11-21T05:17:11Z load: { 5.12 5.73 5.18 }
+=== serial-base2 end 2026-11-21T05:19:26Z rc=0 seconds=135 load: { 6.33 5.97 5.37 }
+=== serial-cand2 start 2026-11-21T05:19:26Z load: { 6.33 5.97 5.37 }
+=== serial-cand2 end 2026-11-21T05:20:59Z rc=0 seconds=93 load: { 5.40 5.74 5.33 }
+session end 2026-11-21T05:20:59Z load: { 5.40 5.74 5.33 }
