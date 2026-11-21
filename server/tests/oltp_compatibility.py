@@ -167,7 +167,12 @@ def olap_scope(first, other):
         db.close()
 
 
+def interrupt_fixture(signum, _frame):
+    raise KeyboardInterrupt(f'fixture interrupted by signal {signum}')
+
+
 def main():
+    signal.signal(signal.SIGTERM, interrupt_fixture)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--olap-binary', type=Path, required=True)
     parser.add_argument('--oltp-binary', type=Path)

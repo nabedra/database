@@ -26,4 +26,8 @@ if (total) {
   assert.ok(!(await db.tables()).some(table => table.name === name || table.id === id))
   await assert.rejects(() => db.table(name),
     error => error instanceof NotFoundError && error.outcome === "not_applied")
+  const receipt = await (await db.submit("table.get", { table_id: id, key: 1n })).wait({ timeout: 20 })
+  assert.equal(receipt.state, "failed")
+  assert.equal(receipt.error?.code, "not_found")
+  assert.equal(receipt.error?.outcome, "not_applied")
 }

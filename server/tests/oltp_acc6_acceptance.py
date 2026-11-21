@@ -12,16 +12,17 @@ import operator
 import os
 from pathlib import Path
 import random
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 
-from oltp_compatibility import OlapServer
+from oltp_compatibility import OlapServer, interrupt_fixture
 from oltp_direct_acceptance import Database, admin_owner, col, dump
 from oltp_direct_cluster import (DATABASE, Rf1Serve, Rf3Cluster, WORKERS, call, operation,
-                                 resources, uid, write_json)
+                                 Http, resources, uid, write_json)
 from oltp_runtime_acceptance import (
     DIRECT, assertion, assert_accepted, assert_record, evidence, exact_receipt, gates,
     gateway, launch_retained, prepare_rolling_restart, read_record, receipt_path, release,
@@ -113,10 +114,9 @@ def o02(binary, test_executable):
 
 
 @contextmanager
-def transactions(binary, test_executable, scenario):
+def transactions(binary, test_executable, scenario, *, queue_bytes=None):
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{scenario.lower()}-') as root:
-        cluster = Rf3Cluster(binary, root, test_executable=test_executable,
-                             direct=dict.fromkeys(WORKERS, DIRECT), api_direct=(DIRECT, DIRECT))
+        cluster = Acc6Cluster(binary, root, test_executable, queue_bytes=queue_bytes)
         fixture = Transactions(cluster, DIRECT)
         try:
             fixture.start()
@@ -186,17 +186,24 @@ def o03(binary, test_executable):
             assert status == 200, refreshed
             if DIRECT:
                 old, new = (stats['direct_gateway'] for stats in (warm, refreshed))
-                assert new['catalog_reads'] > old['catalog_reads'], (old, new)
-                assert any(new[field] > old[field] for field in ('stale_routes', 'fallbacks')), (old, new)
+                redirected = (new['stale_routes'] > old['stale_routes']
+                              and new['catalog_reads'] > old['catalog_reads'])
+                assert redirected or new['fallbacks'] > old['fallbacks'], (old, new)
+            assert table.update(0, {'number': 1.25})
         finally:
             fixture.release(pending['request_id'], 'snapshot')
         fixture.terminal(pending['request_id'], rows)
+        assert table.get(0) == {'id': 0, 'number': 1.25}
+        assert table.update(0, {'number': 0.0})
         error(fixture.api('api1', OPERATIONS, operation('table.get', {
             'table_id': uid(), 'key': 0})), 'not_found')
-        before = cluster.all_stats()
-        for key, expected in ((keys[0], rows[0]), (keys[-1], rows[-1]), (3, None)):
-            assert table.get(key) == expected
-        after = cluster.all_stats()
+        with closing(database(cluster, 'api2')) as observer:
+            current = observer.table('o03_ints')
+            assert current.id == table.id
+            before = cluster.all_stats()
+            for key, expected in ((keys[0], rows[0]), (keys[-1], rows[-1]), (3, None)):
+                assert current.get(key) == expected
+            after = cluster.all_stats()
         point = 'leader.get.read' if DIRECT else 'test.data.point'
         assert stage_delta(before, after, point) == 3, (point, before, after)
         assert stage_delta(before, after, 'test.data.scan') == 0
@@ -211,7 +218,10 @@ def o03(binary, test_executable):
         copies = {name: after[name]['queue']['accepted_records'] - before[name]['queue']['accepted_records']
                   for name in after}
         assert copies == dict.fromkeys(WORKERS, 0 if DIRECT else 3), copies
-        assertion('O03', 'admission-cost', {'replicated_records': copies, 'application_reads': 3})
+        queue_bytes = {name: after[name]['queue']['charged_queue_bytes']
+                       - before[name]['queue']['charged_queue_bytes'] for name in after}
+        assertion('O03', 'admission-cost',
+                  {'replicated_records': copies, 'retained_queue_bytes_delta': queue_bytes, 'application_reads': 3})
         assert table.query().collect() == rows
         for key, sign in ((-1, -1), (0, 1)):
             assert math.copysign(1, table.get(key)['number']) == sign
@@ -228,6 +238,13 @@ def o03(binary, test_executable):
         for bad_key in ('-1', 2**63, -(2**63)-1, -0.0, 0.0, True, float('inf'), float('nan')):
             error(fixture.api('api1', OPERATIONS, operation('table.get', {
                 'table_id': table.id, 'key': bad_key})), 'validation_error')
+        request = operation('table.get', {'table_id': table.id, 'key': 0})
+        body = json.dumps(request, separators=(',', ':')).encode()
+        assert body.endswith(b'"key":0}}')
+        with closing(gateway(cluster)) as client:
+            client.connection.request('POST', OPERATIONS, body[:-3] + b'1e400}}', client.headers)
+            reply = client.connection.getresponse()
+            error((reply.status, json.load(reply)), 'validation_error')
         assert table.get(-1) == rows[2]
         table.drop()
         replacement = fixture.db.create_table('o03_ints', {'id': int}, key='id')
@@ -293,7 +310,7 @@ def query_cases(fixture, table, rows, *, shards, indexed):
 
 
 def o04(binary, test_executable):
-    with transactions(binary, test_executable, 'O04') as fixture:
+    with transactions(binary, test_executable, 'O04', queue_bytes=64 * MIB) as fixture:
         table = fixture.db.create_table('o04_rows', {'id': int, 'category': int, 'value': int, 'label': str}, key='id')
         rng = random.Random(406)
         rows = [{'id': key, 'category': key % 3, 'value': key % 4, 'label': rng.choice('xyzz')}
@@ -338,17 +355,21 @@ def o04(binary, test_executable):
 class Acc6Cluster(Rf3Cluster):
     """Use the standard registered topology with optional unequal limits and copy probes."""
 
-    def __init__(self, binary, root, test_executable, *, unequal=False, traced=(), mounts=False):
+    def __init__(self, binary, root, test_executable, *, unequal=False, traced=(), mounts=False,
+                 queue_bytes=None):
         super().__init__(binary, root, test_executable=test_executable,
                          direct=dict.fromkeys(WORKERS, DIRECT), api_direct=(DIRECT, DIRECT), mounts=mounts)
         self.unequal = unequal
         self.traced = traced
+        self.queue_bytes = queue_bytes
 
     def launch_worker(self, name):
-        if self.unequal:
+        if self.unequal and name not in self.workers:
             threads = (1, 2, 4)[WORKERS.index(name)]
             self.config[name]['resources'] = resources((2048 + 128 * threads) * MIB, threads)
             self.config[name]['execution']['max_workers_per_request'] = 2
+        if self.queue_bytes is not None:
+            self.config[name]['execution']['max_queue_bytes_per_replica'] = self.queue_bytes
         if self.traced:
             directory = self.barrier_dir(name)
             directory.mkdir(parents=True, exist_ok=True)
@@ -361,9 +382,13 @@ def cluster_process(binary, test_executable, label, **options):
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{label}-') as root:
         cluster = Acc6Cluster(binary, root, test_executable, **options)
         try:
-            yield cluster.start()
+            cluster.start()
+            if DIRECT:
+                cluster.wait_direct_active()
+            yield cluster
         except BaseException:
             dump(cluster)
+            cluster.kill_all()
             raise
         finally:
             cluster.close()
@@ -487,7 +512,7 @@ def o05(binary, test_executable):
               'not-run')
 
 
-def malformed_requests(cluster, table):
+def malformed_requests(open_client, table):
     def limit_shape(depth):
         predicate = {'op': 'eq', 'column': 'id', 'value': 1}
         for _ in range(depth):
@@ -503,15 +528,45 @@ def malformed_requests(cluster, table):
         (json.dumps({**query, 'payload': {'table_id': table.id, 'query': {
             **query['payload']['query'], 'filter': limit_shape(64)}}}).encode(), 'validation_error', None),
         (json.dumps({**query, 'payload': {'table_id': table.id, 'query': {
-            **query['payload']['query'], 'limit': 2**65}}}).encode(), 'validation_error', None),
+            **query['payload']['query'], 'limit': -(2**65)}}}).encode(), 'validation_error', None),
         (valid, 'unauthorized', 'Bearer rejected-o22-token'),
     ]
     for payload, code, token in cases:
-        with closing(gateway(cluster, 'api2')) as client:
+        with closing(open_client()) as client:
             headers = client.headers if token is None else {**client.headers, 'Authorization': token}
             client.connection.request('POST', REQUESTS, payload, headers)
             response = client.connection.getresponse()
             error((response.status, json.load(response)), code)
+
+
+def huge_query_count(table):
+    query = dict(table.query()._to_wire(), limit=2**65)
+    return operation('query.count', {'table_id': table.id, 'query': query})
+
+
+def rejected_registered_configs(cluster, binary):
+    name = WORKERS[0]
+    original = cluster.config[name]
+    path = cluster.root / 'invalid-worker.json'
+    destination = cluster.root / 'invalid-worker-storage'
+    before = cluster.all_stats()
+    for label, changed in (
+            ('zero-threads', {'max_threads': 0}),
+            ('overflowing-threads', {'max_threads': 2**65}),
+            ('contradictory-memory', {'memory_limit_bytes': 128 * MIB})):
+        write_json(path, {**original,
+                          'node': {**original['node'], 'directory': str(destination), 'mount': None},
+                          'resources': {**original['resources'], **changed}})
+        refused = subprocess.run([binary, 'worker', '--bootstrap', str(path)], capture_output=True,
+                                 text=True, timeout=15)
+        assert refused.returncode != 0 and 'registered' in refused.stderr, (label, refused.stderr)
+        assert not destination.exists(), label
+    after = cluster.all_stats()
+    assert {name: value['queue'] for name, value in before.items()} == {
+        name: value['queue'] for name, value in after.items()}
+    assert {name: value['native_thread_budget'] for name, value in before.items()} == {
+        name: value['native_thread_budget'] for name, value in after.items()}
+    same_run_ready(cluster, cluster.run_id, WORKERS, 3)
 
 
 def o22(binary, test_executable):
@@ -531,52 +586,127 @@ def o22(binary, test_executable):
         'u02_invalid_auth_or_pin_installs_no_identity_and_wire_keeps_exact_raw_bytes',
         'u03_seed_343687_membership_memory_drain_and_retry_conservation',
     ])
-    with cluster_process(binary, test_executable, 'o22', unequal=True) as cluster, closing(database(cluster)) as db:
+    mounts = Rf3Cluster.mounts_available()
+    with cluster_process(binary, test_executable, 'o22', unequal=True, mounts=mounts) as cluster, closing(database(cluster)) as db:
         table = db.create_table('o22_rows', {'id': int}, key='id')
-        rows = [dict(id=index) for index in range(384)]
-        assert table.insert_many(rows) == len(rows)
-        baseline = cluster.all_stats()
-        observed = [baseline[name]['native_thread_budget']['query_threads'] for name in WORKERS]
-        assert observed == [1, 2, 4], observed
+        rows = [dict(id=index) for index in range(-192, 192)]
+        fixture = Transactions(cluster, DIRECT)
+        _, source = seed_and_source(fixture, table, rows)
+        split = split_at_zero(fixture, source)
+        shard_ids = [child['group_id'] for child in split['children']]
+        assert len(set(shard_ids)) == 2, split
+        assert 'scope shards 2;' in table.query().explain()
+        limits = [cluster.stats(name)['native_thread_budget']['query_threads'] for name in WORKERS]
+        assert limits == [1, 2, 4], limits
+        rejected_registered_configs(cluster, binary)
         held = [operation('query.collect', {'table_id': table.id, 'query': table.query()._to_wire()})
                 for _ in range(2)]
         directories = [cluster.barrier_dir(name) for name in WORKERS]
         for directory in directories:
-            gates(directory, [(req, 'queued') for req in held])
+            (directory / 'read-scheduler-fixture').touch()
+            write_json(directory / 'inspect.json', [req['request_id'] for req in held])
+            for req in held:
+                for shard_id in shard_ids:
+                    (directory / f"read-{req['request_id']}-{shard_id}-hold-running").touch()
+
+        def running(req):
+            return [path for directory in directories
+                    for path in directory.glob(f"read-{req['request_id']}-*-running")
+                    if not path.name.endswith(('hold-running', 'release-running'))]
+
         with closing(gateway(cluster)) as first, closing(gateway(cluster, 'api2')) as second:
             try:
                 for req in held:
                     assert_accepted(first.exchange(REQUESTS, req), cluster.run_id, req)
-                    wait_reached(directories, req, 'queued')
-                assert all(second.exchange(receipt_path(cluster.run_id, req))[1]['state'] == 'queued' for req in held)
+                    wait_until(lambda: running(req), f"{req['request_id']} did not launch a Data page", timeout=20)
+                # A cap of two keeps one request slot for coordinator/reduction.
+                for req in held:
+                    pages = running(req)
+                    assert len(pages) == 1, pages
+                    marker = json.loads(pages[0].read_text())
+                    assert marker['scope']['request']['request_id'] == req['request_id'], marker
+                    status, receipt = second.exchange(receipt_path(cluster.run_id, req))
+                    assert status == 200 and receipt['state'] == 'running', receipt
+                wait_until(lambda: all(not slot[1] for stats in cluster.all_stats().values()
+                                       for slot in stats['scheduler']),
+                           'a blocked remote page retained a compute permit', timeout=5)
                 before_errors = cluster.all_stats()
-                malformed_requests(cluster, table)
+                malformed_requests(lambda: gateway(cluster, 'api2'), table)
                 assert {name: stats['queue'] for name, stats in cluster.all_stats().items()} == {
                     name: stats['queue'] for name, stats in before_errors.items()}
-                assert table.get(5) == {'id': 5}
+                assert table.where(id=5).collect() == [{'id': 5}]
+                count = huge_query_count(table)
+                assert_accepted(second.exchange(REQUESTS, count), cluster.run_id, count)
+                exact_receipt(second.exchange, cluster.run_id, count, len(rows))
                 observed = storage_observation(cluster)
             finally:
                 for directory in directories:
                     for req in held:
-                        release(directory, req)
+                        for shard_id in shard_ids:
+                            (directory / f"read-{req['request_id']}-{shard_id}-release-running").touch()
             for req in held:
                 exact_receipt(second.exchange, cluster.run_id, req, rows)
                 for name in WORKERS:
                     assert_record(read_record(cluster, name, req), cluster.run_id, req)
+                assert all(any((directory / f"read-{req['request_id']}-{shard_id}-reply-ready").exists()
+                               for directory in directories) for shard_id in shard_ids)
         final = cluster.all_stats()
         assert all(not stats['queue']['queued_records'] and not stats['queue']['running_records']
                    and not stats['queue']['reconciling_records'] for stats in final.values())
         evidence('O22', 'unequal-registered-workers', limits={
             name: cluster.config[name]['resources'] for name in WORKERS}, resources=observed)
+        if mounts:
+            owner_id = final[WORKERS[0]]['accept_to_dispatch']['owner']['worker_id']
+            owner = next(name for name in WORKERS if cluster.enrollments[name]['worker_id'] == owner_id)
+            target = next(name for name in WORKERS if name != owner)
+            survivors = tuple(name for name in WORKERS if name != target)
+            route_before = [table.where(id=key).explain().split('owning shard ', 1)[1].splitlines()[0]
+                            for key in (-1, 1)]
+            cluster.workers[target].kill()
+            same_run_ready(cluster, cluster.run_id, survivors, 2)
+            prepare_rolling_restart(cluster, target, owner)
+            cluster.config[target]['resources']['max_threads'] = 3
+            launch_retained(cluster, target)
+            same_run_ready(cluster, cluster.run_id, WORKERS, 3)
+            assert cluster.stats(target)['native_thread_budget']['query_threads'] == 3
+            current = db.table('o22_rows')
+            assert current.id == table.id and current.query().collect() == rows
+            route_after = [current.where(id=key).explain().split('owning shard ', 1)[1].splitlines()[0]
+                           for key in (-1, 1)]
+            assert route_after == route_before, (route_before, route_after)
+            evidence('O22', 'C03-same-store-reconfiguration', worker=target, old_threads=limits[WORKERS.index(target)],
+                     new_threads=3, table=current.id, shards=route_after, rows=len(rows))
+
+
+    with tempfile.TemporaryDirectory(prefix='nabedra-o22-u01-') as root:
+        local = Rf1Serve(binary, root, direct=DIRECT)
+        try:
+            local.start()
+            with closing(Database(url=local.url, token=local.token, database=DATABASE)) as db:
+                table = db.create_table('o22_rows', {'id': int}, key='id')
+                assert table.insert_many(rows) == len(rows)
+                baseline = local.stats()['queue']
+                malformed_requests(lambda: Http(local.url, local.token), table)
+                assert local.stats()['queue'] == baseline
+                assert table.where(id=5).collect() == [{'id': 5}]
+                assert table.query().collect() == rows
+                count = huge_query_count(table)
+                with closing(Http(local.url, local.token)) as client:
+                    status, ready = client.exchange('/health/ready')
+                    assert status == 200, ready
+                    assert_accepted(client.exchange(REQUESTS, count), ready['run_id'], count)
+                    exact_receipt(client.exchange, ready['run_id'], count, len(rows))
+        finally:
+            local.close()
     assertion('O22', 'protected-progress',
-              'Authenticated receipts and a point read progressed past parked RF3 requests. Native mTLS tests exercised reserved Raft progress at the Data-lane saturation cut.')
+              'Authenticated receipts and a small query progressed while two broad scans held remote Data tickets. Native mTLS assertions exercised reserved Raft progress with occupied Data lanes and query executors.')
     assertion('O22', 'dependent-waits-release-compute',
-              'Two native writers were pending on the async ordering lock at zero compute use. The separate read, ordered writes, cancellation and remote wait assertions executed.')
+              'Both live remote page waits and two native writes blocked on asynchronous ordering reached zero compute use. Exact reads, ordered writes, cancellation and settlement executed.')
     assertion('O22', 'caps-fairness-and-conservation',
-              'Deterministic scheduler caps, refill and fairness executed. The unequal RF3 process test observed bounds and exact identity conservation, but did not trace per-request reduction placement under pressure.',
-              'not-run')
+              'Two broad scans used one in-flight Data page per request under a cap of two, visited both shards and returned exact rows. The 100-partition scheduler assertions included reductions, caps 1/2/3, deterministic fairness, refill and conservation.')
     assertion('O22', 'scheduler-contract',
-              'C01–C07/F01–F03/U02–U03 native and registered assertions ran in part. Missing matching local/distributed saturation histories, every C02 failure cut, and persisted partition identity across C03 reconfiguration.',
+              'Native and process C01–C07/F01–F03/U01–U03 assertions ran in part. Missing matching local/distributed saturation histories and forged capacity or stale incarnation during live C02 admission.'
+              + ('' if mounts else ' C03 retained reconfiguration requires Linux loopback pool mounts with passwordless sudo.'),
               'not-run')
 
 
@@ -609,6 +739,7 @@ def queue_workload(cluster, ready, source, target, identities):
     """Compare finite read-heavy and write-heavy bursts at one ready count."""
     sample = iter(identities)
     phases = []
+    write_keys = set()
     for writes_per_batch in (1, 3):
         for repetition in range(4):
             jobs = []
@@ -626,15 +757,30 @@ def queue_workload(cluster, ready, source, target, identities):
             def complete(job):
                 request, expected = job
                 start = time.monotonic_ns()
-                with closing(gateway(cluster, 'api2', timeout=40)) as client:
-                    assert_accepted(client.exchange(REQUESTS, request), cluster.run_id, request)
+                retries = 0
+                with closing(gateway(cluster, 'api2', timeout=20)) as client:
+                    while True:
+                        reply = client.exchange(REQUESTS, request)
+                        if reply[0] == 202:
+                            assert_accepted(reply, cluster.run_id, request)
+                            break
+                        status, body = reply
+                        assert body['request_id'] == request['request_id'], reply
+                        assert status == 503 and body['error']['code'] == 'storage_unavailable', reply
+                        assert body['error']['outcome'] in ('unknown', 'not_applied'), reply
+                        # An uncertain admission can retain the original UUID.
+                        # Retry the exact bytes across a ready-set transition.
+                        retries += 1
+                        assert retries <= 12 and time.monotonic_ns() - start < 20_000_000_000, reply
+                        time.sleep(min(.25 + .05 * retries, 1))
                     accepted = time.monotonic_ns()
                     exact_receipt(client.exchange, cluster.run_id, request, expected)
-                return dict(request_id=request['request_id'],
+                return dict(request_id=request['request_id'], admission_retries=retries,
                             acceptance_ns=accepted-start, terminal_ns=time.monotonic_ns()-start,
                             **copy_metrics(cluster, request, len(ready)))
 
             peak = dict.fromkeys(ready, 0)
+            queue_before = {name: stats['accept_to_dispatch'] for name, stats in cluster.all_stats(ready).items()}
             begin = time.monotonic_ns()
             with ThreadPoolExecutor(max_workers=2) as workers:
                 futures = [workers.submit(complete, job) for job in jobs]
@@ -646,17 +792,28 @@ def queue_workload(cluster, ready, source, target, identities):
                     time.sleep(.01)
                 measurements = [future.result() for future in futures]
             duration = (time.monotonic_ns()-begin) / 1e9
+            queue_wait = {}
+            for name, stats in cluster.all_stats(ready).items():
+                after = stats['accept_to_dispatch']
+                before = queue_before[name]
+                assert after['view'] == before['view'], (before, after)
+                buckets = [current - prior for prior, current in zip(before['bucket_counts'], after['bucket_counts'])]
+                assert all(count >= 0 for count in buckets), buckets
+                queue_wait[name] = {'upper_us': after['upper_us'], 'counts': buckets}
+            assert sum(sum(row['counts']) for row in queue_wait.values()) == len(jobs), queue_wait
             assert len({row['request_id'] for row in measurements}) == len(jobs)
             written = {row['id'] for req, _ in jobs if req['operation'] == 'table.insert_many'
                        for row in req['payload']['rows']}
+            assert not write_keys.intersection(written)
+            write_keys.update(written)
             if repetition:
                 phases.append(dict(
                     writes_per_batch=writes_per_batch, repetition=repetition, peak_slots=peak,
-                    terminal_rate=len(jobs) / duration, recorded_write_keys=len(written),
+                    accept_to_dispatch=queue_wait, terminal_rate=len(jobs) / duration, recorded_write_keys=len(written),
                     acceptance_ns=quantiles([row['acceptance_ns'] for row in measurements]),
                     terminal_ns=quantiles([row['terminal_ns'] for row in measurements]), samples=measurements))
     assert next(sample, None) is None
-    return phases
+    return phases, write_keys
 
 
 def o23(binary, test_executable):
@@ -675,7 +832,7 @@ def o23(binary, test_executable):
         assert table.insert_many(source_rows) == len(source_rows)
         out = db.create_table('o23_output', {'id': int, 'payload': str}, key='id')
         workload_out = db.create_table('o23_workload_output', {'id': str, 'payload': str}, key='id')
-        three = queue_workload(cluster, WORKERS, table, workload_out, traced[2:34])
+        three, write_keys = queue_workload(cluster, WORKERS, table, workload_out, traced[2:34])
         two = None
         read = operation('query.collect', {'table_id': table.id, 'query': table.query().select('id')._to_wire()}, traced[0])
         write_rows = [dict(id=i, payload='y' * 8192) for i in range(16)]
@@ -694,8 +851,16 @@ def o23(binary, test_executable):
             first = clients.submit(admit, read)
             try:
                 wait_reached([directories[target]], read, 'before-staged-copy')
-                assert not first.done()
-                assert read_record(cluster, owner, read)['accepted'] is False
+                def installed_elsewhere():
+                    try:
+                        return read_record(cluster, other, read)
+                    except FileNotFoundError:
+                        return None
+
+                staged = wait_until(installed_elsewhere, 'healthy peer did not finish the staged install', timeout=8)
+                assert not staged['accepted'] and not first.done()
+                local = read_record(cluster, owner, read)
+                assert staged['body_hash'] == local['body_hash'] and not local['accepted'], staged
             finally:
                 release(directories[target], read)
             assert_accepted(first.result(), run, read)
@@ -721,7 +886,9 @@ def o23(binary, test_executable):
                 if mounts:
                     cluster.workers[target].kill()
                     same_run_ready(cluster, run, (owner, other), 2)
-                    two = queue_workload(cluster, (owner, other), table, workload_out, traced[34:])
+                    two, extra_keys = queue_workload(cluster, (owner, other), table, workload_out, traced[34:])
+                    assert not write_keys.intersection(extra_keys)
+                    write_keys.update(extra_keys)
                     for name in (owner, other):
                         for request in (read, write):
                             assert assert_record(read_record(cluster, name, request), run, request) == identities[request['request_id']]
@@ -742,8 +909,7 @@ def o23(binary, test_executable):
             settled = recovered.table('o23_output')
             assert settled.id == out.id and settled.query().collect() == write_rows
             updated = recovered.table('o23_workload_output').query().select('id').collect()
-        assert len(updated) == 128 * (2 if mounts else 1), len(updated)
-        assert len({row['id'] for row in updated}) == len(updated)
+        assert updated == [{'id': key} for key in sorted(write_keys)], updated
         evidence('O23', 'mixed-load', ready_three=three, ready_two=two,
                  cpu_max=(Path('/sys/fs/cgroup/cpu.max').read_text().strip()
                           if Path('/sys/fs/cgroup/cpu.max').is_file() else None),
@@ -769,6 +935,7 @@ def o23(binary, test_executable):
 
 
 def main():
+    signal.signal(signal.SIGTERM, interrupt_fixture)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('scenario', choices=('O02', 'O03', 'O04', 'O05', 'O22', 'O23'))
     parser.add_argument('binary')
