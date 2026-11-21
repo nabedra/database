@@ -4,7 +4,7 @@ use super::super::*;
 use super::point;
 use crate::oltp::{
     backup::{
-        history::{HistoryFrame, MetadataImage},
+        history::{ARCHIVE_PAGE_WIRE_BYTES, ArchivePageBudget, HistoryFrame, MetadataImage},
         restore::OfflineRestoreTarget,
     },
     mvcc::{MvccKey, index::IndexRecord},
