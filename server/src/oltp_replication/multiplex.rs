@@ -12,10 +12,7 @@ use std::{future::Future, ops::Deref, pin::Pin, sync::Arc};
 use uuid::Uuid;
 mod directory;
 mod transport;
-pub(crate) use directory::{
-    AppliedPeerDirectory, MAX_VIEW_REVOCATIONS, REVOCATION_REFRESH, REVOCATION_STALE_AFTER,
-    RevocationSource,
-};
+pub(crate) use directory::AppliedPeerDirectory;
 pub use transport::{
     EndpointRegistry, PeerDirectory, ResidentGroup, ResidentLease, TransportConfig, TransportTrust,
     WorkerClient, WorkerTransport,

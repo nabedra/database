@@ -180,44 +180,11 @@ a new run and recovers data through the archived cut.
 
 Send the admin operations to `POST /v1/cluster/operations` with the admin
 token. A prepared intent authorizes only its exact candidate. Workers check
-each peer request against the Control revocations they know, including on an
-existing connection. The check is an in-memory lookup and makes no Control
-call:
-
-- A Control host checks its applied Control replica.
-- A Data-only worker checks a local revocation view: the revoked worker IDs
-  and certificate digests. At startup it reads the full list from its
-  configured Control peers. A majority must return the same pages, otherwise
-  startup fails. It then repeats that majority read once per second.
-- When the view learns a revocation, the worker closes that identity's
-  sessions at once and refuses its new ones. A revocation committed while a
-  Control majority is reachable takes effect on every Data-only worker
-  within about 1 second, plus up to 2 seconds for a slow read.
-- A refresh can fail, for example when the worker cannot reach a Control
-  majority. The view then keeps every revocation it already learned, since
-  Control never deletes one. The worker keeps serving Data replication and
-  direct requests. After 5 seconds without a successful refresh, it logs one
-  warning, `Data-only revocation view is stale`, and keeps retrying every
-  second. The view stays stale until a majority refresh succeeds, which is
-  also logged.
-
-A revocation the view has not learned yet is still not trusted for long:
-
-- Control commits a revocation only through a Control majority, and only
-  after the survivors proved the lost worker unreachable.
-- The revoked worker is removed from every Raft group it shared, so it cannot
-  commit to them.
-- It is fenced out of the RAM queue.
-
-What the view guards against is a revoked process that comes back, sending
-non-Raft requests to a Data-only worker during the window. If you cannot
-restore a Data-only worker's Control connectivity, stop the revoked worker's
-host or isolate it from the network.
-
-Update Data workers' Control placements and enrollments before their next
-restart. A confirmed revocation removes the stale bootstrap trust. A
-Data-only worker's view needs a majority of its configured Control peers. A
-peer that was replaced and revoked no longer counts toward that majority.
+each peer request against applied Control revocations, including on an
+existing connection. Control hosts check their local view. A Data-only
+worker requires agreement from a majority of its configured Control peers
+before dispatch and refuses the request if it cannot establish agreement. Update Data workers' Control placements and enrollments before their
+next restart. A confirmed revocation removes the stale bootstrap trust.
 
 Control accepts up to 1,024 committed worker revocations. It refuses the
 next mount before enrolling the candidate or changing any placement. The

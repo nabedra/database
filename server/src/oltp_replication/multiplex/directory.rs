@@ -14,41 +14,10 @@ use serde::de::DeserializeOwned;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Mutex, RwLock,
+        RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
-
-/// REP6: a Data-only worker refreshes its revocation view this often.
-pub(crate) const REVOCATION_REFRESH: Duration = Duration::from_secs(1);
-/// One refresh waits at most this long for a Control majority.
-const REVOCATION_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// A view without a successful majority refresh for longer than this is
-/// stale. It keeps enforcing what it learned and keeps serving (Data
-/// availability does not depend on Control's); see `docs/oltp-recovery.md`.
-pub(crate) const REVOCATION_STALE_AFTER: Duration = Duration::from_secs(5);
-/// Control retains at most 1,024 revocations plus the one REP4 could commit
-/// past its limit (`system_trust::MAX_RETAINED_REVOCATIONS`).
-pub(crate) const MAX_VIEW_REVOCATIONS: usize = 1025;
-
-/// Committed system revocations as a majority of Control voters report
-/// them. A Data-only worker has no Control replica of its own.
-pub(crate) trait RevocationSource: Send + Sync + 'static {
-    fn revocations(&self) -> EndpointFuture<'_, Vec<WorkerIdentity>>;
-}
-
-impl RevocationSource for ControlClient {
-    fn revocations(&self) -> EndpointFuture<'_, Vec<WorkerIdentity>> {
-        Box::pin(self.revocations_quorum())
-    }
-}
-
-/// The freshness of a Data-only worker's revocation view.
-struct RemoteRevocations {
-    refreshed: Mutex<Instant>,
-    stale: AtomicBool,
-}
 
 enum Role {
     Worker,
@@ -77,14 +46,11 @@ struct Revocations {
     certificates: BTreeSet<Digest>,
 }
 
-pub(crate) struct RevocationReload<'a>(&'a AppliedPeerDirectory);
+pub(crate) struct RevocationReload<'a>(&'a AtomicBool);
 
 impl Drop for RevocationReload<'_> {
     fn drop(&mut self) {
-        self.0.reloading_revocations.store(false, Ordering::Release);
-        // A revocation recorded during the reload wakes sessions only now:
-        // while reloading, `resolve` refuses every peer.
-        self.0.wake_sessions();
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -103,8 +69,7 @@ pub(crate) struct AppliedPeerDirectory {
     revocations_ready: AtomicBool,
     revocations: RwLock<Revocations>,
     revocation_memory: std::sync::OnceLock<ScratchLease>,
-    remote: std::sync::OnceLock<RemoteRevocations>,
-    trust_changes: tokio::sync::watch::Sender<u64>,
+    remote_revocations: std::sync::OnceLock<std::sync::Weak<ControlClient>>,
     refresh: tokio::sync::Mutex<()>,
     #[cfg(test)]
     pub(crate) fail_replacement_trust_install: AtomicBool,
@@ -137,8 +102,7 @@ impl AppliedPeerDirectory {
             revocations_ready: AtomicBool::new(true),
             revocations: RwLock::new(Revocations::default()),
             revocation_memory: std::sync::OnceLock::new(),
-            remote: std::sync::OnceLock::new(),
-            trust_changes: tokio::sync::watch::Sender::new(0),
+            remote_revocations: std::sync::OnceLock::new(),
             refresh: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             fail_replacement_trust_install: AtomicBool::new(false),
@@ -156,123 +120,13 @@ impl AppliedPeerDirectory {
         }
         Ok(directory)
     }
-    /// REP6: seeds a Data-only worker's revocation view from a Control
-    /// majority. Each exchange then checks the view in memory only
-    /// ([`PeerDirectory::revoked`], [`PeerDirectory::verify`]); the view is
-    /// kept current by [`Self::run_revocation_refresh`].
-    pub(crate) async fn seed_remote_revocations(
+    pub(crate) fn check_remote_revocations(
         &self,
-        source: &dyn RevocationSource,
+        control: &Arc<ControlClient>,
     ) -> Result<(), ProtocolError> {
-        self.reserve_revocations(MAX_VIEW_REVOCATIONS)?;
-        let revoked = source.revocations().await?;
-        self.learn_revocations(revoked)?;
-        let now = Instant::now();
-        if let Err(view) = self.remote.set(RemoteRevocations {
-            refreshed: Mutex::new(now),
-            stale: AtomicBool::new(false),
-        }) {
-            drop(view);
-            self.mark_refreshed(now);
-        }
-        Ok(())
-    }
-
-    /// Refreshes the view every [`REVOCATION_REFRESH`] with one majority
-    /// read. A failed refresh keeps every revocation already learned (Control
-    /// never deletes one) and keeps the worker serving; past
-    /// [`REVOCATION_STALE_AFTER`] it logs that the view is stale.
-    pub(crate) async fn run_revocation_refresh(
-        self: Arc<Self>,
-        source: Arc<dyn RevocationSource>,
-        mut stop: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let mut interval = tokio::time::interval(REVOCATION_REFRESH);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
-        loop {
-            if *stop.borrow() {
-                return;
-            }
-            tokio::select! {
-                changed = stop.changed() => if changed.is_err() || *stop.borrow() { return },
-                _ = interval.tick() => {}
-            }
-            let read = tokio::time::timeout(REVOCATION_READ_TIMEOUT, source.revocations());
-            let result = tokio::select! {
-                changed = stop.changed() => {
-                    if changed.is_err() || *stop.borrow() { return }
-                    continue
-                }
-                result = read => result.unwrap_or_else(|_| Err(unavailable())),
-            };
-            self.refreshed(result.and_then(|revoked| self.learn_revocations(revoked)));
-        }
-    }
-
-    fn refreshed(&self, result: Result<usize, ProtocolError>) {
-        use crate::oltp_runtime::stage_timing::perf_stage;
-        let Some(remote) = self.remote.get() else {
-            return;
-        };
-        match result {
-            Ok(learned) => {
-                perf_stage!("peer.revocations.refresh").record(Duration::ZERO);
-                self.mark_refreshed(Instant::now());
-                if learned > 0 {
-                    tracing::info!(learned, "Data-only revocation view learned revocations");
-                }
-            }
-            Err(error) => {
-                perf_stage!("peer.revocations.refresh_failed").record(Duration::ZERO);
-                let age = self.revocation_view_age().unwrap_or_default();
-                if age > REVOCATION_STALE_AFTER && !remote.stale.swap(true, Ordering::AcqRel) {
-                    tracing::warn!(code=?error.code, age_ms=age.as_millis() as u64,
-                        "Data-only revocation view is stale: no Control majority refresh; \
-                         enforcing the revocations already learned");
-                }
-            }
-        }
-    }
-
-    fn mark_refreshed(&self, now: Instant) {
-        if let Some(remote) = self.remote.get() {
-            *remote
-                .refreshed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
-            if remote.stale.swap(false, Ordering::AcqRel) {
-                tracing::info!("Data-only revocation view refreshed from a Control majority again");
-            }
-        }
-    }
-
-    /// Time since the last successful majority refresh of a Data-only
-    /// worker's revocation view; `None` where Control is local.
-    pub(crate) fn revocation_view_age(&self) -> Option<Duration> {
-        let remote = self.remote.get()?;
-        Some(
-            remote
-                .refreshed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .elapsed(),
-        )
-    }
-
-    /// Records each revocation not yet known and drops its directory entry.
-    fn learn_revocations(&self, revoked: Vec<WorkerIdentity>) -> Result<usize, ProtocolError> {
-        if revoked.len() > MAX_VIEW_REVOCATIONS {
-            return Err(invalid());
-        }
-        let mut learned = 0;
-        for worker in revoked {
-            if self.record_revocation(worker) {
-                self.remove_replaced(worker)?;
-                learned += 1;
-            }
-        }
-        Ok(learned)
+        self.remote_revocations
+            .set(Arc::downgrade(control))
+            .map_err(|_| invalid())
     }
 
     pub(crate) async fn exclude_replaced_bootstrap_peers(
@@ -379,7 +233,7 @@ impl AppliedPeerDirectory {
 
     pub(crate) fn reloading_revocations(&self) -> RevocationReload<'_> {
         self.reloading_revocations.store(true, Ordering::Release);
-        RevocationReload(self)
+        RevocationReload(&self.reloading_revocations)
     }
 
     pub(crate) fn require_revocation_snapshot(&self) {
@@ -387,41 +241,19 @@ impl AppliedPeerDirectory {
     }
 
     pub(crate) fn install_revocations(&self, revoked: Vec<WorkerIdentity>) {
-        let mut learned = false;
         for worker in revoked {
-            learned |= self.record_revocation(worker);
+            self.record_revocation(worker);
         }
         self.revocations_ready.store(true, Ordering::Release);
-        if learned {
-            self.wake_sessions();
-        }
     }
 
-    /// Records `worker` as revoked. A new revocation wakes every session
-    /// ([`PeerDirectory::trust_changes`]) so a revoked peer's sessions close
-    /// now rather than at their next directory check.
-    pub(crate) fn record_revocation(&self, worker: WorkerIdentity) -> bool {
-        let learned = {
-            let mut revoked = self
-                .revocations
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let id = revoked.workers.insert(worker.worker_id);
-            revoked.certificates.insert(worker.certificate_sha256) || id
-        };
-        if learned {
-            self.wake_sessions();
-        }
-        learned
-    }
-
-    /// Wakes every session to recheck its peer ([`PeerDirectory::trust_changes`]).
-    /// Not while trust is unavailable: sessions would see every peer refused.
-    fn wake_sessions(&self) {
-        if self.trust_available() {
-            self.trust_changes
-                .send_modify(|generation| *generation = generation.wrapping_add(1));
-        }
+    pub(crate) fn record_revocation(&self, worker: WorkerIdentity) {
+        let mut revoked = self
+            .revocations
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        revoked.workers.insert(worker.worker_id);
+        revoked.certificates.insert(worker.certificate_sha256);
     }
 
     fn trust_available(&self) -> bool {
@@ -542,13 +374,6 @@ impl AppliedPeerDirectory {
             },
         );
         Ok(())
-    }
-    #[cfg(test)]
-    pub(crate) fn install_worker_for_test(
-        &self,
-        enrollment: WorkerEnrollment,
-    ) -> Result<(), ProtocolError> {
-        self.install(enrollment, Role::Worker, self.epoch.load(Ordering::Relaxed))
     }
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
@@ -705,8 +530,16 @@ impl PeerDirectory for AppliedPeerDirectory {
     fn revoked(&self, peer: WorkerIdentity) -> bool {
         !self.trust_available() || self.denied(peer.worker_id, Some(peer.certificate_sha256))
     }
-    fn trust_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
-        Some(self.trust_changes.subscribe())
+    fn check_inbound(&self, peer: WorkerIdentity) -> Option<EndpointFuture<'_, ()>> {
+        let control = self.remote_revocations.get()?;
+        Some(Box::pin(async move {
+            let control = control.upgrade().ok_or_else(unavailable)?;
+            if control.worker_exclusion_quorum(peer).await? {
+                self.remove_replaced(peer)?;
+                return Err(invalid());
+            }
+            Ok(())
+        }))
     }
     fn is_api(&self, peer: WorkerIdentity) -> bool {
         self.entries.read().is_ok_and(|entries| {
@@ -723,11 +556,7 @@ impl PeerDirectory for AppliedPeerDirectory {
         if self.denied(worker, None) {
             return Err(unavailable());
         }
-        if let Some((record, _)) = self
-            .system
-            .read()
-            .map_err(|_| unavailable())?
-            .as_ref()
+        if let Some((record, _)) = self.system.read().map_err(|_| unavailable())?.as_ref()
             .and_then(|state| state.candidate.as_ref())
             && record.intent.next.worker_id == worker
         {

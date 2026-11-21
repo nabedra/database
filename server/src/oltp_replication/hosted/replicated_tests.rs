@@ -3,15 +3,11 @@ use super::*;
 #[path = "../../../tests/support/tls.rs"]
 mod tls;
 use crate::oltp_replication::{
-    multiplex::{
-        AppliedPeerDirectory, EndpointFuture, PeerDirectory, Purpose, REVOCATION_REFRESH,
-        REVOCATION_STALE_AFTER, RevocationSource, TransportConfig, TransportTrust, WorkerTransport,
-    },
+    multiplex::{PeerDirectory, Purpose, TransportConfig, TransportTrust, WorkerTransport},
     typed_network::{RECEIVED_APPENDS, ReplicaEndpoint, TypedNetworkFactory},
     types::{Digest, WorkerEnrollment, WorkerIdentity},
 };
 use openraft::type_config::async_runtime::watch::WatchReceiver;
-use std::sync::atomic::AtomicU64;
 use tokio::{net::TcpListener, sync::oneshot};
 
 struct Peers(BTreeMap<Uuid, WorkerEnrollment>);
@@ -47,10 +43,6 @@ struct Voter {
     store: GroupStore,
     pool: OltpPool,
     node: u64,
-    identity: WorkerIdentity,
-    transport: Arc<WorkerTransport>,
-    /// REP6: the Data-only directory of the voter built by [`data_only_voters`].
-    data_only: Option<Arc<AppliedPeerDirectory>>,
     _resident: ResidentGroup,
 }
 
@@ -75,34 +67,6 @@ async fn voters_with(
     one_shot: &[u64],
     faults: &BTreeMap<u64, FaultFs>,
     elect_all: bool,
-) -> (
-    Vec<Voter>,
-    Vec<oneshot::Sender<()>>,
-    Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
-    GroupIdentity,
-) {
-    voters_inner(dir, one_shot, faults, elect_all, None).await
-}
-/// [`voters`] where node `data_only` authenticates peers like a worker with
-/// no Control replica: an [`AppliedPeerDirectory`] holding the three
-/// enrollments, whose revocation view comes from a scripted Control source.
-async fn data_only_voters(
-    dir: &Path,
-    data_only: u64,
-) -> (
-    Vec<Voter>,
-    Vec<oneshot::Sender<()>>,
-    Vec<tokio::task::JoinHandle<Result<(), ProtocolError>>>,
-    GroupIdentity,
-) {
-    voters_inner(dir, &[], &BTreeMap::new(), false, Some(data_only)).await
-}
-async fn voters_inner(
-    dir: &Path,
-    one_shot: &[u64],
-    faults: &BTreeMap<u64, FaultFs>,
-    elect_all: bool,
-    data_only: Option<u64>,
 ) -> (
     Vec<Voter>,
     Vec<oneshot::Sender<()>>,
@@ -192,30 +156,12 @@ async fn voters_inner(
         } else {
             WorkerTransport::new
         };
-        let directory = (data_only == Some(node)).then(|| {
-            let control = GroupIdentity {
-                group_id: Uuid::new_v4(),
-                kind: GroupKind::Control,
-                ..group.clone()
-            };
-            let directory =
-                AppliedPeerDirectory::from_bootstrap(control, workers.clone(), shared.clone())
-                    .unwrap();
-            for worker in &workers {
-                directory.install_worker_for_test(worker.clone()).unwrap();
-            }
-            directory
-        });
-        let trust: Arc<dyn PeerDirectory> = match &directory {
-            Some(directory) => directory.clone(),
-            None => peers.clone(),
-        };
         let transport = Arc::new(
             build(
                 worker,
                 tls,
                 shared.clone(),
-                trust,
+                peers.clone(),
                 registry.clone(),
                 TransportConfig::default(),
             )
@@ -270,7 +216,7 @@ async fn voters_inner(
         }
         let (stop, stopped) = oneshot::channel();
         stops.push(stop);
-        tasks.push(tokio::spawn(transport.clone().run(listener, async {
+        tasks.push(tokio::spawn(transport.run(listener, async {
             let _ = stopped.await;
         })));
         voters.push(Voter {
@@ -278,9 +224,6 @@ async fn voters_inner(
             store,
             pool,
             node,
-            identity: WorkerIdentity::from(worker),
-            transport,
-            data_only: directory,
             _resident: resident,
         });
     }
@@ -562,201 +505,5 @@ async fn ns11_o06_rv_apply_rf3_save_vote_retries_during_a_forced_election() {
             .iter()
             .all(|voter| voter.consensus.raft.restarts() == 0)
     );
-    stop_all(voters, stops, tasks).await;
-}
-
-/// REP6: a scripted Control revocation source. Each call stands for one
-/// majority read (one RPC per Control voter).
-#[derive(Default)]
-struct ScriptedRevocations {
-    calls: AtomicU64,
-    failing: AtomicBool,
-    revoked: std::sync::Mutex<Vec<WorkerIdentity>>,
-}
-impl RevocationSource for ScriptedRevocations {
-    fn revocations(&self) -> EndpointFuture<'_, Vec<WorkerIdentity>> {
-        Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            if self.failing.load(Ordering::Acquire) {
-                return Err(ProtocolError::new(
-                    ErrorCode::StorageUnavailable,
-                    "scripted Control majority outage",
-                    Outcome::Unknown,
-                ));
-            }
-            Ok(self.revoked.lock().unwrap().clone())
-        })
-    }
-}
-
-/// Seeds the Data-only voter's view and starts its refresh task, as
-/// `data_worker_process` does at startup.
-async fn start_view(
-    voter: &Voter,
-) -> (
-    Arc<AppliedPeerDirectory>,
-    Arc<ScriptedRevocations>,
-    tokio::sync::watch::Sender<bool>,
-    tokio::task::JoinHandle<()>,
-) {
-    let directory = voter.data_only.clone().expect("Data-only voter");
-    let source = Arc::new(ScriptedRevocations::default());
-    directory.seed_remote_revocations(&*source).await.unwrap();
-    let (stop, stopped) = tokio::sync::watch::channel(false);
-    let refresh = tokio::spawn(
-        directory
-            .clone()
-            .run_revocation_refresh(source.clone(), stopped),
-    );
-    (directory, source, stop, refresh)
-}
-
-fn percentile(samples: &[u64], percent: usize) -> f64 {
-    let mut ordered = samples.to_vec();
-    ordered.sort_unstable();
-    let index = (ordered.len() * percent / 100).min(ordered.len() - 1);
-    ordered[index] as f64 / 1000.0
-}
-
-/// D01/O06/O17 (REP6): a Data-only follower authenticates every
-/// AppendEntries against its in-memory revocation view. Its Control reads
-/// follow the refresh interval (one majority read per second), not the
-/// appends. A Control majority outage leaves the view stale but does not
-/// stop replication: with the other follower stopped, every commit needs
-/// the Data-only follower's ack, and all of them commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn o06_d01_rep6_data_only_follower_appends_make_no_control_call_and_survive_a_control_outage()
-{
-    let dir = Dir::new();
-    let (voters, stops, tasks, group) = data_only_voters(&dir.0, 3).await;
-    let leader = leader(&voters).await;
-    assert_eq!(voters[leader].node, 1, "only node 1 elects");
-    let (directory, source, stop, refresh) = start_view(&voters[2]).await;
-    assert_eq!(source.calls.load(Ordering::Acquire), 1, "the startup seed");
-
-    let started = std::time::Instant::now();
-    let appends_before = received(&group, 3).0;
-    let mut commits = Vec::new();
-    for id in 0..200 {
-        let at = std::time::Instant::now();
-        propose_all(&voters[leader], id..id + 1).await;
-        commits.push(at.elapsed().as_micros() as u64);
-    }
-    applied_everywhere(&voters, 200).await;
-    let elapsed = started.elapsed();
-    let appends = received(&group, 3).0 - appends_before;
-    let reads = source.calls.load(Ordering::Acquire) - 1;
-    let budget = elapsed.as_secs() / REVOCATION_REFRESH.as_secs() + 2;
-    eprintln!(
-        "REP6 Data-only follower: {appends} AppendEntries, {reads} Control majority reads in \
-         {elapsed:?} (budget {budget}); RF3 commit p50 {:.3} ms p99 {:.3} ms",
-        percentile(&commits, 50),
-        percentile(&commits, 99),
-    );
-    assert!(appends >= 50, "the follower received {appends} appends");
-    assert!(
-        reads <= budget,
-        "{reads} Control reads for {appends} appends in {elapsed:?}"
-    );
-
-    // Control majority outage: refreshes fail; the view goes stale.
-    source.failing.store(true, Ordering::Release);
-    timeout_loop(|| async {
-        (directory.revocation_view_age().unwrap() > REVOCATION_STALE_AFTER).then_some(())
-    })
-    .await;
-    let failed_reads = source.calls.load(Ordering::Acquire);
-    // Stop node 2: each commit now needs node 3, the Data-only follower.
-    tokio::time::timeout(Duration::from_secs(20), voters[1].consensus.shutdown())
-        .await
-        .expect("shutdown")
-        .unwrap();
-    let mut outage = Vec::new();
-    for id in 200..240 {
-        let at = std::time::Instant::now();
-        propose_all(&voters[leader], id..id + 1).await;
-        outage.push(at.elapsed().as_micros() as u64);
-    }
-    timeout_loop(|| async { (read_count(&voters[2].store).await == 240).then_some(()) }).await;
-    assert!(!directory.revoked(voters[0].identity));
-    // The refresh keeps retrying once per interval (the commits above can
-    // finish within one interval).
-    timeout_loop(|| async { (source.calls.load(Ordering::Acquire) > failed_reads).then_some(()) })
-        .await;
-    eprintln!(
-        "REP6 Data-only follower during a Control outage (view {:?} old): commit p50 {:.3} ms \
-         p99 {:.3} ms with the Data-only ack on every commit",
-        directory.revocation_view_age().unwrap(),
-        percentile(&outage, 50),
-        percentile(&outage, 99),
-    );
-
-    let _ = stop.send(true);
-    refresh.await.unwrap();
-    for voter in [&voters[0], &voters[2]] {
-        tokio::time::timeout(Duration::from_secs(20), voter.consensus.shutdown())
-            .await
-            .expect("shutdown")
-            .unwrap();
-    }
-    for stop in stops {
-        let _ = stop.send(());
-    }
-    for task in tasks {
-        task.await.unwrap().unwrap();
-    }
-}
-
-/// O17 (REP6): a revocation that Control commits reaches the Data-only
-/// follower within one refresh interval. The view wakes the follower's
-/// sessions, which close the revoked peer's at once; the follower then
-/// refuses its appends, and the group commits through the other voters.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn o17_rep6_a_learned_revocation_closes_the_data_only_follower_sessions() {
-    let dir = Dir::new();
-    let (voters, stops, tasks, group) = data_only_voters(&dir.0, 3).await;
-    let leader = leader(&voters).await;
-    assert_eq!(voters[leader].node, 1, "only node 1 elects");
-    let (directory, source, stop, refresh) = start_view(&voters[2]).await;
-    propose_all(&voters[leader], 0..5).await;
-    applied_everywhere(&voters, 5).await;
-    assert_eq!(voters[2].transport.revoked_session_closes(), 0);
-
-    // Control commits the revocation of node 1's identity.
-    let revoked = voters[0].identity;
-    *source.revoked.lock().unwrap() = vec![revoked];
-    let committed = std::time::Instant::now();
-    timeout_loop(|| async { directory.revoked(revoked).then_some(()) }).await;
-    let learned = committed.elapsed();
-    timeout_loop(|| async { (voters[2].transport.revoked_session_closes() > 0).then_some(()) })
-        .await;
-    let closed = committed.elapsed();
-    eprintln!("REP6 revocation learned after {learned:?}; session closed after {closed:?}");
-    assert!(
-        learned <= REVOCATION_REFRESH + Duration::from_secs(1),
-        "{learned:?}"
-    );
-    // The push closes the session without waiting for the 1 s directory check.
-    assert!(closed <= learned + Duration::from_millis(500), "{closed:?}");
-    assert!(directory.resolve(revoked.worker_id).is_err());
-
-    // An append that passed its check before the view learned may still be
-    // decoding; none can start after.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let appends = received(&group, 3).0;
-    propose_all(&voters[leader], 5..25).await;
-    for voter in &voters[..2] {
-        timeout_loop(|| async { (read_count(&voter.store).await == 25).then_some(()) }).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(
-        read_count(&voters[2].store).await,
-        5,
-        "revoked appends applied"
-    );
-    assert_eq!(received(&group, 3).0, appends, "revoked appends decoded");
-
-    let _ = stop.send(true);
-    refresh.await.unwrap();
     stop_all(voters, stops, tasks).await;
 }

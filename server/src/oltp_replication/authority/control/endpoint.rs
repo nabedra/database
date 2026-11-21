@@ -2,9 +2,9 @@
 //! grants no raw Raft proposal or caller-supplied proof capability.
 use super::{
     ControlCommand, ControlHandle, ControlReply, DataWorkerGrowthProof, Fault, GroupRecord,
-    InventoryPage, SCOPED_QUEUE_VERSION, ScopedQueueCapability, ScopedQueuePlacement,
-    ScopedQueueTransferReport, ScopedQueueTransition, ServiceAction, ServiceAuthorization,
-    TimestampPointRoute, scoped_queue::ScopedQueueOperation, unsupported_service_route,
+    SCOPED_QUEUE_VERSION, ScopedQueueCapability, ScopedQueuePlacement, ScopedQueueTransferReport,
+    ScopedQueueTransition, ServiceAction, ServiceAuthorization, TimestampPointRoute,
+    scoped_queue::ScopedQueueOperation, unsupported_service_route,
 };
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes, ExecutionClass, ScratchLease, WorkerSharedResources},
@@ -39,8 +39,6 @@ const HEADER_LIMIT: usize = 4096;
 const READ_FAILOVER_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_PEER_TIMEOUT: Duration = Duration::from_millis(750);
 const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
-/// A revocation page holds at most 128 identities of about 200 JSON bytes.
-const REVOCATION_PAGE_BYTES: usize = 64 << 10;
 
 #[cfg(test)]
 mod route_tests;
@@ -67,11 +65,6 @@ enum ReadRequest {
     },
     WorkerExcluded {
         worker: WorkerIdentity,
-    },
-    /// REP6: one page of committed system revocations, for Data-only
-    /// workers' revocation views.
-    Revocations {
-        after: Option<Uuid>,
     },
     OwnWorkerDrain,
     OwnGrowthSample {
@@ -630,7 +623,6 @@ impl ControlEndpoint {
                     self.shared
                         .encode_in(ByteClass::Progress, &excluded, HEADER_LIMIT)?
                 }
-                ReadRequest::Revocations { after } => self.handle.revocations(after).await?,
                 ReadRequest::OwnWorkerDrain => {
                     self.handle.own_worker_drain(session.remote()).await?
                 }
@@ -1548,81 +1540,16 @@ impl ControlClient {
         Ok(*reply.decode_section::<bool>(0)?)
     }
     /// An identity pinned in old bootstrap configuration must not vouch
-    /// for itself. A Data-only worker checks its bootstrap pins against a
-    /// majority of the distinct Control pins once, at startup.
+    /// for itself. A Data-only receiver requires agreement from a majority
+    /// of the distinct Control pins before it dispatches a peer request.
     pub(crate) async fn worker_exclusion_quorum(
         &self,
         identity: WorkerIdentity,
     ) -> Result<bool, ProtocolError> {
-        self.quorum_read(
-            &ReadRequest::WorkerExcluded { worker: identity },
-            64 << 10,
-            |reply| async move { Ok(*reply.decode_section::<bool>(0)?) },
-        )
-        .await
-    }
-
-    /// REP6: every committed system revocation (the set Control hosts
-    /// enforce), each page agreed by a majority of the Control pins. A
-    /// Data-only worker seeds its revocation view with this at startup and
-    /// refreshes it once per [`REVOCATION_REFRESH`], never per exchange.
-    ///
-    /// [`REVOCATION_REFRESH`]: crate::oltp_replication::multiplex::REVOCATION_REFRESH
-    pub(crate) async fn revocations_quorum(&self) -> Result<Vec<WorkerIdentity>, ProtocolError> {
-        let mut revoked = Vec::new();
-        let mut after = None;
-        loop {
-            let page = self
-                .quorum_read(
-                    &ReadRequest::Revocations { after },
-                    REVOCATION_PAGE_BYTES,
-                    |reply| async move {
-                        let bytes = reply.sections[0]
-                            .as_ref()
-                            .ok_or_else(|| invalid("Control revocation page is missing"))?;
-                        let budget = crate::oltp::mvcc::json_decode_budget(bytes.as_slice())?;
-                        let reply = reply.reserve_reply_decode(&self.shared, budget).await?;
-                        let page = reply.decode_section::<InventoryPage<WorkerIdentity>>(0)?;
-                        let page = (*page).clone();
-                        Ok((page.items.into_inner(), page.after, page.done))
-                    },
-                )
-                .await?;
-            let (items, cursor, done) = page;
-            for worker in &items {
-                if after.is_some_and(|previous| worker.worker_id <= previous)
-                    || revoked.len() == MAX_VIEW_REVOCATIONS
-                {
-                    return Err(invalid("invalid Control revocation page"));
-                }
-                after = Some(worker.worker_id);
-                revoked.push(*worker);
-            }
-            if cursor != after || (!done && items.is_empty()) {
-                return Err(invalid("invalid Control revocation page"));
-            }
-            if done {
-                return Ok(revoked);
-            }
-        }
-    }
-
-    /// `request` sent to every Control pin; the first value a majority of
-    /// them return (each a linearizable read on its replica) wins.
-    async fn quorum_read<T, F, D>(
-        &self,
-        request: &ReadRequest,
-        reply_bytes: usize,
-        decode: D,
-    ) -> Result<T, ProtocolError>
-    where
-        T: PartialEq,
-        F: std::future::Future<Output = Result<T, ProtocolError>>,
-        D: Fn(ReceivedReply) -> F,
-    {
+        let request = ReadRequest::WorkerExcluded { worker: identity };
         let header = self
             .shared
-            .encode_in(ByteClass::Progress, request, HEADER_LIMIT)?;
+            .encode_in(ByteClass::Progress, &request, HEADER_LIMIT)?;
         let mut voters = Vec::new();
         while let Some(worker) = self.routes.next(voters.last().copied())? {
             if worker.is_nil()
@@ -1637,7 +1564,6 @@ impl ControlClient {
             return Err(unavailable());
         }
         let quorum = voters.len() / 2 + 1;
-        // D01/REP6 evidence: majority reads and the RPCs they send, by kind.
         let _call = crate::oltp_runtime::stage_timing::json_variant(
             "control.quorum_read.",
             header.as_slice(),
@@ -1647,7 +1573,6 @@ impl ControlClient {
             "control.quorum_rpc.",
             header.as_slice(),
         );
-        let decode = &decode;
         let mut requests = FuturesUnordered::new();
         for voter in voters {
             let header = header.clone();
@@ -1655,32 +1580,20 @@ impl ControlClient {
                 let _rpc = rpc.timer();
                 let reply = self
                     .client
-                    .request_authority_dependency(&self.group, voter, header, reply_bytes)
+                    .request_authority_dependency(&self.group, voter, header, 64 << 10)
                     .await?;
                 self.validate_read_reply(&reply, voter)?;
-                decode(reply).await
+                Ok::<bool, ProtocolError>(*reply.decode_section::<bool>(0)?)
             });
         }
         time::timeout(READ_FAILOVER_TIMEOUT, async move {
-            let mut agreement: Vec<(T, usize)> = Vec::new();
+            let mut agreement = [0; 2];
             while let Some(result) = requests.next().await {
-                let Ok(value) = result else { continue };
-                let votes = match agreement.iter_mut().find(|(seen, _)| *seen == value) {
-                    Some((_, votes)) => {
-                        *votes += 1;
-                        *votes
+                if let Ok(revoked) = result {
+                    agreement[usize::from(revoked)] += 1;
+                    if agreement[usize::from(revoked)] == quorum {
+                        return Ok(revoked);
                     }
-                    None => {
-                        agreement.push((value, 1));
-                        1
-                    }
-                };
-                if votes == quorum {
-                    let index = agreement
-                        .iter()
-                        .position(|(_, count)| *count == quorum)
-                        .ok_or_else(unavailable)?;
-                    return Ok(agreement.swap_remove(index).0);
                 }
             }
             Err(unavailable())
