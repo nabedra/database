@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+from functools import partial
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ from uuid import UUID
 from oltp_direct_acceptance import run_program
 from oltp_direct_cluster import DATABASE, ROOT, WORKERS, Rf3Cluster, call, operation, uid, write_json
 from oltp_orm_contract import exercise
+from oltp_runtime_acceptance import RuntimeServer
 from nabedra import Database, col
 
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -52,16 +54,20 @@ class MigrationCluster(Rf3Cluster):
                         ca_file=str(self.ca), timeout=120)
 
     def operator(self, name, payload, request_id=None):
-        request = operation(name, payload, request_id)
-        errors = []
-        for worker in self.live():
-            status, reply = call(self.urls[worker], '/v1/cluster/operations', request,
-                                 token=self.auth['admin_token'], timeout=180)
-            if status == 200:
-                assert reply['request_id'] == request['request_id'], reply
-                return reply['data']
-            errors.append((worker, status, reply))
-        raise AssertionError((name, errors))
+        return admin_request([self.urls[worker] for worker in self.live()], self.auth['admin_token'],
+                             name, payload, request_id)
+
+
+def admin_request(urls, token, name, payload, request_id=None):
+    request = operation(name, payload, request_id)
+    errors = []
+    for url in urls:
+        status, reply = call(url, '/v1/cluster/operations', request, token=token, timeout=180)
+        if status == 200:
+            assert reply['request_id'] == request['request_id'], reply
+            return reply['data']
+        errors.append((url, status, reply))
+    raise AssertionError((name, errors))
 
 
 def wait_for(description, condition, timeout=180):
@@ -94,14 +100,14 @@ def verify_rf3(cluster, groups):
         assert {(member['worker_id'], member['pool_id']) for member in placement['members']} == expected, placement
 
 
-def create_index(cluster, table, name, column, covering):
+def create_index(operator, table, name, column, covering):
     index_id, build_id = uid(), uid()
     definition = dict(table_id=table.id, index_id=index_id, name=name, columns=[column], covering=covering)
-    cluster.operator('storage.index.create', definition, build_id)
+    operator('storage.index.create', definition, build_id)
     selector = dict(table_id=table.id, index_id=index_id, build_id=build_id, attempt=1)
     deadline = time.monotonic() + 120
     while True:
-        reply = cluster.operator('storage.index.status', selector)
+        reply = operator('storage.index.status', selector)
         if reply['state'] == 'ready':
             assert reply['definition'] == definition, reply
             return selector, definition
@@ -110,8 +116,28 @@ def create_index(cluster, table, name, column, covering):
         time.sleep(0.5)
 
 
-def seed(cluster, db):
-    ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
+def seed_legacy_indexes(binary, root):
+    # b29a178's remote Timestamp endpoint rejects index metadata pin binding.
+    # Its local admin API can create the indexes. Move those pre-existing
+    # tables into the RF3 source using the same unmodified legacy binary.
+    local = root / 'legacy-local'
+    local.mkdir()
+    archive = root / 'legacy-seed-archive'
+    with RuntimeServer(binary, local, cli=True) as server:
+        token = json.loads((local / 'auth.json').read_text())['admin_token']
+        operator = partial(admin_request, [server.url], token)
+        with Database(url=server.url, token=server.token, database=DATABASE) as db:
+            ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
+            locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
+            indexes = (create_index(operator, ledger, 'by_bucket', 'bucket', ['label']),
+                       create_index(operator, locations, 'by_region', 'region', ['score']))
+        manifest = operator('archive.create', dict(output=str(archive), owner=dict(backup_id=uid(), attempt=1)))
+    print('MIG1 legacy indexes created and archived', flush=True)
+    return archive, manifest['scope'], indexes
+
+
+def seed(cluster, db, indexes):
+    ledger = db.table('migration_ledger')
     keys_at_boundary = list(range(BOUNDARY - 4, BOUNDARY + 4))
     assert ledger.insert_many([ledger_row(key) for key in keys_at_boundary]) == len(keys_at_boundary)
     source = initial_group(cluster, ledger.id)
@@ -126,18 +152,17 @@ def seed(cluster, db):
         assert result['state'] == 'importing' and time.monotonic() < deadline, result
     assert len({group['group_id'] for group in children}) == 2, children
     verify_rf3(cluster, children)
-    ledger_index = create_index(cluster, ledger, 'by_bucket', 'bucket', ['label'])
+    ledger_index, location_index = indexes
     for start in range(0, ROW_COUNT, 256):
         batch = [ledger_row(key) for key in range(start, min(start + 256, ROW_COUNT)) if key not in keys_at_boundary]
         assert ledger.insert_many(batch) == len(batch), start
     for key in sorted(DELETED):
         assert ledger.delete(key) is True, key
 
-    locations = db.create_table('migration_locations', {'id': str, 'region': str, 'score': float}, key='id')
+    locations = db.table('migration_locations')
     location_rows = [dict(id=f'city-{key:03d}', region='east' if key % 7 == 0 else 'west', score=key + 0.5)
                      for key in range(257)]
     assert locations.insert_many(location_rows) == len(location_rows)
-    location_index = create_index(cluster, locations, 'by_region', 'region', ['score'])
     assert locations.delete('city-000') is True
     empty = db.create_table('migration_empty', {'id': int}, key='id')
     return {
@@ -148,10 +173,10 @@ def seed(cluster, db):
     }, children
 
 
-def describe(db, tables):
+def describe(db):
     return {table.name: dict(id=table.id, schema={name: ty.__name__ for name, ty in table.schema.items()},
                              key=table.key, format=table.format)
-            for table in db.tables() if table.name in tables}
+            for table in db.tables()}
 
 
 def verify_rows(cluster, db, tables):
@@ -300,16 +325,19 @@ def main():
         root = Path(directory).resolve()
         repository = root / 'archive-repository'
         repository.mkdir(mode=0o700)
-        clusters = [MigrationCluster(args.old_binary, root / 'old', repository=repository)]
-        source = clusters[0]
+        clusters = []
         try:
+            seed_archive, seed_scope, indexes = seed_legacy_indexes(args.old_binary, root)
+            source = MigrationCluster(args.old_binary, root / 'old', repository=repository,
+                                      archive=seed_archive, scope=seed_scope)
+            clusters.append(source)
             source.start()
             print('MIG1 old RF3 ready', flush=True)
             with source.database() as db:
-                expected, ranges = seed(source, db)
+                expected, ranges = seed(source, db, indexes)
                 print('MIG1 old tables seeded and split', flush=True)
                 old_programs = o01_programs(source, db)
-                descriptors = describe(db, expected)
+                descriptors = describe(db)
                 before = verify_rows(source, db, expected)
             assert set(descriptors) == set(expected)
             assert before['migration_ledger']['rows'] > 100_000
@@ -333,7 +361,7 @@ def main():
             assert target.cluster_id != source.cluster_id
             verify_rf3(target, [group | {'cluster_id': target.cluster_id} for group in ranges])
             with target.database() as db:
-                assert describe(db, expected) == descriptors
+                assert describe(db) == descriptors
                 assert verify_rows(target, db, expected) == before
                 assert o01_programs(target, db) == old_programs
             evidence = dict(scenario='MIG1', status='passed', rows=before, descriptors=descriptors,
@@ -348,6 +376,8 @@ def main():
             write_json(args.output / 'results.json', evidence)
             print(json.dumps(evidence, sort_keys=True), flush=True)
         except BaseException:
+            if (root / 'legacy-local' / 'server.log').exists():
+                (args.output / 'legacy-local.log').write_bytes((root / 'legacy-local' / 'server.log').read_bytes())
             for cluster in clusters:
                 for name in [*WORKERS, 'api1']:
                     if log := cluster.tail(name, size=16000):
