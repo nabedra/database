@@ -517,7 +517,6 @@ impl IndexService {
                             ).await {
                                 return Err(failure(ErrorCode::StorageUnavailable, "index fixture interrupted backfill"));
                             }
-                            tracing::info!(index=%maintenance.index_id, count=records.len(), visible=records.iter().filter(|record| record.value.is_some()).count(), exhausted, "FLAKE3 backfill page");
                             blocked = 0;
                             for record in records.iter() {
                                 if record.value.is_some() {
@@ -600,7 +599,6 @@ impl IndexService {
             }
             next = page.next_page;
         }
-        tracing::info!(index=%maintenance.index_id, "FLAKE3 planning Ready");
         let (job, digest) = ready_job(maintenance)?;
         let metadata = self
             .backend

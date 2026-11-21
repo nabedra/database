@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        fixture: [vote-order]
+        fixture: [typed-log]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.94.1 --profile minimal
@@ -30,10 +30,6 @@ jobs:
           key: oltp-1.94.1-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml') }}
           restore-keys: oltp-1.94.1-
       - run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
-      - name: Reproduce GC1 vote ordering
-        if: matrix.fixture == 'vote-order'
-        working-directory: server
-        run: cargo test --locked --no-default-features --features oltp --lib o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote
       - name: Repeat the typed-log library suite
         if: matrix.fixture == 'typed-log'
         working-directory: server
@@ -56,6 +52,10 @@ jobs:
           done
           echo "$failed/200 rounds failed"
           test "$failed" = 0
+      - name: Clippy for touched Rust code
+        if: always()
+        working-directory: server
+        run: cargo clippy --locked --no-default-features --features oltp --lib --no-deps
       - uses: actions/setup-python@v5
         if: matrix.fixture == 'd11'
         with:
@@ -72,7 +72,6 @@ jobs:
               --suite d11 --output "flake3/d11-$round" > "flake3/d11-$round.log" 2>&1 || rc=$?
             printf 'round=%s exit=%s\n' "$round" "$rc"
             cat "flake3/d11-$round.log"
-            grep -E "FLAKE3|index build stopped" "flake3/d11-$round/logs/rf1-cli-server-stderr.log" | tail -30 || true
             if [ "$rc" != 0 ]; then failed=$((failed + 1)); fi
           done
           echo "$failed/8 rounds failed"

@@ -68,8 +68,6 @@ async fn run_cli() -> ExitCode {
                             rpc_trace,
                         )
                         .with_target("nabedra_database_server::oltp_runtime", rpc_trace)
-                        .with_target("nabedra_database_server::oltp_runtime::worker_runtime::index_admin", tracing::Level::INFO)
-                        .with_target("nabedra_database_server::oltp::mvcc::index::build", tracing::Level::INFO)
                         .with_target("nabedra_database_server::oltp_replication::manager::data_factory", rpc_trace)
                         .with_target("nabedra_database_server::oltp_replication::authority::control::forwarding", rpc_trace)
                         .with_target("nabedra_database_server::oltp_replication::typed_network", rpc_trace)
