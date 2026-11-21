@@ -68,6 +68,10 @@ pub(super) struct Sweep {
     done: bool,
 }
 impl Sweep {
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.done && self.page.is_empty()
+    }
+
     pub(super) async fn next(
         &mut self,
         runtime: &WorkerRuntime,

@@ -5,7 +5,7 @@ use crate::oltp::mvcc::{
     index::{IndexPhase, IndexRecord},
     store::{ParticipantCommand, ParticipantReply, index_reclaim::ReclaimIndex},
 };
-use crate::oltp_replication::owned::OwnedCommand;
+use crate::oltp_replication::{authority::control::IdlePasses, owned::OwnedCommand};
 use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_millis(250);
@@ -19,6 +19,7 @@ struct Range {
 pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
     let mut sweep = automatic_split::Sweep::default();
     let mut range = None;
+    let mut idle = IdlePasses::new(Duration::from_secs(2));
     loop {
         tokio::time::sleep(INTERVAL).await;
         let Some(runtime) = runtime.upgrade() else {
@@ -26,6 +27,11 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
         };
         if !runtime.accepting.load(Ordering::Acquire) {
             break;
+        }
+        let started = tokio::time::Instant::now();
+        let applied = runtime.services.control.applied_index();
+        if !idle.due(applied, &(), started) {
+            continue;
         }
         let result = tokio::time::timeout(STEP_TIMEOUT, async {
             let authority = runtime.index_authority(None).await?;
@@ -55,9 +61,15 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
         if let Ok(Err(error)) = &result {
             tracing::debug!(code=?error.code, message=error.message, "index reclamation step interrupted");
         }
-        if !matches!(result, Ok(Ok(()))) {
+        let succeeded = matches!(result, Ok(Ok(())));
+        let complete = succeeded && range.is_none() && sweep.is_exhausted();
+        if complete {
+            sweep = automatic_split::Sweep::default();
+        } else if !succeeded {
             range = None;
         }
+        // Catalog retirement and Timestamp pin release can occur without a Control entry.
+        idle.record(complete, applied, (), started);
     }
 }
 
