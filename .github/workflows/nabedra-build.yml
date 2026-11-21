@@ -250,7 +250,7 @@ jobs:
         working-directory: server
         run: |
           exe=$(cargo test --locked --no-default-features --features oltp --lib --no-run --message-format=json \
-            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "nabedra_database") | .executable')
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and .target.name == "nabedra_database_server") | .executable')
           test -x "$exe"
           log="$RUNNER_TEMP/flake2.log"
           total_failed=0
