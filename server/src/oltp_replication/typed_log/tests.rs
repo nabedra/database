@@ -728,12 +728,14 @@ async fn c07_f03_append_waiting_for_native_slot_stays_tracked_and_orders_its_gro
             .append([blank(0)], IOFlushed::signal(sent))
             .await
             .unwrap();
+        // The queued job owns one guard. The append task owns a second guard
+        // until its captured store and resources have been dropped.
         assert_eq!(
             f.log
                 .pending
                 .count
                 .load(std::sync::atomic::Ordering::Acquire),
-            1
+            2
         );
         let mut identity = f.log.group().identity().clone();
         identity.group_id = Uuid::new_v4();
