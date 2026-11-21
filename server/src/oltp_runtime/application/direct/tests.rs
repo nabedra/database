@@ -485,6 +485,7 @@ impl Cluster {
         Arc::new(InProcess {
             routes: Mutex::new(routes),
             down: Mutex::default(),
+            retired: Mutex::default(),
             deny: AtomicBool::new(false),
             lose: AtomicUsize::new(0),
             after_lose: Mutex::default(),
@@ -589,6 +590,7 @@ type Replicas = HashMap<(Uuid, u64), (Arc<DirectExecutor>, Arc<ParticipantHandle
 struct InProcess {
     routes: Mutex<Replicas>,
     down: Mutex<HashSet<u64>>,
+    retired: Mutex<HashSet<Uuid>>,
     deny: AtomicBool,
     lose: AtomicUsize,
     /// Runs once, when a reply is lost (before the gateway resends).
@@ -621,6 +623,9 @@ impl DirectTransport for InProcess {
             };
             if self.down.lock().unwrap().contains(&voter.node_id) {
                 return Err(unreachable());
+            }
+            if self.retired.lock().unwrap().contains(&group.group_id) {
+                return Ok(DirectResponse::NotLeader { hint: None });
             }
             let Some((executor, handle)) = self
                 .routes
@@ -1052,6 +1057,42 @@ async fn o03_d04_gateway_follows_the_leader_and_resends_after_a_lost_reply() {
         (2, 2),
         "one fill per gateway, none per request"
     );
+    cluster.shutdown().await;
+}
+
+/// O28/D07: a cached parent cannot report a newer epoch after its voters
+/// retire. Settle the queued mutation at the child from a refreshed Catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o28_d07_queue_settlement_refreshes_a_retired_split_parent() {
+    let mut cluster = Cluster::new().await;
+    let parent = cluster.add_group(span(None, None), 1, &[1]).await;
+    let left = cluster.add_group(span(None, Some(5)), 2, &[1]).await;
+    let right = cluster.add_group(span(Some(5), None), 2, &[1]).await;
+    let source = Source::new(
+        vec![cluster.fill(&[parent]), cluster.fill(&[left, right])],
+        cluster.voters(),
+    );
+    let transport = cluster.transport();
+    let gateway = cluster.gateway(direct_on(), source.clone(), transport.clone());
+    let id = Uuid::new_v4();
+    let get = cluster.body(id, "table.get", json!({"key": 7}));
+    assert_eq!(answer(&gateway, &get, id).await, Answer::Data(Value::Null));
+    assert_eq!(source.reads(), (1, 1));
+    transport
+        .retired
+        .lock()
+        .unwrap()
+        .insert(cluster.shard(parent).group.group_id);
+
+    let id = Uuid::new_v4();
+    let mutation = cluster.body(id, "table.insert", json!({"row": {"id": 7, "value": 1}}));
+    assert!(matches!(
+        gateway.route(&mutation, true).await,
+        Ok(Routed::Queued)
+    ));
+    assert_eq!(source.reads(), (2, 2));
+    assert_eq!(answer(&gateway, &mutation, id).await, Answer::Queued);
+    assert_eq!(cluster.latest(right, 0, 7).await.1, None);
     cluster.shutdown().await;
 }
 

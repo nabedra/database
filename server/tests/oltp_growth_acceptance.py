@@ -167,15 +167,21 @@ def queue_owner(facade, table, expected, scan=None):
 
 
 def admit_during_transition(facade, body):
+    refusals = deque(maxlen=4)
+
     def accepted():
         status, reply = facade.api('api1', REQUESTS, body, timeout=15)
         if status in (429, 503, 504):
+            refusals.append((status, reply))
             return None
         assert status == 202 and reply['run_id'] == facade.cluster.run_id, (status, reply)
         assert reply['request_id'] == body['request_id'], reply
         return reply
 
-    wait_for(accepted, 'same-ID queue admission through a route change', 90)
+    try:
+        wait_for(accepted, 'same-ID queue admission through a route change', 90)
+    except AssertionError as error:
+        raise AssertionError(f'queue admission did not settle: {list(refusals)}') from error
 
 
 def admit_stale_update(facade, table, key, value):
@@ -863,6 +869,7 @@ def o28(facade):
     facade.make_index(table, queue_owner(facade, table, rows))
 
     source = initial_range(cluster, table.id)
+    print(f'O28 initial Data group {source["group_id"]}', flush=True)
     routes = [dict(group=source, span=dict(start=None, end=None), at=0)]
 
     def next_split():

@@ -301,6 +301,16 @@ impl TopologyCache {
             .entries
             .remove(&table_id);
     }
+    fn remove_if_current(&self, route: &Arc<TableRoute>) {
+        let mut lru = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if lru
+            .entries
+            .get(&route.table_id)
+            .is_some_and(|(current, _)| Arc::ptr_eq(current, route))
+        {
+            lru.entries.remove(&route.table_id);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.inner
@@ -708,6 +718,7 @@ impl DirectGateway {
         let mut delay = Duration::ZERO;
         let mut rotation = 0usize;
         let mut refreshed_unknown_table = false;
+        let mut refreshed_unreachable = false;
         loop {
             if Instant::now() >= deadline {
                 return Err(deadline_error(*uncertain));
@@ -753,6 +764,18 @@ impl DirectGateway {
                     continue;
                 }
             };
+            if rotation >= voters.len() && !refreshed_unreachable {
+                // An already retired source can no longer report StaleRoute.
+                // Check Catalog once after the cached voter set fails.
+                refreshed_unreachable = true;
+                if self
+                    .refresh(&table, deadline)
+                    .await
+                    .is_some_and(|fresh| !Arc::ptr_eq(&table, &fresh))
+                {
+                    continue;
+                }
+            }
             let voter = range
                 .leader_hint()
                 .and_then(|node| voters.iter().find(|voter| voter.node_id == node))
@@ -786,6 +809,7 @@ impl DirectGateway {
                 // The gateway's deadline cut the call: it may have executed.
                 Err(_) => {
                     *uncertain = true;
+                    self.cache.remove_if_current(&table);
                     return Err(deadline_error(true));
                 }
                 Ok(reply) => reply,
@@ -808,6 +832,7 @@ impl DirectGateway {
                         // The leader could not settle an attempt within the
                         // deadline: pass it through as unknown.
                         *uncertain = true;
+                        self.cache.remove_if_current(&table);
                         return Err(error);
                     }
                     if error.outcome == Outcome::Unknown {
@@ -838,6 +863,9 @@ impl DirectGateway {
                     } else if error.code != ErrorCode::StorageUnavailable {
                         range.leader_hint.store(voter.node_id, Ordering::Relaxed);
                         return Ok(Terminal::Failed(error));
+                    } else {
+                        range.leader_hint.store(0, Ordering::Relaxed);
+                        rotation += 1;
                     }
                     // Not applied and transient: retry within the deadline.
                     if !pause(deadline, &mut delay).await {
