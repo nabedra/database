@@ -1457,6 +1457,7 @@ impl WorkerClient {
             prefix,
             header,
             sections,
+            ..
         } = raw;
         if prefix.nonce != *nonce.as_bytes() {
             return Err(malformed("invalid worker response context").into());

@@ -211,6 +211,10 @@ where
     {
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
+            if responder.is_some() && matches!(self.store().identity().kind, GroupKind::Data { .. })
+            {
+                proposal_clock::applying();
+            }
             let _timer = crate::oltp_runtime::stage_timing::by_kind(
                 &self.store().identity().kind,
                 [
@@ -773,6 +777,37 @@ where
         stopped.map_err(|_| unavailable())
     }
 }
+/// RD2 breakdown of a Data `client_write` on its leader: the time from the
+/// latest proposal on this process to the apply of an entry this replica
+/// proposed (`raft.data.propose_to_apply`: local append and replication,
+/// quorum, commit notification and apply scheduling). Exact only while one
+/// proposal is in flight (the serial benchmark); a diagnostic, not a
+/// per-entry measurement.
+mod proposal_clock {
+    use std::{
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    fn now_us() -> u64 {
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        BASE.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
+    }
+    pub(super) fn proposed() {
+        LAST.store(now_us(), Ordering::Relaxed);
+    }
+    pub(super) fn applying() {
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 {
+            crate::oltp_runtime::stage_timing::perf_stage!("raft.data.propose_to_apply")
+                .record(Duration::from_micros(now_us().saturating_sub(last)));
+        }
+    }
+}
+
 impl<C, M> Consensus<C::Command, C::Reply> for RaftConsensus<C, M>
 where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
@@ -794,6 +829,9 @@ where
                 super::entry::OwnedRaftEntry::<C::Command>::normal_metadata_bytes(),
             )?;
             let kind = self.state.store().identity().kind.clone();
+            if matches!(kind, GroupKind::Data { .. }) {
+                proposal_clock::proposed();
+            }
             let _timer = crate::oltp_runtime::stage_timing::by_kind(
                 &kind,
                 [

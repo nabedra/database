@@ -317,7 +317,7 @@ pub(super) fn allowed(header: &super::Header) -> bool {
 }
 
 pub(super) async fn authorize(
-    control: &crate::oltp_replication::authority::control::ControlClient,
+    control: &Arc<crate::oltp_replication::authority::control::ControlClient>,
     session: &super::AuthenticatedSession,
     header: &super::Header,
 ) -> Result<(), ProtocolError> {
@@ -331,16 +331,31 @@ pub(super) async fn authorize(
     };
     let target = control.control_group().clone();
     // Cached like the stable roles (T6 concern 4): one Control read per
-    // API process per `GRANT_TTL`, not per request.
+    // API process per `GRANT_TTL`, not per request. Kept warm while the API
+    // sends direct requests (RD2), so an idle API's next request does not
+    // wait for a Control read.
     let key = super::GrantKey::direct_ingress(session.remote(), &target);
     control
         .service_grants()
-        .role(key, control.applied_revision(), || async {
-            control
-                .service_role(&scope, session.remote(), header.action, target.clone())
-                .await
-                .map(Some)
-        })
+        .role_warm(
+            key,
+            control.applied_revision(),
+            || async {
+                control
+                    .service_role(&scope, session.remote(), header.action, target.clone())
+                    .await
+                    .map(Some)
+            },
+            || {
+                super::warm_role(
+                    control,
+                    scope.clone(),
+                    session.remote(),
+                    header.action,
+                    target.clone(),
+                )
+            },
+        )
         .await
 }
 
