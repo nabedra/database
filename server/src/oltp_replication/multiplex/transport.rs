@@ -580,6 +580,12 @@ struct Common {
     outgoing: OutgoingLanes,
     /// Caller slots per class across every peer lane (RV-FINAL L1).
     outgoing_class: [Arc<Semaphore>; CLASSES],
+    /// Bounds on the callers that wait for a lane (`reserve_outgoing`): one
+    /// slot short of each peer lane, and one lane's worth short of each
+    /// class, so a caller that refuses at once (a queued submission next to
+    /// waiting direct requests) always finds headroom (PERF1).
+    waiting: OutgoingLanes,
+    waiting_class: [Arc<Semaphore>; CLASSES],
     authority_roles: Semaphore,
     authority_waiters: Semaphore,
     resolver: PeerResolver,
@@ -798,6 +804,16 @@ impl WorkerTransport {
                     Arc::new(Semaphore::new(outgoing_class_slots(
                         config.handler_slots[i],
                     )))
+                }),
+                waiting: OutgoingLanes {
+                    headroom: 1,
+                    ..OutgoingLanes::default()
+                },
+                waiting_class: std::array::from_fn(|i| {
+                    let class = outgoing_class_slots(config.handler_slots[i]);
+                    Arc::new(Semaphore::new(
+                        class.saturating_sub(config.handler_slots[i]).max(1),
+                    ))
                 }),
                 authority_roles: Semaphore::new(
                     config.handler_slots[TrafficClass::Authority as usize] - 1,
@@ -1077,20 +1093,19 @@ impl WorkerClient {
             .validate()
             .map_err(|_| malformed("invalid target group"))?;
         let class = traffic(group, purpose)?;
-        if let Ok(slot) = self.try_outgoing_slot(target, class) {
-            return Ok(OutgoingReservation {
-                target,
-                class,
-                slot,
-            });
-        }
         let index = class as usize;
+        let waiting_lane = self.common.waiting.lane(target, class, &self.common.config);
+        let waiting_class = self.common.waiting_class[index].clone();
         let lane = self
             .common
             .outgoing
             .lane(target, class, &self.common.config);
         let class_slots = self.common.outgoing_class[index].clone();
         let acquire = timeout_at(until, async {
+            let waiting = (
+                waiting_lane.acquire_owned().await?,
+                waiting_class.acquire_owned().await?,
+            );
             #[cfg(test)]
             let held = self.common.outgoing_hold[index]
                 .clone()
@@ -1098,12 +1113,15 @@ impl WorkerClient {
                 .await?;
             let slot = lane.acquire_owned().await?;
             let class_slot = class_slots.acquire_owned().await?;
-            Ok::<_, tokio::sync::AcquireError>(OutgoingSlot {
-                _slot: slot,
-                _class: class_slot,
-                #[cfg(test)]
-                _held: held,
-            })
+            Ok::<_, tokio::sync::AcquireError>((
+                waiting,
+                OutgoingSlot {
+                    _slot: slot,
+                    _class: class_slot,
+                    #[cfg(test)]
+                    _held: held,
+                },
+            ))
         });
         // Charge the pending acquisition and timer, as `authority_slots` does.
         let _memory = self
@@ -1111,10 +1129,11 @@ impl WorkerClient {
             .shared
             .reserve_scratch(ByteClass::Progress, std::mem::size_of_val(&acquire))?;
         match acquire.await {
-            Ok(Ok(slot)) => Ok(OutgoingReservation {
+            Ok(Ok((waiting, slot))) => Ok(OutgoingReservation {
                 target,
                 class,
                 slot,
+                _waiting: waiting,
             }),
             _ => {
                 self.common.refusals.outgoing(class);
@@ -1604,6 +1623,9 @@ pub(crate) struct OutgoingReservation {
     target: Uuid,
     class: TrafficClass,
     slot: OutgoingSlot,
+    /// The waiting callers' share of the lane and the class, held with the
+    /// slot. A request moves `slot` out; dropping the rest frees the share.
+    _waiting: (OwnedSemaphorePermit, OwnedSemaphorePermit),
 }
 
 /// A caller slot on one peer lane and in its class. Dropping it frees both.
@@ -1620,6 +1642,9 @@ struct OutgoingSlot {
 #[derive(Default)]
 struct OutgoingLanes {
     lanes: Mutex<std::collections::HashMap<Uuid, Arc<[Arc<Semaphore>; CLASSES]>>>,
+    /// Slots each lane keeps back from its handler capacity (at least one
+    /// slot stays).
+    headroom: usize,
 }
 impl OutgoingLanes {
     /// Lanes are kept per worker ID, not per incarnation. Idle lanes of
@@ -1631,16 +1656,17 @@ impl OutgoingLanes {
             .lanes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capacity = |slots: usize| slots.saturating_sub(self.headroom).max(1);
         if !lanes.contains_key(&worker) && lanes.len() >= Self::PRUNE_AT {
             lanes.retain(|_, lane| {
                 lane.iter()
                     .zip(&config.handler_slots)
-                    .any(|(slots, &capacity)| slots.available_permits() != capacity)
+                    .any(|(slots, &handlers)| slots.available_permits() != capacity(handlers))
             });
         }
         lanes.entry(worker).or_insert_with(|| {
             Arc::new(std::array::from_fn(|i| {
-                Arc::new(Semaphore::new(config.handler_slots[i]))
+                Arc::new(Semaphore::new(capacity(config.handler_slots[i])))
             }))
         })[class as usize]
             .clone()

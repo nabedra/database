@@ -879,7 +879,9 @@ async fn c07_m02_rv_final_l1_class_in_flight_is_capped_across_peer_lanes() {
 
 /// PERF1 (O03, D01): a direct request that finds its leader's lane full
 /// waits for a slot, in arrival order, until its deadline, instead of being
-/// refused at once; the lane keeps its bound, and a wait that times out is a
+/// refused at once. Waiting callers hold at most one slot less than the lane,
+/// so a caller that refuses at once (a queued submission next to direct load,
+/// D11-drop in run 44904328496) still finds one. A wait that times out is a
 /// local, not-applied `OutgoingLaneFull`.
 #[tokio::test]
 async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
@@ -921,12 +923,12 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
     let lane = config.handler_slots[class as usize];
     let leader = Uuid::new_v4();
     let reserve = |until| client.reserve_outgoing(&group, leader, Purpose::ApiIngress, until);
-    // The lane admits `lane` requests at once, without waiting.
+    // Waiting callers get `lane - 1` slots at once.
     let mut held = Vec::new();
-    for _ in 0..lane {
+    for _ in 0..lane - 1 {
         held.push(reserve(Instant::now()).await.unwrap());
     }
-    // A full lane: refused at the deadline, counted as a local refusal.
+    // Their share is full: refused at the deadline, counted as a local refusal.
     let refused = transport.common.refusals.snapshot();
     let start = Instant::now();
     assert!(matches!(
@@ -935,6 +937,12 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
     ));
     assert!(start.elapsed() >= Duration::from_millis(50));
     assert_ne!(transport.common.refusals.snapshot(), refused);
+    // The last slot is still there for a caller that refuses at once.
+    let headroom = client.try_outgoing(leader, class).unwrap();
+    assert!(matches!(
+        client.try_outgoing(leader, class),
+        Err(RequestError::OutgoingLaneFull)
+    ));
     // A waiter gets the slot a finished request frees.
     let waiter = tokio::spawn({
         let client = client.clone();
@@ -948,7 +956,6 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
                     Instant::now() + Duration::from_secs(10),
                 )
                 .await
-                .map(|_| ())
         }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -957,18 +964,18 @@ async fn perf1_direct_waits_for_a_full_lane_within_its_deadline() {
         "the waiter must wait while the lane is full"
     );
     held.pop();
-    tokio::time::timeout(Duration::from_secs(5), waiter)
+    let admitted = tokio::time::timeout(Duration::from_secs(5), waiter)
         .await
         .expect("the freed slot admits the waiter")
         .unwrap()
         .unwrap();
-    // The bound holds: still `lane` slots at most.
-    held.push(reserve(Instant::now()).await.unwrap());
+    held.push(admitted);
+    // The bound holds: `lane` slots in all, the waiter's included.
     assert!(matches!(
         client.try_outgoing(leader, class),
         Err(RequestError::OutgoingLaneFull)
     ));
-    drop(held);
+    drop((held, headroom));
     assert!(client.try_outgoing(leader, class).is_ok());
 }
 
