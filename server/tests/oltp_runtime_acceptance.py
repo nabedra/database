@@ -927,10 +927,10 @@ def queue_survival(binary, test_executable):
         assert recovered.get('once') == dict(id='once', value=3)
         assert recovered.get('no_quorum') is None
         assert recovered.query().count() == 2
-        assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway returned the historical row and one mutation result.')
         prepare_rolling_restart(cluster, owner, survivor)
         launch_retained(cluster, owner)
         same_run_ready(cluster, run, WORKERS, 3)
+        assertion('O14', 'same-run-request-and-context', 'Successive API and worker losses preserved exact bytes, identity, read timestamp, schema, authorization and outcomes. The restored gateway returned the historical row and one mutation result, and all three workers became ready on the original run.')
 
 
 def count_pressure(test_executable):
