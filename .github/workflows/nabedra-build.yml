@@ -1111,6 +1111,13 @@ jobs:
           python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
             --output "$GITHUB_WORKSPACE/perf-out/serial" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
             --clients 1 --rows 2000 --seed 20261118 --timeout 10 --perf-record 30 --perf-delay 20 --perf-frequency 999 --perf-call-graph fp
+      # RD2: the same serial run with the role checks not kept warm (same binary and runner).
+      - name: Serial pair without grant warming (RD2 A/B)
+        run: |
+          cd scripts
+          python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/perf-bin/nabedra-db-fp" --direct-oltp on \
+            --output "$GITHUB_WORKSPACE/perf-out/serial-nowarm" --rates 0.2 --seconds 5 --warmup-seconds 5 --repetitions 10 \
+            --clients 1 --rows 2000 --seed 20261118 --timeout 10 --worker-env NABEDRA_BENCH_NO_GRANT_WARM=1
       - name: 50 updates/s with perf
         run: |
           cd scripts

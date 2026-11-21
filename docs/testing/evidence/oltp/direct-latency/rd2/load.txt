@@ -1,0 +1,13 @@
+=== serial-cand-on1 start 2026-11-21T18:32:32Z waited=210s bin=nabedra-db-22a1934 args= load: { 3.61 28.98 45.46 }
+=== serial-cand-on1 end 2026-11-21T18:34:14Z rc=0 seconds=102 load: { 4.16 21.83 40.83 }
+=== serial-cand-off1 start 2026-11-21T18:34:29Z waited=15s bin=nabedra-db-22a1934 args=--worker-env NABEDRA_BENCH_NO_GRANT_WARM=1 load: { 3.53 20.83 40.14 }
+=== serial-cand-off1 end 2026-11-21T18:36:04Z rc=0 seconds=95 load: { 7.78 17.61 36.86 }
+=== serial-cand-on2 start 2026-11-21T18:37:19Z waited=75s bin=nabedra-db-22a1934 args= load: { 3.62 14.12 33.90 }
+=== serial-cand-on2 end 2026-11-21T18:38:55Z rc=0 seconds=96 load: { 4.88 11.72 30.89 }
+=== serial-cand-off2 start 2026-11-21T18:39:40Z waited=45s bin=nabedra-db-22a1934 args=--worker-env NABEDRA_BENCH_NO_GRANT_WARM=1 load: { 3.59 10.45 29.43 }
+=== serial-cand-off2 end 2026-11-21T18:41:17Z rc=0 seconds=97 load: { 3.98 8.63 26.61 }
+=== update-cand start 2026-11-21T18:41:18Z waited=0s bin=nabedra-db-22a1934 args= load: { 3.98 8.63 26.61 }
+=== update-cand end 2026-11-21T18:44:59Z rc=0 seconds=222 load: { 4.43 6.30 21.48 }
+=== fixed-cand start 2026-11-21T18:45:15Z waited=15s bin=nabedra-db-22a1934 args= load: { 3.89 6.09 21.14 }
+=== fixed-cand end 2026-11-21T18:47:26Z rc=0 seconds=131 load: { 9.01 7.25 19.47 }
+session done 2026-11-21T18:47:26Z
