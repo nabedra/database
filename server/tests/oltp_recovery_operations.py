@@ -234,6 +234,12 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         acknowledged = insert(table, 1, 77)
         original = send_op(acknowledged)
         assert success(*original) is None
+        acknowledged_writes = [(acknowledged, original)]
+        for key in range(3, 11):
+            body = insert(table, key, key * 11)
+            observed = send_op(body)
+            assert success(*observed) is None
+            acknowledged_writes.append((body, observed))
         queued = insert(table, 2, 88)
         queued_id = queued['request_id']
         for name in WORKERS:
@@ -378,6 +384,7 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         write_json(candidate_barrier / 'inspect.json', [queued_id])
         write_json(candidate_barrier / 'gates.json', {
             intent['id']: 'rolling_copy_complete', queued_id: 'queued',
+            fresh['worker_id']: 'system_replacement_rf3_applied',
         })
         for name in survivors:
             write_json(cluster.barrier_dir(name) / 'gates.json', {
@@ -433,6 +440,10 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             for name in survivors:
                 (cluster.barrier_dir(name) / f'release-{data_group}').touch()
 
+        stable_checkpoint = candidate_barrier / f'reached-{fresh["worker_id"]}'
+        wait_for(stable_checkpoint.exists, 'replacement applied stable RF3 in every group', RECOVERY_DEADLINE)
+        rf3_restored = time.monotonic()
+        (candidate_barrier / f'release-{fresh["worker_id"]}').touch()
         copy_checkpoint = candidate_barrier / f'reached-{intent["id"]}'
         def copied():
             if not cluster.workers['replacement'].alive():
@@ -440,7 +451,6 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             return copy_checkpoint.exists()
 
         wait_for(copied, 'complete replacement queue snapshot', RECOVERY_DEADLINE)
-        rf3_restored = time.monotonic()
         copied_record = json.loads((candidate_barrier / f'record-{queued_id}.json').read_text())
         assert copied_record['accepted'] and json.loads(copied_record['body']) == queued, copied_record
         queue_copy = json.loads((candidate_barrier / 'rolling-copy.json').read_text())
@@ -466,8 +476,10 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
 
         for name in (*survivors, 'replacement'):
             (cluster.barrier_dir(name) / f'release-{queued_id}').touch()
-        assert send_op(acknowledged) == original
-        assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
+        for body, acknowledged_result in acknowledged_writes:
+            row = body['payload']['row']
+            assert send_op(body) == acknowledged_result
+            assert success(*send_op(get(table, row['id']))) == row
         receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
 
         def receipt():
@@ -491,12 +503,54 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                refused_missing_advert=True, refused_candidate_missing_advert=True,
                refused_data_quorum=True, refused_reused_certificate=True,
                replayed_intent=True, settled_receipts=1, revoked_old_certificate=True,
+               acknowledged_direct_writes=len(acknowledged_writes),
                probe_recovery_seconds=round(first_read - stopped_at, 3),
                elapsed_loss_to_rf3_seconds=round(rf3_restored - stopped_at, 3),
                elapsed_start_to_rf3_seconds=round(rf3_restored - replacement_started, 3))
     finally:
         if peer_probe is not None:
             peer_probe.stop()
+        cluster.close()
+
+
+def o17_mixed_binary_retained_enrollment_refused(binary, test_executable, legacy_binary, root):
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable, api_direct=())
+    try:
+        cluster.start()
+        for name in WORKERS:
+            (cluster.barrier_dir(name) / 'inspect-control-leader').touch()
+
+        def enable():
+            for name in WORKERS:
+                cluster.stats(name)
+                if json.loads((cluster.barrier_dir(name) / 'control-leader.json').read_text()):
+                    return cluster.admin('worker.system_replacement.enable', {}, worker=name)
+            return None
+
+        assert wait_for(enable, 'activate system replacement', PROBE_WINDOW)['capability'] == 'control.system-replacement.v1'
+        target = WORKERS[-1]
+        survivors = [name for name in WORKERS if name != target]
+        original = cluster.enrollments[target]
+        cluster.workers[target].kill()
+        cluster.workers[target].stop()
+        wait_for(lambda: two_ready(cluster, survivors), 'survivors removed the stopped worker')
+        retained = retained_config(cluster, target, survivors)
+        config = root / 'legacy.json'
+        write_json(config, retained)
+        env = {key: value for key, value in os.environ.items() if not key.startswith(('AWS_', 'NABEDRA_S3_'))}
+        legacy = Process('legacy', [str(legacy_binary), 'worker', '--bootstrap', str(config)],
+                         env, root / 'legacy.log')
+        try:
+            assert legacy.popen.wait(timeout=PROBE_WINDOW) != 0, (root / 'legacy.log').read_text()
+            log = (root / 'legacy.log').read_text()
+            assert 'UnsupportedOperation' in log and 'must advertise control.system-replacement' in log, log
+            assert two_ready(cluster, survivors)
+            peers = cluster.admin('cluster.connection', {}, worker=survivors[0])['control_peers']
+            assert original in peers and retained['node']['enrollment'] not in peers, peers
+        finally:
+            legacy.stop()
+        report('O17 mixed-binary retained startup', refused_legacy_binary=True, ready_workers=2)
+    finally:
         cluster.close()
 
 
@@ -797,7 +851,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check'), default='all')
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed'),
+                        default='all')
+    parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='nabedra-rep1-') as directory:
         root = Path(directory).resolve()
@@ -809,6 +865,12 @@ def main():
         if args.suite in ('all', 'replacement-check'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
+
+        if args.suite == 'replacement-mixed':
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            assert args.legacy_binary, 'the mixed startup check requires the pre-execution binary'
+            o17_mixed_binary_retained_enrollment_refused(
+                args.binary, args.test_executable, args.legacy_binary.resolve(), root / 'replacement-mixed')
 
 
 if __name__ == '__main__':

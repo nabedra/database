@@ -88,6 +88,7 @@ impl ControlMachine {
                 trust.candidate,
             )?;
         }
+        directory.replace_revocation_view(false);
         Ok(())
     }
 }

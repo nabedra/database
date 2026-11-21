@@ -51,8 +51,14 @@ pub(crate) use service::{
 };
 pub(crate) use service::IdlePasses;
 pub(crate) use system_recovery::{
-    CAPABILITY as SYSTEM_REPLACEMENT_CAPABILITY, EXECUTION_CAPABILITY as SYSTEM_REPLACEMENT_EXECUTION, MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS,
-    ReplacementGroup, ReplacementIntent, ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
+    CAPABILITY as SYSTEM_REPLACEMENT_CAPABILITY,
+    EXECUTION_CAPABILITY as SYSTEM_REPLACEMENT_EXECUTION,
+    MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup, ReplacementIntent,
+    ReplacementMountProof, ReplacementRecord, SystemRecoveryCommand,
+};
+pub(crate) use worker_drain::{EksReplacementAction, EksReplacementPermit, SignedEksReplacement};
+pub(crate) use worker_drain::{
+    WorkerCloseAttestation, WorkerDrainIntent, WorkerDrainPhase, WorkerDrainRecord,
 };
 #[cfg(test)]
 mod tests;

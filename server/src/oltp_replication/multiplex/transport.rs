@@ -78,7 +78,10 @@ fn admit_trust(
         && (group.kind != GroupKind::Control
             || !matches!(
                 purpose,
-                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery
+                Purpose::Raft
+                    | Purpose::Authority
+                    | Purpose::ControlDelegation
+                    | Purpose::SystemRecovery
             ))
     {
         return Err(malformed(
@@ -119,7 +122,11 @@ pub trait PeerDirectory: Send + Sync + 'static {
 }
 
 fn revoked_peer() -> ProtocolError {
-    ProtocolError::new(ErrorCode::Unauthorized, "worker certificate or identity was revoked", Outcome::NotApplied)
+    ProtocolError::new(
+        ErrorCode::Unauthorized,
+        "worker certificate or identity was revoked",
+        Outcome::NotApplied,
+    )
 }
 
 /// Whether this worker is the hello's audience. Every audience names this

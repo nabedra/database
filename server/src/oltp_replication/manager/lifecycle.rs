@@ -168,8 +168,10 @@ where
             let minimum = *reply.log_id();
             #[cfg(test)]
             crate::oltp_runtime::recovery_tests::pause(
-                "replacement_learner_appended", self.state.store().identity().group_id,
-            ).await;
+                "replacement_learner_appended",
+                self.state.store().identity().group_id,
+            )
+            .await;
             self.raft
                 .wait(Some(Duration::from_secs(25)))
                 .replication(target.node_id, Some(minimum.index), u64::MAX)

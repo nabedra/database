@@ -30,9 +30,14 @@ impl ControlHandle {
     }
     /// The worker's certificate is an operator pin of this Control.
     pub(crate) fn is_operator(&self, worker: &WorkerIdentity) -> bool {
-        self.registered_directory.get()
+        self.registered_directory
+            .get()
             .and_then(|directory| directory.current_operator(*worker))
-            .unwrap_or_else(|| self.policy.certificate_pins.contains(&worker.certificate_sha256))
+            .unwrap_or_else(|| {
+                self.policy
+                    .certificate_pins
+                    .contains(&worker.certificate_sha256)
+            })
     }
     /// Installs the predicate that allows the NS14 commands.
     pub(crate) fn install_group_damage_gate(&self, gate: Arc<dyn GroupDamageGate>) {

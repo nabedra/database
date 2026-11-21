@@ -320,9 +320,14 @@ impl ForwardedControl {
             if received.group() != group
                 || received.purpose() != Purpose::ControlDelegation
                 || received.remote_identity().worker_id != member.worker_id
-                || !self.directory.as_ref()
+                || !self
+                    .directory
+                    .as_ref()
                     .and_then(|directory| directory.current_operator(received.remote_identity()))
-                    .unwrap_or_else(|| self.pins.contains(&received.remote_identity().certificate_sha256))
+                    .unwrap_or_else(|| {
+                        self.pins
+                            .contains(&received.remote_identity().certificate_sha256)
+                    })
                 || received.sections[1].is_some()
                 || received.sections[2].is_some()
             {
@@ -505,7 +510,9 @@ impl HostedControlEndpoint {
     }
 
     async fn check_worker_capability(&self, command: &ControlCommand) -> Result<(), ProtocolError> {
-        let Some(manager) = &self.manager else { return Ok(()) };
+        let Some(manager) = &self.manager else {
+            return Ok(());
+        };
         let worker = match command {
             ControlCommand::Enroll { next, .. } => WorkerIdentity::from(next),
             ControlCommand::CompleteRestart { intent, .. } => WorkerIdentity::from(&intent.next),
@@ -513,7 +520,10 @@ impl HostedControlEndpoint {
             ControlCommand::CompleteEksWorkerReplacement { worker, .. } => *worker,
             _ => return Ok(()),
         };
-        self.reads.control().check_replacement_enrollment_capability(manager, worker).await
+        self.reads
+            .control()
+            .check_replacement_enrollment_capability(manager, worker)
+            .await
     }
 
     fn request(
@@ -534,7 +544,8 @@ impl HostedControlEndpoint {
         );
         if session.group() != self.local.state.store().identity()
             || session.purpose() != Purpose::ControlDelegation
-            || (!scoped_data_worker && !self.reads.is_operator(session.remote())
+            || (!scoped_data_worker
+                && !self.reads.is_operator(session.remote())
                 && !(session.recovery_only()
                     && matches!(request.control_consensus, Operation::CompleteRestart)))
             || (scoped_data_worker && self.reads.is_operator(session.remote()))

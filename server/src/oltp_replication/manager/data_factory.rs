@@ -268,14 +268,28 @@ impl DataGroupFactory {
         group: &GroupIdentity,
         initialize: bool,
     ) -> Result<(), ProtocolError> {
-        self.host_at(group, &self.local, &self.voters, initialize).await
+        self.host_at(group, &self.local, &self.voters, initialize)
+            .await
     }
 
-    async fn host_at(&self, group: &GroupIdentity, local: &ReplicaMember, voters: &[ReplicaMember], initialize: bool) -> Result<(), ProtocolError> {
+    async fn host_at(
+        &self,
+        group: &GroupIdentity,
+        local: &ReplicaMember,
+        voters: &[ReplicaMember],
+        initialize: bool,
+    ) -> Result<(), ProtocolError> {
         let _start = self.starts.lock().await;
         let running = start_data_group(
-            &self.manager, &self.config, &self.pool, group, local, voters, initialize,
-        ).await?;
+            &self.manager,
+            &self.config,
+            &self.pool,
+            group,
+            local,
+            voters,
+            initialize,
+        )
+        .await?;
         self.wire_participant(group, local.node_id, running)
     }
     pub(crate) async fn host_replacement_data(
@@ -287,13 +301,19 @@ impl DataGroupFactory {
             if !matches!(group.kind, GroupKind::Data { .. }) {
                 continue;
             }
-            let running = self.manager.start_data(
-                self.pool.group(group.clone()).await?,
-                plan.learner.clone(),
-                plan.old.iter().chain(std::iter::once(&plan.learner))
-                    .map(|member| (member.node_id, member.clone())).collect(),
-                self.config.clone(),
-            ).await?;
+            let running = self
+                .manager
+                .start_data(
+                    self.pool.group(group.clone()).await?,
+                    plan.learner.clone(),
+                    plan.old
+                        .iter()
+                        .chain(std::iter::once(&plan.learner))
+                        .map(|member| (member.node_id, member.clone()))
+                        .collect(),
+                    self.config.clone(),
+                )
+                .await?;
             self.wire_participant(group, plan.learner.node_id, running)?;
         }
         Ok(())
@@ -318,7 +338,12 @@ impl DataGroupFactory {
         }
         Ok(())
     }
-    async fn activate(&self, spec: &DataGroupSpec, local: &ReplicaMember, voters: &[ReplicaMember]) -> Result<Membership, ProtocolError> {
+    async fn activate(
+        &self,
+        spec: &DataGroupSpec,
+        local: &ReplicaMember,
+        voters: &[ReplicaMember],
+    ) -> Result<Membership, ProtocolError> {
         let running = self.manager.hosted_data(&spec.group, local.node_id)?;
         // Only the leader can produce this observation after real ReadIndex.
         let started = tokio::time::Instant::now();
@@ -468,14 +493,21 @@ impl Endpoint for DataGroupFactory {
                     .await?;
                 let voters = self.initial_voters().await?;
                 self.validate(&request, &voters)?;
-                let local = voters.iter().find(|member| member.worker_id == self.local.worker_id
-                    && member.pool_id == self.local.pool_id && member.node_id == header.to_node).ok_or_else(invalid)?;
+                let local = voters
+                    .iter()
+                    .find(|member| {
+                        member.worker_id == self.local.worker_id
+                            && member.pool_id == self.local.pool_id
+                            && member.node_id == header.to_node
+                    })
+                    .ok_or_else(invalid)?;
                 if request.spec.authority != current {
                     return Err(unauthorized());
                 }
                 let output = match header.method {
                     Method::Host => {
-                        self.host_at(&request.spec.group, local, &voters, true).await?;
+                        self.host_at(&request.spec.group, local, &voters, true)
+                            .await?;
                         self.manager.resources().encode_in(
                             ByteClass::Progress,
                             &(&request.spec, local),
@@ -547,7 +579,11 @@ impl DataGroupClient {
             _owner: owner,
         }))
     }
-    pub(crate) async fn initial_voters(&self, control: &ControlHandle, rpc: &ControlClient) -> Result<Page<ReplicaMember>, ProtocolError> {
+    pub(crate) async fn initial_voters(
+        &self,
+        control: &ControlHandle,
+        rpc: &ControlClient,
+    ) -> Result<Page<ReplicaMember>, ProtocolError> {
         initial_voters(control, rpc, &self.voters).await
     }
 
@@ -633,7 +669,9 @@ impl DataGroupClient {
         voters: &Page<ReplicaMember>,
     ) -> Result<(), ProtocolError> {
         for member in voters.iter() {
-            if !ready.iter().any(|worker| worker.worker_id == member.worker_id)
+            if !ready
+                .iter()
+                .any(|worker| worker.worker_id == member.worker_id)
                 || control.pool_drain_blocks_placement(member.pool_id).await?
             {
                 tracing::debug!(group_id = %spec.group.group_id, node = member.node_id, "initial Data voter or pool is ineligible");
@@ -646,7 +684,12 @@ impl DataGroupClient {
             async move {
                 let started = tokio::time::Instant::now();
                 let verified = self
-                    .call::<(DataGroupSpec, ReplicaMember)>(&member, Method::Host, spec.clone(), voters)
+                    .call::<(DataGroupSpec, ReplicaMember)>(
+                        &member,
+                        Method::Host,
+                        spec.clone(),
+                        voters,
+                    )
                     .await
                     .and_then(|((observed, hosted), _)| {
                         if observed == spec && hosted == member {

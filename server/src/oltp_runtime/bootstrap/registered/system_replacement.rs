@@ -18,6 +18,7 @@ pub(super) async fn join(
     // RegisteredWorker validates the configured expectation against the
     // mounted directory and holds both locks through the peer exchange.
     let proof = ReplacementMountProof::sign(control.identity(), record, &record.intent.mount, key)?;
+    let mut mount_committed = false;
     loop {
         let mut mounted = false;
         if let Some((applied, accepted, complete)) =
@@ -35,6 +36,12 @@ pub(super) async fn join(
                         "system replacement run or bootstrap policy differs",
                     ));
                 }
+                #[cfg(test)]
+                crate::oltp_runtime::recovery_tests::pause(
+                    "system_replacement_rf3_applied",
+                    record.intent.next.worker_id,
+                )
+                .await;
                 return Ok(());
             }
             mounted = accepted;
@@ -50,7 +57,7 @@ pub(super) async fn join(
             {
                 tracing::debug!(code=?error.code, message=error.message, "system replacement promotion waits");
             }
-        } else {
+        } else if !mount_committed {
             for enrollment in original
                 .iter()
                 .filter(|peer| peer.worker_id != record.intent.previous.worker_id)
@@ -60,7 +67,10 @@ pub(super) async fn join(
                     .send_mount_proof(control.identity(), WorkerIdentity::from(enrollment), &proof)
                     .await
                 {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        mount_committed = true;
+                        break;
+                    }
                     Err(error)
                         if matches!(
                             error.code,

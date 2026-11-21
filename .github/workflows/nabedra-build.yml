@@ -2,7 +2,8 @@
 # See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
 # pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
 # Opt-in checks: put [ci docker], [ci campaign], [ci acceptance], [ci direct], [ci rep1]
-# or [ci memory] in the pushed head commit message.
+# or [ci memory] in the pushed head commit message. Add [ci rep4-mixed] to
+# [ci rep1] to build the pre-execution worker and test mixed-version enrollment.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
 # and manifests, and saves it right after its build step, before any test runs, so a failing test
@@ -258,6 +259,23 @@ jobs:
             python3 server/tests/oltp_recovery_operations.py --binary server/target/debug/nabedra-db \
               --test-executable "$test_executable" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || status=1
           done
+          if [[ "${{ contains(github.event.head_commit.message, '[ci rep4-mixed]') }}" == true ]]; then
+            legacy_base=3b77bced7c8d6aa5decb25e58e5f428b7dc18ce2
+            legacy_root="$(mktemp -d "$RUNNER_TEMP/rep4-legacy.XXXXXX")"
+            git fetch --no-tags --depth=1 origin "$legacy_base"
+            mkdir "$legacy_root/source"
+            git archive "$legacy_base" | tar -x -C "$legacy_root/source"
+            cp server/target/debug/nabedra-db "$legacy_root/current-nabedra-db"
+            CARGO_TARGET_DIR="$legacy_root/target" cargo build \
+              --manifest-path "$legacy_root/source/server/Cargo.toml" --locked --no-default-features \
+              --features oltp --bin nabedra-db
+            python3 server/tests/oltp_recovery_operations.py --suite replacement-mixed \
+              --binary "$legacy_root/current-nabedra-db" --test-executable "$test_executable" \
+              --legacy-binary "$legacy_root/target/debug/nabedra-db" 2>&1 | tee oltp-rep1-replacement-mixed.log || status=1
+            rm -r "$legacy_root"
+            cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --lib \
+              2>&1 | tee oltp-rep1-replacement-clippy.log || status=1
+          fi
           exit "$status"
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && (steps.rep1.outcome == 'success' || steps.rep1.outcome == 'failure') }}
