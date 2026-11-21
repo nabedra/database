@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     oltp::pool::{ByteClass, ChargedBytes},
     oltp_replication::{
-        authority::control::ControlHandle,
+        authority::control::{ControlHandle, SYSTEM_REPLACEMENT_CAPABILITY},
         multiplex::{
             AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture,
             ReceivePlan, TrafficClass,
@@ -20,7 +20,7 @@ const HEADER: usize = 4096;
 const QUORUM_TIMEOUT: Duration = Duration::from_secs(3);
 const LOST_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(3);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct QuorumRequest {
     pub group: GroupIdentity,
@@ -36,6 +36,13 @@ pub(crate) struct SurvivingQuorum {
     pub leader: u64,
     pub follower: u64,
     pub applied_at: AppliedPosition,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum Request {
+    Quorum(Box<QuorumRequest>),
+    Advertise,
 }
 
 pub(super) type QuorumFuture<'a> =
@@ -167,6 +174,56 @@ where
 }
 
 impl HostedGroupManager {
+    pub(crate) fn local_control(
+        &self,
+        group: &GroupIdentity,
+    ) -> Result<ManagedControl, ProtocolError> {
+        let routes = self.routes.lock().map_err(|_| unavailable())?;
+        let control = routes
+            .get(&group.group_id)
+            .and_then(|route| route.replicas.values().find(|replica| !replica.retiring))
+            .ok_or_else(unavailable)?
+            .typed
+            .clone()
+            .downcast::<RaftConsensus<ControlConfig, ControlMachine>>()
+            .map_err(|_| invalid())?;
+        if control.state.store().identity() != group {
+            return Err(invalid());
+        }
+        Ok(control)
+    }
+
+    pub(crate) async fn verify_recovery_advert(
+        &self,
+        control: &GroupIdentity,
+        target: WorkerIdentity,
+    ) -> Result<(), ProtocolError> {
+        let header = self
+            .shared
+            .encode_in(ByteClass::Progress, &Request::Advertise, HEADER)?;
+        let reply = self
+            .client
+            .request_classified(
+                control,
+                target,
+                Purpose::SystemRecovery,
+                header,
+                [None, None, None],
+                HEADER,
+            )
+            .await
+            .map_err(|_| unsupported())?;
+        if reply.remote_identity() != target
+            || reply.group() != control
+            || reply.purpose() != Purpose::SystemRecovery
+            || reply.sections.iter().any(Option::is_some)
+            || reply.decode_header::<String>()?.as_str() != SYSTEM_REPLACEMENT_CAPABILITY
+        {
+            return Err(unsupported());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn surviving_quorum(
         &self,
         request: &QuorumRequest,
@@ -190,9 +247,11 @@ impl HostedGroupManager {
         target: WorkerIdentity,
         request: &QuorumRequest,
     ) -> Result<SurvivingQuorum, ProtocolError> {
-        let header = self
-            .shared
-            .encode_in(ByteClass::Progress, request, HEADER)?;
+        let header = self.shared.encode_in(
+            ByteClass::Progress,
+            &Request::Quorum(Box::new(request.clone())),
+            HEADER,
+        )?;
         let reply = self
             .client
             .request_classified(
@@ -231,7 +290,7 @@ impl QuorumEndpoint {
         &self,
         session: &AuthenticatedSession,
         header: &[u8],
-    ) -> Result<QuorumRequest, ProtocolError> {
+    ) -> Result<Request, ProtocolError> {
         if session.group() != self.control.identity()
             || session.purpose() != Purpose::SystemRecovery
             || session.recovery_only()
@@ -244,8 +303,10 @@ impl QuorumEndpoint {
             ));
         }
         crate::protocol::json_input(header, HEADER).map_err(|_| invalid())?;
-        let request: QuorumRequest = serde_json::from_slice(header).map_err(|_| invalid())?;
-        request.validate(self.control.identity())?;
+        let request: Request = serde_json::from_slice(header).map_err(|_| invalid())?;
+        if let Request::Quorum(request) = &request {
+            request.validate(self.control.identity())?;
+        }
         Ok(request)
     }
 }
@@ -276,12 +337,31 @@ impl Endpoint for QuorumEndpoint {
             if (0..3).any(|index| sections.section(index).is_some()) {
                 return Err(invalid());
             }
-            let proof = self.manager.surviving_quorum(&request).await?;
+            let header = match request {
+                Request::Quorum(request) => {
+                    let proof = self.manager.surviving_quorum(&request).await?;
+                    self.manager
+                        .shared
+                        .encode_in(ByteClass::Progress, &proof, HEADER)?
+                }
+                Request::Advertise => {
+                    #[cfg(test)]
+                    if std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|path| {
+                        std::path::Path::new(&path)
+                            .join("hold-system-replacement-advert")
+                            .exists()
+                    }) {
+                        return Err(unsupported());
+                    }
+                    self.manager.shared.encode_in(
+                        ByteClass::Progress,
+                        &SYSTEM_REPLACEMENT_CAPABILITY,
+                        HEADER,
+                    )?
+                }
+            };
             Ok(ChargedReply {
-                header: self
-                    .manager
-                    .shared
-                    .encode_in(ByteClass::Progress, &proof, HEADER)?,
+                header,
                 sections: [None, None, None],
             })
         })
@@ -292,6 +372,14 @@ pub(crate) fn reachable() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::Conflict,
         "lost worker is still reachable",
+        Outcome::NotApplied,
+    )
+}
+
+fn unsupported() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::UnsupportedOperation,
+        "every current Control voter must advertise control.system-replacement.v1",
         Outcome::NotApplied,
     )
 }

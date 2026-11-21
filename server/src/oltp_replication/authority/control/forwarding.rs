@@ -614,6 +614,7 @@ impl Endpoint for HostedControlEndpoint {
                             | (Operation::CompleteRestart, _) => return Err(invalid()),
                             (_, ControlCommand::EnsureScopedQueue { .. } | ControlCommand::ScopedQueue { .. }) =>
                                 return Err(invalid()),
+                            (_, ControlCommand::SystemRecovery { .. }) => return Err(invalid()),
                             (
                                 Operation::Propose,
                                 ControlCommand::RegisterRestartMount { worker, .. },

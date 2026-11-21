@@ -1,6 +1,9 @@
 use super::*;
 use crate::oltp_replication::{
-    authority::control::{GroupRecord, InventoryPage, State},
+    authority::control::{
+        GroupRecord, InventoryPage, MAX_SYSTEM_REPLACEMENT_GROUPS, ReplacementGroup,
+        ReplacementIntent, SYSTEM_REPLACEMENT_CAPABILITY, State,
+    },
     manager::system_recovery::{QuorumRequest, reachable},
 };
 use crate::oltp_runtime::{
@@ -11,7 +14,6 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_GROUPS: usize = 128;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,29 +30,112 @@ impl ReplacementCheck {
     }
 }
 
+struct CheckedGroups {
+    state: State,
+    groups: Vec<(GroupRecord, [ReplicaMember; 3])>,
+    _scratch: ScratchLease,
+}
+
 impl WorkerRuntime {
-    pub(crate) async fn check_system_replacement(
-        &self,
-        request_id: Uuid,
-        check: ReplacementCheck,
-    ) -> Result<EncodedResponse, ProtocolError> {
+    fn require_system_replacement_operator(&self) -> Result<(), ProtocolError> {
         if self.services.replication_factor != 3 {
             return Err(ProtocolError::new(
                 ErrorCode::UnsupportedOperation,
-                "system replacement check requires a registered RF3 worker",
+                "system replacement requires a registered RF3 worker",
                 Outcome::NotApplied,
             ));
         }
         if !self.services.control.is_operator(&self.services.local) {
             return Err(ProtocolError::new(
                 ErrorCode::Unauthorized,
-                "system replacement check requires a registered operator",
+                "system replacement requires a registered operator",
                 Outcome::NotApplied,
             ));
         }
-        let groups = tokio::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
+        Ok(())
+    }
+
+    pub(crate) async fn enable_system_replacement(
+        &self,
+        request_id: Uuid,
+    ) -> Result<EncodedResponse, ProtocolError> {
+        self.require_system_replacement_operator()?;
+        let position = tokio::time::timeout(
+            CHECK_TIMEOUT,
+            self.services.control.enable_system_replacement(
+                &self.services.manager,
+                &self.services.operator,
+                request_id,
+            ),
+        )
+        .await
+        .map_err(|_| quorum_unavailable())??;
+        Ok(response::encode_success(
+            request_id,
+            &serde_json::json!({
+                "capability": SYSTEM_REPLACEMENT_CAPABILITY,
+                "applied_at": position,
+            }),
+            true,
+        ))
+    }
+
+    pub(crate) async fn prepare_system_replacement(
+        &self,
+        intent: ReplacementIntent,
+    ) -> Result<EncodedResponse, ProtocolError> {
+        self.require_system_replacement_operator()?;
+        let control = &self.services.control;
+        let request_id = intent.id;
+        if let Some(record) = control
+            .system_replacement_record(intent.previous.worker_id)
+            .await?
+        {
+            if record.intent != intent {
+                return Err(conflict(
+                    "a different intent already names this lost worker",
+                ));
+            }
+            return Ok(response::encode_success(request_id, &record, true));
+        }
+        let check = ReplacementCheck {
+            run_id: intent.run_id,
+            previous: intent.previous,
+        };
+        let checked = tokio::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
             .await
             .map_err(|_| quorum_unavailable())??;
+        let groups = checked
+            .groups
+            .into_iter()
+            .map(|(record, old)| ReplacementGroup::new(record, old, &intent))
+            .collect::<Result<Vec<_>, _>>()?;
+        let record = control
+            .prepare_system_replacement(
+                &self.services.manager,
+                &self.services.operator,
+                intent,
+                &checked.state,
+                groups,
+            )
+            .await?;
+        Ok(response::encode_success(request_id, &record, true))
+    }
+
+    pub(crate) async fn check_system_replacement(
+        &self,
+        request_id: Uuid,
+        check: ReplacementCheck,
+    ) -> Result<EncodedResponse, ProtocolError> {
+        self.require_system_replacement_operator()?;
+        let checked = tokio::time::timeout(CHECK_TIMEOUT, self.check_surviving_groups(&check))
+            .await
+            .map_err(|_| quorum_unavailable())??;
+        let groups = checked
+            .groups
+            .iter()
+            .map(|(record, _)| record.identity.group_id)
+            .collect::<Vec<_>>();
         Ok(response::encode_success(
             request_id,
             &serde_json::json!({
@@ -65,7 +150,7 @@ impl WorkerRuntime {
     async fn check_surviving_groups(
         &self,
         check: &ReplacementCheck,
-    ) -> Result<Vec<Uuid>, ProtocolError> {
+    ) -> Result<CheckedGroups, ProtocolError> {
         let control = &self.services.control;
         let state = control.inspect().await?.ok_or_else(quorum_unavailable)?;
         if state.ready.view.run_id != check.run_id
@@ -94,18 +179,28 @@ impl WorkerRuntime {
             return Err(conflict("lost worker has not left the ready set"));
         }
 
+        let scratch = self
+            .services
+            .shared
+            .reserve_scratch(ByteClass::Progress, MAX_SYSTEM_REPLACEMENT_GROUPS * 2048)?;
         let mut groups = Vec::new();
         let mut after = None;
         loop {
             let raw = control
                 .groups(state.group_inventory_revision, after)
                 .await?;
-            let page: InventoryPage<GroupRecord> = {
+            let (page, _page_memory): (InventoryPage<GroupRecord>, _) = {
                 let budget = crate::oltp::mvcc::json_decode_budget(raw.as_ref())?;
+                let memory = self
+                    .services
+                    .shared
+                    .reserve_scratch(ByteClass::Progress, budget)?;
                 self.services
                     .shared
-                    .execute(ExecutionClass::Control, 0, budget as u64, move || {
-                        serde_json::from_slice(raw.as_ref()).map_err(|_| quorum_unavailable())
+                    .execute(ExecutionClass::Control, 0, 0, move || {
+                        let page = serde_json::from_slice(raw.as_ref())
+                            .map_err(|_| quorum_unavailable())?;
+                        Ok((page, memory))
                     })
                     .await?
             };
@@ -123,7 +218,7 @@ impl WorkerRuntime {
                     .iter()
                     .any(|member| member.worker_id == check.previous.worker_id)
                 {
-                    if groups.len() >= MAX_GROUPS {
+                    if groups.len() >= MAX_SYSTEM_REPLACEMENT_GROUPS {
                         return Err(ProtocolError::new(
                             ErrorCode::UnsupportedOperation,
                             "system replacement check exceeds the affected group limit",
@@ -136,9 +231,9 @@ impl WorkerRuntime {
                         .try_into()
                         .map(|slice: &[ReplicaMember; 3]| slice.clone())
                         .map_err(|_| quorum_unavailable())?;
-                    self.check_group_quorum(record, voters, check.previous)
+                    self.check_group_quorum(record, &voters, check.previous)
                         .await?;
-                    groups.push(record.identity.group_id);
+                    groups.push((record.clone(), voters));
                 }
             }
             if page.done {
@@ -149,7 +244,10 @@ impl WorkerRuntime {
             }
             after = page.after;
         }
-        if !groups.contains(&control.identity().group_id) {
+        if !groups
+            .iter()
+            .any(|(record, _)| record.identity == *control.identity())
+        {
             return Err(conflict(
                 "lost worker is outside the current Control voters",
             ));
@@ -165,7 +263,11 @@ impl WorkerRuntime {
         {
             return Err(quorum_unavailable());
         }
-        Ok(groups)
+        Ok(CheckedGroups {
+            state,
+            groups,
+            _scratch: scratch,
+        })
     }
 
     async fn probe_lost_worker(
@@ -191,7 +293,7 @@ impl WorkerRuntime {
     async fn check_group_quorum(
         &self,
         record: &GroupRecord,
-        voters: [ReplicaMember; 3],
+        voters: &[ReplicaMember; 3],
         previous: WorkerIdentity,
     ) -> Result<(), ProtocolError> {
         let control = &self.services.control;

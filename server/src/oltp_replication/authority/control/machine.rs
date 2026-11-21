@@ -18,6 +18,7 @@ pub(super) mod restart;
 pub(super) mod placement;
 pub(super) mod pool_drain;
 pub(super) mod scoped_queue;
+pub(super) mod system_recovery;
 pub(super) mod worker_drain;
 
 pub(super) const STATE: &[u8] = b"ct/state";
@@ -236,6 +237,8 @@ fn apply_initialized(
         return fault(Fault::Busy);
     }
     match command {
+        SystemRecovery { operation_id, command } =>
+            system_recovery::apply(tx, scope, state, position, *operation_id, command),
         DirectCapability {
             actor,
             action,

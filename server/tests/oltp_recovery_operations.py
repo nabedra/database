@@ -186,15 +186,15 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         for name in WORKERS:
             (cluster.barrier_dir(name) / 'inspect-control-leader').touch()
 
-        def control_leader():
+        def control_leader(names):
             leaders = []
-            for name in WORKERS:
+            for name in names:
                 cluster.stats(name)
                 if json.loads((cluster.barrier_dir(name) / 'control-leader.json').read_text()):
                     leaders.append(name)
             return leaders[0] if len(leaders) == 1 else None
 
-        victim = wait_for(control_leader, 'stable Control leader', PROBE_WINDOW)
+        victim = wait_for(lambda: control_leader(WORKERS), 'stable Control leader', PROBE_WINDOW)
         survivors = [name for name in WORKERS if name != victim]
         enrollment = cluster.enrollments[victim]
         previous = {field: enrollment[field] for field in IDENTITY_FIELDS}
@@ -205,10 +205,25 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             return send(cluster.urls[survivors[0]], token or cluster.auth['admin_token'], check,
                         path='/v1/cluster/operations', timeout=15)
 
+        def operator(name, request):
+            return send(cluster.urls[name], cluster.auth['admin_token'], request,
+                        path='/v1/cluster/operations', timeout=15)
+
         status, reply = observe(cluster.auth['data_token'])
         assert status in (401, 403), (status, reply)
         status, reply = observe()
         assert status == 409 and 'reachable' in json.dumps(reply), (status, reply)
+
+        held_advert = cluster.barrier_dir(survivors[0]) / 'hold-system-replacement-advert'
+        enable = operation('worker.system_replacement.enable', {})
+        held_advert.touch()
+        try:
+            status, reply = operator(victim, enable)
+            assert reply.get('error', {}).get('code') == 'unsupported_operation', (status, reply)
+        finally:
+            held_advert.unlink()
+        activation = success(*operator(victim, enable))
+        assert activation['capability'] == 'control.system-replacement.v1'
 
         cluster.wait_direct_active()
         send_op = lambda body: send(cluster.api_urls['api1'], cluster.auth['data_token'],
@@ -242,10 +257,33 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                     for group in cluster.config[victim]['node']['placements'].values()}
         expected.add(initial_range(cluster, table)['group_id'])
         assert set(result['groups']) == expected, result
+        leader = wait_for(lambda: control_leader(survivors), 'new Control leader', PROBE_WINDOW)
+        assert success(*operator(leader, enable)) == activation
+        fresh = cluster.certificate('replacement')
+        fresh_mount = cluster.mount_pool('replacement', uid(), fresh)
+        intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
+                      next=fresh, mount=fresh_mount)
+        prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
+        prepared = success(*operator(leader, prepare))
+        assert prepared['intent'] == intent
+        assert {item['expected']['identity']['group_id'] for item in prepared['groups']} == expected
+        for plan in prepared['groups']:
+            assert len(plan['old']) == 3 and any(item['worker_id'] == previous['worker_id'] for item in plan['old'])
+            assert plan['learner']['worker_id'] == fresh['worker_id']
+            assert plan['learner']['pool_id'] == fresh_mount['identity']['pool_id']
+            assert plan['learner']['node_id'] not in [item['node_id'] for item in plan['old']]
+        for name in survivors:
+            assert success(*operator(name, prepare)) == prepared
+        for conflicting in (dict(intent, id=uid()),
+                            dict(intent, mount=dict(fresh_mount, provider_volume_id='docker-volume:other'))):
+            status, reply = operator(leader, operation('worker.system_replacement.prepare',
+                                                       conflicting, conflicting['id']))
+            assert status == 409, (status, reply)
         assert send_op(acknowledged) == original
         assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
         report('O06/O17 system replacement preflight', lost_control_leader=victim,
-               groups=len(expected), refused_live_worker=True, refused_without_quorum=True)
+               groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
+               refused_missing_advert=True, replayed_intent=True)
     finally:
         cluster.close()
 

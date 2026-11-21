@@ -13,6 +13,7 @@ mod pool_drain;
 mod restart;
 mod scoped_queue;
 mod service;
+mod system_recovery;
 mod worker_drain;
 
 pub(crate) use endpoint::{ControlClient, ControlEndpoint, ControlRoutes, ReplicaRoutes};
@@ -49,5 +50,9 @@ pub(crate) use service::{
     VerifiedExclusion, VerifiedMembership, VerifiedQueueCopy,
 };
 pub(crate) use service::IdlePasses;
+pub(crate) use system_recovery::{
+    CAPABILITY as SYSTEM_REPLACEMENT_CAPABILITY, MAX_GROUPS as MAX_SYSTEM_REPLACEMENT_GROUPS,
+    ReplacementGroup, ReplacementIntent, ReplacementRecord, SystemRecoveryCommand,
+};
 #[cfg(test)]
 mod tests;
