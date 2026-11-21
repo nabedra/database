@@ -4,6 +4,7 @@
 //! described as an untimestamped MVCC snapshot at the application data cut.
 use super::timestamp_point::projection::{TimestampPointProjection, read_for_transaction};
 use super::*;
+use crate::oltp::backup::history::{ARCHIVE_PAGE_WIRE_BYTES, ArchivePageBudget};
 use crate::oltp_replication::authority::timestamp::VerifiedArchiveClosure;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,7 +181,7 @@ impl IdentityArchivePage {
 pub(super) const ARCHIVE_BUDGET: TransactionBudget = TransactionBudget {
     scratch_bytes: 2 << 20,
     batch_bytes: 0,
-    output_bytes: 128 << 10,
+    output_bytes: ARCHIVE_PAGE_WIRE_BYTES,
 };
 impl StatusHandle {
     pub(crate) async fn archive_cut(
@@ -280,7 +281,7 @@ impl StatusHandle {
                     cursor.push(0);
                 }
                 let mut items = Vec::new();
-                let mut used = 4096usize;
+                let mut budget = ArchivePageBudget::new();
                 let mut next = after;
                 let mut examined = 0;
                 while examined < 64 {
@@ -339,14 +340,9 @@ impl StatusHandle {
                                     settled_at: state.settled_at.ok_or_else(unknown)?,
                                     owner: None,
                                 };
-                                let bytes = serialized_length(&item)?;
-                                if used
-                                    .checked_add(bytes)
-                                    .is_none_or(|n| n > ARCHIVE_BUDGET.output_bytes - 4096)
-                                {
+                                if !budget.include(view, &item)? {
                                     break;
                                 }
-                                used += bytes;
                                 items.push(item);
                             }
                         }
@@ -441,10 +437,7 @@ impl StatusHandle {
                     cursor.push(0);
                 }
                 let mut items = Vec::new();
-                let mut used = 4096usize;
-                // The authenticated RPC reserves decoded memory before parsing.
-                // Keep space for the page envelope, cursor and reply headers.
-                let mut decoded = 64usize << 10;
+                let mut budget = ArchivePageBudget::new();
                 let mut next = after;
                 for _ in 0..64 {
                     let Some(row) = view.first_from(IDENTITIES, &cursor)? else {
@@ -507,36 +500,9 @@ impl StatusHandle {
                         point_projection: point_projection.map(Box::new),
                         owner: None,
                     };
-                    let bytes = serialized_length(&item)?;
-                    let exceeds_wire = used
-                        .checked_add(bytes)
-                        .is_none_or(|n| n > ARCHIVE_BUDGET.output_bytes - 4096);
-                    let cost = if exceeds_wire {
-                        None
-                    } else {
-                        Some(view.with_scratch_buffer(bytes, |_, scratch| {
-                            let mut destination = &mut *scratch;
-                            serde_json::to_writer(&mut destination, &item).map_err(|_| unknown())?;
-                            if !destination.is_empty() {
-                                return Err(unknown());
-                            }
-                            crate::oltp::mvcc::json_decode_budget(scratch)
-                        })?)
-                    };
-                    let Some(next_decoded) = cost
-                        .and_then(|cost| decoded.checked_add(cost))
-                        .filter(|bytes| *bytes <= crate::oltp::pool::DEFAULT_REPLY_DECODE_BYTES)
-                    else {
-                        if items.is_empty() {
-                            return Err(crate::oltp::failure(
-                                crate::protocol::ErrorCode::LimitExceeded,
-                                "one archived identity exceeds a page budget",
-                            ));
-                        }
+                    if !budget.include(view, &item)? {
                         break;
-                    };
-                    used += bytes;
-                    decoded = next_decoded;
+                    }
                     next = Some(IdentityArchiveCursor {
                         archive_id,
                         data_cut: cut,
@@ -624,25 +590,6 @@ pub(super) fn identity_disposition(
             ArchivedIdentityDisposition::CurrentRejected { rejection }
         }),
     }
-}
-
-fn serialized_length(value: &impl Serialize) -> Result<usize, ProtocolError> {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .ok_or_else(|| std::io::Error::other("archive metadata overflow"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).map_err(|_| unknown())?;
-    Ok(count.0)
 }
 
 macro_rules! debug_fields {

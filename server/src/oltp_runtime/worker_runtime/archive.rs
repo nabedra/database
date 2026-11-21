@@ -952,7 +952,8 @@ impl WorkerRuntime {
         loop {
             let page = status
                 .native_archive_page(&closure, metadata_after.clone())
-                .await?;
+                .await
+                .map_err(|error| backup_error("status metadata page", error))?;
             for image in page.items.iter() {
                 export.frame(HistoryFrame::Metadata(image.clone())).await?;
             }
@@ -966,7 +967,10 @@ impl WorkerRuntime {
         }
         let mut after = None;
         loop {
-            let page = status.committed_page(&closure, base, after).await?;
+            let page = status
+                .committed_page(&closure, base, after)
+                .await
+                .map_err(|error| backup_error("committed decisions page", error))?;
             for decision in page.items.iter() {
                 let txn = decision.statement.txn;
                 let manifest = decision.statement.manifest;
@@ -980,7 +984,10 @@ impl WorkerRuntime {
                 let mut cursor = None;
                 let mut participants = 0u64;
                 loop {
-                    let plans = status.manifest_page(txn, manifest, cursor).await?;
+                    let plans = status
+                        .manifest_page(txn, manifest, cursor)
+                        .await
+                        .map_err(|error| backup_error("participant manifest page", error))?;
                     for plan in plans.items.iter() {
                         if base.is_none() {
                             export
