@@ -947,9 +947,10 @@ def o28(facade):
            'Owner loss after page one preserved the exact pin, rows and order across takeover. The mutation pinned to the split parent failed without applying.')
     archive_routes(cluster, table, routes)
     passed('O28', 'exact-paged-coverage', 'Scans and the verified archive covered two Catalog pages in routing order. Every interval, indexed row and split boundary matched the oracle.')
-    passed('O28', 'no-logical-metadata-cap', 'One table retained 130 routes, and its two current routing archive frames exceeded 64 KiB in aggregate with its index and exact query results intact.')
+    pending_clause('O28', 'no-logical-metadata-cap',
+                   'Archived routing frames for 130 ranges exceeded 64 KiB in aggregate. The direct gateway still caps each cached table route at 1,024 ranges.')
     pending_clause('O28', 'bounded-authenticated-pagination',
-                   'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. A tampered internal continuation was not exercised.')
+                   'The planner traversed two bounded Catalog pages and unauthenticated receipt access was refused. Cache high-water and a tampered internal continuation were not observed.')
     count_overflow(facade, table, rows[1]['id'])
     assert query(facade, table, 'count') == len(expected)
 
