@@ -23,6 +23,9 @@ pub(super) const FREE_EXT: &str = "free";
 
 /// Zero-fill chunk for new segment files.
 const ZERO_CHUNK: usize = 1 << 20;
+/// A zero fill syncs and drops its pages every this many bytes, so the fill adds at
+/// most this much page cache to the process's memory peak (G7), not a whole segment.
+pub(super) const ZERO_DROP_BYTES: u64 = 4 << 20;
 
 pub(super) fn path_of(dir: &Path, number: u64, ext: &str) -> PathBuf {
     dir.join(format!("{number:016}.{ext}"))
@@ -188,6 +191,7 @@ pub(super) fn create_free(
         if zero_fill {
             let zeros = vec![0u8; ZERO_CHUNK];
             let mut at = RECORDS_START;
+            let mut dropped = RECORDS_START;
             while at < segment_bytes {
                 if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                     return Err(std::io::ErrorKind::Interrupted.into());
@@ -195,6 +199,14 @@ pub(super) fn create_free(
                 let n = ZERO_CHUNK.min((segment_bytes - at) as usize);
                 file.write_all_at(&zeros[..n], at)?;
                 at += n as u64;
+                // Only clean pages can be dropped. The header blocks are not written
+                // yet, so these syncs never cover them (the single header write
+                // below still meets a never-synced region).
+                if at - dropped >= ZERO_DROP_BYTES && at < segment_bytes {
+                    file.sync_data()?;
+                    file.advise_dont_need(dropped, at - dropped);
+                    dropped = at;
+                }
             }
         }
         let header = SegmentHeader {
