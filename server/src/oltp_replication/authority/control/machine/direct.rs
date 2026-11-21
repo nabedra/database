@@ -211,9 +211,10 @@ fn can_activate(
     {
         return Ok(false);
     }
-    let advertised = |tx: &mut GroupTransaction<'_>, worker| {
-        Ok(advertising == Some(worker) || supports(tx, worker)?)
-    };
+    let advertised =
+        |tx: &mut GroupTransaction<'_>, worker: WorkerIdentity| -> Result<bool, ProtocolError> {
+            Ok(advertising == Some(worker) || supports(tx, worker)?)
+        };
     Ok(all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
         WorkerIdentity::from(&entry.enrollment)
     })? && all_members(tx, APIS, advertised, |entry: ApiEnrollment| {
@@ -242,9 +243,10 @@ fn maybe_enable_batch(
     {
         return Ok(());
     }
-    let advertised = |tx: &mut GroupTransaction<'_>, worker| {
-        Ok(advertising == Some(worker) || supports_batch(tx, worker)?)
-    };
+    let advertised =
+        |tx: &mut GroupTransaction<'_>, worker: WorkerIdentity| -> Result<bool, ProtocolError> {
+            Ok(advertising == Some(worker) || supports_batch(tx, worker)?)
+        };
     if all_members(tx, WORKERS, advertised, |entry: WorkerRecord| {
         WorkerIdentity::from(&entry.enrollment)
     })? {

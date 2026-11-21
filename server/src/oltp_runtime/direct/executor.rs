@@ -161,7 +161,8 @@ impl DirectExecutor {
         Arc::new(Self {
             admission: DirectAdmission::new(resources.clone(), config.max_in_flight),
             latches: KeyLatches::new(config.latch_stripes),
-            batchers: Batchers::new(resources.clone(), MAX_DIRECT_ENTRY_BYTES),
+            // The members' encoded bytes, with room for the batch framing.
+            batchers: Batchers::new(resources.clone(), MAX_DIRECT_ENTRY_BYTES - (4 << 10)),
             resources,
             config,
             gate,
