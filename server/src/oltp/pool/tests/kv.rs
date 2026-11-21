@@ -710,6 +710,11 @@ fn ns22_rocksdb_pools_and_legacy_stores_are_refused_untouched() {
             "{}",
             error.message
         );
+        assert!(
+            error.message.contains("docs/oltp-rocksdb-upgrade.md"),
+            "{}",
+            error.message
+        );
         assert_eq!(tree(&dir.0), before, "{} changed", dir.0.display());
     }
     // A format 1 identity is not a valid identity for opening either.
