@@ -54,8 +54,10 @@ pub(crate) const WARM_IDLE: Duration = Duration::from_secs(30);
 /// How often the warm task looks for entries to refresh.
 const WARM_TICK: Duration = Duration::from_secs(1);
 /// An entry with less validity left than this is refreshed. With
-/// [`WARM_TICK`] it is refreshed while it still has at least 1.5 s left.
-const WARM_AHEAD: Duration = Duration::from_millis(2500);
+/// [`WARM_TICK`] it is refreshed while it still has at least 0.5 s left, so a
+/// key in use is read about every 3.5 to 4.5 s: close to the one read per
+/// [`GRANT_TTL`] that a continuously used key costs without warming.
+const WARM_AHEAD: Duration = Duration::from_millis(1500);
 /// At most this many keys are kept warm.
 pub(crate) const MAX_WARM: usize = 64;
 
@@ -775,7 +777,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reads.load(Ordering::Relaxed), 1);
-        assert!(refreshes.load(Ordering::Relaxed) >= 3);
+        assert!(refreshes.load(Ordering::Relaxed) >= 2);
+        // Background reads stay close to one per TTL: at most one per 3.5 s.
+        assert!(refreshes.load(Ordering::Relaxed) <= 4);
 
         // Control becomes unreachable: the entry is not extended. It lapses
         // exactly GRANT_TTL after the last successful read started.
