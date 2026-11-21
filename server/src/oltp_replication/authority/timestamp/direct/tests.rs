@@ -354,6 +354,27 @@ async fn o09_d06_watermark_move_discards_the_rest_of_the_window() {
 }
 
 #[tokio::test]
+async fn o12_retirement_floor_can_pass_the_last_allocation_on_an_idle_cluster() {
+    let cluster = Cluster::new(1).await;
+    let handle = cluster.handle(0);
+    let authority = initialize(&handle).await;
+    handle.install_direct_gate(open_gate());
+    handle.set_direct_window_size(1).unwrap();
+    let retired_at = handle.allocate_direct(1).await.unwrap().last();
+    assert_eq!(
+        handle.advance_floor(authority, None).await.unwrap(),
+        retired_at.get()
+    );
+    assert!(
+        handle
+            .advance_floor(authority, Some(retired_at))
+            .await
+            .unwrap()
+            > retired_at.get()
+    );
+}
+
+#[tokio::test]
 async fn o09_d06_raced_reservation_serves_its_head_and_installs_nothing() {
     let mut f = Fixture::new().await;
     let ready = ready(worker());

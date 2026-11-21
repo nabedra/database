@@ -29,7 +29,7 @@ mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
 pub(crate) use session::PeerFeature;
-use session::{PeerSessions, RawReply, SESSION_ALPN};
+use session::{INDEX_RECLAIM_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
 #[cfg(test)]
 mod tests;
 
@@ -78,7 +78,7 @@ fn admit_trust(
         && (group.kind != GroupKind::Control
             || !matches!(
                 purpose,
-                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation
+                Purpose::Raft | Purpose::Authority | Purpose::ControlDelegation | Purpose::SystemRecovery
             ))
     {
         return Err(malformed(
@@ -108,10 +108,18 @@ pub trait PeerDirectory: Send + Sync + 'static {
     fn applied_revision(&self) -> Option<u64> {
         None
     }
+    /// Revocations are checked again after asynchronous endpoint preflight.
+    fn revoked(&self, _peer: WorkerIdentity) -> bool {
+        false
+    }
     /// Whether `peer` is an enrolled API gateway (not a worker).
     fn is_api(&self, _peer: WorkerIdentity) -> bool {
         false
     }
+}
+
+fn revoked_peer() -> ProtocolError {
+    ProtocolError::new(ErrorCode::Unauthorized, "worker certificate or identity was revoked", Outcome::NotApplied)
 }
 
 /// Whether this worker is the hello's audience. Every audience names this
@@ -688,11 +696,12 @@ impl Drop for RaftTransportTrace {
 pub(crate) enum RequestTarget {
     WorkerId(Uuid),
     Exact(WorkerIdentity),
+    Feature(Uuid, PeerFeature),
 }
 impl RequestTarget {
     pub(crate) fn worker_id(self) -> Uuid {
         match self {
-            Self::WorkerId(id) => id,
+            Self::WorkerId(id) | Self::Feature(id, _) => id,
             Self::Exact(worker) => worker.worker_id,
         }
     }
@@ -779,7 +788,7 @@ impl WorkerTransport {
             return Err(malformed("local certificate differs from enrollment"));
         }
         let (connector, acceptor) = if sessions_enabled {
-            tls.transports(&[SESSION_ALPN, ALPN])
+            tls.transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN])
         } else {
             tls.transports(&[ALPN])
         };
@@ -906,7 +915,7 @@ impl WorkerTransport {
             return;
         };
         if let Some(pending) = pending
-            && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
+            && session_alpn(stream.get_ref().1.alpn_protocol())
         {
             let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
                 return;
@@ -996,6 +1005,9 @@ impl WorkerTransport {
             let sections = read_sections(&mut stream, &self.common, class, plan).await?;
             drop(preflight);
             trace.phase = RaftTransportPhase::Handle;
+            if self.common.directory.revoked(hello.from) {
+                return Err(revoked_peer());
+            }
             let reply = endpoint.handle(session, header, sections).await?;
             validate_reply(&self.common.config, class, &reply)?;
             // Free the lane before the reply can reach the peer, as on a
@@ -1356,9 +1368,10 @@ impl WorkerClient {
             purpose,
             phase: RaftTransportPhase::ResolvePeer,
         };
-        let (worker, expected) = match target {
-            RequestTarget::WorkerId(worker) => (worker, None),
-            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity)),
+        let (worker, expected, required) = match target {
+            RequestTarget::WorkerId(worker) => (worker, None, None),
+            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity), None),
+            RequestTarget::Feature(worker, feature) => (worker, None, Some(feature)),
         };
         let peer = self.common.directory.resolve(worker)?;
         peer.validate()
@@ -1400,6 +1413,7 @@ impl WorkerClient {
                 header,
                 sections,
                 deadline,
+                required,
                 probe_resolving.take(),
                 &mut trace.phase,
             )

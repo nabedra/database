@@ -580,6 +580,12 @@ def d11_index(url, token, ca, admin, stats):
            not_applied_errors=len(errors), index_state=state, status_retried=retried[:8],
            status_retries=len(retried),
            direct_entries=direct(after, 'entries_proposed') - direct(before, 'entries_proposed'),
+           # GC2: DirectBatch entries (`data.direct.batch` enabled by the processes
+           # themselves) and the commits they carried.
+           direct_batch_entries=direct(after, 'batch_entries') - direct(before, 'batch_entries'),
+           direct_batched_commits=direct(after, 'batched_commits') - direct(before, 'batched_commits'),
+           batch_enabled={name: (value.get('direct_capability') or {}).get('batch')
+                          for name, value in after.items()},
            direct_fallbacks=direct_map(after, 'fallbacks') - direct_map(before, 'fallbacks'),
            plan_uses_index=True, plan_sample=plans[0][:300])
 
@@ -595,7 +601,7 @@ def admin_owner(cluster, name, payload, request_id=None):
     raise AssertionError(f'{name}: {errors}')
 
 
-def d11_drop(cluster, url, token, ca):
+def d11_drop(cluster, url, token, ca, *, writer_count=4):
     db = Database(url=url, token=token, database=DATABASE, ca_file=str(ca), timeout=30)
     table = db.create_table('d11_drop', {'id': int, 'value': int}, key='id')
     stop, lock = threading.Event(), threading.Lock()
@@ -620,8 +626,8 @@ def d11_drop(cluster, url, token, ca):
         finally:
             client.close()
 
-    with ThreadPoolExecutor(4) as pool:
-        futures = [pool.submit(writer) for _ in range(4)]
+    with ThreadPoolExecutor(writer_count) as pool:
+        futures = [pool.submit(writer) for _ in range(writer_count)]
         try:
             time.sleep(1.0)
             table.drop()

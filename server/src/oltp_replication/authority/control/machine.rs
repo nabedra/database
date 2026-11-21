@@ -19,6 +19,7 @@ pub(super) mod placement;
 pub(super) mod pool_drain;
 pub(super) mod scoped_queue;
 pub(super) mod system_recovery;
+mod system_trust;
 pub(super) mod worker_drain;
 
 pub(super) const STATE: &[u8] = b"ct/state";
@@ -35,13 +36,28 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 #[derive(Clone)]
 pub(crate) struct ControlMachine {
     store: GroupStore,
+    replacement_directory: Option<std::sync::Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>>,
+    /// GC2 mixed-version tests: apply as the build before cluster features.
+    #[cfg(test)]
+    legacy_v1: bool,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
         if store.identity().kind != GroupKind::Control {
             return Err(unavailable("wrong Control group kind"));
         }
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            replacement_directory: None,
+            #[cfg(test)]
+            legacy_v1: false,
+        })
+    }
+    /// GC2: this replica applies every entry as a pre-feature build would.
+    #[cfg(test)]
+    pub(crate) fn legacy_v1_for_test(mut self) -> Self {
+        self.legacy_v1 = true;
+        self
     }
     pub(crate) fn store(&self) -> &GroupStore {
         &self.store
@@ -55,14 +71,37 @@ impl ControlMachine {
         let scope = self.store.identity().clone();
         let position = meta.position;
         let digest = meta.command_digest;
-        self.store
+        let payload = command.payload()?;
+        let refresh = matches!(payload,
+            ControlCommand::SystemRecovery { .. }
+            | ControlCommand::Enroll { .. }
+            | ControlCommand::CompleteRestart { .. }
+        );
+        if let ControlCommand::SystemRecovery { command, .. } = payload
+            && matches!(command.as_ref(), super::SystemRecoveryCommand::Mount { .. })
+            && let Some(directory) = &self.replacement_directory
+        {
+            directory.replace_revocation_view(true);
+        }
+        #[cfg(test)]
+        let legacy_v1 = self.legacy_v1;
+        let result = self.store
             .transaction(meta, BUDGET, move |tx| {
                 if crate::oltp_replication::owned::serialized_digest(&command)? != digest {
                     return Err(unavailable("Control command digest differs"));
                 }
-                apply(tx, &scope, position, digest, command.payload()?)
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(legacy_v1));
+                let result = apply(tx, &scope, position, digest, command.payload()?);
+                #[cfg(test)]
+                direct::LEGACY_V1.with(|legacy| legacy.set(false));
+                result
             })
-            .await
+            .await?;
+        if refresh && let Some(directory) = &self.replacement_directory {
+            self.refresh_replacement_trust(directory).await?;
+        }
+        Ok(result)
     }
 }
 
@@ -240,11 +279,11 @@ fn apply_initialized(
         SystemRecovery { operation_id, command } =>
             system_recovery::apply(tx, scope, state, position, *operation_id, command),
         DirectCapability {
+            operation_id,
             actor,
             action,
             unix_ms,
-            ..
-        } => direct::apply(tx, state, position, *actor, action, *unix_ms),
+        } => direct::apply(tx, state, position, *operation_id, *actor, action, *unix_ms),
         ScopedQueue { operation_id, actor, action, authorization } => {
             scoped_queue::apply(tx, scope, state, *operation_id, *actor, action, authorization.as_ref())
         }
@@ -386,7 +425,8 @@ fn apply_initialized(
             previous_process,
             ..
         } => {
-            if tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
+            if system_recovery::blocked_enrollment(tx, next)?
+                || tx.get(&key(data_worker::REGISTERED, next.worker_id))?.is_some()
                 || load::<super::DataWorkerIntent>(tx, data_worker::PREPARED)?
                     .is_some_and(|intent| intent.enrollment.worker_id == next.worker_id)
             {
@@ -463,6 +503,9 @@ fn apply_initialized(
                 || next.validate().is_err()
                 || next.database != scope.database
             {
+                return fault(Fault::Unauthorized);
+            }
+            if system_recovery::blocked_enrollment(tx, next.transport())? {
                 return fault(Fault::Unauthorized);
             }
             let next_identity = WorkerIdentity::from(next.transport());
@@ -1080,6 +1123,9 @@ fn begin_ready(
     if state.ready.view != expected || target.validate().is_err() {
         return fault(Fault::Stale);
     }
+    if change == ReadyChange::Join && system_recovery::waits_for_groups(tx, target.worker_id)? {
+        return fault(Fault::Busy);
+    }
     if change == ReadyChange::Join && !direct::admits(tx, target)? {
         return fault(Fault::DirectCapabilityRequired);
     }
@@ -1622,6 +1668,17 @@ fn unknown() -> ProtocolError {
 impl crate::oltp_replication::hosted::TypedMachine<super::super::config::ControlConfig>
     for ControlMachine
 {
+    fn installing_snapshot(&self) {
+        if let Some(directory) = &self.replacement_directory {
+            directory.replace_revocation_view(true);
+        }
+    }
+    async fn snapshot_installed(&self) -> Result<(), ProtocolError> {
+        if let Some(directory) = &self.replacement_directory {
+            self.refresh_replacement_trust(directory).await?;
+        }
+        Ok(())
+    }
     fn store(&self) -> &GroupStore {
         ControlMachine::store(self)
     }

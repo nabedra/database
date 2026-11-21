@@ -201,7 +201,8 @@ pub(super) fn complete(
             fault(Fault::Conflict)
         };
     }
-    if !data_worker::ready_for_join(state, permit.next.run_id)
+    if system_recovery::blocked_enrollment(tx, &permit.next.enrollment)?
+        || !data_worker::ready_for_join(state, permit.next.run_id)
         || load::<super::super::DataWorkerIntent>(tx, data_worker::PREPARED)?.as_ref()
             != Some(&permit.next)
         || !super::super::worker_drain::eligible_add_pool(&drain.intent, &old_claim, &new_claim)

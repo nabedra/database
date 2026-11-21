@@ -621,6 +621,8 @@ impl NativePlanner {
             self.catalog.participant().identity().group_id,
             txn.request_id,
         );
+        #[cfg(test)]
+        crate::oltp_runtime::recovery_tests::pool_sync::observe_create_plan(txn.request_id, id);
         let descriptor = TableDescriptor {
             id,
             name: payload.name,
@@ -876,6 +878,8 @@ impl NativePlanner {
         ),
         PlanError,
     > {
+        #[cfg(test)]
+        let _point = crate::oltp_runtime::stage_timing::perf_stage!("test.data.point").timer();
         value(
             decode_record(
                 self.catalog.resources(),

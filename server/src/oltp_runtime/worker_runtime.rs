@@ -9,6 +9,7 @@ mod deployment;
 mod direct_gateway;
 mod index_admin;
 mod index_backend;
+mod index_reclaim;
 mod migration;
 mod placement;
 mod pool_drain;
@@ -249,26 +250,30 @@ impl WorkerRuntime {
             }
         }
         let retirement = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let Some(runtime) = weak.upgrade() else {
-                    break;
-                };
-                if !runtime.accepting.load(Ordering::Acquire) {
-                    break;
+            let reclaim = index_reclaim::reclaim_indexes(weak.clone());
+            let retire = async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let Some(runtime) = weak.upgrade() else {
+                        break;
+                    };
+                    if !runtime.accepting.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let _ = runtime.tick_supervision();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.dispatch_retained(),
+                    )
+                    .await;
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        runtime.retire_expired(),
+                    )
+                    .await;
                 }
-                let _ = runtime.tick_supervision();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.dispatch_retained(),
-                )
-                .await;
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    runtime.retire_expired(),
-                )
-                .await;
-            }
+            };
+            tokio::join!(retire, reclaim);
         });
         *runtime.retirement.lock().map_err(|_| unknown())? = Some(retirement);
         let endpoint = super::application::ApplicationEndpoint::new(&runtime);
@@ -1898,37 +1903,80 @@ impl HttpRuntime for WorkerRuntime {
                 (replica.stats(), replica.queue_latency_stats())
             };
             let scheduler = self.services.shared.scheduler().usage();
+            #[allow(unused_mut)]
+            let mut stats = serde_json::json!({
+                "engine":"oltp", "queue":queue, "scheduler":scheduler,
+                "accept_to_dispatch":accept_to_dispatch,
+                "block_cache":self.services.shared.block_cache_usage(),
+                "storage":self.services.shared.storage_stats(),
+                // Rule 6: secondary pools refused at open, with the error class.
+                "refused_pools":self.services.pools.refused_report(),
+                "working_decode_bytes":self.services.shared.working_decode_bytes(),
+                "native_thread_budget":self.services.shared.thread_budget(),
+                // `null` until `data.direct.v1` activates the executor.
+                "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
+                    Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
+                    None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
+                        .map(|service| service.stats())
+                        .unwrap_or(serde_json::Value::Null),
+                },
+                "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
+                    "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
+                    "history_settling":switch.history_settling(),
+                    // GC2: `data.direct.batch` enabled (DirectBatch entries).
+                    "batch":switch.is_batch_enabled(),
+                })),
+                "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
+                // Local lane refusals (NS11 finding 8).
+                "transport":self.services.manager.client().lane_refusals(),
+                // RV-APPLY: transient retries and stopped cores.
+                "raft":self.services.manager.raft_health(),
+                // PERF1: per-stage latency histograms of this process.
+                "stage_timing":super::stage_timing::snapshot(),
+            });
+            #[cfg(test)]
+            {
+                if let Some(source) = &self.services.direct_timestamps
+                    && let Some(probe) =
+                        super::recovery_tests::timestamp_probe(source.as_ref()).await
+                {
+                    stats["test_timestamp"] = probe;
+                }
+                if let Some(group) = super::recovery_tests::group_leader_probe() {
+                    stats["test_group_leader"] =
+                        serde_json::json!(self.services.manager.test_group_leader(group));
+                }
+                if let Some(request) = super::recovery_tests::pool_sync::status_probe() {
+                    let lookup = match self.durable_lookup(request).await {
+                        Ok(Some(IdentityLookup::Terminal(terminal))) => {
+                            let result = match &terminal {
+                                TerminalIdentity::Committed { outcome, .. } => {
+                                    Some(outcome.result()?)
+                                }
+                                _ => None,
+                            };
+                            serde_json::json!({"terminal": terminal, "result": result})
+                        }
+                        Ok(Some(_)) => serde_json::json!({"pending": true}),
+                        Ok(None) => serde_json::Value::Null,
+                        Err(error) => serde_json::json!({"error": error}),
+                    };
+                    stats["test_pool_sync"] = serde_json::json!({
+                        "pools_requiring_recovery": self.services.pools.pool_ids()?.into_iter()
+                            .filter_map(|id| self.services.pools.get(id).ok().flatten())
+                            .filter(|pool| pool.requires_recovery()).count(),
+                        "status": lookup,
+                    });
+                }
+                if let Some(observed) =
+                    super::recovery_tests::maintenance::observe(&self.services).await?
+                {
+                    stats["test_maintenance"] = observed;
+                }
+            }
             Ok(EncodedResponse {
                 status: 200,
-                body: serde_json::to_vec(&serde_json::json!({
-                    "engine":"oltp", "queue":queue, "scheduler":scheduler,
-                    "accept_to_dispatch":accept_to_dispatch,
-                    "block_cache":self.services.shared.block_cache_usage(),
-                    "storage":self.services.shared.storage_stats(),
-                    // Rule 6: secondary pools refused at open, with the error class.
-                    "refused_pools":self.services.pools.refused_report(),
-                    "working_decode_bytes":self.services.shared.working_decode_bytes(),
-                    "native_thread_budget":self.services.shared.thread_budget(),
-                    // `null` until `data.direct.v1` activates the executor.
-                    "direct":match self.direct_switch().and_then(|switch| switch.direct_stats()) {
-                        Some(stats) => serde_json::to_value(stats).map_err(|_| unknown())?,
-                        None => crate::oltp_replication::service_rpc::direct::installed(&self.services.shared)
-                            .map(|service| service.stats())
-                            .unwrap_or(serde_json::Value::Null),
-                    },
-                    "direct_capability":self.direct_switch().map(|switch| serde_json::json!({
-                        "active":switch.is_direct_active(), "direct_oltp":switch.direct_oltp(),
-                        "history_settling":switch.history_settling(),
-                    })),
-                    "direct_gateway":self.direct_gateway_handle().map(|gateway| gateway.stats()),
-                    // Local lane refusals (NS11 finding 8).
-                    "transport":self.services.manager.client().lane_refusals(),
-                    // RV-APPLY: transient retries and stopped cores.
-                    "raft":self.services.manager.raft_health(),
-                    // PERF1: per-stage latency histograms of this process.
-                    "stage_timing":super::stage_timing::snapshot(),
-                }))
-                .map_err(|_| unknown())?,
+                body: serde_json::to_vec(&stats).map_err(|_| unknown())?,
             })
         })
     }

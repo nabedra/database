@@ -198,7 +198,8 @@ def announcement(process, timeout=60):
 
 class Rf3Cluster:
     def __init__(self, binary, root, *, test_executable=None, direct=None, api_direct=(True,),
-                 worker_env=None, key_type='ed25519', worker_memory=2048 * MIB, mounts=False):
+                 worker_env=None, key_type='ed25519', worker_memory=2048 * MIB, mounts=False,
+                 status_partitions=1, test_child=CHILD):
         self.binary = str(Path(binary).resolve())
         # Cold start (D09) requires each pool on its own Docker-profile mount
         # (`cold::validate`). With `mounts`, every worker directory is a tmpfs
@@ -206,6 +207,7 @@ class Rf3Cluster:
         self.mounts = mounts
         self.mounted = []
         self.test_executable = str(Path(test_executable).resolve()) if test_executable else None
+        self.test_child = test_child
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.direct = dict(direct or {name: True for name in WORKERS})
@@ -213,6 +215,7 @@ class Rf3Cluster:
         self.worker_env = dict(worker_env or {})
         self.key_spec = {'rsa': 'rsa:2048', 'ed25519': 'ed25519'}[key_type]
         self.worker_memory = worker_memory
+        self.status_partitions = status_partitions
         self.cluster_id, self.run_id, self.bootstrap_id = uid(), uid(), uid()
         self.auth = {role + '_token': secrets.token_urlsafe(32) for role in ('admin', 'data', 'enrollment')}
         self.workers, self.apis = {}, {}
@@ -279,11 +282,19 @@ class Rf3Cluster:
                               group_format_version=1),
                 voters=[dict(node_id=index, worker_id=enrollment[name]['worker_id'], pool_id=pool[name])
                         for index, name in enumerate(order, start=1)])
+        if self.status_partitions > 1:
+            status = placements['status']
+            placements['status_partitions'] = [
+                dict(identity=status['identity'] | dict(group_id=uid(), kind={'status': {'bucket': bucket}}),
+                     voters=status['voters'])
+                for bucket in range(1, self.status_partitions)
+            ]
         peers = sorted(enrollment.values(), key=lambda record: record['worker_id'])
         pins = sorted(record['certificate_sha256'] for record in peers)
         for index, name in enumerate(WORKERS, start=1):
             (self.root / name).mkdir(exist_ok=True)
-            node = dict(format=1, directory=str(self.root / name / 'data'), pool_id=pool[name],
+            node = dict(format=2 if self.status_partitions > 1 else 1,
+                        directory=str(self.root / name / 'data'), pool_id=pool[name],
                         scheduler_node_id=index, enrollment=enrollment[name],
                         bind=f'127.0.0.1:{node_ports[name]}', certificate=str(self.root / f'{name}.pem'),
                         private_key=str(self.root / f'{name}.key'), authority_ca=str(self.ca),
@@ -310,8 +321,8 @@ class Rf3Cluster:
         return sys.platform.startswith('linux') and subprocess.run(
             ['sudo', '-n', 'true'], capture_output=True, timeout=30).returncode == 0
 
-    def mount_pool(self, name, pool_id, enrollment):
-        directory = self.root / name / 'data'
+    def mount_pool(self, name, pool_id, enrollment, *, directory=None):
+        directory = directory or self.root / name / 'data'
         directory.mkdir(parents=True, exist_ok=True)
         subprocess.run(['sudo', '-n', 'mount', '-t', 'tmpfs', '-o',
                         f'size=2g,mode=0700,uid={os.getuid()},gid={os.getgid()}', 'tmpfs', str(directory)],
@@ -339,7 +350,7 @@ class Rf3Cluster:
             barriers = self.root / 'barriers' / name
             barriers.mkdir(parents=True, exist_ok=True)
             env.update(NABEDRA_OLTP_TEST_REGISTERED_CONFIG=str(path), NABEDRA_OLTP_TEST_BARRIER_DIR=str(barriers))
-            command = [self.test_executable, '--exact', CHILD, '--ignored', '--nocapture']
+            command = [self.test_executable, '--exact', self.test_child, '--ignored', '--nocapture']
         else:
             command = [self.binary, 'worker', '--bootstrap', str(path)]
         self.workers[name] = Process(name, command, env, self.root / f'{name}.log')

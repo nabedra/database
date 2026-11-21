@@ -48,6 +48,9 @@ mod oltp_acceptance;
 pub(crate) mod oltp_backup_repository;
 #[cfg(feature = "oltp")]
 pub mod oltp_deployment;
+#[cfg(all(test, feature = "oltp"))]
+#[path = "oltp_acceptance/growth.rs"]
+mod oltp_growth_acceptance;
 #[cfg(feature = "oltp")]
 pub mod oltp_replication;
 #[cfg(feature = "oltp")]

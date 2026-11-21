@@ -221,6 +221,13 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         shared.clone(),
     )?;
     let registry = Arc::new(EndpointRegistry::new(shared.clone()));
+    registry.reserve(group.clone())?.bind(
+        Purpose::SystemRecovery,
+        Arc::new(crate::oltp_replication::manager::system_recovery::ReplacementCapabilityEndpoint {
+            group: group.clone(),
+            shared: shared.clone(),
+        }),
+    )?;
     let transport = Arc::new(WorkerTransport::new(
         &node.intent.enrollment,
         &tls,
@@ -414,6 +421,14 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                     crate::oltp_replication::authority::control::DirectCapabilityOperation::Advertise {
                         version: crate::oltp_replication::authority::control::DIRECT_VERSION,
                     },
+                )
+                .await;
+            // GC2: likewise for every enabled cluster feature this build
+            // supports (`data.direct.batch`).
+            control
+                .advertise_direct_feature(
+                    crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE,
+                    local,
                 )
                 .await;
             match startup_read(

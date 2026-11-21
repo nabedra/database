@@ -1,28 +1,49 @@
 # Cache ORM contract
 
-Both clients use RESP2 over a pool of persistent connections. Each connection
-has one request in flight. An operation uses one monotonic timeout for
-connection setup, authentication, command exchange and any redirects. Pool
-saturation fails before sending the command. The default pool size is 16 and
-the default timeout is 2,000 ms.
-Closing a client closes established sockets and sockets still opening or
-authenticating. A pending DNS lookup can finish in the background and the
-closed client discards its result.
+The Python and TypeScript Cache clients must behave the same way. This page
+lists the rules they share, and [vectors.json](vectors.json) holds the test
+cases both of them run.
 
-Use `redis://` for a loopback IP or `localhost`. Use `rediss://` everywhere
-else. TLS verifies the endpoint name against the platform roots or the
-configured CA file. A connection gets credentials only for a configured
-endpoint or an authorized node. Standalone mode takes one endpoint. Cluster
-mode takes up to 32 seeds and accepts discovered primaries from the seed list,
-the explicit node list, or subdomains of the configured private DNS suffix on
-the same ports as the seeds. Suffix-based authorization requires TLS.
+## Connections and deadlines
 
-The cluster client fetches `CLUSTER SLOTS` on connection and can refresh from
-its seeds following a transport failure. Normal commands go straight to the
-cached primary. A `MOVED` response for the requested slot updates that slot
-and retries against the validated owner. Four redirects are allowed within
-the original deadline. Command bodies that reached a connection are never
-replayed on transport failures.
+Both clients speak RESP2 over a pool of persistent connections, with one
+request in flight per connection. The pool holds 16 connections by default.
+
+Each operation gets a single monotonic deadline, 2,000 ms by default, which
+covers connecting, authenticating, exchanging the command and following any
+redirects. If the pool is full, the operation fails before the client sends
+anything.
+
+Closing a client closes every socket, including ones that are still connecting
+or authenticating. A DNS lookup that is already running may finish in the
+background, but the closed client throws its result away.
+
+## Endpoints and TLS
+
+Use `redis://` only for a loopback IP or `localhost`, and `rediss://` for
+everything else. With TLS, the client checks the endpoint's name against the
+platform's root certificates or the CA file you configure.
+
+The client sends credentials only to an endpoint you configured or a node it
+has authorized. In standalone mode you give it one endpoint. In cluster mode
+you give it up to 32 seeds. A primary it discovers is accepted only if it is in
+the seed list, in the explicit node list, or under the configured private DNS
+suffix on the same port as a seed. Authorizing nodes by DNS suffix requires
+TLS.
+
+## Cluster routing
+
+When it connects, the cluster client fetches `CLUSTER SLOTS`. After a
+transport failure it can refresh that map from its seeds. Commands go straight
+to the cached primary for their slot.
+
+If a node replies `MOVED` for the requested slot, the client updates that slot
+and retries against the new owner, once it has checked that the owner is
+authorized. It follows at most four redirects, all within the original
+deadline. If a command's bytes reached a connection and the transport then
+failed, the client never sends that command again.
+
+## Errors
 
 | Condition | Error type | Code | Outcome |
 | --- | --- | --- | --- |
@@ -31,52 +52,69 @@ replayed on transport failures.
 | `NOAUTH`, `WRONGPASS`, `NOPERM` | `AuthenticationError` | `unauthorized` | `not_applied` |
 | Full client pool, `BUSY`, `OOM`, `TRYAGAIN` | `OverloadedError` | `overloaded` | `not_applied` |
 | `CLUSTERDOWN`, redirect limit | `StorageError` | `storage_unavailable` | `not_applied` |
-| Read transport failure or transport failure before sending a write | `TransportError` | `transport_error` | `not_applied` |
-| Malformed read reply or invalid discovery or redirection | `ProtocolError` | `protocol_error` | |
-| Write may have been sent and response is lost or unrecognized | `UnknownOutcomeError` | `outcome_unknown` | `unknown` |
+| Transport failure on a read, or before a write was sent | `TransportError` | `transport_error` | `not_applied` |
+| Malformed read reply, or invalid discovery or redirect | `ProtocolError` | `protocol_error` | |
+| A write may have been sent, and its reply was lost or unrecognized | `UnknownOutcomeError` | `outcome_unknown` | `unknown` |
 
-A binary empty value is a hit. The clients enforce 1 MiB maximum values, valid UTF-8
-keys of 1–250 bytes, namespaces of 1–64 characters in `[a-z0-9_-]`, and
-safe-integer millisecond expiry inputs. The counter accepts signed 64-bit
-integers, represented by Python `int` and TypeScript `bigint`. See
-[vectors.json](vectors.json) for the wire key encoding and shared cases.
+## Limits
+
+An empty binary value counts as a hit. Both clients enforce these limits:
+
+- Values are at most 1 MiB.
+- Keys are valid UTF-8, from 1 to 250 bytes long.
+- Namespaces are 1 to 64 characters from `[a-z0-9_-]`.
+- Expiry times in milliseconds are safe integers.
+- Counters are signed 64-bit integers, which are `int` in Python and `bigint`
+  in TypeScript.
+
+The wire encoding of keys is in [vectors.json](vectors.json).
 
 ## Check both installed packages
 
-Run from the repository root with Python ≥3.11, Node ≥22.13 and OpenSSL.
+Run this from the repository root. It needs Python 3.11 or newer, Node 22.13 or
+newer, and OpenSSL.
 
 ```sh
 orm/cache-contract/run.sh
 ```
 
-The runner installs the wheel and npm tarball into temporary directories.
-Its fault peer verifies authentication, TLS hostname checks, pool bounds,
-strict error mappings, direct routing after `MOVED`, untrusted redirects,
-deadlines, closing during TLS and authentication, and one execution of a
-mutation whose reply is lost or malformed.
+The runner installs the wheel and the npm tarball into temporary directories
+and runs them against a fault-injecting peer. That peer checks authentication,
+TLS hostname checks, pool limits, the error mappings above, direct routing
+after `MOVED`, rejection of untrusted redirects, deadlines, closing a client in
+the middle of TLS or authentication, and that a mutation whose reply was lost
+or malformed runs exactly once.
 
-Give the runner a disposable endpoint for K01 server-backed tests. It sets and
-deletes keys in the `catalog` namespace.
+To also run the K01 tests against a real server, give the runner a disposable
+endpoint. These tests set and delete keys in the `catalog` namespace.
 
 ```sh
 NABEDRA_CACHE_TEST_CONFIG='{"endpoint":"redis://127.0.0.1:6379"}' \
   orm/cache-contract/run.sh
 ```
 
-Use the same command with the Nabedra and pinned Valkey endpoints. For an
-authenticated or clustered endpoint the JSON also accepts `username`,
-`password`, `caFile`, `cluster`, `allowedNodes` and `allowedNodeSuffix`.
+Run it once against a Nabedra endpoint and once against the pinned Valkey
+version. For an endpoint with authentication or clustering, the JSON also
+accepts `username`, `password`, `caFile`, `cluster`, `allowedNodes` and
+`allowedNodeSuffix`.
 
-## Stock driver spike
+## Why not use redis-py or node-redis
 
-The RESP2 adapters use Python sockets and Node TCP/TLS. This gives both clients
-control of the operation-wide deadline and the boundary after which a lost
-response is an unknown write outcome. In the pinned redis-py 6.4.0 cluster
-client, a connection or timeout error after command submission can trigger
-topology initialization before the error is rethrown. A zero command-retry
-setting alone leaves that recovery path active. Node-redis 5.8.2 can decode
-RESP2 integers losslessly with explicit string mapping. Its cluster wrapper
-runs rediscovery inside the redirection loop. The shared clients enforce their
-endpoint authorization before connecting to new owners, bound discovery inside
-the same caller deadline and distinguish pre-submit failures from faults after
-submission. [redis-py 6.4.0 cluster source](https://github.com/redis/redis-py/blob/v6.4.0/redis/cluster.py) · [node-redis 5.8.2 decoder and cluster loop](https://github.com/redis/node-redis/tree/redis%405.8.2/packages/client/lib)
+Both clients implement RESP2 directly, on Python sockets and Node's TCP and TLS
+modules. That way they control the deadline for the whole operation and know
+exactly when a lost reply makes a write's outcome unknown. We tried the stock
+drivers first, and neither gave us that control.
+
+- In the cluster client of redis-py 6.4.0, a connection or timeout error
+  after a command has been sent can start topology initialization before the
+  error reaches the caller. Setting command retries to zero doesn't turn that
+  recovery off. See the
+  [redis-py 6.4.0 cluster source](https://github.com/redis/redis-py/blob/v6.4.0/redis/cluster.py).
+- node-redis 5.8.2 can decode RESP2 integers without losing precision if you
+  map them to strings, but its cluster wrapper reruns discovery inside the
+  redirect loop. See the
+  [node-redis 5.8.2 decoder and cluster loop](https://github.com/redis/node-redis/tree/redis%405.8.2/packages/client/lib).
+
+Our clients check that a new owner is authorized before connecting to it, keep
+discovery within the caller's deadline, and tell failures before a command was
+sent apart from failures after it.

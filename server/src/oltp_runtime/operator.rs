@@ -66,7 +66,7 @@ impl WorkerRuntime {
                         return Err(invalid());
                     }
                     intent.validate()?;
-                } else if request.operation == "worker.system_replacement.check" {
+                } else if matches!(request.operation.as_str(), "worker.system_replacement.check" | "worker.system_replacement.status") {
                     let check: super::worker_runtime::system_recovery::ReplacementCheck =
                         serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
                     check.validate()?;
@@ -151,6 +151,10 @@ impl WorkerRuntime {
         if request.operation == "worker.restart.prepare" {
             let intent = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
             return self.prepare_worker_restart(intent).await;
+        }
+        if request.operation == "worker.system_replacement.status" {
+            let check = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;
+            return self.system_replacement_status(request.request_id, check).await;
         }
         if request.operation == "worker.system_replacement.check" {
             let check = serde_json::from_str(request.payload.get()).map_err(|_| invalid())?;

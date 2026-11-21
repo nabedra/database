@@ -14,8 +14,8 @@ import threading
 import time
 from uuid import UUID
 
-from oltp_direct_cluster import (DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Rf1Serve,
-                                 Rf3Cluster, call, operation, uid, write_json)
+from oltp_direct_cluster import (CHILD, DATABASE, EXECUTION, IDENTITY_FIELDS, WORKERS, Process,
+                                 Rf1Serve, Rf3Cluster, call, free_port, operation, uid, write_json)
 
 # Includes a Control election and ready-set removal on the CI runner.
 PROBE_WINDOW = 60
@@ -179,7 +179,9 @@ def two_ready(cluster, survivors):
 
 
 def o06_o17_system_replacement_check(binary, test_executable, root):
-    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable)
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable,
+                         status_partitions=2)
+    peer_probe = None
     try:
         cluster.start()
         connection = cluster.admin('cluster.connection', {})
@@ -232,6 +234,12 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         acknowledged = insert(table, 1, 77)
         original = send_op(acknowledged)
         assert success(*original) is None
+        acknowledged_writes = [(acknowledged, original)]
+        for key in range(3, 11):
+            body = insert(table, key, key * 11)
+            observed = send_op(body)
+            assert success(*observed) is None
+            acknowledged_writes.append((body, observed))
         queued = insert(table, 2, 88)
         queued_id = queued['request_id']
         for name in WORKERS:
@@ -245,6 +253,31 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             saved = json.loads((cluster.barrier_dir(name) / f'record-{queued_id}.json').read_text())
             assert saved['accepted'] and json.loads(saved['body']) == queued, saved
 
+        old_probe_dir = root / 'old-peer'
+        old_probe_dir.mkdir()
+        probe_input = old_probe_dir / 'config.json'
+        victim_node = cluster.config[victim]['node']
+        write_json(probe_input, {
+            'group': victim_node['placements']['control']['identity'],
+            'from': enrollment, 'targets': [cluster.enrollments[name] for name in survivors],
+            'certificate': victim_node['certificate'], 'private_key': victim_node['private_key'],
+            'authority_ca': victim_node['authority_ca'], 'directory': str(old_probe_dir),
+        })
+        probe_env = {key: value for key, value in os.environ.items() if not key.startswith(('AWS_', 'NABEDRA_S3_'))}
+        probe_env['NABEDRA_OLTP_TEST_REPLACEMENT_PEER'] = str(probe_input)
+        peer_probe = Process('old-peer', [str(test_executable), '--exact', CHILD, '--ignored', '--nocapture'],
+                             probe_env, old_probe_dir / 'peer.log')
+
+        def old_certificate_observation(phase):
+            (old_probe_dir / f'probe-{phase}').touch()
+            result = old_probe_dir / f'probe-{phase}.json'
+            def observed():
+                if not peer_probe.alive() and not result.exists():
+                    raise AssertionError((old_probe_dir / 'peer.log').read_text())
+                return json.loads(result.read_text()) if result.exists() else None
+            return wait_for(observed, f'old certificate {phase} replacement', PROBE_WINDOW)
+
+        assert old_certificate_observation('before') == [True, True]
         stopped_at = time.monotonic()
         cluster.workers[victim].kill()
         mount = Path(cluster.config[victim]['node']['directory'])
@@ -252,9 +285,6 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
         cluster.mounted.remove(mount)
         assert not (mount / 'pool').exists()
         wait_for(lambda: two_ready(cluster, survivors), 'surviving ready workers')
-        for name in survivors:
-            write_json(cluster.barrier_dir(name) / 'gates.json', {})
-
         def reading():
             status, reply = send_op(get(table, 1))
             if status in (429, 503, 504):
@@ -295,16 +325,28 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             return success(status, reply)
 
         result = wait_for(checked, 'all affected groups have surviving quorum', PROBE_WINDOW)
-        expected = {group['identity']['group_id']
-                    for group in cluster.config[victim]['node']['placements'].values()}
+        original_placements = cluster.config[victim]['node']['placements']
+        system_groups = [original_placements[label]
+                         for label in ('control', 'timestamps', 'status', 'catalog')]
+        system_groups.extend(original_placements['status_partitions'])
+        expected = {group['identity']['group_id'] for group in system_groups}
         expected.add(initial_range(cluster, table)['group_id'])
         assert set(result['groups']) == expected, result
         leader = wait_for(lambda: control_leader(survivors), 'new Control leader', PROBE_WINDOW)
         assert success(*operator(leader, enable)) == activation
         fresh = cluster.certificate('replacement')
         fresh_mount = cluster.mount_pool('replacement', uid(), fresh)
+        mount_key = cluster.root / 'replacement-mount.pem'
+        cluster.openssl('genpkey', '-algorithm', 'Ed25519', '-out', mount_key)
+        mount_key.chmod(0o600)
+        def mount_der(*args):
+            return subprocess.check_output(['openssl', 'pkey', '-in', str(mount_key),
+                                            '-outform', 'DER', *args], timeout=30)[-32:]
+        mount_seed = Path(fresh_mount['mount_path']) / 'NABEDRA_RESTART_KEY'
+        mount_seed.write_bytes(mount_der())
+        mount_seed.chmod(0o600)
         intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
-                      next=fresh, mount=fresh_mount)
+                      next=fresh, mount=fresh_mount, mount_public_key=mount_der('-pubout').hex())
         prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
         borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
         bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))
@@ -326,27 +368,220 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
             status, reply = operator(leader, operation('worker.system_replacement.prepare',
                                                        conflicting, conflicting['id']))
             assert status == 409, (status, reply)
-        assert send_op(acknowledged) == original
-        assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
+        replacement = deepcopy(cluster.config[victim])
+        replacement['bind'] = f'127.0.0.1:{free_port()}'
+        replacement['node'].update(
+            directory=fresh_mount['mount_path'], pool_id=fresh_mount['identity']['pool_id'],
+            scheduler_node_id=4, enrollment=fresh, bind=fresh['endpoint'], mount=fresh_mount,
+            certificate=str(cluster.root / 'replacement.pem'),
+            private_key=str(cluster.root / 'replacement.key'), system_replacement=prepared,
+            bootstrap_placements=original_placements,
+        )
+        cluster.config['replacement'] = replacement
+        candidate_barrier = cluster.barrier_dir('replacement')
+        candidate_barrier.mkdir(parents=True)
+        (candidate_barrier / 'rolling-test-id').write_text(intent['id'])
+        write_json(candidate_barrier / 'inspect.json', [queued_id])
+        write_json(candidate_barrier / 'gates.json', {
+            intent['id']: 'rolling_copy_complete', queued_id: 'queued',
+            fresh['worker_id']: 'system_replacement_rf3_applied',
+        })
+        for name in survivors:
+            write_json(cluster.barrier_dir(name) / 'gates.json', {
+                queued_id: 'queued', data_group: 'replacement_learner_appended',
+            })
+
+        def learner_leader():
+            for name in survivors:
+                if (cluster.barrier_dir(name) / f'reached-{data_group}').exists():
+                    return name
+            if not cluster.workers['replacement'].alive():
+                cluster.check_lost_port('replacement')
+            return None
+
+        held_candidate_advert = candidate_barrier / 'hold-system-replacement-advert'
+        held_candidate_advert.touch()
+        cluster.launch_worker('replacement')
+        unsupported = cluster.workers['replacement']
+        try:
+            assert unsupported.popen.wait(timeout=PROBE_WINDOW) != 0
+            assert 'must advertise control.system-replacement' in cluster.tail('replacement'), cluster.tail('replacement')
+            assert two_ready(cluster, survivors)
+            still_prepared = cluster.admin('worker.system_replacement.status',
+                                           dict(run_id=cluster.run_id, previous=previous), worker=survivors[0])
+            assert not still_prepared['mounted'] and not still_prepared['complete'], still_prepared
+        finally:
+            unsupported.stop()
+            held_candidate_advert.unlink()
+
+        replacement_started = time.monotonic()
+        cluster.launch_worker('replacement')
+        data_leader = wait_for(learner_leader, 'learner append committed', PROBE_WINDOW)
+        paused = next(name for name in survivors if name != data_leader)
+        data_plan = next(plan for plan in prepared['groups']
+                         if plan['expected']['identity']['group_id'] == data_group)
+        data_node = next(member['node_id'] for member in data_plan['old']
+                         if member['worker_id'] == cluster.enrollments[data_leader]['worker_id'])
+        data_barrier = cluster.barrier_dir(data_leader)
+        write_json(data_barrier / 'inspect-data-voters.json',
+                   [[data_plan['expected']['identity'], data_node]])
+        cluster.workers[paused].pause()
+        try:
+            (data_barrier / f'release-{data_group}').touch()
+            # Probe actual Raft state while one of the two old surviving
+            # voters is stopped. The old majority cannot commit promotion.
+            for _ in range(3):
+                cluster.stats(data_leader)
+                voters, _ = json.loads((data_barrier / 'data-voters.json').read_text())[0]
+                assert voters == [member['node_id'] for member in data_plan['old']], voters
+            assert not (candidate_barrier / 'rolling-copy.json').exists()
+        finally:
+            cluster.workers[paused].resume()
+            for name in survivors:
+                (cluster.barrier_dir(name) / f'release-{data_group}').touch()
+
+        stable_checkpoint = candidate_barrier / f'reached-{fresh["worker_id"]}'
+        wait_for(stable_checkpoint.exists, 'replacement applied stable RF3 in every group', RECOVERY_DEADLINE)
+        rf3_restored = time.monotonic()
+        (candidate_barrier / f'release-{fresh["worker_id"]}').touch()
+        copy_checkpoint = candidate_barrier / f'reached-{intent["id"]}'
+        def copied():
+            if not cluster.workers['replacement'].alive():
+                cluster.check_lost_port('replacement')
+            return copy_checkpoint.exists()
+
+        wait_for(copied, 'complete replacement queue snapshot', RECOVERY_DEADLINE)
+        copied_record = json.loads((candidate_barrier / f'record-{queued_id}.json').read_text())
+        assert copied_record['accepted'] and json.loads(copied_record['body']) == queued, copied_record
+        queue_copy = json.loads((candidate_barrier / 'rolling-copy.json').read_text())
+        assert queue_copy['statement']['ticket']['target']['worker_id'] == fresh['worker_id'], queue_copy
+        assert two_ready(cluster, survivors), 'the queue-copy proof is still held before publication'
+        (candidate_barrier / f'release-{intent["id"]}').touch()
+        cluster.wait_workers(names=('replacement',))
+        assert old_certificate_observation('after') == [False, False]
+        progress = cluster.admin('worker.system_replacement.status',
+                                 dict(run_id=cluster.run_id, previous=previous), worker='replacement')
+        assert progress['mounted'] and progress['complete'], progress
+        assert len(progress['groups']) == len(prepared['groups'])
+        for plan, route in zip(prepared['groups'], progress['groups']):
+            assert route['record']['identity'] == plan['expected']['identity'], route
+            assert len(route['members']) == route['record']['replica_count'] == 3, route
+            assert plan['learner'] in route['members'], route
+            assert all(member['worker_id'] != previous['worker_id'] for member in route['members']), route
+        control_plan = next(plan for plan in prepared['groups']
+                            if plan['expected']['identity']['kind'] == 'control')
+        current_voters = sorted([member for member in control_plan['old']
+                                 if member['worker_id'] != previous['worker_id']] + [control_plan['learner']],
+                                key=lambda member: member['node_id'])
+
+        live_workers = {cluster.enrollments[name]['worker_id']: name for name in survivors}
+        live_workers[fresh['worker_id']] = 'replacement'
+
+        def parked_queue_owner():
+            cluster.stats('replacement')
+            record = json.loads((candidate_barrier / f'record-{queued_id}.json').read_text())
+            authority = record['authority']
+            if authority['ready']['ready_count'] != 3:
+                return None
+            name = live_workers[authority['owner']['worker_id']]
+            reached = cluster.barrier_dir(name) / f'reached-{queued_id}'
+            if not reached.exists() or reached.read_text() != 'queued':
+                return None
+            assert record['accepted'] and record['state'] == 'queued', record
+            return name
+
+        # A parked executor waits for its release file even after gates.json changes.
+        queue_owner = wait_for(parked_queue_owner, 'current queue owner parked before release', PROBE_WINDOW)
+        print(f'Accepted request {queued_id} parked at queued gate on {queue_owner}', flush=True)
+        released_at = time.monotonic()
+        for name in live_workers.values():
+            (cluster.barrier_dir(name) / f'release-{queued_id}').touch()
+        for body, acknowledged_result in acknowledged_writes:
+            row = body['payload']['row']
+            assert send_op(body) == acknowledged_result
+            assert success(*send_op(get(table, row['id']))) == row
         receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
+        last_receipt = None
 
         def receipt():
+            nonlocal last_receipt
             status, reply = call(cluster.api_urls['api1'], receipt_path,
                                  token=cluster.auth['data_token'], ca=cluster.ca, timeout=5)
+            last_receipt = (status, reply)
             if status in (429, 503, 504):
                 return None
             assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
             return reply if reply['state'] == 'succeeded' else None
 
-        settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        try:
+            settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        except AssertionError as error:
+            raise AssertionError(f'{error}. Parked on {queue_owner}. Last receipt response {last_receipt!r}') from error
+        release_to_receipt = time.monotonic() - released_at
         assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
                                result=None, error=None), settled
         assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
-        report('O06/O17 system replacement preflight', lost_control_leader=victim,
+        new_table = create(send_op, 'rep4_new_placement')
+        new_route = cluster.admin('storage.replica.placement', {'group': initial_range(cluster, new_table)},
+                                  worker='replacement')
+        assert new_route['members'] == current_voters, new_route
+        report('O06/O16/O17/NS23/R01/R03/R06/Q03 system replacement', lost_control_leader=victim,
                groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
-               refused_missing_advert=True, refused_data_quorum=True, refused_reused_certificate=True,
-               replayed_intent=True, settled_receipts=1,
-               probe_recovery_seconds=round(first_read - stopped_at, 3))
+               refused_missing_advert=True, refused_candidate_missing_advert=True,
+               refused_data_quorum=True, refused_reused_certificate=True,
+               replayed_intent=True, settled_receipts=1, revoked_old_certificate=True,
+               queued_gate_owner=queue_owner, elapsed_queue_release_to_receipt_seconds=round(release_to_receipt, 3),
+               acknowledged_direct_writes=len(acknowledged_writes),
+               probe_recovery_seconds=round(first_read - stopped_at, 3),
+               elapsed_loss_to_rf3_seconds=round(rf3_restored - stopped_at, 3),
+               elapsed_start_to_rf3_seconds=round(rf3_restored - replacement_started, 3))
+    finally:
+        if peer_probe is not None:
+            peer_probe.stop()
+        cluster.close()
+
+
+def o17_mixed_binary_retained_enrollment_refused(binary, test_executable, legacy_binary, root):
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable, api_direct=())
+    try:
+        cluster.start()
+        for name in WORKERS:
+            (cluster.barrier_dir(name) / 'inspect-control-leader').touch()
+
+        def enable():
+            for name in WORKERS:
+                cluster.stats(name)
+                if json.loads((cluster.barrier_dir(name) / 'control-leader.json').read_text()):
+                    return cluster.admin('worker.system_replacement.enable', {}, worker=name)
+            return None
+
+        activation = wait_for(enable, 'activate system replacement', PROBE_WINDOW)
+        assert activation['capability'] == 'control.system-replacement.v1'
+        target = WORKERS[-1]
+        # The old process should reach enrollment with the on-disk activation
+        # already applied. Prove that before replacing the current process.
+        assert cluster.admin('worker.system_replacement.enable', {}, worker=target) == activation
+        survivors = [name for name in WORKERS if name != target]
+        original = cluster.enrollments[target]
+        cluster.workers[target].kill()
+        cluster.workers[target].stop()
+        wait_for(lambda: two_ready(cluster, survivors), 'survivors removed the stopped worker')
+        retained = retained_config(cluster, target, survivors)
+        config = root / 'legacy.json'
+        write_json(config, retained)
+        env = {key: value for key, value in os.environ.items() if not key.startswith(('AWS_', 'NABEDRA_S3_'))}
+        legacy = Process('legacy', [str(legacy_binary), 'worker', '--bootstrap', str(config)],
+                         env, root / 'legacy.log')
+        try:
+            assert legacy.popen.wait(timeout=PROBE_WINDOW) != 0, (root / 'legacy.log').read_text()
+            log = (root / 'legacy.log').read_text()
+            assert 'UnsupportedOperation' in log and 'must advertise control.system-replacement' in log, log
+            assert two_ready(cluster, survivors)
+            peers = cluster.admin('cluster.connection', {}, worker=survivors[0])['control_peers']
+            assert original in peers and retained['node']['enrollment'] not in peers, peers
+        finally:
+            legacy.stop()
+        report('O17 mixed-binary retained startup', refused_legacy_binary=True, ready_workers=2)
     finally:
         cluster.close()
 
@@ -648,7 +883,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check'), default='all')
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check', 'replacement-mixed'),
+                        default='all')
+    parser.add_argument('--legacy-binary', type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='nabedra-rep1-') as directory:
         root = Path(directory).resolve()
@@ -660,6 +897,12 @@ def main():
         if args.suite in ('all', 'replacement-check'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
+
+        if args.suite == 'replacement-mixed':
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            assert args.legacy_binary, 'the mixed startup check requires the pre-execution binary'
+            o17_mixed_binary_retained_enrollment_refused(
+                args.binary, args.test_executable, args.legacy_binary.resolve(), root / 'replacement-mixed')
 
 
 if __name__ == '__main__':

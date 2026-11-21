@@ -199,6 +199,7 @@ pub(crate) struct SplitClient {
     data: Arc<DataGroupClient>,
     control: Arc<ControlClient>,
     timestamps: GroupIdentity,
+    catalog: GroupIdentity,
 }
 pub(crate) struct OwnedSplitAttempt {
     job: SplitAttempt,
@@ -216,11 +217,13 @@ impl SplitClient {
         data: Arc<DataGroupClient>,
         control: Arc<ControlClient>,
         timestamps: GroupIdentity,
+        catalog: GroupIdentity,
     ) -> Self {
         Self {
             data,
             control,
             timestamps,
+            catalog,
         }
     }
     fn shared(&self) -> &Arc<crate::oltp::pool::WorkerSharedResources> {
@@ -292,7 +295,12 @@ impl SplitClient {
         )?;
         let mut last = unavailable();
         let data = operation.routes_data();
-        let system = self.data.voters.iter().filter(|voter| {
+        let system_routes = if data || destination == &self.catalog {
+            routes.clone()
+        } else {
+            self.control.replica_routes(&self.catalog).await?
+        };
+        let system = system_routes.members.iter().filter(|voter| {
             !data
                 && routes.members.iter().any(|member| {
                     member.worker_id == voter.worker_id && member.pool_id == voter.pool_id
@@ -399,7 +407,7 @@ impl SplitClient {
                 .map(|voter| voter.member.clone())
                 .collect::<Vec<_>>()
         } else {
-            self.data.voters.to_vec()
+            self.data.initial_voters(control, &self.control).await?.into_inner()
         };
         let exact_worker = |reply: &ReceivedReply, index: usize| {
             placement.is_none_or(|placement| {

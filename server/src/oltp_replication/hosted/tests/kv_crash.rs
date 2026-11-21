@@ -151,7 +151,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// O11, D09, NS10: a crash, a 512 B power loss or a 4 KiB power loss after the n-th
 /// mutating operation of a run of concurrent proposals with snapshots and purges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn o11_d09_ns10_raft_writes_survive_cuts_at_sampled_operations() {
+pub(super) async fn o11_d09_ns10_raft_writes_survive_cuts_at_sampled_operations() {
     let commands = env_u64("NS10_RAFT_COMMANDS", 96);
     let points = env_u64("NS10_RAFT_POINTS", 18);
     // Reference run: how many mutating operations the proposals take.

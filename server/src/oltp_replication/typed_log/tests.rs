@@ -152,6 +152,7 @@ struct GateState {
     closed: bool,
     entered: usize,
     passed: usize,
+    fail_after_sync: bool,
 }
 struct GatedFile {
     inner: Arc<dyn nabedra_kv::fs::FsFile>,
@@ -184,6 +185,10 @@ impl GatedSync {
             gate.entered = 0;
         });
         HeldSync(self)
+    }
+    /// The next successful native sync persists its bytes but reports EIO.
+    pub(crate) fn fail_after_sync(&self) {
+        self.state(|gate| gate.fail_after_sync = true);
     }
     /// Syncs that reached the closed gate since [`Self::hold`].
     pub(crate) fn entered(&self) -> usize {
@@ -255,11 +260,15 @@ impl nabedra_kv::fs::FsFile for GatedFile {
                 ));
             }
         }
+        let fail_after_sync = std::mem::take(&mut state.fail_after_sync);
         drop(state);
         let result = self.inner.sync_data();
         if result.is_ok() {
             lock.lock().unwrap().passed += 1;
             changed.notify_all();
+        }
+        if fail_after_sync && result.is_ok() {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         result
     }
@@ -958,6 +967,13 @@ impl GatedLog {
         let log = TypedLogStore::<TestConfig>::new(group, 1).await.unwrap();
         (pool, log)
     }
+    /// Waits until a sync reached the closed gate (GC1; lost in the merge
+    /// of GC1 into `nabedra/hardening`, restored by GC2).
+    async fn entered(&self) {
+        while self.gated.state(|gate| gate.entered) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 /// O29/NS10 (FaultFs crash and power-loss models), PERF2d: a crash between an
@@ -1248,7 +1264,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
         let (pool, mut log) = rig.open(Arc::new(rig.gated.clone()), true).await;
         let syncs = || pool.kv_store().stats().journal_syncs;
         let before = syncs();
-        rig.gated.state(|gate| gate.closed = true);
+        let held_sync = rig.gated.hold();
         let mut acks = Vec::new();
         let mut ack = |index: u64| {
             let (sent, acked) = TestConfig::oneshot();
@@ -1287,7 +1303,7 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
                 "no append reports a flush before its sync"
             );
         }
-        rig.gated.state(|gate| gate.closed = false);
+        drop(held_sync);
         let mut voter = vote.await.unwrap();
         for acked in acks {
             acked.await.unwrap().unwrap();
@@ -1309,4 +1325,42 @@ async fn o06_o11_gc1_queued_appends_share_one_sync_and_never_cross_a_vote() {
     })
     .await
     .expect("GC1 append coalescing watchdog");
+}
+
+/// KVfix4, NS13/O05: once `drain` returns, no append task still holds what it
+/// captured (the group store, charged entries, the worker's resource owner).
+/// The hosted NS13 test drops its pool after a drain and reopens the worker at
+/// once; an append task that released its pending guard before dropping its
+/// captured store let `bind_worker` meet the old owner ("worker storage
+/// capacity unavailable"). The task's last copy of the hook drops slowly, so a
+/// guard released first is caught every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ns13_o05_drain_waits_until_the_append_task_dropped_its_state() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct SlowDrop(Arc<AtomicBool>);
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(200));
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let mut f = Fixture::new().await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let slow = SlowDrop(dropped.clone());
+    *f.log.append_hook.lock().unwrap() = Some(Arc::new(move || {
+        let _ = &slow;
+    }));
+    let (sender, callback) = TestConfig::oneshot();
+    f.log
+        .append([blank(0)], IOFlushed::signal(sender))
+        .await
+        .unwrap();
+    callback.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), f.log.drain())
+        .await
+        .expect("drain");
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "drain returned while the append task still held its captured state"
+    );
 }

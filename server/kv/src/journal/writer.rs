@@ -198,6 +198,13 @@ impl Writer {
             };
             let number = shared.next_number.fetch_add(1, Ordering::Relaxed);
             live.push(segment::activate(fs, dir, spare, number, next_seq)?);
+        } else {
+            // The inventory saw the names of the process that stopped, which may not be
+            // durable yet: a Kill between a roll's rename and its directory sync leaves the
+            // new live name only in the OS. This open appends to that segment and the store
+            // records it in the manifest, so its name must be durable first (KVfix4).
+            // `activate` above syncs the directory itself.
+            fs.sync_dir(dir).map_err(segment::io)?;
         }
 
         let active = live.last().expect("an active segment").clone();

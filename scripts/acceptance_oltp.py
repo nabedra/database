@@ -171,8 +171,13 @@ def source_identity():
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
+    paths += sorted((ROOT / "server/tests").rglob("*.c"))
+    paths += sorted((ROOT / "server/tests").rglob("*.mjs"))
     paths += sorted((ROOT / "scripts").glob("*.py"))
     paths += sorted((ROOT / "orm/python/src").rglob("*.py"))
+    paths += sorted((ROOT / "orm/typescript/src").rglob("*.ts"))
+    paths += [ROOT / "orm/python/pyproject.toml", ROOT / "orm/typescript/package.json",
+              ROOT / "orm/typescript/package-lock.json", ROOT / "orm/typescript/tsconfig.json"]
     for path in sorted(set(paths)):
         digest.update(str(path.relative_to(ROOT)).encode() + b"\0")
         digest.update(hashlib.sha256(path.read_bytes()).digest())

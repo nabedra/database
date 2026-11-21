@@ -741,6 +741,19 @@ impl LogRig {
         }
         Ok(Self { logs, pool, shared })
     }
+    /// Joins every pending log operation, then drops the pool, as the host does
+    /// before it releases a replica. An append task outlives its `IOFlushed`
+    /// callback (PERF2d) and holds the pool, so dropping without the join and
+    /// reopening at once can meet the old worker owner ("worker storage capacity
+    /// unavailable", KVfix4). Durable state is unchanged: the oracle holds only
+    /// synced entries.
+    async fn close(self) {
+        for log in &self.logs {
+            tokio::time::timeout(Duration::from_secs(30), log.drain())
+                .await
+                .expect("pending log operations finish");
+        }
+    }
     async fn append(&mut self, group: usize, oracle: &mut LogOracle) -> std::io::Result<()> {
         let index = oracle.next[group];
         let id = (group as u64) << 32 | index;
@@ -963,12 +976,12 @@ async fn ns13_o06_o11_lagging_group_pins_the_oldest_segment_until_gc_relocates_i
     // A last lagging entry stays unflushed in the memtable, then the machine
     // crashes: the reopen replays it and reads every entry back.
     rig.append(LAGGING, &mut oracle).await.unwrap();
-    drop(rig);
+    rig.close().await;
     let crashed = fault.crash();
     let mut rig = LogRig::open(&path, &layout, &crashed, true).await.unwrap();
     assert!(rig.pool.kv_store().quarantined().is_empty());
     rig.check(&oracle, "reopen").await;
-    drop(rig);
+    rig.close().await;
     let mut rig = LogRig::open(&path, &layout, &crashed.crash(), true)
         .await
         .unwrap();
@@ -1043,7 +1056,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             }
         }
         crashed_runs += usize::from(fault.is_crashed());
-        drop(rig);
+        rig.close().await;
         let context = format!("crash after window op {k}");
         let image = fault.crash();
         let mut rig = LogRig::open(&path, &layout, &image, true)
@@ -1051,7 +1064,7 @@ async fn ns04_ns13_o11_crash_at_every_relocation_step_keeps_the_log() {
             .unwrap_or_else(|error| panic!("{context}: reopen: {error}"));
         assert!(rig.pool.kv_store().quarantined().is_empty(), "{context}");
         rig.check(&oracle, &context).await;
-        drop(rig);
+        rig.close().await;
         let mut rig = LogRig::open(&path, &layout, &image.crash(), true)
             .await
             .unwrap_or_else(|error| panic!("{context}: second reopen: {error}"));
@@ -1188,4 +1201,39 @@ fn d01_perf2b_inline_digest_equals_the_native_digest() {
     assert!(bounded_digest(&small, exact - 1).is_none());
     let large = serde_json::json!({"blob": "x".repeat(INLINE_BYTES)});
     assert!(bounded_digest(&large, INLINE_BYTES).is_none());
+}
+
+pub(crate) fn acceptance_o11_storage() {
+    use crate::oltp_acceptance::clause;
+
+    d09_o11_o29_lost_unsynced_applies_replay_once_from_the_synced_log();
+    o11_purge_and_snapshot_never_pass_the_durable_applied_index();
+    kv_crash::o11_d09_ns10_raft_writes_survive_cuts_at_sampled_operations();
+    clause(
+        "O11",
+        "idempotent-apply",
+        "passed",
+        "FaultFs restarted production Raft after a lost applied suffix and sampled checkpoint and purge cuts. Every recovered command changed the counter once.",
+    );
+    crate::oltp_replication::manager::acceptance_overlapped_append();
+    clause(
+        "O11",
+        "optimization-durability",
+        "passed",
+        "FaultFs exercised deferred apply and durable snapshot/purge. RF3 PERF2d cuts retained a follower-quorum commit when the leader had not synced and dropped the uncommitted entry when no voter synced.",
+    );
+    crate::oltp::mvcc::store::direct::acceptance_indexed_direct_replay();
+    clause(
+        "O11",
+        "data-index-result-position",
+        "passed",
+        "Reopened the real pool at the same applied position and command digest. The base row, index entry, serialized result and dedup result matched the original entry.",
+    );
+    crate::oltp::pool::acceptance_damaged_checkpoints();
+    clause(
+        "O11",
+        "damaged-state-rejection",
+        "passed",
+        "Truncated checkpoint bytes, corrupt membership and a checksum-valid but inconsistent header were all rejected without activating an invalid cut.",
+    );
 }

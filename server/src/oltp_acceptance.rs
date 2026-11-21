@@ -2,12 +2,18 @@
 //! in their owning modules. Run these explicitly through the central runner.
 use std::{path::PathBuf, process::Command};
 
+#[path = "oltp_acceptance/acc6.rs"]
+mod acc6;
 #[path = "oltp_acceptance/o07.rs"]
 mod o07;
 #[path = "oltp_acceptance/o10.rs"]
 mod o10;
 
 fn transaction_scenario(scenario: &str) {
+    process_scenario(scenario, "oltp_transaction_acceptance.py");
+}
+
+fn process_scenario(scenario: &str, driver: &str) {
     let Some(binary) = std::env::var_os("NABEDRA_OLTP_BINARY") else {
         let marker = serde_json::json!({
             "scenario": scenario, "status": "not-run", "reason": "missing actual OLTP server executable",
@@ -15,8 +21,9 @@ fn transaction_scenario(scenario: &str) {
         eprintln!("NABEDRA_OLTP_ACCEPTANCE {marker}");
         return;
     };
-    let script =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_transaction_acceptance.py");
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(driver);
     let status = Command::new(
         std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
     )
@@ -28,11 +35,8 @@ fn transaction_scenario(scenario: &str) {
     .arg(std::env::current_exe().unwrap())
     .env("PYTHONDONTWRITEBYTECODE", "1")
     .status()
-    .expect("launch RF3 transaction acceptance");
-    assert!(
-        status.success(),
-        "{scenario} RF3 transaction assertions failed"
-    );
+    .expect("launch RF3 acceptance driver");
+    assert!(status.success(), "{scenario} RF3 process assertions failed");
 }
 
 #[test]
@@ -66,4 +70,49 @@ fn acceptance_o01() {
         status.success(),
         "public ORM parity failed on actual servers"
     );
+}
+
+#[test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+fn acceptance_o06() {
+    crate::oltp_replication::manager::acceptance_o06_storage();
+    process_scenario("O06", "oltp_hardening_acceptance.py");
+}
+
+#[test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+fn acceptance_o08() {
+    process_scenario("O08", "oltp_hardening_acceptance.py");
+}
+
+#[test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+fn acceptance_o09() {
+    process_scenario("O09", "oltp_hardening_acceptance.py");
+}
+
+#[test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+fn acceptance_o11() {
+    crate::oltp_replication::hosted::acceptance_o11_storage();
+    process_scenario("O11", "oltp_hardening_acceptance.py");
+}
+
+#[tokio::test]
+#[ignore = "run through scripts/acceptance_oltp.py"]
+async fn acceptance_o29() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        crate::oltp::pool::o29_pool_recovery(),
+    )
+    .await
+    .expect("O29 pool recovery watchdog");
+    process_scenario("O29", "oltp_o29_acceptance.py");
+}
+
+pub(crate) fn clause(scenario: &str, assertion: &str, status: &str, detail: &str) {
+    let marker = serde_json::json!({
+        "scenario": scenario, "assertion": assertion, "status": status, "detail": detail,
+    });
+    println!("NABEDRA_OLTP_ASSERT {marker}");
 }

@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 pub(crate) mod index_faults;
 pub(crate) mod index_holds;
+pub(crate) mod maintenance;
+pub(crate) mod pool_sync;
 
 struct Barrier {
     stage: String,
@@ -398,6 +400,36 @@ pub(crate) async fn transaction_checkpoint(
     }
 }
 
+/// Private test-process observation of the local Timestamp service. A follower
+/// must pass the same lease/ReadIndex check as the owner of a cached window.
+pub(super) async fn timestamp_probe(
+    source: &dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+) -> Option<serde_json::Value> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    if !directory.join("probe-timestamp").is_file() {
+        return None;
+    }
+    let wall_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = tokio::time::timeout(Duration::from_secs(2), source.allocate_direct(4)).await;
+    Some(match result {
+        Ok(Ok(range)) => serde_json::json!({ "window": range, "wall_seconds": wall_seconds }),
+        other => serde_json::json!({
+            "window": null, "wall_seconds": wall_seconds, "error": format!("{other:?}"),
+        }),
+    })
+}
+
+pub(super) fn group_leader_probe() -> Option<Uuid> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::read_to_string(directory.join("probe-group-leader"))
+        .ok()?
+        .parse()
+        .ok()
+}
+
 pub(super) fn mark(name: &str, request: Uuid) {
     if let Some(Some(barrier)) = BARRIER.get() {
         if barrier.request == request {
@@ -582,6 +614,12 @@ fn actual_runtime_child() {
                 ),
         )
         .try_init();
+    if let Some(config) = std::env::var_os("NABEDRA_OLTP_TEST_REPLACEMENT_PEER") {
+        super::standalone_network_runtime()
+            .unwrap()
+            .block_on(replacement_peer_probe(config.into()));
+        return;
+    }
     if let Some(config) = std::env::var_os("NABEDRA_OLTP_TEST_DATA_WORKER_CONFIG") {
         super::standalone_network_runtime()
             .unwrap()
@@ -619,6 +657,132 @@ fn actual_runtime_child() {
         .unwrap()
         .block_on(super::run(options))
         .unwrap();
+}
+
+async fn replacement_peer_probe(config: PathBuf) {
+    use crate::{
+        config::WorkerResources,
+        oltp::pool::{ByteClass, SharedResourceConfig, WorkerSharedResources},
+        oltp_replication::{
+            multiplex::{AppliedPeerDirectory, EndpointRegistry, Purpose, TransportConfig, WorkerTransport},
+            types::{GroupIdentity, WorkerEnrollment, WorkerIdentity},
+        },
+    };
+    use std::sync::Arc;
+
+    #[derive(serde::Deserialize)]
+    struct Config {
+        group: GroupIdentity,
+        from: WorkerEnrollment,
+        targets: Vec<WorkerEnrollment>,
+        certificate: PathBuf,
+        private_key: PathBuf,
+        authority_ca: PathBuf,
+        directory: PathBuf,
+        queue_view: Option<crate::oltp_replication::types::AuthorityView>,
+    }
+    let config: Config = serde_json::from_slice(&std::fs::read(config).unwrap()).unwrap();
+    let tls = crate::oltp_replication::TlsMaterial::from_pem(
+        &std::fs::read(config.certificate).unwrap(),
+        &std::fs::read(config.private_key).unwrap(),
+        &std::fs::read(config.authority_ca).unwrap(),
+    ).unwrap();
+    let shared = WorkerSharedResources::new(1, WorkerResources::default(), SharedResourceConfig::default()).unwrap();
+    let directory = AppliedPeerDirectory::from_bootstrap(
+        config.group.clone(), config.targets.clone(), shared.clone(),
+    ).unwrap();
+    if let Some(view) = config.queue_view {
+        use super::{replica::QueueScope, worker_endpoint::QueueRequest};
+        use crate::oltp_replication::multiplex::RequestError;
+
+        let [target] = config.targets.as_slice() else {
+            panic!("queue enrollment probe requires one target");
+        };
+        // The fixture pins the outbound receiver. The real receiver checks
+        // the caller against its applied Control enrollment.
+        directory
+            .install_system_trust(1, config.targets.clone(), Vec::new(), None)
+            .unwrap();
+        for stale in [false, true] {
+            let mut enrollment = config.from.clone();
+            if stale {
+                enrollment.incarnation = Uuid::new_v4();
+            }
+            let client = WorkerTransport::new(
+                &enrollment,
+                &tls,
+                shared.clone(),
+                directory.clone(),
+                Arc::new(EndpointRegistry::new(shared.clone())),
+                TransportConfig::default(),
+            )
+            .unwrap()
+            .client();
+            let ping = QueueRequest::Ping {
+                scope: QueueScope {
+                    cluster_id: config.group.cluster_id,
+                    database: config.group.database.clone(),
+                },
+                view,
+            };
+            let header = shared.encode_in(ByteClass::Progress, &ping, 4096).unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                client.request_classified(
+                    &config.group,
+                    WorkerIdentity::from(target),
+                    Purpose::QueueControl,
+                    header,
+                    [None, None, None],
+                    16 << 10,
+                ),
+            )
+            .await
+            .expect("queue peer probe watchdog");
+            if stale {
+                assert!(matches!(result, Err(RequestError::Unreachable)));
+            } else {
+                assert!(result.is_ok(), "current enrollment's queue ping failed");
+            }
+        }
+        return;
+    }
+    let client = WorkerTransport::new(&config.from, &tls, shared.clone(), directory,
+        Arc::new(EndpointRegistry::new(shared.clone())), TransportConfig::default()).unwrap().client();
+    let probe = |target: WorkerIdentity| {
+        let header = shared.encode_in(ByteClass::Progress, &"advertise", 4096).unwrap();
+        let client = client.clone();
+        let group = config.group.clone();
+        async move {
+            client.request_classified(&group, target, Purpose::SystemRecovery, header,
+                [None, None, None], 16 << 10).await.is_ok()
+        }
+    };
+    for phase in ["before", "after"] {
+        let marker = config.directory.join(format!("probe-{phase}"));
+        tokio::time::timeout(Duration::from_secs(240), async {
+            while !marker.exists() {
+                if phase == "after" {
+                    // Keep the original sessions open until Control revokes
+                    // their identity. Both sessions use the same client below.
+                    for target in &config.targets {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), probe(WorkerIdentity::from(target))).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }).await.unwrap();
+        let mut observed = Vec::new();
+        for target in &config.targets {
+            observed.push(probe(WorkerIdentity::from(target)).await);
+        }
+        let output = config.directory.join(format!("probe-{phase}.json"));
+        let temporary = output.with_extension("tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&observed).unwrap()).unwrap();
+        std::fs::rename(temporary, output).unwrap();
+    }
 }
 
 #[test]
