@@ -842,6 +842,16 @@ impl Client {
                         continue;
                     }
                     Ok(Err(error)) => return Err(error.into()),
+                    Err(CallError::Transport(RequestError::PeerRejected { worker, error }))
+                        if matches!(method, Method::ParticipantFence { .. })
+                            && worker.worker_id == member.worker_id
+                            && placement_rejected_before_execution(&error) =>
+                    {
+                        // Control retains the placement while replicas reopen.
+                        // This peer had no route for the fence, so try the
+                        // other verified voters before refreshing membership.
+                        continue;
+                    }
                     Err(CallError::Transport(error)) => {
                         match &error {
                             RequestError::Protocol(detail)
