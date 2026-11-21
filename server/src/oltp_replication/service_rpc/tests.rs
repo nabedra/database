@@ -14,6 +14,20 @@ use crate::{
 };
 use uuid::Uuid;
 
+#[test]
+fn o06_o18_direct_catalog_reads_use_bounded_replica_failover() {
+    let read = Method::ParticipantRead {
+        read_ts: ReadTs::new(u64::MAX).unwrap(),
+    };
+    assert!(read.uses_bounded_read_failover(ServiceAction::DirectLeader));
+    assert!(Method::ParticipantGuard.uses_bounded_read_failover(ServiceAction::DirectLeader));
+    assert!(
+        !Method::ParticipantPropose { progress: false }
+            .uses_bounded_read_failover(ServiceAction::DirectLeader)
+    );
+    assert!(!read.uses_bounded_read_failover(ServiceAction::Owner));
+}
+
 struct Directory(std::path::PathBuf);
 impl Drop for Directory {
     fn drop(&mut self) {

@@ -241,7 +241,7 @@ impl Method {
                 Self::ParticipantPropose { .. } | Self::ParticipantScanRun { .. }
             )
     }
-    fn can_repeat_scoped_read(self, action: ServiceAction) -> bool {
+    fn uses_bounded_read_failover(self, action: ServiceAction) -> bool {
         self.can_repeat_read()
             && (matches!(
                 action,
@@ -249,7 +249,9 @@ impl Method {
                     | ServiceAction::ScopedQueueExecute(_)
                     | ServiceAction::ScopedQueueRead { .. }
                     | ServiceAction::ScopedQueueFenceReceipt { .. }
-            ) || matches!(self, Self::ScopedStatusParticipant { .. }))
+            ) || matches!(self, Self::ScopedStatusParticipant { .. })
+                || (action == ServiceAction::DirectLeader
+                    && matches!(self, Self::ParticipantRead { .. } | Self::ParticipantGuard)))
     }
     /// Calls whose small replies are decoded inline (PERF2a): only
     /// `AllocateDirect`, whose reply is a fixed-shape range.
@@ -440,7 +442,7 @@ impl Client {
         method: Method,
         payload: Option<ChargedBytes>,
     ) -> Result<ServiceResponse, ProtocolError> {
-        if method.can_repeat_scoped_read(action) {
+        if method.uses_bounded_read_failover(action) {
             return self.repeat_as(action, method, payload).await;
         }
         let mut possibly_applied = false;

@@ -1,4 +1,5 @@
 use super::*;
+
 use crate::{
     config::WorkerResources,
     oltp::pool::{OltpPool, SharedResourceConfig},
@@ -15,6 +16,24 @@ use std::{
 };
 use tokio::sync::oneshot;
 
+#[test]
+fn o06_o18_enrollment_refresh_has_bounded_replica_failover() {
+    for request in [
+        ReadRequest::EnrollmentRevision,
+        ReadRequest::Workers {
+            revision: 1,
+            after: None,
+        },
+        ReadRequest::Apis {
+            revision: 1,
+            after: None,
+        },
+        ReadRequest::RestartPreparation { revision: 1 },
+        ReadRequest::PreparedDataWorker { revision: 1 },
+    ] {
+        assert!(request.supports_bounded_failover());
+    }
+}
 struct Directory(PathBuf);
 impl Drop for Directory {
     fn drop(&mut self) {
