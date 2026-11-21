@@ -157,6 +157,22 @@ impl HostedGroupManager {
         }
         Ok(running)
     }
+
+    #[cfg(test)]
+    pub(crate) fn data_voter_state(
+        &self,
+        group: &GroupIdentity,
+        node: u64,
+    ) -> Option<(Vec<u64>, u64)> {
+        let hosted = self.hosted_data(group, node).ok()?;
+        let metrics = hosted.raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let index = metrics.last_applied.as_ref()?.index;
+        metrics.running_state.as_ref().ok()?;
+        let voters = metrics.membership_config.membership().voter_ids().collect();
+        Some((voters, index))
+    }
+
     pub(crate) fn new(
         shared: Arc<WorkerSharedResources>,
         client: WorkerClient,

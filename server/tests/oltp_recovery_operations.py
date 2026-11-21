@@ -199,6 +199,8 @@ def restart_during_split(cluster, send_op):
         raise AssertionError('no worker could run the split')
 
     def imported():
+        if pending.done():
+            raise AssertionError(f'split returned before reaching the barrier: {pending.result()!r}')
         return next((name for name in WORKERS
                      if (cluster.barrier_dir(name) / f'reached-{split_id}').exists()), None)
 
@@ -394,32 +396,39 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
             assert success(*send_op(get(table, row['id']))) == row, body
         await_receipt(queued_id)
         assert success(*send_op(get(table, 1))) == {'id': 1, 'value': 1234}
+        recovered_nodes = []
+        expected_voters = []
         for group, before in zip(groups, placements):
             after = cluster.admin('storage.replica.placement', {'group': group})
             assert after == before and len(after['members']) == after['record']['replica_count'] == 3, after
+            expected_voters.append(sorted(member['node_id'] for member in after['members']))
+            recovered_nodes.append(next(member['node_id'] for member in after['members']
+                                        if member['worker_id'] == peer['worker_id']))
 
-        # Published voters already numbered three during the outage. Require
-        # a new quorum with the recovered voter on both ranges.
-        alternate = cluster.workers[survivors[0]]
-        alternate.pause()
-        try:
-            for table_id in (table, independent):
-                probe = insert(table_id, -1, 456)
+        # Inspect the restarted Raft core. Control placement alone was RF3
+        # even while its voter was stopped.
+        barrier = cluster.barrier_dir(victim)
+        write_json(barrier / 'inspect-data-voters.json', list(zip(groups, recovered_nodes)))
 
-                def committed():
-                    status, reply = send_op(probe, timeout=12)
-                    if status == 200:
-                        assert reply == dict(request_id=probe['request_id'], data=None), reply
-                        return True
-                    assert status in (429, 503, 504), (status, reply)
-                    return False
+        def applied():
+            cluster.stats(victim)
+            observations = json.loads((barrier / 'data-voters.json').read_text())
+            if any(state is None for state in observations):
+                return None
+            assert [sorted(voters) for voters, _ in observations] == expected_voters, observations
+            return [index for _, index in observations]
 
-                wait_for(committed, 'recovered voter formed a new write quorum', PROBE_WINDOW)
-        finally:
-            alternate.resume()
-        cluster.wait_workers()
+        baseline = wait_for(applied, 'restarted worker hosts both Data voters', PROBE_WINDOW)
+        for table_id in (table, independent):
+            assert success(*send_op(insert(table_id, -1, 456))) is None
+
+        def newer_applies():
+            current = applied()
+            return current if current and all(new > old for old, new in zip(baseline, current)) else None
+
+        applied_after = wait_for(newer_applies, 'restarted voter applied new log entries', PROBE_WINDOW)
         report('O06/R01/R03/R06 retained restart', acknowledged=len(acknowledged), attempts_with_errors=len(errors),
-               settled_receipts=2, published_data_voters=3, ranges=len(groups), recovered_quorums=2,
+               settled_receipts=2, data_voters=3, ranges=len(groups), applied_before=baseline, applied_after=applied_after,
                max_independent_read_gap_seconds=round(max(gaps), 3), worker=victim)
         restart_during_split(cluster, send_op)
     except BaseException:

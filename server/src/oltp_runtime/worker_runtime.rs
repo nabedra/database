@@ -1865,6 +1865,8 @@ impl HttpRuntime for WorkerRuntime {
     }
     fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
         Box::pin(async move {
+            #[cfg(test)]
+            super::recovery_tests::observe_data_voters(&self.services.manager);
             let (queue, accept_to_dispatch) = {
                 let replica = self.services.replica.lock().map_err(|_| unknown())?;
                 #[cfg(test)]
