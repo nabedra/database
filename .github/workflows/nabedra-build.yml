@@ -845,6 +845,7 @@ jobs:
           GC1_RATES: "100,400,1000,2000"
           GC1_RANGES: "1,8"
           GC1_MODES: "off,on"
+          GC1_PACKING: "800,1600"
           GC1_SECONDS: "10"
           GC1_SERIAL: "300"
         run: |

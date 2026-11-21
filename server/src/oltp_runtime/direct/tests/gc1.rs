@@ -499,13 +499,43 @@ const STAGES: &[&str] = &[
 
 /// One open-loop phase (`rate` > 0) or a closed-loop serial phase
 /// (`rate` = 0, `serial` requests one after another).
+/// `insert_rows` = 0: updates of seeded rows. Otherwise each request
+/// inserts that many fresh rows (`table.insert` for 1, `table.insert_many`
+/// above) into the last range; per-write figures are then per row.
 async fn phase(
     measure: &Measure,
     rate: f64,
     seconds: f64,
     serial: usize,
     rows: i64,
+    insert_rows: usize,
 ) -> serde_json::Value {
+    static FRESH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1 << 40);
+    let make = |key: i64, i: usize| -> (usize, DirectRequest) {
+        match insert_rows {
+            0 => {
+                let g = measure.range_of(key);
+                let request = measure.request(
+                    g,
+                    "table.update",
+                    serde_json::json!({"key": key, "values": {"value": i as i64}}),
+                );
+                (g, request)
+            }
+            count => {
+                let first = FRESH.fetch_add(count as i64, Ordering::Relaxed);
+                let row = |id: i64| serde_json::json!({"id": id, "value": i as i64, "tag": "gc1", "score": 0.5});
+                let g = measure.groups.len() - 1;
+                let request = if count == 1 {
+                    measure.request(g, "table.insert", serde_json::json!({"row": row(first)}))
+                } else {
+                    let rows: Vec<_> = (first..first + count as i64).map(row).collect();
+                    measure.request(g, "table.insert_many", serde_json::json!({"rows": rows}))
+                };
+                (g, request)
+            }
+        }
+    };
     let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ (rate as u64);
     let mut next = move || {
         rng ^= rng << 13;
@@ -535,12 +565,7 @@ async fn phase(
     if rate == 0.0 {
         for i in 0..serial {
             let key = (next() % rows as u64) as i64;
-            let g = measure.range_of(key);
-            let request = measure.request(
-                g,
-                "table.update",
-                serde_json::json!({"key": key, "values": {"value": i as i64}}),
-            );
+            let (g, request) = make(key, i);
             let (response, latency) = measure
                 .spawn(g, request, std::time::Instant::now())
                 .await
@@ -557,12 +582,7 @@ async fn phase(
             let due = origin + interval * i as u32;
             tokio::time::sleep_until(due).await;
             let key = (next() % rows as u64) as i64;
-            let g = measure.range_of(key);
-            let request = measure.request(
-                g,
-                "table.update",
-                serde_json::json!({"key": key, "values": {"value": i as i64}}),
-            );
+            let (g, request) = make(key, i);
             // Latency from the scheduled arrival (open loop).
             let task = measure.spawn(g, request, origin_std + interval * i as u32);
             tasks.push(task);
@@ -578,6 +598,9 @@ async fn phase(
     let stages_after = crate::oltp_runtime::stage_timing::snapshot();
     let direct_after = measure.voters[0].executor.stats();
     latencies.sort();
+    // Requests that succeeded become rows written for the per-write figures.
+    let requests = ok;
+    let ok = ok * insert_rows.max(1) as u64;
     let per = |ns: u64| {
         if ok == 0 {
             0.0
@@ -619,6 +642,8 @@ async fn phase(
         .collect();
     serde_json::json!({
         "ranges": measure.groups.len(),
+        "workload": if insert_rows == 0 { "update".to_owned() } else { format!("insert x{insert_rows}") },
+        "requests_ok": requests,
         "offered_per_s": rate,
         "serial": rate == 0.0,
         "wall_s": wall,
@@ -664,6 +689,7 @@ fn gc1_measure_direct_write_cost() {
     let seconds = list("GC1_SECONDS", "10")[0];
     let serial = list("GC1_SERIAL", "300")[0] as usize;
     let rows = list("GC1_ROWS", "5000")[0] as i64;
+    let packing = list("GC1_PACKING", "800");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("gc1-driver")
@@ -682,13 +708,21 @@ fn gc1_measure_direct_write_cost() {
                 let measure = Measure::new(ranges as usize, rows).await;
                 measure.seed(rows).await;
                 // Warm up the sessions, caches and the timestamp client.
-                let _ = phase(&measure, 50.0, 2.0, 0, rows).await;
+                let _ = phase(&measure, 50.0, 2.0, 0, rows, 0).await;
                 let mut records = Vec::new();
                 if ranges as usize == 1 && serial > 0 {
-                    records.push(phase(&measure, 0.0, 0.0, serial, rows).await);
+                    records.push(phase(&measure, 0.0, 0.0, serial, rows, 0).await);
                 }
                 for &rate in &rates {
-                    records.push(phase(&measure, rate, seconds, 0, rows).await);
+                    records.push(phase(&measure, rate, seconds, 0, rows, 0).await);
+                }
+                // Upper bound for packing requests into one entry: the same
+                // row rate as single-row inserts and as 8-row `insert_many`.
+                if ranges as usize == 1 {
+                    for &row_rate in &packing {
+                        records.push(phase(&measure, row_rate, seconds, 0, rows, 1).await);
+                        records.push(phase(&measure, row_rate / 8.0, seconds, 0, rows, 8).await);
+                    }
                 }
                 for mut record in records {
                     record["coalesce_appends"] = serde_json::json!(coalesce);
