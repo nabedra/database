@@ -474,23 +474,48 @@ def o06_o17_system_replacement_check(binary, test_executable, root):
                                  if member['worker_id'] != previous['worker_id']] + [control_plan['learner']],
                                 key=lambda member: member['node_id'])
 
-        for name in (*survivors, 'replacement'):
-            (cluster.barrier_dir(name) / f'release-{queued_id}').touch()
+        live_workers = {enrollment['worker_id']: name for name, enrollment in cluster.enrollments.items()
+                        if name in survivors}
+        live_workers[fresh['worker_id']] = 'replacement'
+
+        def parked_queue_owner():
+            cluster.stats('replacement')
+            record = json.loads((candidate_barrier / f'record-{queued_id}.json').read_text())
+            authority = record['authority']
+            if authority['ready']['ready_count'] != 3:
+                return None
+            name = live_workers[authority['owner']['worker_id']]
+            reached = cluster.barrier_dir(name) / f'reached-{queued_id}'
+            if not reached.exists() or reached.read_text() != 'queued':
+                return None
+            assert record['accepted'] and record['state'] == 'queued', record
+            return name
+
+        queue_owner = wait_for(parked_queue_owner, 'current queue owner parked before release', PROBE_WINDOW)
+        print(f'Accepted request {queued_id} parked at queued gate on {queue_owner}', flush=True)
+        for name in live_workers.values():
+            write_json(cluster.barrier_dir(name) / 'gates.json', {})
         for body, acknowledged_result in acknowledged_writes:
             row = body['payload']['row']
             assert send_op(body) == acknowledged_result
             assert success(*send_op(get(table, row['id']))) == row
         receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
+        last_receipt = None
 
         def receipt():
+            nonlocal last_receipt
             status, reply = call(cluster.api_urls['api1'], receipt_path,
                                  token=cluster.auth['data_token'], ca=cluster.ca, timeout=5)
+            last_receipt = (status, reply)
             if status in (429, 503, 504):
                 return None
             assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
             return reply if reply['state'] == 'succeeded' else None
 
-        settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        try:
+            settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        except AssertionError as error:
+            raise AssertionError(f'{error}; last receipt on parked owner {queue_owner}: {last_receipt!r}') from error
         assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
                                result=None, error=None), settled
         assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
