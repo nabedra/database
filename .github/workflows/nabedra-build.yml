@@ -19,6 +19,8 @@ on:
       - main
       - nabedra/remove-rocksdb
       - "nabedra/rr-*"
+      - nabedra/hardening
+      - "nabedra/hd-*"
   pull_request:
     branches:
       - main
