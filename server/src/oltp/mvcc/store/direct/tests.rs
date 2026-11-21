@@ -873,9 +873,22 @@ async fn o07_queued_prepare_conflicts_on_a_direct_commit_and_reads_it_as_committ
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
+pub(super) async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
     let f = Fixture::new().await;
-    let commit = f.put(1, None, 10);
+    let index = MvccKey::IndexEntry {
+        table_id: f.table,
+        index_id: Uuid::new_v4(),
+        values: Page::new(vec![IndexValue::Int64(7)]).unwrap(),
+        primary_key: Key::Int64(1),
+    };
+    let mut write = f.write(1, None, Some(serde_json::json!({"id": 1, "value": 7})));
+    write.index.push(IndexChange {
+        key: index.clone(),
+        expected_version: None,
+        value: Some(f.json(serde_json::json!({"id": 1}))),
+    });
+    let commit = f.commit(Uuid::new_v4(), 1, 10, vec![write]);
+    let key = f.key(1);
     let command = ParticipantCommand::Direct(commit.clone());
     let entry = || OwnedCommand::new_owned(command.clone(), f.shared(), ByteClass::Data).unwrap();
     let meta = |index| ApplyMeta {
@@ -902,6 +915,7 @@ async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         .unwrap();
     assert_eq!(again.as_slice(), first.as_slice());
     assert_eq!(f.dump().await, state);
+    let result = first.as_slice().to_vec();
     drop((first, again));
 
     // Close everything and reopen the pool from disk.
@@ -927,6 +941,18 @@ async fn o11_crash_replay_of_a_direct_commit_entry_is_idempotent() {
         index: next_index,
     };
     assert_eq!(reopened.dump().await, state, "the commit is durable");
+    let cut = reopened.machine.store().applied_state(BUDGET).await.unwrap().unwrap();
+    assert_eq!(cut.position, meta(next_index - 1).position);
+    assert_eq!(cut.command_digest, meta(next_index - 1).command_digest);
+    for key in [key, index] {
+        let visible = reopened.machine.read_at(ts(10), key).await.unwrap();
+        let visible: serde_json::Value = serde_json::from_slice(visible.as_slice()).unwrap();
+        assert_eq!(visible["value"]["version"], 10);
+        assert_eq!(visible["value"]["value"]["id"], 1);
+    }
+    let repeated = OwnedCommand::new_owned(command, &reopened.shared, ByteClass::Data).unwrap();
+    let repeated = reopened.machine.apply(meta(next_index - 1), repeated).await.unwrap();
+    assert_eq!(repeated.as_slice(), result);
     // The same request proposed again as a new entry replays.
     assert_eq!(
         reopened

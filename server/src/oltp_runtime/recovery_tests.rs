@@ -183,7 +183,11 @@ pub(super) fn observe_rolling_copy(
     };
     observe_record(replica);
     let copied = serde_json::json!({"statement": statement, "queue":replica.stats()});
-    std::fs::write(directory.join("rolling-copy.json"), serde_json::to_vec(&copied).unwrap()).unwrap();
+    std::fs::write(
+        directory.join("rolling-copy.json"),
+        serde_json::to_vec(&copied).unwrap(),
+    )
+    .unwrap();
 }
 pub(super) async fn pause_rolling_copy() {
     if let Some((_, id)) = rolling_test() {
@@ -192,9 +196,11 @@ pub(super) async fn pause_rolling_copy() {
 }
 pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
     const STAGE: &str = "staged-copy-refused";
-    if BARRIER.get().and_then(Option::as_ref).is_some_and(|barrier| {
-        barrier.request == request && barrier.stage == STAGE
-    }) {
+    if BARRIER
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|barrier| barrier.request == request && barrier.stage == STAGE)
+    {
         pause(STAGE, request).await;
         return true;
     }
@@ -203,7 +209,10 @@ pub(super) async fn refuse_staged_copy(request: Uuid) -> bool {
 fn rolling_test() -> Option<(PathBuf, Uuid)> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
     let input = std::fs::read_to_string(directory.join("rolling-test-id")).ok()?;
-    Some((directory, input.trim().parse().expect("rolling fixture UUID")))
+    Some((
+        directory,
+        input.trim().parse().expect("rolling fixture UUID"),
+    ))
 }
 pub(crate) async fn pause(stage: &str, request: Uuid) {
     if stage == "queued" {
@@ -319,6 +328,36 @@ pub(crate) async fn transaction_checkpoint(
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+}
+
+/// Private test-process observation of the local Timestamp service. A follower
+/// must pass the same lease/ReadIndex check as the owner of a cached window.
+pub(super) async fn timestamp_probe(
+    source: &dyn crate::oltp_replication::authority::timestamp::DirectTimestampSource,
+) -> Option<serde_json::Value> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    if !directory.join("probe-timestamp").is_file() {
+        return None;
+    }
+    let wall_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let result = tokio::time::timeout(Duration::from_secs(2), source.allocate_direct(4)).await;
+    Some(match result {
+        Ok(Ok(range)) => serde_json::json!({ "window": range, "wall_seconds": wall_seconds }),
+        other => serde_json::json!({
+            "window": null, "wall_seconds": wall_seconds, "error": format!("{other:?}"),
+        }),
+    })
+}
+
+pub(super) fn group_leader_probe() -> Option<Uuid> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    std::fs::read_to_string(directory.join("probe-group-leader"))
+        .ok()?
+        .parse()
+        .ok()
 }
 
 pub(super) fn mark(name: &str, request: Uuid) {

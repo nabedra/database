@@ -171,6 +171,7 @@ def source_identity():
     paths += sorted((ROOT / "server/src").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.rs"))
     paths += sorted((ROOT / "server/tests").rglob("*.py"))
+    paths += sorted((ROOT / "server/tests").rglob("*.c"))
     paths += sorted((ROOT / "scripts").glob("*.py"))
     paths += sorted((ROOT / "orm/python/src").rglob("*.py"))
     for path in sorted(set(paths)):

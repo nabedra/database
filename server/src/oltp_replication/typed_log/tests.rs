@@ -145,6 +145,7 @@ struct GateState {
     closed: bool,
     entered: usize,
     passed: usize,
+    fail_after_sync: bool,
 }
 struct GatedFile {
     inner: Arc<dyn nabedra_kv::fs::FsFile>,
@@ -178,6 +179,10 @@ impl GatedSync {
     }
     pub(crate) fn release(&self) {
         self.state(|gate| gate.closed = false);
+    }
+    /// The next successful native sync persists its bytes but reports EIO.
+    pub(crate) fn fail_after_sync(&self) {
+        self.state(|gate| gate.fail_after_sync = true);
     }
     /// Syncs that reached the closed gate since [`Self::hold`].
     pub(crate) fn entered(&self) -> usize {
@@ -234,11 +239,15 @@ impl nabedra_kv::fs::FsFile for GatedFile {
                 state = changed.wait(state).unwrap();
             }
         }
+        let fail_after_sync = std::mem::take(&mut state.fail_after_sync);
         drop(state);
         let result = self.inner.sync_data();
         if result.is_ok() {
             lock.lock().unwrap().passed += 1;
             changed.notify_all();
+        }
+        if fail_after_sync && result.is_ok() {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
         }
         result
     }

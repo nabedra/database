@@ -4,20 +4,24 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import http.client
+import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 from threading import Barrier
 import time
 
-from oltp_direct_acceptance import admin_owner, dump, queue_owner
+from oltp_direct_acceptance import admin_owner, d11_drop, dump
 from oltp_direct_cluster import Rf3Cluster, WORKERS, operation, uid
 from oltp_transaction_acceptance import OPERATIONS, REQUESTS, Transactions, batch, passed, rows
+from oltp_terminal_copy_acceptance import wait_for
+from nabedra.validation import schema_to_wire
 
 
 def not_run(scenario, clause, detail):
-    import json
-
     print('NABEDRA_OLTP_ASSERT ' + json.dumps(dict(
         scenario=scenario, assertion=clause, status='not-run', detail=detail,
     )), flush=True)
@@ -47,16 +51,26 @@ def uncertain_or_refused(fixture, body):
 
 def o06(fixture):
     table = create(fixture, 'quorum')
+    seed = batch(table, rows(0, category=5))
+    fixture.select(seed['request_id'], {'participants': False})
+    fixture.admit(seed)
+    _, plans = fixture.reached(seed['request_id'], 'participants')
+    assert len(plans) == 1, plans
+    fixture.terminal(seed['request_id'], 1)
+    group = plans[0]['group']['group_id']
     acknowledged = [point(table, 'insert', row=row) for row in rows(1, 2, 3, category=5)]
     for body in acknowledged:
         assert fixture.data(body) is None
 
     workers = fixture.cluster.workers
-    owner = queue_owner(fixture.cluster)
+    owner = data_leader(fixture, group)
     paused = [worker for worker in WORKERS if worker != owner]
     for worker in paused:
         workers[worker].pause()
     try:
+        # The old leader may still hold a valid read lease immediately after
+        # the pause. Probe only after the registered election timeout expires.
+        time.sleep(3.5)
         # Exercise both entry points concurrently while the same two voters are stopped.
         with ThreadPoolExecutor(max_workers=2) as pool:
             read = pool.submit(uncertain_or_refused, fixture, point(table, 'get', key=1))
@@ -82,6 +96,7 @@ def o06(fixture):
             break
         assert time.monotonic() < deadline, (status, reply)
         time.sleep(.25)
+    assert data_leader(fixture, group) != owner
     for body in acknowledged:
         row = body['payload']['row']
         assert fixture.data(point(table, 'get', key=row['id']), 'api2') == row
@@ -89,9 +104,25 @@ def o06(fixture):
     assert fixture.data(point(table, 'get', key=4), 'api2') is None
     assert fixture.data(point(table, 'insert', row=rows(5, category=10)[0]), 'api2') is None
     passed('O06', 'quorum-and-applied-authority',
-           'Two stopped RF3 voters prevented both read and write success. A surviving quorum served the applied row and a fresh write after SIGKILL of the old queue owner.')
+           'Two stopped RF3 voters prevented both read and write success. A surviving quorum served the applied row and a fresh write after SIGKILL of the old Data leader.')
     passed('O06', 'acknowledged-write-survival',
            'The surviving processes returned all three acknowledged rows and the exact results for their original identities.')
+
+
+def data_leader(fixture, group):
+    cluster = fixture.cluster
+    live = cluster.live()
+    reports = []
+    for worker in live:
+        path = cluster.barrier_dir(worker) / 'probe-group-leader'
+        path.write_text(group)
+        try:
+            reports.append(cluster.stats(worker)['test_group_leader'])
+        finally:
+            path.unlink(missing_ok=True)
+    leaders = set(reports)
+    assert len(leaders) == 1 and None not in leaders, reports
+    return next(worker for worker in live if cluster.enrollments[worker]['worker_id'] in leaders)
 
 
 def run_concurrently(fixture, requests):
@@ -202,17 +233,63 @@ def o08(fixture):
     passed('O08', 'stable-results', 'Queued no-op and conflict replays through the same identity returned the original outcome after a change that would reverse a re-executed result.')
 
     name = 'schema_race'
-    original = create(fixture, name)
-    contender = operation('table.create', {'name': name, 'key': 'id',
-                                           'schema': {'id': 'int64', 'category': 'int64', 'value': 'int64'}})
-    # Use the production ORM serialization for competing create and drop.
-    from oltp_direct_acceptance import d11_drop
+    creates = []
+    for field in ('left', 'right'):
+        payload = dict(name=name, key='id', format='parquet', schema=schema_to_wire({'id': int, field: int}))
+        creates.append(operation('table.create', payload))
+    creation = run_concurrently(fixture, list(zip(('api1', 'api2'), creates, strict=True)))
+    winners, losers = [], []
+    for _, _, body, (status, reply) in creation:
+        if status == 200:
+            winners.append(reply['data'])
+            assert reply['data']['schema'] == body['payload']['schema'], (body, reply)
+        else:
+            assert status == 409 and reply['error']['outcome'] == 'not_applied', (status, reply)
+            losers.append(reply)
+    assert len(winners) == len(losers) == 1, creation
+    assert str(fixture.db.table(name).id) == winners[0]['id']
     d11_drop(fixture.cluster, fixture.cluster.api_urls['api1'], fixture.cluster.auth['data_token'], fixture.cluster.ca)
-    assert original.id == fixture.db.table(name).id
+    passed('O08', 'schema-fences', 'Concurrent distinct schema creates left one descriptor. The RF3 drop race refused stale writes and reopened the name under a fresh, empty table identity.')
     passed('O08', 'bounded-progress', 'The concurrent history and the RF3 drop/write race returned within the fixture deadlines.')
-    not_run('O08', 'schema-fences', 'Drop/write and recreate assertions ran. Concurrent creation for the same name still needs an observable race.')
-    not_run('O08', 'fresh-snapshot-retry', 'The final row preserves both field changes. No retry was forced and observed to replan from a fresh snapshot.')
+    if fixture.direct:
+        verify_snapshot_retry(fixture, table)
+        passed('O08', 'fresh-snapshot-retry',
+               'An already planned queued upsert changed the head while a direct update was paused before proposal. The stale proposal lost and the same identity recomputed against the new head.')
+    else:
+        not_run('O08', 'fresh-snapshot-retry', 'No automatic retry after a stale version was forced on the queued-only path.')
     not_run('O08', 'storage-reservations', 'The RF3 process fixture has no deterministic admission gate for competing pool-space reservations.')
+
+
+def verify_snapshot_retry(fixture, table):
+    queued = point(table, 'upsert', row=dict(id=1, category=88, value=89))
+    fixture.select(queued['request_id'], {'participants': True})
+    fixture.admit(queued, 'api2')
+    fixture.reached(queued['request_id'], 'participants')
+    direct = point(table, 'update', key=1, values={'value': 90})
+    request_id = direct['request_id']
+    for worker in WORKERS:
+        fixture.gate(worker, request_id, 'direct-proposing')
+    reached = [fixture.cluster.barrier_dir(worker) / f'reached-{request_id}' for worker in WORKERS]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        update = pool.submit(exchange, fixture, direct)
+        try:
+            def first_attempt(path):
+                if path.read_text() == 'direct-proposing':
+                    return path.with_name(f'attempts-{request_id}')
+
+            attempts = wait_for(reached, first_attempt, timeout=15)
+            assert not update.done()
+            fixture.release(queued['request_id'], 'participants')
+            fixture.terminal(queued['request_id'], None)
+        finally:
+            for worker in WORKERS:
+                fixture.release_copy(worker, request_id)
+        result = update.result(timeout=35)
+    assert result == (200, dict(request_id=request_id, data=True)), result
+    assert attempts.read_text().splitlines() == ['direct-proposing', 'direct-proposing']
+    assert fixture.data(point(table, 'get', key=1)) == dict(id=1, category=88, value=90)
+    assert exchange(fixture, direct) == result
+
 
 
 def split_table(fixture, table):
@@ -278,23 +355,122 @@ def o09(fixture):
     assert decision['decision'] == {'commit': {'commit_ts': stamp['commit_ts']}}, decision
     passed('O09', 'commit-after-prepare', 'Both RF3 participants applied their pages and sealed the manifest before allocation. The exact decision used the later timestamp.')
 
-    # Drain the older snapshot while the coordinator is still held. A quorum
-    # Status decision already exists, so a newer read can resolve the intent.
-    fixture.release(old_id, 'snapshot')
-    fixture.terminal(old_id, before_rows)
     expected = sorted(before_rows + inserts, key=lambda row: row['id'])
-    for body, result in [(fixture.query(table), expected), (fixture.query(table, 7), inserts)]:
+    probes = [
+        (point(table, 'get', key=-9), inserts[0]),
+        (fixture.query(table), expected),
+        (fixture.query(table, 7), inserts),
+    ]
+    # Hold every reader before it helps, so each proves a genuinely obstructed
+    # read even when another reader would otherwise resolve the same intent.
+    for body, _ in probes:
         probe = body['request_id']
-        fixture.select(probe, {'snapshot': False})
+        fixture.select(probe, {'snapshot': False, 'blocked': True})
         fixture.admit(body, 'api2')
         _, probe_stamp = fixture.reached(probe, 'snapshot')
         assert probe_stamp > stamp['commit_ts'], (probe_stamp, stamp)
-        fixture.terminal(probe, result)
+        _, intent = fixture.reached(probe, 'blocked')
+        assert intent == dict(txn=decision['txn'], manifest=decision['manifest']), intent
+    for body, result in probes[1:]:
+        fixture.release(body['request_id'], 'blocked')
+        fixture.terminal(body['request_id'], result)
+    body, result = probes[0]
+    fixture.release(body['request_id'], 'blocked')
+    fixture.terminal(body['request_id'], result)
+    fixture.release(old_id, 'snapshot')
+    fixture.terminal(old_id, before_rows)
     fixture.release(request, 'commit-reply')
     fixture.terminal(request, len(inserts))
-    not_run('O09', 'ambiguous-intent-reads', 'Older and newer base/index scans returned the exact rows. A point miss at a still-unresolved intent needs its own observed history.')
-    not_run('O09', 'timestamp-order', 'Prepare and scan timestamps passed the real-time checks. Allocator failover, old leader resume and wall-clock jumps still need process evidence.')
-    not_run('O09', 'no-backdated-allocation', 'Scan pins followed the queued commit. The AllocateDirect window was not observed in this process history.')
+    passed('O09', 'ambiguous-intent-reads',
+           'A missing point, base scan and index scan found the unresolved COMMIT. Helping recovered the expected rows, while an earlier pin kept its original result.')
+
+    check_allocator(fixture, table, stamp['commit_ts'])
+
+
+def timestamp_probe(fixture, worker):
+    signal = fixture.cluster.barrier_dir(worker) / 'probe-timestamp'
+    signal.touch()
+    try:
+        observed = fixture.cluster.stats(worker)['test_timestamp']
+    finally:
+        signal.unlink(missing_ok=True)
+    assert observed['window'] is not None or 'error' in observed, observed
+    return observed
+
+
+def allocator(fixture, workers):
+    deadline = time.monotonic() + 50
+    while time.monotonic() < deadline:
+        for worker in workers:
+            observation = timestamp_probe(fixture, worker)
+            if observation['window'] is not None:
+                window = observation['window']
+                assert window['last'] - window['first'] == 3, observation
+                return worker, window, observation['wall_seconds']
+        time.sleep(.2)
+    raise AssertionError(f'no Timestamp allocator in {workers}')
+
+
+def snapshot(fixture, table, expected):
+    body = fixture.query(table)
+    rid = body['request_id']
+    fixture.select(rid, {'snapshot': False})
+    fixture.admit(body, 'api2')
+    _, stamp = fixture.reached(rid, 'snapshot')
+    fixture.terminal(rid, expected)
+    return stamp
+
+
+def check_allocator(fixture, table, commit_ts):
+    cluster = fixture.cluster
+    cluster.wait_direct_active()
+    expected = fixture.data(fixture.query(table))
+    clock_jumps = 'LD_PRELOAD' in cluster.worker_env
+    previous, first, wall = allocator(fixture, WORKERS)
+    assert abs(wall - time.time()) < 5, wall
+    assert first['first'] > commit_ts, (first, commit_ts)
+    contiguous = timestamp_probe(fixture, previous)['window']
+    assert contiguous is not None and contiguous['first'] > first['last'], (first, contiguous)
+
+    intervening = snapshot(fixture, table, expected)
+    assert intervening > contiguous['last'], (intervening, contiguous)
+    _, after_queued, _ = allocator(fixture, (previous,))
+    assert after_queued['first'] > intervening, (after_queued, intervening)
+    for worker in WORKERS:
+        (cluster.barrier_dir(worker) / 'clock-offset-seconds').write_text('-60')
+    survivors = [worker for worker in WORKERS if worker != previous]
+    cluster.workers[previous].pause()
+    try:
+        replacement, new, backward = allocator(fixture, survivors)
+        assert replacement != previous and new['first'] > after_queued['last'], (replacement, new)
+        if clock_jumps:
+            assert abs(backward - (time.time() - 60)) < 5, backward
+    finally:
+        cluster.workers[previous].resume()
+    assert timestamp_probe(fixture, previous)['window'] is None, 'deposed Timestamp leader issued its old window'
+    for worker in WORKERS:
+        (cluster.barrier_dir(worker) / 'clock-offset-seconds').write_text('60')
+    _, latest, forward = allocator(fixture, survivors)
+    if clock_jumps:
+        assert abs(forward - (time.time() + 60)) < 5, forward
+    assert latest['first'] > new['last'], (latest, new)
+
+    if fixture.direct:
+        body = point(table, 'insert', row=rows(12, category=7)[0])
+        rid = body['request_id']
+        fixture.select(rid, {'direct-timestamp': False})
+        assert fixture.data(body) is None
+        _, used = fixture.reached(rid, 'direct-timestamp')
+        assert used > latest['last'], (used, latest)
+        expected.append(body['payload']['row'])
+        assert snapshot(fixture, table, expected) > used
+    passed('O09', 'no-backdated-allocation',
+           'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
+    if clock_jumps:
+        passed('O09', 'timestamp-order',
+               'RF3 Timestamp re-election during a simulated backward wall-clock jump preserved ordering. The resumed leader refused to issue, and allocation advanced through a forward jump.')
+    else:
+        not_run('O09', 'timestamp-order', 'Timestamp failover and old-leader resume passed. Wall-clock jumps require Linux and a C compiler.')
 
 
 def o11(fixture):
@@ -322,7 +498,11 @@ def o11(fixture):
         fixture.cluster.wait_direct_active()
     status, actual = fixture.api('api2', f"{REQUESTS}/{old_run}/{committed['request_id']}")
     assert (status, actual) == (200, receipt), (status, actual, receipt)
-    assert exchange(fixture, written, 'api2') == exact
+    if fixture.direct:
+        assert exchange(fixture, written, 'api2') == exact
+    else:
+        code, result = fixture.api('api2', f"{REQUESTS}/{old_run}/{written['request_id']}")
+        assert code == 200 and result['state'] == 'succeeded' and result['result'] is None, (code, result)
     status, abandoned = fixture.api('api2', f"{REQUESTS}/{old_run}/{held['request_id']}")
     assert status == 200 and abandoned['state'] == 'abandoned', (status, abandoned)
     assert abandoned['result'] is None, abandoned
@@ -348,9 +528,16 @@ def main():
         return
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{args.scenario.lower()}-') as root:
         api2_direct = direct and args.scenario != 'O08'
+        worker_env = {}
+        if args.scenario == 'O09' and sys.platform.startswith('linux') and shutil.which('cc'):
+            shim = Path(root) / 'wall-clock.so'
+            subprocess.run(['cc', '-shared', '-fPIC', '-O2', '-o', str(shim),
+                            str(Path(__file__).with_name('oltp_test_wall_clock.c')), '-ldl'],
+                           check=True, timeout=20)
+            worker_env['LD_PRELOAD'] = str(shim)
         cluster = Rf3Cluster(args.binary, root, test_executable=args.test_executable,
                              direct=dict.fromkeys(WORKERS, direct), api_direct=(direct, api2_direct),
-                             mounts=mounts)
+                             mounts=mounts, worker_env=worker_env)
         fixture = Transactions(cluster, direct)
         try:
             fixture.start()

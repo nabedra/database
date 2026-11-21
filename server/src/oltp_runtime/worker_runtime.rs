@@ -1875,9 +1875,8 @@ impl HttpRuntime for WorkerRuntime {
                 (replica.stats(), replica.queue_latency_stats())
             };
             let scheduler = self.services.shared.scheduler().usage();
-            Ok(EncodedResponse {
-                status: 200,
-                body: serde_json::to_vec(&serde_json::json!({
+            #[allow(unused_mut)]
+            let mut stats = serde_json::json!({
                     "engine":"oltp", "queue":queue, "scheduler":scheduler,
                     "accept_to_dispatch":accept_to_dispatch,
                     "block_cache":self.services.shared.block_cache_usage(),
@@ -1904,8 +1903,22 @@ impl HttpRuntime for WorkerRuntime {
                     "raft":self.services.manager.raft_health(),
                     // PERF1: per-stage latency histograms of this process.
                     "stage_timing":super::stage_timing::snapshot(),
-                }))
-                .map_err(|_| unknown())?,
+                });
+            #[cfg(test)]
+            {
+                if let Some(source) = &self.services.direct_timestamps
+                    && let Some(probe) = super::recovery_tests::timestamp_probe(source.as_ref()).await
+                {
+                    stats["test_timestamp"] = probe;
+                }
+                if let Some(group) = super::recovery_tests::group_leader_probe() {
+                    stats["test_group_leader"] =
+                        serde_json::json!(self.services.manager.test_group_leader(group));
+                }
+            }
+            Ok(EncodedResponse {
+                status: 200,
+                body: serde_json::to_vec(&stats).map_err(|_| unknown())?,
             })
         })
     }

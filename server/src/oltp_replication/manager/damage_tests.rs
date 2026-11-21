@@ -1112,20 +1112,116 @@ async fn o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry() {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower() {
+    use nabedra_kv::fs::{Fault, FaultError, FsOp};
+
+    let mut cluster = Cluster::new_with(3, 3, true).await;
+    let leader = cluster.leader(&[0, 1, 2]).await;
+    let followers: Vec<_> = (0..3).filter(|node| *node != leader).collect();
+    let (delayed, failing) = (followers[0], followers[1]);
+    let first = cluster.fence(leader, 1).await;
+    for follower in &followers {
+        applied_term_reaches(&cluster, *follower, 1).await;
+    }
+    let gate = cluster.workers[delayed].gate.clone().unwrap();
+    gate.hold();
+    let failing_pool = cluster.workers[failing].pool.clone().unwrap();
+    cluster.workers[failing].fault.inject(
+        Fault::on(FsOp::SyncData)
+            .path_prefix(cluster.pool_path(failing).join("kv/journal"))
+            .error(FaultError::Eio),
+    );
+    let proposal = cluster.fence_task(leader, 2);
+    let held = timeout(Duration::from_secs(15), async {
+        while gate.entered() == 0 || !failing_pool.requires_recovery() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let metrics = cluster.host(leader).raft.metrics().borrow_watched().clone();
+        (
+            !proposal.is_finished(),
+            metrics
+                .cluster_committed
+                .is_some_and(|id| id.index == first.index),
+            metrics
+                .last_applied
+                .is_some_and(|id| id.index == first.index),
+            followers.iter().all(|node| {
+                cluster
+                    .matched(leader, *node as u64 + 1)
+                    .is_none_or(|index| index <= first.index)
+            }),
+        )
+    })
+    .await;
+    // Always unblock the journal thread before assertions can unwind.
+    gate.release();
+    assert_eq!(
+        held.expect("both follower syncs reached their fault"),
+        (true, true, true, true)
+    );
+    let applied = timeout(Duration::from_secs(15), proposal)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(applied.index, first.index + 1);
+    applied_term_reaches(&cluster, delayed, 2).await;
+    assert_eq!(
+        cluster
+            .host(leader)
+            .ensure_linearizable()
+            .await
+            .unwrap()
+            .applied,
+        applied
+    );
+    assert!(failing_pool.requires_recovery());
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o06_foreign_pool_and_group_identity_are_refused() {
+    let cluster = Cluster::new(3, 3).await;
+    let index = 0;
+    let pool = cluster.workers[index].pool.as_ref().unwrap();
+    let mut foreign = cluster.group.clone();
+    foreign.cluster_id = Uuid::new_v4();
+    assert!(pool.retained_group(foreign).await.is_err());
+    let path = cluster.pool_path(index);
+    let identity = cluster.pool_identity(index);
+    let shared = cluster.workers[index].shared.clone();
+    let mut cluster = cluster;
+    cluster.stop(index).await;
+    let mut foreign = identity.clone();
+    foreign.pool_id = cluster.pool_identity(1).pool_id;
+    let fs: Arc<dyn Fs> = Arc::new(cluster.workers[index].fault.clone());
+    assert!(OltpPool::open_development_on(&path, foreign, shared.clone(), fs.clone()).is_err());
+    let exact = OltpPool::open_development_on(path, identity, shared, fs).unwrap();
+    assert!(exact.retained_group(cluster.group.clone()).await.is_ok());
+    cluster.shutdown().await;
+}
+
 pub(crate) fn acceptance_o06_storage() {
-    o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry();
-    o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commit();
+    o06_follower_sync_error_cannot_complete_a_quorum_with_a_delayed_follower();
     crate::oltp_acceptance::clause(
         "O06",
         "stable-storage-before-ack",
-        "not-run",
-        "RF3 FaultFs verified absent quorum and a delayed leader sync. A delayed follower and a second fsync-failing follower still need a combined RF3 history.",
+        "passed",
+        "An RF3 mTLS FaultFs fixture held one follower at journal sync and failed the other with EIO. The leader could neither commit, apply nor reply until the held follower synced.",
     );
     ns23_o06_o17_rf3_damaged_replica_is_quarantined_replaced_and_released();
+    o06_foreign_pool_and_group_identity_are_refused();
+    crate::oltp::pool::acceptance_damaged_checkpoints();
     crate::oltp_acceptance::clause(
         "O06",
         "corrupt-and-foreign-rejection",
-        "not-run",
-        "RF3 FaultFs injected a corrupt journal and verified quarantine and replacement. Foreign replica and corrupt checkpoint refusal still need coverage.",
+        "passed",
+        "The RF3 storage fixture quarantined a corrupted voter log and refused foreign pool and group identities. The pool also rejected corrupt checkpoint membership and an inconsistent header.",
     );
+}
+
+pub(crate) fn acceptance_overlapped_append() {
+    o29_ns10_perf2d_power_cut_before_any_sync_loses_the_unacked_entry();
+    o29_ns10_perf2d_leader_power_cut_before_its_sync_keeps_the_quorum_commit();
 }

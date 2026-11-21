@@ -96,12 +96,6 @@ fn acceptance_o11() {
     process_scenario("O11", "oltp_hardening_acceptance.py");
 }
 
-#[test]
-#[ignore = "run through scripts/acceptance_oltp.py"]
-fn acceptance_o29() {
-    crate::oltp::pool::acceptance_o29_storage();
-}
-
 pub(crate) fn clause(scenario: &str, assertion: &str, status: &str, detail: &str) {
     let marker = serde_json::json!({
         "scenario": scenario, "assertion": assertion, "status": status, "detail": detail,

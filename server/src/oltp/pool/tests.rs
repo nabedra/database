@@ -696,6 +696,17 @@ async fn o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_
         header,
     };
     assert!(b.install_snapshot(incoming, budget()).await.is_err());
+    let path = target_dir.0.join("truncated-test.bin");
+    fs::write(&path, &bytes[..bytes.len() - 17]).unwrap();
+    let file = File::open(&path).unwrap();
+    let truncated = GroupSnapshot {
+        file: PoolSnapshotFile::new(file, b.pool().clone()),
+        path,
+        bytes: (bytes.len() - 17) as u64,
+        header: original.header.clone(),
+    };
+    assert!(b.install_snapshot(truncated, budget()).await.is_err());
+
     assert_eq!(
         u64::from_be_bytes(
             target
@@ -1867,4 +1878,8 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
 }
 
 mod kv;
-pub(crate) use kv::acceptance_o29_storage;
+
+pub(crate) fn acceptance_damaged_checkpoints() {
+    o11_o16_inconsistent_snapshot_header_body_is_rejected_without_changing_active_state();
+    o11_snapshot_membership_comes_from_immutable_cut_and_rejects_corrupt_record();
+}

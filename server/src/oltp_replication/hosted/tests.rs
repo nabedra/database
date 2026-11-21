@@ -1202,22 +1202,25 @@ pub(crate) fn acceptance_o11_storage() {
         "passed",
         "FaultFs restarted production Raft after a lost applied suffix and sampled checkpoint and purge cuts. Every recovered command changed the counter once.",
     );
+    crate::oltp_replication::manager::acceptance_overlapped_append();
     clause(
         "O11",
         "optimization-durability",
-        "not-run",
-        "FaultFs exercised synced append, deferred apply and durable snapshot/purge. PERF2d overlapping append/sync needs its own crash evidence in this scenario.",
+        "passed",
+        "FaultFs exercised deferred apply and durable snapshot/purge. RF3 PERF2d cuts retained a follower-quorum commit when the leader had not synced and dropped the uncommitted entry when no voter synced.",
     );
+    crate::oltp::mvcc::store::direct::acceptance_indexed_direct_replay();
     clause(
         "O11",
         "data-index-result-position",
-        "not-run",
-        "Raft replay checked counters and applied positions. A single recovered native cut still needs an exact comparison of row, index, result and position.",
+        "passed",
+        "Reopened the real pool at the same applied position and command digest. The base row, index entry, serialized result and dedup result matched the original entry.",
     );
+    crate::oltp::pool::acceptance_damaged_checkpoints();
     clause(
         "O11",
         "damaged-state-rejection",
-        "not-run",
-        "No damaged-state variant ran inside this scenario.",
+        "passed",
+        "Truncated checkpoint bytes, corrupt membership and a checksum-valid but inconsistent header were all rejected without activating an invalid cut.",
     );
 }

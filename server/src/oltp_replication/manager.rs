@@ -40,7 +40,7 @@ pub(crate) use lifecycle::{DamageControl, DamagedReplacement, settle_damage};
 #[cfg(test)]
 mod damage_tests;
 #[cfg(test)]
-pub(crate) use damage_tests::acceptance_o06_storage;
+pub(crate) use damage_tests::{acceptance_o06_storage, acceptance_overlapped_append};
 #[cfg(test)]
 mod damage_scheduler_tests;
 mod retirement;
@@ -221,6 +221,17 @@ impl HostedGroupManager {
         dispatcher.retire(node).await?;
         self.bind_service(identity, node, endpoint)
     }
+    #[cfg(test)]
+    pub(crate) fn test_group_leader(&self, group: uuid::Uuid) -> Option<uuid::Uuid> {
+        let routes = self.routes.lock().ok()?;
+        let routes = routes.get(&group)?;
+        let leader = routes.replicas.values().find_map(|route| route.running.leader())?;
+        routes.replicas.values().find_map(|route| {
+            route.running.members().into_iter().find(|member| member.node_id == leader)
+                .map(|member| member.worker_id)
+        })
+    }
+
     pub(crate) fn leader_candidates(
         &self,
         group: uuid::Uuid,
