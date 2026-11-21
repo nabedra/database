@@ -777,6 +777,13 @@ def saturated_history(db, exchange, worker_stats, directories, run, memory_limit
         for worker, stats in after.items():
             assert stats['queue'] == before[worker]['queue'], (worker, stats['queue'])
             assert stats['native_thread_budget'] == before[worker]['native_thread_budget']
+        evidence('O22', 'saturation-resource-samples', workers={
+            worker: dict(scheduler_before=before[worker]['scheduler'], scheduler_after=stats['scheduler'],
+                         memory_limit_bytes=memory_limits[worker],
+                         queue_bytes=stats['queue']['charged_queue_bytes'],
+                         result_bytes=stats['queue']['charged_result_bytes'])
+            for worker, stats in after.items()
+        })
         for request, result in held:
             release_snapshot(request)
             receipt = exact_receipt(exchange, run, request, result)
