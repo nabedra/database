@@ -990,8 +990,10 @@ def disk_pressure_settlement(test_executable):
                     wait_reached([server.root], request, 'prepared')
 
                 filler = server.directory / 'acc3-disk-pressure'
+                [headroom] = server.stats()['storage_reservations']
                 remaining = os.statvfs(server.directory)
                 keep = 1 << 20
+                assert keep < headroom['protected_bytes'], headroom
                 size = remaining.f_bavail * remaining.f_frsize - keep
                 assert size > 0
                 with filler.open('xb') as allocation:
@@ -1030,9 +1032,12 @@ def disk_pressure_settlement(test_executable):
                     assert db.tables() == []
                     queue = server.stats()['queue']
                     assert queue['queued_records'] == queue['running_records'] == queue['reconciling_records'] == 0, queue
+                    [settled] = server.stats()['storage_reservations']
+                    assert settled['reserved_bytes'] == settled['reservations'] == 0, settled
                 finally:
                     filler.unlink()
-                return dict(free_bytes=free.f_bavail * free.f_frsize, committed=1, aborted=1, pending=0)
+                return dict(free_bytes=free.f_bavail * free.f_frsize, protected_bytes=headroom['protected_bytes'],
+                            committed=1, aborted=1, pending=0, reserved_bytes=settled['reserved_bytes'])
         finally:
             subprocess.run(['sudo', '-n', 'umount', mount], capture_output=True, check=True, timeout=30)
 

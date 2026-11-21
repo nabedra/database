@@ -2,7 +2,9 @@
 use super::{HostRaft, client_write_error, proposal_forwarded, unavailable};
 use crate::{
     oltp::{
-        mvcc::store::{ParticipantCommand, ParticipantMachine},
+        mvcc::store::{
+            ParticipantCommand, ParticipantMachine, direct::DirectCommit, encoded_length,
+        },
         pool::{DiskReservation, GroupStore},
     },
     oltp_replication::{authority::config::DataConfig, owned::OwnedCommand},
@@ -21,9 +23,11 @@ pub(super) async fn client_write(
     store: &GroupStore,
     command: OwnedCommand<ParticipantCommand>,
 ) -> Result<ClientWriteResponse<DataConfig>, ProtocolError> {
-    let Some(request) = reservation_request(command.payload()?)? else {
+    let payload = command.payload()?;
+    let Some((request, apply_items)) = reservation_request(payload)? else {
         return raft.client_write(command).await.map_err(client_write_error);
     };
+    let encoded_bytes = encoded_length(payload, usize::MAX)?;
     #[cfg(test)]
     if is_leader(raft) {
         crate::oltp_runtime::recovery_tests::transaction_checkpoint(
@@ -35,13 +39,16 @@ pub(super) async fn client_write(
     }
     #[cfg(not(test))]
     let _ = request;
-    let reservation = store.pool().reserve_proposal_disk().map_err(|error| {
-        if is_leader(raft) {
-            error
-        } else {
-            proposal_forwarded()
-        }
-    })?;
+    let reservation = store
+        .pool()
+        .reserve_proposal_disk(encoded_bytes, apply_items)
+        .map_err(|error| {
+            if is_leader(raft) {
+                error
+            } else {
+                proposal_forwarded()
+            }
+        })?;
     #[cfg(test)]
     if is_leader(raft) {
         crate::oltp_runtime::recovery_tests::transaction_checkpoint(
@@ -70,13 +77,27 @@ fn is_leader(raft: &HostRaft<DataConfig, ParticipantMachine>) -> bool {
 /// adapters directly, while seal, resolve, fencing and cleanup must still run
 /// when new writes are refused. Timestamp-point recovery also uses its
 /// Prepare command to settle an already installed decision home.
-fn reservation_request(command: &ParticipantCommand) -> Result<Option<Uuid>, ProtocolError> {
+fn reservation_request(
+    command: &ParticipantCommand,
+) -> Result<Option<(Uuid, usize)>, ProtocolError> {
+    fn direct_items(commit: &DirectCommit) -> usize {
+        // One item for the member's dedup and expiry metadata, then one per
+        // changed row or secondary index key.
+        1 + commit
+            .writes
+            .iter()
+            .map(|write| 1 + write.index.len())
+            .sum::<usize>()
+    }
     Ok(match command {
-        ParticipantCommand::Direct(commit) => Some(commit.request_id),
-        ParticipantCommand::DirectBatch(batch) => {
-            batch.members.first().map(|commit| commit.request_id)
-        }
-        ParticipantCommand::PreparePage { txn, .. } => Some(txn.request_id),
+        ParticipantCommand::Direct(commit) => Some((commit.request_id, direct_items(commit))),
+        ParticipantCommand::DirectBatch(batch) => batch.members.first().map(|first| {
+            (
+                first.request_id,
+                batch.members.iter().map(direct_items).sum(),
+            )
+        }),
+        ParticipantCommand::PreparePage { txn, writes, .. } => Some((txn.request_id, writes.len())),
         ParticipantCommand::Scoped { command, .. } => reservation_request(command.payload()?)?,
         _ => None,
     })

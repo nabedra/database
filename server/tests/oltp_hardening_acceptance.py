@@ -339,8 +339,22 @@ def verify_storage_reservations(fixture, table):
         return stats
 
     before = disk_stats()
-    charge = before['proposal_bytes']
-    assert charge > 0 and before['reserved_bytes'] == before['reservations'] == 0, before
+    assert before['reserved_bytes'] == before['reservations'] == 0, before
+    # Measure a same-sized insert through this mode's real proposal path.
+    # Prepare and Direct have different encoded sizes and apply costs.
+    target, group = contenders[0]
+    probe = point(target, 'insert', row=rows(103, category=1)[0])
+    fixture.select(probe['request_id'], {'storage-reserved': True})
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        call = pool.submit(exchange, fixture, probe)
+        try:
+            assert fixture.reached(probe['request_id'], 'storage-reserved') == (owner, group)
+            measured = disk_stats()
+            charge = measured['reserved_bytes']
+            assert measured['reservations'] == 1 and charge >= 8192, measured
+        finally:
+            fixture.release(probe['request_id'], 'storage-reserved')
+        assert call.result(timeout=35) == (200, dict(request_id=probe['request_id'], data=None))
     keep = before['protected_bytes'] + charge + charge // 2
     requests = [point(target, 'insert', row=row)
                 for (target, _), row in zip(contenders, rows(101, 102, category=1), strict=True)]
@@ -349,17 +363,17 @@ def verify_storage_reservations(fixture, table):
         fixture.select(body['request_id'], {'storage-admission': True, 'storage-reserved': True})
     filler = directory / 'o08-reservation-pressure'
     try:
-        free = os.statvfs(directory)
-        size = free.f_bavail * free.f_frsize - keep
-        assert size > 0
-        with filler.open('xb') as handle:
-            os.posix_fallocate(handle.fileno(), 0, size)
         with ThreadPoolExecutor(max_workers=2) as pool:
             calls = {pool.submit(exchange, fixture, body): body for body in requests}
             try:
                 for body in requests:
                     _, expected_group = by_table[body['payload']['table_id']]
                     assert fixture.reached(body['request_id'], 'storage-admission') == (owner, expected_group)
+                free = os.statvfs(directory)
+                size = free.f_bavail * free.f_frsize - keep
+                assert size > 0
+                with filler.open('xb') as handle:
+                    os.posix_fallocate(handle.fileno(), 0, size)
                 ready = disk_stats()
                 budget = ready['available_bytes'] - ready['protected_bytes']
                 assert charge <= budget < 2 * charge and ready['reserved_bytes'] == 0, ready
@@ -378,8 +392,9 @@ def verify_storage_reservations(fixture, table):
                     outcome='not_applied',
                 ))), refusal
                 charged = disk_stats()
-                assert charged['reservations'] == 1 and charged['reserved_bytes'] == charge, charged
-                assert charge <= charged['available_bytes'] - charged['protected_bytes'] < 2 * charge, charged
+                actual = charged['reserved_bytes']
+                assert charged['reservations'] == 1 and abs(actual - charge) <= 4096, charged
+                assert actual <= budget < actual + charge - 4096, charged
                 losing_table, _ = by_table[loser['payload']['table_id']]
                 assert fixture.data(point(losing_table, 'get', key=loser['payload']['row']['id'])) is None
             finally:
@@ -403,8 +418,17 @@ def verify_storage_reservations(fixture, table):
         print('O08 filesystem accounting', json.dumps(dict(ready=ready, charged=charged, settled=settled)), flush=True)
     finally:
         filler.unlink(missing_ok=True)
+
+    result = subprocess.run([
+        cluster.test_executable, '--exact',
+        'oltp_runtime::direct::tests::reservations::o08_o13_small_data_proposals_share_two_gib',
+        '--ignored', '--nocapture',
+    ], env={**os.environ, 'TMPDIR': str(directory)}, capture_output=True, text=True, timeout=90)
+    print(result.stdout, end='', flush=True)
+    print(result.stderr, end='', file=sys.stderr, flush=True)
+    assert result.returncode == 0 and 'test result: ok. 1 passed; 0 failed;' in result.stdout
     passed('O08', 'storage-reservations',
-           'Two RF3 inserts met at the Data leader with room for either alone. One held the shared filesystem charge and the other received storage_unavailable / not_applied. Settlement released the charge and a fresh request used the freed budget.')
+           'Two RF3 inserts raced for one filesystem budget. On a 2 GiB filesystem, 256 concurrent small Data proposals applied and an oversized proposal was refused before Raft. Both fixtures released every reservation.')
 
 
 def direct_proposal_paths(fixture, request_id):

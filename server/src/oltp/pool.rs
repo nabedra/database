@@ -417,8 +417,12 @@ impl OltpPool {
     pub fn identity(&self) -> &PoolIdentity {
         &self.inner.identity
     }
-    pub(crate) fn reserve_proposal_disk(&self) -> Result<DiskReservation, ProtocolError> {
-        self.inner.disk.reserve()
+    pub(crate) fn reserve_proposal_disk(
+        &self,
+        encoded_bytes: usize,
+        apply_items: usize,
+    ) -> Result<DiskReservation, ProtocolError> {
+        self.inner.disk.reserve(encoded_bytes, apply_items)
     }
     pub fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.inner.shared

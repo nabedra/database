@@ -1,5 +1,6 @@
 //! Admission accounting for the filesystem behind a pool's journal.
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
+use nabedra_kv::journal::format::{BLOCK, RECORD_HEADER_LEN};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -63,11 +64,32 @@ pub(super) struct PoolDisk {
     segment_bytes: u64,
 }
 
-/// Each new write can rotate the journal at append and again at apply. Keep
-/// another two segments per open pool clear of new writes for replication,
-/// votes, decisions and resolution. The OS accounts for existing segments.
-const SEGMENTS_PER_PROPOSAL: u64 = 2;
-const PROTECTED_SEGMENTS_PER_POOL: u64 = 2;
+// The journal can allocate a whole spare before a roll. Hold two segments per
+// open pool for this allocation granularity and two for replication, votes,
+// decisions and resolution. Pools on the device contribute independently.
+const ROLLOVER_SEGMENTS_PER_POOL: u64 = 2;
+const SETTLEMENT_SEGMENTS_PER_POOL: u64 = 2;
+const PROTECTED_SEGMENTS_PER_POOL: u64 = ROLLOVER_SEGMENTS_PER_POOL + SETTLEMENT_SEGMENTS_PER_POOL;
+
+fn proposal_charge(encoded_bytes: usize, apply_items: usize) -> u64 {
+    // Append stores the encoded command once. Apply stores each key up to
+    // four times (head, version and, for the anchor, dedup and expiry). A
+    // Prepare item can instead store an intent, head and ordinal key copy.
+    // The native key encoding adds fewer variable bytes than JSON escaping.
+    // Allow 1 KiB per item for record framing, scoped keys, and metadata
+    // repeated per write or direct member, including Prepare intent/audit.
+    // Another 2 KiB covers entry, log and applied-position metadata.
+    let records = (encoded_bytes as u64)
+        .saturating_mul(5)
+        .saturating_add((apply_items as u64).saturating_mul(1024))
+        .saturating_add(2048);
+    // Allow a header and worst-case sync pad for each of append and apply.
+    // Charge twice the total since the next record can leave up to its own
+    // length unused at the end of a segment. GC1 measured ~4 KiB journal
+    // bytes per serial direct update with a synced append and deferred apply.
+    let padding = 2 * (BLOCK + 2 * RECORD_HEADER_LEN as u64);
+    records.saturating_add(padding).saturating_mul(2)
+}
 
 impl PoolDisk {
     pub(super) fn device(&self) -> u64 {
@@ -108,9 +130,13 @@ impl PoolDisk {
         })
     }
 
-    pub(super) fn reserve(&self) -> Result<DiskReservation, ProtocolError> {
+    pub(super) fn reserve(
+        &self,
+        encoded_bytes: usize,
+        apply_items: usize,
+    ) -> Result<DiskReservation, ProtocolError> {
         self.budget
-            .reserve(self.segment_bytes * SEGMENTS_PER_PROPOSAL, || {
+            .reserve(proposal_charge(encoded_bytes, apply_items), || {
                 available_bytes(&self.directory)
             })
     }
@@ -123,7 +149,6 @@ impl PoolDisk {
             protected_bytes: budget.protected_bytes,
             reserved_bytes: budget.reserved_bytes,
             reservations: budget.reservations,
-            proposal_bytes: self.segment_bytes * SEGMENTS_PER_PROPOSAL,
         }
     }
 }
@@ -158,7 +183,6 @@ pub(crate) struct DiskReservationStats {
     protected_bytes: u64,
     reserved_bytes: u64,
     reservations: u64,
-    proposal_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -190,8 +214,8 @@ mod tests {
         let first = PoolDisk::open(&directory, 4096).unwrap();
         let second = PoolDisk::open(&directory, 4096).unwrap();
         assert!(Arc::ptr_eq(&first.budget, &second.budget));
-        let charge = first.stats().proposal_bytes;
-        let protected = 2 * charge;
+        let charge = proposal_charge(512, 2);
+        let protected = first.stats().protected_bytes;
         let filesystem = Arc::new(Filesystem(Mutex::new(Budget {
             protected_bytes: protected,
             ..Budget::default()
