@@ -1,0 +1,604 @@
+{
+  "dns": {
+    "errors": [],
+    "max_ms": 23.785,
+    "placement": [
+      "NAME                       READY   STATUS        RESTARTS   AGE   IP           NODE                                   NOMINATED NODE   READINESS GATES",
+      "coredns-54b8fcb95-ktr7m    1/1     Running       0          5s    10.244.0.6   nabedra-live3-0228214b-control-plane   <none>           <none>",
+      "coredns-54b8fcb95-sqjtb    1/1     Running       0          6s    10.244.0.5   nabedra-live3-0228214b-control-plane   <none>           <none>",
+      "coredns-66bc5c9577-5xkm9   1/1     Terminating   0          23s   10.244.0.3   nabedra-live3-0228214b-control-plane   <none>           <none>",
+      "coredns-66bc5c9577-qq4h8   1/1     Terminating   0          23s   10.244.0.4   nabedra-live3-0228214b-control-plane   <none>           <none>"
+    ],
+    "samples": 52
+  },
+  "events": [
+    {
+      "check": "host",
+      "context": "desktop-linux",
+      "csi": "hostpath",
+      "docker": "28.3.3",
+      "docker_disk": "/Volumes/ZX20/Docker/vms/0/data/Docker.raw",
+      "elapsed_seconds": 0.317,
+      "kernel": "Darwin MacBook-Pro-de-Antonio.local 25.6.0 Darwin Kernel Version 25.6.0: Mon Oct 12 00:33:09 PDT 2026; root:xnu-12377.161.15.701.48~2/RELEASE_X86_64 x86_64",
+      "kind": "kind v0.33.0 go1.27.0 darwin/amd64",
+      "scenario": "zone",
+      "server_sha256": "e97e6386a01c1e422e0d9e69fa64ee72d6a53fa67b8a39cd1ee2432783ee4656",
+      "server_source": "b423c2d731dd59c8096babe37978ddac2ea2c5d0",
+      "source": "b423c2d731dd59c8096babe37978ddac2ea2c5d0",
+      "test_executable_sha256": null
+    },
+    {
+      "check": "docker-lane",
+      "elapsed_seconds": 0.322,
+      "status": "acquired"
+    },
+    {
+      "check": "O18 initial PVC",
+      "elapsed_seconds": 217.45,
+      "volume": {
+        "attachment_uid": "1b875181-f6a3-4470-8694-05f352ed4142",
+        "claim": "w1-primary",
+        "driver": "hostpath-a.live3.csi.k8s.io",
+        "handle": "2b52d30d-e5f1-11f1-a346-8e4d60ae5350",
+        "mount": "1936 1927 254:1 /docker/volumes/137176e7d63df69ae6ad523094b12dc11b11e9a8fd8a15dbf829ef8ae2415e48/_data/lib/csi-hostpath-data/2b52d30d-e5f1-11f1-a346-8e4d60ae5350 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker",
+        "pod_uid": "aea485dc-3112-42ab-8228-67a04a203bb6",
+        "pv": "pvc-5199798c-99e4-4121-b9a3-385d05630f2e",
+        "pvc_uid": "5199798c-99e4-4121-b9a3-385d05630f2e",
+        "zone": "a"
+      }
+    },
+    {
+      "check": "O18 initial PVC",
+      "elapsed_seconds": 218.141,
+      "volume": {
+        "attachment_uid": "96bf1581-39f8-4a42-9eeb-8b3f0ab39e7c",
+        "claim": "w2-primary",
+        "driver": "hostpath-b.live3.csi.k8s.io",
+        "handle": "2bb8afc5-e5f1-11f1-a597-b61b51cf38d5",
+        "mount": "1910 1782 254:1 /docker/volumes/805ea9d652560f03718b6dfee922a838406a797d9554929e38a65c3e28f46731/_data/lib/csi-hostpath-data/2bb8afc5-e5f1-11f1-a597-b61b51cf38d5 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker2",
+        "pod_uid": "0134a8ba-884b-4874-8c1d-7fa5c6065140",
+        "pv": "pvc-810e7b5f-62da-408b-ab27-0e93aa61ed9f",
+        "pvc_uid": "810e7b5f-62da-408b-ab27-0e93aa61ed9f",
+        "zone": "b"
+      }
+    },
+    {
+      "check": "O18 initial PVC",
+      "elapsed_seconds": 218.854,
+      "volume": {
+        "attachment_uid": "791be1eb-4889-438f-ac49-4c3ceb0cf92e",
+        "claim": "w3-primary",
+        "driver": "hostpath-c.live3.csi.k8s.io",
+        "handle": "2c2986f6-e5f1-11f1-b4b0-2a46fbf7f096",
+        "mount": "1976 1967 254:1 /docker/volumes/98ccccff77c9810641438c3bfceef98e896b8371c01e9649b94babe54e849211/_data/lib/csi-hostpath-data/2c2986f6-e5f1-11f1-b4b0-2a46fbf7f096 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker3",
+        "pod_uid": "9140778d-8ebf-4932-8521-d425bd76cfea",
+        "pv": "pvc-1d4b213b-d7cf-483d-8e85-b76511860233",
+        "pvc_uid": "1d4b213b-d7cf-483d-8e85-b76511860233",
+        "zone": "c"
+      }
+    },
+    {
+      "check": "O18 one-writer PVC",
+      "denial": "0/4 nodes are available: 1 node(s) had untolerated taint(s), 1 node(s) unavailable due to PersistentVolumeClaim with ReadWriteOncePod access mode already in-use by another pod, 2 node(s) didn't match Pod's node affinity/selector. no new claims to deallocate, preemption: 0/4 nodes are available: 1 No preemption victims found for incoming pod, 3 Preemption is not helpful for scheduling.",
+      "elapsed_seconds": 222.069,
+      "primary": {
+        "attachment_uid": "1b875181-f6a3-4470-8694-05f352ed4142",
+        "claim": "w1-primary",
+        "driver": "hostpath-a.live3.csi.k8s.io",
+        "handle": "2b52d30d-e5f1-11f1-a346-8e4d60ae5350",
+        "mount": "1936 1927 254:1 /docker/volumes/137176e7d63df69ae6ad523094b12dc11b11e9a8fd8a15dbf829ef8ae2415e48/_data/lib/csi-hostpath-data/2b52d30d-e5f1-11f1-a346-8e4d60ae5350 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker",
+        "pod_uid": "aea485dc-3112-42ab-8228-67a04a203bb6",
+        "pv": "pvc-5199798c-99e4-4121-b9a3-385d05630f2e",
+        "pvc_uid": "5199798c-99e4-4121-b9a3-385d05630f2e",
+        "zone": "a"
+      }
+    },
+    {
+      "check": "O18 zone-stop-issued",
+      "elapsed_seconds": 223.091,
+      "node": "nabedra-live3-0228214b-worker",
+      "zone": "a"
+    },
+    {
+      "check": "O18 zone-stopped",
+      "elapsed_seconds": 223.668,
+      "node": "nabedra-live3-0228214b-worker",
+      "zone": "a"
+    },
+    {
+      "check": "O18 two-zone quorum",
+      "elapsed_seconds": 229.302,
+      "first_read_after_stop_seconds": 5.028,
+      "read_completion_gap_seconds": 5.676,
+      "stop_seconds": 0.568,
+      "zone": "a"
+    },
+    {
+      "check": "O18 retained restart preparation replay",
+      "elapsed_seconds": 245.485,
+      "operator": "w2",
+      "original": {
+        "applied_at": {
+          "index": 78,
+          "node_id": 2,
+          "term": 2
+        },
+        "identity": {
+          "certificate_sha256": "f6fe0f04f36206c041eb2e54cc95023c119efcadb3c57dbdfd21c80c4ad4b0be",
+          "enrollment_revision": 2,
+          "incarnation": "b8cc6683-8727-4a0a-b7d2-08dbac25de64",
+          "worker_id": "b5c755e4-81c2-41c0-9226-588735507c8e"
+        }
+      },
+      "preparation_id": "a3e9520d-d001-4a2f-b339-5f1d7e2db2a2",
+      "replay": {
+        "applied_at": {
+          "index": 79,
+          "node_id": 2,
+          "term": 2
+        },
+        "identity": {
+          "certificate_sha256": "f6fe0f04f36206c041eb2e54cc95023c119efcadb3c57dbdfd21c80c4ad4b0be",
+          "enrollment_revision": 2,
+          "incarnation": "b8cc6683-8727-4a0a-b7d2-08dbac25de64",
+          "worker_id": "b5c755e4-81c2-41c0-9226-588735507c8e"
+        }
+      }
+    },
+    {
+      "check": "O18 zone-restored",
+      "elapsed_seconds": 246.065,
+      "node": "nabedra-live3-0228214b-worker",
+      "zone": "a"
+    },
+    {
+      "check": "O18 retained replacement",
+      "elapsed_seconds": 265.093,
+      "identity": {
+        "certificate_sha256": "f6fe0f04f36206c041eb2e54cc95023c119efcadb3c57dbdfd21c80c4ad4b0be",
+        "enrollment_revision": 2,
+        "incarnation": "b8cc6683-8727-4a0a-b7d2-08dbac25de64",
+        "worker_id": "b5c755e4-81c2-41c0-9226-588735507c8e"
+      },
+      "new": {
+        "attachment_uid": "1b875181-f6a3-4470-8694-05f352ed4142",
+        "claim": "w1-primary",
+        "driver": "hostpath-a.live3.csi.k8s.io",
+        "handle": "2b52d30d-e5f1-11f1-a346-8e4d60ae5350",
+        "mount": "2012 2003 254:1 /docker/volumes/137176e7d63df69ae6ad523094b12dc11b11e9a8fd8a15dbf829ef8ae2415e48/_data/lib/csi-hostpath-data/2b52d30d-e5f1-11f1-a346-8e4d60ae5350 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker",
+        "pod_uid": "2b85befe-fce1-4f60-858a-fccbfeb4f564",
+        "pv": "pvc-5199798c-99e4-4121-b9a3-385d05630f2e",
+        "pvc_uid": "5199798c-99e4-4121-b9a3-385d05630f2e",
+        "zone": "a"
+      },
+      "old": {
+        "attachment_uid": "1b875181-f6a3-4470-8694-05f352ed4142",
+        "claim": "w1-primary",
+        "driver": "hostpath-a.live3.csi.k8s.io",
+        "handle": "2b52d30d-e5f1-11f1-a346-8e4d60ae5350",
+        "mount": "1936 1927 254:1 /docker/volumes/137176e7d63df69ae6ad523094b12dc11b11e9a8fd8a15dbf829ef8ae2415e48/_data/lib/csi-hostpath-data/2b52d30d-e5f1-11f1-a346-8e4d60ae5350 /pool rw,relatime - ext4 /dev/vda1 rw,discard",
+        "node": "nabedra-live3-0228214b-worker",
+        "pod_uid": "aea485dc-3112-42ab-8228-67a04a203bb6",
+        "pv": "pvc-5199798c-99e4-4121-b9a3-385d05630f2e",
+        "pvc_uid": "5199798c-99e4-4121-b9a3-385d05630f2e",
+        "zone": "a"
+      },
+      "worker": "w1"
+    },
+    {
+      "acknowledged_direct": 167,
+      "check": "O17/O18 row and receipt oracle",
+      "elapsed_seconds": 291.408,
+      "exact_rows": 202,
+      "failed_receipts": [],
+      "originally_accepted_receipts": 8,
+      "retried_receipts": 27
+    },
+    {
+      "check": "O18 Data placement RF3",
+      "elapsed_seconds": 291.462,
+      "group": {
+        "cluster_id": "ba1957c8-a235-4595-b96d-a007d0ac34cd",
+        "database": "test",
+        "group_format_version": 1,
+        "group_id": "0a827002-c2e2-3fcd-80a7-2162c5ccc0df",
+        "kind": {
+          "data": {
+            "shard_id": "17be87fa-909c-f39f-bccc-2c6fda18ddf9",
+            "table_id": "b5dcd4b8-ffb5-20e3-8738-6bb5100bed10"
+          }
+        }
+      },
+      "placement": {
+        "members": [
+          {
+            "node_id": 1,
+            "pool_id": "11a630e1-3d06-40df-ba41-612f976bd3d8",
+            "worker_id": "b5c755e4-81c2-41c0-9226-588735507c8e"
+          },
+          {
+            "node_id": 2,
+            "pool_id": "f7da7074-9b3d-4a07-8a1c-66ee2294a415",
+            "worker_id": "e383ce04-5f6f-45ab-9eaa-92bf4326ae27"
+          },
+          {
+            "node_id": 3,
+            "pool_id": "6c0fcea8-f70e-4149-8fe5-8789c939179e",
+            "worker_id": "9624d339-b107-4d4f-a83b-f028f33670f2"
+          }
+        ],
+        "record": {
+          "generation": "f6174a33-665f-5252-d751-6c083fa31124",
+          "identity": {
+            "cluster_id": "ba1957c8-a235-4595-b96d-a007d0ac34cd",
+            "database": "test",
+            "group_format_version": 1,
+            "group_id": "0a827002-c2e2-3fcd-80a7-2162c5ccc0df",
+            "kind": {
+              "data": {
+                "shard_id": "17be87fa-909c-f39f-bccc-2c6fda18ddf9",
+                "table_id": "b5dcd4b8-ffb5-20e3-8738-6bb5100bed10"
+              }
+            }
+          },
+          "membership_position": {
+            "index": 1,
+            "node_id": 1,
+            "term": 1
+          },
+          "replica_count": 3,
+          "replica_root": "a0cddf59e0b6d24199894a71d7d389480a927b97ce9b73d884e9e8a49285a934"
+        }
+      }
+    },
+    {
+      "check": "O18 Data placement RF3",
+      "elapsed_seconds": 291.509,
+      "group": {
+        "cluster_id": "ba1957c8-a235-4595-b96d-a007d0ac34cd",
+        "database": "test",
+        "group_format_version": 1,
+        "group_id": "9e3ba374-ba69-3d4c-0376-dcee3f10f12d",
+        "kind": {
+          "data": {
+            "shard_id": "a1685c8f-3fee-035e-0004-35acf443c653",
+            "table_id": "4568cd43-f641-53ad-3008-3a05eba20e3f"
+          }
+        }
+      },
+      "placement": {
+        "members": [
+          {
+            "node_id": 1,
+            "pool_id": "11a630e1-3d06-40df-ba41-612f976bd3d8",
+            "worker_id": "b5c755e4-81c2-41c0-9226-588735507c8e"
+          },
+          {
+            "node_id": 2,
+            "pool_id": "f7da7074-9b3d-4a07-8a1c-66ee2294a415",
+            "worker_id": "e383ce04-5f6f-45ab-9eaa-92bf4326ae27"
+          },
+          {
+            "node_id": 3,
+            "pool_id": "6c0fcea8-f70e-4149-8fe5-8789c939179e",
+            "worker_id": "9624d339-b107-4d4f-a83b-f028f33670f2"
+          }
+        ],
+        "record": {
+          "generation": "19d33ef7-6906-d5f6-d6cc-f2485883049a",
+          "identity": {
+            "cluster_id": "ba1957c8-a235-4595-b96d-a007d0ac34cd",
+            "database": "test",
+            "group_format_version": 1,
+            "group_id": "9e3ba374-ba69-3d4c-0376-dcee3f10f12d",
+            "kind": {
+              "data": {
+                "shard_id": "a1685c8f-3fee-035e-0004-35acf443c653",
+                "table_id": "4568cd43-f641-53ad-3008-3a05eba20e3f"
+              }
+            }
+          },
+          "membership_position": {
+            "index": 1,
+            "node_id": 1,
+            "term": 1
+          },
+          "replica_count": 3,
+          "replica_root": "a0cddf59e0b6d24199894a71d7d389480a927b97ce9b73d884e9e8a49285a934"
+        }
+      }
+    },
+    {
+      "check": "kind-delete",
+      "elapsed_seconds": 297.911,
+      "kind_exit": 0,
+      "peak_vm_used_bytes": 2560757760,
+      "remaining_nodes": [],
+      "status": "passed"
+    },
+    {
+      "check": "docker-lane",
+      "elapsed_seconds": 298.05,
+      "status": "released"
+    }
+  ],
+  "operations": {
+    "read": {
+      "attempts": 61,
+      "first_success_seconds": 5.294,
+      "p99_ms": 407.574,
+      "status_counts": {
+        "200": 61
+      },
+      "successes_while_down": 61
+    },
+    "write": {
+      "attempts": 69,
+      "first_success_seconds": 5.491,
+      "p99_ms": 616.721,
+      "status_counts": {
+        "200": 69
+      },
+      "successes_while_down": 69
+    }
+  },
+  "stage_stats": [
+    {
+      "error": "TimeoutError('The read operation timed out')",
+      "kind": "stats",
+      "phase": "after first two-zone success",
+      "pod": "api"
+    },
+    {
+      "direct": {
+        "catalog_reads": 0,
+        "direct_done": 0,
+        "fallbacks": 0,
+        "forward_replayed": 0,
+        "forwards": 0,
+        "not_leader": 0,
+        "overloaded": 0,
+        "peer_timeouts": 0,
+        "placement_reads": 0,
+        "queued": 0,
+        "requests": 0,
+        "resends": 0,
+        "stale_routes": 0,
+        "unknown": 0
+      },
+      "kind": "stats",
+      "phase": "after first two-zone success",
+      "pod": "w2-0",
+      "timings": {
+        "api_stage_timing": {},
+        "stage_timing": {
+          "control.read.enrollment_revision": {
+            "count": 20,
+            "le_us": {
+              "4096": 13,
+              "8192": 6,
+              "8388608": 1
+            },
+            "max_us": 4616318,
+            "sum_us": 4694851
+          },
+          "leader.get.barrier": {
+            "count": 14,
+            "le_us": {
+              "32": 13,
+              "64": 1
+            },
+            "max_us": 36,
+            "sum_us": 318
+          },
+          "leader.get.epochs": {
+            "count": 14,
+            "le_us": {
+              "16": 1,
+              "2": 12,
+              "4": 1
+            },
+            "max_us": 12,
+            "sum_us": 26
+          },
+          "leader.get.read": {
+            "count": 14,
+            "le_us": {
+              "1024": 7,
+              "2048": 3,
+              "32768": 1,
+              "4096": 1,
+              "512": 1,
+              "8192": 1
+            },
+            "max_us": 18399,
+            "sum_us": 39682
+          },
+          "leader.get.table": {
+            "count": 14,
+            "le_us": {
+              "1048576": 1,
+              "128": 1,
+              "16": 8,
+              "32": 1,
+              "64": 1,
+              "8": 2
+            },
+            "max_us": 531092,
+            "sum_us": 531323
+          },
+          "leader.get.token": {
+            "count": 15,
+            "le_us": {
+              "1": 14,
+              "4": 1
+            },
+            "max_us": 2,
+            "sum_us": 2
+          },
+          "leader.get.total": {
+            "count": 15,
+            "le_us": {
+              "1024": 5,
+              "1048576": 1,
+              "2048": 4,
+              "32768": 1,
+              "4096": 1,
+              "512": 1,
+              "64": 1,
+              "8192": 1
+            },
+            "max_us": 531813,
+            "sum_us": 572297
+          },
+          "rpc.call.ParticipantRead": {
+            "count": 4,
+            "le_us": {
+              "4096": 1,
+              "524288": 1,
+              "8192": 2
+            },
+            "max_us": 502152,
+            "sum_us": 519833
+          }
+        }
+      }
+    },
+    {
+      "direct": {
+        "catalog_reads": 0,
+        "direct_done": 0,
+        "fallbacks": 0,
+        "forward_replayed": 0,
+        "forwards": 0,
+        "not_leader": 0,
+        "overloaded": 0,
+        "peer_timeouts": 0,
+        "placement_reads": 0,
+        "queued": 0,
+        "requests": 0,
+        "resends": 0,
+        "stale_routes": 0,
+        "unknown": 0
+      },
+      "kind": "stats",
+      "phase": "after first two-zone success",
+      "pod": "w3-0",
+      "timings": {
+        "api_stage_timing": {},
+        "stage_timing": {
+          "control.read.enrollment_revision": {
+            "count": 19,
+            "le_us": {
+              "131072": 1,
+              "4096": 12,
+              "8192": 5,
+              "8388608": 1
+            },
+            "max_us": 4637530,
+            "sum_us": 4811082
+          },
+          "leader.get.token": {
+            "count": 3,
+            "le_us": {
+              "4": 3
+            },
+            "max_us": 2,
+            "sum_us": 6
+          },
+          "leader.get.total": {
+            "count": 3,
+            "le_us": {
+              "32": 3
+            },
+            "max_us": 31,
+            "sum_us": 80
+          },
+          "leader.mutation.table": {
+            "count": 14,
+            "le_us": {
+              "1048576": 1,
+              "16": 7,
+              "32": 1,
+              "8": 5
+            },
+            "max_us": 537896,
+            "sum_us": 538024
+          },
+          "rpc.call.ParticipantRead": {
+            "count": 8,
+            "le_us": {
+              "16384": 2,
+              "4096": 3,
+              "524288": 2,
+              "8192": 1
+            },
+            "max_us": 502695,
+            "sum_us": 1040715
+          },
+          "ts.rpc.converge": {
+            "count": 14,
+            "le_us": {
+              "1024": 1,
+              "16384": 2,
+              "2048": 8,
+              "4096": 2,
+              "65536": 1
+            },
+            "max_us": 59641,
+            "sum_us": 96113
+          },
+          "ts.rpc.converge_fallback": {
+            "count": 1,
+            "le_us": {
+              "16384": 1
+            },
+            "max_us": 8979,
+            "sum_us": 8979
+          },
+          "ts.rpc.decode": {
+            "count": 14,
+            "le_us": {
+              "16": 1,
+              "2": 3,
+              "4": 10
+            },
+            "max_us": 11,
+            "sum_us": 35
+          },
+          "ts.rpc.encode": {
+            "count": 14,
+            "le_us": {
+              "128": 2,
+              "16": 3,
+              "256": 1,
+              "64": 1,
+              "8": 7
+            },
+            "max_us": 169,
+            "sum_us": 474
+          },
+          "ts.rpc.thin": {
+            "count": 14,
+            "le_us": {
+              "1024": 1,
+              "16384": 1,
+              "2": 1,
+              "2048": 8,
+              "4096": 2,
+              "65536": 1
+            },
+            "max_us": 59635,
+            "sum_us": 87022
+          }
+        }
+      }
+    }
+  ],
+  "zone_down_seconds": 22.397
+}
