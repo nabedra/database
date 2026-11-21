@@ -373,7 +373,11 @@ pub(super) async fn lose_reservation_reply(
 }
 
 pub(super) async fn lose_receipt_observation(request: Uuid) -> bool {
-    if take_fault("lose-observation", request).is_none() {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {
+        return false;
+    };
+    let repeated = PathBuf::from(directory).join(format!("lose-all-observations-{request}"));
+    if !repeated.is_file() && take_fault("lose-observation", request).is_none() {
         return false;
     }
     pause("observation-refused", request).await;

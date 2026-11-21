@@ -1228,6 +1228,7 @@ def simultaneous_admission(binary, test_executable):
         cluster.start_api('api1', DIRECT)
         reservation_reply_loss(cluster, owner, table)
         transient_receipt_observation(cluster, owner, table)
+        transient_receipt_observation(cluster, owner, table, exhaust=True)
 
 
 def cancel_receipt_observer(cluster, owner, request):
@@ -1286,33 +1287,51 @@ def reservation_reply_loss(cluster, owner, table):
     evidence('O13', 'lost-reservation-reply', fields=sorted(reservation), original_run=reservation['original_run'])
 
 
-def transient_receipt_observation(cluster, owner, table):
+def transient_receipt_observation(cluster, owner, table, *, exhaust=False):
     query = dict(select=None, filter=None, order_by=None, limit=None)
     request = operation('query.count', dict(table_id=table.id, query=query))
     request_id = request['request_id']
     gates(owner, [(request, 'observation-refused')])
-    (owner / f'lose-observation-{request_id}').touch()
+    fault_prefix = 'lose-all-observations' if exhaust else 'lose-observation'
+    fault = owner / f'{fault_prefix}-{request_id}'
+    fault.touch()
     trace = owner / f'submissions-{request_id}'
     trace.touch()
 
     def submit():
-        with closing(gateway(cluster, 'api2')) as client:
+        with closing(gateway(cluster, 'api2', timeout=10)) as client:
             return client.exchange('/v1/operations', request)
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        pending = pool.submit(submit)
-        try:
-            wait_reached([owner], request, 'observation-refused')
-            original = assert_record(read_record(cluster, owner.name, request), cluster.run_id, request)
-            assert not pending.done()
-        finally:
-            release(owner, request)
-        reply = pending.result()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(submit)
+            try:
+                wait_reached([owner], request, 'observation-refused')
+                original = assert_record(read_record(cluster, owner.name, request), cluster.run_id, request)
+                assert not pending.done()
+            finally:
+                start = time.monotonic()
+                release(owner, request)
+            reply = pending.result()
+            elapsed = time.monotonic() - start
+    finally:
+        fault.unlink(missing_ok=True)
+    attempts = (owner / f'attempts-{request_id}').read_text().splitlines()
+    assert set(attempts) == {'observation-refused'}, attempts
+    if exhaust:
+        assert_unknown(reply, request)
+        assert reply[1]['error']['code'] == 'storage_unavailable', reply
+        assert 2 <= len(attempts) <= 10 and 1.8 <= elapsed < 8, (attempts, elapsed)
+        with closing(gateway(cluster, 'api2')) as client:
+            exact_receipt(client.exchange, cluster.run_id, request, 2)
+    else:
         assert reply == (200, dict(request_id=request_id, data=2)), reply
+        assert len(attempts) == 1, attempts
     assert trace.read_text().splitlines() == [request_id]
     final = read_record(cluster, owner.name, request)
     assert assert_record(final, cluster.run_id, request) == original and final['state'] == 'succeeded', final
-    evidence('O13', 'Q04-transient-receipt', submissions=1, lost_observations=1)
+    evidence('O13', 'Q04-transient-receipt', submissions=1, lost_observations=len(attempts),
+             exhausted=exhaust, elapsed_seconds=round(elapsed, 3))
 
 
 FENCE_STAGES = ('allocator', 'status', 'shard')
