@@ -461,13 +461,14 @@ impl Fixture {
         self.assert_point(5, row(5, 7, "five")).await;
     }
 
-    async fn pin_query(&self) -> HeldQuery {
+    async fn pin_query(&self, operation: &'static str) -> HeldQuery {
         let id = Uuid::new_v4();
         let hold = index_holds::register_checkpoint(id, Checkpoint::ReadPin);
         let (app, query) = (self.app.clone(), self.query(7));
-        let task = tokio::spawn(async move {
-            post(&app, "/v1/operations", TOKEN, id, "query.collect", query).await
-        });
+        let task =
+            tokio::spawn(
+                async move { post(&app, "/v1/operations", TOKEN, id, operation, query).await },
+            );
         let hold = reached(hold).await;
         let replica = self.runtime.services.replica.lock().unwrap();
         assert!(replica.record(id).is_some_and(|record| record.accepted));
@@ -554,11 +555,11 @@ struct HeldQuery {
 }
 
 impl HeldQuery {
-    async fn assert_result(self, expected: Value) {
+    async fn result(self) -> Value {
         self.hold.release.send(false).unwrap();
         let (status, body) = self.task.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["data"], expected);
+        body["data"].clone()
     }
 }
 
@@ -582,7 +583,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
     assert_eq!(page.rows, 128);
     assert!(!page.exhausted);
     fixture.assert_building(&original(7)).await;
-    let historical = fixture.pin_query().await;
+    let historical = fixture.pin_query("query.collect").await;
     fixture.mutate().await;
     fixture.assert_building(&changed(7)).await;
     first.release.send(true).unwrap();
@@ -594,6 +595,10 @@ async fn backfill_and_retirement() -> (usize, usize) {
     let first = index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Backfill);
     let actor = fixture.spawn_resume(record);
     let first = reached(first).await;
+    let page = first.buffers.as_ref().unwrap();
+    assert_page_bounds(page);
+    let first_bytes = page.page_bytes;
+    fixture.assert_status(1, "building", false).await;
     let second =
         index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Backfill);
     first.release.send(false).unwrap();
@@ -603,16 +608,20 @@ async fn backfill_and_retirement() -> (usize, usize) {
     assert_eq!(page.rows, 1);
     assert!(page.exhausted);
     assert!(page.cursor_bytes > 0);
-    let page_peak = page.page_bytes + page.cursor_bytes;
+    let page_peak = first_bytes.max(page.page_bytes + page.cursor_bytes);
+    fixture.assert_status(1, "building", false).await;
     second.release.send(false).unwrap();
     actor.await.unwrap().unwrap();
     fixture.assert_ready(1, changed).await;
-    historical.assert_result(original(7)).await;
+    assert_eq!(historical.result().await, original(7));
 
-    let ready_snapshot = fixture.pin_query().await;
+    let ready_snapshot = fixture.pin_query("query.collect").await;
+    let ready_plan = fixture.pin_query("query.explain").await;
     let read_ts = ready_snapshot.read_ts;
-    let entries = fixture.stored_index_rows(read_ts, 7).await;
-    assert_eq!(entries, *changed(7).as_array().unwrap());
+    for category in [7, 8] {
+        let entries = fixture.stored_index_rows(read_ts, category).await;
+        assert_eq!(entries, *changed(category).as_array().unwrap());
+    }
     let (status, retired) = fixture
         .admin(Uuid::new_v4(), "storage.index.retire", fixture.selector(1))
         .await;
@@ -633,7 +642,9 @@ async fn backfill_and_retirement() -> (usize, usize) {
             false,
         )
         .await;
-    ready_snapshot.assert_result(changed(7)).await;
+    assert_eq!(ready_snapshot.result().await, changed(7));
+    let plan = ready_plan.result().await;
+    assert!(plan.as_str().unwrap().contains(INDEX), "{plan}");
     let retained = fixture
         .stored_index_rows(ReadTs::new(u64::MAX).unwrap(), 7)
         .await
@@ -712,6 +723,7 @@ async fn interrupt_publication() {
     let actor = fixture.spawn_resume(record);
     let held = reached(phase).await;
     fixture.assert_building(&original(7)).await;
+    let historical = fixture.pin_query("query.explain").await;
     let catalog = fixture.runtime.services.catalog.participant();
     let catalog_id = catalog.identity().group_id;
     let mut holds = index_holds::register(catalog_id);
@@ -723,6 +735,8 @@ async fn interrupt_publication() {
         .unwrap();
     assert_eq!(prepared.stage, Stage::Prepared);
     fixture.assert_status(1, "building", true).await;
+    let plan = historical.result().await;
+    assert!(!plan.as_str().unwrap().contains(INDEX), "{plan}");
     prepared.release.send(()).unwrap();
 
     let decided = tokio::time::timeout(WAIT, holds.recv())
