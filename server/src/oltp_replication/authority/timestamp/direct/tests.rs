@@ -587,6 +587,8 @@ struct Source {
     fail: AtomicBool,
     panic: AtomicBool,
     entered: AtomicUsize,
+    /// The task each call ran on (PERF2a).
+    tasks: Mutex<Vec<Option<tokio::task::Id>>>,
 }
 impl Source {
     fn new(held: bool) -> Arc<Self> {
@@ -598,6 +600,7 @@ impl Source {
             fail: AtomicBool::new(false),
             panic: AtomicBool::new(false),
             entered: AtomicUsize::new(0),
+            tasks: Mutex::new(Vec::new()),
         })
     }
     fn calls(&self) -> Vec<u64> {
@@ -608,6 +611,7 @@ impl DirectTimestampSource for Source {
     fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(count);
+            self.tasks.lock().unwrap().push(tokio::task::try_id());
             self.entered.fetch_add(1, Ordering::SeqCst);
             if self.held.load(Ordering::SeqCst) {
                 self.hold.acquire().await.unwrap().forget();
@@ -904,10 +908,65 @@ async fn o09_coalescing_client_survives_callers_dropped_mid_batch() {
         .await
         .expect("no hang after dropped callers")
         .unwrap();
-    // Dropped callers' values are skipped, never handed to anyone else.
+    // Dropped callers' values are skipped, never handed to anyone else. The
+    // aborted first caller made its own call (PERF2a), so the abort cancelled
+    // that call before it issued anything; the queued three were handed to a
+    // driver at once.
     assert_eq!(remote.calls(), vec![1, 3, 1]);
-    assert_eq!((kept.first().get(), kept_too.first().get()), (2, 4));
-    assert_eq!(later.first().get(), 5);
+    assert_eq!((kept.first().get(), kept_too.first().get()), (1, 3));
+    assert_eq!(later.first().get(), 4);
+}
+
+/// PERF2a: a caller that finds the client idle calls on its own task, with
+/// no driver task hop; callers queued behind it still share the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn o09_perf2a_idle_caller_calls_on_its_own_task() {
+    let remote = Source::new(false);
+    let client = DirectTimestampClient::new(None, remote.clone());
+    let mut last = 0;
+    for _ in 0..3 {
+        let caller = tokio::spawn({
+            let client = client.clone();
+            async move {
+                let value = client.commit_ts().await.unwrap().get();
+                (value, tokio::task::id())
+            }
+        });
+        let (value, task) = caller.await.unwrap();
+        assert!(value > last);
+        last = value;
+        assert_eq!(remote.tasks.lock().unwrap().last(), Some(&Some(task)));
+    }
+    // A caller that queues behind a call in flight is served by a driver.
+    remote.held.store(true, Ordering::SeqCst);
+    let first = tokio::spawn({
+        let client = client.clone();
+        async move { (client.allocate(1).await.unwrap(), tokio::task::id()) }
+    });
+    until(|| remote.entered.load(Ordering::SeqCst) == 4).await;
+    let queued = tokio::spawn({
+        let client = client.clone();
+        async move { (client.allocate(2).await.unwrap(), tokio::task::id()) }
+    });
+    until(|| client.waiting() == 1).await;
+    remote.hold.add_permits(2);
+    let (first, first_task) = first.await.unwrap();
+    let (queued, queued_task) = queued.await.unwrap();
+    assert!(queued.first() > first.last());
+    let tasks = remote.tasks.lock().unwrap().clone();
+    assert_eq!(tasks[3], Some(first_task));
+    assert!(tasks[4].is_some() && tasks[4] != Some(queued_task));
+    assert_eq!(remote.calls(), vec![1, 1, 1, 1, 2]);
+    // The driver stops: the next idle caller calls on its own task again.
+    until(|| client.idle()).await;
+    remote.held.store(false, Ordering::SeqCst);
+    let (_, task) = tokio::spawn({
+        let client = client.clone();
+        async move { (client.commit_ts().await.unwrap(), tokio::task::id()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(remote.tasks.lock().unwrap().last(), Some(&Some(task)));
 }
 
 #[tokio::test]
