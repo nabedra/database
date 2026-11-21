@@ -500,6 +500,8 @@ async fn o11_purge_and_snapshot_never_pass_the_durable_applied_index() {
         .map(|index| OwnedRaftEntry::<Bump>::new(id(index), Payload::Blank))
         .collect();
     log.append(entries, IOFlushed::noop()).await.unwrap();
+    // `append` returns before its sync (PERF2d); a host applies only after it.
+    log.drain().await;
     let _deferred = store.defer_apply_sync(log.group()).unwrap();
     let apply = |index: u64| {
         store.transaction(
@@ -625,6 +627,8 @@ async fn o06_o11_wide_append_writes_bounded_synced_batches() {
     }));
     let before = store.write_stats().synced_requests;
     log.append(entries, IOFlushed::noop()).await.unwrap();
+    // `append` returns before its synced writes (PERF2d).
+    log.drain().await;
     assert_eq!(
         store.write_stats().synced_requests - before,
         expected.len() as u64
@@ -748,7 +752,14 @@ impl LogRig {
             OwnedCommand::new_owned(Bump { id, pad }, &self.shared, ByteClass::Data).unwrap();
         let entry = OwnedRaftEntry::new(ns13_id(index), Payload::Normal(command));
         let bytes = serde_json::to_vec(&entry).unwrap();
-        self.logs[group].append([entry], IOFlushed::noop()).await?;
+        // The oracle keeps acknowledged entries: wait for the sync (PERF2d).
+        let (flushed, synced) = <CounterConfig as openraft::type_config::TypeConfigExt>::oneshot();
+        self.logs[group]
+            .append([entry], IOFlushed::signal(flushed))
+            .await?;
+        synced
+            .await
+            .map_err(|_| std::io::Error::other("append callback dropped"))??;
         oracle.entries[group].insert(index, bytes);
         oracle.next[group] = index + 1;
         Ok(())
@@ -1116,6 +1127,7 @@ async fn ns13_raft_log_write_amplification_from_store_stats() {
                 log.purge(ns13_id(next - lag - 1)).await.unwrap();
             }
         }
+        log.drain().await;
         let flushed = pool.clone();
         tokio::task::spawn_blocking(move || {
             flushed.kv_store().flush().unwrap();
