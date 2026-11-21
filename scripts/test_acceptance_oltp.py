@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -16,11 +17,11 @@ class EssentialRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='nabedra-runner-cli-') as directory:
             root = Path(directory)
             binary = root / 'component-tests'
-            binary.write_text(f'#!{sys.executable}\nprint("supporting_component: test")\n')
+            binary.write_text('#!/bin/sh\necho "supporting_component: test"\n')
             binary.chmod(0o700)
             result = subprocess.run([sys.executable, str(Path(acceptance.__file__)), '--scenario', 'O01',
                                      '--test-binary', str(binary), '--target-dir', str(root / 'target'),
-                                     '--output', str(root / 'report')], capture_output=True, text=True, timeout=10)
+                                     '--output', str(root / 'report')], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 2, result.stderr)
             report = json.loads((root / 'report/results.json').read_text())
             self.assertEqual(len(report['results']), 29)
@@ -73,10 +74,10 @@ class EssentialRunnerTests(unittest.TestCase):
             binary = root / 'fake-test-executable'
             for output, exit_code, expected, executed, missing in cases:
                 with self.subTest(expected=expected, exit_code=exit_code, output=output):
-                    binary.write_text(f'#!{sys.executable}\nimport sys\nprint({output!r}, end="")\nsys.exit({exit_code})\n')
+                    binary.write_text(f'#!/bin/sh\nprintf %s {shlex.quote(output)}\nexit {exit_code}\n')
                     binary.chmod(0o700)
                     result = acceptance.run_scenario(binary, 'acceptance_o01', scenario, {}, root / 'case.log', 5)
-                    self.assertEqual(result['status'], expected)
+                    self.assertEqual(result['status'], expected, result['reason'])
                     self.assertEqual(result['executed_clauses'], executed)
                     self.assertEqual(result['missing_clauses'], missing)
                     self.assertTrue(all(clause in result['reason'] for clause in missing))
