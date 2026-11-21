@@ -1,7 +1,7 @@
 # Heavy builds and verification for the remove-RocksDB track, on free standard runners.
 # See .agents/skills/nabedra-builds/SKILL.md. Runs on pushes to main and the track's branches, and on
 # pull requests to main (RV-FINAL L5). The workflow uses no secrets and only reads the repository.
-# Opt-in jobs: put [ci docker], [ci campaign], [ci acceptance] or [ci direct] in the pushed head
+# Opt-in jobs: put [ci docker], [ci campaign], [ci acceptance], [ci direct] or [ci memory] in the pushed head
 # commit message, or use workflow_dispatch once this file is on the default branch.
 #
 # Caches (plans/fast-builds.md, BLD1). Each Cargo job restores a dependency cache keyed by toolchain
@@ -649,6 +649,76 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: direct-evidence
+          path: artifacts
+          retention-days: 14
+
+  # FLAKE1 (G7 follow-up): worker anon memory under point-update load on a real RF3 cluster
+  # (server/tests/oltp_worker_memory.py), for THP always/madvise x MALLOC_ARENA_MAX unset/2, plus
+  # a heaptrack profile of every worker. Opt-in: put [ci memory] in the pushed head commit message.
+  memory:
+    name: worker memory under load, THP and malloc arenas, heaptrack (FLAKE1)
+    if: contains(github.event.head_commit.message, '[ci memory]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" || { echo "rust-toolchain.toml disagrees with RUST_TOOLCHAIN" >&2; exit 1; }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build release nabedra-db (oltp, line tables for heaptrack)
+        working-directory: server
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq heaptrack > /dev/null
+          python -m pip install --quiet "httpx>=0.27,<1"
+          nproc; free -m; ldd --version | sed -n 1p
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+      - name: Memory matrix (THP x MALLOC_ARENA_MAX)
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          bin="$PWD/server/target/release/nabedra-db"
+          status=0
+          for thp in always madvise; do
+            echo "$thp" | sudo tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null
+            for arena in default 2; do
+              label="thp-$thp-arena-$arena"
+              if [ "$arena" = default ]; then unset MALLOC_ARENA_MAX; else export MALLOC_ARENA_MAX=$arena; fi
+              python server/tests/oltp_worker_memory.py --binary "$bin" --output "artifacts/$label" --label "$label" \
+                2>&1 | tee "artifacts/$label.log" | grep -v '^{' || status=1
+              rm -rf "artifacts/$label/cluster"
+            done
+          done
+          unset MALLOC_ARENA_MAX
+          exit $status
+      - name: Heaptrack profile (THP always, default arenas)
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null
+          bin="$PWD/server/target/release/nabedra-db"
+          python server/tests/oltp_worker_memory.py --binary "$bin" --output artifacts/heaptrack --label heaptrack \
+            --heaptrack 2>&1 | tee artifacts/heaptrack.log | grep -v '^{'
+          grep -h '"leader"' artifacts/heaptrack/memory.json || true
+          for profile in artifacts/heaptrack/heaptrack.w*; do
+            name=$(basename "$profile" | sed -E 's/\.(gz|zst)$//')
+            heaptrack_print -f "$profile" --print-peaks 1 --print-allocators 1 --print-temporary 1 --print-leaks 0 \
+              -n 25 > "artifacts/heaptrack/$name.txt" 2>&1 || true
+            echo "===== $profile"; awk '/^PEAK MEMORY CONSUMERS/{p=1} p' "artifacts/heaptrack/$name.txt" | head -220
+            tail -12 "artifacts/heaptrack/$name.txt"
+          done
+          rm -rf artifacts/heaptrack/cluster
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-evidence
           path: artifacts
           retention-days: 14
 
