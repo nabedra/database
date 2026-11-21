@@ -1943,8 +1943,13 @@ impl HttpRuntime for WorkerRuntime {
                 }
                 if let Some(request) = super::recovery_tests::pool_sync::status_probe() {
                     let lookup = match self.durable_lookup(request).await {
-                        Ok(Some(IdentityLookup::Terminal(terminal))) =>
-                            serde_json::json!({"terminal": terminal}),
+                        Ok(Some(IdentityLookup::Terminal(terminal))) => {
+                            let result = match &terminal {
+                                TerminalIdentity::Committed { outcome, .. } => Some(outcome.result()?),
+                                _ => None,
+                            };
+                            serde_json::json!({"terminal": terminal, "result": result})
+                        }
                         Ok(Some(_)) => serde_json::json!({"pending": true}),
                         Ok(None) => serde_json::Value::Null,
                         Err(error) => serde_json::json!({"error": error}),
@@ -1955,6 +1960,9 @@ impl HttpRuntime for WorkerRuntime {
                             .filter(|pool| pool.requires_recovery()).count(),
                         "status": lookup,
                     });
+                }
+                if let Some(observed) = super::recovery_tests::maintenance::observe(&self.services).await? {
+                    stats["test_maintenance"] = observed;
                 }
             }
             Ok(EncodedResponse {

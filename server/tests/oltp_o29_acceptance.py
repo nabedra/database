@@ -116,6 +116,7 @@ def authoritative_after_decision(binary, test_executable):
             # strong quorum authority, even while the original pool is latched.
             proof = cluster.stats(owner)['test_pool_sync']
             assert proof['pools_requiring_recovery'] == 0, proof
+            assert proof['status']['result'] == expected, proof
             proof = proof['status']['terminal']['committed']
             assert proof['decision'] == decision, proof
             assert proof['reservation']['request_id'] == request, proof

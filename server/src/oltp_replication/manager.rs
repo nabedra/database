@@ -262,6 +262,63 @@ impl HostedGroupManager {
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.shared
     }
+    #[cfg(test)]
+    pub(crate) async fn test_transfer_data_snapshot(
+        &self,
+        group: &GroupIdentity,
+        target: uuid::Uuid,
+    ) -> Result<u64, ProtocolError> {
+        use openraft::{
+            RaftSnapshotBuilder,
+            network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
+            storage::RaftStateMachine,
+        };
+
+        let (source, target) = {
+            let routes = self.routes.lock().map_err(|_| unavailable())?;
+            let replica = routes
+                .get(&group.group_id)
+                .and_then(|route| {
+                    route.replicas.values().find(|replica| {
+                        replica.running.leader() == Some(replica.member.node_id)
+                    })
+                })
+                .ok_or_else(unavailable)?;
+            let target = replica.running.members().into_iter()
+                .find(|member| member.worker_id == target)
+                .ok_or_else(unavailable)?;
+            (replica.member.clone(), target)
+        };
+        let host = self.hosted_data(group, source.node_id)?;
+        host.ensure_linearizable().await?;
+        let mut state = host.state.clone();
+        let snapshot = state
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .map_err(|_| unavailable())?;
+        let cut = snapshot.meta.last_log_id.ok_or_else(unavailable)?.index;
+        let mut factory = TypedNetworkFactory::<DataConfig>::new(
+            self.client(),
+            source,
+            host.state.resident(),
+            self.shared.clone(),
+        )?;
+        let vote = host.raft.metrics().borrow_watched().vote;
+        factory
+            .new_client(target.node_id, &target)
+            .await
+            .full_snapshot(
+                vote,
+                snapshot,
+                std::future::pending(),
+                RPCOption::new(std::time::Duration::from_secs(10)),
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        Ok(cut)
+    }
     pub(crate) fn client(&self) -> WorkerClient {
         self.client.clone()
     }

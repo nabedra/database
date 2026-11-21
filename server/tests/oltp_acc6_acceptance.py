@@ -21,10 +21,10 @@ import time
 
 from oltp_compatibility import OlapServer, interrupt_fixture
 from oltp_direct_acceptance import Database, admin_owner, col, dump
-from oltp_direct_cluster import (DATABASE, Rf1Serve, Rf3Cluster, WORKERS, call, operation,
+from oltp_direct_cluster import (CHILD, DATABASE, IDENTITY_FIELDS, Rf1Serve, Rf3Cluster, WORKERS, call, operation,
                                  Http, resources, uid, write_json)
 from oltp_runtime_acceptance import (
-    DIRECT, assertion, assert_accepted, assert_record, evidence, exact_receipt, gates,
+    DIRECT, RuntimeServer, assertion, assert_accepted, assert_record, evidence, exact_receipt, gates,
     gateway, launch_retained, prepare_rolling_restart, read_record, receipt_path, release,
     run_native_assertions, same_run_ready, wait_reached, wait_until,
 )
@@ -116,7 +116,8 @@ def o02(binary, test_executable):
 @contextmanager
 def transactions(binary, test_executable, scenario, *, queue_bytes=None):
     with tempfile.TemporaryDirectory(prefix=f'nabedra-{scenario.lower()}-') as root:
-        cluster = Acc6Cluster(binary, root, test_executable, queue_bytes=queue_bytes)
+        cluster = Acc6Cluster(binary, root, test_executable, queue_bytes=queue_bytes,
+                              maintenance=scenario == 'O05')
         fixture = Transactions(cluster, DIRECT)
         try:
             fixture.start()
@@ -356,12 +357,18 @@ class Acc6Cluster(Rf3Cluster):
     """Use the standard registered topology with optional unequal limits and copy probes."""
 
     def __init__(self, binary, root, test_executable, *, unequal=False, traced=(), mounts=False,
-                 queue_bytes=None):
+                 queue_bytes=None, pending=None, maintenance=False):
         super().__init__(binary, root, test_executable=test_executable,
                          direct=dict.fromkeys(WORKERS, DIRECT), api_direct=(DIRECT, DIRECT), mounts=mounts)
         self.unequal = unequal
         self.traced = traced
         self.queue_bytes = queue_bytes
+        self.pending = pending
+        self.index_fault_dir = None
+        if maintenance:
+            self.index_fault_dir = self.root / 'index-gates'
+            self.index_fault_dir.mkdir(mode=0o700)
+            self.worker_env['NABEDRA_OLTP_TEST_INDEX_FAULT_DIR'] = str(self.index_fault_dir)
 
     def launch_worker(self, name):
         if self.unequal and name not in self.workers:
@@ -370,10 +377,16 @@ class Acc6Cluster(Rf3Cluster):
             self.config[name]['execution']['max_workers_per_request'] = 2
         if self.queue_bytes is not None:
             self.config[name]['execution']['max_queue_bytes_per_replica'] = self.queue_bytes
+        if self.pending is not None:
+            self.config[name]['execution']['max_pending_requests'] = self.pending
         if self.traced:
             directory = self.barrier_dir(name)
             directory.mkdir(parents=True, exist_ok=True)
             write_json(directory / 'identity-load-ids.json', self.traced)
+        if self.index_fault_dir is not None:
+            directory = self.barrier_dir(name)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'enable-maintenance-observation').touch()
         super().launch_worker(name)
 
 
@@ -475,7 +488,110 @@ def storage_observation(cluster, *, measure_cache=False):
         observations[name] = dict(
             cache=cache, native=budget, storage=stats['storage'], scheduler=slots, peak_rss_bytes=rss,
             allocated_disk_bytes=allocated, resident_pool_file_bytes=cached)
+        if 'test_maintenance' in stats:
+            observations[name]['maintenance'] = stats['test_maintenance']['pools']
     return observations
+
+
+def o05_maintenance(fixture, table, owner, source, rows, baseline):
+    from oltp_hardening_acceptance import data_leader
+
+    cluster = fixture.cluster
+    directory = cluster.barrier_dir(owner)
+    # Drive several successive immutable runs with overlapping key spans.
+    # The real background compactor holds its merge at the first output sync.
+    churn = fixture.db.create_table('o05_churn', {'id': int, 'value': int}, key='id')
+    assert churn.insert_many([dict(id=0, value=0), dict(id=1, value=0)]) == 2
+    compact = directory / 'reached-compaction'
+    (directory / 'hold-compaction').touch()
+    scan = operation('query.collect', {
+        'table_id': table.id, 'query': table.query().select('id')._to_wire()})
+    snapshot_stage = f"snapshot-{source['group_id']}"
+    index = uid()
+    index_stage = f'{index}-backfill'
+    index_directory = cluster.index_fault_dir
+    leader_directory = None
+
+    def worker_stats(worker):
+        status, stats = call(cluster.urls[worker], '/v1/runtime/stats',
+                             token=cluster.auth['data_token'], timeout=100)
+        assert status == 200, (worker, status, stats)
+        return stats
+
+    def flush():
+        (directory / 'maintenance-flush').touch()
+        worker_stats(owner)
+
+    with ThreadPoolExecutor(max_workers=3) as jobs:
+        try:
+            for step in range(1, 9):
+                assert churn.update(step % 2, {'value': step})
+                flush()
+                if compact.is_file():
+                    break
+            wait_until(compact.is_file, 'background compaction output sync', timeout=15)
+            fixture.select(scan['request_id'], {'snapshot': True})
+            fixture.admit(scan)
+            fixture.reached(scan['request_id'], 'snapshot')
+            (index_directory / f'hold-{index_stage}').touch()
+            building = jobs.submit(fixture.make_index, table, owner, index_id=index)
+            wait_until(lambda: (index_directory / f'index-{index_stage}.json').is_file(),
+                       'index backfill completed its Data writes', timeout=25)
+
+            leader = data_leader(fixture, source['group_id'])
+            target = next(worker for worker in WORKERS if worker != leader)
+            leader_directory = cluster.barrier_dir(leader)
+            (leader_directory / f'hold-{snapshot_stage}').touch()
+            write_json(leader_directory / 'maintenance-transfer.json',
+                       [source, cluster.enrollments[target]['worker_id']])
+            sending = jobs.submit(worker_stats, leader)
+            chunk = leader_directory / f'reached-{snapshot_stage}'
+            wait_until(lambda: chunk.is_file() and chunk.stat().st_size > 0,
+                       'first mTLS snapshot chunk acknowledgement', timeout=25)
+            transferred, total = json.loads(chunk.read_text())
+            assert transferred == 64 << 10 and total > transferred, (transferred, total)
+
+            (directory / 'hold-flush').touch()
+            assert churn.update(0, {'value': 99})
+            flushing = jobs.submit(flush)
+            flushed_run = directory / 'reached-flush'
+            wait_until(lambda: flushed_run.is_file() and flushed_run.stat().st_size > 0,
+                       'flush output sync', timeout=20)
+            assert not flushing.done() and not sending.done() and not building.done()
+            assert fixture.pending(scan['request_id'])['state'] == 'running'
+            held = storage_observation(cluster, measure_cache=True)
+            assert int(compact.read_text()) > 0 and int(flushed_run.read_text()) > 0
+            assert held[owner]['maintenance'][0]['merge_and_flush_writers_bytes'] > 0, held[owner]
+        finally:
+            for stage in ('compaction', 'flush'):
+                (directory / f'release-{stage}').touch()
+            if leader_directory is not None:
+                (leader_directory / f'release-{snapshot_stage}').touch()
+            (index_directory / f'release-{index_stage}').write_text('continue')
+            fixture.release(scan['request_id'], 'snapshot')
+        flushing.result(timeout=30)
+        cut = sending.result(timeout=30)['test_maintenance']['snapshot_cut']
+        assert cut > 0, cut
+        building.result(timeout=60)
+
+    fixture.terminal(scan['request_id'], [{'id': row['id']} for row in rows])
+    assert table.where(category=2).count() == 24
+    settled = storage_observation(cluster, measure_cache=True)
+    assert settled[owner]['storage']['flush_bytes'] > baseline[owner]['storage']['flush_bytes']
+    assert settled[owner]['storage']['compaction_bytes'] > baseline[owner]['storage']['compaction_bytes']
+    for observed in (held, settled):
+        for worker, stats in observed.items():
+            assert stats['allocated_disk_bytes'] <= baseline[worker]['allocated_disk_bytes'] + 96 * MIB, stats
+            for pool in stats['maintenance']:
+                # One active and at most one queued dispatch for each kind per
+                # store. The small fixture permits one preallocated segment
+                # plus 32 MiB of data/run/snapshot growth per worker.
+                assert pool['flush_queue'] <= 1 and pool['compaction_queue'] <= 1, pool
+                assert pool['journal_queue_items'] <= 16 and pool['journal_queue_bytes'] <= 8 * MIB, pool
+                assert pool['merge_and_flush_writers_bytes'] <= pool['overhead_bytes'] <= 64 * MIB, pool
+    evidence('O05', 'joint-native-maintenance-cut', baseline=baseline, held=held, settled=settled,
+             flush_and_compaction_worker=owner, snapshot_sender=leader, snapshot_receiver=target,
+             snapshot_installed_cut=cut, first_chunk_bytes=transferred, image_bytes=total)
 
 
 def o05(binary, test_executable):
@@ -495,23 +611,11 @@ def o05(binary, test_executable):
             'id': int, 'category': int, 'value': int, 'blob': str}, key='id')
         rows = [dict(id=index, category=index % 4, value=index, blob='p' * (32 << 10))
                 for index in range(96)]
-        owner, _ = seed_and_source(fixture, table, rows[:32])
+        owner, source = seed_and_source(fixture, table, rows[:32])
         baseline = storage_observation(fixture.cluster, measure_cache=True)
         for start in (32, 64):
             assert table.insert_many(rows[start:start + 32]) == 32
-        scan = operation('query.collect', {
-            'table_id': table.id, 'query': table.query().select('id')._to_wire()})
-        fixture.select(scan['request_id'], {'snapshot': True})
-        fixture.admit(scan)
-        fixture.reached(scan['request_id'], 'snapshot')
-        try:
-            fixture.make_index(table, owner)
-            concurrent = storage_observation(fixture.cluster, measure_cache=True)
-        finally:
-            fixture.release(scan['request_id'], 'snapshot')
-        fixture.terminal(scan['request_id'], [{'id': row['id']} for row in rows])
-        assert table.where(category=2).count() == 24
-        evidence('O05', 'scan-pin-index-build', baseline=baseline, measured=concurrent)
+        o05_maintenance(fixture, table, owner, source, rows, baseline)
     assertion('O05', 'allocation-failure-isolation',
               'Exhausted Data buffers rejected allocation while Progress stayed usable. Native apply, cancelled jobs, and Raft lane exhaustion preserved independent work.')
     if sys.platform == 'linux':
@@ -522,8 +626,9 @@ def o05(binary, test_executable):
                   'Native two-pool assertions executed. Physical thread attribution, VmHWM and resident pool file sampling require Linux.',
                   'not-run')
     assertion('O05', 'maintenance-bounds',
-              'Snapshot transfer with a full Data lane, wide-key paging, and a pinned scan during index build executed. No fixture yet proves flush, compaction, scan, index build and snapshot transfer overlap at one bounded cut.',
-              'not-run')
+              'A single cut held native run flush and compaction, a running pinned scan, index backfill, '
+              'and an acknowledged mid-transfer mTLS snapshot. Merge writer memory, I/O queues and disk '
+              'growth stayed within their asserted limits, and all five operations settled.')
 
 
 def malformed_requests(open_client, table):
@@ -583,9 +688,98 @@ def rejected_registered_configs(cluster, binary):
     same_run_ready(cluster, cluster.run_id, WORKERS, 3)
 
 
+def reject_live_enrollments(cluster):
+    target, observer = WORKERS[:2]
+    node = cluster.config[target]['node']
+    worker = node['enrollment']
+    previous = {field: worker[field] for field in IDENTITY_FIELDS}
+    fresh = dict(worker, incarnation=uid(), enrollment_revision=worker['enrollment_revision'] + 1)
+    generation = (node.get('mount') or {}).get('generation', 1) + 1
+    before = cluster.admin('cluster.connection', {})
+    intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
+                  next=dict(fresh, resources={'max_threads': 256}),
+                  pool_id=node['pool_id'], mount_generation=generation)
+    status, response = call(cluster.urls[observer], '/v1/cluster/operations',
+                            operation('worker.restart.prepare', intent, intent['id']),
+                            token=cluster.auth['admin_token'], timeout=10)
+    assert status == 400 and response['error']['code'] == 'validation_error', (status, response)
+    assert response['error']['outcome'] == 'not_applied', response
+
+    directory = cluster.barrier_dir(target)
+    config = directory / 'queue-enrollment-probe.json'
+    write_json(config, dict(
+        group=node['placements']['control']['identity'],
+        **{'from': worker}, targets=[cluster.enrollments[observer]],
+        certificate=node['certificate'], private_key=node['private_key'],
+        authority_ca=node['authority_ca'], directory=str(directory),
+        queue_view=cluster.stats(observer)['accept_to_dispatch']['view']))
+    probe = subprocess.run([cluster.test_executable, '--exact', CHILD, '--ignored', '--nocapture'],
+                           env={**os.environ, 'NABEDRA_OLTP_TEST_REPLACEMENT_PEER': str(config)},
+                           capture_output=True, text=True, timeout=22)
+    assert probe.returncode == 0 and '1 passed' in probe.stdout, (probe.stdout, probe.stderr)
+    after = cluster.admin('cluster.connection', {})
+    assert after == before and after['ready_workers'] == 3, (before, after)
+
+
+def saturated_history(db, exchange, worker_stats, directories, run, *, membership_faults=None):
+    table = db.create_table('o22_saturation', {'id': int, 'value': int}, key='id')
+    rows = [dict(id=key, value=key) for key in range(8)]
+    assert table.insert_many(rows) == len(rows)
+    collection = {'table_id': table.id, 'query': table.query()._to_wire()}
+    count = operation('query.count', collection)
+    get = operation('table.get', {'table_id': table.id, 'key': 0})
+    update = operation('table.update', {'table_id': table.id, 'key': 1, 'values': {'value': 10}})
+    scan = operation('query.collect', collection)
+    held = [(count, len(rows)), (get, rows[0]), (update, True), (scan, rows)]
+    overflow = operation('table.insert', {'table_id': table.id, 'row': {'id': 8, 'value': 8}})
+    for directory in directories:
+        write_json(directory / 'transaction-gates.json',
+                   {request['request_id']: {'snapshot': True} for request, _ in held})
+
+    def release_snapshot(request):
+        for directory in directories:
+            (directory / f"release-transaction-{request['request_id']}-snapshot").touch()
+
+    results = []
+    try:
+        for request, _ in held:
+            assert_accepted(exchange(REQUESTS, request), run, request)
+            wait_until(lambda: any((directory / f"transaction-{request['request_id']}-snapshot.json").is_file()
+                                   for directory in directories),
+                       f"{request['request_id']} did not pin a running snapshot", timeout=15)
+        before = worker_stats()
+        assert all(stats['queue']['running_records'] == 4 for stats in before.values()), before
+        if membership_faults is not None:
+            membership_faults()
+        status, refused = exchange(REQUESTS, overflow)
+        assert status == 429 and refused['request_id'] == overflow['request_id'], (status, refused)
+        assert refused['error']['code'] == 'overloaded' and refused['error']['outcome'] == 'not_applied', refused
+        after = worker_stats()
+        for worker, stats in after.items():
+            assert stats['queue'] == before[worker]['queue'], (worker, stats['queue'])
+            assert stats['scheduler'] == before[worker]['scheduler'], (worker, stats['scheduler'])
+            assert stats['native_thread_budget'] == before[worker]['native_thread_budget']
+        for request, result in held:
+            release_snapshot(request)
+            receipt = exact_receipt(exchange, run, request, result)
+            results.append((receipt['state'], receipt['result']))
+        expected = [dict(row, value=10) if row['id'] == 1 else row for row in rows]
+        assert table.query().collect() == expected
+        assert table.get(8) is None
+        settled = worker_stats()
+        assert all(not any(stats['queue'][field] for field in
+                           ('queued_records', 'running_records', 'reconciling_records'))
+                   for stats in settled.values()), settled
+        return {'accepted': results, 'refused': refused['error']['code'], 'rows': expected}
+    finally:
+        for request, _ in held:
+            release_snapshot(request)
+
+
 def o22(binary, test_executable):
     run_native_assertions(test_executable, [
         'c01_c02_heterogeneous_limits_and_impossible_work',
+        'c02_signed_capacity_and_incarnation_cannot_be_forged',
         'c03_drain_preserves_owned_work_and_reconfigure_reuses_node',
         'c04_caps_include_reducers_across_hundred_jobs',
         'c05_equal_peers_progress_with_one_slot_per_fair_round',
@@ -601,7 +795,7 @@ def o22(binary, test_executable):
         'u03_seed_343687_membership_memory_drain_and_retry_conservation',
     ])
     mounts = Rf3Cluster.mounts_available()
-    with cluster_process(binary, test_executable, 'o22', unequal=True, mounts=mounts) as cluster, closing(database(cluster)) as db:
+    with cluster_process(binary, test_executable, 'o22', unequal=True, mounts=mounts, pending=4) as cluster, closing(database(cluster)) as db:
         table = db.create_table('o22_rows', {'id': int}, key='id')
         rows = [dict(id=index) for index in range(-192, 192)]
         fixture = Transactions(cluster, DIRECT)
@@ -700,11 +894,14 @@ def o22(binary, test_executable):
             evidence('O22', 'C03-same-store-reconfiguration', worker=target, old_threads=limits[WORKERS.index(target)],
                      new_threads=3, table=current.id, shards=route_after, rows=len(rows))
 
+        with closing(gateway(cluster)) as client:
+            distributed = saturated_history(db, client.exchange, cluster.all_stats, directories, cluster.run_id,
+                                            membership_faults=lambda: reject_live_enrollments(cluster))
 
     with tempfile.TemporaryDirectory(prefix='nabedra-o22-u01-') as root:
-        local = Rf1Serve(binary, root, direct=DIRECT)
-        try:
-            local.start()
+        local = RuntimeServer(binary, root)
+        local.test_executable = test_executable
+        with local:
             with closing(Database(url=local.url, token=local.token, database=DATABASE)) as db:
                 table = db.create_table('o22_rows', {'id': int}, key='id')
                 assert table.insert_many(rows) == len(rows)
@@ -719,12 +916,17 @@ def o22(binary, test_executable):
                     assert status == 200, ready
                     assert_accepted(client.exchange(REQUESTS, count), ready['run_id'], count)
                     exact_receipt(client.exchange, ready['run_id'], count, len(rows))
-        finally:
-            local.close()
+                    standalone = saturated_history(db, client.exchange, lambda: {'local': local.stats()},
+                                                   [Path(root)], ready['run_id'])
+    assert standalone == distributed, (standalone, distributed)
+    evidence('O22', 'C02-U01-live-admission-saturation', rf1=standalone, rf3=distributed)
     assertion('O22', 'scheduler-contract',
-              'Native and process C01–C07/F01–F03/U01–U03 assertions ran in part. Missing matching local/distributed saturation histories and forged capacity or stale incarnation during live C02 admission.'
-              + ('' if mounts else ' C03 retained reconfiguration requires Linux loopback pool mounts with passwordless sudo.'),
-              'not-run')
+              'C01–C07/F01–F03/U01–U03 native and process assertions ran. RF1 and RF3 agreed on four '
+              'held requests and the fifth overload. Under RF3 saturation, Control rejected a supplied '
+              'capacity claim and the live mTLS queue lane refused a stale incarnation. Readiness and '
+              'charges stayed unchanged.'
+              if mounts else 'C03 retained reconfiguration requires Linux loopback pool mounts with passwordless sudo.',
+              'passed' if mounts else 'not-run')
 
 
 def copy_metrics(cluster, request, ready_count):

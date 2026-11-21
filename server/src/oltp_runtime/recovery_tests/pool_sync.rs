@@ -9,16 +9,27 @@ use std::{
 use uuid::Uuid;
 
 fn directory() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    let path = barrier_directory()?;
     path.join("enable-post-sync-fault")
         .is_file()
         .then_some(path)
 }
 
+fn barrier_directory() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var_os(
+        "NABEDRA_OLTP_TEST_BARRIER_DIR",
+    )?))
+}
+
 pub(crate) fn wrap(fs: Arc<dyn Fs>) -> Arc<dyn Fs> {
-    match directory() {
-        Some(directory) => Arc::new(FaultSync { fs, directory }),
-        None => fs,
+    match barrier_directory() {
+        Some(directory)
+            if directory.join("enable-post-sync-fault").is_file()
+                || directory.join("enable-maintenance-observation").is_file() =>
+        {
+            Arc::new(FaultSync { fs, directory })
+        }
+        _ => fs,
     }
 }
 
@@ -57,9 +68,10 @@ impl Fs for FaultSync {
         let file = self.fs.open(path, mode)?;
         match path.extension().and_then(|ext| ext.to_str()) {
             // A preallocated .free segment can become live without reopening.
-            Some("jnl" | "free") => Ok(Arc::new(JournalFile {
+            Some("jnl" | "free" | "run") => Ok(Arc::new(ObservedFile {
                 file,
                 directory: self.directory.clone(),
+                run: path.extension().is_some_and(|ext| ext == "run"),
                 selected: Mutex::new(None),
             })),
             _ => Ok(file),
@@ -95,17 +107,20 @@ impl Fs for FaultSync {
     }
 }
 
-struct JournalFile {
+struct ObservedFile {
     file: Arc<dyn FsFile>,
     directory: PathBuf,
+    run: bool,
     selected: Mutex<Option<String>>,
 }
 
-impl FsFile for JournalFile {
+impl FsFile for ObservedFile {
     fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
         self.file.write_all_at(bytes, offset)?;
         let arm = self.directory.join("post-sync-arm");
-        if let Ok(selection) = std::fs::read_to_string(&arm) {
+        if !self.run
+            && let Ok(selection) = std::fs::read_to_string(&arm)
+        {
             let (operation, request) = selection.trim().split_once(' ').unwrap();
             assert!(matches!(operation, "prepare_page" | "resolve"));
             assert!(request.parse::<Uuid>().is_ok());
@@ -147,6 +162,9 @@ impl FsFile for JournalFile {
     }
 
     fn sync_all(&self) -> io::Result<()> {
+        if self.run {
+            super::maintenance::hold_run_sync(&self.directory, self.file.len()?)?;
+        }
         self.file.sync_all()
     }
 

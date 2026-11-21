@@ -118,8 +118,8 @@ class Transactions:
         query = table.query() if category is None else table.where(col('category') == category)
         return operation('query.collect', {'table_id': table.id, 'query': query._to_wire()})
 
-    def make_index(self, table, owner):
-        index_id, build_id = uid(), uid()
+    def make_index(self, table, owner, *, index_id=None):
+        index_id, build_id = index_id or uid(), uid()
         created = admin_owner(self.cluster, 'storage.index.create', {
             'table_id': table.id, 'index_id': index_id, 'name': 'by_category',
             'columns': ['category'], 'covering': ['value'],
