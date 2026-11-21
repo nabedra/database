@@ -144,7 +144,9 @@ def seed_legacy_indexes(binary, root):
     local = root / 'legacy-local'
     local.mkdir()
     archive = root / 'legacy-seed-archive'
-    with RuntimeServer(binary, local, cli=True) as server:
+    legacy = RuntimeServer(binary, local, cli=True)
+    legacy.execution.pop('direct_oltp', None)
+    with legacy as server:
         token = json.loads((local / 'auth.json').read_text())['admin_token']
         with Database(url=server.url, token=server.token, database=DATABASE) as db:
             ledger = db.create_table('migration_ledger', {'id': int, 'bucket': int, 'label': str, 'active': bool}, key='id')
