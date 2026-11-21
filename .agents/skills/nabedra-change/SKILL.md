@@ -9,7 +9,13 @@ When you are given a task or asked to make a change, do the following:
 2. For the thread, create a branch in git called `nabedra/<task-title-name>` and continue the work of your thread in that branch and worktree
 3. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
 4. When you are done, file a PR in GitHub
-5. Run the checks and tests appropriate to the change, including GitHub Actions when applicable. If checks run after you open the PR, wait for them. Fix failures and rerun the affected checks. Once all applicable checks and tests pass, merge the PR automatically if you have permission.
+5. For docs-only changes, review the diff and skip tests and GitHub Actions.
+   Put `[skip ci]` in the PR head commit message and in the commit message that
+   lands on the base branch. For other changes, run the applicable checks and
+   tests, including GitHub Actions when appropriate. Wait for checks that start
+   after you open the PR, fix failures, and rerun the affected checks. Once all
+   applicable checks and tests pass, merge the PR automatically if you have
+   permission.
 6. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
