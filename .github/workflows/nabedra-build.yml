@@ -245,7 +245,21 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: REP1 worker recovery and direct-mode rollback
+        if: inputs.direct || contains(github.event.head_commit.message, '[ci direct]') || contains(github.event.head_commit.message, '[ci rep1]')
+        run: |
+          set -o pipefail
+          test_executable="$(cargo test --manifest-path server/Cargo.toml --locked --no-default-features --features oltp --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test and (.target.kind | index("lib"))) | .executable' | tail -1)"
+          test -x "$test_executable"
+          status=0
+          for suite in rollback restart; do
+            python3 server/tests/oltp_recovery_operations.py --binary server/target/debug/nabedra-db \
+              --test-executable "$test_executable" --suite "$suite" 2>&1 | tee "oltp-rep1-$suite.log" || status=1
+          done
+          exit "$status"
       - name: Library suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         working-directory: server
         run: |
           set -o pipefail
