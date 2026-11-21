@@ -597,7 +597,7 @@ fn actual_runtime_child() {
                         )
                         .with_target(
                             "nabedra_database_server::oltp_runtime::data_worker_process",
-                            tracing::Level::WARN,
+                            tracing::Level::DEBUG,
                         )
                         .with_target(
                             "nabedra_database_server::oltp_runtime::scoped_worker::maintenance",

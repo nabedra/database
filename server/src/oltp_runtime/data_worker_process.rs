@@ -454,6 +454,17 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 ControlReply::Rejected(Fault::Busy | Fault::Stale | Fault::NotReady) => {
                     wait_startup(deadline).await?
                 }
+                ControlReply::Rejected(Fault::DirectCapabilityRequired) => {
+                    // A capability advert can miss the accepting leader
+                    // while voters refresh this worker's enrollment. The
+                    // rejected join has no receipt. Re-advertise this exact
+                    // incarnation and retry against the current ready set.
+                    tracing::debug!(
+                        fault = ?Fault::DirectCapabilityRequired,
+                        "retrying data worker queue join after incomplete capability advertisement"
+                    );
+                    wait_startup(deadline).await?
+                }
                 ControlReply::Rejected(fault) => {
                     tracing::warn!(?fault, "Control rejected data worker queue join");
                     return Err(refused("Control refused data worker queue join"));
