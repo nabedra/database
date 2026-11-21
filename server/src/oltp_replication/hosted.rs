@@ -553,18 +553,15 @@ fn bounded_digest(
     }
 }
 
-/// SNAP1: the snapshot policy of the production Raft profiles. A policy
-/// build is a header-only cut (a sync and three point reads under the
-/// application order), so the interval no longer trades apply stalls for log
-/// length; it sets how often the log is purged. One cut per 1,024 entries plus
-/// 4,096 entries kept behind it bounds a group's retained log to 4,096-5,120
-/// entries (OpenRaft's defaults kept 1,000-6,000): a steadier journal footprint
-/// with a smaller worst case, fewer journal values for GC to relocate, and a
-/// follower lagging up to 4,096 entries still catches up from the log instead
-/// of a full state transfer. The extra cost is one cut and one purge write per
-/// 1,024 entries, against at least one synced append per 64.
-pub(crate) const SNAPSHOT_LOGS_SINCE_LAST: u64 = 1024;
-pub(crate) const SNAPSHOT_LOGS_TO_KEEP: u64 = 4096;
+/// SNAP1: the snapshot policy of the production Raft profiles, set
+/// explicitly. A policy build is now a header-only cut (a sync and three point
+/// reads under the application order), so the interval no longer trades apply
+/// stalls for log length; it only sets how often the log is purged. The values
+/// stay OpenRaft's defaults: a group retains 1,000-6,000 entries, as every
+/// existing recovery, move and catch-up scenario was validated against, and a
+/// cut every 5,000 entries costs one sync and one purge write.
+pub(crate) const SNAPSHOT_LOGS_SINCE_LAST: u64 = 5000;
+pub(crate) const SNAPSHOT_LOGS_TO_KEEP: u64 = 1000;
 /// How long policy snapshot builds pause after a transient failure (F2).
 const SNAPSHOT_DEFERRAL: Duration = Duration::from_secs(1);
 /// Cores one host can run over its lifetime: the first and the supervisor's
