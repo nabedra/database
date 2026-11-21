@@ -91,7 +91,8 @@ def command(*args, timeout=30):
     return completed.stdout.strip()
 
 
-MAX_IDLE_SECONDS = 2.0
+# The ORMs' reuse bound (PERF2e), under the API's 30 s idle bound.
+MAX_IDLE_SECONDS = 25.0
 
 
 def idle_socket_quiet(sock):
@@ -137,9 +138,9 @@ class Http:
         payload = None if body is None else json.dumps(body, separators=(',', ':'), allow_nan=False).encode()
         self.sizes = {'request_body_bytes': len(payload) if payload else 0}
         # The ORMs' reuse rule (orm/python/src/nabedra/_http_pool.py): reuse a kept-alive
-        # connection only while it has been idle under 2 s and its socket is quiet, so a
-        # request never races the server's 5 s idle close. Closing before the first byte
-        # is written opens a new connection; nothing is ever sent twice.
+        # connection only while it has been idle under 25 s and its socket is quiet, so a
+        # request never races the server's 30 s idle close or an eviction. Closing before
+        # the first byte is written opens a new connection; nothing is ever sent twice.
         if self.connection.sock is not None and (
                 self.released is None or time.monotonic() - self.released >= MAX_IDLE_SECONDS
                 or not idle_socket_quiet(self.connection.sock)):
@@ -1056,6 +1057,8 @@ exec python3 -m nabedra.cli database serve --config /tmp/config/api.json
             settings += ['--stop-p99-ms', str(args.stop_p99_ms)]
         if args.stop_on_rejection:
             settings.append('--stop-on-rejection')
+        if args.snapshot_between_phases:
+            settings.append('--snapshot-between-phases')
         if args.soak:
             settings.append('--soak')
         sampler = threading.Thread(target=self.sample_cgroups, args=(args.cgroup_interval,), daemon=True)
