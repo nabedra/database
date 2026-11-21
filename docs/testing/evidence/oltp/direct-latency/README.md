@@ -21,6 +21,8 @@ PERF2c follow-up (HTTP keep-alive on the OLTP API, idle Control reads): [perf2c/
 
 Final comparative benchmark of the follow-up PR (BENCH2: G1–G7 and the direct-path targets): [final/README.md](final/README.md).
 
+RD1 (hardening): lease reads without the RaftCore round trip, no Timestamp store read, no pre-latch epochs read; per-step tables on the controlled host (external SSD) and runner: [rd1/README.md](rd1/README.md).
+
 ## Fixes
 
 | Commit | Change | Effect (controlled host, serial) |
