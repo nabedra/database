@@ -292,13 +292,24 @@ async fn o29_ns10_ambiguous_journal_sync_error_under_raft_writes() {
     );
     assert!(node.pool.requires_recovery() && alias.requires_recovery());
     let journal = path.join("kv").join("journal");
-    let syncs_after = || {
-        fault.calls()[calls_before..]
-            .iter()
-            .filter(|c| c.op == FsOp::SyncData && c.path.starts_with(&journal))
-            .count()
-    };
-    assert_eq!(syncs_after(), 1, "the failed journal sync was retried");
+    // A sync that a background commit issued between `calls_before` and the injection
+    // succeeded and is not a retry (CI run 44811636932 counted one): what must hold is
+    // one failed journal sync and no journal sync after it.
+    let syncs: Vec<bool> = fault.calls()[calls_before..]
+        .iter()
+        .filter(|c| c.op == FsOp::SyncData && c.path.starts_with(&journal))
+        .map(|c| c.ok)
+        .collect();
+    let failed = syncs.iter().position(|ok| !ok);
+    assert!(
+        failed.is_some() && syncs[..failed.unwrap()].iter().all(|&ok| ok),
+        "one journal sync fails first: {syncs:?}"
+    );
+    assert_eq!(
+        syncs.len(),
+        failed.unwrap() + 1,
+        "the failed journal sync was retried: {syncs:?}"
+    );
     // Later proposals fail too: nothing is applied from uncertain state.
     let (later, refused) = propose_waves(&node, 48..49).await;
     assert!(later.is_empty() && refused == [48]);
