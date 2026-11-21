@@ -1,0 +1,5 @@
+NAME                                   STATUS     ROLES           AGE   VERSION    INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION     CONTAINER-RUNTIME    ZONE
+nabedra-live3-6430c078-control-plane   Ready      control-plane   45s   v1.34.11   172.19.0.3    <none>        Debian GNU/Linux 13 (trixie)   6.10.14-linuxkit   containerd://2.3.4
+nabedra-live3-6430c078-worker          NotReady   <none>          23s   v1.34.11   172.19.0.5    <none>        Debian GNU/Linux 13 (trixie)   6.10.14-linuxkit   containerd://2.3.4   a
+nabedra-live3-6430c078-worker2         NotReady   <none>          24s   v1.34.11   172.19.0.4    <none>        Debian GNU/Linux 13 (trixie)   6.10.14-linuxkit   containerd://2.3.4   b
+nabedra-live3-6430c078-worker3         NotReady   <none>          26s   v1.34.11   172.19.0.2    <none>        Debian GNU/Linux 13 (trixie)   6.10.14-linuxkit   containerd://2.3.4   c

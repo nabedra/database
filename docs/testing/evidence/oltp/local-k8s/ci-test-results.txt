@@ -186,3 +186,14 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.10s
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+GitHub Actions 44935858334 at e2fb3ba1479daf187fcb7cc6bda632b087b95ad4
+OLTP job 136942204448
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 1.63s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 532 filtered out; finished in 1.82s
+test result: ok. 500 passed; 0 failed; 31 ignored; 0 measured; 2 filtered out; finished in 167.36s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.69s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

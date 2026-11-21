@@ -174,7 +174,7 @@ class Kind:
             def rawfile_registered():
                 return storage_nodes <= {node['metadata']['name']
                     for node in self.obj('csinode', namespaced=False)['items']
-                    if any(driver['name'] == RAWFILE for driver in node['spec']['drivers'])}
+                    if any(driver['name'] == RAWFILE for driver in node['spec'].get('drivers') or ())}
 
             wait_for(rawfile_registered, 'Rawfile CSI registered on the storage nodes', 90)
         self.evidence.file('csi-ready.txt', self.kube('get', 'csidriver,csinode,storageclass', '-o', 'wide'))
@@ -602,17 +602,20 @@ class Oltp(Rf3Cluster):
                     pool_id=node['pool_id'], mount_generation=node['mount']['generation'] + 1)
         request = operation('worker.restart.prepare', plan, plan['id'])
 
-        def prepare():
-            for other in survivors:
+        def prepare(targets):
+            for other in targets:
                 status, reply = self.worker(other, CLUSTER_ADMIN, request, admin=True, timeout=10)
                 if status == 200:
-                    return success(status, reply)
+                    return other, success(status, reply)
                 assert status in (409, *RETRYABLE), (status, reply)
             return None
 
-        result = wait_for(prepare, 'retained restart preparation', 90)
-        assert prepare() == result, 'lost-reply replay changed the restart preparation'
-        assert result['identity'] == {field: fresh[field] for field in IDENTITY_FIELDS}, result
+        operator, result = wait_for(lambda: prepare(survivors), 'retained restart preparation', 90)
+        _, replay = wait_for(lambda: prepare([operator]), 'retained restart preparation replay', 35)
+        expected = {field: fresh[field] for field in IDENTITY_FIELDS}
+        assert result['identity'] == replay['identity'] == expected, (result, replay)
+        self.cluster.evidence.record('O18 retained restart preparation replay', operator=operator,
+                                     preparation_id=plan['id'], original=result, replay=replay)
         node.update(enrollment=fresh, control_enrollments=peers,
                     rolling=dict(preparation_id=plan['id'], run_id=self.run_id))
         node['mount'].update(worker=result['identity'], generation=plan['mount_generation'])

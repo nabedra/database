@@ -84,11 +84,21 @@ on that node. The corrected fixture puts CoreDNS on the control plane.
 [CoreDNS pod placement](zone-attempt/pods.txt) ·
 [Survivor output](zone-attempt/survivor-output.txt)
 
+The rolling attempt with corrected DNS placement observed a new Pod UID
+after deleting `w1-0`. It stopped on the fixture's full-response replay
+comparison. The fixture now repeats preparation through the same
+operator, compares the prepared identity, and records both replies.
+[Rolling attempt](rolling-attempt/trace.jsonl)
+
 Two early Rawfile probes stopped during infrastructure setup. A third run
 created three PVC objects, which stayed pending because the plugin rejected
 the fixture's `6Gi` reserve setting during startup. The chart documents
-`GiB`, and the generator now uses `6GiB`. [Driver output](rawfile-attempts/invalid-capacity-driver.txt) ·
-[Pod scheduling](rawfile-attempts/invalid-capacity-scheduler.txt)
+`GiB`, and the generator now uses `6GiB`. The corrected provider-only
+probe expanded an ext4 PVC from 256 MiB to 512 MiB without replacing the Pod.
+`df` grew from 235,431 KiB to 480,868 KiB and the sentinel survived. Filling
+the volume returned ENOSPC on the subsequent allocation. [Filesystem trace](rawfile-filesystem/trace.jsonl) ·
+[CSI expansion calls](rawfile-filesystem/driver-resize.txt) ·
+[Earlier driver output](rawfile-attempts/invalid-capacity-driver.txt)
 
 The Linux process tests reran after the hardening merge. Retained restart
 verified 78 acknowledged writes, two settled receipts and three applied
