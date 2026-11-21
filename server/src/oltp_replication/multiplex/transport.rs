@@ -29,7 +29,7 @@ mod resolve;
 mod session;
 use resolve::{PeerResolver, ResolveError};
 pub(crate) use session::PeerFeature;
-use session::{PeerSessions, RawReply, SESSION_ALPN};
+use session::{INDEX_RECLAIM_ALPN, PeerSessions, RawReply, SESSION_ALPN, session_alpn};
 #[cfg(test)]
 mod tests;
 
@@ -688,11 +688,12 @@ impl Drop for RaftTransportTrace {
 pub(crate) enum RequestTarget {
     WorkerId(Uuid),
     Exact(WorkerIdentity),
+    Feature(Uuid, PeerFeature),
 }
 impl RequestTarget {
     pub(crate) fn worker_id(self) -> Uuid {
         match self {
-            Self::WorkerId(id) => id,
+            Self::WorkerId(id) | Self::Feature(id, _) => id,
             Self::Exact(worker) => worker.worker_id,
         }
     }
@@ -779,7 +780,7 @@ impl WorkerTransport {
             return Err(malformed("local certificate differs from enrollment"));
         }
         let (connector, acceptor) = if sessions_enabled {
-            tls.transports(&[SESSION_ALPN, ALPN])
+            tls.transports(&[INDEX_RECLAIM_ALPN, SESSION_ALPN, ALPN])
         } else {
             tls.transports(&[ALPN])
         };
@@ -906,7 +907,7 @@ impl WorkerTransport {
             return;
         };
         if let Some(pending) = pending
-            && stream.get_ref().1.alpn_protocol() == Some(SESSION_ALPN)
+            && session_alpn(stream.get_ref().1.alpn_protocol())
         {
             let Ok(certificate) = peer_digest(stream.get_ref().1.peer_certificates()) else {
                 return;
@@ -1356,9 +1357,10 @@ impl WorkerClient {
             purpose,
             phase: RaftTransportPhase::ResolvePeer,
         };
-        let (worker, expected) = match target {
-            RequestTarget::WorkerId(worker) => (worker, None),
-            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity)),
+        let (worker, expected, required) = match target {
+            RequestTarget::WorkerId(worker) => (worker, None, None),
+            RequestTarget::Exact(identity) => (identity.worker_id, Some(identity), None),
+            RequestTarget::Feature(worker, feature) => (worker, None, Some(feature)),
         };
         let peer = self.common.directory.resolve(worker)?;
         peer.validate()
@@ -1400,6 +1402,7 @@ impl WorkerClient {
                 header,
                 sections,
                 deadline,
+                required,
                 probe_resolving.take(),
                 &mut trace.phase,
             )

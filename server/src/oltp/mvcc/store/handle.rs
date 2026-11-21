@@ -32,6 +32,9 @@ pub(crate) use direct::LatestRead;
 pub(crate) use timestamp_point::PointEvidenceRead;
 
 pub(crate) trait RemoteParticipant: Send + Sync {
+    fn next_stored_index(&self, _after: Option<Uuid>) -> ParticipantFuture<'_, Option<Uuid>> {
+        Box::pin(async { Err(invalid()) })
+    }
     fn resolve_timestamp_point(
         &self,
         _authority: Authority,

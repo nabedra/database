@@ -140,6 +140,25 @@ impl Fixture {
         reply["data"].clone()
     }
 
+    async fn queued(&self, id: Uuid, op: &str, payload: Value) -> (Uuid, OwnedReceipt) {
+        let (status, accepted) = post(&self.app, "/v1/requests", TOKEN, id, op, payload).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{op}: {accepted}");
+        let run = serde_json::from_value(accepted["run_id"].clone()).unwrap();
+        loop {
+            let receipt = self.runtime.observe(run, id).await.unwrap();
+            if receipt.state.terminal() {
+                assert_eq!(
+                    receipt.state,
+                    RequestState::Succeeded,
+                    "{op}: {:?}",
+                    receipt.receipt
+                );
+                return (run, receipt);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn spawn_resume(
         &self,
         record: IndexRecord,
@@ -190,6 +209,7 @@ async fn open(path: &Path, cold: bool) -> Arc<WorkerRuntime> {
             max_pending_requests: 32,
             max_queue_bytes_per_replica: 8 << 20,
             max_retained_result_bytes_per_worker: 8 << 20,
+            result_retention_ms: 5_000,
             ..Default::default()
         },
         WorkerResources {
@@ -431,24 +451,10 @@ impl Fixture {
             ),
         ] {
             let id = Uuid::new_v4();
-            let (status, accepted) =
-                post(&self.app, "/v1/requests", TOKEN, id, op, payload.clone()).await;
-            assert_eq!(status, StatusCode::ACCEPTED, "{op}: {accepted}");
-            let run = serde_json::from_value(accepted["run_id"].clone()).unwrap();
-            let mut receipt = self.runtime.observe(run, id).await.unwrap();
-            while !receipt.state.terminal() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                receipt = self.runtime.observe(run, id).await.unwrap();
-            }
-            assert_eq!(
-                receipt.state,
-                RequestState::Succeeded,
-                "{op}: {:?}",
-                receipt.receipt
-            );
+            let (run, receipt) = self.queued(id, op, payload.clone()).await;
             let (status, replayed) = post(&self.app, "/v1/requests", TOKEN, id, op, payload).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{op} retry: {replayed}");
-            assert_eq!(replayed["run_id"], accepted["run_id"]);
+            assert_eq!(replayed["run_id"], json!(run));
             assert_eq!(
                 self.runtime.observe(run, id).await.unwrap().receipt,
                 receipt.receipt
@@ -639,6 +645,16 @@ async fn backfill_and_retirement() -> (usize, usize) {
 
     let ready_snapshot = fixture.pin_query("query.collect").await;
     let ready_plan = fixture.pin_query("query.explain").await;
+    let authority = fixture.runtime.index_authority(None).await.unwrap();
+    let backup_owner = crate::oltp::backup::BackupOwnerRef {
+        backup_id: Uuid::new_v4(),
+        attempt: 1,
+    };
+    let timestamps = &fixture.runtime.services.timestamps;
+    let backup = timestamps
+        .begin_backup(authority, backup_owner)
+        .await
+        .unwrap();
     let read_ts = ready_snapshot.read_ts;
     for category in [7, 8] {
         let entries = fixture.stored_index_rows(read_ts, category).await;
@@ -664,20 +680,51 @@ async fn backfill_and_retirement() -> (usize, usize) {
             false,
         )
         .await;
+    assert!(timestamps.advance_floor(authority).await.unwrap() <= read_ts.get());
     assert_eq!(ready_snapshot.result().await, changed(7));
     let plan = ready_plan.result().await;
     assert!(plan.as_str().unwrap().contains(INDEX), "{plan}");
-    let retained = fixture
-        .stored_index_rows(ReadTs::new(u64::MAX).unwrap(), 7)
+    let retained = fixture.stored_index_rows(backup.read_ts, 7).await.len();
+    assert_eq!(retained, 2, "the backup retained the old covering entries");
+    assert!(timestamps.advance_floor(authority).await.unwrap() <= backup.read_ts.get());
+    let reclaim =
+        index_holds::register_checkpoint(fixture.definition.index_id, Checkpoint::Reclaim);
+    timestamps
+        .cancel_backup(
+            authority,
+            crate::oltp::backup::lifecycle::VerifiedBackupCancelled::after_settlement(
+                crate::oltp::backup::lifecycle::BackupCancelledStatement {
+                    owner: backup_owner,
+                    pin: backup,
+                    archive_id: Uuid::new_v4(),
+                },
+            )
+            .unwrap(),
+        )
         .await
-        .len();
-    let reclaimed = tokio::time::timeout(Duration::from_secs(10), async {
+        .unwrap();
+    let first = reached(reclaim).await;
+    let synchronous = tests::call(
+        &fixture.app,
+        "table.update",
+        json!({
+            "table_id":fixture.definition.table_id,"key":5,"values":{"label":"during reclamation"}
+        }),
+    );
+    let queued = fixture.queued(Uuid::new_v4(), "table.update", json!({
+        "table_id":fixture.definition.table_id,"key":7,"values":{"label":"queued during reclamation"}
+    }));
+    tokio::join!(synchronous, queued);
+    first.release.send(false).unwrap();
+    assert_eq!(fixture.point(5).await, row(5, 7, "during reclamation"));
+    assert_eq!(
+        fixture.point(7).await,
+        row(7, 7, "queued during reclamation")
+    );
+    let participant = fixture.participant().await;
+    let reclaimed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            if fixture
-                .stored_index_rows(ReadTs::new(u64::MAX).unwrap(), 7)
-                .await
-                .is_empty()
-            {
+            if participant.next_stored_index(None).await.unwrap().is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -687,7 +734,7 @@ async fn backfill_and_retirement() -> (usize, usize) {
     fixture.close().await;
     assert!(
         reclaimed.is_ok(),
-        "retired Data entries remained after the snapshot readers released their pins"
+        "retired Data entries remained after the readers and backup released their pins"
     );
     (page_peak, retained)
 }
@@ -839,13 +886,12 @@ async fn acceptance_o12() {
         marker("never-plan-incomplete-index", "passed", json!("queued query plans, exact results and configured point-read path while Building; typed status at validation and the Prepared Ready transaction"));
         marker("concurrent-writes-exactly-once", "passed", json!("same-ID retries on synchronous and queued insert, move and delete; exact covering query results, counts and native index entries"));
         marker("recovery-and-retired-snapshots", "passed", json!("same-run actor recovery, cold worker restart, interrupted Ready reconciliation and held queries spanning publication and retirement"));
-        marker("bounded-resources", "not-run", json!({
+        let (before_run_bytes, after_run_bytes) = crate::oltp::mvcc::store::tests::index_reclamation_storage_evidence().await;
+        marker("bounded-resources", "passed", json!({
             "backfill_page_and_cursor_bytes":page_peak, "bound_bytes":128 << 20,
-            "retired_entries_still_visible_in_data_store":retained,
-            "reason":"retirement has no snapshot-safe Data reclamation",
+            "retained_entries_at_backup_cut":retained, "remaining_retired_namespaces":0,
+            "fault_fs_run_bytes_before":before_run_bytes,
+            "fault_fs_run_bytes_after":after_run_bytes, "run_bound_bytes":64 << 10,
         }));
-        // The original runner predates assertion markers. Keep it from
-        // counting the scenario as passed while retired disk data remains.
-        eprintln!("NABEDRA_OLTP_ACCEPTANCE {}", json!({"scenario":"O12","status":"not-run","reason":"retired index Data reclamation is missing"}));
     }).await.expect("O12 acceptance watchdog");
 }

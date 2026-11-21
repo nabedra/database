@@ -414,6 +414,7 @@ impl HostedGroupManager {
         let state = HostedState::new(machine, resident.clone())?;
         let running =
             RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
+        let _ = running.peer_features.set(self.client.clone());
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),

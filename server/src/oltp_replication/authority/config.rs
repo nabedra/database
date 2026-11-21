@@ -61,6 +61,9 @@ impl TypedConfig for DataConfig {
     fn accepts(kind: &crate::oltp_replication::types::GroupKind) -> bool {
         matches!(kind, crate::oltp_replication::types::GroupKind::Data { .. })
     }
+    fn requires_index_reclamation(command: &ParticipantCommand) -> bool {
+        matches!(command, ParticipantCommand::ReclaimIndex(_))
+    }
 }
 openraft::declare_raft_types!(
     pub(crate) CatalogConfig:

@@ -29,6 +29,16 @@ struct ReleasePause {
     resume: Arc<tokio::sync::Notify>,
 }
 impl TimestampHandle {
+    pub(crate) async fn advance_floor(&self, authority: Authority) -> Result<u64, ProtocolError> {
+        match self
+            .submit(TimestampCommand::AdvanceFloor { authority })
+            .await?
+            .reply
+        {
+            TimestampReply::Retention { safe_ts, .. } => Ok(safe_ts),
+            reply => Err(rejected(reply)),
+        }
+    }
     pub(crate) async fn begin_import_metadata(
         &self,
         authority: Authority,
