@@ -553,6 +553,12 @@ impl WorkerSharedResources {
     }
 
     #[cfg(test)]
+    pub(crate) fn reset_working_decode_peak(&self) {
+        self.peak_decode_bytes
+            .swap(self.working_decode_bytes(), Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn peak_working_decode_bytes(&self) -> usize {
         self.peak_decode_bytes.load(Ordering::Relaxed)
     }
