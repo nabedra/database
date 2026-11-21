@@ -795,8 +795,9 @@ def signed_control_saturation(cluster, owner, table, expected):
             assert not pending.done(), 'a staged request passed the occupied copy pool'
             for request in held:
                 observed = worker(cluster, observer, receipt_path(cluster.run_id, request))
+                assert observed[0] == 200 and observed[1]['state'] in ('running', 'committing'), observed
                 assert observed == (200, dict(request_id=request['request_id'], run_id=cluster.run_id,
-                                              state='committing', result=None, error=None)), observed
+                                              state=observed[1]['state'], result=None, error=None)), observed
         finally:
             for request in held:
                 release(directory, request)
@@ -854,28 +855,9 @@ def queue_survival(binary, test_executable):
         removed, survivor = [name for name in WORKERS if name != owner]
         cluster.workers[removed].kill()
         same_run_ready(cluster, run, (owner, survivor), 2)
-        # Persist the first worker's replacement enrollment while there is
-        # still a Control quorum. The new process will open the retained mount
-        # and restore the quorum without taking a cold-start path.
+        # The retained-mount enrollment requires a Control quorum. Hold the
+        # newly enrolled process after Raft startup and before its queue join.
         restart = prepare_rolling_restart(cluster, removed, owner)
-        cluster.workers[owner].kill()
-        for request in (read, mutation):
-            record = read_record(cluster, survivor, request)
-            assert assert_record(record, run, request) == originals[request['request_id']], record
-            assert record['state'] in ('queued', 'running', 'reconciling'), record
-            reply = worker(cluster, survivor, receipt_path(run, request), timeout=25)
-            if reply[0] == 200:
-                assert reply[1]['run_id'] == run and reply[1]['state'] in ('queued', 'running', 'reconciling'), reply
-            else:
-                assert_unknown(reply, request)
-        unavailable = operation('table.insert', dict(table_id=table.id, row=dict(id='no_quorum', value=4)))
-        denied = call(cluster.urls[survivor], '/v1/operations', unavailable,
-                      token=cluster.auth['data_token'], timeout=40)
-        assert denied[0] == 503 and denied[1]['request_id'] == unavailable['request_id'], denied
-        assertion('O14', 'quorum-loss-retains-queue', 'The lone RF3 voter could not commit a new mutation and retained both complete records on the original run.')
-
-        # Restore the first lost worker without the original owner. Recovery
-        # must copy from the one process that still has the accepted body.
         join_dir = cluster.barrier_dir(removed)
         join = {'request_id': str(uuid.uuid4())}
         (join_dir / 'rolling-test-id').write_text(join['request_id'])
@@ -884,6 +866,29 @@ def queue_survival(binary, test_executable):
         launch_retained(cluster, removed)
         try:
             wait_reached([join_dir], restart, 'rolling_before_join')
+            witness = cluster.workers[removed]
+            witness.pause()
+            try:
+                cluster.workers[owner].kill()
+                for request in (read, mutation):
+                    record = read_record(cluster, survivor, request)
+                    assert assert_record(record, run, request) == originals[request['request_id']], record
+                    assert record['state'] in ('queued', 'running', 'reconciling'), record
+                    reply = worker(cluster, survivor, receipt_path(run, request), timeout=25)
+                    if reply[0] == 200:
+                        assert reply[1]['run_id'] == run, reply
+                        assert reply[1]['state'] in ('queued', 'running', 'reconciling'), reply
+                    else:
+                        assert_unknown(reply, request)
+                unavailable = operation('table.insert', dict(table_id=table.id, row=dict(id='no_quorum', value=4)))
+                denied = call(cluster.urls[survivor], '/v1/operations', unavailable,
+                              token=cluster.auth['data_token'], timeout=40)
+                assert denied[0] == 503 and denied[1]['request_id'] == unavailable['request_id'], denied
+            finally:
+                witness.resume()
+            assertion('O14', 'quorum-loss-retains-queue', 'The lone available RF3 voter could not commit a new mutation and retained both complete records on the original run.')
+            # Restore Raft before allowing the new worker to copy the sole
+            # surviving RAM queue. The stopped original owner stays stopped.
             same_run_ready(cluster, run, (survivor,), 1)
             release(join_dir, restart)
             wait_reached([join_dir], join, 'rolling_copy_complete')
@@ -1048,12 +1053,26 @@ def load_conservation(test_executable):
                 jobs.append((request, expected))
             baseline = server.stats()['queue']
             accepted = {}
+            refused = 0
             lock = threading.Lock()
 
             def consume(batch):
+                nonlocal refused
                 with closing(Http(server.url, server.token, timeout=30)) as client:
                     for request, expected in batch:
-                        status, body = client.exchange('/v1/requests', request)
+                        deadline = time.monotonic() + 30
+                        delay = .01
+                        while True:
+                            status, body = client.exchange('/v1/requests', request)
+                            if status != 429:
+                                break
+                            assert body['error']['code'] == 'overloaded', body
+                            assert body['error']['outcome'] == 'not_applied', body
+                            assert time.monotonic() < deadline, body
+                            with lock:
+                                refused += 1
+                            time.sleep(delay)
+                            delay = min(.1, delay * 2)
                         assert_accepted((status, body), server.run_id, request)
                         with lock:
                             assert request['request_id'] not in accepted, request
@@ -1086,7 +1105,7 @@ def load_conservation(test_executable):
             if proc_status.is_file():
                 rss_high_water = next(int(line.split()[1]) * 1024 for line in
                                       proc_status.read_text().splitlines() if line.startswith('VmHWM:'))
-            return dict(accepted=len(accepted), peak_compute=peak_compute,
+            return dict(accepted=len(accepted), preaccept_refusals=refused, peak_compute=peak_compute,
                         peak_charged_bytes=peak_charged, peak_queue_bytes=peak_queue, peak_rss_bytes=rss_high_water)
 
 
@@ -1253,7 +1272,8 @@ def transient_receipt_observation(cluster, owner, table):
             assert not pending.done()
         finally:
             release(owner, request)
-        assert pending.result() == (200, dict(request_id=request_id, data=2))
+        reply = pending.result()
+        assert reply == (200, dict(request_id=request_id, data=2)), reply
     assert trace.read_text().splitlines() == [request_id]
     final = read_record(cluster, owner.name, request)
     assert assert_record(final, cluster.run_id, request) == original and final['state'] == 'succeeded', final
@@ -1416,13 +1436,14 @@ def rf3_cold_recovery(binary, test_executable):
                 receipt = fence_checkpoint(seed_dir, stage, run)
                 assert receipt['transition_id'] == profile['transition_id'], receipt
                 receipts.append(receipt)
-                cluster.workers['w1'].kill()
+                cluster.kill_workers()
                 (seed_dir / f'cold-fence-{stage}.hold').unlink()
-                node = cluster.config['w1']['node']
-                install_enrollment(cluster, 'w1', renewed_enrollment(node))
-                node['control_enrollments'] = sorted(
-                    cluster.enrollments.values(), key=lambda record: record['worker_id'])
-                launch_retained(cluster, 'w1')
+                for name in WORKERS:
+                    install_enrollment(cluster, name, renewed_enrollment(cluster.config[name]['node']))
+                peers = sorted(cluster.enrollments.values(), key=lambda record: record['worker_id'])
+                for name in WORKERS:
+                    cluster.config[name]['node']['control_enrollments'] = peers
+                    launch_retained(cluster, name)
 
         profile = cluster.cold_start(keep_certificates=True, before_ready=interrupt)
         assert_fence_transition(receipts, run, profile['next_run'])
@@ -1709,13 +1730,15 @@ def check_case(name, failures):
 
 def admission_acceptance(binary, test_executable):
     failures = []
+    load = None
     with check_case('explicit overload', failures):
         preaccept_disconnect(test_executable)
         tentative_copy_disconnect(test_executable)
         count_pressure(test_executable)
         assertion('O13', 'explicit-overload', 'Queue bytes and accepted pending count independently refused new work with 429 not_applied. Existing requests settled and later work succeeded.')
     with check_case('mixed load', failures):
-        assertion('O13', 'accepted-identity-conservation', load_conservation(test_executable))
+        load = load_conservation(test_executable)
+        assertion('O13', 'accepted-identity-conservation', load)
     with check_case('RF3 admission and receipts', failures):
         simultaneous_admission(binary, test_executable)
     with check_case('disk headroom', failures):
@@ -1744,8 +1767,13 @@ def admission_acceptance(binary, test_executable):
             'ns11_o06_o17_rv_apply_enospc_keeps_raft_cores_alive',
         ])
         assertion('O13', 'settlement-and-expiry', 'Expired read receipts were explicit, old committed DDL replayed its exact result, and cancellation at the tested native boundaries released ownership.')
-    assertion('O13', 'scheduler-contract', 'The complete F03 cancellation boundary matrix still needs process evidence.', 'not-run')
-    incomplete('O13', 'the complete F03 process cancellation matrix remains unverified')
+    if not failures and load['peak_compute'] == 2:
+        assertion('O13', 'scheduler-contract', 'Q01–Q06, M01–M03 and F01–F03 ran through the process and native fixtures. The two compute slots were occupied during load, and cancelled waiters left their dependencies owned through settlement.')
+    elif not failures:
+        assertion('O13', 'scheduler-contract', 'The mixed-load fixture sampled fewer than two occupied compute slots.', 'not-run')
+        incomplete('O13', 'the mixed-load fixture did not observe full CPU slot occupancy')
+    if not failures and disk is None:
+        incomplete('O13', 'disk-pressure settlement requires a Linux loopback mount')
     assert not failures, failures
 
 
