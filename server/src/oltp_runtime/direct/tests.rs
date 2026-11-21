@@ -2289,16 +2289,30 @@ struct Steered {
     next: AtomicU64,
     calls: AtomicU64,
     answered: AtomicU64,
+    /// Calls whose future was dropped before answering. Since PERF2a an idle
+    /// caller runs its call on its own task, so dropping the fetch cancels it.
+    abandoned: AtomicU64,
     hold: AtomicBool,
     stale: AtomicBool,
+}
+/// Counts a [`Steered`] call as abandoned unless it answered.
+struct Unanswered<'a>(&'a AtomicU64, bool);
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 }
 impl DirectTimestampSource for Steered {
     fn allocate_direct(&self, count: u64) -> ConsensusFuture<'_, DirectTimestampRange> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
+            let mut guard = Unanswered(&self.abandoned, false);
             while self.hold.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            guard.1 = true;
             let first = if self.stale.swap(false, Ordering::SeqCst) {
                 1
             } else {
@@ -2418,6 +2432,7 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
         next: AtomicU64::new(1_000),
         calls: AtomicU64::new(0),
         answered: AtomicU64::new(0),
+        abandoned: AtomicU64::new(0),
         hold: AtomicBool::new(false),
         stale: AtomicBool::new(false),
     });
@@ -2454,11 +2469,13 @@ async fn o09_perf2b_the_commit_timestamp_is_fetched_during_the_reads() {
     assert_eq!(missing, done("false"));
     assert_eq!(source.calls.load(Ordering::SeqCst), calls + 1);
     assert_eq!(cluster.last_index(leader), before, "nothing committed");
-    // The held call answers nobody once released; later calls follow it.
+    // The held call answers nobody once released (or was cancelled with
+    // the dropped fetch); later calls follow it.
     source.hold.store(false, Ordering::SeqCst);
     watchdog(|| async {
-        (source.answered.load(Ordering::SeqCst) == source.calls.load(Ordering::SeqCst))
-            .then_some(())
+        (source.answered.load(Ordering::SeqCst) + source.abandoned.load(Ordering::SeqCst)
+            == source.calls.load(Ordering::SeqCst))
+        .then_some(())
     })
     .await;
     let (version, _) = cluster.latest(leader, cluster.row_key(1)).await;
