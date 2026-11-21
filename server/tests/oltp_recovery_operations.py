@@ -178,6 +178,179 @@ def two_ready(cluster, survivors):
                .get('ready_workers') == 2 for name in survivors)
 
 
+def o06_o17_system_replacement_check(binary, test_executable, root):
+    cluster = Rf3Cluster(binary, root, mounts=True, test_executable=test_executable)
+    try:
+        cluster.start()
+        connection = cluster.admin('cluster.connection', {})
+        for name in WORKERS:
+            (cluster.barrier_dir(name) / 'inspect-control-leader').touch()
+
+        def control_leader(names):
+            leaders = []
+            for name in names:
+                cluster.stats(name)
+                if json.loads((cluster.barrier_dir(name) / 'control-leader.json').read_text()):
+                    leaders.append(name)
+            return leaders[0] if len(leaders) == 1 else None
+
+        victim = wait_for(lambda: control_leader(WORKERS), 'stable Control leader', PROBE_WINDOW)
+        survivors = [name for name in WORKERS if name != victim]
+        enrollment = cluster.enrollments[victim]
+        previous = {field: enrollment[field] for field in IDENTITY_FIELDS}
+        check = operation('worker.system_replacement.check',
+                          dict(run_id=connection['run_id'], previous=previous))
+
+        def observe(token=None):
+            return send(cluster.urls[survivors[0]], token or cluster.auth['admin_token'], check,
+                        path='/v1/cluster/operations', timeout=15)
+
+        def operator(name, request):
+            return send(cluster.urls[name], cluster.auth['admin_token'], request,
+                        path='/v1/cluster/operations', timeout=15)
+
+        status, reply = observe(cluster.auth['data_token'])
+        assert status in (401, 403), (status, reply)
+        status, reply = observe()
+        assert status == 409 and 'reachable' in json.dumps(reply), (status, reply)
+
+        held_advert = cluster.barrier_dir(survivors[0]) / 'hold-system-replacement-advert'
+        enable = operation('worker.system_replacement.enable', {})
+        held_advert.touch()
+        try:
+            status, reply = operator(victim, enable)
+            assert reply.get('error', {}).get('code') == 'unsupported_operation', (status, reply)
+        finally:
+            held_advert.unlink()
+        activation = success(*operator(victim, enable))
+        assert activation['capability'] == 'control.system-replacement.v1'
+
+        cluster.wait_direct_active()
+        send_op = lambda body: send(cluster.api_urls['api1'], cluster.auth['data_token'],
+                                    body, ca=cluster.ca)
+        table = create(send_op, 'rep3_preflight')
+        acknowledged = insert(table, 1, 77)
+        original = send_op(acknowledged)
+        assert success(*original) is None
+        queued = insert(table, 2, 88)
+        queued_id = queued['request_id']
+        for name in WORKERS:
+            write_json(cluster.barrier_dir(name) / 'gates.json', {queued_id: 'queued'})
+            write_json(cluster.barrier_dir(name) / 'inspect.json', [queued_id])
+        admitted = send(cluster.api_urls['api1'], cluster.auth['data_token'], queued,
+                        ca=cluster.ca, path='/v1/requests')
+        assert admitted == (202, dict(request_id=queued_id, run_id=cluster.run_id, state='queued')), admitted
+        for name in survivors:
+            cluster.stats(name)
+            saved = json.loads((cluster.barrier_dir(name) / f'record-{queued_id}.json').read_text())
+            assert saved['accepted'] and json.loads(saved['body']) == queued, saved
+
+        stopped_at = time.monotonic()
+        cluster.workers[victim].kill()
+        mount = Path(cluster.config[victim]['node']['directory'])
+        subprocess.run(['sudo', '-n', 'umount', str(mount)], check=True, timeout=60)
+        cluster.mounted.remove(mount)
+        assert not (mount / 'pool').exists()
+        wait_for(lambda: two_ready(cluster, survivors), 'surviving ready workers')
+        for name in survivors:
+            write_json(cluster.barrier_dir(name) / 'gates.json', {})
+
+        def reading():
+            status, reply = send_op(get(table, 1))
+            if status in (429, 503, 504):
+                return None
+            assert success(status, reply) == dict(id=1, value=77)
+            return time.monotonic()
+
+        first_read = wait_for(reading, 'read an acknowledged row after Control failover', PROBE_WINDOW)
+
+        cluster.workers[survivors[1]].pause()
+        try:
+            status, reply = observe()
+            assert status == 503, (status, reply)
+        finally:
+            cluster.workers[survivors[1]].resume()
+
+        def ready_to_check():
+            status, reply = observe()
+            return reply if status == 200 else None
+
+        wait_for(ready_to_check, 'Control quorum restored', PROBE_WINDOW)
+        data_group = initial_range(cluster, table)['group_id']
+        held = [cluster.barrier_dir(name) / f'hold-raft-{data_group}' for name in survivors]
+        for path in held:
+            path.touch()
+        try:
+            assert cluster.admin('cluster.connection', {}, worker=survivors[0])['run_id'] == cluster.run_id
+            status, reply = observe()
+            assert status == 503 and 'surviving RF3 quorum' in json.dumps(reply), (status, reply)
+        finally:
+            for path in held:
+                path.unlink()
+
+        def checked():
+            status, reply = observe()
+            if status == 503:
+                return None
+            return success(status, reply)
+
+        result = wait_for(checked, 'all affected groups have surviving quorum', PROBE_WINDOW)
+        expected = {group['identity']['group_id']
+                    for group in cluster.config[victim]['node']['placements'].values()}
+        expected.add(initial_range(cluster, table)['group_id'])
+        assert set(result['groups']) == expected, result
+        leader = wait_for(lambda: control_leader(survivors), 'new Control leader', PROBE_WINDOW)
+        assert success(*operator(leader, enable)) == activation
+        fresh = cluster.certificate('replacement')
+        fresh_mount = cluster.mount_pool('replacement', uid(), fresh)
+        intent = dict(id=uid(), run_id=cluster.run_id, previous=previous,
+                      next=fresh, mount=fresh_mount)
+        prepare = operation('worker.system_replacement.prepare', intent, intent['id'])
+        borrowed_cert = cluster.enrollments[survivors[0]]['certificate_sha256']
+        bad_mount = dict(fresh_mount, worker=dict(fresh_mount['worker'], certificate_sha256=borrowed_cert))
+        bad_intent = dict(intent, next=dict(fresh, certificate_sha256=borrowed_cert), mount=bad_mount)
+        status, reply = operator(leader, operation('worker.system_replacement.prepare', bad_intent, intent['id']))
+        assert status == 400, (status, reply)
+        prepared = success(*operator(leader, prepare))
+        assert prepared['intent'] == intent
+        assert {item['expected']['identity']['group_id'] for item in prepared['groups']} == expected
+        for plan in prepared['groups']:
+            assert len(plan['old']) == 3 and any(item['worker_id'] == previous['worker_id'] for item in plan['old'])
+            assert plan['learner']['worker_id'] == fresh['worker_id']
+            assert plan['learner']['pool_id'] == fresh_mount['identity']['pool_id']
+            assert plan['learner']['node_id'] not in [item['node_id'] for item in plan['old']]
+        for name in survivors:
+            assert success(*operator(name, prepare)) == prepared
+        for conflicting in (dict(intent, id=uid()),
+                            dict(intent, mount=dict(fresh_mount, provider_volume_id='docker-volume:other'))):
+            status, reply = operator(leader, operation('worker.system_replacement.prepare',
+                                                       conflicting, conflicting['id']))
+            assert status == 409, (status, reply)
+        assert send_op(acknowledged) == original
+        assert success(*send_op(get(table, 1))) == dict(id=1, value=77)
+        receipt_path = f'/v1/requests/{cluster.run_id}/{queued_id}'
+
+        def receipt():
+            status, reply = call(cluster.api_urls['api1'], receipt_path,
+                                 token=cluster.auth['data_token'], ca=cluster.ca, timeout=5)
+            if status in (429, 503, 504):
+                return None
+            assert status == 200 and reply['state'] not in ('failed', 'abandoned'), (status, reply)
+            return reply if reply['state'] == 'succeeded' else None
+
+        settled = wait_for(receipt, 'original queued receipt settled', PROBE_WINDOW)
+        assert settled == dict(request_id=queued_id, run_id=cluster.run_id, state='succeeded',
+                               result=None, error=None), settled
+        assert success(*send_op(get(table, 2))) == dict(id=2, value=88)
+        report('O06/O17 system replacement preflight', lost_control_leader=victim,
+               groups=len(expected), refused_live_worker=True, refused_without_quorum=True,
+               refused_missing_advert=True, refused_data_quorum=True, refused_reused_certificate=True,
+               replayed_intent=True, settled_receipts=1,
+               probe_recovery_seconds=round(first_read - stopped_at, 3))
+    finally:
+        cluster.close()
+
+
 def restart_during_split(cluster, send_op):
     table = create(send_op, 'rep1_split')
     rows = [{'id': key, 'value': key * 3} for key in (1, 9)]
@@ -475,7 +648,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--test-executable', required=True)
-    parser.add_argument('--suite', choices=('all', 'rollback', 'restart'), default='all')
+    parser.add_argument('--suite', choices=('all', 'rollback', 'restart', 'replacement-check'), default='all')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='nabedra-rep1-') as directory:
         root = Path(directory).resolve()
@@ -484,6 +657,9 @@ def main():
         if args.suite in ('all', 'restart'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_r01_r03_r06_retained_restart(args.binary, args.test_executable, root / 'restart')
+        if args.suite in ('all', 'replacement-check'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-check')
 
 
 if __name__ == '__main__':

@@ -13,6 +13,12 @@ struct Barrier {
 }
 static BARRIER: OnceLock<Option<Barrier>> = OnceLock::new();
 
+pub(crate) fn block_raft_for_test(group: Uuid) -> bool {
+    std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").is_some_and(|directory| {
+        PathBuf::from(directory).join(format!("hold-raft-{group}")).exists()
+    })
+}
+
 pub(super) async fn build_archive_split_index(
     runtime: std::sync::Arc<super::worker_runtime::WorkerRuntime>,
     directory: PathBuf,
@@ -99,6 +105,20 @@ pub(super) fn observe_data_voters(manager: &crate::oltp_replication::manager::Ho
         serde_json::to_vec(&state).unwrap(),
     )
     .unwrap();
+}
+
+pub(super) fn observe_control_leader(
+    manager: &crate::oltp_replication::manager::HostedGroupManager,
+    group: Uuid,
+) {
+    let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR").map(PathBuf::from)
+    else {
+        return;
+    };
+    if directory.join("inspect-control-leader").exists() {
+        let leading = manager.local_leads(group);
+        std::fs::write(directory.join("control-leader.json"), leading.to_string()).unwrap();
+    }
 }
 
 pub(super) fn observe_application_status_lookup(run: Uuid, id: Uuid) {

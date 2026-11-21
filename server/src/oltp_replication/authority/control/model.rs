@@ -172,6 +172,10 @@ impl ApiEnrollment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlCommand {
+    SystemRecovery {
+        operation_id: Uuid,
+        command: Box<super::SystemRecoveryCommand>,
+    },
     /// `data.direct.v1` adverts and activation. New in this build: see
     /// `control::direct` for the upgrade order.
     DirectCapability {
@@ -440,7 +444,8 @@ pub(crate) enum ControlCommand {
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
         match self {
-            Self::DirectCapability { operation_id, .. }
+            Self::SystemRecovery { operation_id, .. }
+            | Self::DirectCapability { operation_id, .. }
             | Self::ScopedQueue { operation_id, .. }
             | Self::EnsureScopedQueue { operation_id, .. }
             | Self::PoolDrain { operation_id, .. }
@@ -495,6 +500,9 @@ impl fmt::Display for ControlCommand {
 impl OwnedPayload for ControlCommand {
     fn heap_bytes(&self) -> Result<usize, ProtocolError> {
         Ok(match self {
+            Self::SystemRecovery { command, .. } => {
+                size_of::<super::SystemRecoveryCommand>() + command.heap_bytes()
+            }
             Self::ScopedQueue { action, .. } => {
                 size_of::<ScopedQueueOperation>() + action.heap_bytes()
             }
@@ -589,6 +597,8 @@ pub(crate) enum Fault {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ControlReply {
+    SystemReplacementEnabled(AppliedPosition),
+    SystemReplacementPrepared(Box<super::ReplacementRecord>),
     DirectCapability(super::DirectCapability),
     ScopedQueueUpdated,
     ScopedQueueTransfer(Box<super::ScopedQueueTransition>),

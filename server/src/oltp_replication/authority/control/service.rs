@@ -29,6 +29,7 @@ mod pool_drain;
 mod replacement;
 mod restart;
 mod scoped_queue;
+mod system_recovery;
 mod worker_drain;
 
 /// Authentication configuration, supplied by the operator rather than a worker

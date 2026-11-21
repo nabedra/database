@@ -18,6 +18,7 @@ pub(super) mod retirement;
 #[cfg(test)]
 mod shard_route;
 mod split;
+pub(super) mod system_recovery;
 mod worker_drain;
 use super::{
     admission::{DurableAdmission, ReservationResult},
@@ -1875,7 +1876,13 @@ impl HttpRuntime for WorkerRuntime {
     fn stats(&self) -> EndpointFuture<'_, EncodedResponse> {
         Box::pin(async move {
             #[cfg(test)]
-            super::recovery_tests::observe_data_voters(&self.services.manager);
+            {
+                super::recovery_tests::observe_data_voters(&self.services.manager);
+                super::recovery_tests::observe_control_leader(
+                    &self.services.manager,
+                    self.services.control.identity().group_id,
+                );
+            }
             let (queue, accept_to_dispatch) = {
                 let replica = self.services.replica.lock().map_err(|_| unknown())?;
                 #[cfg(test)]
