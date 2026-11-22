@@ -1,0 +1,52 @@
+{
+  "artifacts": [
+    {
+      "name": "w2-stream-nightly-b179692-182338--olap-stream-sim-nightly.log",
+      "sha256": "f5450d7bb7fe611af8f0bea57fd2f80b2d9f525f6f5e5628965b03b06f702e13"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "olap-stream-sim-nightly",
+  "duration_s": 220.961,
+  "guarantees": [
+    "OLAP-STR-G01",
+    "OLAP-STR-G02",
+    "OLAP-STR-G03",
+    "OLAP-STR-G04",
+    "OLAP-STR-G05",
+    "OLAP-STR-G06"
+  ],
+  "kind": "S H",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T18:24:04.368698+00:00",
+    "request_id": "w2-stream-nightly-b179692-182338",
+    "runner": "GitHub Actions 1000003928",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989"
+  },
+  "scenarios": [
+    "ST01",
+    "ST02",
+    "ST03",
+    "ST04",
+    "ST05",
+    "ST06"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

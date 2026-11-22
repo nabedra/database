@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "19250c1b3048b91b1d53013ffb50245e54710fc6",
+  "head": "e3dea900adf4349aaa9912e2799e545376ed7180",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -1746,10 +1746,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "Finite scans cover the batch boundaries",
@@ -1772,10 +1780,18 @@
           "state": "n/a"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1807,10 +1823,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted open retries cover the race",
@@ -1834,10 +1858,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1867,10 +1899,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "Directed reconnect and delivery cases cover the boundaries",
@@ -1894,10 +1934,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1928,10 +1976,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "Targeted coordinator kills exercise the checkpoint boundaries",
@@ -1955,10 +2011,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -1988,10 +2052,18 @@
           "state": "n/a"
         },
         "H": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "A single complete stop exercises the run boundary",
@@ -2015,10 +2087,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "reason": "The assertion depends on complete worker shutdown",
@@ -2047,9 +2127,18 @@
           "state": "n/a"
         },
         "H": {
-          "reason": "Scanned and delivered row counts detect repeated work directly",
-          "required": false,
-          "state": "n/a"
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
+          "failed": 0,
+          "last": "pass",
+          "required": true,
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "K": {
           "reason": "Planned read and reconnect trials cover the scan boundaries",
@@ -2076,10 +2165,18 @@
           "state": "missing"
         },
         "S": {
-          "executed": 0,
+          "behind": 5,
+          "checks": [
+            "olap-stream-sim-nightly"
+          ],
+          "date": "2026-11-22T18:24:04.368698+00:00",
+          "executed": 1,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45054822989",
+          "sha": "b17969285fc7719c4f434f6b17d2db98d883ad5c",
+          "state": "stale"
         },
         "U": {
           "executed": 0,
@@ -3991,5 +4088,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }
