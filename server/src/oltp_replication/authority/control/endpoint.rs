@@ -108,6 +108,13 @@ enum ReadRequest {
     /// as "not enabled".
     DirectFeatures,
     QueuedSnapshotRetryEnabled,
+    /// CAP1: one registered cluster feature (`ClusterFeatureState`). An
+    /// older Control leader rejects the unknown request, and one that does
+    /// not register the name answers an error; callers treat both as "not
+    /// enabled".
+    ClusterFeature {
+        name: String,
+    },
     ScopedQueueTransition {
         group_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,6 +210,7 @@ impl ReadRequest {
                 | Self::DirectCapability
                 | Self::DirectFeatures
                 | Self::QueuedSnapshotRetryEnabled
+                | Self::ClusterFeature { .. }
                 | Self::ScopedQueueTransition { .. }
                 | Self::ScopedQueuePredecessor { .. }
                 | Self::ScopedQueueEpochRetired { .. }
@@ -469,6 +477,11 @@ impl ControlEndpoint {
                 }
                 ReadRequest::DirectFeatures => {
                     let state = self.handle.direct_features(session.remote()).await?;
+                    self.shared
+                        .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
+                }
+                ReadRequest::ClusterFeature { name } => {
+                    let state = self.handle.cluster_feature(session.remote(), &name).await?;
                     self.shared
                         .encode_in(ByteClass::Progress, &state, HEADER_LIMIT)?
                 }
@@ -909,6 +922,20 @@ impl ControlClient {
     pub(crate) async fn direct_features(&self) -> Result<super::DirectFeatures, ProtocolError> {
         let reply = self.read(&ReadRequest::DirectFeatures).await?;
         Ok(*reply.decode_section::<super::DirectFeatures>(0)?)
+    }
+
+    /// CAP1: the strong Control view of one registered cluster feature for
+    /// this caller. An older Control answers an error: not enabled.
+    pub(crate) async fn cluster_feature(
+        &self,
+        name: &str,
+    ) -> Result<super::ClusterFeatureState, ProtocolError> {
+        let reply = self
+            .read(&ReadRequest::ClusterFeature {
+                name: name.to_owned(),
+            })
+            .await?;
+        Ok(*reply.decode_section::<super::ClusterFeatureState>(0)?)
     }
 
     pub(crate) async fn queued_snapshot_retry_enabled(&self) -> Result<bool, ProtocolError> {

@@ -584,6 +584,7 @@ impl RegisteredWorker {
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
             health: Arc::default(),
+            features: Arc::default(),
         });
         let mut restart_mount = None;
         let mut replacement_mount_committed = false;

@@ -711,7 +711,9 @@ where
     pub(crate) log: TypedLogStore<C>,
     pub(crate) state: HostedState<C, M>,
     pub(in crate::oltp_replication) membership_changes: tokio::sync::Mutex<()>,
-    pub(super) peer_features: OnceLock<super::multiplex::WorkerClient>,
+    /// CAP1: the cluster features the hosting worker observed enabled. Set
+    /// by the hosted-group manager; unset, no gated entry is proposed.
+    pub(crate) cluster_features: OnceLock<Arc<super::authority::control::EnabledFeatures>>,
     /// Guards the single direct-leadership watcher of a Data replica. The
     /// watcher follows every core of the host (RV-FINAL H1).
     pub(in crate::oltp_replication) direct_watch: std::sync::Once,
@@ -826,7 +828,7 @@ where
             log,
             state,
             membership_changes: tokio::sync::Mutex::new(()),
-            peer_features: OnceLock::new(),
+            cluster_features: OnceLock::new(),
             direct_watch: std::sync::Once::new(),
             deferred_applies: std::sync::Mutex::new(deferred_applies),
             retry,
@@ -951,13 +953,20 @@ where
     fn propose(&self, command: OwnedCommand<C::Command>) -> ConsensusFuture<'_, Applied<C::Reply>> {
         Box::pin(async move {
             command.ensure_charged()?;
-            let _membership = if C::requires_index_reclamation(command.payload()?) {
-                let guard = self.membership_changes.lock().await;
-                self.check_index_reclamation_voters()?;
-                Some(guard)
-            } else {
-                None
-            };
+            // CAP1: `ReclaimIndex` only once Control enabled
+            // `data.index.reclaim`: then every replica host decodes it, and
+            // Control refuses joiners whose build does not.
+            if C::requires_index_reclamation(command.payload()?)
+                && !self.cluster_features.get().is_some_and(|features| {
+                    features.enabled(super::authority::control::INDEX_RECLAIM_FEATURE)
+                })
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    "cluster feature data.index.reclaim is not enabled",
+                    Outcome::NotApplied,
+                ));
+            }
             // A full device: nothing would commit until space frees up, so
             // the leader says so before proposing (RV-APPLY F1).
             if self.retry.out_of_space() {
@@ -1046,45 +1055,6 @@ where
     }
 }
 
-impl<C, M> RaftConsensus<C, M>
-where
-    C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,
-    M: TypedMachine<C>,
-{
-    fn check_index_reclamation_voters(&self) -> Result<(), ProtocolError> {
-        use super::multiplex::{PeerFeature, TrafficClass};
-        use openraft::type_config::async_runtime::watch::WatchReceiver;
-
-        let local = self.state.resident().node_id();
-        let metrics = self.raft.metrics();
-        let metrics = metrics.borrow_watched();
-        if metrics.current_leader != Some(local)
-            || metrics.membership_config != metrics.committed_membership_config
-        {
-            return Err(unavailable());
-        }
-        let membership = metrics.membership_config.membership();
-        if membership.nodes().any(|(node, member)| {
-            *node != local
-                && self.peer_features.get().is_none_or(|client| {
-                    [TrafficClass::RaftProgress, TrafficClass::DataConsensus]
-                        .into_iter()
-                        .all(|class| {
-                            client
-                                .peer_supports(
-                                    member.worker_id,
-                                    class,
-                                    PeerFeature::IndexReclamation,
-                                )
-                                .is_none()
-                        })
-                })
-        }) {
-            return Err(unavailable());
-        }
-        Ok(())
-    }
-}
 impl<C, M> RaftConsensus<C, M>
 where
     C: TypedConfig<R = Applied<Option<<C as TypedConfig>::Reply>>>,

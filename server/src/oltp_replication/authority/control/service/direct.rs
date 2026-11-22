@@ -1,8 +1,9 @@
 //! `data.direct.v1` reads and the accepting leader's advert path.
 use super::*;
 use crate::oltp_replication::authority::control::{
-    DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
-    DirectCapabilityOperation, DirectFeatures, FeatureActivation, feature_operation_id,
+    ClusterFeatureState, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
+    DirectCapabilityOperation, DirectFeatures, FeatureActivation, cluster_feature,
+    feature_operation_id,
     machine::direct::{SNAPSHOT_RETRY_ENABLED, activation_key, batch_key, reader_key},
 };
 
@@ -44,6 +45,38 @@ impl ControlHandle {
                 view.encode(&DirectFeatures {
                     batch,
                     batch_advertised,
+                })
+            })
+            .await?;
+        machine::decode(raw.as_ref())
+    }
+
+    /// CAP1: one registered cluster feature's enablement and whether
+    /// `remote`'s current identity advertised it. A strong (linearizable)
+    /// read. A name this build does not register is invalid.
+    pub(crate) async fn cluster_feature(
+        &self,
+        remote: WorkerIdentity,
+        name: &str,
+    ) -> Result<ClusterFeatureState, ProtocolError> {
+        let feature = cluster_feature(name).ok_or_else(|| {
+            ProtocolError::new(
+                crate::protocol::ErrorCode::ValidationError,
+                "unknown Control cluster feature",
+                crate::protocol::Outcome::NotApplied,
+            )
+        })?;
+        let raw = self
+            .read(move |view| {
+                let enabled: Option<FeatureActivation> = load(view, feature.enabled_key)?;
+                let receipt = machine::key(b"ct/op/", feature_operation_id(feature.name, remote));
+                // As `machine::direct::supports_feature` reads it.
+                let advertised = load::<machine::Receipt>(view, &receipt)?.is_some_and(|receipt| {
+                    matches!(receipt.reply, ControlReply::DirectCapability(_))
+                });
+                view.encode(&ClusterFeatureState {
+                    enabled,
+                    advertised,
                 })
             })
             .await?;

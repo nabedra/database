@@ -3,6 +3,7 @@
 mod data_worker;
 mod direct;
 mod endpoint;
+mod features;
 mod forwarding;
 mod group_damage;
 mod growth;
@@ -18,13 +19,14 @@ mod worker_drain;
 
 pub(crate) use data_worker::{DataWorkerGrowthProof, DataWorkerIntent};
 pub(crate) use direct::{
-    DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
-    DirectCapabilityOperation, DirectFeatures, FeatureActivation, QUEUED_SNAPSHOT_RETRY_FEATURE,
-    feature_operation_id,
+    CLUSTER_FEATURES, ClusterFeatureState, DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation,
+    DirectCapability, DirectCapabilityOperation, DirectFeatures, FeatureActivation,
+    INDEX_RECLAIM_FEATURE, QUEUED_SNAPSHOT_RETRY_FEATURE, cluster_feature, feature_operation_id,
 };
 pub(crate) use endpoint::{
     ControlClient, ControlEndpoint, ControlRoutes, PublishedControlRoutes, ReplicaRoutes,
 };
+pub(crate) use features::{EnabledFeatures, spawn_watch as watch_cluster_features};
 pub(crate) use forwarding::{DataWorkerClient, ForwardedControl, HostedControlEndpoint};
 pub(crate) use group_damage::{
     GroupDamageReason, GroupDamageRecord, GroupDamageReplacement, GroupDamageReplacementPlan,

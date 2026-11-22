@@ -195,6 +195,9 @@ pub(crate) struct HostedGroupManager {
     damage_sink: Arc<Mutex<Option<Arc<dyn DamageSink>>>>,
     /// Retry, restart and stop counters of every core (`/v1/runtime/stats`).
     health: Arc<super::hosted::transient::RaftHealthStats>,
+    /// CAP1: the cluster features this worker observed enabled, shared with
+    /// every hosted core (gated proposals).
+    features: Arc<crate::oltp_replication::authority::control::EnabledFeatures>,
 }
 impl HostedGroupManager {
     fn hosted_data(
@@ -258,10 +261,17 @@ impl HostedGroupManager {
             starts: tokio::sync::Mutex::new(()),
             damage_sink: Arc::new(Mutex::new(None)),
             health: Arc::default(),
+            features: Arc::default(),
         })
     }
     pub(crate) fn resources(&self) -> &Arc<WorkerSharedResources> {
         &self.shared
+    }
+    /// CAP1: this worker's view of the enabled cluster features.
+    pub(crate) fn cluster_features(
+        &self,
+    ) -> &Arc<crate::oltp_replication::authority::control::EnabledFeatures> {
+        &self.features
     }
     #[cfg(test)]
     pub(crate) async fn test_transfer_data_snapshot(
@@ -523,7 +533,7 @@ impl HostedGroupManager {
         let state = HostedState::new(machine, resident.clone())?;
         let running =
             RaftConsensus::start_with(config, network, log, state, self.health.clone()).await?;
-        let _ = running.peer_features.set(self.client.clone());
+        let _ = running.cluster_features.set(self.features.clone());
         let endpoint = ReplicaEndpoint::new(
             running.raft.clone(),
             running.state.clone(),

@@ -5,7 +5,10 @@ use crate::oltp::mvcc::{
     index::{IndexPhase, IndexRecord},
     store::{ParticipantCommand, ParticipantReply, index_reclaim::ReclaimIndex},
 };
-use crate::oltp_replication::{authority::control::IdlePasses, owned::OwnedCommand};
+use crate::oltp_replication::{
+    authority::control::{INDEX_RECLAIM_FEATURE, IdlePasses},
+    owned::OwnedCommand,
+};
 use std::time::Duration;
 
 const INTERVAL: Duration = Duration::from_millis(250);
@@ -27,6 +30,12 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
         };
         if !runtime.accepting.load(Ordering::Acquire) {
             break;
+        }
+        // CAP1: no reclamation call or proposal before Control enabled
+        // `data.index.reclaim` (an older build decodes neither); the
+        // feature watch sets the flag.
+        if !runtime.index_reclaim_enabled() {
+            continue;
         }
         let started = tokio::time::Instant::now();
         let applied = runtime.services.control.applied_index();
@@ -74,6 +83,14 @@ pub(super) async fn reclaim_indexes(runtime: Weak<WorkerRuntime>) {
 }
 
 impl WorkerRuntime {
+    /// CAP1: Control enabled `data.index.reclaim`, as this worker observed.
+    pub(super) fn index_reclaim_enabled(&self) -> bool {
+        self.services
+            .manager
+            .cluster_features()
+            .enabled(INDEX_RECLAIM_FEATURE)
+    }
+
     async fn reclaim_index_step(
         &self,
         authority: Authority,

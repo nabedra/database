@@ -41,17 +41,21 @@ use tokio::{
 use tokio_rustls::{client, server};
 
 pub(super) const SESSION_ALPN: &[u8] = b"nabedra-otp/2";
-pub(super) const INDEX_RECLAIM_ALPN: &[u8] = b"nabedra-otp/3";
-/// RD3: `nabedra-otp/3` plus direct admission: the receiver handles direct
+/// RD3: `nabedra-otp/2` plus direct admission: the receiver handles direct
 /// requests (ingress on a Data group) in their own pools of
 /// `direct_handler_slots`, so a caller may keep that many in flight to it.
+/// It changes only the receiver's lanes, never a frame, entry or log
+/// format, so it stays a per-connection capability (CAP1).
+///
+/// CAP1: `nabedra-otp/3` (IDXGC1, index reclamation frames) is retired.
+/// Index reclamation is gated by Control's `data.index.reclaim` cluster
+/// feature, which also covers replicas that join later. Builds that offer
+/// otp/3 also offer otp/2 (and RD3's otp/4), so this build still negotiates
+/// a session with them.
 pub(super) const DIRECT_ADMISSION_ALPN: &[u8] = b"nabedra-otp/4";
 
 pub(super) fn session_alpn(alpn: Option<&[u8]>) -> bool {
-    matches!(
-        alpn,
-        Some(SESSION_ALPN | INDEX_RECLAIM_ALPN | DIRECT_ADMISSION_ALPN)
-    )
+    matches!(alpn, Some(SESSION_ALPN | DIRECT_ADMISSION_ALPN))
 }
 pub(super) const REPLY_PREFIX_BYTES: usize = 53;
 const FRAME_BYTES: usize = 13;
@@ -153,7 +157,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) enum PeerFeature {
     /// AppendEntries frames carrying more than one entry.
     MultiEntryAppend,
-    IndexReclamation,
     /// RD3: the receiver admits direct requests by its direct handler pool
     /// (`TransportConfig::direct_handler_slots`), not the ingress class's.
     DirectAdmission,
@@ -471,7 +474,6 @@ struct Waiters {
 struct ClientSession {
     enrollment: WorkerEnrollment,
     identity: WorkerIdentity,
-    index_reclamation: bool,
     direct_admission: bool,
     outgoing: mpsc::Sender<Outbound>,
     waiters: Mutex<Waiters>,
@@ -489,7 +491,6 @@ impl ClientSession {
     fn supports(&self, feature: PeerFeature) -> bool {
         match feature {
             PeerFeature::MultiEntryAppend => true,
-            PeerFeature::IndexReclamation => self.index_reclamation,
             PeerFeature::DirectAdmission => self.direct_admission,
         }
     }
@@ -502,14 +503,12 @@ impl ClientSession {
     ) -> Arc<Self> {
         let alpn = stream.get_ref().1.alpn_protocol();
         let direct_admission = alpn == Some(DIRECT_ADMISSION_ALPN);
-        let index_reclamation = direct_admission || alpn == Some(INDEX_RECLAIM_ALPN);
         let (read, write) = tokio::io::split(stream);
         let (outgoing, queue) = mpsc::channel(WRITE_QUEUE);
         let (closed, stop) = watch::channel(false);
         let received = Arc::new(AtomicU64::new(0));
         let session = Arc::new(Self {
             identity: WorkerIdentity::from(&enrollment),
-            index_reclamation,
             direct_admission,
             enrollment,
             outgoing,
@@ -1142,7 +1141,6 @@ impl PeerSessions {
         header: ChargedBytes,
         sections: [Option<ChargedBytes>; MAX_SECTIONS],
         deadline: Instant,
-        required: Option<PeerFeature>,
         mut probe_resolving: Option<&mut bool>,
         phase: &mut RaftTransportPhase,
     ) -> Result<RawReply, RequestError> {
@@ -1159,14 +1157,10 @@ impl PeerSessions {
                 .await?
             {
                 Route::Session(session) => session,
-                Route::OneShot(_) if required.is_some() => return Err(RequestError::Unreachable),
                 Route::OneShot(stream) => {
                     return one_shot(*stream, hello, header, sections, class, common, phase).await;
                 }
             };
-            if required.is_some_and(|feature| !session.supports(feature)) {
-                return Err(RequestError::Unreachable);
-            }
             match session
                 .call(hello, &header, &sections, deadline, phase)
                 .await

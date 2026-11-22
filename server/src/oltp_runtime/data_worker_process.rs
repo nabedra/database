@@ -440,10 +440,10 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                     },
                 )
                 .await;
-            for feature in [
-                crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE,
-                crate::oltp_replication::authority::control::QUEUED_SNAPSHOT_RETRY_FEATURE,
-            ] {
+            // Every registered cluster feature (CAP1's registry).
+            for feature in crate::oltp_replication::authority::control::CLUSTER_FEATURES
+                .map(|feature| feature.name)
+            {
                 #[cfg(test)]
                 if feature == crate::oltp_replication::authority::control::DIRECT_BATCH_FEATURE
                     && super::recovery_tests::take_fault("lose-batch-advert", local.worker_id)
@@ -553,6 +553,7 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
         }
         endpoint.release_join_mount()?;
         let manager = HostedGroupManager::new(shared.clone(), client.clone(), registry.clone());
+        let cluster_features = manager.cluster_features().clone();
         let (direct_catalog, direct_timestamps) = (catalog.identity.clone(), timestamps.clone());
         let scoped = if let Some(limits) = scoped_limits {
             let resolver = ScopedParticipants::new(shared.clone(), client.clone(), control.clone());
@@ -636,6 +637,16 @@ async fn start(config: Config, auth: Auth) -> Result<(), ProtocolError> {
                 local_timestamps: None,
             },
         );
+        // CAP1: this worker's hosted leaders gate `ReclaimIndex` on it.
+        let feature_control = control.clone();
+        direct.on_active(move || {
+            crate::oltp_replication::authority::control::watch_cluster_features(
+                &feature_control,
+                local,
+                &[crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE],
+                &cluster_features,
+            );
+        });
         direct.start();
         Ok(Arc::new(Joined {
             scope,
