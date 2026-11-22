@@ -470,6 +470,28 @@ def dump(cluster):
         print('\n'.join(matched), file=sys.stderr, flush=True)
 
 
+def create_d11_index(admin, definition):
+    delay = 0.05
+    for retries in range(8):
+        build_id = uid()
+        code, reply = admin('storage.index.create', definition, build_id)
+        refusal = {
+            'request_id': build_id,
+            'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'},
+        }
+        if code == 429 and reply == refusal and retries < 7:
+            # A refused declaration can leave a terminal failure for its build
+            # UUID. Keep the index definition and use a fresh build UUID only
+            # after this exact, definitive refusal.
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
+            continue
+        assert code == 200, ('storage.index.create', code, reply)
+        created = reply['data']
+        assert created['build_id'] == build_id, created
+        return build_id, created, retries
+
+
 def d11_index(url, token, ca, admin, stats):
     """D11 index publication racing direct writers. `admin(operation, payload, request_id)`
     runs an admin operation and returns `(status, reply)`; `stats()` returns
@@ -501,7 +523,10 @@ def d11_index(url, token, ca, admin, stats):
 
     def writer(index):
         client = Http(url, token, 30, ca)
-        target, next_key, revision = index, seed_count + index, 0
+        # Backfill starts at the low end of the primary key order. Keep the
+        # initial writer keys at the end so the build can start on untouched
+        # rows while writers switch to new keys after declaration.
+        target, next_key, revision = seed_count - writers + index, seed_count + index, 0
         acknowledged, refused = {}, 0
 
         def write(name, payload):
@@ -551,11 +576,8 @@ def d11_index(url, token, ca, admin, stats):
             index_id = uid()
             definition = {'table_id': table.id, 'index_id': index_id, 'name': 'by_category', 'columns': ['category'],
                           'covering': ['label']}
-            build_id = uid()
             started = time.monotonic()
-            code, created = admin('storage.index.create', definition, build_id)
-            assert code == 200, ('storage.index.create', code, created)
-            created = created['data']
+            build_id, created, create_retries = create_d11_index(admin, definition)
             selector = {'table_id': table.id, 'index_id': index_id, 'build_id': build_id, 'attempt': 1}
             deadline = time.monotonic() + 120
             state = created['state']
@@ -594,7 +616,7 @@ def d11_index(url, token, ca, admin, stats):
     direct_entries = direct(after, 'entries_proposed') - direct(before, 'entries_proposed')
     assert direct_entries > 0, 'the writer workload did not use the direct path'
     report('D11-index', table=table.id, rows=len(rows), acknowledged_rows=acknowledged_rows,
-           not_applied_errors=errors, index_state=state, status_retried=retried[:8],
+           not_applied_errors=errors, index_state=state, create_retries=create_retries, status_retried=retried[:8],
            status_retries=len(retried), ready_seconds=round(ready_seconds, 3),
            insert_acknowledged_while_building=True, update_acknowledged_after_ready=True,
            direct_entries=direct_entries,
