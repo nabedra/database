@@ -114,8 +114,8 @@ impl<M: Model> Outcome<M> {
         }
     }
 
-    /// A human-readable report: the verdict, and for a violation one numbered
-    /// line per trace step.
+    /// A human-readable verdict and, for a violation, a numbered trace.
+    /// Consecutive steps with the same action label can share one line.
     pub fn report(&self) -> String {
         match self {
             Outcome::Passed(e) => {
@@ -130,7 +130,7 @@ impl<M: Model> Outcome<M> {
                     "violated: {invariant}\ntrace ({} steps):\n",
                     trace.len().saturating_sub(1)
                 );
-                // A run of three or more identical actions (such as clock ticks) is
+                // A run of three or more identical debug labels (such as clock ticks) is
                 // printed once with its count and the state after the run.
                 let mut i = 0;
                 while i < trace.len() {
@@ -143,7 +143,10 @@ impl<M: Model> Outcome<M> {
                     let label = format!("{a:?}");
                     let mut j = i + 1;
                     while j < trace.len()
-                        && trace[j].0.as_ref().is_some_and(|b| format!("{b:?}") == label)
+                        && trace[j]
+                            .0
+                            .as_ref()
+                            .is_some_and(|b| format!("{b:?}") == label)
                     {
                         j += 1;
                     }
@@ -180,8 +183,8 @@ pub fn explore<M: Model>(model: &M, max_states: usize) -> Outcome<M> {
     let mut queue: VecDeque<usize> = VecDeque::new();
     let mut max_depth = 0usize;
 
-    let trace_to = |states: &Vec<M::State>,
-                    parent: &Vec<Option<(usize, M::Action)>>,
+    let trace_to = |states: &[M::State],
+                    parent: &[Option<(usize, M::Action)>],
                     mut i: usize|
      -> Vec<(Option<M::Action>, M::State)> {
         let mut rev = Vec::new();
@@ -274,18 +277,29 @@ mod tests {
     struct Counter {
         limit: u32,
         bad: Option<u32>,
+        starts: &'static [u32],
+    }
+
+    impl Counter {
+        fn new(limit: u32, bad: Option<u32>) -> Self {
+            Self {
+                limit,
+                bad,
+                starts: &[0],
+            }
+        }
     }
 
     impl Model for Counter {
         type State = u32;
         type Action = u32;
         fn init_states(&self) -> Vec<u32> {
-            vec![0]
+            self.starts.to_vec()
         }
         fn actions(&self, _: &u32, out: &mut Vec<u32>) {
-            // +1 first, so a depth-first search would find the long trace 1,1,1,1,1,1.
-            out.push(1);
+            // The +1 successor is queued last so a LIFO traversal takes it first.
             out.push(3);
+            out.push(1);
         }
         fn next_state(&self, s: &u32, a: &u32) -> Option<u32> {
             let n = s + a;
@@ -320,7 +334,7 @@ mod tests {
 
     #[test]
     fn counter_passes_and_counts_states() {
-        let out = explore(&Counter { limit: 10, bad: None }, 1_000);
+        let out = explore(&Counter::new(10, None), 1_000);
         match out {
             Outcome::Passed(e) => {
                 assert_eq!(e.states, 11, "states 0..=10");
@@ -333,12 +347,12 @@ mod tests {
 
     #[test]
     fn reachable_bad_state_gives_shortest_trace() {
-        let out = explore(&Counter { limit: 20, bad: Some(6) }, 1_000);
+        let out = explore(&Counter::new(20, Some(6)), 1_000);
         println!("{}", out.report());
         match out {
             Outcome::Violated { invariant, trace } => {
                 assert!(invariant.starts_with("counter-not-6"), "{invariant}");
-                // Shortest: 0 -> 3 -> 6. A depth-first search taking +1 first would give six steps.
+                // Shortest: 0 -> 3 -> 6. A LIFO traversal takes the longer branch.
                 let steps: Vec<_> = trace.iter().map(|(a, s)| (*a, *s)).collect();
                 assert_eq!(steps, vec![(None, 0), (Some(3), 3), (Some(3), 6)]);
             }
@@ -348,7 +362,7 @@ mod tests {
 
     #[test]
     fn violating_initial_state_has_one_step_trace() {
-        let out = explore(&Counter { limit: 5, bad: Some(0) }, 10);
+        let out = explore(&Counter::new(5, Some(0)), 10);
         match out {
             Outcome::Violated { trace, .. } => assert_eq!(trace, vec![(None, 0)]),
             other => panic!("expected Violated, got {other:?}"),
@@ -365,18 +379,44 @@ mod tests {
             other => panic!("expected LimitReached, got {other:?}"),
         }
         // A space of exactly max_states states is exhausted, not limited.
-        assert!(explore(&Counter { limit: 9, bad: None }, 10).is_passed());
+        assert!(explore(&Counter::new(9, None), 10).is_passed());
         assert!(matches!(
-            explore(&Counter { limit: 10, bad: None }, 10),
+            explore(&Counter::new(10, None), 10),
             Outcome::LimitReached(_)
         ));
     }
 
     #[test]
+    fn multiple_initial_states_share_budget_and_break_ties_in_order() {
+        let model = Counter {
+            starts: &[3, 3, 1],
+            ..Counter::new(5, Some(4))
+        };
+        assert!(matches!(
+            explore(&model, 0),
+            Outcome::LimitReached(Explored {
+                states: 0,
+                max_depth: 0
+            })
+        ));
+        assert!(matches!(
+            explore(&model, 2),
+            Outcome::LimitReached(Explored {
+                states: 2,
+                max_depth: 0
+            })
+        ));
+        match explore(&model, 3) {
+            Outcome::Violated { trace, .. } => assert_eq!(trace, vec![(None, 3), (Some(1), 4)]),
+            other => panic!("expected a one-step violation from the first start, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn report_collapses_repeated_actions() {
-        let out = explore(&Counter { limit: 20, bad: Some(5) }, 1_000);
+        let out = explore(&Counter::new(20, Some(5)), 1_000);
         let report = out.report();
-        // Shortest path to 5 is 1, 1, 3 (BFS tries +1 first): no run of three.
+        // Shortest path to 5 is 3, 1, 1: no run of three.
         assert!(report.contains("trace (3 steps)"), "{report}");
         struct Ticks;
         impl Model for Ticks {
@@ -401,7 +441,7 @@ mod tests {
 
     #[test]
     fn exploration_is_deterministic() {
-        let m = Counter { limit: 50, bad: Some(37) };
+        let m = Counter::new(50, Some(37));
         let a = explore(&m, 1_000).report();
         let b = explore(&m, 1_000).report();
         assert_eq!(a, b);
