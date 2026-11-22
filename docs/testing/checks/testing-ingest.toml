@@ -1,0 +1,11 @@
+id = "testing-ingest"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "test_ingest_evidence", "test_ledger_sync"]
+cwd = "scripts/testing"
+timeout_s = 60
+needs = []
+result_parser = "unittest"

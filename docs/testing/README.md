@@ -146,7 +146,10 @@ on that SHA. List recent runs with:
 gh run list -e schedule -L 5
 ```
 
-Its records feed the matrix like any other attested run.
+The evidence workflow imports attested records and opens an evidence-only PR. Once on `main`,
+those records feed the coverage matrix and the S3 budget. Use `gh workflow run nabedra-evidence.yml
+--ref main -f run_id=<id>` to retry a completed build run. Repository settings must let GitHub
+Actions create pull requests and allow auto-merge.
 
 ### 6. Read the matrix
 
@@ -195,6 +198,13 @@ If the dedicated bucket is available, export `NABEDRA_TEST_S3_BUCKET` and
 use your usual AWS credentials. On Actions, only dispatched and scheduled
 jobs can request the bucket-scoped role through GitHub OIDC. See
 `scripts/testing/s3/README.md` for setup.
+
+### 10. Publish workflow ledgers
+
+Run `python3 scripts/testing/ledger_sync.py <name>` from the checkout containing
+`.nabedra/workflows/<name>/`. It publishes UTF-8 Markdown and text in that directory to the orphan
+`ledgers` branch on origin. The branch is public. Its history preserves briefs and reports after
+local worktrees are removed.
 
 ## Rules that apply to every change
 
