@@ -37,8 +37,8 @@ that matter are elsewhere:
   someone else's run as yours.
 - Keep at most one full run per branch in flight. Dispatch only the jobs you need while iterating
   (`base=false` with `scenarios` or `tests`), and the full set once for final evidence.
-- Do not add workflow files on a task branch: they cannot be dispatched until they reach `main`.
-  Ask the workflow file's owner for a job or an input instead (see
+- A new workflow cannot be dispatched until it reaches `main`.
+  Coordinate new jobs and inputs with the workflow file's owner (see
   [hot files](../../nabedra-change/references/subagent-driven-development.md#prepare-the-work)).
 - Keep working while a run is queued or running. A queued job waits for a free runner; it is never
   cancelled for being queued.
@@ -64,12 +64,12 @@ The `build` job compiles the debug OLTP server and every OLTP test executable on
 tests that build downloads it instead of compiling.
 
 The `fuzz` job runs each target in `server/fuzz/fuzz_targets/` with a pinned Rust nightly. Crashes
-are available in the `fuzz-crashes` artifact. The `mutants` job runs cargo-mutants on Rust changes in
+are available in `fuzz-crashes-<target>`. The `mutants` job runs cargo-mutants on Rust changes in
 the server workspace since the merge base with `main`, and uploads `mutants-diff`.
 
-Each registered check uploads its `evidence/` directory as `evidence-<id>`. GitHub attests the JSON
-records on deliberate and nightly dispatches. The `checks` matrix takes up to eight runners, or
-seven when the dispatch also selects `fuzz`.
+Each registered check uploads its `evidence/` directory and command logs as `evidence-<id>`. GitHub
+attests the JSON records on deliberate and nightly dispatches. The `checks` matrix takes up to
+eight runners, or six with two reserved for the `fuzz` matrix.
 
 A check that declares `s3` uses GitHub OIDC only on deliberate or nightly dispatches. Configure
 `NABEDRA_TEST_S3_ROLE_ARN` and `NABEDRA_TEST_S3_BUCKET` as repository variables, with

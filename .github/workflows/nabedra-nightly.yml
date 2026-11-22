@@ -30,7 +30,7 @@ jobs:
         run: |
           sha=$(git rev-parse HEAD)
           if [ -f scripts/testing/run_check.py ] && python3 scripts/testing/run_check.py --help | grep -F -- --tier > /dev/null; then
-            checks=$(python3 scripts/testing/run_check.py --list --tier T2 | paste -sd, -)
+            checks=$(python3 scripts/testing/run_check.py --list --tier T2 | cut -f1 | paste -sd, -)
           else
             checks=$(python3 - <<'PY'
           from pathlib import Path
