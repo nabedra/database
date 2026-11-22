@@ -262,9 +262,9 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         control_group = victim_node['placements']['control']['identity']
         targets = [cluster.enrollments[name] for name in survivors]
         if variant in ('data-trust', 'voter-refresh'):
-            # A separate process with a Data-only directory and no inventory
-            # refresh uses a survivor's enrolled identity for Control reads.
-            # Give its listener a distinct endpoint and reuse its TLS name.
+            # A separate process with a Data-only directory uses a survivor's
+            # enrolled identity for Control reads. Give the listener its own
+            # endpoint and reuse the survivor's TLS name.
             identity = dict(targets[0], worker_id=uid(), incarnation=uid(), endpoint=f'127.0.0.1:{free_port()}')
             pin_node = cluster.config[survivors[0]]['node']
             data_peer_dir = root / 'data-trust'
@@ -772,8 +772,14 @@ def o17_check_second_control_replacement(
 
     def wait_for_voters(expected):
         path = data_peer_dir / 'control-voters.json'
-        wait_for(lambda: path.is_file() and set(json.loads(path.read_text())) == expected,
-                 'Data-only worker adopted the published Control voters', PROBE_WINDOW)
+        try:
+            wait_for(lambda: path.is_file() and set(json.loads(path.read_text())) == expected,
+                     'Data-only worker adopted the published Control voters', PROBE_WINDOW)
+        except AssertionError as error:
+            current = path.read_text() if path.is_file() else 'missing'
+            stats = (data_peer_dir / 'stats.json').read_text()
+            raise AssertionError(f'{error}. Current voters {current}, expected {sorted(expected)}. '
+                                 f'Control refresh stats {stats}') from error
 
     wait_for_voters({cluster.enrollments[actor]['worker_id'], old['worker_id'], first['worker_id']})
     probe_dir = cluster.root / 'second-old-peer'

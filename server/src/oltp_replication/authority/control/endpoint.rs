@@ -779,7 +779,7 @@ impl PublishedControlRoutes {
                     &ReadRequest::Group {
                         group_id: control.group.group_id,
                     },
-                    HEADER_LIMIT,
+                    64 << 10,
                     |reply| async move {
                         Ok((*reply.decode_section::<Option<GroupRecord>>(0)?).clone())
                     },
