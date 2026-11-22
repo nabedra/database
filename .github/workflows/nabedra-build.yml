@@ -1279,3 +1279,83 @@ jobs:
           name: perf1-factors-${{ matrix.factor }}
           path: perf1-out
           retention-days: 14
+
+  # SNAP1 (hardening): NS11 soaks before/after taking Raft snapshot export off the apply path.
+  # Opt-in with [ci snap1]. Before = nabedra/hardening bb6dc32 (main 70c4e7d merged), after = this commit.
+  # Runner numbers are relative; same driver, data, rates and NS11 caps for both binaries.
+  snap1-bin:
+    name: SNAP1 soak binary (${{ matrix.side }})
+    if: contains(github.event.head_commit.message, '[ci snap1]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: rust:1.94.1-bookworm
+    strategy:
+      matrix:
+        side: [before, after]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'before' && 'bb6dc324e00493ee4ae5d3735184811d29404fb3' || github.sha }}
+      - name: Build release nabedra-db (oltp)
+        working-directory: server
+        run: |
+          rustup default "$RUST_TOOLCHAIN"
+          cargo build --locked --release --no-default-features --features oltp --bin nabedra-db
+          mkdir -p ../snap1-bin && cp target/release/nabedra-db ../snap1-bin/nabedra-db-${{ matrix.side }}
+          echo "built ${{ matrix.side }}"; sha256sum ../snap1-bin/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snap1-binary-${{ matrix.side }}
+          path: snap1-bin
+          retention-days: 7
+
+  snap1-soak:
+    name: SNAP1 soaks (${{ matrix.rate }}/s)
+    needs: snap1-bin
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        rate: [100, 50]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snap1-binary-*
+          path: snap1-bin
+          merge-multiple: true
+      - name: Binaries and image
+        run: |
+          chmod +x snap1-bin/*
+          sha256sum snap1-bin/*
+          printf 'FROM python:3.11-slim-bookworm\nENV TOKIO_WORKER_THREADS=2\n' | docker build -t nabedra-perf-ci:1 -
+          nproc; free -m; df -h .
+      - name: Soaks
+        run: |
+          cd scripts
+          OUT="$GITHUB_WORKSPACE/snap1-out"; mkdir -p "$OUT"
+          SOAK="--soak --soak-rows 80000 --soak-payload-bytes 2048 --soak-seconds 300 --soak-phase-seconds 60 --clients 32 --soak-verify-keys 500"
+          for side in before after; do
+            name="soak${{ matrix.rate }}-$side"; rc=0; start=$(date +%s)
+            python3.11 benchmark_oltp_nabedra.py --image nabedra-perf-ci:1 --binary "$GITHUB_WORKSPACE/snap1-bin/nabedra-db-$side" \
+              --direct-oltp on --api-cpus none --seed 20261118 --timeout 10 --output "$OUT/$name" $SOAK --soak-rate ${{ matrix.rate }} \
+              > "$OUT/$name.console.log" 2>&1 || rc=$?
+            echo "$name rc=$rc seconds=$(( $(date +%s) - start )) load=$(cut -d' ' -f1-3 /proc/loadavg)" | tee -a "$OUT/runs.txt"
+          done
+      - name: Summary
+        if: always()
+        run: |
+          OUT="$GITHUB_WORKSPACE/snap1-out"
+          cat "$OUT/runs.txt" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/snap1/analyze_snap1.py "$OUT"/*/ --json "$OUT/snap1-summary.json" || true
+          python3.11 docs/testing/evidence/oltp/direct-latency/perf1-hardening/analyze.py "$OUT"/*/ --json "$OUT/perf1-summary.json" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap1-soak-${{ matrix.rate }}
+          path: snap1-out
+          retention-days: 14

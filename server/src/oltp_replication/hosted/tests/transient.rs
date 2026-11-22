@@ -435,3 +435,82 @@ async fn o06_rv_apply_oversized_reply_drops_the_responder() {
     assert_eq!(node.count().await, 2);
     node.consensus.shutdown().await.unwrap();
 }
+
+/// SNAP1 / O11 / O16: a policy snapshot build is a header-only cut. It writes
+/// no file, yet OpenRaft records it and purges the log up to it, and the
+/// purge never passes the applied index the cut synced. A follower that needs
+/// the state gets a fresh cut from `get_current_snapshot`: its metadata is the
+/// current applied position, it pins its view until its file is written (on
+/// the caller's task, not the state machine's), and the file's header and
+/// membership match that metadata exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snap1_o11_o16_policy_builds_write_nothing_and_current_snapshot_is_a_fresh_cut() {
+    use openraft::storage::RaftStateMachine as _;
+    let (_dir, path, fault) = fault_dir();
+    let layout = Layout::new();
+    let node = open_node(&path, &layout, &fault, Some(24)).await;
+    node.lead(&layout, true).await;
+    for id in 0..90 {
+        node.consensus
+            .propose(command(&node, id, "snapshot-cut"))
+            .await
+            .unwrap();
+    }
+    node.consensus
+        .raft
+        .wait(Some(Duration::from_secs(20)))
+        .metrics(
+            |m| m.snapshot.is_some_and(|s| s.index >= 48) && m.purged.is_some(),
+            "a policy cut and a purge",
+        )
+        .await
+        .unwrap();
+    let metrics = node.consensus.raft.metrics().borrow_watched().clone();
+    assert!(metrics.purged.unwrap().index <= metrics.snapshot.unwrap().index);
+    assert!(metrics.snapshot.unwrap().index <= metrics.last_applied.unwrap().index);
+    let snapshots = path
+        .join("snapshots")
+        .join(layout.group.group_id.to_string());
+    let files = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .map(|items| items.flatten().filter(|i| i.path().is_file()).count())
+            .unwrap_or(0)
+    };
+    assert_eq!(files(&snapshots), 0, "a policy build wrote a snapshot file");
+
+    let mut state = node.consensus.state.clone();
+    // Metrics trail the state machine: the cut names at least what they
+    // reported before it, and they reach exactly the cut's position.
+    let before = node.consensus.raft.metrics().borrow_watched().last_applied;
+    let current = state.get_current_snapshot().await.unwrap().unwrap();
+    assert!(
+        current.meta.last_log_id >= before,
+        "{:?} {before:?}",
+        current.meta
+    );
+    let cut_at = current.meta.last_log_id.clone();
+    node.consensus
+        .raft
+        .wait(Some(Duration::from_secs(20)))
+        .metrics(|m| m.last_applied >= cut_at, "metrics reach the cut")
+        .await
+        .unwrap();
+    let cut = current.snapshot.cut().unwrap().clone();
+    assert!(cut.pins_view());
+    assert_eq!(
+        files(&snapshots.join("outgoing")),
+        0,
+        "the cut wrote a file"
+    );
+    let file = current.snapshot.file().await.unwrap();
+    assert!(!cut.pins_view());
+    assert_eq!(file.header, cut.header);
+    assert_eq!(files(&snapshots.join("outgoing")), 1);
+    let checked = state.snapshot(file.clone()).await.unwrap();
+    assert_eq!(checked.meta, current.meta);
+    drop((file, checked, cut, current));
+    assert_eq!(files(&snapshots.join("outgoing")), 0);
+    assert!(running(&node));
+    assert_eq!(node.count().await, 90);
+    node.consensus.shutdown().await.unwrap();
+}
