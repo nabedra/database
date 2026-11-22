@@ -7,9 +7,9 @@
 #   api-cpus: 0.35 (NS11), 0.7, 1.0 or none
 # Before every run: wait until the 1-minute load average is below 3 (cap WAIT_CAP s), and log it.
 set -u
-REPO=${REPO:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/35d3dd65-a5b4f767b704f547}
-L=${L:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/perf1}
-BEFORE_BIN=/Users/antoniopenapena/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/bin/nabedra-db-5eb80fb
+REPO=${REPO:-$HOME/.t3/worktrees/nabedra-database/35d3dd65-a5b4f767b704f547}
+L=${L:-$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/perf1}
+BEFORE_BIN=$HOME/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/bin/nabedra-db-5eb80fb
 AFTER_BIN=${AFTER_BIN:?set AFTER_BIN to the [ci bench] binary of this branch}
 # nabedra-oltp-perf-builder:1.94.1 by ID, as in BENCH2
 IMAGE=sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc

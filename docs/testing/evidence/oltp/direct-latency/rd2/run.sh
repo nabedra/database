@@ -4,8 +4,8 @@
 #   workloads: serial (0.2/s x10), update (GC2 sweep with stop rules), fixed (200,300,400/s, no stop rules)
 #   labels pick the binary: cand* = RD2 bench binary, gc2* = GC2's 238b911
 set -u
-REPO=/Users/antoniopenapena/.t3/worktrees/nabedra-database/9583ea47-3a61458ee1324a02
-L=/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd2
+REPO=$HOME/.t3/worktrees/nabedra-database/9583ea47-3a61458ee1324a02
+L=$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd2
 IMAGE=sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc
 COMMON="--seed 20261118 --timeout 10"
 declare -A W=(

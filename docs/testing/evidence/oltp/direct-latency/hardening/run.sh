@@ -7,8 +7,8 @@
 # Settings are BENCH2's (docs/testing/evidence/oltp/direct-latency/final/run.sh); the sweep rates and the
 # 5-minute soaks are BENCH3's brief.
 set -u
-REPO=${REPO:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/9fbb3789-9817c99d5e1ba610}
-L=${L:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
+REPO=${REPO:-$HOME/.t3/worktrees/nabedra-database/9fbb3789-9817c99d5e1ba610}
+L=${L:-$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
 CAND_BIN=$L/bin/nabedra-db-c38a4a7
 MAIN_BIN=$L/bin/nabedra-db-6141321
 # nabedra-oltp-perf-builder:1.94.1 by ID (Docker Desktop sometimes fails to resolve the tag)

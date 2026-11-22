@@ -4,8 +4,8 @@
 #   workloads: serial (0.2/s x10), fixed (200,300,400,600/s, 64 clients, no stop rules)
 #   labels pick the binary: cand* = RD3 bench binary, base* = RD2's 22a1934 (bb6dc32 + RD2)
 set -u
-REPO=/Users/antoniopenapena/.t3/worktrees/nabedra-database/8f99b242-1667543e3074471c
-L=/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd3
+REPO=$HOME/.t3/worktrees/nabedra-database/8f99b242-1667543e3074471c
+L=$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd3
 IMAGE=sha256:1547483c44543b51e35b72fce17d9bf49d6b6f56c027dd5b634392006f83f7dc
 COMMON="--seed 20261118 --timeout 10"
 declare -A W=(

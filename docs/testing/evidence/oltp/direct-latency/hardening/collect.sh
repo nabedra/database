@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BENCH3: build this directory's compact evidence from the full run outputs in the ledger.
 set -eu
-L=${L:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
+L=${L:-$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
 cd "$(dirname "$0")"
 all=(); nab=(); soak=()
 for d in "$L"/runs/*/; do

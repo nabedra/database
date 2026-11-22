@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # RD2 controlled-host session: holds the Docker lane (BENCH) for all runs.
 set -u
-L=/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd2
-LANE=/Users/antoniopenapena/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/docker-lane.lock
+L=$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/rd2
+LANE=$HOME/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/docker-lane.lock
 until mkdir "$LANE" 2>/dev/null; do sleep 30; done
 echo "RD2 BENCH $(date)" > "$LANE/owner"
 trap 'rm -rf "$LANE"' EXIT

@@ -5,8 +5,8 @@
 #   e.g. session.sh w1 serial:cand-1,main-1,scylla-1 update-cr:cand,main update:scylla
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-L=${L:-/Users/antoniopenapena/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
-LANE=/Users/antoniopenapena/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/docker-lane.lock
+L=${L:-$HOME/.t3/worktrees/nabedra-database/nabedra-hardening-4cde81a5fa19a0c7/.nabedra/workflows/hardening/bench3}
+LANE=$HOME/.t3/worktrees/nabedra-database/remove-rocksdb/.nabedra/workflows/remove-rocksdb/docker-lane.lock
 name=$1; shift
 until mkdir "$LANE" 2>/dev/null; do sleep 30; done
 echo "BENCH3 BENCH window $name $(date)" > "$LANE/owner"
