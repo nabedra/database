@@ -296,6 +296,7 @@ async fn o12_hot_key_cannot_starve_backfill() {
         let fixture = Fixture::new().await;
         fixture.insert_rows(vec![row(0, 0, "seed")]).await;
         let record = fixture.declare().await;
+        fixture.assert_point(0, row(0, 0, "seed")).await;
         let owner = MaintenanceOwnerRef {
             catalog_group_id: fixture.runtime.services.catalog.participant().identity().group_id,
             table_id: fixture.definition.table_id,
@@ -320,11 +321,19 @@ async fn o12_hot_key_cannot_starve_backfill() {
                     let hold = hold.unwrap();
                     revision += 1;
                     assert!(revision <= MAX_QUEUED_MUTATION_ATTEMPTS as i64);
-                    let reply = tests::call(&fixture.app, "table.update", json!({
-                        "table_id":owner.table_id, "key":0,
-                        "values":{"category":revision,"label":format!("write {revision}")},
-                    })).await;
-                    assert_eq!(reply, true);
+                    let (status, reply) = post(
+                        &fixture.app,
+                        "/v1/operations",
+                        TOKEN,
+                        Uuid::new_v4(),
+                        "table.update",
+                        json!({
+                            "table_id":owner.table_id, "key":0,
+                            "values":{"category":revision,"label":format!("write {revision}")},
+                        }),
+                    ).await;
+                    assert_eq!(status, StatusCode::OK, "{reply}");
+                    assert_eq!(reply["data"], true);
                     next = index_holds::register_checkpoint(job, Checkpoint::RefreshPrepare);
                     hold.release.send(false).unwrap();
                 }
