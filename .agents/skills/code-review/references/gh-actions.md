@@ -19,9 +19,12 @@ that matter are elsewhere:
 
 ## What starts a run
 
-- **Nothing starts on push or commit.** A `[ci ...]` tag in a commit message does nothing.
+- **Nothing starts on push or commit.** A `[ci ...]` tag in a commit message does nothing. Runs
+  start only from a deliberate dispatch, the scheduled nightly, or the pull-request gate.
 - **A deliberate dispatch** is how agents start their runs. Each dispatch has its own concurrency
-  group, so no later push, commit or other agent's dispatch can cancel it.
+  group, so no later push, commit or other agent's dispatch can cancel it. The scheduled nightly is
+  the only other dispatch: it is pinned to the SHA of `main` when it starts, and it gets the same
+  protection.
 - **The nightly schedule.** At 01:17 UTC, `nabedra-nightly.yml` resolves `main` to a commit and
   dispatches its T2 checks and a one-hour fuzz run per target. It can also be started manually.
   The dispatch uses at most eight runners at a time and each run has its own concurrency group.
@@ -67,6 +70,12 @@ The `fuzz` job runs each target in `server/fuzz/fuzz_targets/` with a pinned Rus
 are available in `fuzz-crashes-<target>`. The `mutants` job runs cargo-mutants on Rust changes in
 the server workspace since the merge base with `main`, and uploads `mutants-diff`.
 
+The `checks` job installs only the tools a check declares in `needs`, plus Python 3.11. It does not
+build binaries or install packages for the check. A check that needs a binary, such as a release
+server or a client wheel, builds or installs it in its own command, for example a script under
+`scripts/testing/` that runs `cargo build` and then the suite. The job's time limit is the check's
+`timeout_s` plus 30 minutes for setup and that build, capped at six hours.
+
 Each registered check uploads its `evidence/` directory and command logs as `evidence-<id>`. GitHub
 attests the JSON records on deliberate and nightly dispatches. The `checks` matrix takes up to
 eight runners, or six with two reserved for the `fuzz` matrix.
@@ -75,7 +84,13 @@ A check that declares `s3` uses GitHub OIDC only on deliberate or nightly dispat
 `NABEDRA_TEST_S3_ROLE_ARN` and `NABEDRA_TEST_S3_BUCKET` as repository variables, with
 `NABEDRA_TEST_S3_REGION` if the bucket is outside `us-east-1`. Scope the role to the dedicated test
 bucket, and write under `runs/<request_id>/`. A missing role or bucket produces
-`not-run: s3-unconfigured`. The PR gate has no OIDC token or bucket credentials.
+`not-run: s3-unconfigured`. The PR gate has no OIDC token or bucket credentials. In the role's
+trust policy, require `token.actions.githubusercontent.com:sub` to match this repository's branch
+refs (`repo:<owner>/<repo>:ref:refs/heads/*`), so a `pull_request` token cannot assume it.
+
+With `jobs=docker`, the Events image job also runs the kind Events suite after NS27 when
+`scripts/testing/kind/suite_events.py` exists. That step does not fail the job until it has been
+verified on Actions.
 
 ## Dispatch, pinned to your commit
 

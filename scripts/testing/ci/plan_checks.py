@@ -2,6 +2,7 @@
 """Build a GitHub Actions matrix from the checks requested for a pinned revision."""
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -9,6 +10,9 @@ import tomllib
 
 
 NEEDS = {"docker", "kind", "node", "python-orm", "rust-nightly", "s3", "valkey"}
+# Setup, tool installation and the check's own build come on top of its timeout_s.
+SETUP_MINUTES = 30
+MAX_JOB_MINUTES = 360
 
 
 def check_matrix(requested, directory):
@@ -30,7 +34,11 @@ def check_matrix(requested, directory):
             not isinstance(need, str) or need not in NEEDS for need in needs
         ):
             raise ValueError(f"{manifest}: unsupported needs {needs!r}")
-        checks.append({"id": check_id, "tools": needs})
+        timeout_s = check.get("timeout_s", 3600)
+        if not isinstance(timeout_s, int) or isinstance(timeout_s, bool) or timeout_s < 1:
+            raise ValueError(f"{manifest}: timeout_s must be a positive integer")
+        minutes = min(MAX_JOB_MINUTES, math.ceil(timeout_s / 60) + SETUP_MINUTES)
+        checks.append({"id": check_id, "tools": needs, "timeout_minutes": minutes})
     return checks
 
 
