@@ -253,22 +253,35 @@ pub fn check_with(events: &[Event], opts: &Options) -> Verdict {
     Verdict::new(checked, anomalies)
 }
 
-fn checkpoints(p: &Partition, opts: &Options, sub: &str, op: &Op) -> (i64, i64) {
-    let mut confirmed = opts.start_offset.saturating_sub(1);
-    let mut possible = confirmed;
-    for ack in p
-        .acks
-        .iter()
-        .filter(|a| a.outcome != Outcome::Fail && a.call < op.ret_pos() && subscription(a) == sub)
-    {
-        if let Some(through) = ack_offset(ack) {
-            possible = possible.max(through);
+fn checkpoint_allowed(
+    acks: &[(&Op, String, i64)],
+    polls: &[&Op],
+    start_offset: i64,
+    sub: &str,
+    op: &Op,
+    checkpoint: i64,
+) -> bool {
+    let initial = start_offset.saturating_sub(1);
+    let mut confirmed = initial;
+    let mut possible = checkpoint == initial;
+    for (ack, subscription, through) in acks {
+        if subscription == sub && ack.call < op.ret_pos() {
+            possible |= checkpoint == *through;
             if ack.outcome == Outcome::Ok && ack.precedes(op) {
-                confirmed = confirmed.max(through);
+                confirmed = confirmed.max(*through);
             }
         }
     }
-    (confirmed, possible)
+    for &poll in polls {
+        if poll.outcome == Outcome::Ok
+            && poll.precedes(op)
+            && subscription(poll) == sub
+            && let Some(after) = poll_cursor(poll)
+        {
+            confirmed = confirmed.max(after);
+        }
+    }
+    possible && checkpoint >= confirmed
 }
 
 fn check_partition<'a>(
@@ -364,9 +377,9 @@ fn check_partition<'a>(
             } else {
                 malformed(op, "delivery has no valid offset", anomalies);
             }
-            if !possible
+            if possible
                 .get(&canon(&d.value))
-                .is_some_and(|&call| call < op.ret_pos())
+                .is_none_or(|&call| call >= op.ret_pos())
             {
                 anomalies.push(Anomaly::new(
                     "invented-event",
@@ -379,24 +392,48 @@ fn check_partition<'a>(
             }
         }
     }
-    for op in p.acks.iter().filter(|op| op.outcome == Outcome::Ok) {
-        let Some(through) = ack_offset(op) else {
-            malformed(op, "invalid acknowledgment offset", anomalies);
-            continue;
-        };
-        if let Some(reply) = op.complete_value.get("checkpoint") {
-            let sub = subscription(op);
-            let (known, possible) = checkpoints(p, opts, &sub, op);
-            if reply
-                .as_i64()
-                .is_none_or(|checkpoint| checkpoint < known.max(through) || checkpoint > possible)
-            {
-                malformed(
-                    op,
-                    "acknowledgment checkpoint is outside the possible acknowledged prefix",
-                    anomalies,
-                );
-            }
+    let mut acks = Vec::new();
+    for &op in p.acks.iter().filter(|op| op.outcome != Outcome::Fail) {
+        let sub = subscription(op);
+        let through = ack_offset(op).filter(|through| {
+            p.polls.iter().any(|poll| {
+                poll.outcome == Outcome::Ok
+                    && poll.precedes(op)
+                    && subscription(poll) == sub
+                    && delivered(poll).iter().any(|d| d.offset == Some(*through))
+            })
+        });
+        if let Some(through) = through {
+            acks.push((op, sub, through));
+        } else if op.outcome == Outcome::Ok {
+            malformed(
+                op,
+                "acknowledgment offset was not delivered to its subscription",
+                anomalies,
+            );
+        }
+    }
+    for (op, sub, through) in &acks {
+        if op.outcome == Outcome::Ok
+            && op.complete_value.get("checkpoint").is_some_and(|reply| {
+                reply.as_i64().is_none_or(|checkpoint| {
+                    checkpoint < *through
+                        || !checkpoint_allowed(
+                            &acks,
+                            &p.polls,
+                            opts.start_offset,
+                            sub,
+                            op,
+                            checkpoint,
+                        )
+                })
+            })
+        {
+            malformed(
+                op,
+                "acknowledgment checkpoint is outside the possible acknowledged prefix",
+                anomalies,
+            );
         }
     }
     for (c, offs) in &offsets_of {
@@ -460,15 +497,14 @@ fn check_partition<'a>(
             let ds = delivered(op);
             let cursor = poll_cursor(op);
             let redelivery = ds.first().is_some_and(|d| d.redelivered);
-            if let Some(after) = cursor {
-                let (confirmed, possible) = checkpoints(p, opts, sub, op);
-                if after < confirmed || after > possible {
-                    anomalies.push(Anomaly::new(
-                        "out-of-order",
-                        format!("partition {name:?} subscription {sub:?}: checkpoint {after} outside {confirmed}..={possible}"),
-                        op.indices(),
-                    ));
-                }
+            if let Some(after) = cursor
+                && !checkpoint_allowed(&acks, polls, opts.start_offset, sub, op, after)
+            {
+                anomalies.push(Anomaly::new(
+                    "out-of-order",
+                    format!("partition {name:?} subscription {sub:?}: checkpoint {after} is not a possible acknowledged offset"),
+                    op.indices(),
+                ));
             }
             let at_event = op.complete_index.unwrap_or(op.invoke_index);
             let mut prev: Option<i64> = None;
@@ -552,17 +588,16 @@ fn check_partition<'a>(
         .iter()
         .filter(|op| op.outcome == Outcome::Ok && delivered(op).is_empty())
     {
-        if let Some(after) = poll_cursor(op) {
-            if let Some((offset, _, published)) = acked_publishes
+        if let Some(after) = poll_cursor(op)
+            && let Some((offset, _, published)) = acked_publishes
                 .iter()
                 .find(|(o, _, w)| *o > after && w.precedes(op))
-            {
-                anomalies.push(Anomaly::new(
-                    "lost-publish",
-                    format!("partition {name:?}: empty poll after checkpoint {after} omitted acknowledged offset {offset}"),
-                    [published.indices(), op.indices()].concat(),
-                ));
-            }
+        {
+            anomalies.push(Anomaly::new(
+                "lost-publish",
+                format!("partition {name:?}: empty poll after checkpoint {after} omitted acknowledged offset {offset}"),
+                [published.indices(), op.indices()].concat(),
+            ));
         }
     }
 
@@ -581,11 +616,10 @@ fn check_partition<'a>(
             }
             _ => None,
         };
-        let acked = p
-            .acks
+        let acked = acks
             .iter()
-            .filter(|a| a.outcome != Outcome::Fail && a.call < heal.pos && subscription(a) == *sub)
-            .filter_map(|a| ack_offset(a))
+            .filter(|(op, subscription, _)| op.call < heal.pos && subscription == sub)
+            .map(|(_, _, through)| *through)
             .max()
             .unwrap_or(opts.start_offset.saturating_sub(1));
         let mut required = BTreeSet::new();

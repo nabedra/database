@@ -74,9 +74,9 @@ pub fn check_kv_with(events: &[Event], max_configs: usize) -> Verdict {
             return Verdict::malformed(format!("{} at event {} has no key", op.f, op.invoke_index));
         };
         if op.f == "cas"
-            && !payload(&op.invoke_value)
+            && payload(&op.invoke_value)
                 .as_array()
-                .is_some_and(|args| args.len() == 2)
+                .is_none_or(|args| args.len() != 2)
         {
             return Verdict::malformed(format!(
                 "cas at event {} needs [expected, new]",

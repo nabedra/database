@@ -385,7 +385,10 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
         let newer = acked_writes.iter().filter(|w2| {
             w2.precedes(r)
                 && match w {
-                    Some(w) => w.precedes(w2),
+                    Some(w) => {
+                        observed_before(w, w2, &seen)
+                            && !possible_rewrite(&writer[&canon(v)], w2, r)
+                    }
                     // A later operation can explain absence only if it could take effect
                     // between the write and this read.
                     None => {
@@ -423,7 +426,10 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
                     && epoch(r1).is_some()
                     && epoch(r1) == epoch(r2)
                     && w_new.is_some_and(|wn| match w_old {
-                        Some(w_old) => w_old.precedes(wn),
+                        Some(w_old) => {
+                            observed_before(w_old, wn, &seen)
+                                && !possible_rewrite(&writer[&canon(written(w_old))], wn, r2)
+                        }
                         None => {
                             !removals.iter().any(|d| can_remove_between(d, r1, r2))
                                 && !deadline_passed(wn, r2)
@@ -445,6 +451,19 @@ fn check_register(key: &str, ops: &[&Op], ctx: &Ctx, anomalies: &mut Vec<Anomaly
             ));
         }
     }
+}
+
+fn observed_before(old: &Op, next: &Op, reads: &[(&Op, Option<&Op>)]) -> bool {
+    old.precedes(next)
+        || reads.iter().any(|(read, source)| {
+            read.precedes(next) && source.is_some_and(|op| std::ptr::eq(op, old))
+        })
+}
+
+fn possible_rewrite(writers: &[&Op], newer: &Op, read: &Op) -> bool {
+    writers.iter().any(|writer| {
+        writer.outcome != Outcome::Fail && writer.call >= newer.call && writer.call < read.ret_pos()
+    })
 }
 
 fn deadline_passed(expiring: &Op, read: &Op) -> bool {

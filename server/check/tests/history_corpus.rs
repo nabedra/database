@@ -514,6 +514,20 @@ fn events_simulator_receipts_are_checked() {
     wrong_ack[9].value["checkpoint"] = serde_json::json!(2);
     assert!(queue::check(&wrong_ack).has("malformed-history"));
 
+    let invented_checkpoint = history(
+        r#"
+{"type":"invoke","process":0,"f":"publish","key":"p0","value":["a","b"]}
+{"type":"ok","process":0,"f":"publish","key":"p0","value":[1,2]}
+{"type":"invoke","process":1,"f":"poll","key":"p0"}
+{"type":"ok","process":1,"f":"poll","key":"p0","value":{"after":0,"events":[[1,"a"],[2,"b"]]}}
+{"type":"invoke","process":1,"f":"ack","key":"p0","value":{"after":0,"through":2}}
+{"type":"info","process":1,"f":"ack","key":"p0"}
+{"type":"invoke","process":2,"f":"poll","key":"p0"}
+{"type":"ok","process":2,"f":"poll","key":"p0","value":{"after":1,"events":[[2,"b"]]}}
+"#,
+    );
+    assert!(queue::check(&invented_checkpoint).has("out-of-order"));
+
     let mut timeout_before_gap = history(
         r#"
 {"type":"invoke","process":0,"f":"publish","key":"p0","value":"a"}
@@ -567,6 +581,20 @@ fn relaxed_kv_review_cases() {
         ..Default::default()
     };
     assert!(relaxed_kv::check_with(&stale, &bound).has("lost-write"));
+
+    let observed_info = history(
+        r#"
+{"type":"invoke","process":0,"f":"set","key":"k","value":1}
+{"type":"info","process":0,"f":"set","key":"k"}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"value":1,"epoch":1}}
+{"type":"invoke","process":2,"f":"set","key":"k","value":2}
+{"type":"ok","process":2,"f":"set","key":"k","value":{"epoch":1}}
+{"type":"invoke","process":1,"f":"get","key":"k"}
+{"type":"ok","process":1,"f":"get","key":"k","value":{"value":1,"epoch":1}}
+"#,
+    );
+    assert!(relaxed_kv::check(&observed_info).has("stale-read"));
 
     let mut reset = stale;
     reset[2].f = "cold-reset".into();

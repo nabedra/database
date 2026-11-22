@@ -527,12 +527,11 @@ pub fn check(events: &[Event]) -> Verdict {
     }
 
     anomalies.extend(g.cycles(&txns));
-    if anomalies.is_empty() {
-        if let Some(anomaly) =
+    if anomalies.is_empty()
+        && let Some(anomaly) =
             check_register_order(&g, &reads, &writes, &reg_writers, &in_graph, &txns)
-        {
-            anomalies.push(anomaly);
-        }
+    {
+        anomalies.push(anomaly);
     }
     Verdict::new(txns.len(), anomalies)
 }
