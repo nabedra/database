@@ -283,8 +283,11 @@ async fn exercise_case(case: &str) {
                 change: Change::Put(value),
             }];
             assert!(
-                backend.commit(attempt, plan).await.is_err(),
-                "metadata cleanup authorized a Data mutation"
+                matches!(
+                    backend.commit(attempt, plan).await,
+                    Ok(IndexCommitOutcome::Aborted(_))
+                ),
+                "metadata cleanup must yield a settled abort"
             );
             let status = runtime
                 .services
