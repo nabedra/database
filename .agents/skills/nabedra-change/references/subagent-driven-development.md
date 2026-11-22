@@ -11,7 +11,7 @@ runners, and integration changes as tasks where the plan calls for them.
    Read the approved plan, its spec, and applicable repository instructions.
    If the work needs an implementation plan, follow the planning rules in that
    skill before dispatching.
-2. Keep a Markdown ledger in an ignored directory such as
+2. Keep a Markdown ledger in the workflow ledgers worktree, such as
    `.nabedra/workflows/<branch-and-plan>/`. Record the plan or task brief, base
    commit, and a TODO table with columns for task ID, dependencies, file or
    resource ownership, acceptance checks, status, and agent or commit. Put task
@@ -29,9 +29,9 @@ runners, and integration changes as tasks where the plan calls for them.
    guarantee registers (`docs/testing/guarantees/*`), `docs/testing/modules.toml`,
    the coverage matrix (`docs/testing/coverage-matrix.*`) and the test catalog
    (`docs/testing/catalog.json`). The lead regenerates the matrix and the catalog
-   after each merge. Give each
-   hot file one owner for the wave in the ledger's ownership column: the task
-   with the largest change there, or the lead for CI files. Only the owner
+   after each merge. Give each hot file one owner for the wave and record it
+   in the ledger. Default to the task with the largest change there, or to
+   the lead for CI files. Only the owner
    commits to a hot file. A task that needs a change in a hot file it does not
    own stops editing that file. It sends the exact change (a diff or a precise
    description) and the reason to the lead, in its report or a message, and
@@ -43,7 +43,7 @@ runners, and integration changes as tasks where the plan calls for them.
    wave. Assign an owner task to every `unassigned` row and decide every
    expired row, following
    [the quarantine protocol](../../code-review/references/gh-actions.md#quarantine).
-   Brief agents that CI runs only on deliberate dispatch, as described in
+   Follow the dispatch procedure in
    [GitHub Actions for checks](../../code-review/references/gh-actions.md).
 
 For worker execution or recovery changes, follow [AGENTS.md](../../../../AGENTS.md).
@@ -81,13 +81,13 @@ Each task has three roles, filled by separate agents:
 
 | Role | Works from | Delivers |
 | --- | --- | --- |
-| Implementer | The brief and the plan | The change, and T0 results on each commit. It never records its own work as verified. |
-| Adversarial tester | The affected guarantees and the diff, not the implementer's notes | New tests that fail on the bug corpus, a mutant of the touched code or a reverted fix before they count |
-| Reviewer | The brief, the diff, the tester's results and the T1 evidence on the final SHA | Verdicts per guarantee, and blocking findings |
+| Implementer | The brief and the plan | The change, applicable T0 results before each commit, and raw results for the checks it ran |
+| Adversarial tester | The affected guarantees and the diff, independently of the implementer's notes | Tests that catch relevant cases from the bug corpus, mutants of the touched code or reverted fixes |
+| Reviewer | The brief, the diff, the tester's results and applicable T1 evidence on the final SHA | Verdicts per guarantee and blocking findings |
 
-The tester runs on a different model from the implementer. The reviewer did
-not author the change. A task is complete only with the reviewer's approval
-and no open blocking finding. See
+The tester runs on a different model from the implementer. A task is
+complete after a non-author reviewer approves it and all blocking findings
+are resolved. See
 [the verification rules](../../code-review/SKILL.md#verification-rules).
 
 Give each agent a brief with the task ID, relevant requirements, agreed
@@ -100,10 +100,11 @@ subsequent agents can find the relevant evidence.
 
 ## Review each task before integration
 
-1. When the implementer reports completion, give a fresh reviewer the brief,
-   implementation report, and task diff. Use the task's recorded base and
-   final commit for an isolated checkout. In a shared checkout, scope the diff
-   to the task's owned paths, including new files.
+1. Give the adversarial tester the affected guarantees and task diff
+   once the diff is ready. Give a fresh reviewer the brief, implementation
+   report, task diff and tester's results. Use the task's recorded base and
+   final commit for an isolated checkout. In a shared checkout, scope the
+   diff to the task's owned paths, including new files.
 2. Ask for separate verdicts on compliance with the brief and code quality.
    Apply the relevant checks from [code-review](../../code-review/SKILL.md),
    including regression coverage. The lead coordinates the review rubric.

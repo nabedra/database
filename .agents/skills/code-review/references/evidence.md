@@ -1,11 +1,11 @@
 # Evidence
 
-A guarantee is verified only by attested evidence on the SHA being shipped. This page says what a
-record holds, how one is produced and signed, and how the coverage matrix reads records.
+A guarantee is verified only by attested evidence on the SHA being shipped.
 
 ## Checks
 
-Each runnable check is one file, `docs/testing/checks/<id>.toml`, whose `id` equals the file name:
+Each runnable check is one file, `docs/testing/checks/<id>.toml`. The `id`
+equals the filename stem.
 
 ```toml
 id = "kv-store-model"
@@ -26,16 +26,19 @@ env = { NABEDRA_CASES = "1000" } # optional
 
 ## Run a check
 
+Set `CHECK_ID` to the check you want to run.
+
 ```sh
 python3 scripts/testing/run_check.py --list --tier T0   # the checks in a tier
-python3 scripts/testing/run_check.py <id>               # run one and write its record
+python3 scripts/testing/run_check.py "$CHECK_ID"        # run one and write its record
 ```
 
 `run_check.py` runs the check's command, parses its results with `result_parser` and writes one
 record. A check whose `needs` are missing writes `not-run` with the reason instead of failing. For
 example, without `NABEDRA_TEST_S3_BUCKET` an S3 check writes `not-run: s3-unconfigured`. On
-Actions, the `checks` input of `nabedra-build.yml` runs a comma-separated list of check IDs the
-same way. Rust tests write records through `nabedra_check::evidence::Record`.
+Actions, the `checks` input of `nabedra-build.yml` runs a comma-separated
+list of check IDs. Rust tests can write records through
+`nabedra_check::evidence::Record`.
 
 ## Record format
 
@@ -77,7 +80,7 @@ counts.
 
 | State | Meaning | Counts as green |
 | --- | --- | --- |
-| `pass` | Assertions executed and passed on the cell's SHA | yes, for that SHA only |
+| `pass` | The required assertions executed and passed on the cell's SHA | yes, for that SHA only |
 | `fail` | An assertion failed | no |
 | `not-run: <reason>` | The check did not execute, for example `s3-unconfigured`, `cloud-deferred` or `hardware-deferred` | no |
 | `quarantined n/5` | The check is in quarantine, with its pass count | no |
@@ -85,10 +88,12 @@ counts.
 | `n/a` | The register gives a reason the kind does not apply | not required |
 | `missing` | No record exists | no |
 
-`not-run` never counts as green, whatever its reason. `matrix.py gate --sha <sha> --scope release`
-fails unless every in-scope cell passed on that SHA. The orchestrator regenerates the matrix after
-each merge, and the test catalog (`docs/testing/catalog.json`, written by
-`scripts/testing/catalog.py`) with it. Both are hot files.
+`not-run` never counts as green, whatever its reason. A deferred kind stays
+in the register's Checks column and appears as `not-run`, with the deferral
+reason. The release gate lists deferred cells by name.
+`matrix.py gate --sha <sha> --scope release` requires a pass on that SHA
+for every in-scope cell. The lead regenerates the matrix and the test
+catalog (`docs/testing/catalog.json`) after each merge. Both are hot files.
 
 ## Report evidence
 

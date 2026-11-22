@@ -1,15 +1,15 @@
 # Guarantees and assurance levels
 
 Every module states what it promises in a guarantee register, one file per module in
-`docs/testing/guarantees/<module>.md`. A review starts from the guarantees a diff can affect, not
-from the tests that happen to exist.
+`docs/testing/guarantees/<module>.md`. Start the review with the guarantees the diff can affect.
 
 ## Find the affected IDs
 
-1. Select the checks for the diff:
+1. Set `BASE_SHA` and `HEAD_SHA` to the commits under review and select
+   the checks for the diff.
 
    ```sh
-   python3 scripts/testing/matrix.py select --base <base sha> --head <head sha>
+   python3 scripts/testing/matrix.py select --base "$BASE_SHA" --head "$HEAD_SHA"
    ```
 
    It maps each changed path through `docs/testing/modules.toml` to a module, each module to its
@@ -22,8 +22,9 @@ from the tests that happen to exist.
 4. Add guarantees the path map misses. Typical cases are a shared type, a wire or on-disk format
    another module reads, a configuration default, or a protocol whose caller lives elsewhere.
    Give the reason in the rubric.
-5. A changed path that maps to no module, or a new test that maps to no guarantee, fails the matrix
-   build. Ask the owner of `modules.toml` to add the mapping. Do not drop the test.
+5. A test that maps to no guarantee fails the matrix build. If a code path
+   lacks a module or a test lacks a guarantee, send the missing mapping
+   to the owner of `docs/testing/modules.toml` or the corresponding check file.
 
 The rubric then lists the selected checks, the assurance level and the affected guarantees. It
 covers each guarantee or states why it does not apply, and gives a reason for every check it adds
@@ -43,9 +44,10 @@ In that table:
 - **ID** uses the module prefix and a number, such as `OLTP-G04` or `KV-G02`. IDs are never reused.
 - **Checks** is a space-separated list of the kind letters below, such as `M S H R`.
 - **n/a** holds `<kind>: <reason>` entries separated by `;`, or is empty.
-- A check that needs cloud compute reads `R: cloud-deferred (<what>)` in n/a and keeps R in
-  Checks, so it stays required when cloud compute returns. A check that waits for dedicated
-  hardware uses the same form with `hardware-deferred`.
+- For a check that needs cloud compute, put `R: cloud-deferred (<what>)` in
+  the `n/a` column and keep R in Checks. For a check that needs dedicated
+  hardware, use `<kind>: hardware-deferred (<what>)` and keep its kind in
+  Checks. Both deferrals remain visible as `not-run` cells.
 
 ```text
 | ID | Guarantee | Failure model | Scenarios | Checks | n/a |

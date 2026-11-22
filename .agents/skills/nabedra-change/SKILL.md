@@ -9,19 +9,20 @@ When you are given a task or asked to make a change, do the following:
 2. For the thread, create a branch in git called `nabedra/<task-title-name>` and continue the work of your thread in that branch and worktree
 3. Always when you are done with the implementation, tell the user you are ready to run the code review (he might want you to add more features). If he asks for the review, run a deep code review/QA using the `code-review` skill of this repo
 4. When you are done, file a PR in GitHub
-5. For docs-only changes, review the diff and skip tests and GitHub Actions.
+5. For docs-only changes, review the diff, examples and links locally. Skip
+   runtime tests and GitHub Actions.
    Put `[skip ci]` in the PR head commit message and in the commit message that
    lands on the base branch. For other changes, run the applicable checks and
    tests, including GitHub Actions dispatched on the PR's head commit when
-   appropriate. Wait for the merge-gate checks that start when you open the PR,
-   fix failures, and rerun the affected checks. Once all
-   applicable checks and tests pass, merge the PR automatically if you have
-   permission.
+   appropriate. Wait for the applicable PR gate, fix failures, and rerun
+   affected checks. Before merging any PR, confirm that the applicable checks
+   pass and the [non-author reviewer](../code-review/SKILL.md#verification-rules)
+   approves.
 6. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.
-Pushes start no CI: dispatch runs as described in
+Pushes alone start no CI. Follow the dispatch procedure in
 [GitHub Actions for checks](../code-review/references/gh-actions.md).
 
 When agents work in parallel on one codebase, every hot file has a single owner
@@ -30,14 +31,15 @@ per wave. See the hot-file rule in the
 
 # Feedback tiers
 
-Run checks by tier. `python3 scripts/testing/matrix.py select --base <sha> --head <sha>`
-picks the checks for a diff, and `python3 scripts/testing/run_check.py --list --tier <tier>`
+For changes that need runtime checks, use the tiers below.
+`python3 scripts/testing/matrix.py select --base <sha> --head <sha>` picks
+the checks for a diff. `python3 scripts/testing/run_check.py --list --tier <tier>`
 lists a tier's checks.
 
 | Tier | Where and when | Contents |
 | --- | --- | --- |
-| T0 | Locally, before each commit | The T0 checks of the touched modules, such as model, property and logic tests, each in process in under 10 s. Simulation runs one thread and about 20 seeds. |
-| T1 | On Actions, dispatched on the final SHA before review | The set from `matrix.py select`, the repetition gate for new or changed tests, and paired A/B when the diff touches a hot path listed in `docs/testing/modules.toml` |
+| T0 | Locally, before each commit | In-process checks of touched modules, each under 10 s. Aim for under 60 s including the incremental build. Simulation uses one thread and about 20 seeds. |
+| T1 | On Actions, dispatched on the final SHA before review | The set from `matrix.py select`, the repetition gate for new or changed tests, and paired A/B for hot paths listed in `docs/testing/modules.toml`. Run the Valkey differential when Cache changes. |
 | T2 | Nightly, scheduled on the SHA of `main` | Long seed runs, fuzzing, real S3 and kind suites |
 | Weekly | Scheduled on `main` | The upgrade and downgrade matrix |
 | T3 | Release SHA | Every in-scope matrix cell green on that SHA |
@@ -47,15 +49,11 @@ Never start a T2 or T3 run from a task branch. Record what each tier ran as
 
 # Fixing a bug
 
-Follow the [bug loop](../code-review/references/bug-loop.md):
-
-1. Classify the bug and name the guarantees it breaks.
-2. Write a failing regression at the lowest level that reproduces it, a seed if
-   possible, and confirm that it fails before the fix.
-3. Fix it.
-4. Answer why no check caught it.
-5. Add the missing invariant, and show that it fails on the reverted fix.
-6. Write the bug record in `docs/testing/bugs/<date>-<slug>.toml`.
+Classify the bug, then write a regression at the lowest level that
+reproduces it. Use a seed if possible. Confirm the regression fails before
+the fix and passes with it. Identify why no check caught the bug, add the
+missing invariant, and record it in `docs/testing/bugs/<date>-<slug>.toml`.
+Follow the [bug loop](../code-review/references/bug-loop.md).
 
 To file the PR, use the `file-pr` skill in this repo. Include before and after pictures or videos for UI changes and give a concise description of the problem and solution of the PR
 

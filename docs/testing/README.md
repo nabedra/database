@@ -1,9 +1,9 @@
 # Testing system
 
-Nabedra tests what each module promises, not just the code that changed. Every module lists its
-guarantees in a register. Each guarantee names the kinds of check it needs. Each check is a file
-that a runner executes, and every run writes an evidence record. The coverage matrix joins the
-registers and the records, so anyone can see which guarantees are verified on which commit.
+Each module lists its guarantees and required check kinds in a register.
+The runner reads each check's definition and writes an evidence record.
+The coverage matrix shows the result for each guarantee and check kind,
+along with the tested commit.
 
 ```text
 register (guarantee, required kinds) -> check file -> run_check.py -> evidence record -> matrix
@@ -66,12 +66,17 @@ the required kinds and the seed budgets
 | T1 | GitHub Actions | On the final SHA before review: the checks `matrix.py select` picks, the repetition gate, and paired A/B for hot paths |
 | T2 | GitHub Actions | Nightly, pinned to the SHA of `main` when it starts |
 | Weekly | GitHub Actions | The upgrade and downgrade matrix |
-| T3 | GitHub Actions and the release host | On a release SHA: every in-scope cell green |
+| T3 | GitHub Actions | On a release SHA: every in-scope cell green. The release gate lists deferred cloud and hardware checks. |
 
-Real-environment checks run on Docker and kind. Checks that need cloud compute show as
-`not-run: cloud-deferred` and never count as green.
+Real-environment compute runs in Docker and kind. Checks that need cloud
+compute show as `not-run: cloud-deferred`. Real S3 checks use the dedicated
+test bucket.
 
 ## Quickstart on a fresh laptop
+
+These commands require the testing tools, check files and workflow inputs
+on your checkout. If a tool or workflow input is unavailable, record the
+affected check as not run and give the reason.
 
 ### 1. Clone and check the tools
 
@@ -96,9 +101,10 @@ python3 scripts/testing/run_check.py --list --tier T0
 python3 scripts/testing/run_check.py kv-store-model
 ```
 
-Each run prints the raw test result lines and writes an evidence record. On a small machine, set
-`CARGO_BUILD_JOBS=2` and keep property and simulation runs to one test thread. Locally written
-records help you iterate, but only records signed by the workflow count as evidence.
+Each run writes an evidence record. Use `CARGO_BUILD_JOBS=2` on a small
+machine and keep local property and simulation runs to one test thread.
+Use local records to investigate failures. Verification requires records
+attested by the workflow.
 
 A check whose needs are missing reports `not-run` with the reason. For example, an S3 check reports
 `not-run: s3-unconfigured` until `NABEDRA_TEST_S3_BUCKET` is set.
@@ -115,14 +121,17 @@ T1 check set.
 
 ### 4. Dispatch T1 on GitHub Actions
 
-Nothing runs on push. Push your branch, then dispatch the selected checks pinned to your commit:
+A push alone starts no checks. Push your branch, then dispatch the checks
+that `matrix.py select` returned. Use their IDs in the `checks` field. The
+example dispatches one ID.
 
 ```sh
-SHA=$(git rev-parse HEAD); BRANCH=$(git branch --show-current)
+SHA=$(git rev-parse HEAD)
+BRANCH=$(git branch --show-current)
 git push origin "$BRANCH"
-RID="<task>-${SHA:0:7}-$(date +%H%M%S)"
+RID="testing-$(git rev-parse --short=7 HEAD)-$(date +%H%M%S)"
 gh workflow run nabedra-build.yml --ref "$BRANCH" -f sha="$SHA" -f request_id="$RID" \
-  -f base=false -f checks=kv-store-model,olap-logic
+  -f base=false -f checks=kv-store-model
 ```
 
 [GitHub Actions for checks](../../.agents/skills/code-review/references/gh-actions.md) explains how
@@ -165,10 +174,10 @@ A failing property or simulation prints a replay line:
 replay: NABEDRA_SEED=<seed> NABEDRA_CASES=1
 ```
 
-Put it in front of the same test command to reproduce the failure exactly, with the shrunk case.
-A seed that does not reproduce is a determinism bug, not a flake.
-[Simulation](../../.agents/skills/code-review/references/simulation.md) covers running, replaying
-and shrinking.
+Put the assignments after `replay:` in front of the same test command.
+For properties, this regenerates the original input and runs shrinking
+again. If the same seed and configuration pass on replay, report a
+determinism bug. See [simulation](../../.agents/skills/code-review/references/simulation.md).
 
 ### 8. Run the paired A/B runner
 
@@ -178,14 +187,14 @@ with a bootstrap threshold. A regression is 5% or more and above the threshold. 
 `python3 scripts/testing/ab.py --help` for its arguments. Absolute numbers from shared runners or
 a laptop are not evidence.
 
-### 9. Set up the S3 test bucket
+### 9. Use the S3 test bucket
 
 Real S3 checks write only to one dedicated test bucket, under `runs/<request_id>/`, so parallel runs
 never collide. The bucket deletes objects and aborts incomplete multipart uploads after one day.
-Locally, export `NABEDRA_TEST_S3_BUCKET` and use your usual AWS credentials. On Actions, dispatched
-and scheduled jobs assume a role limited to that bucket through GitHub OIDC, and the pull-request
-gate never gets it. `scripts/testing/s3/README.md` has the
-setup steps.
+If the dedicated bucket is available, export `NABEDRA_TEST_S3_BUCKET` and
+use your usual AWS credentials. On Actions, only dispatched and scheduled
+jobs can request the bucket-scoped role through GitHub OIDC. See
+`scripts/testing/s3/README.md` for setup.
 
 ## Rules that apply to every change
 

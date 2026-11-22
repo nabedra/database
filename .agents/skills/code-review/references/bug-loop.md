@@ -1,7 +1,7 @@
 # Bug loop
 
-Every bug, whether a review finding, a failing seed, a CI failure or a user report, goes through the
-same loop. The fix is not done until a check exists that would have caught the bug.
+Use this procedure for bugs found in review, test runs or user reports. The
+fix includes a check that catches the bug.
 
 ## Steps
 
@@ -9,23 +9,22 @@ same loop. The fix is not done until a check exists that would have caught the b
 
    | Class | Typical invariant |
    | --- | --- |
-   | Uncertain outcome reported as not applied | a failed or `not_applied` write is never observed later, and every `not_applied` carries a proof from the deciding authority |
+   | Uncertain outcome reported as not applied | a write reported as `not_applied` is never observed later, and every `not_applied` carries proof from the deciding authority |
    | Stale route, topology or schema | each commit uses the epoch in effect at its timestamp, and a retired leader never answers success |
    | Fence and lifecycle ordering | lifecycles move only along declared edges, and a fence takes effect only after validation |
    | Membership, replacement and trust | Raft safety across joint changes, and a wiped node never votes under its old identity |
    | Resources released in the wrong order | every acquire has exactly one release, after the work it guards, and counters return to baseline |
    | Other | name the invariant in the record |
 
-2. **Reproduce at the lowest level.** Write a failing regression at the lowest level that reaches
-   the bug, in this order of preference: a model counterexample, a property or simulation seed, a
-   recorded history the checker rejects, a unit test, a real-environment case. A seed is best,
-   because it replays in seconds (see [simulation](simulation.md)).
+2. **Reproduce at the lowest level.** Write a regression at the lowest level
+   that reproduces the bug. Use a seed if possible so others can reproduce
+   the same failure. See [simulation](simulation.md).
 3. **Confirm it fails.** Run the regression on the unfixed code and keep the failing output.
 4. **Fix it.** Then run the regression and the checks `matrix.py select` picks for the diff. A new
    test also passes the repetition gate.
-5. **Answer why no check caught it.** Pick the cause: no check of the required kind, an invariant
-   missing, a generator or nemesis that cannot reach the case, a check that exists but did not run,
-   a quarantined check, or a register that marked the kind `n/a`.
+5. **Identify the coverage gap.** Check whether the invariant was missing,
+   the generator could reach the case, or the required check was skipped,
+   quarantined or marked `n/a` in the register.
 6. **Add the invariant.** Put it where every later run checks it: the model's `check`, the
    simulator's invariants, the history checker, or a property. Show that it fails on the reverted
    fix.

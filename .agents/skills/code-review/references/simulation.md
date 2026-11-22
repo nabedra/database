@@ -1,8 +1,9 @@
 # Properties, models and simulation
 
-Property tests, model checks and simulation workloads all draw their choices from one seeded
-generator in `server/check` (the `nabedra-check` crate, a dev-only dependency). A failure is
-therefore a seed that replays exactly and shrinks to a small case.
+Property tests and simulation workloads use seeded choices. The dev-only
+`nabedra-check` crate in `server/check` provides the property generator,
+choice-tape shrinker and history checkers. The explicit-state model checker
+enumerates actions and reports a counterexample trace.
 
 | Tool | Entry point | Check kind |
 | --- | --- | --- |
@@ -14,21 +15,25 @@ therefore a seed that replays exactly and shrinks to a small case.
 
 ## Run
 
-Two environment variables control every run:
+The property runner reads the following environment variables. Simulation
+workloads use the same seed convention and document their own case budgets.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `NABEDRA_CASES` | Cases (or seeds) per property or workload | 256 |
 | `NABEDRA_SEED` | First seed. When it is unset the crate chooses one, and a failure prints it | unset |
 
-Run a registered check through its check file, so the run writes an evidence record:
+Set `CHECK_ID` to a registered check. The runner uses its check file and
+writes an evidence record.
 
 ```sh
-python3 scripts/testing/run_check.py <check id>
+python3 scripts/testing/run_check.py "$CHECK_ID"
 ```
 
-To iterate on one test, run the check's command directly with a filter, for example
-`NABEDRA_CASES=20 cargo test -j 2 --lib <module path> -- --test-threads=1`.
+To iterate on one test, set `TEST_FILTER` to the test path and run the
+check's command directly. For a library check, use
+`NABEDRA_CASES=20 cargo test -j 2 --lib "$TEST_FILTER" -- --test-threads=1`
+with the check's feature flags.
 
 ## Replay
 
@@ -39,16 +44,20 @@ shrunk tape length, the failure message and a replay line:
 replay: NABEDRA_SEED=<seed> NABEDRA_CASES=1
 ```
 
-Prefix the same test command with that line. The run is deterministic, so it fails the same way.
-A seed that does not reproduce on replay is a determinism bug in the test or the simulator. Record
-it as a bug. Never rerun it to get a pass.
+Prefix the same test command with the two assignments after `replay:` and
+keep the build, workload and other configuration the same. If the seed
+fails to reproduce under those conditions, record a determinism bug in
+the test or the simulator.
 
 ## Shrink
 
-The generator records every choice on a tape. After a failure, `prop` shrinks the tape (shorter,
-then smaller choices) for up to `max_shrink_steps` and reports the smallest failing case. Report
-the shrunk case, not the first one. Keep the failure as a regression: a named test that replays the
-seed with `Config { seed: Some(<seed>), cases: 1, ..Default::default() }` through `prop::check_with`.
+The generator records choices on a tape. After a failure, `prop` tries
+shorter tapes and smaller choices for up to `max_shrink_steps`. Seed replay
+regenerates the original input and runs shrinking again. Keep the smallest
+case found as a fixture when it can be expressed directly. You can also
+write a named regression that replays the failing seed with
+`Config { seed: Some(<seed>), cases: 1, ..Default::default() }` through
+`prop::check_with`.
 
 ## Determinism
 
@@ -75,7 +84,7 @@ A simulation build sets `--cfg tokio_unstable` so that `Builder::rng_seed` makes
 follow the seed. Only simulation builds set it. Product builds, Docker images and releases never
 do, and the O02 and NS26 checks assert that no simulation feature or dev-only crate reaches a
 product build. Changing `RUSTFLAGS` rebuilds the whole target directory, so run simulation builds
-with this flag on Actions, not in a shared local target directory.
+with this flag on Actions when the local target directory is shared.
 
 ## What simulation evidence means
 
