@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "fdf25fab0af560c61aa5bcbe39706fe6c9228928",
+  "head": "75150dcf9b00157c70f1e7ef5ffb71015bab0abf",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -695,7 +695,7 @@
           "failed": 0,
           "reason": "cloud-deferred (EV10 backup, restore, and TLS cases that require cloud hosts, while the S3 parts run on real S3)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "S": {
           "reason": "Provider and TLS behavior need the actual integrations",
@@ -749,7 +749,7 @@
           "failed": 0,
           "reason": "hardware-deferred (absolute Events latency targets)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "R": {
           "reason": "The benchmark itself runs the brokers",
@@ -813,7 +813,7 @@
           "failed": 0,
           "reason": "cloud-deferred (EV06 EBS volume loss and reattachment)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "S": {
           "reason": "A storage model cannot establish volume reattachment behavior",
@@ -1046,7 +1046,7 @@
           "failed": 0,
           "reason": "hardware-deferred (absolute latency caps under memory pressure)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "R": {
           "reason": "The benchmark runs in the measured environment",
@@ -1399,7 +1399,7 @@
           "failed": 0,
           "reason": "hardware-deferred (K04b absolute scale-out efficiency and absolute latency targets)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "R": {
           "reason": "The benchmark itself uses the measured environment",
@@ -1464,7 +1464,7 @@
           "failed": 0,
           "reason": "cloud-deferred (K05 deploy, replace, and drain on EC2)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "S": {
           "reason": "Modeled nodes cannot establish deploy or drain behavior",
@@ -2063,7 +2063,7 @@
           "failed": 0,
           "reason": "hardware-deferred (absolute streaming latency targets on dedicated hardware)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "R": {
           "executed": 0,
@@ -2633,7 +2633,7 @@
           "failed": 0,
           "reason": "cloud-deferred (A01 and A02 on cloud providers)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "S": {
           "reason": "Modeled lifecycle cannot establish integration behavior",
@@ -3217,7 +3217,7 @@
           "failed": 0,
           "reason": "cloud-deferred (O18 and O27 EC2, EBS, and EKS lifecycle checks)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "S": {
           "executed": 0,
@@ -3531,7 +3531,7 @@
           "failed": 0,
           "reason": "hardware-deferred (absolute OLTP latency targets, including the direct-path benchmark)",
           "required": true,
-          "state": "n/a"
+          "state": "not-run"
         },
         "R": {
           "reason": "The benchmark itself runs on the required environment",
