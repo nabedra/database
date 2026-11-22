@@ -362,7 +362,6 @@ mod tests {
     #[test]
     #[ignore = "benchmark"]
     fn ns_unit_crc32c_bench() {
-        use std::time::Instant;
         let mut rng = SplitMix(1);
         let data: Vec<u8> = (0..1 << 20).map(|_| rng.next() as u8).collect();
         for (name, path) in paths() {
@@ -374,7 +373,7 @@ mod tests {
                 };
                 let rounds = total / size;
                 let mut acc = 0u32;
-                let started = Instant::now();
+                let started = nabedra_rt::time::now_std();
                 for i in 0..rounds {
                     let offset = (i * 64) % (data.len() - size + 1);
                     acc ^= path(acc, std::hint::black_box(&data[offset..offset + size]));

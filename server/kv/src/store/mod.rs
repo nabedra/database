@@ -41,6 +41,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, 
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use nabedra_rt::time;
 
 pub use background::{Background, THREAD_STACK_BYTES};
 pub use read::{Iter, Snapshot};
@@ -385,7 +386,7 @@ impl JournalSink for Sink {
 impl Store {
     /// Opens or creates the store in `dir` and recovers it (plan section 3).
     pub fn open(dir: &Path, options: Options) -> Result<Opened> {
-        let started = Instant::now();
+        let started = time::now_std();
         let fs = options.fs.clone();
         let opened = recovery::prepare(&*fs, dir, options.scope_of)?;
         let runs_dir = dir.join(RUNS_DIR);
@@ -505,7 +506,7 @@ impl Store {
             writer_memory: AtomicUsize::new(0),
             l0_runs: AtomicUsize::new(l0_runs),
             pace_until_ns: AtomicU64::new(0),
-            epoch: Instant::now(),
+            epoch: time::now_std(),
             quarantine: Quarantine::new(quarantine_list),
             latched: AtomicBool::new(false),
             jobs: Mutex::new(Jobs::default()),
@@ -630,7 +631,7 @@ impl Store {
             replayed_records: report.replayed_records,
             tail_truncations: report.tail_truncations,
             tail_bytes: report.tail_bytes,
-            recovery_ms: started.elapsed().as_millis() as u64,
+            recovery_ms: time::now_std().duration_since(started).as_millis() as u64,
             manifest_torn_tail: opened.manifest_torn_tail,
             orphans_removed: orphans,
             journal_behind_manifest: report.voided_at_open,
@@ -685,7 +686,7 @@ impl Store {
     pub fn pace(&self, bytes: usize) {
         let delay = self.inner.write_delay(bytes);
         if !delay.is_zero() {
-            std::thread::sleep(delay);
+            time::thread_sleep(delay);
         }
     }
 
@@ -722,13 +723,13 @@ impl Store {
     /// the same steps after flushes.
     pub fn gc_journal(&self) -> Result<bool> {
         self.inner.check_usable()?;
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = time::now_std() + Duration::from_secs(1);
         let mut backoff = Duration::from_micros(200);
-        while Instant::now() < deadline {
+        while time::now_std() < deadline {
             match self.inner.journal_gc()? {
                 None => return Ok(true),
                 Some(wait) => {
-                    std::thread::sleep(backoff.min(wait));
+                    time::thread_sleep(backoff.min(wait));
                     backoff *= 2;
                 }
             }
@@ -1245,7 +1246,7 @@ impl Inner {
                     self.group.flush_largest();
                 }
                 self.budget
-                    .wait_below_limit(Some(Instant::now() + STALL_POLL));
+                    .wait_below_limit(Some(time::now_std() + STALL_POLL));
                 continue;
             }
             if l0 >= self.levels.l0_stop_writes {
@@ -1268,7 +1269,7 @@ impl Inner {
         }
         let rate = self.levels.delayed_write_rate.max(1);
         let cost = (bytes as u64).saturating_mul(1_000_000_000) / rate;
-        let now = self.epoch.elapsed().as_nanos() as u64;
+        let now = time::now_std().duration_since(self.epoch).as_nanos() as u64;
         let mut prev = self.pace_until_ns.load(Ordering::Acquire);
         loop {
             let next = prev.max(now).saturating_add(cost);

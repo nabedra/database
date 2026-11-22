@@ -362,7 +362,6 @@ fn ns01_memtable_range_deletes_update_the_fragmented_set_in_place() {
 #[test]
 #[ignore = "bench: cargo test --release -p nabedra-kv -- --ignored ns18_memtable_range_delete --nocapture"]
 fn ns18_memtable_range_delete_churn_bench() {
-    use std::time::Instant;
     let mut worst = std::time::Duration::ZERO;
     for &existing in &[16usize, 1_000, 10_000] {
         let mem = Arc::new(Memtable::new(MemtableOptions::default(), None));
@@ -377,7 +376,7 @@ fn ns18_memtable_range_delete_churn_bench() {
             seq += 1;
         }
         let rounds = 2_000u64;
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         for r in 0..rounds {
             let mut b = WriteBatch::new();
             let g = r as usize % existing;
@@ -392,7 +391,7 @@ fn ns18_memtable_range_delete_churn_bench() {
         let per = start.elapsed() / rounds as u32;
         // The same with an iterator's handle taken after every purge, so each purge
         // copies the chunk handles it shares with that iterator.
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         for r in 0..rounds {
             let mut b = WriteBatch::new();
             let g = (r as usize * 7) % existing;
@@ -406,7 +405,7 @@ fn ns18_memtable_range_delete_churn_bench() {
             let _ = held.max_covering_seq(b"@g000001/log/0", seq);
         }
         let per_held = start.elapsed() / rounds as u32;
-        let start = Instant::now();
+        let start = nabedra_rt::time::now_std();
         for r in 0..rounds {
             let mut b = WriteBatch::new();
             b.put(

@@ -272,7 +272,7 @@ impl FsFile for FaultFile {
         while self.faults.hold_syncs.load(Ordering::SeqCst)
             && index >= self.faults.syncs_allowed.load(Ordering::SeqCst)
         {
-            thread::sleep(std::time::Duration::from_millis(1));
+            nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(1));
         }
         if self.faults.fail_sync.load(Ordering::SeqCst) {
             return Err(io::Error::from_raw_os_error(libc::EIO));
@@ -1152,7 +1152,7 @@ fn ns12_replay_of_64_mib_journal() {
     let value = vec![0xAB; 1024];
     let mut bytes = 0u64;
     let mut i = 0u64;
-    let write_start = std::time::Instant::now();
+    let write_start = nabedra_rt::time::now_std();
     let mut pending = Vec::new();
     while bytes < 64 << 20 {
         let mut b = WriteBatch::new();
@@ -1190,7 +1190,7 @@ fn ns12_replay_of_64_mib_journal() {
         }
     }
     let sink = Arc::new(Counting::default());
-    let started = std::time::Instant::now();
+    let started = nabedra_rt::time::now_std();
     let (_j, report) = Journal::open(real(), dir.path(), options, 0, sink.clone()).unwrap();
     let open_ms = started.elapsed().as_millis();
     println!(
@@ -1250,15 +1250,15 @@ fn ns08_commit_is_counted_before_its_waiter_wakes() {
 
 /// Polls `commit` until it completes or `limit` passes.
 fn result_within(commit: &mut Commit, limit: std::time::Duration) -> Option<Result<Seq>> {
-    let deadline = std::time::Instant::now() + limit;
+    let deadline = nabedra_rt::time::now_std() + limit;
     loop {
         if let Some(result) = commit.try_result() {
             return Some(result);
         }
-        if std::time::Instant::now() >= deadline {
+        if nabedra_rt::time::now_std() >= deadline {
             return None;
         }
-        thread::sleep(std::time::Duration::from_millis(1));
+        nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -1288,13 +1288,13 @@ fn rd3_unsynced_head_of_a_group_is_visible_before_its_sync() {
     let mut s0 = journal
         .submit(batch(b"g/", b"s0", b"v0"), Durability::Sync, Box::new(()))
         .unwrap();
-    let wait = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let wait = nabedra_rt::time::now_std() + std::time::Duration::from_secs(10);
     while faults.syncs.load(Ordering::SeqCst) == base {
         assert!(
-            std::time::Instant::now() < wait,
+            nabedra_rt::time::now_std() < wait,
             "the journal reaches the held sync"
         );
-        thread::sleep(std::time::Duration::from_millis(1));
+        nabedra_rt::time::thread_sleep(std::time::Duration::from_millis(1));
     }
     // Group 2, queued meanwhile: an unsynced write, then a synced one.
     let mut u1 = journal
