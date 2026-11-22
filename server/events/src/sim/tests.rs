@@ -132,6 +132,13 @@ fn different_seeds_differ() {
     assert_ne!(a.trace_hash, b.trace_hash);
 }
 
+#[test]
+fn same_term_leader_handoff_preserves_safety() {
+    // Seed 188 elects n1 and n2 with different leader IDs in term 5.
+    let report = run(SimConfig::new(188));
+    assert!(report.passed(), "{}", describe(&report, "leader-handoff"));
+}
+
 /// Runs seeds from a fixed start until one violation mentions `expect`.
 fn find_planted(knobs: Knobs, expect: &[&str], label: &str) {
     let first = env_u64("NABEDRA_PLANTED_SEED", 1_000);
@@ -209,6 +216,7 @@ fn planted_fsynced_data_loss_is_caught() {
 }
 
 mod checkers {
+    use openraft::{CommittedLeaderId, LogId, Vote};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -353,9 +361,10 @@ mod checkers {
 
     #[test]
     fn kafka_invariants_flag_known_bad_observations() {
+        let same_term = Vote::new_committed(3, 1);
         let mut o = Observer::default();
-        o.observe_for_test(1, 3, true, Some(1));
-        o.observe_for_test(2, 3, true, Some(1));
+        o.observe_for_test(1, same_term, true, Some(1));
+        o.observe_for_test(2, same_term, true, Some(1));
         assert!(
             o.violations.iter().any(|v| v.contains("SingleLeader")),
             "{:?}",
@@ -363,8 +372,13 @@ mod checkers {
         );
 
         let mut o = Observer::default();
-        o.observe_for_test(1, 5, false, None);
-        o.observe_for_test(1, 4, false, None);
+        o.observe_for_test(1, same_term, true, Some(1));
+        o.observe_for_test(2, Vote::new_committed(3, 2), true, Some(1));
+        assert!(o.violations.is_empty(), "{:?}", o.violations);
+
+        let mut o = Observer::default();
+        o.observe_for_test(1, Vote::new(5, 2), false, None);
+        o.observe_for_test(1, Vote::new(5, 1), false, None);
         assert!(
             o.violations.iter().any(|v| v.contains("MonotonicEpoch")),
             "{:?}",
@@ -372,8 +386,8 @@ mod checkers {
         );
 
         let mut o = Observer::default();
-        o.observe_for_test(1, 1, false, Some(9));
-        o.observe_for_test(1, 1, false, Some(8));
+        o.observe_for_test(1, same_term, false, Some(9));
+        o.observe_for_test(1, same_term, false, Some(8));
         assert!(
             o.violations
                 .iter()
@@ -382,11 +396,14 @@ mod checkers {
             o.violations
         );
 
+        let first = LogId::new(CommittedLeaderId::new(1, 1), 1);
+        let next = LogId::new(CommittedLeaderId::new(1, 1), 2);
+        let conflict = LogId::new(CommittedLeaderId::new(1, 2), 1);
         let mut o = Observer::new(3);
-        o.appended(1, 1, 1);
-        o.appended(2, 1, 1);
-        o.applied(1, 1, 1, 0xaa, 0);
-        o.applied(2, 1, 1, 0xbb, 0);
+        o.appended(1, first);
+        o.appended(2, first);
+        o.applied(1, first, 0xaa, 0);
+        o.applied(2, first, 0xbb, 0);
         assert!(
             o.violations
                 .iter()
@@ -396,12 +413,13 @@ mod checkers {
         );
 
         let mut o = Observer::new(3);
-        o.appended(1, 1, 1);
-        o.applied(1, 1, 1, 0xaa, 0);
+        o.appended(1, first);
+        o.appended(2, conflict);
+        o.applied(1, first, 0xaa, 0);
         // The next entry reaches a majority before the next metrics sample.
-        o.appended(1, 2, 1);
-        o.appended(2, 2, 1);
-        o.applied(1, 2, 1, 0xaa, 0);
+        o.appended(1, next);
+        o.appended(2, next);
+        o.applied(1, next, 0xaa, 0);
         assert!(
             o.violations
                 .iter()
@@ -410,9 +428,9 @@ mod checkers {
             o.violations
         );
         let mut o = Observer::new(3);
-        o.appended(1, 1, 1);
-        o.appended(2, 1, 1);
-        o.applied(1, 1, 1, 0xaa, 0);
+        o.appended(1, first);
+        o.appended(2, first);
+        o.applied(1, first, 0xaa, 0);
         assert_eq!(o.violations, Vec::<String>::new());
     }
 }

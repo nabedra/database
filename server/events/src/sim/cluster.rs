@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use nabedra_kv::fs::FaultFs;
-use openraft::ServerState;
+use openraft::{CommittedLeaderId, LogId, ServerState, Vote};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -106,14 +106,13 @@ impl Report {
 #[derive(Default)]
 pub(crate) struct Observer {
     voters: u64,
-    /// index -> (term, payload hash) of every entry any replica applied.
-    committed: BTreeMap<u64, (u64, u64)>,
+    /// index -> (leader ID, payload hash) of every entry any replica applied.
+    committed: BTreeMap<u64, (CommittedLeaderId<u64>, u64)>,
     /// Each replica's durable log, from the append and truncate hooks; rebuilt from its
     /// volume on every start.
-    logs: BTreeMap<u64, BTreeMap<u64, u64>>,
-    /// The highest term each replica has reported, across restarts (the vote is durable).
-    max_term: BTreeMap<u64, u64>,
-    leaders: BTreeMap<u64, u64>,
+    logs: BTreeMap<u64, BTreeMap<u64, CommittedLeaderId<u64>>>,
+    /// The highest vote each replica has reported, across restarts.
+    max_vote: BTreeMap<u64, Vote<u64>>,
     /// The applied index each replica reported in its current incarnation.
     applied_hook: BTreeMap<u64, u64>,
     applied_metric: BTreeMap<u64, u64>,
@@ -136,18 +135,20 @@ impl Observer {
         }
     }
 
-    pub fn applied(&mut self, node: u64, index: u64, term: u64, hash: u64, now_ms: u64) {
+    pub fn applied(&mut self, node: u64, log_id: LogId<u64>, hash: u64, now_ms: u64) {
+        let LogId { leader_id, index } = log_id;
         match self.committed.get(&index) {
-            Some(&(t, h)) if (t, h) != (term, hash) => self.violate(
+            Some(&(prior, prior_hash)) if (prior, prior_hash) != (leader_id, hash) => self.violate(
                 now_ms,
                 format!(
-                    "AppliedPrefixesAgree: n{node} applied {term}:{index} ({hash:x}), another replica applied {t}:{index} ({h:x})"
+                    "AppliedPrefixesAgree: n{node} applied {log_id} ({hash:x}), another replica applied {} ({prior_hash:x})",
+                    LogId::new(prior, index),
                 ),
             ),
             Some(_) => {}
             None => {
-                self.committed.insert(index, (term, hash));
-                self.check_entry_majority(index, term, now_ms);
+                self.committed.insert(index, (leader_id, hash));
+                self.check_entry_majority(log_id, now_ms);
             }
         }
         if let Some(previous) = self
@@ -162,45 +163,51 @@ impl Observer {
         }
     }
 
-    pub fn appended(&mut self, node: u64, index: u64, term: u64) {
-        self.logs.entry(node).or_default().insert(index, term);
+    pub fn appended(&mut self, node: u64, log_id: LogId<u64>) {
+        self.logs
+            .entry(node)
+            .or_default()
+            .insert(log_id.index, log_id.leader_id);
     }
 
     pub fn truncated(&mut self, node: u64, from: u64) {
         self.logs.entry(node).or_default().split_off(&from);
     }
 
-    pub fn restarted(&mut self, node: u64, log: BTreeMap<u64, u64>) {
-        self.logs.insert(node, log);
+    pub fn restarted(&mut self, node: u64, log: Vec<LogId<u64>>) {
+        self.logs.insert(
+            node,
+            log.into_iter().map(|id| (id.index, id.leader_id)).collect(),
+        );
         self.applied_hook.remove(&node);
         self.applied_metric.remove(&node);
     }
 
-    fn observe(&mut self, node: u64, term: u64, leader: bool, applied: Option<u64>, now_ms: u64) {
-        let max = self.max_term.entry(node).or_default();
-        if term < *max {
+    fn observe(
+        &mut self,
+        node: u64,
+        vote: Vote<u64>,
+        leader: bool,
+        applied: Option<u64>,
+        now_ms: u64,
+    ) {
+        let max = self.max_vote.entry(node).or_default();
+        if vote < *max {
             let previous = *max;
             self.violate(
                 now_ms,
-                format!("MonotonicEpoch: n{node} reports term {term} after term {previous}"),
+                format!("MonotonicEpoch: n{node} reports vote {vote} after {previous}"),
             );
         } else {
-            *max = term;
+            *max = vote;
         }
-        if leader {
-            match self.leaders.get(&term) {
-                Some(other) if *other != node => {
-                    let other = *other;
-                    self.violate(
-                        now_ms,
-                        format!("SingleLeader: n{node} and n{other} both led term {term}"),
-                    );
-                }
-                Some(_) => {}
-                None => {
-                    self.leaders.insert(term, node);
-                }
-            }
+        // OpenRaft's default election epoch is (term, node ID). A new leader can
+        // supersede another leader in the same numeric term with a higher vote.
+        if leader && (!vote.committed || vote.leader_id.node_id != node) {
+            self.violate(
+                now_ms,
+                format!("SingleLeader: n{node} reports leadership under vote {vote}"),
+            );
         }
         if let Some(applied) = applied {
             if let Some(previous) = self
@@ -217,24 +224,24 @@ impl Observer {
     }
 
     fn check_majority(&mut self, now_ms: u64) {
-        let Some((&index, &(term, _))) = self.committed.iter().next_back() else {
+        let Some((&index, &(leader_id, _))) = self.committed.last_key_value() else {
             return;
         };
-        self.check_entry_majority(index, term, now_ms);
+        self.check_entry_majority(LogId::new(leader_id, index), now_ms);
     }
 
-    fn check_entry_majority(&mut self, index: u64, term: u64, now_ms: u64) {
+    fn check_entry_majority(&mut self, log_id: LogId<u64>, now_ms: u64) {
         let holders = self
             .logs
             .values()
-            .filter(|log| log.get(&index) == Some(&term))
+            .filter(|log| log.get(&log_id.index) == Some(&log_id.leader_id))
             .count() as u64;
         if holders <= self.voters / 2 {
             let voters = self.voters;
             self.violate(
                 now_ms,
                 format!(
-                    "MajorityReachedHighWatermark: committed entry {term}:{index} is held by {holders} of {voters} replicas"
+                    "MajorityReachedHighWatermark: committed entry {log_id} is held by {holders} of {voters} replicas"
                 ),
             );
         }
@@ -369,10 +376,6 @@ impl Cluster {
             .await
             .map_err(|error| anyhow!("open group on n{id}: {error}"))?;
         let log = in_node(id, group.sim_log_ids()).await?;
-        let log = log
-            .into_iter()
-            .map(|id| (id.index, id.leader_id.term))
-            .collect();
         self.world.lock().observer.restarted(id, log);
         self.trace(format_args!("start n{id}"));
         Ok(())
@@ -438,14 +441,14 @@ impl Cluster {
             let metrics = group.sim_metrics();
             seen.push((
                 id,
-                metrics.current_term,
+                metrics.vote,
                 metrics.state == ServerState::Leader,
                 metrics.last_applied.map(|log| log.index),
             ));
         }
         let mut state = self.world.lock();
-        for (id, term, leader, applied) in seen {
-            state.observer.observe(id, term, leader, applied, now);
+        for (id, vote, leader, applied) in seen {
+            state.observer.observe(id, vote, leader, applied, now);
         }
         state.observer.check_majority(now);
     }
@@ -1215,7 +1218,13 @@ async fn consumer(world: Arc<World>, stop: Arc<AtomicBool>, seed: u64) {
 
 #[cfg(test)]
 impl Observer {
-    pub fn observe_for_test(&mut self, node: u64, term: u64, leader: bool, applied: Option<u64>) {
-        self.observe(node, term, leader, applied, 0);
+    pub fn observe_for_test(
+        &mut self,
+        node: u64,
+        vote: Vote<u64>,
+        leader: bool,
+        applied: Option<u64>,
+    ) {
+        self.observe(node, vote, leader, applied, 0);
     }
 }

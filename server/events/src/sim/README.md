@@ -115,10 +115,14 @@ After every 10 ms step (and inside the apply hook), after Kafka's
 | --- | --- |
 | `MonotonicHighWatermark` | a replica's applied index never decreases within one incarnation |
 | `MonotonicCommit` | the apply hook never sees an index at or below the previous one |
-| `MonotonicEpoch` | a replica's term never decreases, across restarts too (the vote is durable) |
-| `SingleLeader` | each term has at most one leader |
+| `MonotonicEpoch` | each replica's vote is monotonically ordered, including across restarts |
+| `SingleLeader` | only the broker named by a committed vote can report leadership for that vote |
 | `MajorityReachedHighWatermark` | each entry is in the durable log of a majority at first apply and the highest applied entry is rechecked every step. The append and truncate hooks track the logs, which are rebuilt from the volume at every start. |
-| `AppliedPrefixesAgree` | every replica that applies index i applies the same term and payload |
+| `AppliedPrefixesAgree` | every replica that applies index i applies the same Raft log ID and payload |
+
+Events uses [OpenRaft's default leader IDs](https://docs.rs/openraft/0.9.25/openraft/docs/data/leader_id/index.html).
+They order elections by `(term, node ID)`, so a higher vote can replace a leader within
+the same numeric term. Seed 188 exercises this handoff.
 
 At the end:
 

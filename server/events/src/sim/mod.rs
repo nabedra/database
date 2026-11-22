@@ -434,14 +434,13 @@ pub(crate) mod hooks {
             return;
         };
         world.trace(format_args!(
-            "apply n{node} {group} {}:{} {payload_hash:x}",
-            log_id.leader_id.term, log_id.index
+            "apply n{node} {group} {log_id} {payload_hash:x}"
         ));
         let now = world.elapsed_ms();
         world
             .lock()
             .observer
-            .applied(node, log_id.index, log_id.leader_id.term, payload_hash, now);
+            .applied(node, log_id, payload_hash, now);
     }
 
     /// A replica made these log entries durable.
@@ -451,7 +450,7 @@ pub(crate) mod hooks {
         };
         let mut state = world.lock();
         for id in ids {
-            state.observer.appended(node, id.index, id.leader_id.term);
+            state.observer.appended(node, *id);
         }
     }
 
