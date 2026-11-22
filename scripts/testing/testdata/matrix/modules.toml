@@ -1,0 +1,35 @@
+schema = "nabedra.modules/1"
+fallback = "misc"
+
+[nightly]
+core_hours = 10
+
+[[nightly.pool]]
+name = "kv"
+share = 60
+modules = ["kv"]
+
+[[nightly.pool]]
+name = "events"
+share = 40
+modules = ["events"]
+
+[[module]]
+name = "kv"
+level = "L2"
+register = "registers/kv.md"
+paths = ["server/src/cache/**", "server/src/cache.rs"]
+hot_paths = ["server/src/cache/store/**"]
+
+[[module]]
+name = "events"
+level = "L2"
+register = "registers/events.md"
+paths = ["server/events/**"]
+hot_paths = []
+
+[[module]]
+name = "testing"
+level = "L1"
+paths = ["scripts/testing/**"]
+hot_paths = []
