@@ -14,7 +14,7 @@
 # `revision` job resolves the list and writes it to the run summary:
 #   direct      D01-D12, ORM suites, library suite off, acceptance, one leg per mode; implies rep1, growth, o02
 #   acceptance  Linux OLTP acceptance in the default mode; implies growth, o02
-#   o02         O02 engine identity with the same-commit engine matrix and an OLAP server, per mode (+ T02)
+#   o02         O01 ORM parity and O02 engine identity with an OLAP server and the engine matrix, per mode (+ T02)
 #   growth      O16 and O26 on the shared build, O21 and O28 on one opt-level-1 build, per mode
 #   rep1        REP1-REP5 process suites: scale, rollback, restart, replacement check, abandon, wipe, data trust
 #   rep4-mixed  builds the pre-execution worker and tests mixed-version enrollment
@@ -444,8 +444,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/cargo-cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
-      # O02 inputs for the o02 job: the same-commit engine matrix (installed binaries, compile guards) and
-      # an OLAP server for the cross-engine worker check. Built after the cache is saved.
+      # Inputs for the o02 job: the same-commit engine matrix (installed binaries, compile guards) and an
+      # OLAP server for O01's ORM parity and O02's cross-engine worker check. Built after the cache is saved.
       - name: Build installed engine variants and check feature guards (O02)
         if: contains(needs.revision.outputs.jobs, ',o02,')
         run: python scripts/check_engine_features.py --acceptance-evidence o02-engine-features.json
@@ -842,11 +842,12 @@ jobs:
       - name: Acceptance (no AWS, no comparative benchmarks)
         if: ${{ !cancelled() }}
         run: |
-          # O02 runs in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
+          # O01 and O02 run in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
           # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, never counted as passed).
+          keep=${KEEP_SCENARIOS//--scenario O01/}
           rc=0; python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" --server-binary "$NABEDRA_BIN" \
             --category compatibility --category queries --category transactions \
-            --category recovery ${KEEP_SCENARIOS//--scenario O02/} --output artifacts/oltp-acceptance || rc=$?
+            --category recovery ${keep//--scenario O02/} --output artifacts/oltp-acceptance || rc=$?
           python scripts/ci_acceptance_summary.py artifacts/oltp-acceptance/results.json >> "$GITHUB_STEP_SUMMARY" || true
           [ "$rc" = 0 ] || [ "$rc" = 2 ]
       - if: always()
@@ -930,11 +931,12 @@ jobs:
       - name: OLTP acceptance, direct_oltp ${{ matrix.mode }} (no AWS, no benchmarks)
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          # O02 runs in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
+          # O01 and O02 run in the o02 job and the growth category (O16, O21, O26, O28) in the growth jobs.
+          keep=${KEEP_SCENARIOS//--scenario O01/}
           rc=0
           NABEDRA_TEST_DIRECT_OLTP=$MODE python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
             --server-binary "$NABEDRA_BIN" --category compatibility --category queries --category transactions \
-            --category recovery ${KEEP_SCENARIOS//--scenario O02/} --output "artifacts/acceptance-$MODE" > "artifacts/acceptance-$MODE.log" 2>&1 || rc=$?
+            --category recovery ${keep//--scenario O02/} --output "artifacts/acceptance-$MODE" > "artifacts/acceptance-$MODE.log" 2>&1 || rc=$?
           tail -40 "artifacts/acceptance-$MODE.log"
           python scripts/ci_acceptance_summary.py "artifacts/acceptance-$MODE/results.json" >> "$GITHUB_STEP_SUMMARY" || true
           # Exit 1 = a scenario failed; exit 2 = some scenarios did not run (listed in results.json, not counted as passed).
@@ -953,10 +955,11 @@ jobs:
           path: artifacts
           retention-days: 14
 
-  # O02 engine identity with the inputs it needs: the same-commit engine matrix and the OLAP server
-  # from `features`, and the shared OLTP build. Every selected mode, in one job.
+  # Engine parity scenarios with the inputs they need: O01 (unchanged ORMs against an OLAP and an OLTP
+  # server) and O02 (engine identity with the same-commit engine matrix), using the OLAP server and the
+  # matrix from `features` and the shared OLTP build. Every selected mode, in one job.
   o02:
-    name: O02 engine identity, direct_oltp ${{ inputs.modes || 'on,off' }}
+    name: O01 and O02 engine parity, direct_oltp ${{ inputs.modes || 'on,off' }}
     needs: [revision, build, features]
     if: ${{ !cancelled() && needs.build.result == 'success' && contains(needs.revision.outputs.jobs, ',o02,') }}
     runs-on: ubuntu-24.04
@@ -968,6 +971,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: actions/download-artifact@v4
         with:
           name: oltp-bins
@@ -985,22 +991,29 @@ jobs:
           echo "NABEDRA_BIN=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_DIRECT_OFF_BINARY=$GITHUB_WORKSPACE/server/target/debug/nabedra-db" >> "$GITHUB_ENV"
           echo "NABEDRA_O02_ENGINE_FEATURES=$GITHUB_WORKSPACE/o02-inputs/o02-engine-features.json" >> "$GITHUB_ENV"
-      - name: O02 in every mode
+      - name: Build the unmodified ORMs
+        run: |
+          (cd orm/typescript && npm ci --no-audit --no-fund && npm run build)
+          python -m pip install --quiet "httpx>=0.27,<1"
+      - name: O01 and O02 in every mode
         env:
           MODES: ${{ join(fromJSON(needs.revision.outputs.modes), ' ') }}
         run: |
-          if python3 scripts/ci_quarantine.py scenarios | grep -qx O02; then
-            echo "O02 is quarantined: it runs in the quarantine job." >> "$GITHUB_STEP_SUMMARY"; exit 0
-          fi
+          quarantined=" $(python3 scripts/ci_quarantine.py scenarios | tr '\n' ' ') "
           status=0
-          for mode in $MODES; do
-            rc=0
-            NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
-              --server-binary "$NABEDRA_BIN" --olap-binary o02-inputs/nabedra-db-olap --scenario O02 \
-              --output "artifacts/O02-$mode" || rc=$?
-            python scripts/ci_acceptance_summary.py "artifacts/O02-$mode/results.json" >> "$GITHUB_STEP_SUMMARY" || true
-            # Exit 2 = not every clause executed: shown as not-run, never as passed.
-            if [ "$rc" = 2 ]; then echo "::warning::O02 direct_oltp=$mode: not-run (see results.json)"; elif [ "$rc" != 0 ]; then status=1; fi
+          for scenario in O01 O02; do
+            if [[ "$quarantined" == *" $scenario "* ]]; then
+              echo "$scenario is quarantined: it runs in the quarantine job." >> "$GITHUB_STEP_SUMMARY"; continue
+            fi
+            for mode in $MODES; do
+              rc=0
+              NABEDRA_TEST_DIRECT_OLTP=$mode python scripts/acceptance_oltp.py --test-binary "$NABEDRA_TEST_EXE" \
+                --server-binary "$NABEDRA_BIN" --olap-binary o02-inputs/nabedra-db-olap --scenario "$scenario" \
+                --output "artifacts/$scenario-$mode" || rc=$?
+              python scripts/ci_acceptance_summary.py "artifacts/$scenario-$mode/results.json" >> "$GITHUB_STEP_SUMMARY" || true
+              # Exit 2 = not every clause executed: shown as not-run, never as passed.
+              if [ "$rc" = 2 ]; then echo "::warning::$scenario direct_oltp=$mode: not-run (see results.json)"; elif [ "$rc" != 0 ]; then status=1; fi
+            done
           done
           exit "$status"
       - if: always()
