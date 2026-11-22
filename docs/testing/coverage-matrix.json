@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "cb15c48d3168ad3070d4e5d88946d8e0b7ff54ed",
+  "head": "e55fcd7452d958e46a5d8feb3482c2d21e79dfe8",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -14,6 +14,715 @@
     "K"
   ],
   "rows": [
+    {
+      "cells": {
+        "D": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "F": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "H": {
+          "reason": "The checks compare each reply directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Finite generated programs cover the command cases",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "The command reference is executable",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "The row covers reply semantics",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "reason": "One server can exercise RESP2 replies",
+          "required": false,
+          "state": "n/a"
+        },
+        "U": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        }
+      },
+      "guarantee": "Supported commands reply byte for byte as Valkey 8.1 does. Unsupported commands return a Valkey-compatible error.",
+      "id": "CACHE-G01",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K01"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "F": {
+          "reason": "The rule uses well-formed TTL commands",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "Generated sequences compare replies and store state directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Time advances deterministically to the cutoff",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "A reference store models expiry",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "The sweep cutoff is a work limit",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "reason": "An injected clock exercises expiry boundaries",
+          "required": false,
+          "state": "n/a"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        }
+      },
+      "guarantee": "Reads never extend a TTL. A non-positive EXPIRE deletes. TTL uses -2 for an absent key and -1 for a key without expiry. Expired keys never return, and each sweep stays within 64 items or 200 \u00b5s.",
+      "id": "CACHE-G02",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K01"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The configured cap and live key set define the oracle",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The workload exercises pressure and eviction after parsing",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "Counters and evicted identities are available directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Directed saturation exercises the cap",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "Generated properties inspect actual memory accounting",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        }
+      },
+      "guarantee": "Memory never exceeds the cap. `noeviction` returns OOM, and `sampled_lru` evicts only existing keys and frees enough space to admit the write.",
+      "id": "CACHE-G03",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K02"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "Paired comparisons belong to P",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The workload uses known pressure patterns",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "The check uses timing samples",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "The pressure profiles use bounded benchmark trials",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "Latency needs measurement",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "deferred": "hardware-deferred",
+          "executed": 0,
+          "failed": 0,
+          "reason": "hardware-deferred (absolute latency caps under memory pressure)",
+          "required": true,
+          "state": "not-run"
+        },
+        "R": {
+          "reason": "The benchmark runs in the measured environment",
+          "required": false,
+          "state": "n/a"
+        },
+        "S": {
+          "reason": "Virtual time cannot measure actual latency",
+          "required": false,
+          "state": "n/a"
+        },
+        "U": {
+          "reason": "The workload needs the running server",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Latency stays within its caps under memory pressure.",
+      "id": "CACHE-G04",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K02"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The relaxed history checker determines admissible values",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The workload uses valid commands and injected faults",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "K": {
+          "reason": "A quiescent check after targeted failover tests convergence",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "P": {
+          "reason": "This row covers safety and convergence",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "reason": "Failover spans epochs and replicas",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Failover may lose writes acknowledged within the replication lag window. It never invents a value or resurrects a deleted or expired key. Replicas converge after writes stop.",
+      "id": "CACHE-G05",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K03"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The clock bound and lease grants define authority",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "Failures affect valid lease operations",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "K": {
+          "reason": "Directed pauses cross the lease boundary",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "P": {
+          "reason": "Single-primary authority is a safety assertion",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "reason": "Lease authority spans workers, clocks, and the controller",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "At most one primary accepts writes for a slot at any instant under 3 s leases and the 10 ms clock-uncertainty bound.",
+      "id": "CACHE-G06",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K03"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "Full coverage and uniqueness are checked directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "Slot moves use valid messages",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "The controller map is inspected after each step",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Directed transition sequences exercise the invariant",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "P": {
+          "reason": "Slot coverage has no performance target",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "reason": "The model and simulation inspect every committed map",
+          "required": false,
+          "state": "n/a"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "reason": "Ownership is checked across committed transitions",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Every committed controller state assigns each of the 16,384 slots to exactly one group.",
+      "id": "CACHE-G07",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K03"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The committed map gives the expected routes",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The check sends valid commands to old or unavailable owners",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "The fixture compares replies with the active map",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Directed route changes exercise the replies",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "Results depend on the implemented command and routing paths",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "Redirect correctness has no performance target",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "reason": "Redirects span workers and the controller map",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "MOVED, TRYAGAIN and CLUSTERDOWN redirect correctly. CLUSTER SLOTS and SHARDS match the controller map.",
+      "id": "CACHE-G08",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K03"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The expected key set is empty",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "No malformed input is needed for a restart",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "The fixture checks for an empty store directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "A complete restart exercises the boundary",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "The restart check observes the actual data state",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "This row covers cold-start contents",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "U": {
+          "reason": "Cold start concerns worker lifecycle",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Cold start is empty.",
+      "id": "CACHE-G09",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K03"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "Paired Valkey comparison belongs to P",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The offered workload follows fixed profiles",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "The benchmark records timing and resource series",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "The matched workloads use bounded benchmark trials",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "Performance qualification needs measurements",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "deferred": "hardware-deferred",
+          "executed": 0,
+          "failed": 0,
+          "reason": "hardware-deferred (K04b absolute scale-out efficiency and absolute latency targets)",
+          "required": true,
+          "state": "not-run"
+        },
+        "R": {
+          "reason": "The benchmark itself uses the measured environment",
+          "required": false,
+          "state": "n/a"
+        },
+        "S": {
+          "reason": "K04b logical checks do not qualify absolute efficiency",
+          "required": false,
+          "state": "n/a"
+        },
+        "U": {
+          "reason": "The paired comparison uses running servers",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Single-host p50 and p99 are at most 1.20 times Valkey's, with at least 80% of its goodput. Scale-out efficiency is at least 80% at 3, 6 and 12 groups.",
+      "id": "CACHE-G10",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K04a",
+        "K04b"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "reason": "The controller map gives the expected authority",
+          "required": false,
+          "state": "n/a"
+        },
+        "F": {
+          "reason": "The failure concerns worker lifecycle",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "Placement and slot authority are checked directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Directed deploy, replace, and drain exercise the transitions",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "The workflow depends on provider lifecycle behavior",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "This row covers lifecycle safety",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "deferred": "cloud-deferred",
+          "executed": 0,
+          "failed": 0,
+          "reason": "cloud-deferred (K05 deploy, replace, and drain on EC2)",
+          "required": true,
+          "state": "not-run"
+        },
+        "S": {
+          "reason": "Modeled nodes cannot establish deploy or drain behavior",
+          "required": false,
+          "state": "n/a"
+        },
+        "U": {
+          "reason": "Deployment crosses workers, controller, and provider",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Deploy, replace and drain preserve slot authority.",
+      "id": "CACHE-G11",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K05"
+      ]
+    },
+    {
+      "cells": {
+        "D": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "F": {
+          "reason": "Command decoding fuzzing belongs to CACHE-G01",
+          "required": false,
+          "state": "n/a"
+        },
+        "H": {
+          "reason": "Replies and errors are compared directly",
+          "required": false,
+          "state": "n/a"
+        },
+        "K": {
+          "reason": "Shared programs cover the client cases",
+          "required": false,
+          "state": "n/a"
+        },
+        "M": {
+          "reason": "Compatibility uses actual clients",
+          "required": false,
+          "state": "n/a"
+        },
+        "P": {
+          "reason": "This row covers interoperability",
+          "required": false,
+          "state": "n/a"
+        },
+        "R": {
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
+        },
+        "S": {
+          "reason": "A live RESP2 path supplies the replies",
+          "required": false,
+          "state": "n/a"
+        },
+        "U": {
+          "reason": "The check exercises public client and server entry points",
+          "required": false,
+          "state": "n/a"
+        }
+      },
+      "guarantee": "Both ORMs, redis-py and node-redis behave identically.",
+      "id": "CACHE-G12",
+      "level": "L2",
+      "module": "cache",
+      "scenarios": [
+        "K01"
+      ]
+    },
     {
       "cells": {
         "D": {
@@ -120,9 +829,10 @@
           "state": "missing"
         },
         "U": {
-          "reason": "Offset continuity is checked over a publish history",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         }
       },
       "guarantee": "Offsets start at 1, stay contiguous in commit order, and are never reassigned.",
@@ -179,9 +889,10 @@
           "state": "missing"
         },
         "U": {
-          "reason": "Retry resolves committed state after leader change",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         }
       },
       "guarantee": "A retried publish with the same UUID returns its original offsets.",
@@ -237,9 +948,10 @@
           "state": "missing"
         },
         "U": {
-          "reason": "A crash can interrupt state-machine application",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         }
       },
       "guarantee": "A batch applies whole or not at all.",
@@ -296,9 +1008,10 @@
           "state": "missing"
         },
         "U": {
-          "reason": "Lease generation and delivery order span claim, poll, and ack",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         }
       },
       "guarantee": "Every event at or after a checkpoint is redelivered until acknowledged. Acks advance a prefix. A stale lease generation gets `409 lease_lost`. The lease clock never moves backward.",
@@ -832,715 +1545,6 @@
       "module": "events",
       "scenarios": [
         "EV06"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "F": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "H": {
-          "reason": "The checks compare each reply directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Finite generated programs cover the command cases",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "The command reference is executable",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "The row covers reply semantics",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "reason": "One server can exercise RESP2 replies",
-          "required": false,
-          "state": "n/a"
-        },
-        "U": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        }
-      },
-      "guarantee": "Supported commands reply byte for byte as Valkey 8.1 does. Unsupported commands return a Valkey-compatible error.",
-      "id": "KV-G01",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K01"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "F": {
-          "reason": "The rule uses well-formed TTL commands",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "Generated sequences compare replies and store state directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Time advances deterministically to the cutoff",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "A reference store models expiry",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "The sweep cutoff is a work limit",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "reason": "An injected clock exercises expiry boundaries",
-          "required": false,
-          "state": "n/a"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        }
-      },
-      "guarantee": "Reads never extend a TTL. A non-positive EXPIRE deletes. TTL uses -2 for an absent key and -1 for a key without expiry. Expired keys never return, and each sweep stays within 64 items or 200 \u00b5s.",
-      "id": "KV-G02",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K01"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The configured cap and live key set define the oracle",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The workload exercises pressure and eviction after parsing",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "Counters and evicted identities are available directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Directed saturation exercises the cap",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "Generated properties inspect actual memory accounting",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        }
-      },
-      "guarantee": "Memory never exceeds the cap. `noeviction` returns OOM, and `sampled_lru` evicts only existing keys and frees enough space to admit the write.",
-      "id": "KV-G03",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K02"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "Paired comparisons belong to P",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The workload uses known pressure patterns",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "The check uses timing samples",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "The pressure profiles use bounded benchmark trials",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "Latency needs measurement",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "deferred": "hardware-deferred",
-          "executed": 0,
-          "failed": 0,
-          "reason": "hardware-deferred (absolute latency caps under memory pressure)",
-          "required": true,
-          "state": "not-run"
-        },
-        "R": {
-          "reason": "The benchmark runs in the measured environment",
-          "required": false,
-          "state": "n/a"
-        },
-        "S": {
-          "reason": "Virtual time cannot measure actual latency",
-          "required": false,
-          "state": "n/a"
-        },
-        "U": {
-          "reason": "The workload needs the running server",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Latency stays within its caps under memory pressure.",
-      "id": "KV-G04",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K02"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The relaxed history checker determines admissible values",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The workload uses valid commands and injected faults",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "K": {
-          "reason": "A quiescent check after targeted failover tests convergence",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "P": {
-          "reason": "This row covers safety and convergence",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "reason": "Failover spans epochs and replicas",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Failover may lose writes acknowledged within the replication lag window. It never invents a value or resurrects a deleted or expired key. Replicas converge after writes stop.",
-      "id": "KV-G05",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K03"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The clock bound and lease grants define authority",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "Failures affect valid lease operations",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "K": {
-          "reason": "Directed pauses cross the lease boundary",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "P": {
-          "reason": "Single-primary authority is a safety assertion",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "reason": "Lease authority spans workers, clocks, and the controller",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "At most one primary accepts writes for a slot at any instant under 3 s leases and the 10 ms clock-uncertainty bound.",
-      "id": "KV-G06",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K03"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "Full coverage and uniqueness are checked directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "Slot moves use valid messages",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "The controller map is inspected after each step",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Directed transition sequences exercise the invariant",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "P": {
-          "reason": "Slot coverage has no performance target",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "reason": "The model and simulation inspect every committed map",
-          "required": false,
-          "state": "n/a"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "reason": "Ownership is checked across committed transitions",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Every committed controller state assigns each of the 16,384 slots to exactly one group.",
-      "id": "KV-G07",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K03"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The committed map gives the expected routes",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The check sends valid commands to old or unavailable owners",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "The fixture compares replies with the active map",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Directed route changes exercise the replies",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "Results depend on the implemented command and routing paths",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "Redirect correctness has no performance target",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "reason": "Redirects span workers and the controller map",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "MOVED, TRYAGAIN and CLUSTERDOWN redirect correctly. CLUSTER SLOTS and SHARDS match the controller map.",
-      "id": "KV-G08",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K03"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The expected key set is empty",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "No malformed input is needed for a restart",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "The fixture checks for an empty store directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "A complete restart exercises the boundary",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "The restart check observes the actual data state",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "This row covers cold-start contents",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "U": {
-          "reason": "Cold start concerns worker lifecycle",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Cold start is empty.",
-      "id": "KV-G09",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K03"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "Paired Valkey comparison belongs to P",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The offered workload follows fixed profiles",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "The benchmark records timing and resource series",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "The matched workloads use bounded benchmark trials",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "Performance qualification needs measurements",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "deferred": "hardware-deferred",
-          "executed": 0,
-          "failed": 0,
-          "reason": "hardware-deferred (K04b absolute scale-out efficiency and absolute latency targets)",
-          "required": true,
-          "state": "not-run"
-        },
-        "R": {
-          "reason": "The benchmark itself uses the measured environment",
-          "required": false,
-          "state": "n/a"
-        },
-        "S": {
-          "reason": "K04b logical checks do not qualify absolute efficiency",
-          "required": false,
-          "state": "n/a"
-        },
-        "U": {
-          "reason": "The paired comparison uses running servers",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Single-host p50 and p99 are at most 1.20 times Valkey's, with at least 80% of its goodput. Scale-out efficiency is at least 80% at 3, 6 and 12 groups.",
-      "id": "KV-G10",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K04a",
-        "K04b"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "reason": "The controller map gives the expected authority",
-          "required": false,
-          "state": "n/a"
-        },
-        "F": {
-          "reason": "The failure concerns worker lifecycle",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "Placement and slot authority are checked directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Directed deploy, replace, and drain exercise the transitions",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "The workflow depends on provider lifecycle behavior",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "This row covers lifecycle safety",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "deferred": "cloud-deferred",
-          "executed": 0,
-          "failed": 0,
-          "reason": "cloud-deferred (K05 deploy, replace, and drain on EC2)",
-          "required": true,
-          "state": "not-run"
-        },
-        "S": {
-          "reason": "Modeled nodes cannot establish deploy or drain behavior",
-          "required": false,
-          "state": "n/a"
-        },
-        "U": {
-          "reason": "Deployment crosses workers, controller, and provider",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Deploy, replace and drain preserve slot authority.",
-      "id": "KV-G11",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K05"
-      ]
-    },
-    {
-      "cells": {
-        "D": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "F": {
-          "reason": "Command decoding fuzzing belongs to KV-G01",
-          "required": false,
-          "state": "n/a"
-        },
-        "H": {
-          "reason": "Replies and errors are compared directly",
-          "required": false,
-          "state": "n/a"
-        },
-        "K": {
-          "reason": "Shared programs cover the client cases",
-          "required": false,
-          "state": "n/a"
-        },
-        "M": {
-          "reason": "Compatibility uses actual clients",
-          "required": false,
-          "state": "n/a"
-        },
-        "P": {
-          "reason": "This row covers interoperability",
-          "required": false,
-          "state": "n/a"
-        },
-        "R": {
-          "executed": 0,
-          "failed": 0,
-          "required": true,
-          "state": "missing"
-        },
-        "S": {
-          "reason": "A live RESP2 path supplies the replies",
-          "required": false,
-          "state": "n/a"
-        },
-        "U": {
-          "reason": "The check exercises public client and server entry points",
-          "required": false,
-          "state": "n/a"
-        }
-      },
-      "guarantee": "Both ORMs, redis-py and node-redis behave identically.",
-      "id": "KV-G12",
-      "level": "L2",
-      "module": "kv",
-      "scenarios": [
-        "K01"
       ]
     },
     {
@@ -3683,9 +3687,10 @@
     {
       "cells": {
         "D": {
-          "reason": "The version comparison is part of U",
-          "required": false,
-          "state": "n/a"
+          "executed": 0,
+          "failed": 0,
+          "required": true,
+          "state": "missing"
         },
         "F": {
           "reason": "Version fields are read from package metadata",
