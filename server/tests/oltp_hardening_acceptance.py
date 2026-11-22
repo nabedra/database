@@ -656,7 +656,7 @@ def check_allocator(fixture, table, commit_ts):
         not_run('O09', 'timestamp-order', 'Timestamp failover and old-leader resume passed. Wall-clock jumps require Linux and a C compiler.')
 
     if fixture.direct:
-        verify_direct_scan(fixture, table, expected, latest['last'])
+        verify_direct_scan(fixture, table, expected, latest['last'], survivors)
     passed('O09', 'no-backdated-allocation',
            'Four-value AllocateDirect replies advanced past completed allocations and a queued scan pin. The new leader advanced past the old window.')
 
@@ -705,7 +705,7 @@ def wait_for_recovered_read(fixture, api, new_request, expected):
     evidence('O09', 'post-failover-read', api=api, attempts=attempts)
 
 
-def verify_direct_scan(fixture, table, prior_rows, completed_ts):
+def verify_direct_scan(fixture, table, prior_rows, clock_jump_ts, survivors):
     row = rows(12, category=7)[0]
     # SIGSTOP pauses every group on the old allocator's worker. The new
     # Timestamp leader can issue before Catalog and Data can serve requests.
@@ -713,6 +713,11 @@ def verify_direct_scan(fixture, table, prior_rows, completed_ts):
     # starting the race. The racing write must still hit direct-proposing.
     wait_for_recovered_read(fixture, 'api2', lambda: fixture.query(table), prior_rows)
     wait_for_recovered_read(fixture, 'api1', lambda: point(table, 'get', key=row['id']), None)
+    # Take the timestamp under test after the probes. A queued read moves the
+    # allocator watermark and can invalidate the rest of a direct window.
+    _, completed, _ = allocator(fixture, survivors)
+    assert completed['first'] > clock_jump_ts, (completed, clock_jump_ts)
+    completed_ts = completed['last']
     body = point(table, 'insert', row=row)
     request_id = body['request_id']
     reached = direct_proposal_paths(fixture, request_id)
