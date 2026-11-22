@@ -4,6 +4,8 @@ mod admission;
 mod auth;
 mod error;
 mod wire;
+#[cfg(test)]
+mod tests;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
