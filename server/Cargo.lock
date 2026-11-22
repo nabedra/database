@@ -1904,6 +1904,7 @@ dependencies = [
  "mime",
  "nabedra-check",
  "nabedra-kv",
+ "nabedra-rt",
  "openraft",
  "parquet",
  "ring",
@@ -1930,6 +1931,14 @@ dependencies = [
  "bytes",
  "libc",
  "tokio",
+]
+
+[[package]]
+name = "nabedra-rt"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

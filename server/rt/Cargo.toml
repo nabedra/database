@@ -1,0 +1,25 @@
+[package]
+name = "nabedra-rt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.1"
+description = "Nabedra's runtime seam: clock, task spawning and ids, with a deterministic simulation mode"
+license = "MIT"
+repository = "https://github.com/zPy52/nabedra-database"
+publish = ["crates-io"]
+
+[lib]
+name = "nabedra_rt"
+
+[features]
+# Deterministic simulation: per-node clocks, seeded ids, a per-node task registry and
+# inline blocking work. Never enable it in a product build; `server/src/main.rs` refuses
+# to compile with it.
+sim = ["tokio/test-util"]
+
+[dependencies]
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "time"] }
+uuid = { version = "=1.29.2", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
