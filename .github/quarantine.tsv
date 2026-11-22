@@ -4,3 +4,4 @@
 # owner: the task or thread that fixes it, assigned by the orchestrator; `unassigned` until then.
 # added/expires: ISO dates. exit_criteria: what lets the row be deleted.
 id	kind	owner	added	expires	exit_criteria
+node::payload_owner::installation_tests::final_drain_receipt_account_publication_cleanup_and_release	test	harness-followup-olap-flake	2026-11-22	2026-12-06	Failed 1 of 2 OLAP shard-1 gate runs once the OLAP suite ran in CI (job 137280310725, installation_tests.rs:5230); exit after a root-cause fix with a regression test and 20/20 passes
