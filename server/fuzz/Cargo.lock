@@ -1489,6 +1489,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime",
+ "nabedra-rt",
  "openraft 0.10.0",
  "parquet",
  "ring",
@@ -1559,6 +1560,14 @@ dependencies = [
  "bytes",
  "libc",
  "tokio",
+]
+
+[[package]]
+name = "nabedra-rt"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

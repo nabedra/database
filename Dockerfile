@@ -24,20 +24,22 @@ RUN case "$NABEDRA_ENGINE" in olap|oltp|cache) ;; *) exit 2 ;; esac && \
 COPY server/Cargo.toml server/Cargo.lock ./
 COPY server/kv/Cargo.toml ./kv/
 COPY server/check/Cargo.toml ./check/
-RUN mkdir -p src kv/src check/src tests examples /out/timings && \
-    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && \
+COPY server/rt/Cargo.toml ./rt/
+RUN mkdir -p src kv/src check/src rt/src tests examples /out/timings && \
+    echo 'fn main() {}' > src/main.rs && : > src/lib.rs && : > kv/src/lib.rs && : > check/src/lib.rs && : > rt/src/lib.rs && \
     awk -F'"' '/^\[\[(test|example)\]\]/ { dir = ($0 ~ /test/) ? "tests" : "examples"; next } \
                /^\[/ { dir = "" } \
                dir != "" && /^name *=/ { print dir "/" $2 ".rs" }' Cargo.toml | xargs -r touch && \
     cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \
-    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv && \
+    cargo clean --offline --locked --release -p nabedra-database -p nabedra-kv -p nabedra-rt && \
     mv target/cargo-timings/cargo-timing.html /out/timings/dependencies.html && \
-    rm -rf target/cargo-timings src kv/src
+    rm -rf target/cargo-timings src kv/src rt/src
 
 # The real sources. The layer below keeps only the binary and the timing report, so a
 # `mode=max` cache export does not carry the server crate's build outputs.
 COPY server/kv/src ./kv/src
+COPY server/rt/src ./rt/src
 COPY server/src ./src
 RUN cargo build --locked --release ${BUILD_JOBS:+--jobs "$BUILD_JOBS"} --timings \
         --bin nabedra-db --no-default-features --features "$(cat /src/features)" && \

@@ -14,7 +14,7 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv", "check"]
+members = [".", "kv", "check", "rt"]
 exclude = ["events", "fuzz"]
 
 [lib]
@@ -32,6 +32,9 @@ cache = ["dep:clock-bound-client", "dep:hashbrown", "dep:smallvec", "dep:toml", 
 test-hooks = ["cache"]
 oltp-backup-s3 = ["oltp", "s3"]
 s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-http-client"]
+# Simulation builds of the library only (nabedra-rt deterministic runtime). src/main.rs
+# refuses to compile with it, so no simulation build produces a server binary.
+sim = ["nabedra-rt/sim"]
 
 [dependencies]
 ring = "=0.17.14"
@@ -63,6 +66,7 @@ tokio-rustls = { version = "=0.26.6", optional = true, default-features = false,
 socket2 = { version = "=0.6.5", optional = true }
 bytes = "=1.12.1"
 nabedra-kv = { path = "kv", version = "0.1.0", optional = true }
+nabedra-rt = { path = "rt", version = "0.1.0" }
 hashbrown = { version = "=0.17.1", default-features = false, optional = true }
 smallvec = { version = "=1.16.5", optional = true }
 toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde"], optional = true }

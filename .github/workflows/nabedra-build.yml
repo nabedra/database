@@ -608,7 +608,9 @@ jobs:
       - name: Build
         working-directory: server
         run: |
-          cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings
+          # server/clippy.toml bans direct clock, task and id calls (phase 7). The P7-BANS
+          # step enforces it once every module goes through nabedra-rt; until then it is allowed.
+          cargo clippy --locked -p nabedra-kv --all-targets -- -D warnings -A clippy::disallowed_methods
           cargo test --locked -p nabedra-kv --no-run
       - name: Stage Cargo cache without workspace crates
         if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
