@@ -184,7 +184,7 @@ pub(crate) async fn remote(
     context: Option<RequestContext>,
 ) -> Result<Reply, Error> {
     let node = scheduler(root)?;
-    let delivery = matches!(request, Request::Batch { .. }).then(Uuid::new_v4);
+    let delivery = matches!(request, Request::Batch { .. }).then(nabedra_rt::ids::uuid_v4);
     let command = Command::StreamRequest {
         request,
         context,
