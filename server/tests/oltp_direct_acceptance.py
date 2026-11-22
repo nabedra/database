@@ -1233,7 +1233,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
-    suites = args.suite or ['rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum']
+    suites = args.suite or ['d11'] * 10
     if {'barriers', 'quorum'} & set(suites) and not args.test_executable:
         parser.error('--suite barriers and quorum need --test-executable')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -1241,12 +1241,12 @@ def main():
     failed = []
     rf1_reference = None
     try:
-        for suite in suites:
+        for attempt, suite in enumerate(suites):
             try:
                 if suite == 'rf1':
                     rf1_reference = suite_rf1(args, work)
                 elif suite == 'd11':
-                    d11_rf1_cli(args, work)
+                    d11_rf1_cli(args, work / str(attempt))
                 elif suite == 'cluster':
                     suite_cluster(args, work, rf1_reference)
                 elif suite == 'd05':

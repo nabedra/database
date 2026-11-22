@@ -1373,7 +1373,9 @@ impl WorkerClient {
         let class = traffic(group, purpose)?;
         let _slot = match reserved {
             Some(slot) => slot,
-            None => self.try_outgoing(target.worker_id(), class)?,
+            None => self.try_outgoing(target.worker_id(), class).inspect_err(|_| {
+                eprintln!("FLAKE5 immediate outgoing refusal: {class:?} {purpose:?} {:?} group={} target={}", group.kind, group.group_id, target.worker_id());
+            })?,
         };
         let deadline = self.common.config.deadline;
         let mut resolving = false;
@@ -1421,6 +1423,7 @@ impl WorkerClient {
             .ok_or_else(|| malformed("worker transport deadline is too large"))?;
         let refused = |error: RequestError| {
             if matches!(error, RequestError::OutgoingLaneFull) {
+                eprintln!("FLAKE5 outgoing authority dependency refusal: {:?} group={}", group.kind, group.group_id);
                 self.common.refusals.outgoing(class);
             }
             error
