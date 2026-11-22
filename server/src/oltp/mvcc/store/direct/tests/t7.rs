@@ -37,7 +37,7 @@ fn insert(f: &Fixture, key: i64, commit_ts: u64, epoch: u64, index: Option<Uuid>
             value: Some(f.json(serde_json::json!({"id": key}))),
         });
     }
-    let mut commit = f.commit(Uuid::new_v4(), 1, commit_ts, vec![write]);
+    let mut commit = f.commit(nabedra_rt::ids::uuid_v4(), 1, commit_ts, vec![write]);
     commit.schema_epoch = epoch;
     commit
 }
@@ -57,12 +57,12 @@ async fn schema_of(f: &Fixture) -> Option<DirectSchema> {
 
 #[tokio::test]
 async fn o02_t7_the_store_gate_rejects_direct_family_commands_before_activation() {
-    let mut f = Fixture::inactive(Uuid::new_v4(), full_span()).await;
+    let mut f = Fixture::inactive(nabedra_rt::ids::uuid_v4(), full_span()).await;
     let before = f.dump().await;
     assert_eq!(schema_of(&f).await, None);
     let commands = [
         ParticipantCommand::Direct(f.put(1, None, 10)),
-        ParticipantCommand::DirectForward(f.forward_of(1, Uuid::new_v4(), 1)),
+        ParticipantCommand::DirectForward(f.forward_of(1, nabedra_rt::ids::uuid_v4(), 1)),
         ParticipantCommand::DirectExpire(DirectExpire {
             authority: f.authority,
             cutoff_unix_ms: 10,
@@ -71,7 +71,7 @@ async fn o02_t7_the_store_gate_rejects_direct_family_commands_before_activation(
         }),
         ParticipantCommand::DirectPause(DirectPause {
             authority: f.authority,
-            split_id: Uuid::new_v4(),
+            split_id: nabedra_rt::ids::uuid_v4(),
             paused: true,
         }),
     ];
@@ -97,7 +97,7 @@ async fn o02_t7_the_store_gate_rejects_direct_family_commands_before_activation(
     let again = schema_change(
         &f,
         DirectSchemaChange::Activate {
-            lifecycle: Uuid::new_v4(),
+            lifecycle: nabedra_rt::ids::uuid_v4(),
         },
     );
     assert_eq!(f.submit(again).await, schema_reply(1, Some(f.table)));
@@ -106,7 +106,7 @@ async fn o02_t7_the_store_gate_rejects_direct_family_commands_before_activation(
 #[tokio::test]
 async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by_an_older_build() {
     let mut f = Fixture::new().await;
-    let command = fence(&f, Some(Uuid::new_v4()));
+    let command = fence(&f, Some(nabedra_rt::ids::uuid_v4()));
     assert!(command.is_direct(), "gated like Direct");
     let value = serde_json::to_value(&command).unwrap();
     assert!(value.get("direct_schema").is_some());
@@ -128,9 +128,9 @@ async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by
     let before = f.dump().await;
     let scoped = ParticipantCommand::Scoped {
         scope: crate::oltp_replication::authority::control::ScopedCatalogRead {
-            queue_group_id: Uuid::new_v4(),
-            data_generation: Uuid::new_v4(),
-            queue_generation: Uuid::new_v4(),
+            queue_group_id: nabedra_rt::ids::uuid_v4(),
+            data_generation: nabedra_rt::ids::uuid_v4(),
+            queue_generation: nabedra_rt::ids::uuid_v4(),
             queue_view: crate::oltp_replication::types::AuthorityView {
                 run_id: f.authority.run_id,
                 owner_term: f.authority.owner_term,
@@ -138,7 +138,7 @@ async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by
             },
             request: RequestBinding {
                 run_id: f.authority.run_id,
-                request_id: Uuid::new_v4(),
+                request_id: nabedra_rt::ids::uuid_v4(),
                 digest: digest(1),
                 accepted_context: digest(2),
             },
@@ -181,7 +181,7 @@ async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by
         .await
         .unwrap();
     assert!(serde_json::from_slice::<OlderConfig>(raw.as_slice()).is_err());
-    let inactive = Fixture::inactive(Uuid::new_v4(), full_span()).await;
+    let inactive = Fixture::inactive(nabedra_rt::ids::uuid_v4(), full_span()).await;
     let raw = inactive
         .machine()
         .store()
@@ -202,8 +202,8 @@ async fn o02_t7_direct_schema_is_a_new_tag_and_an_active_config_is_unreadable_by
 async fn o08_o12_d11_direct_writes_racing_an_index_publication_use_the_new_descriptor() {
     for seed in 1..=8u64 {
         let mut f = Fixture::new().await;
-        let index_id = Uuid::new_v4();
-        let published = Uuid::new_v4();
+        let index_id = nabedra_rt::ids::uuid_v4();
+        let published = nabedra_rt::ids::uuid_v4();
         let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let mut next = || {
             rng ^= rng << 13;
@@ -320,7 +320,7 @@ async fn o08_d11_a_drop_fence_stops_every_direct_commit_and_leaves_queued_epochs
     f.seal_and_resolve(&plan, 21).await;
     assert_eq!(f.read(21, 3).await["value"]["value"]["queued"], true);
     // If the drop never published, a later DDL fence binds a lifecycle again.
-    let later = Uuid::new_v4();
+    let later = nabedra_rt::ids::uuid_v4();
     assert_eq!(
         f.submit(fence(&f, Some(later))).await,
         schema_reply(3, Some(later))
@@ -333,9 +333,9 @@ async fn o08_d11_a_drop_fence_stops_every_direct_commit_and_leaves_queued_epochs
 /// activation that arrives after a DDL fence never undoes it.
 #[tokio::test]
 async fn o02_d11_schema_fences_are_deterministic_and_survive_a_run_fence() {
-    let mut f = Fixture::inactive(Uuid::new_v4(), full_span()).await;
+    let mut f = Fixture::inactive(nabedra_rt::ids::uuid_v4(), full_span()).await;
     let mut other = f.replica_of_inactive().await;
-    let published = Uuid::new_v4();
+    let published = nabedra_rt::ids::uuid_v4();
     let log = [
         fence(&f, Some(published)),
         // The activator read the old lifecycle before the DDL began; its
@@ -359,7 +359,7 @@ async fn o02_d11_schema_fences_are_deterministic_and_survive_a_run_fence() {
         owner_term: 2,
     };
     let run_fence = ParticipantCommand::Fence {
-        transition_id: Uuid::new_v4(),
+        transition_id: nabedra_rt::ids::uuid_v4(),
         expected: Some(f.authority),
         next,
         schema_epoch: 1,
@@ -390,7 +390,7 @@ async fn o02_d11_schema_fences_are_deterministic_and_survive_a_run_fence() {
         applied(10)
     );
     // A fence under the old authority is refused and changes nothing.
-    let mut stale = fence(&f, Some(Uuid::new_v4()));
+    let mut stale = fence(&f, Some(nabedra_rt::ids::uuid_v4()));
     if let ParticipantCommand::DirectSchema(fence) = &mut stale {
         fence.authority.owner_term = 1;
     }
@@ -405,7 +405,7 @@ async fn o02_d11_schema_fences_are_deterministic_and_survive_a_run_fence() {
     // A fence for another table's id is malformed.
     let mut foreign = fence(&f, None);
     if let ParticipantCommand::DirectSchema(fence) = &mut foreign {
-        fence.table_id = Uuid::new_v4();
+        fence.table_id = nabedra_rt::ids::uuid_v4();
     }
     assert_eq!(
         f.submit(foreign).await,

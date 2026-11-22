@@ -11,13 +11,13 @@ pub(crate) async fn pause_routing_page(read_ts: u64) {
     }
     let reached = directory.join(format!("routing-page-{read_ts}.reached"));
     std::fs::write(reached, b"").expect("record first routing page traversal");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = nabedra_rt::time::now() + Duration::from_secs(120);
     while control.is_file() {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            nabedra_rt::time::now() < deadline,
             "routing page watchdog expired"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        nabedra_rt::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

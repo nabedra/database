@@ -137,6 +137,7 @@ impl DamageState {
         let Some(pool) = self.pool.get().cloned() else {
             return;
         };
+        #[allow(clippy::disallowed_methods)] // explicit kv stack size, which spawn_service cannot set
         let spawned = std::thread::Builder::new()
             .name("oltp-damage".into())
             .stack_size(nabedra_kv::THREAD_STACK_BYTES)
@@ -342,7 +343,7 @@ impl OltpPool {
         // Holding the handle registry excludes a concurrent open of the group.
         let groups = self.inner.groups.clone().lock_owned().await;
         let pool = self.clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             if groups
                 .get(&id)
                 .is_some_and(|group| group.strong_count() > 0)

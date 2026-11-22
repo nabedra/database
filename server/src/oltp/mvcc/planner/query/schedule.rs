@@ -99,7 +99,7 @@ impl QueryScheduler {
             .collect();
         drop(active);
         let active = self.active.clone();
-        tokio::spawn(async move {
+        nabedra_rt::task::spawn(async move {
             let _recovering = recovering;
             for (id, pending) in outstanding {
                 if !pending.read.settle().await {
@@ -156,7 +156,7 @@ pub(super) struct QueryExecution {
 }
 impl QueryExecution {
     pub(super) async fn reserve_page(&self) -> Result<Reservation, ProtocolError> {
-        tokio::time::timeout(
+        nabedra_rt::time::timeout(
             std::time::Duration::from_secs(10),
             self.shared
                 .scheduler()
@@ -216,7 +216,7 @@ impl<T: Send + 'static> Pages<T> {
         &mut self,
         page: impl Future<Output = Result<T, PlanError>> + Send + 'static,
     ) {
-        self.jobs.push(tokio::spawn(page));
+        self.jobs.push(nabedra_rt::task::spawn(page));
     }
 
     pub(super) async fn next(&mut self) -> Result<T, PlanError> {
@@ -251,8 +251,8 @@ mod tests {
     fn request() -> RequestBinding {
         let digest = crate::oltp_replication::types::Digest::from_bytes([1; 32]);
         RequestBinding {
-            run_id: Uuid::new_v4(),
-            request_id: Uuid::new_v4(),
+            run_id: nabedra_rt::ids::uuid_v4(),
+            request_id: nabedra_rt::ids::uuid_v4(),
             digest,
             accepted_context: digest,
         }
@@ -261,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn o22_c04_c06_delayed_page_refills_under_caps_one_two_and_three() {
         for cap in 1..=3 {
-            tokio::time::timeout(DEADLINE, async {
+            nabedra_rt::time::timeout(DEADLINE, async {
                 let shared = shared();
                 let baseline = shared.scheduler().usage();
                 let scheduler = QueryScheduler::new(cap, &shared).unwrap();
@@ -318,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn o22_c05_c07_m02_m03_f03_cancelled_receiver_leaves_grant_with_job() {
-        tokio::time::timeout(DEADLINE, async {
+        nabedra_rt::time::timeout(DEADLINE, async {
             let shared = shared();
             let baseline = shared.scheduler().usage();
             let scheduler = QueryScheduler::new(3, &shared).unwrap();

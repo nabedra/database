@@ -85,7 +85,7 @@ impl OltpPool {
         // memtable to runs. `Store::flush` blocks, so it runs off the runtime.
         self.sync_wal().await?;
         let pool = self.clone();
-        tokio::task::spawn_blocking(move || {
+        nabedra_rt::task::spawn_blocking(move || {
             target.authorize_pool(pool.identity(), &pool.inner.path)?;
             pool.healthy()?;
             pool.inner.store.flush().map_err(storage_error)?;

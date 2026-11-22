@@ -18,7 +18,7 @@ fn member_applied(commit_ts: u64) -> DirectMemberReply {
 /// A one-row upsert with its own request id and body byte.
 fn put_as(f: &Fixture, key: i64, expected: Option<u64>, commit_ts: u64, body: u8) -> DirectCommit {
     f.commit(
-        Uuid::new_v4(),
+        nabedra_rt::ids::uuid_v4(),
         body,
         commit_ts,
         vec![f.write(
@@ -141,7 +141,7 @@ async fn o07_d08_gc2_mixed_rejections_write_nothing_for_their_member_and_the_oth
         f.prepare(&plan, vec![write]).await,
         ParticipantReply::PreparedPage { .. }
     ));
-    let forward = f.forward_of(4, Uuid::new_v4(), 4);
+    let forward = f.forward_of(4, nabedra_rt::ids::uuid_v4(), 4);
     assert_eq!(f.forward(&forward).await, forwarded_reply());
     let before = f.dump().await;
     let stale = put_as(&f, 1, Some(9), 20, 1);
@@ -204,7 +204,7 @@ async fn o07_gc2_apply_refuses_a_member_sharing_a_key_with_an_earlier_member() {
     // Another row whose index entry is the first one's: the same index key.
     let index_key = MvccKey::IndexEntry {
         table_id: f.table,
-        index_id: Uuid::new_v4(),
+        index_id: nabedra_rt::ids::uuid_v4(),
         values: Page::new(vec![IndexValue::Int64(7)]).unwrap(),
         primary_key: Key::Int64(2),
     };
@@ -215,7 +215,7 @@ async fn o07_gc2_apply_refuses_a_member_sharing_a_key_with_an_earlier_member() {
         value: Some(f.json(serde_json::json!({"id": 2}))),
     });
     let mut index_again = with_index.clone();
-    index_again.request_id = Uuid::new_v4();
+    index_again.request_id = nabedra_rt::ids::uuid_v4();
     index_again.commit_ts = ts(13);
     assert_eq!(
         f.submit(batch(vec![
@@ -278,7 +278,7 @@ async fn o07_gc2_batch_bounds_and_split_barrier_apply_per_member() {
     );
     // The split barrier: new members answer `SplitInProgress`, an exact
     // retry still replays.
-    let split = Uuid::new_v4();
+    let split = nabedra_rt::ids::uuid_v4();
     assert!(matches!(
         f.submit(pause(&f, split, true)).await,
         ParticipantReply::DirectPaused { paused: true, .. }
@@ -308,12 +308,12 @@ async fn d06_gc2_applying_a_batch_settles_every_member_in_the_range_clock() {
     for member in &members {
         register(&clock, member.commit_ts.get(), member.keys()).unwrap();
     }
-    let scan = tokio::spawn({
+    let scan = nabedra_rt::task::spawn({
         let machine = f.machine().clone();
         let table = f.table;
         async move { scan_versions(&machine, table, 20).await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    nabedra_rt::time::sleep(Duration::from_millis(50)).await;
     assert!(!scan.is_finished(), "the scan waits for both members");
     // One applied and one rejected member: both leave the clock.
     assert_eq!(
@@ -419,9 +419,9 @@ async fn o02_gc2_direct_batch_uses_a_new_tag_that_an_older_decoder_rejects() {
     let before = f.dump().await;
     let scoped = ParticipantCommand::Scoped {
         scope: crate::oltp_replication::authority::control::ScopedCatalogRead {
-            queue_group_id: Uuid::new_v4(),
-            data_generation: Uuid::new_v4(),
-            queue_generation: Uuid::new_v4(),
+            queue_group_id: nabedra_rt::ids::uuid_v4(),
+            data_generation: nabedra_rt::ids::uuid_v4(),
+            queue_generation: nabedra_rt::ids::uuid_v4(),
             queue_view: crate::oltp_replication::types::AuthorityView {
                 run_id: f.authority.run_id,
                 owner_term: f.authority.owner_term,
@@ -429,7 +429,7 @@ async fn o02_gc2_direct_batch_uses_a_new_tag_that_an_older_decoder_rejects() {
             },
             request: RequestBinding {
                 run_id: f.authority.run_id,
-                request_id: Uuid::new_v4(),
+                request_id: nabedra_rt::ids::uuid_v4(),
                 digest: digest(1),
                 accepted_context: digest(2),
             },

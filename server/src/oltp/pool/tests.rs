@@ -12,7 +12,7 @@ use std::{
 struct Dir(PathBuf);
 impl Dir {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!("oltp-pool-{}", Uuid::new_v4())))
+        Self(std::env::temp_dir().join(format!("oltp-pool-{}", nabedra_rt::ids::uuid_v4())))
     }
 }
 impl Drop for Dir {
@@ -35,16 +35,16 @@ fn pool_identity() -> PoolIdentity {
     PoolIdentity {
         engine: "oltp".into(),
         pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-        cluster_id: Uuid::new_v4(),
-        worker_id: Uuid::new_v4(),
-        pool_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        worker_id: nabedra_rt::ids::uuid_v4(),
+        pool_id: nabedra_rt::ids::uuid_v4(),
     }
 }
 fn group_identity(pool: &OltpPool) -> GroupIdentity {
     GroupIdentity {
         cluster_id: pool.identity().cluster_id,
         database: Text::try_from("default").unwrap(),
-        group_id: Uuid::new_v4(),
+        group_id: nabedra_rt::ids::uuid_v4(),
         kind: GroupKind::Catalog,
         group_format_version: 1,
     }
@@ -348,7 +348,7 @@ async fn o26_ns04_pool_reopens_while_a_forked_child_holds_its_descriptors() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_worker_drain() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    nabedra_rt::time::timeout(Duration::from_secs(30), async {
         let dir = Dir::new();
         let resources = shared(SharedResourceConfig {
             query_threads: 2,
@@ -378,7 +378,7 @@ async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_work
         let _release = ReleaseOnDrop(gate.clone());
         let (entered, arrival) = tokio::sync::oneshot::channel();
         let (settled, completed) = tokio::sync::oneshot::channel();
-        let work = tokio::spawn({
+        let work = nabedra_rt::task::spawn({
             let shared = resources.clone();
             let gate = gate.clone();
             async move {
@@ -405,7 +405,7 @@ async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_work
         let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
         let compute = prepared.reserve_compute(0, 0).await.unwrap();
         let pool = match pool
-            .close_with_native(Uuid::new_v4(), prepared, compute)
+            .close_with_native(nabedra_rt::ids::uuid_v4(), prepared, compute)
             .await
             .unwrap()
         {
@@ -421,7 +421,7 @@ async fn o26_f03_pool_close_waits_for_cancelled_snapshot_file_owner_without_work
         let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
         let compute = prepared.reserve_compute(0, 0).await.unwrap();
         let proof = match pool
-            .close_with_native(Uuid::new_v4(), prepared, compute)
+            .close_with_native(nabedra_rt::ids::uuid_v4(), prepared, compute)
             .await
             .unwrap()
         {
@@ -469,7 +469,7 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
         let resources = resources.clone();
         let gate = gate.clone();
         let entered = entered.clone();
-        tasks.push(runtime.spawn(async move {
+        tasks.push(nabedra_rt::task::spawn_on(runtime.handle(), async move {
             resources
                 .execute(ExecutionClass::Query, id, 1024, move || {
                     entered.send(std::thread::current().id()).unwrap();
@@ -483,7 +483,7 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
     runtime.block_on(async {
         for _ in 0..7 {
             threads.insert(
-                tokio::time::timeout(Duration::from_secs(10), arrivals.recv())
+                nabedra_rt::time::timeout(Duration::from_secs(10), arrivals.recv())
                     .await
                     .expect("all seven Query jobs reached the native gate")
                     .expect("native arrival channel remained open"),
@@ -496,7 +496,7 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
     cancelled.abort();
     runtime.block_on(async {
         assert!(
-            tokio::time::timeout(Duration::from_secs(10), cancelled)
+            nabedra_rt::time::timeout(Duration::from_secs(10), cancelled)
                 .await
                 .expect("the Query caller observed cancellation")
                 .unwrap_err()
@@ -506,7 +506,7 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
     assert_eq!(resources.scheduler().usage()[0].1, 7);
     let control = runtime
         .block_on(async {
-            tokio::time::timeout(
+            nabedra_rt::time::timeout(
                 Duration::from_secs(10),
                 resources.execute(ExecutionClass::Control, 99, 0, || {
                     Ok(std::thread::current().id())
@@ -522,13 +522,13 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
         assert!(futures_util::poll!(&mut drain).is_pending());
         drop(release);
         for task in tasks {
-            tokio::time::timeout(Duration::from_secs(10), task)
+            nabedra_rt::time::timeout(Duration::from_secs(10), task)
                 .await
                 .expect("released Query work settled")
                 .unwrap()
                 .unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(10), drain)
+        nabedra_rt::time::timeout(Duration::from_secs(10), drain)
             .await
             .expect("native drain completed after releasing Query work");
     });
@@ -536,7 +536,7 @@ fn c01_c07_f03_owned_executor_exceeds_callers_blocking_capacity_and_retains_canc
     assert!(
         runtime
             .block_on(async {
-                tokio::time::timeout(
+                nabedra_rt::time::timeout(
                     Duration::from_secs(10),
                     resources.prepare(ExecutionClass::Query),
                 )
@@ -887,7 +887,7 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
     });
     let release = ReleaseOnDrop(gate.clone());
     let (entered, arrived) = tokio::sync::oneshot::channel();
-    let query = tokio::spawn({
+    let query = nabedra_rt::task::spawn({
         let resources = resources.clone();
         async move {
             resources
@@ -899,7 +899,7 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
                 .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(10), arrived)
+    nabedra_rt::time::timeout(Duration::from_secs(10), arrived)
         .await
         .unwrap()
         .unwrap();
@@ -917,7 +917,7 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
         .unwrap();
     let saturated = [(node, 1, limits.working_bytes())];
     assert_eq!(scheduler.usage(), saturated);
-    let authority = tokio::time::timeout(
+    let authority = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         group.read(budget(), |view| {
             view.get(b"authority").and_then(|v| v.ok_or_else(capacity))
@@ -930,7 +930,7 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
     assert_eq!(scheduler.usage(), saturated);
     drop(authority);
     drop(release);
-    tokio::time::timeout(Duration::from_secs(10), query)
+    nabedra_rt::time::timeout(Duration::from_secs(10), query)
         .await
         .unwrap()
         .unwrap()
@@ -943,9 +943,9 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
 #[test]
 fn c02_o05_worker_identity_cannot_reset_budgets_or_adopt_a_second_resource_owner() {
     let resources = shared(SharedResourceConfig::default());
-    let worker = Uuid::new_v4();
+    let worker = nabedra_rt::ids::uuid_v4();
     resources.bind_worker(worker).unwrap();
-    assert!(resources.bind_worker(Uuid::new_v4()).is_err());
+    assert!(resources.bind_worker(nabedra_rt::ids::uuid_v4()).is_err());
     let alias = resources.clone();
     alias.bind_worker(worker).unwrap();
     let second = shared(SharedResourceConfig::default());
@@ -958,7 +958,7 @@ fn c02_o05_worker_identity_cannot_reset_budgets_or_adopt_a_second_resource_owner
 #[test]
 fn q02_m02_one_physical_queue_owner_preserves_worker_identity_until_last_owner_releases() {
     let resources = shared(SharedResourceConfig::default());
-    let worker = Uuid::new_v4();
+    let worker = nabedra_rt::ids::uuid_v4();
     assert!(resources.claim_queue().is_err());
     resources.bind_worker(worker).unwrap();
     let queue = resources.claim_queue().unwrap();
@@ -1005,7 +1005,7 @@ async fn o05_c07_committed_storage_apply_uses_private_capacity_with_full_transpo
     let (entered, arrived) = tokio::sync::oneshot::channel();
     // ApplyMeta models an entry already ordered by consensus. This test covers
     // the native storage transition, not a multi-node quorum history.
-    let applying = tokio::spawn({
+    let applying = nabedra_rt::task::spawn({
         let data = data.clone();
         async move {
             data.transaction(meta(0), budget(), move |tx| {
@@ -1024,11 +1024,11 @@ async fn o05_c07_committed_storage_apply_uses_private_capacity_with_full_transpo
             .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(10), arrived)
+    nabedra_rt::time::timeout(Duration::from_secs(10), arrived)
         .await
         .unwrap()
         .unwrap();
-    let authority = tokio::time::timeout(
+    let authority = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         control.read(budget(), |view| {
             view.get(b"authority")
@@ -1040,7 +1040,7 @@ async fn o05_c07_committed_storage_apply_uses_private_capacity_with_full_transpo
     .unwrap();
     assert_eq!(authority.as_slice(), b"current");
     drop(release);
-    let result = tokio::time::timeout(Duration::from_secs(10), applying)
+    let result = nabedra_rt::time::timeout(Duration::from_secs(10), applying)
         .await
         .unwrap()
         .unwrap()
@@ -1095,11 +1095,11 @@ async fn f03_query_reply_capacity_wait_has_no_cpu_and_does_not_block_control_pro
         .read(small, |view| view.copy_output(&[7u8; 64]))
         .await
         .unwrap();
-    let waiting = tokio::spawn({
+    let waiting = nabedra_rt::task::spawn({
         let data = data.clone();
         async move { data.read(small, |view| view.copy_output(b"next")).await }
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while resources.reply_waiters(ExecutionClass::Query) != 1 {
             tokio::task::yield_now().await;
         }
@@ -1107,7 +1107,7 @@ async fn f03_query_reply_capacity_wait_has_no_cpu_and_does_not_block_control_pro
     .await
     .unwrap();
     assert_eq!(resources.scheduler().usage()[0].1, 0);
-    let answer = tokio::time::timeout(
+    let answer = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         control.read(small, |view| view.copy_output(b"authority")),
     )
@@ -1115,7 +1115,7 @@ async fn f03_query_reply_capacity_wait_has_no_cpu_and_does_not_block_control_pro
     .unwrap()
     .unwrap();
     assert_eq!(answer.as_slice(), b"authority");
-    let committed = tokio::time::timeout(
+    let committed = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         data.transaction(meta(0), small, |view| {
             Ok(Transition::Commit(view.copy_output(b"committed")?))
@@ -1163,7 +1163,7 @@ async fn o05_m01_wide_internal_log_read_retains_dynamic_owner_without_apply_or_r
         .unwrap();
         let write = PreparedWrite {
             key: MvccKey::Row {
-                table_id: Uuid::new_v4(),
+                table_id: nabedra_rt::ids::uuid_v4(),
                 primary_key: crate::protocol::Key::Utf8(key),
             },
             expected_version: None,
@@ -1265,7 +1265,7 @@ async fn o05_m01_wide_internal_log_read_retains_dynamic_owner_without_apply_or_r
 #[test]
 fn m02_f03_retained_wire_and_decode_owners_prevent_worker_budget_reset() {
     let resources = shared(SharedResourceConfig::default());
-    let worker = Uuid::new_v4();
+    let worker = nabedra_rt::ids::uuid_v4();
     resources.bind_worker(worker).unwrap();
     let wire = resources.copy_bytes(b"retained").unwrap();
     let decoded = resources.reserve_scratch(ByteClass::Data, 1024).unwrap();
@@ -1289,7 +1289,7 @@ fn m02_f03_retained_wire_and_decode_owners_prevent_worker_budget_reset() {
 #[test]
 fn c02_o05_ns04_native_job_releases_its_worker_owner_before_its_result() {
     let resources = shared(SharedResourceConfig::default());
-    let worker = Uuid::new_v4();
+    let worker = nabedra_rt::ids::uuid_v4();
     resources.bind_worker(worker).unwrap();
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
     for round in 0..2000 {
@@ -1326,7 +1326,7 @@ async fn f03_native_drain_waits_for_cancelled_guard_drop() {
         }
     }
 
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         let resources = shared(SharedResourceConfig::default());
         let baseline = resources.scheduler().usage();
         let prepared = resources.prepare(ExecutionClass::Query).await.unwrap();
@@ -1343,7 +1343,7 @@ async fn f03_native_drain_waits_for_cancelled_guard_drop() {
         let release_drop = ReleaseOnDrop(drop_gate.clone());
         let (started, running) = tokio::sync::oneshot::channel();
         let (dropping, cleanup) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = nabedra_rt::task::spawn(async move {
             prepared
                 .run_with_guard(
                     (
@@ -1404,7 +1404,7 @@ async fn f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic() {
     });
     let release = ReleaseOnDrop(gate.clone());
     let (entered, arrived) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
+    let task = nabedra_rt::task::spawn(async move {
         prepared
             .run_with_guard((reservation, PanicOnDrop), move || {
                 let _ = entered.send(std::thread::current().id());
@@ -1413,14 +1413,14 @@ async fn f02_f03_owned_executor_survives_cancelled_receiver_guard_drop_panic() {
             })
             .await
     });
-    let original_thread = tokio::time::timeout(Duration::from_secs(10), arrived)
+    let original_thread = nabedra_rt::time::timeout(Duration::from_secs(10), arrived)
         .await
         .unwrap()
         .unwrap();
     task.abort();
     let _ = task.await;
     drop(release);
-    let next = tokio::time::timeout(
+    let next = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         resources.execute(ExecutionClass::Query, 45, 0, || {
             Ok(std::thread::current().id())
@@ -1460,11 +1460,11 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
         .read(small, |view| view.copy_output(b"h"))
         .await
         .unwrap();
-    let large_waiter = tokio::spawn({
+    let large_waiter = nabedra_rt::task::spawn({
         let data = data.clone();
         async move { data.read(large, |view| view.copy_output(&[9u8; 64])).await }
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while resources.reply_waiters(ExecutionClass::Query) != 1 {
             tokio::task::yield_now().await;
         }
@@ -1474,7 +1474,7 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
     // Before aging, each fitting small request finishes while the retained
     // one-byte response prevents the full-capacity request from fitting.
     for _ in 0..32 {
-        let answer = tokio::time::timeout(
+        let answer = nabedra_rt::time::timeout(
             Duration::from_secs(10),
             data.read(small, |view| view.copy_output(b"s")),
         )
@@ -1484,11 +1484,11 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
         assert_eq!(answer.as_slice(), b"s");
         drop(answer);
     }
-    let small_waiter = tokio::spawn({
+    let small_waiter = nabedra_rt::task::spawn({
         let data = data.clone();
         async move { data.read(small, |view| view.copy_output(b"t")).await }
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while resources.reply_waiters(ExecutionClass::Query) != 2 {
             tokio::task::yield_now().await;
         }
@@ -1497,7 +1497,7 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
     .unwrap();
     assert_eq!(resources.scheduler().usage()[0].1, 0);
     assert!(!small_waiter.is_finished());
-    let authority = tokio::time::timeout(
+    let authority = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         control.read(budget(), |view| view.copy_output(b"control")),
     )
@@ -1507,7 +1507,7 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
     assert_eq!(authority.as_slice(), b"control");
     drop(authority);
     drop(retained);
-    let granted = tokio::time::timeout(Duration::from_secs(10), large_waiter)
+    let granted = nabedra_rt::time::timeout(Duration::from_secs(10), large_waiter)
         .await
         .unwrap()
         .unwrap()
@@ -1517,7 +1517,7 @@ async fn m03_c07_reply_arena_bounds_bypass_and_protects_aged_large_waiter_headro
     assert_eq!(resources.reply_waiters(ExecutionClass::Query), 1);
     assert_eq!(resources.scheduler().usage()[0].1, 0);
     drop(granted);
-    let small_result = tokio::time::timeout(Duration::from_secs(10), small_waiter)
+    let small_result = nabedra_rt::time::timeout(Duration::from_secs(10), small_waiter)
         .await
         .unwrap()
         .unwrap()
@@ -1550,11 +1550,11 @@ async fn m03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom() {
         .read(small, |view| view.copy_output(b"h"))
         .await
         .unwrap();
-    let head = tokio::spawn({
+    let head = nabedra_rt::task::spawn({
         let data = data.clone();
         async move { data.read(large, |view| view.copy_output(&[0; 64])).await }
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while resources.reply_waiters(ExecutionClass::Query) != 1 {
             tokio::task::yield_now().await;
         }
@@ -1563,7 +1563,7 @@ async fn m03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom() {
     .unwrap();
     for _ in 0..32 {
         drop(
-            tokio::time::timeout(
+            nabedra_rt::time::timeout(
                 Duration::from_secs(10),
                 data.read(small, |view| view.copy_output(b"s")),
             )
@@ -1572,11 +1572,11 @@ async fn m03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom() {
             .unwrap(),
         );
     }
-    let follower = tokio::spawn({
+    let follower = nabedra_rt::task::spawn({
         let data = data.clone();
         async move { data.read(small, |view| view.copy_output(b"f")).await }
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
+    nabedra_rt::time::timeout(Duration::from_secs(10), async {
         while resources.reply_waiters(ExecutionClass::Query) != 2 {
             tokio::task::yield_now().await;
         }
@@ -1588,7 +1588,7 @@ async fn m03_f03_cancelling_aged_reply_waiter_restores_small_work_headroom() {
     assert!(head.await.unwrap_err().is_cancelled());
     // The held byte still exists. Progress follows cancellation of headroom
     // protection, rather than the large allocation suddenly becoming feasible.
-    let answer = tokio::time::timeout(Duration::from_secs(10), follower)
+    let answer = nabedra_rt::time::timeout(Duration::from_secs(10), follower)
         .await
         .unwrap()
         .unwrap()
@@ -1857,7 +1857,7 @@ async fn c07_o05_consensus_metadata_progresses_with_pending_data_apply_and_query
             .sum::<u64>(),
         0
     );
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         Duration::from_secs(5),
         group.log_transaction_metadata(budget(), |tx| {
             tx.put(b"vote", b"term-7")?;
@@ -1867,7 +1867,7 @@ async fn c07_o05_consensus_metadata_progresses_with_pending_data_apply_and_query
     .await
     .unwrap()
     .unwrap();
-    let vote = tokio::time::timeout(
+    let vote = nabedra_rt::time::timeout(
         Duration::from_secs(5),
         group.log_read_metadata(budget(), |view| view.get(b"vote")?.ok_or_else(capacity)),
     )
@@ -1968,7 +1968,7 @@ async fn m02_c07_reply_decode_has_independent_bounded_ownership_with_raw_and_wir
         )
         .unwrap();
     let owner = Arc::new(
-        tokio::time::timeout(Duration::from_secs(5), resources.reserve_reply_decode(4096))
+        nabedra_rt::time::timeout(Duration::from_secs(5), resources.reserve_reply_decode(4096))
             .await
             .unwrap()
             .unwrap(),
@@ -2021,7 +2021,7 @@ async fn o22_c07_dependent_pool_writers_wait_without_compute() {
     })
     .await;
     assert_eq!(resources.scheduler().usage(), baseline);
-    let read = tokio::time::timeout(
+    let read = nabedra_rt::time::timeout(
         Duration::from_secs(10),
         data.read(budget(), |view| {
             assert!(view.get(b"first")?.is_none());
@@ -2034,7 +2034,7 @@ async fn o22_c07_dependent_pool_writers_wait_without_compute() {
     assert_eq!(read.as_slice(), b"available");
     drop(read);
     drop(order);
-    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+    let (first, second) = nabedra_rt::time::timeout(Duration::from_secs(10), async {
         tokio::join!(first, second)
     })
     .await

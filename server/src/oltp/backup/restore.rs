@@ -187,7 +187,7 @@ impl OfflineRestoreTarget {
             .unwrap_or(Path::new("."));
         let parent = fs::canonicalize(parent).map_err(|_| invalid())?;
         let destination = parent.join(destination.file_name().ok_or_else(invalid)?);
-        let restore_id = Uuid::new_v4();
+        let restore_id = nabedra_rt::ids::uuid_v4();
         let stage = if publish_in_place {
             destination.clone()
         } else {
@@ -209,9 +209,9 @@ impl OfflineRestoreTarget {
             PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: Uuid::new_v4(),
-                worker_id: Uuid::new_v4(),
-                pool_id: Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
+                worker_id: nabedra_rt::ids::uuid_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             restore_id,
             publish_in_place,
@@ -393,7 +393,7 @@ impl RestoredGenesis {
         let staged = self
             .target
             .destination
-            .join(format!(".restore-ready-{}.tmp", Uuid::new_v4()));
+            .join(format!(".restore-ready-{}.tmp", nabedra_rt::ids::uuid_v4()));
         write_statement(&staged, &self.statement)?;
         fs::hard_link(&staged, &ready).map_err(|_| invalid())?;
         fs::remove_file(&staged).map_err(|_| invalid())?;

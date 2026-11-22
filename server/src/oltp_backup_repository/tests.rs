@@ -9,7 +9,7 @@ use std::{
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("nabedra-repository-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("nabedra-repository-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)
@@ -122,7 +122,7 @@ async fn o19_s3_conditional_put_reconciles_only_verified_exact_bytes() {
     let objects = Objects::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
+    let server = nabedra_rt::task::spawn(async move {
         axum::serve(listener, Router::new().fallback(exact).with_state(objects))
             .await
             .unwrap();
@@ -147,8 +147,8 @@ async fn o19_s3_conditional_put_reconciles_only_verified_exact_bytes() {
     .await
     .unwrap();
     let key = ArchiveKey {
-        cluster_id: Uuid::new_v4(),
-        archive_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
     };
     for _ in 0..2 {
         repository
@@ -195,7 +195,7 @@ async fn o19_s3_conditional_put_reconciles_only_verified_exact_bytes() {
         ArchiveKeys::load(Some(&key_config)).unwrap(),
     );
     let scope = ArchiveKey {
-        archive_id: Uuid::new_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
         ..key
     };
     let name = chunk_name(0);
@@ -232,8 +232,8 @@ async fn o19_filesystem_archive_retries_are_immutable_bounded_and_root_publishes
         ArchiveKeys::load(None).unwrap(),
     );
     let key = ArchiveKey {
-        cluster_id: Uuid::new_v4(),
-        archive_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
     };
     let mut upload = UploadSession::new(repository.clone(), key, 4).unwrap();
     let first = upload
@@ -359,8 +359,8 @@ async fn o19_live_s3_archive_reopens_and_reconciles_exact_retries() {
         ArchiveKeys::load(Some(&key_config)).unwrap(),
     );
     let key = ArchiveKey {
-        cluster_id: Uuid::new_v4(),
-        archive_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
     };
     let chunks = [b"abcd".as_slice(), b"ef".as_slice()];
     let history = br#"{"format_version":1,"history_root":"live-transport-fixture"}"#;
@@ -442,11 +442,11 @@ async fn o19_encrypted_archive_authenticates_objects_and_reconciles_exact_retrie
     let repository =
         |config| ArchiveRepository::new(transport.clone(), ArchiveKeys::load(config).unwrap());
     let scope = ArchiveKey {
-        cluster_id: Uuid::new_v4(),
-        archive_id: Uuid::new_v4(),
+        cluster_id: nabedra_rt::ids::uuid_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
     };
     let other = ArchiveKey {
-        archive_id: Uuid::new_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
         ..scope
     };
     let bytes = b"abcd";
@@ -603,7 +603,7 @@ async fn o19_encrypted_archive_authenticates_objects_and_reconciles_exact_retrie
     );
 
     let legacy = ArchiveKey {
-        archive_id: Uuid::new_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
         ..scope
     };
     let mut plaintext = UploadSession::new(repository(None), legacy, 32).unwrap();
@@ -623,7 +623,7 @@ async fn o19_encrypted_archive_authenticates_objects_and_reconciles_exact_retrie
     assert!(mixed_reader.next().await.unwrap().is_none());
 
     let cancelled = ArchiveKey {
-        archive_id: Uuid::new_v4(),
+        archive_id: nabedra_rt::ids::uuid_v4(),
         ..scope
     };
     let rotated_repository = repository(Some(&rotated));

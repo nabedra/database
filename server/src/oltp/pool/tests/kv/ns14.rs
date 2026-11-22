@@ -153,12 +153,12 @@ async fn ns23_o06_release_deletes_only_a_removed_replicas_group() {
     // A stale snapshot file of the damaged group.
     let snapshots = dir.0.join("snapshots").join(damaged.group_id.to_string());
     fs::create_dir_all(&snapshots).unwrap();
-    let stale = snapshots.join(format!("snap-{}.bin", Uuid::new_v4()));
+    let stale = snapshots.join(format!("snap-{}.bin", nabedra_rt::ids::uuid_v4()));
     fs::write(&stale, b"stale").unwrap();
 
     // Evidence for another pool deletes nothing.
     let mut foreign = removal(&identity, &damaged);
-    foreign.removed.pool_id = Uuid::new_v4();
+    foreign.removed.pool_id = nabedra_rt::ids::uuid_v4();
     pool.release_damaged_group(foreign).await.unwrap_err();
     assert!(pool.is_group_quarantined(damaged.group_id));
     assert!(stale.exists());
@@ -276,7 +276,7 @@ async fn ns23_o06_run_time_damage_is_published_and_an_open_handle_blocks_release
     };
     let flush = |pool: &OltpPool| {
         let pool = pool.clone();
-        tokio::task::spawn_blocking(move || pool.kv_store().flush().unwrap())
+        nabedra_rt::task::spawn_blocking(move || pool.kv_store().flush().unwrap())
     };
     let pool = open(&fault);
     flush(&pool).await.unwrap();
@@ -321,7 +321,7 @@ async fn ns23_o06_run_time_damage_is_published_and_an_open_handle_blocks_release
     })
     .await
     .unwrap_err();
-    tokio::time::timeout(
+    nabedra_rt::time::timeout(
         Duration::from_secs(5),
         damage.wait_for(|groups| groups.contains(&a_id.group_id)),
     )
@@ -374,7 +374,7 @@ async fn ns24_o26_o06_a_refused_pool_leaves_the_other_pool_serving() {
         let dir = Dir::new();
         let fault = FaultFs::new();
         let damaged = PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity.clone()
         };
         let pool = fault_pool(&dir, &fault, damaged.clone(), resources.clone());
@@ -462,7 +462,7 @@ async fn ns24_o26_o06_a_refused_pool_leaves_the_other_pool_serving() {
         &extra_dir,
         &FaultFs::new(),
         PoolIdentity {
-            pool_id: Uuid::new_v4(),
+            pool_id: nabedra_rt::ids::uuid_v4(),
             ..identity
         },
         resources.clone(),

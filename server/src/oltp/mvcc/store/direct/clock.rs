@@ -340,7 +340,7 @@ impl RangeClock {
         generation: u64,
         ready: impl Fn(&ClockState) -> bool,
     ) -> Result<(), ProtocolError> {
-        let deadline = tokio::time::Instant::now() + RANGE_CLOCK_WAIT;
+        let deadline = nabedra_rt::time::now() + RANGE_CLOCK_WAIT;
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -360,7 +360,7 @@ impl RangeClock {
                     return Ok(());
                 }
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if nabedra_rt::time::timeout_at(deadline, notified).await.is_err() {
                 return Err(failure(
                     ErrorCode::StorageUnavailable,
                     "range read waited too long for an in-flight direct commit",

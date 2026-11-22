@@ -849,10 +849,10 @@ impl WorkerSharedResources {
         work: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
     ) -> Result<T, ProtocolError> {
         use crate::oltp_runtime::stage_timing::perf_stage;
-        let started = std::time::Instant::now();
+        let started = nabedra_rt::time::now_std();
         let prepared = self.prepare(class).await?;
         let grant = prepared.reserve_compute(request, task_bytes).await?;
-        let admitted = std::time::Instant::now();
+        let admitted = nabedra_rt::time::now_std();
         let result = prepared.run_with_guard(grant, work).await;
         match class {
             ExecutionClass::Query => {
@@ -1111,6 +1111,7 @@ impl NativeExecutor {
         };
         for index in 0..count {
             let receiver = receiver.clone();
+            #[allow(clippy::disallowed_methods)] // explicit stack size, which spawn_service cannot set; phase 9 moves this pool
             let thread = thread::Builder::new()
                 .name(format!("{name}-{index}"))
                 .stack_size(2 << 20)
@@ -1618,7 +1619,7 @@ mod tests {
         .await;
         // The journal makes the write visible and drops the charge.
         drop(batch);
-        let granted = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        let granted = nabedra_rt::time::timeout(std::time::Duration::from_secs(5), waiting)
             .await
             .expect("granted once the batch charge drops");
         assert!(granted.is_ok());

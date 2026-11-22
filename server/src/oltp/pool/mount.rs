@@ -564,7 +564,7 @@ mod linux {
                         return Err(invalid());
                     }
                     let temporary =
-                        base.join(format!(".nabedra-volume-{}.tmp", uuid::Uuid::new_v4()));
+                        base.join(format!(".nabedra-volume-{}.tmp", nabedra_rt::ids::uuid_v4()));
                     write_manifest(&temporary, &expected)?;
                     fs::rename(&temporary, &path).map_err(|_| invalid())?;
                     directory.sync_all().map_err(|_| invalid())?;
@@ -671,7 +671,7 @@ mod linux {
             return Err(invalid());
         }
         if &current == previous {
-            let temporary = base.join(format!(".nabedra-volume-{}.tmp", uuid::Uuid::new_v4()));
+            let temporary = base.join(format!(".nabedra-volume-{}.tmp", nabedra_rt::ids::uuid_v4()));
             let result = write_manifest(&temporary, next).and_then(|()| fs::rename(&temporary, &manifest).map_err(|_| invalid()));
             let _ = fs::remove_file(&temporary);
             result?;
@@ -824,28 +824,28 @@ mod tests {
     fn o26_unmounted_directory_is_rejected_without_creating_pool_files() {
         use crate::oltp_replication::types::Digest;
         let path =
-            std::env::temp_dir().join(format!("nabedra-unmounted-pool-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("nabedra-unmounted-pool-{}", nabedra_rt::ids::uuid_v4()));
         std::fs::create_dir(&path).unwrap();
-        let worker_id = uuid::Uuid::new_v4();
+        let worker_id = nabedra_rt::ids::uuid_v4();
         let expected = PoolMountExpectation {
             profile: PoolMountProfile::Ebs,
             identity: PoolIdentity {
                 engine: "oltp".into(),
                 pool_format_version: crate::oltp::pool::POOL_FORMAT_VERSION,
-                cluster_id: uuid::Uuid::new_v4(),
+                cluster_id: nabedra_rt::ids::uuid_v4(),
                 worker_id,
-                pool_id: uuid::Uuid::new_v4(),
+                pool_id: nabedra_rt::ids::uuid_v4(),
             },
             worker: WorkerIdentity {
                 worker_id,
-                incarnation: uuid::Uuid::new_v4(),
+                incarnation: nabedra_rt::ids::uuid_v4(),
                 certificate_sha256: Digest::from_bytes([1; 32]),
                 enrollment_revision: 1,
             },
             generation: 1,
             mount_path: path.clone(),
             provider_volume_id: "vol-0123456789abcdef0".into(),
-            filesystem_uuid: uuid::Uuid::new_v4().to_string(),
+            filesystem_uuid: nabedra_rt::ids::uuid_v4().to_string(),
         };
         assert!(VerifiedPoolMount::verify(expected.clone(), None).is_err());
         assert_eq!(
