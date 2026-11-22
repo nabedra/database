@@ -15,7 +15,7 @@ use crate::{
     },
     oltp_replication::{
         authority::{
-            control::ScopedCatalogRead,
+            control::{ControlHandle, ScopedCatalogRead},
             status::{
                 IdentityLookup, IdentityReservation, PointManifest, StatusService,
                 TerminalIdentity, VerifiedSettlement, VerifiedStatusDecision,
@@ -673,6 +673,17 @@ impl TransactionCoordinator {
         authority: Authority,
         txn: TxnId,
     ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
+        self.recover_queued(authority, txn, None).await
+    }
+
+    /// A surviving queue copy lets a same-run owner retry a sealed attempt
+    /// after Status has decided its abort and the participants have settled.
+    pub(super) async fn recover_queued(
+        &self,
+        authority: Authority,
+        txn: TxnId,
+        retry_control: Option<&ControlHandle>,
+    ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
         if let Some(scope) = self.scope {
             match self.recover_timestamp_point(authority, scope, txn).await? {
                 point::PointRecovery::Legacy => {}
@@ -717,9 +728,39 @@ impl TransactionCoordinator {
                 .await?
                 .ok_or_else(unknown)?
         } else if authority.owner_term > state.created_authority.owner_term {
-            // This also closes unsealed drafts. A newer fenced owner cannot
-            // infer missing writes or rerun an abandoned application request.
-            self.status.abandon_fenced(authority, txn).await?
+            // An unavailable capability read leaves the attempt undecided.
+            // Only a definite answer can select the terminal fallback.
+            if state.created_authority.run_id == authority.run_id
+                && state.manifest.is_some()
+                && let Some(control) = retry_control
+                && control.queued_snapshot_retry_enabled().await?
+            {
+                let (reason, message) = if txn.attempt < MAX_QUEUED_MUTATION_ATTEMPTS {
+                    (
+                        AbortReason::RetrySnapshot,
+                        "queued mutation owner was fenced",
+                    )
+                } else {
+                    (
+                        AbortReason::AbandonedByFence,
+                        "queued mutation owner was fenced after exhausting snapshot retries",
+                    )
+                };
+                self.status
+                    .abort(
+                        authority,
+                        txn,
+                        reason,
+                        ProtocolError::new(
+                            ErrorCode::StorageUnavailable,
+                            message,
+                            Outcome::NotApplied,
+                        ),
+                    )
+                    .await?
+            } else {
+                self.status.abandon_fenced(authority, txn).await?
+            }
         } else {
             return Ok(None);
         };
@@ -736,6 +777,13 @@ impl TransactionCoordinator {
                 .await?;
             self.release_scoped_guard(authority, scope, txn, settled)
                 .await?;
+        }
+        #[cfg(test)]
+        if decision.statement().decision.retries_snapshot() {
+            super::recovery_tests::observe_decision(
+                &format!("retry-aborted-{}", txn.attempt),
+                decision.statement(),
+            );
         }
         #[cfg(test)]
         super::recovery_tests::observe_decision("resolved", decision.statement());
