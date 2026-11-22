@@ -1,5 +1,6 @@
 //! NS02 (atomic batches under concurrent readers and writers with flush and compaction
 //! forced) and NS17 (random sleeps in every I/O path, cancelled callers) at store level.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 

@@ -6,6 +6,7 @@
 //! must hold exactly the oracle state after some prefix `p` of the submitted batches,
 //! with every batch acknowledged as durable inside `p`. Reopening again changes nothing.
 //! This is a fault model, not physical power-loss evidence.
+#![allow(clippy::disallowed_methods)] // integration tests are outside the phase 7 conversion, which covers kv/src
 
 mod common;
 
