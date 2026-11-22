@@ -14,8 +14,8 @@ include = ["/src/", "/tests/", "/examples/", "/Cargo.lock", "/README.md", "/LICE
 
 [workspace]
 # `nabedra-kv` builds and tests alone: `cargo test -p nabedra-kv`.
-members = [".", "kv"]
-exclude = ["events"]
+members = [".", "kv", "check"]
+exclude = ["events", "fuzz"]
 
 [lib]
 name = "nabedra_database_server"
@@ -85,6 +85,7 @@ clock-bound-client = { version = "=2.0.3", optional = true }
 libc = "=0.2.191"
 
 [dev-dependencies]
+nabedra-check = { path = "check" }
 tokio = { version = "=1.54.1", features = ["test-util"] }
 tower = { version = "=0.5.3", features = ["util"] }
 http-body = "=1.1.0"
@@ -98,6 +99,10 @@ debug = "line-tables-only"
 # Dependencies are not stepped through in a debugger.
 [profile.dev.package."*"]
 debug = false
+
+# Shrinking reruns properties thousands of times; a little optimisation keeps it fast.
+[profile.dev.package.nabedra-check]
+opt-level = 1
 
 [[test]]
 name = "api"
