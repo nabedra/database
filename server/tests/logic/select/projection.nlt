@@ -1,0 +1,58 @@
+# name: select/projection
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+query nosort
+{"op":"query.collect","table":"n","select":["s"]}
+----
+apple
+Banana
+cherry
+apple pie
+(empty)
+Ünïcode
+
+query nosort
+{"op":"query.collect","table":"n","select":["s","id","b"]}
+----
+apple	1	true
+Banana	2	false
+cherry	3	true
+apple pie	4	false
+(empty)	5	true
+Ünïcode	6	false
+
+query nosort
+{"op":"query.collect","table":"n","select":["b","f","id","s","x"]}
+----
+true	0.0	1	apple	-5
+false	0.0	2	Banana	0
+true	2.5	3	cherry	5
+false	-3.75	4	apple pie	5
+true	1e-7	5	(empty)	9223372036854775807
+false	1e300	6	Ünïcode	-9223372036854775808
+
+statement error select must be nonempty
+{"op":"query.collect","table":"n","select":[]}
+
+statement error selected columns must be unique
+{"op":"query.collect","table":"n","select":["id","id"]}
+
+statement error unknown query column
+{"op":"query.collect","table":"n","select":["id","nope"]}
+
+statement error identifier must match
+{"op":"query.collect","table":"n","select":["bad name"]}
+
+statement error validation_error
+{"op":"query.collect","table":"n","select":"id"}
+
+# select does not change the row count.
+query nosort
+{"op":"query.count","table":"n","select":["s"]}
+----
+6

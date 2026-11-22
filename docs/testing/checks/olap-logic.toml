@@ -1,0 +1,11 @@
+id = "olap-logic"
+module = "olap"
+kinds = ["U", "D"]
+guarantees = ["OLAP-G06", "OLAP-G08"]
+scenarios = ["U01", "U02"]
+tiers = ["T0", "T1"]
+command = ["cargo", "test", "--locked", "-j", "2", "--test", "olap_logic", "--", "--nocapture"]
+cwd = "server"
+timeout_s = 900
+needs = []
+result_parser = "cargo-test"

@@ -1,0 +1,35 @@
+# name: ddl/create_describe
+
+query nosort
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+----
+t	id	b:bool,f:float64,id:int64,v:utf8
+
+query nosort
+{"op":"table.describe","name":"t"}
+----
+t	id	b:bool,f:float64,id:int64,v:utf8
+
+query nosort
+{"op":"table.list"}
+----
+t	id	b:bool,f:float64,id:int64,v:utf8
+
+statement error conflict
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement error not_found
+{"op":"table.describe","name":"missing"}
+
+query nosort
+{"op":"table.create","name":"_Mixed_Case9","schema":{"k":"utf8"},"key":"k","format":"parquet"}
+----
+_Mixed_Case9	k	k:utf8
+
+query nosort
+{"op":"table.describe","name":"_Mixed_Case9"}
+----
+_Mixed_Case9	k	k:utf8
+
+statement error not_found
+{"op":"table.describe","name":"_mixed_case9"}

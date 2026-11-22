@@ -1,0 +1,47 @@
+# name: ddl/list_drop
+
+query nosort
+{"op":"table.list"}
+----
+
+statement ok
+{"op":"table.create","name":"b","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.create","name":"a","schema":{"id":"utf8","n":"int64"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"table.list"}
+----
+a	id	id:utf8,n:int64
+b	id	id:int64
+
+statement ok
+{"op":"table.insert","table":"b","row":{"id":1}}
+
+query nosort
+{"op":"table.drop","table":"b"}
+----
+
+query nosort
+{"op":"table.list"}
+----
+a	id	id:utf8,n:int64
+
+statement error not_found
+{"op":"table.drop","table":"b"}
+
+statement error not_found
+{"op":"query.collect","table":"b"}
+
+statement error not_found
+{"op":"table.describe","name":"b"}
+
+# The name is free again and the new table starts empty.
+statement ok
+{"op":"table.create","name":"b","schema":{"id":"int64"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"query.count","table":"b"}
+----
+0

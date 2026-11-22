@@ -1,0 +1,46 @@
+# name: explain/explain
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+skipif standalone and fixed-cluster OLAP explain disagree on the partition footer
+explain
+{"op":"query.explain","table":"n"}
+----
+scan n (<uuid>)
+filter none
+sort id ASC (primary key)
+limit none
+projection all
+partitions 1; worker execution
+
+skipif standalone and fixed-cluster OLAP explain disagree on the partition footer
+explain
+{"op":"query.explain","table":"n","select":["s","id"],"filter":{"op":"and","args":[{"op":"gt","column":"x","value":0},{"op":"eq","column":"f","value":2.5}]},"order_by":{"column":"s","desc":true},"limit":10}
+----
+scan n (<uuid>)
+filter {"op":"and","args":[{"op":"gt","column":"x","value":0},{"op":"eq","column":"f","value":2.5}]}
+sort s DESC; tie-breaker id ASC
+limit 10
+projection s, id
+partitions 1; worker execution
+
+skipif standalone and fixed-cluster OLAP explain disagree on the partition footer
+explain
+{"op":"query.explain","table":"n","filter":{"op":"not","arg":{"op":"eq","column":"s","value":"a\tb"}},"order_by":{"column":"id","desc":false},"limit":0}
+----
+scan n (<uuid>)
+filter {"op":"not","arg":{"op":"eq","column":"s","value":"a\\tb"}}
+sort id ASC; tie-breaker id ASC
+limit 0
+projection all
+partitions 1; worker execution
+
+statement error unknown query column
+{"op":"query.explain","table":"n","select":["nope"]}
+
+statement error not_found
+{"op":"query.explain","table":"missing"}

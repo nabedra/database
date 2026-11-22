@@ -1,0 +1,78 @@
+# name: limit/limit
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"limit":0}
+----
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"limit":1}
+----
+1
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"limit":6}
+----
+1
+2
+3
+4
+5
+6
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"limit":1000}
+----
+1
+2
+3
+4
+5
+6
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"limit":99999999999999999999999999}
+----
+1
+2
+3
+4
+5
+6
+
+query nosort
+{"op":"query.collect","table":"n","select":["id","x"],"order_by":{"column":"x","desc":true},"limit":3}
+----
+5	9223372036854775807
+3	5
+4	5
+
+query nosort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"eq","column":"b","value":false},"limit":2}
+----
+2
+4
+
+query nosort
+{"op":"query.count","table":"n","limit":4}
+----
+4
+
+query nosort
+{"op":"query.count","table":"n","limit":0}
+----
+0
+
+statement error validation_error
+{"op":"query.collect","table":"n","limit":-1}
+
+statement error validation_error
+{"op":"query.collect","table":"n","limit":1.5}
+
+statement error validation_error
+{"op":"query.collect","table":"n","limit":"3"}

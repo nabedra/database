@@ -1,0 +1,50 @@
+# name: labels/equivalent_filters
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+# Equivalent predicates must return the same rows (TLP-style checks).
+
+query rowsort label-le
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"le","column":"x","value":0}}
+
+query rowsort label-le
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"not","arg":{"op":"gt","column":"x","value":0}}}
+
+query rowsort label-le
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"or","args":[{"op":"lt","column":"x","value":0},{"op":"eq","column":"x","value":0}]}}
+
+query rowsort label-demorgan
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"not","arg":{"op":"and","args":[{"op":"eq","column":"b","value":true},{"op":"gt","column":"x","value":0}]}}}
+
+query rowsort label-demorgan
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"or","args":[{"op":"ne","column":"b","value":true},{"op":"le","column":"x","value":0}]}}
+
+query rowsort label-all
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"or","args":[{"op":"eq","column":"b","value":true},{"op":"eq","column":"b","value":false}]}}
+
+query rowsort label-all
+{"op":"query.collect","table":"n","select":["id"]}
+----
+1
+2
+3
+4
+5
+6
+
+query rowsort label-zero
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"eq","column":"f","value":0.0}}
+
+query rowsort label-zero
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"and","args":[{"op":"ge","column":"f","value":-0.0},{"op":"le","column":"f","value":0.0}]}}
+
+# Ordering desc then reversing equals ordering asc when the column is unique.
+query nosort label-byid
+{"op":"query.collect","table":"n","select":["id"],"order_by":{"column":"s","desc":false}}
+
+query nosort label-byid
+{"op":"query.collect","table":"n","select":["id"],"order_by":{"column":"s","desc":false},"limit":100}

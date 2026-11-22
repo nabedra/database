@@ -1,0 +1,47 @@
+# name: types/strings
+
+statement ok
+{"op":"table.create","name":"s","schema":{"id":"int64","v":"utf8"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"s","rows":[{"id":1,"v":"tab\there"},{"id":2,"v":"line\nbreak"},{"id":3,"v":"back\\slash"},{"id":4,"v":""},{"id":5,"v":"NULL"},{"id":6,"v":"日本語"},{"id":7,"v":"emoji 😀"},{"id":8,"v":"\u0000nul"},{"id":9,"v":"quote\"d"},{"id":10,"v":"cr\r"}]}
+
+# Tabs, newlines, carriage returns and backslashes are escaped; the empty string is (empty).
+query nosort
+{"op":"query.collect","table":"s"}
+----
+1	tab\there
+2	line\nbreak
+3	back\\slash
+4	(empty)
+5	NULL
+6	日本語
+7	emoji 😀
+8	\x00nul
+9	quote"d
+10	cr\r
+
+# UTF-8 byte order: only the non-ASCII string sorts after "z".
+query rowsort
+{"op":"query.collect","table":"s","select":["v"],"filter":{"op":"gt","column":"v","value":"z"}}
+----
+日本語
+
+query nosort
+{"op":"query.collect","table":"s","select":["id"],"order_by":{"column":"v","desc":false}}
+----
+4
+8
+5
+3
+10
+7
+2
+9
+1
+6
+
+query nosort
+{"op":"query.count","table":"s","filter":{"op":"eq","column":"v","value":"tab\there"}}
+----
+1

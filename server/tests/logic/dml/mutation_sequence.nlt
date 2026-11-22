@@ -1,0 +1,31 @@
+# name: dml/mutation_sequence
+
+statement ok
+{"op":"table.create","name":"acct","schema":{"id":"utf8","balance":"int64"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"acct","rows":[{"id":"alice","balance":100},{"id":"bob","balance":50}]}
+
+statement ok
+{"op":"table.update","table":"acct","key":"alice","values":{"balance":70}}
+
+statement ok
+{"op":"table.upsert","table":"acct","row":{"id":"carol","balance":30}}
+
+statement ok
+{"op":"table.delete","table":"acct","key":"bob"}
+
+statement ok
+{"op":"table.upsert","table":"acct","row":{"id":"bob","balance":0}}
+
+query nosort
+{"op":"query.collect","table":"acct","order_by":{"column":"balance","desc":true}}
+----
+70	alice
+30	carol
+0	bob
+
+query nosort
+{"op":"query.count","table":"acct","filter":{"op":"gt","column":"balance","value":0}}
+----
+2
