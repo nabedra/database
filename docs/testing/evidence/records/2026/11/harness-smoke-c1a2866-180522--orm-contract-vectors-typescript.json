@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-smoke-c1a2866-180522--orm-contract-vectors-typescript.log",
+      "sha256": "0eabe962afbffc72152a2f181c4d10884515ce44956bbd70c7ca464f4df4d403"
+    }
+  ],
+  "assertions": {
+    "executed": 36,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "orm-contract-vectors-typescript",
+  "duration_s": 6.253,
+  "guarantees": [
+    "ORM-G02"
+  ],
+  "kind": "D F",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T17:05:59.773225+00:00",
+    "request_id": "harness-smoke-c1a2866-180522",
+    "runner": "GitHub Actions 1000003449",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991"
+  },
+  "scenarios": [
+    "U02"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

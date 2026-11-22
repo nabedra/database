@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-smoke-c1a2866-180522--kv-valkey-diff.log",
+      "sha256": "14ec7648c3a16b8864a108d783f889e7461e6f5737511155620b690bdf842de6"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 1,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "kv-valkey-diff",
+  "duration_s": 47.203,
+  "guarantees": [
+    "KV-G01",
+    "KV-G02"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "fail",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T17:06:24.450339+00:00",
+    "request_id": "harness-smoke-c1a2866-180522",
+    "runner": "GitHub Actions 1000003454",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991"
+  },
+  "scenarios": [
+    "K01"
+  ],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

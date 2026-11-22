@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-smoke-c1a2866-180522--testing-bugs.log",
+      "sha256": "b0ebc7de33b61a3f068cfc27185c4b890caf6b81be943f548c07458e9e9bcf99"
+    }
+  ],
+  "assertions": {
+    "executed": 1,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "testing-bugs",
+  "duration_s": 0.065,
+  "guarantees": [],
+  "kind": "U",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T17:05:50.740039+00:00",
+    "request_id": "harness-smoke-c1a2866-180522",
+    "runner": "GitHub Actions 1000003444",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

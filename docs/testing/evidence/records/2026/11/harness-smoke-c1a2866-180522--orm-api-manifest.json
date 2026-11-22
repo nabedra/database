@@ -1,0 +1,41 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-smoke-c1a2866-180522--orm-api-manifest.log",
+      "sha256": "9f50de1006a0bf41036325d6b02659a544195cc750a2e4a8887a12e3505297d5"
+    }
+  ],
+  "assertions": {
+    "executed": 4,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "orm-api-manifest",
+  "duration_s": 8.872,
+  "guarantees": [
+    "ORM-G01",
+    "ORM-G03"
+  ],
+  "kind": "D",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T17:05:50.050876+00:00",
+    "request_id": "harness-smoke-c1a2866-180522",
+    "runner": "GitHub Actions 1000003447",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}

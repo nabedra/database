@@ -1,6 +1,6 @@
 {
   "allow_unattested": false,
-  "head": "cb15c48d3168ad3070d4e5d88946d8e0b7ff54ed",
+  "head": "589dcf98f5b9501e07b32da123a091381750c6cb",
   "ignored_records": [],
   "kinds": [
     "M",
@@ -375,10 +375,18 @@
           "state": "n/a"
         },
         "F": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-22T17:05:50.956506+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "H": {
           "reason": "Each rejection is asserted directly",
@@ -837,16 +845,33 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 80,
+          "checks": [
+            "kv-valkey-diff"
+          ],
+          "date": "2026-11-22T17:06:24.450339+00:00",
+          "executed": 1,
+          "failed": 1,
+          "last": "fail",
+          "reason": "failed: kv-valkey-diff",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "F": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-22T17:05:50.956506+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "H": {
           "reason": "The checks compare each reply directly",
@@ -897,10 +922,19 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
-          "failed": 0,
+          "behind": 80,
+          "checks": [
+            "kv-valkey-diff"
+          ],
+          "date": "2026-11-22T17:06:24.450339+00:00",
+          "executed": 1,
+          "failed": 1,
+          "last": "fail",
+          "reason": "failed: kv-valkey-diff",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "F": {
           "reason": "The rule uses well-formed TTL commands",
@@ -2543,10 +2577,18 @@
           "state": "missing"
         },
         "F": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "fuzz-replay"
+          ],
+          "date": "2026-11-22T17:05:50.956506+00:00",
+          "executed": 5,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "H": {
           "reason": "The checks compare results and state after events",
@@ -3562,10 +3604,18 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "orm-api-manifest"
+          ],
+          "date": "2026-11-22T17:05:50.050876+00:00",
+          "executed": 4,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "F": {
           "reason": "The check concerns API declarations",
@@ -3621,16 +3671,34 @@
     {
       "cells": {
         "D": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "orm-contract-vectors-python",
+            "orm-contract-vectors-typescript"
+          ],
+          "date": "2026-11-22T17:05:57.660251+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "F": {
-          "executed": 0,
+          "behind": 80,
+          "checks": [
+            "orm-contract-vectors-python",
+            "orm-contract-vectors-typescript"
+          ],
+          "date": "2026-11-22T17:05:57.660251+00:00",
+          "executed": 38,
           "failed": 0,
+          "last": "pass",
           "required": true,
-          "state": "missing"
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "H": {
           "reason": "Result, error, and exchange parity are compared directly or in the end-to-end run",
@@ -3683,9 +3751,18 @@
     {
       "cells": {
         "D": {
-          "reason": "The version comparison is part of U",
-          "required": false,
-          "state": "n/a"
+          "behind": 80,
+          "checks": [
+            "orm-api-manifest"
+          ],
+          "date": "2026-11-22T17:05:50.050876+00:00",
+          "executed": 4,
+          "failed": 0,
+          "last": "pass",
+          "required": true,
+          "run_url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991",
+          "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+          "state": "stale"
         },
         "F": {
           "reason": "Version fields are read from package metadata",
@@ -3986,5 +4063,5 @@
     }
   ],
   "schema": "nabedra.coverage-matrix/1",
-  "verified_attestations": false
+  "verified_attestations": true
 }

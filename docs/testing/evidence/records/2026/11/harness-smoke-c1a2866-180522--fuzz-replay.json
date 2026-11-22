@@ -1,0 +1,42 @@
+{
+  "artifacts": [
+    {
+      "name": "harness-smoke-c1a2866-180522--fuzz-replay.log",
+      "sha256": "3d25a93ca89cffedbb6cb8dd9d6528047a1d6c68ce2c1029a2fa851ae40f1eed"
+    }
+  ],
+  "assertions": {
+    "executed": 5,
+    "failed": 0,
+    "not_run": []
+  },
+  "build": {
+    "binary_sha256": null,
+    "features": [],
+    "profile": null
+  },
+  "check": "fuzz-replay",
+  "duration_s": 109.228,
+  "guarantees": [
+    "KV-G01",
+    "EVT-G07",
+    "OLAP-G08"
+  ],
+  "kind": "F",
+  "mode": null,
+  "result": "pass",
+  "run": {
+    "attempt": 1,
+    "date": "2026-11-22T17:05:50.956506+00:00",
+    "request_id": "harness-smoke-c1a2866-180522",
+    "runner": "GitHub Actions 1000003450",
+    "url": "https://github.com/zPy52/nabedra-database/actions/runs/45047452991"
+  },
+  "scenarios": [],
+  "schema": "nabedra.evidence/1",
+  "seeds": null,
+  "sha": "c1a28665c68a8acca25f5602c69e1447dad657e2",
+  "sim_core_hours": null,
+  "tree_clean": true,
+  "virtual_hours": null
+}
