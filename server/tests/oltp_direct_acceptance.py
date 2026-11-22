@@ -289,7 +289,7 @@ def stderr_wrapper(binary, path, log):
     return path
 
 
-def d11_rf1_cli(args, output, *, inject_create_refusal=False):
+def d11_rf1_cli(args, output):
     """D11 index publication through the public CLI's local topology (the RF1 server
     that serves index administration)."""
     from oltp_runtime_acceptance import RuntimeServer
@@ -307,16 +307,9 @@ def d11_rf1_cli(args, output, *, inject_create_refusal=False):
             time.sleep(0.25)
 
         def admin(name, payload, request_id):
-            nonlocal inject_create_refusal
             body = operation(name, payload, request_id)
             sent = time.time()
-            if inject_create_refusal and name == 'storage.index.create':
-                inject_create_refusal = False
-                status, reply = 429, {'request_id': request_id, 'error': {
-                    'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'}}
-                print(json.dumps({'scenario': 'D11-index', 'injected_create_refusal': request_id}), flush=True)
-            else:
-                status, reply = call(server.url, '/v1/cluster/operations', body, token=auth['admin_token'], timeout=60)
+            status, reply = call(server.url, '/v1/cluster/operations', body, token=auth['admin_token'], timeout=60)
             trace.write(json.dumps(dict(sent=sent, elapsed=time.time() - sent, operation=name,
                                         request_id=body['request_id'], status=status, reply=reply)) + '\n')
             trace.flush()
@@ -1259,7 +1252,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--keep', action='store_true', help='keep process directories and logs')
     args = parser.parse_args()
-    suites = args.suite or ['rf1'] * 10 + ['d11']
+    suites = args.suite or ['rf1', 'cluster', 'd05', 'd09', 'barriers', 'quorum']
     if {'barriers', 'quorum'} & set(suites) and not args.test_executable:
         parser.error('--suite barriers and quorum need --test-executable')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -1267,12 +1260,12 @@ def main():
     failed = []
     rf1_reference = None
     try:
-        for attempt, suite in enumerate(suites):
+        for suite in suites:
             try:
                 if suite == 'rf1':
-                    rf1_reference = suite_rf1(args, work / str(attempt))
+                    rf1_reference = suite_rf1(args, work)
                 elif suite == 'd11':
-                    d11_rf1_cli(args, work / str(attempt), inject_create_refusal=True)
+                    d11_rf1_cli(args, work)
                 elif suite == 'cluster':
                     suite_cluster(args, work, rf1_reference)
                 elif suite == 'd05':
