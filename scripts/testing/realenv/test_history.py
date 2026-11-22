@@ -36,5 +36,10 @@ class HistoryTests(unittest.TestCase):
             pair_operations([first, Event(1, "ok", 2, "write", key="other", request_id="same")])
         with self.assertRaisesRegex(ValueError, "overlapping"):
             pair_operations([first, first])
+        crashed = Event(1, "info", 2, "write", key="one", request_id="same")
+        with self.assertRaisesRegex(ValueError, "after an info outcome"):
+            pair_operations([first, crashed, Event(2, "invoke", 2, "read", key="one")])
+        nemesis = [Event(i, kind, 0, "nemesis") for i, kind in enumerate(("invoke", "info", "invoke", "ok"))]
+        self.assertEqual(len(pair_operations(nemesis)), 2)
         with self.assertRaisesRegex(ValueError, "without invoke"):
             pair_operations([Event(0, "ok", 2, "read")])

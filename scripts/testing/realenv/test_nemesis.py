@@ -65,6 +65,23 @@ class NemesisTests(unittest.TestCase):
         self.assertEqual([op.invoke.value["action"] for op in ops],
                          ["disconnect", "netem", "clear_netem", "connect", "heal_all", "heal_all"])
 
+    def test_netem_removed_with_its_interface_counts_as_healed(self):
+        self.nemesis.netem(self.container, delay_ms=25)
+        self.nemesis.disconnect(self.container, "bridge")
+        shown = subprocess.CompletedProcess([], 0, stdout="qdisc noqueue 0: root refcnt 2\n")
+        # connect succeeds, del fails (no handle), show has no netem qdisc.
+        self.run.side_effect = [None, subprocess.CalledProcessError(2, "tc"), shown]
+        self.nemesis.heal_all()
+        self.assertEqual(self.nemesis.undo, {})
+        self.assertEqual(self.commands()[-1][-4:], ["qdisc", "show", "dev", "eth0"])
+
+    def test_failed_netem_removal_with_a_remaining_qdisc_is_reported(self):
+        self.nemesis.netem(self.container, delay_ms=25)
+        shown = subprocess.CompletedProcess([], 0, stdout="qdisc netem 90: root refcnt 2 delay 25ms\n")
+        self.run.side_effect = [subprocess.CalledProcessError(2, "tc"), shown]
+        with self.assertRaises(ExceptionGroup):
+            self.nemesis.heal_all()
+
     def test_timed_out_disconnect_is_healed(self):
         self.run.side_effect = [subprocess.TimeoutExpired("disconnect", 60), None]
         with self.assertRaises(subprocess.TimeoutExpired):

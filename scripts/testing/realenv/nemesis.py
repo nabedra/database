@@ -11,8 +11,8 @@ from typing import Callable
 from .history import HistoryWriter
 
 
-# nicolaka/netshoot v0.16, multi-platform image with iproute2.
-NETEM_IMAGE = "ghcr.io/nicolaka/netshoot@sha256:147f2c4cb0aa7a741151bce2bfef71d9e1a04631636e24665ee2a5ed799feb47"
+# nicolaka/netshoot v0.16 multi-platform image index (linux/amd64 and linux/arm64), with iproute2.
+NETEM_IMAGE = "ghcr.io/nicolaka/netshoot@sha256:b09d9b21381f47a79b3cbcb30da25266dc17186ea00ae65e99fdc51396f48e70"
 
 
 @dataclass(frozen=True)
@@ -32,9 +32,10 @@ class Nemesis:
         self.run = run
         self.process = process
         self.undo: dict[tuple, Callable[[], None]] = {}
+        self._sidecar_ready = False
 
-    def command(self, *args):
-        self.run(list(args), check=True, timeout=60)
+    def command(self, *args, timeout=60):
+        return self.run(list(args), check=True, timeout=timeout)
 
     @contextmanager
     def fault(self, action, node=None, *, partial=False, **details):
@@ -100,9 +101,19 @@ class Nemesis:
             self.command("docker", "network", "connect", *options, network, target.id)
         self.undo.pop(("disconnect", target, network), None)
 
-    def _tc(self, target, *args):
-        self.command("docker", "run", "--rm", "--network", f"container:{target.id}",
-                     "--cap-add", "NET_ADMIN", "--entrypoint", "tc", NETEM_IMAGE, *args)
+    def _tc(self, target, *args, **kwargs):
+        # The first run may pull the sidecar image, which takes longer than a tc command.
+        timeout = 60 if self._sidecar_ready else 600
+        result = self.run(["docker", "run", "--rm", "--network", f"container:{target.id}",
+                           "--cap-add", "NET_ADMIN", "--entrypoint", "tc", NETEM_IMAGE, *args],
+                          timeout=timeout, **{"check": True, **kwargs})
+        self._sidecar_ready = True
+        return result
+
+    def _has_netem(self, target, interface):
+        shown = self._tc(target, "qdisc", "show", "dev", interface, check=False,
+                         capture_output=True, text=True)
+        return shown.returncode == 0 and "netem 90:" in (shown.stdout or "")
 
     def netem(self, target: Container, *, delay_ms=None, loss=None, duplicate=None, interface="eth0"):
         options = []
@@ -130,7 +141,13 @@ class Nemesis:
 
     def clear_netem(self, target: Container, *, interface="eth0"):
         with self.fault("clear_netem", target.id, interface=interface):
-            self._tc(target, "qdisc", "del", "dev", interface, "root", "handle", "90:")
+            try:
+                self._tc(target, "qdisc", "del", "dev", interface, "root", "handle", "90:")
+            except subprocess.CalledProcessError:
+                # A network disconnect deletes the interface and its qdisc, and a
+                # reconnect creates it without one. Only a remaining qdisc is a failure.
+                if self._has_netem(target, interface):
+                    raise
         self.undo.pop(("netem", target, interface), None)
 
     def heal_all(self):

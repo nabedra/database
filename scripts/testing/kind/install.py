@@ -15,6 +15,7 @@ RELEASE = f"https://github.com/kubernetes-sigs/kind/releases/download/{VERSION}"
 # From the release assets named kind-<platform>.sha256sum.
 SHA256 = {
     "linux-amd64": "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d",
+    "linux-arm64": "20022bee6cfcd5086cb7234d218e3454e6090022f2a8f55d1fa7fcf42c3867a2",
     "darwin-amd64": "5a99f26f57246dc9319dd294803313197a0f34d33c525b3ea8b655db5916ece0",
     "darwin-arm64": "0c8c7dbe5e23594a198b786c4bc13dacc101fa6196b0cb0b23a1ca44e61f4b4f",
 }

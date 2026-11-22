@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import select
 import subprocess
+import threading
 from tempfile import TemporaryDirectory
 import time
 from types import SimpleNamespace
@@ -39,6 +40,8 @@ def port_forward(cluster, pod):
                 line = child.stdout.readline().decode(errors="replace").strip()
                 match = re.fullmatch(r"Forwarding from 127\.0\.0\.1:(\d+) -> 8080", line)
                 if match:
+                    # kubectl logs each connection; drain it so a full pipe cannot block the tunnel.
+                    threading.Thread(target=child.stdout.read, daemon=True).start()
                     yield f"http://127.0.0.1:{match[1]}"
                     return
                 raise RuntimeError(f"port-forward for {pod}: {line}")
@@ -58,6 +61,7 @@ class EventsRun:
         self.history = history
         self.urls = {}
         self.operator = None
+        self.process = 1
 
     def deploy(self, image):
         self.cluster.load_image(image)
@@ -176,12 +180,13 @@ class EventsRun:
         eventually(f"{NAME}-{ordinal} applied {group} through {cut}", probe, timeout=75)
 
     def _checked_request(self, f, ordinal, request_id, path, *, expected, body=None, **kwargs):
-        fields = dict(process=1, f=f, key=KEY, request_id=request_id, node=f"{NAME}-{ordinal}")
+        fields = dict(process=self.process, f=f, key=KEY, request_id=request_id, node=f"{NAME}-{ordinal}")
         self.history.record("invoke", value=body, **fields)
         try:
             code, _, reply = self.rpc(ordinal, path, body=body, **kwargs)
         except BaseException as error:
             self.history.record("info", value={"error": type(error).__name__}, **fields)
+            self.process += 1
             raise
         outcome = "ok" if code in expected else "info" if code in (0, 503) else "fail"
         # Credentials are used in requests and never written to history.
@@ -190,6 +195,9 @@ class EventsRun:
         else:
             recorded = reply
         self.history.record(outcome, value=recorded, **fields)
+        if outcome == "info":
+            # The request may still apply, so this client process never invokes again.
+            self.process += 1
         if code in RETRY_STATUSES:
             return None
         return status((code, {}, reply), expected)

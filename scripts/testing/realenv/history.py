@@ -89,13 +89,19 @@ def pair_operations(events: Iterable[Event]) -> list[Operation]:
     """Pair events by process in invocation order, retaining pending invokes.
 
     Standalone nemesis info events are also allowed for external fault observers.
+    A client operation that ends in info may still take effect at any later time,
+    so its process is crashed and must not invoke again (Jepsen's rule). Clients
+    continue on a fresh process number. The nemesis is exempt.
     """
     pending = {}
+    crashed = set()
     operations = []
     for event in events:
         if event.type == "invoke":
             if event.process in pending:
                 raise ValueError(f"overlapping invokes at event {event.index}")
+            if event.process in crashed:
+                raise ValueError(f"process {event.process} invokes after an info outcome at event {event.index}")
             pending[event.process] = len(operations)
             operations.append(Operation(event, None))
             continue
@@ -108,4 +114,6 @@ def pair_operations(events: Iterable[Event]) -> list[Operation]:
         if (invoke.f, invoke.key, invoke.request_id) != (event.f, event.key, event.request_id):
             raise ValueError(f"completion does not match invoke at event {event.index}")
         operations[position] = Operation(invoke, event)
+        if event.type == "info" and event.f != "nemesis":
+            crashed.add(event.process)
     return operations

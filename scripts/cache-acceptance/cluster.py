@@ -87,6 +87,7 @@ class Fleet:
         self.scope = scope
         self.recorder = recorder
         self.nemesis = Nemesis(recorder)
+        self.client_process = 1
         self.metrics = root / "metrics"
         self.metrics.mkdir()
         scope.callback(self.save_metrics)
@@ -224,7 +225,7 @@ class Fleet:
         self.processes[name].wait(timeout=5)
 
     def op(self, node, client, f, key, *args, **kwargs):
-        fields = dict(process=1, f=f, key=key.decode(), node=f"w{node}")
+        fields = dict(process=self.client_process, f=f, key=key.decode(), node=f"w{node}")
         value = None
         if f == "set":
             value = args[0].decode()
@@ -238,6 +239,9 @@ class Fleet:
                 ClusterDownError, TryAgainError, MovedError, ClusterCrossSlotError,
             )) else "info"
             self.recorder.record(outcome, value={"error": type(error).__name__}, **fields)
+            if outcome == "info":
+                # The operation may still apply, so this client process never invokes again.
+                self.client_process += 1
             raise
         observed = value if f == "set" else result
         if isinstance(observed, bytes):

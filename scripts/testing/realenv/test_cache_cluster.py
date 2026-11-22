@@ -48,6 +48,7 @@ class CacheClusterTests(unittest.TestCase):
             with HistoryWriter(path) as writer:
                 fleet.recorder = writer
                 fleet.nemesis = cache.Nemesis(writer)
+                fleet.client_process = 1
                 fleet.stop("w1")
                 self.assertEqual(fleet.op(2, client, "get", b"history:{1}"), b"prior")
                 fleet.resume("w1")
@@ -63,6 +64,25 @@ class CacheClusterTests(unittest.TestCase):
         self.assertEqual([op.invoke.f for op in history], ["nemesis", "get", "nemesis", "set"])
         self.assertEqual(history[1].completion.value, "prior")
         self.assertEqual(history[3].invoke.value, "retired")
+
+    def test_unknown_outcome_moves_the_client_to_a_fresh_process(self):
+        cache = load_cache_cluster()
+        fleet = cache.Fleet.__new__(cache.Fleet)
+        client = Mock()
+        client.set.side_effect = [cache.TimeoutError(), True]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "K03.jsonl"
+            with HistoryWriter(path) as writer:
+                fleet.recorder = writer
+                fleet.client_process = 1
+                with self.assertRaises(cache.TimeoutError):
+                    fleet.op(1, client, "set", b"k", b"one")
+                fleet.op(1, client, "set", b"k", b"two")
+            with path.open() as source:
+                events = list(read_jsonl(source))
+        self.assertEqual([(event.type, event.process) for event in events],
+                         [("invoke", 1), ("info", 1), ("invoke", 2), ("ok", 2)])
+        pair_operations(events)
 
     def test_ready_state_returns_without_waiting(self):
         cache = load_cache_cluster()
