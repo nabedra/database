@@ -523,7 +523,10 @@ def d11_index(url, token, ca, admin, stats):
 
     def writer(index):
         client = Http(url, token, 30, ca)
-        target, next_key, revision = index, seed_count + index, 0
+        # Backfill starts at the low end of the primary key order. Keep the
+        # initial writer keys at the end so the build can start on untouched
+        # rows while writers switch to new keys after declaration.
+        target, next_key, revision = seed_count - writers + index, seed_count + index, 0
         acknowledged, refused = {}, 0
 
         def write(name, payload):
