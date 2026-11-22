@@ -860,8 +860,7 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
         17,
         limits,
         SharedResourceConfig {
-            query_threads: 1,
-            control_threads: 1,
+            max_open_pools: 1,
             ..Default::default()
         },
     )
@@ -878,12 +877,10 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
         })
         .await
         .unwrap();
-    let task_bytes = limits.task_memory_limit_bytes;
-    let already = resources.scheduler().usage()[0].2;
-    let retained = resources
-        .scheduler()
-        .charge_memory(17, limits.working_bytes() - already - task_bytes)
-        .unwrap();
+    let scheduler = resources.scheduler();
+    let node = resources.scheduler_node_id();
+    let baseline = scheduler.usage();
+    let task_bytes = 64 << 20;
     let gate = Arc::new(Gate {
         open: Mutex::new(false),
         changed: Condvar::new(),
@@ -906,7 +903,20 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(resources.scheduler().usage()[0].2, limits.working_bytes());
+    let query_bytes = baseline[0].2 + task_bytes;
+    assert_eq!(scheduler.usage(), [(node, 1, query_bytes)]);
+    // Fill the remaining working memory after the native query has its grant.
+    let retained = scheduler
+        .charge_memory(
+            node,
+            limits
+                .working_bytes()
+                .checked_sub(query_bytes)
+                .expect("working memory must fit the pool and query"),
+        )
+        .unwrap();
+    let saturated = [(node, 1, limits.working_bytes())];
+    assert_eq!(scheduler.usage(), saturated);
     let authority = tokio::time::timeout(
         Duration::from_secs(10),
         group.read(budget(), |view| {
@@ -917,11 +927,16 @@ async fn c07_m02_native_authority_read_progresses_while_query_owns_all_unreserve
     .unwrap()
     .unwrap();
     assert_eq!(authority.as_slice(), b"current");
-    assert_eq!(resources.scheduler().usage()[0].1, 1);
+    assert_eq!(scheduler.usage(), saturated);
     drop(authority);
     drop(release);
-    query.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), query)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     drop(retained);
+    assert_eq!(scheduler.usage(), baseline);
     assert_eq!(resources.control_bytes_used(), 0);
 }
 
