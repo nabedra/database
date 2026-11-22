@@ -615,6 +615,20 @@ pub(crate) const REPLICATION_PAYLOAD_ENTRIES: u64 = MAX_APPEND_ENTRIES as u64;
 /// most `MAX_APPEND_ENTRIES` entries without lingering, and the log writes
 /// each append as synced batches of at most 1 MiB. Bounds transient batches
 /// independently of total retained log/table size.
+/// Benchmark only (RD3): `NABEDRA_BENCH_NO_SUBMIT_BROADCAST=1` keeps
+/// OpenRaft's default (appends reach replication after the core's pass), so
+/// one binary measures both sides.
+fn submit_broadcast_disabled() -> bool {
+    const ENV: &str = "NABEDRA_BENCH_NO_SUBMIT_BROADCAST";
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        let disabled = std::env::var_os(ENV).is_some_and(|value| value == "1");
+        if disabled {
+            tracing::warn!("{ENV}=1: appends are published to replication after the core's pass (benchmark only)");
+        }
+        disabled
+    })
+}
 pub(crate) fn batched_config(
     mut config: openraft::Config,
 ) -> Result<Arc<openraft::Config>, ProtocolError> {
@@ -627,6 +641,15 @@ pub(crate) fn batched_config(
     // direct leader's reads) check the lease on the caller's task. Only
     // `ReadPolicy::LeaseRead` uses it; ReadIndex keeps the quorum round.
     config.enable_local_lease_read = Some(true);
+    // RD3: publish an append to the replication streams as soon as
+    // `RaftLogStorage::append` returns, not after the core's next pass over
+    // its queues (1.7 ms on the controlled host, RD2). `append` returns once
+    // the entries are readable in the pending overlay (PERF2d), so a stream
+    // reads them while the sync runs. Durability is unchanged: a follower
+    // acknowledges after its own sync and the leader counts itself only
+    // after its `IOFlushed`. The option also lets the core handle ready
+    // notifications (replication progress, flushes) between client writes.
+    config.broadcast_submitted_on_append = Some(!submit_broadcast_disabled());
     config
         .validate()
         .map(Arc::new)
@@ -795,6 +818,8 @@ pub(crate) mod proposal_clock {
         time::{Duration, Instant},
     };
     static LAST: AtomicU64 = AtomicU64::new(0);
+    /// The proposal whose first acknowledgement was recorded (RD3).
+    static FIRST: AtomicU64 = AtomicU64::new(0);
     fn now_us() -> u64 {
         static BASE: OnceLock<Instant> = OnceLock::new();
         BASE.get_or_init(Instant::now).elapsed().as_micros() as u64 + 1
@@ -806,6 +831,14 @@ pub(crate) mod proposal_clock {
         mark(crate::oltp_runtime::stage_timing::perf_stage!(
             "raft.data.propose_to_apply"
         ));
+    }
+    /// Records the time since the latest Data proposal in `stage`, once per
+    /// proposal: the first follower's acknowledgement (RD3).
+    pub(crate) fn mark_first(stage: &'static crate::oltp_runtime::stage_timing::Stage) {
+        let last = LAST.load(Ordering::Relaxed);
+        if last != 0 && FIRST.swap(last, Ordering::Relaxed) != last {
+            stage.record(Duration::from_micros(now_us().saturating_sub(last)));
+        }
     }
     /// Records the time since the latest Data proposal in `stage`.
     pub(crate) fn mark(stage: &'static crate::oltp_runtime::stage_timing::Stage) {

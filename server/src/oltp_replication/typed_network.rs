@@ -411,6 +411,9 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
             super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
                 "raft.data.propose_to_ack"
             ));
+            super::hosted::proposal_clock::mark_first(
+                crate::oltp_runtime::stage_timing::perf_stage!("raft.data.propose_to_first_ack"),
+            );
         }
         if (previous.is_none() && matches!(reply, AppendEntriesResponse::Conflict))
             || (header.payload_bytes == 0

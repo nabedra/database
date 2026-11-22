@@ -835,6 +835,14 @@ impl<C: TypedConfig> RaftLogStorage<C> for TypedLogStore<C> {
             ],
         )
         .timer();
+        // RD3: the core saves the commit just before it hands the entries to
+        // the apply worker; with `propose_to_first_ack` and
+        // `propose_to_apply` this splits quorum -> commit -> apply.
+        if id.is_some() && matches!(self.store.identity().kind, GroupKind::Data { .. }) {
+            super::hosted::proposal_clock::mark(crate::oltp_runtime::stage_timing::perf_stage!(
+                "raft.data.propose_to_commit"
+            ));
+        }
         // A quorum of other replicas can commit an entry before this replica's
         // own sync. Its writer records the marker after that sync (PERF2d).
         if id.is_some_and(|id| self.overlay.defer_commit(id)) {
