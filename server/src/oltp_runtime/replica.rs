@@ -178,8 +178,6 @@ impl RecordHeader {
     pub fn preflight(&self, scope: &QueueScope, current: QueueAuthority) -> Result<(), QueueError> {
         if self.queue_format_version != QUEUE_FORMAT_VERSION
             || self.scope != *scope
-            || self.ready != current.ready
-            || self.owner != current.owner
             || self.request_id.is_nil()
             || self.sequence == 0
             || self.version == 0
@@ -200,7 +198,12 @@ impl RecordHeader {
         self.scope.validate()?;
         self.ready.view.validate().map_err(invalid)?;
         self.owner.validate().map_err(invalid)?;
-        self.read_grants.validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
+        self.read_grants
+            .validate(self.ready.view, self.request_id, self.digest, self.accepted)?;
+        // Control can authorize receipt before this replica applies the new ready set.
+        if self.ready != current.ready || self.owner != current.owner {
+            return Err(QueueError::Stale);
+        }
         Ok(())
     }
 }
