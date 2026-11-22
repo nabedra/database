@@ -754,7 +754,11 @@ def r04_o17_finish_replacement_after_cold_restart(
         assert send(url, cluster.auth['data_token'], body) == original
     receipt_path = f'/v1/requests/{profile["previous_run"]}/{queued_id}'
     code, receipt = send(url, cluster.auth['data_token'], None, path=receipt_path)
-    assert code == 200 and receipt['state'] == 'abandoned', (code, receipt)
+    assert code == 404 and receipt == {
+        'request_id': queued_id,
+        'error': {'code': 'not_found', 'message': 'old-run request abandoned; check durable mutation decision',
+                  'outcome': 'unknown'},
+    }, (code, receipt)
     assert success(*send(url, cluster.auth['data_token'], get(table, 2))) is None
     report('R04/O17 cold fence between group publications',
            previous_run=profile['previous_run'], next_run=profile['next_run'],
@@ -1384,10 +1388,6 @@ def main():
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-cold',
                                              variant='cold')
-        if args.suite in ('all', 'replacement-data-trust', 'replacement-voter-refresh'):
-            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
-            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-voter-refresh',
-                                             variant='voter-refresh')
         if args.suite in ('all', 'scale'):
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o17_a02_scale(args.binary, args.test_executable, root / 'scale')
@@ -1396,6 +1396,11 @@ def main():
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
             o06_o17_system_replacement_check(args.binary, args.test_executable, root / args.suite,
                                               variant=args.suite[len('replacement-'):])
+
+        if args.suite in ('all', 'replacement-data-trust', 'replacement-voter-refresh'):
+            assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
+            o06_o17_system_replacement_check(args.binary, args.test_executable, root / 'replacement-voter-refresh',
+                                             variant='voter-refresh')
 
         if args.suite == 'replacement-mixed':
             assert Rf3Cluster.mounts_available(), 'the RF3 process check requires Linux and passwordless sudo'
