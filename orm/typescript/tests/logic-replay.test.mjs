@@ -107,7 +107,8 @@ export function parse(text) {
 
 export function renderString(value) {
   if (value === "") return "(empty)"
-  return value.replace(/[\\\t\n\r]/g, c => ({ "\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r" })[c])
+  const named = { "\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r" }
+  return value.replace(/[\\\x00-\x1f\x7f]/g, c => named[c] ?? "\\x" + c.charCodeAt(0).toString(16).padStart(2, "0"))
 }
 
 function formatFloat(sign, digits, exp) {
@@ -292,8 +293,10 @@ export async function runFile(path, parsed, execute, prefix) {
           + `  expected: ${JSON.stringify(first.actual)}\n  actual: ${JSON.stringify(actual)}`)
       }
     }
-    if (record.expected !== null && JSON.stringify(record.expected) !== JSON.stringify(actual)) {
-      failures.push(`${at}: wrong result\n  expected: ${JSON.stringify(record.expected)}\n  actual: ${JSON.stringify(actual)}`)
+    let expected = record.expected
+    if (expected !== null && sort === "rowsort" && !kind.hash) expected = [...expected].sort(utf8Compare)
+    if (expected !== null && JSON.stringify(expected) !== JSON.stringify(actual)) {
+      failures.push(`${at}: wrong result\n  expected: ${JSON.stringify(expected)}\n  actual: ${JSON.stringify(actual)}`)
     }
   }
   return { assertions, skipped, failures }
@@ -354,6 +357,7 @@ test("canonical floats match the Rust runner", () => {
 test("rendering and translation", () => {
   assert.equal(renderString(""), "(empty)")
   assert.equal(renderString("a\tb\\c\nd"), "a\\tb\\\\c\\nd")
+  assert.equal(renderString("\x00x\x1f\x7f"), "\\x00x\\x1f\\x7f")
   assert.equal(renderValue(3n, true), "3")
   assert.equal(renderValue(3, true), "3.0")
   assert.equal(renderValue(3, false), "3")
@@ -402,6 +406,36 @@ test("parser rejects malformed files", () => {
     "# name: x\nbogus\n"]) {
     assert.throws(() => parse(bad), FormatError, JSON.stringify(bad))
   }
+})
+
+test("replay the Rust runner's recorded server responses", async (t) => {
+  const root = process.env.NABEDRA_LOGIC_TRANSCRIPTS
+  if (!root) {
+    t.skip("not-run: NABEDRA_LOGIC_TRANSCRIPTS unset")
+    return
+  }
+  let total = 0
+  const failures = []
+  for (const path of corpusFiles()) {
+    const rel = relative(corpus, path).split(sep).join("/")
+    const parsed = parse(readFileSync(path, "utf8"))
+    if (!parsed.engines.includes("olap")) continue
+    const log = JSON.parse(readFileSync(join(root, rel + ".json"), "utf8"))
+    const execute = async (op) => {
+      const entry = log.shift()
+      assert.equal(entry.op, op)
+      if (entry.error) throw new NabedraError(entry.error.message, { code: entry.error.code })
+      // Decode as the transport does: bigint integers for the strict operations.
+      return parseJson(entry.data, { integers: strictIntegers.has(op) ? "bigint" : undefined })
+    }
+    const result = await runFile("tests/logic/" + rel, parsed, execute, "")
+    assert.deepEqual(log, [], rel)
+    total += result.assertions
+    failures.push(...result.failures)
+  }
+  t.diagnostic(`logic transcripts (typescript): ${total - failures.length} passed; ${failures.length} failed`)
+  assert.ok(total > 0)
+  assert.deepEqual(failures, [], failures.join("\n"))
 })
 
 test("replay corpus over HTTP", async (t) => {

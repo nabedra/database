@@ -20,6 +20,7 @@ from nabedra.client import _Transport
 
 CORPUS = pathlib.Path(__file__).resolve().parents[3] / 'server' / 'tests' / 'logic'
 MISSING_TABLE_ID = 'ffffffff-ffff-4fff-bfff-ffffffffffff'
+CONTROL_RE = re.compile(r'[\\\x00-\x1f\x7f]')
 UUID_RE = re.compile(r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}')
 
 
@@ -120,8 +121,8 @@ def parse(text):
 def render_string(value):
     if value == '':
         return '(empty)'
-    return (value.replace('\\', '\\\\').replace('\t', '\\t')
-            .replace('\n', '\\n').replace('\r', '\\r'))
+    named = {'\\': '\\\\', '\t': '\\t', '\n': '\\n', '\r': '\\r'}
+    return CONTROL_RE.sub(lambda m: named.get(m.group(), '\\x%02x' % ord(m.group())), value)
 
 
 def format_float(sign, digits, exp):
@@ -288,8 +289,11 @@ def run_file(path, parsed, execute, prefix):
             elif labels[label][1] != actual:
                 failures.append(f'{at}: label-{label} disagrees with line {labels[label][0]}\n'
                                 f'  expected: {labels[label][1]!r}\n  actual: {actual!r}')
-        if record['expected'] is not None and record['expected'] != actual:
-            failures.append(f'{at}: wrong result\n  expected: {record["expected"]!r}\n  actual: {actual!r}')
+        expected = record['expected']
+        if expected is not None and sort == 'rowsort' and not kind.get('hash'):
+            expected = sorted(expected, key=utf8_key)
+        if expected is not None and expected != actual:
+            failures.append(f'{at}: wrong result\n  expected: {expected!r}\n  actual: {actual!r}')
     return assertions, skipped, failures
 
 
@@ -347,6 +351,7 @@ class LogicFormatTests(unittest.TestCase):
     def test_rendering_and_translation(self):
         self.assertEqual(render_string(''), '(empty)')
         self.assertEqual(render_string('a\tb\\c\nd'), 'a\\tb\\\\c\\nd')
+        self.assertEqual(render_string('\x00x\x1f\x7f'), '\\x00x\\x1f\\x7f')
         self.assertEqual(render_value(True), 'true')
         self.assertEqual(render_value(3), '3')
         tr = Translator('p_')
@@ -393,6 +398,33 @@ class LogicFormatTests(unittest.TestCase):
 
 
 class LogicReplayTests(unittest.TestCase):
+    def test_replay_rust_transcripts(self):
+        """Render the Rust runner's recorded server responses (NABEDRA_LOGIC_RECORD) through this replay."""
+        root = os.environ.get('NABEDRA_LOGIC_TRANSCRIPTS')
+        if not root:
+            self.skipTest('not-run: NABEDRA_LOGIC_TRANSCRIPTS unset')
+        total, failures = 0, []
+        for path in corpus_files():
+            rel = path.relative_to(CORPUS).as_posix()
+            parsed = parse(path.read_text(encoding='utf-8'))
+            if 'olap' not in parsed['engines']:
+                continue
+            log = json.loads((pathlib.Path(root) / (rel + '.json')).read_text(encoding='utf-8'))
+
+            def execute(op, payload, log=log):
+                entry = log.pop(0)
+                self.assertEqual(entry['op'], op)
+                if 'error' in entry:
+                    raise errors.NabedraError(entry['error']['message'], code=entry['error']['code'])
+                return json.loads(entry['data'])
+
+            n, _, f = run_file('tests/logic/' + rel, parsed, execute, '')
+            self.assertEqual(log, [], rel)
+            total, failures = total + n, failures + f
+        print(f'logic transcripts (python): {total - len(failures)} passed; {len(failures)} failed')
+        self.assertGreater(total, 0)
+        self.assertEqual(failures, [], '\n'.join(failures))
+
     def test_replay_corpus(self):
         url = os.environ.get('NABEDRA_LOGIC_URL')
         if not url:
