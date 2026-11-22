@@ -1,7 +1,7 @@
 //! Authenticated application service RPCs. Ordinary worker TLS enrollment is
 //! not permission to submit an arbitrary Raft command or manufacture a proof.
 use super::{
-    multiplex::{Purpose, ReceivedReply},
+    multiplex::{MAX_SECTIONS, Purpose, ReceivedReply},
     owned::serialized_digest,
     types::*,
 };
@@ -366,6 +366,15 @@ struct CallDeadlines {
     outgoing: Option<Instant>,
 }
 
+enum Outgoing {
+    Immediate,
+    WaitUntil(Instant),
+    Reserved(crate::oltp_replication::multiplex::OutgoingReservation),
+}
+type TransportFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ReceivedReply, RequestError>> + Send + 'a>,
+>;
+
 struct Client {
     group: GroupIdentity,
     shared: Arc<WorkerSharedResources>,
@@ -465,25 +474,25 @@ impl Client {
     ) -> Result<ServiceResponse, ProtocolError> {
         self.call_as(self.action, method, payload).await
     }
-    async fn call_as(
+    fn call_as(
         &self,
         action: ServiceAction,
         method: Method,
         payload: Option<ChargedBytes>,
-    ) -> Result<ServiceResponse, ProtocolError> {
-        if method.uses_bounded_read_failover(action) {
-            return self.repeat_as(action, method, payload).await;
-        }
-        self.call_once(action, method, payload, None).await
+    ) -> impl std::future::Future<Output = Result<ServiceResponse, ProtocolError>> + Send + '_ {
+        self.call_with_outgoing_deadline(action, method, payload, None)
     }
 
-    async fn call_once(
+    async fn call_with_outgoing_deadline(
         &self,
         action: ServiceAction,
         method: Method,
         payload: Option<ChargedBytes>,
         outgoing_deadline: Option<Instant>,
     ) -> Result<ServiceResponse, ProtocolError> {
+        if method.uses_bounded_read_failover(action) {
+            return self.repeat_as(action, method, payload).await;
+        }
         let mut possibly_applied = false;
         self.call_round(
             action,
@@ -1161,50 +1170,20 @@ impl Client {
         placement_generation: Option<uuid::Uuid>,
         outgoing_deadline: Option<Instant>,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
-        let result = self
-            .call_member_reserved(
-                action,
-                method,
-                payload,
-                node,
-                worker,
-                placement_generation,
-                None,
-            )
-            .await;
-        let (until, refusal) = match (outgoing_deadline, result) {
-            (
-                Some(until),
-                Err(error @ CallError::Transport(RequestError::OutgoingLaneFull { .. })),
-            ) => (until, error),
-            (_, result) => return result,
-        };
-        // Only a local pre-send refusal can wait and send the same command.
-        // Keep the original charged payload and the round's G1 tracking.
-        let reservation = self
-            .transport
-            .reserve_outgoing(&self.group, worker.worker_id(), method.purpose(), until)
-            .await
-            .map_err(CallError::Transport)?;
-        if Instant::now() >= until {
-            return Err(refusal);
-        }
-        self.call_member_reserved(
+        self.call_member_with_outgoing(
             action,
             method,
             payload,
             node,
             worker,
             placement_generation,
-            Some(reservation),
+            outgoing_deadline.map_or(Outgoing::Immediate, Outgoing::WaitUntil),
         )
         .await
     }
 
-    /// `call_member_at` on an outgoing slot the caller already holds
-    /// ([`WorkerClient::reserve_outgoing`]); `None` takes one or refuses.
     #[allow(clippy::too_many_arguments)]
-    async fn call_member_reserved(
+    async fn call_member_with_outgoing(
         &self,
         action: ServiceAction,
         method: Method,
@@ -1212,7 +1191,7 @@ impl Client {
         node: u64,
         worker: RequestTarget,
         placement_generation: Option<uuid::Uuid>,
-        reservation: Option<crate::oltp_replication::multiplex::OutgoingReservation>,
+        outgoing: Outgoing,
     ) -> Result<Result<ServiceResponse, ProtocolError>, CallError> {
         let header = self.shared.encode_in(
             method.class().byte_class(),
@@ -1232,14 +1211,11 @@ impl Client {
         tracing::debug!(group=%self.group.group_id, method=?method, node, "service peer transport start");
         let _timer = crate::oltp_runtime::stage_timing::variant("rpc.call.", &method).timer();
         let sections = [payload.clone(), None, None];
-        // One boxed transport future, whichever lane path: every service
-        // call nests this future, and holding both variants inline grew
-        // the callers' futures until debug builds overflowed a Tokio
-        // worker's stack (run 44895705548, D05 and quorum workers).
-        let transport: std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<ReceivedReply, RequestError>> + Send + '_>,
-        > = match reservation {
-            None => Box::pin(self.transport.request_classified(
+        // Box the transport future and the lane wait. Keeping either inline
+        // grew nested service futures enough to overflow Tokio worker
+        // stacks during D05 and O11 recovery.
+        let transport: TransportFuture<'_> = match outgoing {
+            Outgoing::Immediate => Box::pin(self.transport.request_classified(
                 &self.group,
                 worker,
                 method.purpose(),
@@ -1247,7 +1223,7 @@ impl Client {
                 sections,
                 64 << 10,
             )),
-            Some(reservation) => Box::pin(self.transport.request_reserved(
+            Outgoing::Reserved(reservation) => Box::pin(self.transport.request_reserved(
                 reservation,
                 &self.group,
                 worker,
@@ -1256,6 +1232,9 @@ impl Client {
                 sections,
                 64 << 10,
             )),
+            Outgoing::WaitUntil(until) => {
+                self.request_with_lane_wait(worker, method.purpose(), header, sections, until)
+            }
         };
         let reply = transport.await.map_err(|error| {
                 tracing::debug!(group=%self.group.group_id, method=?method, node, error=?error, "service peer transport refused or lost");
@@ -1273,6 +1252,53 @@ impl Client {
                     mutation_uncertain(error)
                 })
             })
+    }
+
+    fn request_with_lane_wait(
+        &self,
+        worker: RequestTarget,
+        purpose: Purpose,
+        header: ChargedBytes,
+        sections: [Option<ChargedBytes>; MAX_SECTIONS],
+        until: Instant,
+    ) -> TransportFuture<'_> {
+        Box::pin(async move {
+            let refusal = match self
+                .transport
+                .request_classified(
+                    &self.group,
+                    worker,
+                    purpose,
+                    header.clone(),
+                    sections.clone(),
+                    64 << 10,
+                )
+                .await
+            {
+                Err(error @ RequestError::OutgoingLaneFull { .. }) => error,
+                result => return result,
+            };
+            // A local refusal precedes send, so the same header and
+            // charged payload can use a reserved slot.
+            let reservation = self
+                .transport
+                .reserve_outgoing(&self.group, worker.worker_id(), purpose, until)
+                .await?;
+            if Instant::now() >= until {
+                return Err(refusal);
+            }
+            self.transport
+                .request_reserved(
+                    reservation,
+                    &self.group,
+                    worker,
+                    purpose,
+                    header,
+                    sections,
+                    64 << 10,
+                )
+                .await
+        })
     }
 
     async fn member_reply(

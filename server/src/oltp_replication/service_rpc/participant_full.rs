@@ -1413,7 +1413,7 @@ impl RemoteParticipant for ParticipantClient {
                 client.repeat_as(client.action, method, Some(payload)).await?
             } else if wait_for_outgoing {
                 client
-                    .call_once(
+                    .call_with_outgoing_deadline(
                         client.action,
                         method,
                         Some(payload),
