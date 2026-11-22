@@ -165,17 +165,22 @@ a new run and recovers data through the archived cut.
    survivor pauses. A mounted intent can resume with the original mount,
    identity file, and pool contents. Startup checks Control before opening
    the pool, and a wiped mount is refused even if the signing key survived.
-   After a complete shutdown with a mounted replacement, restart the retained
-   workers under one cold-fence profile with new incarnations, incremented
-   enrollment revisions and mount generations, and the retained certificates.
-   Use the stable voter sets from the committed plan for any system groups
-   still awaiting publication. Keep the original policy placements, omit
-   `system_replacement`, and include the retained workers in the configured
-   Control enrollment and operator pins. Use binaries that support mounted
-   replacement across a cold start on every retained Control voter. Control
-   can finish publishing the mounted intent in the new run. For status, keep
-   using the intent's original `run_id`. The cold fence abandons the old
-   RAM queue and preserves committed mutations and request IDs.
+   After a complete shutdown during a mounted replacement, start the two
+   survivors with one cold-fence profile. Keep their certificates and advance
+   their incarnations, enrollment revisions and mount generations. Set their
+   expected system placements to the intent's target voter sets and keep the
+   original policy placements. Include the candidate's original enrollment
+   with the survivors' new Control enrollments and operator pins.
+
+   Wait for `registered cold run <UUID> published` in a survivor's log. Then
+   start the candidate on its original mount with its original enrollment and
+   replacement record. Add the same cold-fence profile and update the
+   survivors' enrollments in the candidate's pre-replacement Control pins.
+   The candidate had never joined the old RAM queue and resumes promotion in
+   the new run. Use binaries that support this procedure on all retained
+   workers. Keep using the original intent's `run_id` for replacement status.
+   The cold fence abandons the old RAM queue and preserves committed mutations
+   and request IDs.
 
    Once the procedure completes, a later permanent loss uses a fresh intent
    naming the replacement worker. If the replacement mount is lost while

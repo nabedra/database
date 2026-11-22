@@ -496,6 +496,7 @@ impl LocalServices {
                     directory.refresh(&rpc).await.map_err(|error|
                         if error.code == ErrorCode::Unauthorized { unavailable() } else { error })
                 }).await?;
+                directory.set_cold_bootstrap(false);
             } else if rolling {
                 startup_read(deadline, &error_trace, "rolling retained Data groups", || factory.rehost_retained(&pools)).await?;
             } else if worker.restored.is_none() {

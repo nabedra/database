@@ -19,18 +19,29 @@ pub(super) async fn join(
     // mounted directory and holds both locks through the peer exchange.
     let proof = ReplacementMountProof::sign(control.identity(), record, &record.intent.mount, key)?;
     let mut mount_committed = worker.replacement_mount_committed;
+    let next_run = worker.cold.as_ref().map(|cold| cold.profile.next_run);
+    let serving_run = next_run.unwrap_or(record.intent.run_id);
     loop {
         let mut mounted = false;
-        if let Some((applied, accepted, complete)) =
+        if let Some((applied, accepted, complete, run)) =
             control.replacement_record_local(record.intent.id).await?
         {
             if &applied != record {
                 return Err(failure("system replacement differs from committed intent"));
             }
+            if next_run.is_some() && run == record.intent.run_id {
+                // The retained candidate has never held the old RAM queue.
+                // Keep its replicas running while the survivors fence that
+                // queue, then resume the mounted intent in the new run.
+                wait_startup(deadline).await?;
+                continue;
+            }
+            if run != serving_run {
+                return Err(failure("system replacement run differs from Control"));
+            }
             if complete && worker.manager.replacement_applied(record).await.is_ok() {
                 let state = control.inspect().await?.ok_or_else(unavailable)?;
-                if state.ready.view.run_id != record.intent.run_id
-                    || state.policy != worker.bootstrap_policy
+                if state.ready.view.run_id != serving_run || state.policy != worker.bootstrap_policy
                 {
                     return Err(failure(
                         "system replacement run or bootstrap policy differs",

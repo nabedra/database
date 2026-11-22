@@ -237,7 +237,7 @@ pub(super) async fn finish(
             .await?
             .ok_or_else(unavailable)?;
         if state.ready.view.run_id == fence.next.view.run_id {
-            return Ok(());
+            break;
         }
         let Some(Pending::Fence(pending)) = state.pending else {
             return Err(failure("pending cold fence disappeared"));
@@ -254,8 +254,13 @@ pub(super) async fn finish(
                 publish_fence(control, &worker.operator, fence)
             })
             .await?;
-            return Ok(());
+            break;
         }
         wait_startup(deadline).await?;
     }
+    eprintln!(
+        "nabedra-db: registered cold run {} published",
+        fence.next.view.run_id
+    );
+    Ok(())
 }

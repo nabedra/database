@@ -473,7 +473,8 @@ def o06_o17_system_replacement_check(binary, test_executable, root, variant=None
         candidate_barrier.mkdir(parents=True)
         (candidate_barrier / 'rolling-test-id').write_text(intent['id'])
         write_json(candidate_barrier / 'inspect.json', [queued_id])
-        publication_gate = ({control_group['group_id']: 'replacement_before_publication'}
+        timestamp_group = original_placements['timestamps']['identity']['group_id']
+        publication_gate = ({timestamp_group: 'replacement_before_publication'}
                             if variant == 'cold' else {})
         write_json(candidate_barrier / 'gates.json', {
             intent['id']: 'rolling_copy_complete', queued_id: 'queued',
@@ -685,39 +686,59 @@ def r04_o17_finish_replacement_after_cold_restart(
     intent = prepared['intent']
     check = dict(run_id=intent['run_id'], previous=intent['previous'])
     control_group = original_placements['control']['identity']['group_id']
+    timestamp_group = original_placements['timestamps']['identity']['group_id']
     names = [*survivors, 'replacement']
-    wait_for(lambda: any((cluster.barrier_dir(name) / f'reached-{control_group}').is_file()
-                         for name in names),
-             'Control Raft promotion applied before publication', PROBE_WINDOW)
+    wait_for(lambda: any((cluster.barrier_dir(name) / f'reached-{timestamp_group}').is_file()
+                         for name in survivors),
+             'Timestamp Raft promotion applied before publication', PROBE_WINDOW)
     status = cluster.admin('worker.system_replacement.status', check, worker=survivors[0])
     assert status['id'] == intent['id'] and status['mounted'] and not status['complete'], status
     planned = {plan['expected']['identity']['group_id']: sorted(
         [member for member in plan['old'] if member['worker_id'] != intent['previous']['worker_id']]
         + [plan['learner']], key=lambda member: member['node_id']) for plan in prepared['groups']}
+    data_group = initial_range(cluster, table)['group_id']
     for plan, route in zip(prepared['groups'], status['groups'], strict=True):
         group = plan['expected']['identity']['group_id']
-        assert route['members'] == (plan['old'] if group == control_group else planned[group]), route
+        if group == data_group:
+            assert route['members'] == planned[group], route
+        elif group in (control_group, timestamp_group):
+            assert route['members'] == plan['old'], route
     cluster.kill_workers()
     assert all(not process.alive() for process in cluster.workers.values())
 
     profile = dict(previous_run=cluster.run_id, next_run=uid(), transition_id=uid())
     placements = replacement_placements(original_placements, planned)
     nexts = {}
-    for name in names:
+    for name in survivors:
         previous = cluster.config[name]['node']['enrollment']
         nexts[name] = dict(previous, incarnation=uid(),
                            enrollment_revision=previous['enrollment_revision'] + 1)
-    peers = sorted(nexts.values(), key=lambda enrollment: enrollment['worker_id'])
+    peers = sorted([*nexts.values(), intent['next']], key=lambda enrollment: enrollment['worker_id'])
     pins = sorted(peer['certificate_sha256'] for peer in peers)
-    for name in names:
+    for name in survivors:
         node = cluster.config[name]['node']
-        node.pop('system_replacement', None)
         node.update(cold=profile, enrollment=nexts[name], control_enrollments=peers,
                     operator_pins=pins, placements=placements, bootstrap_placements=original_placements)
         node['mount']['worker'] = {field: nexts[name][field] for field in IDENTITY_FIELDS}
         node['mount']['generation'] += 1
         write_json(cluster.barrier_dir(name) / 'gates.json', {})
         cluster.launch_worker(name)
+
+    def fenced():
+        for name in survivors:
+            if not cluster.workers[name].alive():
+                cluster.check_lost_port(name)
+            if f'registered cold run {profile["next_run"]} published' in cluster.tail(name):
+                return True
+
+    wait_for(fenced, 'survivors published the cold fence with the candidate stopped', PROBE_WINDOW)
+    candidate = cluster.config['replacement']['node']
+    new_enrollments = {enrollment['worker_id']: enrollment for enrollment in nexts.values()}
+    candidate.update(cold=profile, control_enrollments=[
+        new_enrollments.get(peer['worker_id'], peer) for peer in candidate['control_enrollments']
+    ])
+    write_json(cluster.barrier_dir('replacement') / 'gates.json', {})
+    cluster.launch_worker('replacement')
     cluster.wait_workers(names=names)
     ready = cluster.admin('cluster.connection', {}, worker=survivors[0])
     assert ready['run_id'] == profile['next_run'], ready

@@ -233,7 +233,7 @@ impl RegisteredWorker {
         &self,
         identity: GroupIdentity,
     ) -> Result<GroupStore, ProtocolError> {
-        if self.cold.is_some() || self.rolling.is_some() {
+        if self.system_replacement.is_none() && (self.cold.is_some() || self.rolling.is_some()) {
             self.pool.retained_group(identity).await
         } else {
             self.pool.group(identity).await
@@ -607,6 +607,9 @@ impl RegisteredWorker {
             })
             .await
             .map_err(|_| unavailable())??;
+            if cold.is_some() && !replacement_mount_committed {
+                return Err(invalid());
+            }
             restart_mount = Some(mount);
         }
         let mut restored = None;
@@ -1007,7 +1010,11 @@ fn install_replacement_placements(
     let intent = &record.intent;
     intent.validate()?;
     if config.required_voters != 3
-        || config.cold.is_some() || config.rolling.is_some() || config.restore.is_some()
+        || config
+            .cold
+            .is_some_and(|cold| cold.previous_run != intent.run_id)
+        || config.rolling.is_some()
+        || config.restore.is_some()
         || !config.secondary_pools.is_empty()
         || config.enrollment != intent.next
         || config.mount.as_ref() != Some(&intent.mount)

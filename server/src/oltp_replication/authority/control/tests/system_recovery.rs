@@ -401,6 +401,10 @@ async fn r04_o17_cold_fence_after_mount_completes_publication() {
             .any(|member| member.worker_id == record.intent.next.worker_id)
     );
     assert_eq!(recovery.fixture.state().await.ready, next);
+    recovery
+        .fixture
+        .add_ready(recovery.voters[0], &mut Vec::new())
+        .await;
     let (next_record, _) = recovery.prepare(recovery.voters[1], 5).await;
     assert_eq!(next_record.intent.run_id, next.view.run_id);
 }

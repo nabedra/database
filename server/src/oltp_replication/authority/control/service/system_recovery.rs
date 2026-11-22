@@ -303,7 +303,6 @@ impl ControlHandle {
                 let record =
                     load::<ReplacementRecord>(view, &by_id(proof.id))?.ok_or_else(unauthorized)?;
                 if view.get(&abandoned(proof.id))?.is_some()
-                    || record.intent.run_id != state(view)?.ready.view.run_id
                     || proof.verify(&scope, &record).is_err()
                 {
                     return Err(unauthorized());
@@ -311,6 +310,9 @@ impl ControlHandle {
                 let mounted = view
                     .get(&revoked_id(record.intent.previous.worker_id))?
                     .is_some();
+                if !mounted && record.intent.run_id != state(view)?.ready.view.run_id {
+                    return Err(unauthorized());
+                }
                 if mounted
                     && load::<WorkerRecord>(view, &machine::key(WORKERS, proof.worker.worker_id))?
                         .is_none_or(|worker| {
@@ -328,7 +330,7 @@ impl ControlHandle {
     pub(crate) async fn replacement_record_local(
         &self,
         id: Uuid,
-    ) -> Result<Option<(ReplacementRecord, bool, bool)>, ProtocolError> {
+    ) -> Result<Option<(ReplacementRecord, bool, bool, Uuid)>, ProtocolError> {
         let raw = self
             .machine
             .store()
@@ -340,7 +342,7 @@ impl ControlHandle {
                         .get(&revoked_id(record.intent.previous.worker_id))?
                         .is_some();
                     let complete = mounted && load::<Uuid>(view, ACTIVE)? != Some(id);
-                    Some((record, mounted, complete))
+                    Some((record, mounted, complete, state(view)?.ready.view.run_id))
                 } else {
                     None
                 };

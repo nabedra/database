@@ -547,7 +547,7 @@ impl QuorumEndpoint {
         if running.raft.current_leader().await != Some(running.state.resident().node_id()) {
             return Err(unavailable());
         }
-        let (record, mounted, _) = control
+        let (record, mounted, _, _) = control
             .replacement_record_local(proof.id)
             .await?
             .ok_or_else(unavailable)?;
@@ -648,7 +648,7 @@ impl QuorumEndpoint {
     }
 
     async fn reconcile(&self, id: Uuid, group: Uuid) -> Result<AppliedPosition, ProtocolError> {
-        let (record, mounted, _) = self
+        let (record, mounted, _, _) = self
             .control
             .replacement_record_local(id)
             .await?
