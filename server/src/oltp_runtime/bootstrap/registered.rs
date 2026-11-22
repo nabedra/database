@@ -1011,6 +1011,12 @@ fn spawn_membership(
                 let current = control.current(&scope).await?;
                 let previous = replica.lock().map_err(|_| unavailable())?.authority();
                 if current != previous {
+                    #[cfg(test)]
+                    if current.ready.ready_count == 3
+                        && super::super::recovery_tests::hold_o21_ready_view()
+                    {
+                        return Ok(false);
+                    }
                     let members = ready_members(&control, current.ready).await?;
                     if members.contains(&local) {
                         replica

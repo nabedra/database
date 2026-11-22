@@ -531,6 +531,31 @@ pub(super) fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
     Some(directory)
 }
 
+pub(super) fn hold_o21_ready_view() -> bool {
+    o21_ready_hold().is_some()
+}
+
+fn o21_ready_hold() -> Option<PathBuf> {
+    let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
+    directory
+        .join("o21-hold-ready-view")
+        .is_file()
+        .then_some(directory)
+}
+
+pub(super) fn observe_o21_stale_copy(request: Uuid) {
+    if let Some(directory) = o21_ready_hold() {
+        std::fs::write(directory.join(format!("o21-stale-copy-{request}")), b"").unwrap();
+    }
+}
+
+pub(super) fn observe_o21_stale_proposal(body: &[u8]) {
+    if let Some(directory) = o21_ready_hold() {
+        let request = crate::protocol::parse_request(body).unwrap().request_id;
+        std::fs::write(directory.join(format!("o21-stale-proposal-{request}")), b"").unwrap();
+    }
+}
+
 pub(super) fn count_submission(request: Uuid) {
     use std::io::Write as _;
     let Some(directory) = std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR") else {

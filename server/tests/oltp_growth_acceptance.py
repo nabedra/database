@@ -631,16 +631,74 @@ def split_child(source, attempt, side):
     return source | {'group_id': group, 'kind': {'data': dict(table_id=table_id, shard_id=shard)}}
 
 
-def check_capacity_deficit(facade):
-    parent = facade.cluster
-    cluster = GrowthCluster(parent.binary, parent.root / 'capacity-deficit', mounts=True,
+def create_with_lagging_queue_replicas(constrained, holds):
+    cluster = constrained.cluster
+
+    def ready_views():
+        views = [cluster.stats(worker)['accept_to_dispatch']['view'] for worker in WORKERS]
+        # One of the two followers joined last and has already installed this view.
+        newest = max(views, key=lambda view: view['membership_revision'])
+        return views if views[0] != newest and views[1:].count(newest) == 1 else None
+
+    wait_for(ready_views, 'owner and existing follower still hold the old view', 15)
+    request = operation('table.create', dict(name='capacity_deficit', schema=dict(id='int64', data='utf8'),
+                                             key='id', format='parquet'))
+    proposal = holds[0].parent / f"o21-stale-proposal-{request['request_id']}"
+    copies = [hold.parent / f"o21-stale-copy-{request['request_id']}" for hold in holds[1:]]
+    submissions = [cluster.barrier_dir(worker) / f"submissions-{request['request_id']}"
+                   for worker in WORKERS]
+    for path in submissions:
+        path.touch()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        creating = executor.submit(constrained.api, 'api1', OPERATIONS, request)
+
+        def arrived(paths):
+            if any(path.is_file() for path in paths):
+                return True
+            assert not creating.done(), creating.result()
+            return False
+
+        try:
+            wait_for(lambda: arrived([proposal]), 'create proposal on the owner with an older queue view', 15)
+            holds[0].unlink()
+            wait_for(lambda: arrived(copies), 'create copy on the follower with an older queue view', 15)
+        finally:
+            for hold in holds:
+                hold.unlink(missing_ok=True)
+        status, reply = creating.result(timeout=30)
+    assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
+    attempts = [line for path in submissions for line in path.read_text().splitlines()]
+    assert attempts == [request['request_id']], attempts
+    assert constrained.api('api1', OPERATIONS, request) == (status, reply)
+    changed = request | {'payload': request['payload'] | {'name': 'different'}}
+    conflict, response = constrained.api('api1', OPERATIONS, changed)
+    assert conflict == 409 and response['error']['code'] == 'conflict', (conflict, response)
+    table = constrained.db.table('capacity_deficit')
+    assert table.id == reply['data']['id'], reply
+    print(f'O21 created and replayed {request["request_id"]} after the owner and follower installed the ready view',
+          flush=True)
+    return table
+
+
+def check_capacity_deficit(binary, root, direct, *, test_executable=None):
+    cluster = GrowthCluster(binary, root / 'capacity-deficit', mounts=True,
                             automatic=dict(shard_target_bytes=64 << 10, minimum_free_bytes=3 << 30),
-                            direct=dict.fromkeys(WORKERS, facade.direct), api_direct=(facade.direct,))
-    constrained = Transactions(cluster, facade.direct)
+                            test_executable=test_executable,
+                            direct=dict.fromkeys(WORKERS, direct), api_direct=(direct,))
+    constrained = Transactions(cluster, direct)
+    holds = []
+    if test_executable:
+        # Hold existing workers when the last worker joins. Either follower can join last.
+        for worker in WORKERS:
+            hold = cluster.barrier_dir(worker) / 'o21-hold-ready-view'
+            hold.parent.mkdir(parents=True, exist_ok=True)
+            hold.touch()
+            holds.append(hold)
     try:
         constrained.start()
         configure_growth(cluster)
-        table = constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id')
+        table = (create_with_lagging_queue_replicas(constrained, holds) if holds else
+                 constrained.db.create_table('capacity_deficit', {'id': int, 'data': str}, key='id'))
         rows = [dict(id=key, data='x' * (8 << 10)) for key in range(16)]
         assert constrained.data(batch(table, rows)) == len(rows)
         source = initial_range(cluster, table.id)
@@ -663,7 +721,12 @@ def check_capacity_deficit(facade):
         assert all(pool['available_bytes'] < pool['required_bytes'] for pool in deficit['pools']), deficit
         assert query(constrained, table) == rows
         assert 'shards 1;' in table.query().explain()
+    except BaseException:
+        dump(cluster)
+        raise
     finally:
+        for hold in holds:
+            hold.unlink(missing_ok=True)
         cluster.close()
 
 
@@ -830,7 +893,7 @@ def o21(facade):
            'Simultaneous disjoint mutation manifests each contained one Data write. During an isolated full count, the worker-wide charged decode high-water stayed below the raw size of the table.')
     passed('O21', 'bounded-work',
            'The charged decode high-water stayed below the configured task ceiling. Checked count overflow returned limit_exceeded and left later counts exact.')
-    check_capacity_deficit(facade)
+    check_capacity_deficit(cluster.binary, cluster.root, facade.direct)
     passed('O21', 'capacity-errors', 'A separate RF3 table crossed its target on 2 GiB mounts with a 3 GiB free-space floor. The split reported a measured disk deficit and the existing rows stayed readable.')
 
 
@@ -1192,13 +1255,20 @@ def main():
     parser.add_argument('--scenario', choices=('O16', 'O21', 'O26', 'O28'), required=True)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--test-executable', type=Path, required=True)
+    parser.add_argument('--capacity-only', action='store_true')
     args = parser.parse_args()
     if not Rf3Cluster.mounts_available():
+        if args.capacity_only:
+            raise AssertionError('O21 capacity regression requires Linux and passwordless sudo')
         print('NABEDRA_OLTP_ACCEPTANCE ' + json.dumps(dict(
             scenario=args.scenario, status='not-run', reason='registered RF3 tmpfs mounts require Linux and passwordless sudo'
         )), flush=True)
         return
     direct = os.environ.get('NABEDRA_TEST_DIRECT_OLTP') != 'off'
+    if args.capacity_only:
+        with tempfile.TemporaryDirectory(prefix='nabedra-o21-capacity-') as root:
+            check_capacity_deficit(args.binary, Path(root), direct, test_executable=args.test_executable)
+        return
     if args.scenario == 'O21':
         with args.binary.open('rb') as binary:
             print(f'O21 server SHA-256 {hashlib.file_digest(binary, "sha256").hexdigest()}', flush=True)
