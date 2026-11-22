@@ -1871,6 +1871,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nabedra-check"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nabedra-database"
 version = "0.1.1"
 dependencies = [
@@ -1894,6 +1902,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime",
+ "nabedra-check",
  "nabedra-kv",
  "openraft",
  "parquet",
