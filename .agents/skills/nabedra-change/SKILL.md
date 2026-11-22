@@ -12,14 +12,21 @@ When you are given a task or asked to make a change, do the following:
 5. For docs-only changes, review the diff and skip tests and GitHub Actions.
    Put `[skip ci]` in the PR head commit message and in the commit message that
    lands on the base branch. For other changes, run the applicable checks and
-   tests, including GitHub Actions when appropriate. Wait for checks that start
-   after you open the PR, fix failures, and rerun the affected checks. Once all
+   tests, including GitHub Actions dispatched on the PR's head commit when
+   appropriate. Wait for the merge-gate checks that start when you open the PR,
+   fix failures, and rerun the affected checks. Once all
    applicable checks and tests pass, merge the PR automatically if you have
    permission.
 6. After the merge, remove the PR branch and worktree if they are no longer needed. Then run `git pull` on the base branch.
 
 Use the [Nabedra builds skill](../nabedra-builds/SKILL.md) to choose where to
 run builds and expensive checks. Apply it when coordinating concurrent agents.
+Pushes start no CI: dispatch runs as described in
+[GitHub Actions for checks](../code-review/references/gh-actions.md).
+
+When agents work in parallel on one codebase, every hot file has a single owner
+per wave. See the hot-file rule in the
+[subagent-driven development workflow](references/subagent-driven-development.md#prepare-the-work).
 
 To file the PR, use the `file-pr` skill in this repo. Include before and after pictures or videos for UI changes and give a concise description of the problem and solution of the PR
 

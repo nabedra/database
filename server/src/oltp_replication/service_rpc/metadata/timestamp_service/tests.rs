@@ -163,13 +163,10 @@ async fn terminal_copy(
         .unwrap()
 }
 
+/// The RF1 profile the services were started with: a host re-attaches only
+/// with the same configuration digest.
 fn raft_config() -> openraft::Config {
-    openraft::Config {
-        heartbeat_interval: 100,
-        election_timeout_min: 200,
-        election_timeout_max: 400,
-        ..Default::default()
-    }
+    crate::oltp_runtime::bootstrap::raft_config()
 }
 
 // O09/O13/O14/O22/C07/F03/Q06/R03. Use the actual typed service, durable

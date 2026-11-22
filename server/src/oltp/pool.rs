@@ -16,7 +16,9 @@ mod resources;
 pub(crate) mod restore;
 mod snapshot;
 mod storage;
-pub use snapshot::{GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile};
+pub use snapshot::{
+    GroupSnapshot, GroupSnapshotHeader, IncomingSnapshot, PoolSnapshotFile, SnapshotCut,
+};
 #[cfg(test)]
 mod tests;
 pub use resources::{

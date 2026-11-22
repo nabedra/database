@@ -4,7 +4,7 @@ use super::{
     authority::{
         config::*,
         consensus::{Applied, Consensus},
-        control::ControlMachine,
+        control::{ControlMachine, ReplicaMove},
         status::StatusMachine,
         timestamp::TimestampMachine,
     },
@@ -269,7 +269,6 @@ impl HostedGroupManager {
         target: uuid::Uuid,
     ) -> Result<u64, ProtocolError> {
         use openraft::{
-            RaftSnapshotBuilder,
             network::{RPCOption, RaftNetworkFactory, RaftNetworkV2},
             storage::RaftStateMachine,
         };
@@ -295,13 +294,14 @@ impl HostedGroupManager {
         };
         let host = self.hosted_data(group, source.node_id)?;
         host.ensure_linearizable().await?;
+        // SNAP1: what the replication task sends a lagging follower, a fresh
+        // cut whose file is written during the transfer.
         let mut state = host.state.clone();
         let snapshot = state
-            .get_snapshot_builder()
+            .get_current_snapshot()
             .await
-            .build_snapshot()
-            .await
-            .map_err(|_| unavailable())?;
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
         let cut = snapshot.meta.last_log_id.ok_or_else(unavailable)?.index;
         let mut factory = TypedNetworkFactory::<DataConfig>::new(
             self.client(),
@@ -417,6 +417,7 @@ impl HostedGroupManager {
         machine: M,
         local: ReplicaMember,
         bootstrap: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
         config: openraft::Config,
     ) -> Result<Managed<C, M>, ProtocolError>
     where
@@ -528,7 +529,8 @@ impl HostedGroupManager {
             resident,
             self.shared.clone(),
             bootstrap.clone(),
-        )?;
+        )?
+        .with_learner_catch_up(catch_up_before);
         if let Err(error) = dispatcher.add(local.node_id, Arc::new(endpoint)) {
             running.shutdown().await?;
             return Err(error);
@@ -613,7 +615,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedControl, ProtocolError> {
-        self.start(ControlMachine::new(store)?, local, peers, config)
+        self.start(ControlMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn start_registered_control(
@@ -625,7 +627,7 @@ impl HostedGroupManager {
         directory: Arc<crate::oltp_replication::multiplex::AppliedPeerDirectory>,
     ) -> Result<ManagedControl, ProtocolError> {
         let machine = ControlMachine::new(store)?.with_replacement_directory(directory).await?;
-        self.start(machine, local, peers, config).await
+        self.start(machine, local, peers, None, config).await
     }
     pub(crate) async fn start_timestamps(
         &self,
@@ -634,7 +636,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedTimestamps, ProtocolError> {
-        self.start(TimestampMachine::new(store)?, local, peers, config)
+        self.start(TimestampMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn start_status(
@@ -644,7 +646,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedStatus, ProtocolError> {
-        self.start(StatusMachine::new(store)?, local, peers, config)
+        self.start(StatusMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn start_data(
@@ -654,8 +656,45 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedData, ProtocolError> {
+        self.start_data_with_bootstrap(store, local, peers, None, config)
+            .await
+    }
+    async fn start_placement_learner(
+        &self,
+        store: GroupStore,
+        plan: &ReplicaMove,
+        config: openraft::Config,
+    ) -> Result<ManagedData, ProtocolError> {
+        self.start_data_with_bootstrap(
+            store,
+            plan.request.target.clone(),
+            plan.old
+                .iter()
+                .map(|member| (member.node_id, member.clone()))
+                .collect(),
+            // The move's committed Control record authorizes these senders
+            // while the learner catches up to that placement.
+            Some(plan.expected.membership_position.index),
+            config,
+        )
+        .await
+    }
+    async fn start_data_with_bootstrap(
+        &self,
+        store: GroupStore,
+        local: ReplicaMember,
+        peers: BTreeMap<u64, ReplicaMember>,
+        catch_up_before: Option<u64>,
+        config: openraft::Config,
+    ) -> Result<ManagedData, ProtocolError> {
         let running = self
-            .start(ParticipantMachine::new(store)?, local, peers, config)
+            .start(
+                ParticipantMachine::new(store)?,
+                local,
+                peers,
+                catch_up_before,
+                config,
+            )
             .await?;
         super::hosted::direct_leadership::watch(&running);
         Ok(running)
@@ -667,7 +706,7 @@ impl HostedGroupManager {
         peers: BTreeMap<u64, ReplicaMember>,
         config: openraft::Config,
     ) -> Result<ManagedCatalog, ProtocolError> {
-        self.start(ParticipantMachine::new(store)?, local, peers, config)
+        self.start(ParticipantMachine::new(store)?, local, peers, None, config)
             .await
     }
     pub(crate) async fn shutdown(&self) -> Result<(), ProtocolError> {

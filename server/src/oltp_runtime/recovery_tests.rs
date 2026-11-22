@@ -507,6 +507,10 @@ pub(super) fn refuse_prepared_commit(request: Uuid) -> bool {
     take_fault("refuse-prepared-commit", request).is_some()
 }
 
+pub(crate) fn elect_move_source(request: Uuid) -> bool {
+    take_fault("move-elect-source", request).is_some()
+}
+
 pub(super) fn take_fault(name: &str, request: Uuid) -> Option<PathBuf> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
     std::fs::remove_file(directory.join(format!("{name}-{request}"))).ok()?;

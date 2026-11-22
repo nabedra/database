@@ -12,8 +12,8 @@ use super::{
 };
 use crate::{
     oltp::pool::{
-        ApplyMeta, ChargedBytes, ExecutionClass, GroupSnapshot, GroupStore, TransactionBudget,
-        Transition,
+        ApplyMeta, ChargedBytes, ExecutionClass, GroupSnapshot, GroupSnapshotHeader, GroupStore,
+        SnapshotCut, TransactionBudget, Transition,
     },
     protocol::{ErrorCode, Outcome, ProtocolError},
 };
@@ -135,6 +135,7 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     pub(crate) fn resident(&self) -> ReplicaLease {
         self._resident.clone()
     }
+    /// A received or installed snapshot file, checked against its header.
     pub(crate) async fn snapshot(
         &self,
         file: GroupSnapshot,
@@ -144,6 +145,32 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
             .snapshot_membership(file.clone(), META)
             .await
             .map_err(disk)?;
+        let header = file.header.clone();
+        self.typed(
+            &header,
+            raw.as_ref().map(ChargedBytes::as_slice),
+            SnapshotSource::File(Box::new(file)),
+        )
+        .await
+    }
+    /// SNAP1: the Raft snapshot of a cut; its metadata comes from the cut's
+    /// header and membership, which one `nabedra-kv` view produced.
+    async fn of_cut(&self, cut: SnapshotCut) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
+        let cut = Arc::new(cut);
+        let header = cut.header.clone();
+        self.typed(
+            &header,
+            cut.membership.as_ref().map(ChargedBytes::as_slice),
+            SnapshotSource::Cut(cut.clone()),
+        )
+        .await
+    }
+    async fn typed(
+        &self,
+        header: &GroupSnapshotHeader,
+        raw: Option<&[u8]>,
+        source: SnapshotSource,
+    ) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
         // Waits for room: a refusal here would stop the core (RV-APPLY F3).
         // Every other holder releases on drop.
         let owner = Arc::new(
@@ -153,17 +180,17 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
                 .map_err(disk)?,
         );
         let membership = match raw {
-            Some(raw) => stored_membership(raw.as_slice()).map_err(disk)?,
+            Some(raw) => stored_membership(raw).map_err(disk)?,
             None => StoredMembershipOf::<C>::default(),
         };
         let meta = SnapshotMetaOf::<C> {
-            last_log_id: file.header.applied.map(log_id),
+            last_log_id: header.applied.map(log_id),
             last_membership: membership,
         };
         Ok(openraft::Snapshot {
             meta,
             snapshot: TypedSnapshot {
-                file,
+                source,
                 _owner: owner,
             },
         })
@@ -171,42 +198,72 @@ impl<C: TypedConfig, M: TypedMachine<C>> HostedState<C, M> {
     async fn builder(&self) -> TypedSnapshotBuilder<C, M> {
         // Capture the cut when OpenRaft asks for a builder, not when a later
         // background build polls it after application has advanced.
-        let cut = self.export().await.map_err(disk);
+        let cut = self.cut().await.map_err(disk);
         TypedSnapshotBuilder {
             owner: self.clone(),
             cut: Some(cut),
         }
     }
-    async fn export(&self) -> Result<GroupSnapshot, ProtocolError> {
+    /// SNAP1: a policy build is a header-only cut. OpenRaft keeps only the
+    /// metadata of a built snapshot (to purge the log up to it), so nothing
+    /// is written and no view stays pinned; a follower that needs the state
+    /// gets a fresh cut from [`RaftStateMachine::get_current_snapshot`].
+    async fn cut(&self) -> Result<SnapshotCut, ProtocolError> {
         #[cfg(test)]
         if self.retry.take_export_fault() {
             return Err(crate::oltp::pool::no_space());
         }
-        self.store().export_snapshot(META).await
+        self.store().cut_snapshot(META, false).await
     }
 }
+/// Scratch for writing a cut's file: one 64 KiB write buffer per job.
+const MATERIALIZE: TransactionBudget = TransactionBudget {
+    scratch_bytes: 256 << 10,
+    batch_bytes: 0,
+    output_bytes: 0,
+};
 #[derive(Clone)]
 pub(crate) struct TypedSnapshot {
-    pub(crate) file: GroupSnapshot,
+    source: SnapshotSource,
     _owner: Arc<ReplicaMetadata>,
+}
+#[derive(Clone)]
+enum SnapshotSource {
+    /// A received file, or one written from a cut elsewhere.
+    File(Box<GroupSnapshot>),
+    /// SNAP1: a cut; its file is written on first use.
+    Cut(Arc<SnapshotCut>),
+}
+impl TypedSnapshot {
+    /// The transferable file. A cut writes it here, on the caller's task: the
+    /// replication task streaming it to a follower, never the state machine's
+    /// task, so applies do not wait for it.
+    pub(crate) async fn file(&self) -> Result<GroupSnapshot, ProtocolError> {
+        match &self.source {
+            SnapshotSource::File(file) => Ok((**file).clone()),
+            SnapshotSource::Cut(cut) => cut.file(MATERIALIZE).await,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn cut(&self) -> Option<&Arc<SnapshotCut>> {
+        match &self.source {
+            SnapshotSource::Cut(cut) => Some(cut),
+            SnapshotSource::File(_) => None,
+        }
+    }
 }
 pub(crate) struct TypedSnapshotBuilder<C: TypedConfig, M: TypedMachine<C>> {
     owner: HostedState<C, M>,
-    cut: Option<io::Result<GroupSnapshot>>,
+    cut: Option<io::Result<SnapshotCut>>,
 }
 impl<C: TypedConfig, M: TypedMachine<C>> RaftSnapshotBuilder<C> for TypedSnapshotBuilder<C, M> {
     type SnapshotData = TypedSnapshot;
     async fn build_snapshot(&mut self) -> io::Result<SnapshotOf<C, TypedSnapshot>> {
-        let file = match self.cut.take() {
+        let cut = match self.cut.take() {
             Some(cut) => cut?,
-            None => self
-                .owner
-                .store()
-                .export_snapshot(META)
-                .await
-                .map_err(disk)?,
+            None => self.owner.cut().await.map_err(disk)?,
         };
-        self.owner.snapshot(file).await
+        self.owner.of_cut(cut).await
     }
 }
 impl<C, M> RaftStateMachine<C> for HostedState<C, M>
@@ -412,10 +469,10 @@ where
         }
         let cut = if force {
             self.retry
-                .retry(RaftWrite::BuildSnapshot, || self.export())
+                .retry(RaftWrite::BuildSnapshot, || self.cut())
                 .await
         } else {
-            self.export().await
+            self.cut().await
         };
         match cut {
             Err(error) if !force && transient(&error).is_some() && !self.retry.is_stopping() => {
@@ -439,7 +496,8 @@ where
         meta: &SnapshotMetaOf<C>,
         snapshot: TypedSnapshot,
     ) -> io::Result<()> {
-        let checked = self.snapshot(snapshot.file.clone()).await?;
+        let file = snapshot.file().await.map_err(disk)?;
+        let checked = self.snapshot(file.clone()).await?;
         if checked.meta != *meta {
             return Err(io::Error::other(
                 "snapshot bytes differ from typed Raft metadata",
@@ -449,17 +507,26 @@ where
         self.machine.installing_snapshot();
         self.retry
             .retry(RaftWrite::InstallSnapshot, || {
-                store.install_snapshot(snapshot.file.clone(), META)
+                store.install_snapshot(file.clone(), META)
             })
             .await
             .map_err(disk)?;
         self.machine.snapshot_installed().await.map_err(disk)
     }
+    /// SNAP1: a fresh cut of the current state, which covers every purged
+    /// index (a purge never passes the applied one). It pins its view until
+    /// the replication task that asked for it writes the file, or drops it.
     async fn get_current_snapshot(&mut self) -> io::Result<Option<SnapshotOf<C, TypedSnapshot>>> {
-        match self.store().current_snapshot(META).await.map_err(disk)? {
-            Some(file) => self.snapshot(file).await.map(Some),
-            None => Ok(None),
+        let store = self.store();
+        let cut = self
+            .retry
+            .retry(RaftWrite::BuildSnapshot, || store.cut_snapshot(META, true))
+            .await
+            .map_err(disk)?;
+        if cut.header.applied.is_none() {
+            return Ok(None);
         }
+        self.of_cut(cut).await.map(Some)
     }
 }
 
@@ -511,6 +578,15 @@ fn bounded_digest(
     }
 }
 
+/// SNAP1: the snapshot policy of the production Raft profiles, set
+/// explicitly. A policy build is now a header-only cut (a sync and three point
+/// reads under the application order), so the interval no longer trades apply
+/// stalls for log length; it only sets how often the log is purged. The values
+/// stay OpenRaft's defaults: a group retains 1,000-6,000 entries, as every
+/// existing recovery, move and catch-up scenario was validated against, and a
+/// cut every 5,000 entries costs one sync and one purge write.
+pub(crate) const SNAPSHOT_LOGS_SINCE_LAST: u64 = 5000;
+pub(crate) const SNAPSHOT_LOGS_TO_KEEP: u64 = 1000;
 /// How long policy snapshot builds pause after a transient failure (F2).
 const SNAPSHOT_DEFERRAL: Duration = Duration::from_secs(1);
 /// Cores one host can run over its lifetime: the first and the supervisor's

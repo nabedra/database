@@ -15,7 +15,7 @@ use crate::{
         types::*,
     },
 };
-use openraft::{RaftSnapshotBuilder, storage::RaftStateMachine};
+use openraft::storage::RaftStateMachine;
 use std::{collections::BTreeMap, path::PathBuf};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use uuid::Uuid;
@@ -26,6 +26,58 @@ mod progress;
 #[cfg(target_os = "linux")]
 #[path = "../../../tests/oltp_replicated_durability/fixture.rs"]
 mod replicated_durability;
+
+#[test]
+fn o26_learner_accepts_current_leader_while_replaying_historical_membership() {
+    let member = |node_id| ReplicaMember {
+        node_id,
+        worker_id: Uuid::new_v4(),
+        pool_id: Uuid::new_v4(),
+    };
+    let first = member(1);
+    let second = member(2);
+    let third = member(3);
+    let leader = ReplicaMember {
+        worker_id: first.worker_id,
+        ..member(4)
+    };
+    let bootstrap = BTreeMap::from([(2, second.clone()), (3, third.clone()), (4, leader.clone())]);
+    let history = Membership::new(
+        vec![[1, 2, 3].into_iter().collect()],
+        BTreeMap::from([(1, first), (2, second), (3, third)]),
+    )
+    .unwrap();
+    let stored = |index| {
+        openraft::StoredMembership::new(
+            Some(crate::oltp_replication::hosted::log_id(AppliedPosition {
+                term: 1,
+                node_id: 1,
+                index,
+            })),
+            history.clone(),
+        )
+    };
+    let prefix = stored(1);
+    let published_index = 8;
+    assert_eq!(
+        raft_sender(&prefix, &bootstrap, Some(published_index), 4),
+        Some(&leader)
+    );
+    assert_eq!(raft_sender(&prefix, &bootstrap, None, 4), None);
+    assert_eq!(
+        raft_sender(&prefix, &bootstrap, Some(published_index), 5),
+        None
+    );
+    assert_eq!(
+        raft_sender(
+            &stored(published_index),
+            &bootstrap,
+            Some(published_index),
+            4
+        ),
+        None
+    );
+}
 
 struct Temporary(PathBuf);
 impl Drop for Temporary {
@@ -214,9 +266,10 @@ async fn o05_o28_typed_mtls_snapshot_installs_exact_group_cut_with_data_wire_ful
             .fence(Uuid::new_v4(), None, ready.view.authority(), ready)
             .await
             .unwrap();
+        // SNAP1: what the replication task sends a lagging follower: a fresh
+        // cut, whose file is written during the transfer below.
         let mut state = hosts[leader].state.clone();
-        let mut builder = state.get_snapshot_builder().await;
-        let snapshot = builder.build_snapshot().await.unwrap();
+        let snapshot = state.get_current_snapshot().await.unwrap().unwrap();
         let expected = snapshot.meta.clone();
         let mut factory = TypedNetworkFactory::<TimestampConfig>::new(
             managers[leader].client(),

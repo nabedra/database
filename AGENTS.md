@@ -41,3 +41,15 @@ the runtime implements it.
 For every ORM change and any database change that affects ORM callers, follow the
 [ORM parity checks](docs/testing/orm-parity.md). Apply shared changes to every
 supported language in the same PR and keep their package versions in sync.
+
+# CI on GitHub Actions
+
+The user decided on 2026-11-22 that heavy tests and checks run on GitHub
+Actions (standard runners are free for this public repository). No run starts
+on push or commit. Every run is a deliberate dispatch, pinned to a commit,
+that no later push or other agent can cancel. The pull-request gate to `main`
+remains. Follow [GitHub Actions for checks](.agents/skills/code-review/references/gh-actions.md)
+for dispatching, evidence and the quarantine. When agents work in parallel,
+each hot file has one owner per wave
+([hot-file rule](.agents/skills/nabedra-change/references/subagent-driven-development.md#prepare-the-work)).
+These rules apply to every task and workflow in this repository.

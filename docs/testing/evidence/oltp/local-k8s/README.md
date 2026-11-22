@@ -178,3 +178,79 @@ Data voters across two ranges. The lost-system-worker replacement test
 recovered RF3 in 30.632 s and settled its queued receipt. These tests
 ran on Linux without Kubernetes. [CI test transcripts](ci-test-results.txt) ·
 [Recovery workflow](https://github.com/zPy52/nabedra-database/actions/runs/44934576362)
+
+## AZ1 point failover
+
+The Linux [packet-drop fixture](../../../../../server/tests/oltp_blackhole.py)
+keeps the workers running. It drops packets in both directions in one
+worker's network namespace and probes the Raft leaders from both survivors.
+The API and the worker peers use literal IP addresses. The fixture verifies
+each acknowledged row and replays the original request identity after the
+outage. Its 8 s end-to-end target allows up to 3 s for the old leader lease,
+3 s for the election timer, and 2 s for Control authorization, Catalog, and
+Timestamp during simultaneous leader loss. Each client attempt keeps the
+LIVE3 7 s HTTP timeout, and every read on a surviving Data leader must succeed.
+
+With PR #23 already in the baseline, the survivors agreed on new Data leaders
+in 4.542 and 4.725 s and a new Control leader in 5.505 s. The affected point
+operations had no success during 14.1 s of packet loss. One range whose leader
+survived also timed out after initially serving reads in milliseconds.
+[Linux baseline and raw JSONL](https://github.com/zPy52/nabedra-database/actions/runs/44944730741)
+
+The first candidate, `7bcc902d5885`, bounded gateway attempts and separated
+direct API grant renewal from queue readiness. Its kind run still took
+52.251 s to complete the first verified independent read and 30.120 s to
+acknowledge a direct write started during the outage. The surviving read
+leader spent up to 8,388.619 ms in table descriptor lookup. Its Data read
+barrier took at most 0.403 ms. The API's point sends topped out at 1,506.050 ms,
+and 146 DNS lookups from the API Pod to the two surviving peers succeeded,
+with a maximum of 17.472 ms. The audit verified 215 acknowledged direct
+writes and both RF3 placements. One queued receipt ended with overload.
+[Stage measurements and outcome](az1/initial-candidate.json) ·
+[Candidate build and Linux assertions](https://github.com/zPy52/nabedra-database/actions/runs/44945672868)
+
+The next Linux run, `b4c9403065d9`, bounded direct Catalog reads and kept
+the original attempt open while the gateway tried another voter. Affected
+Data ranges read again in 5.894 and 6.306 s. Every read on a surviving
+leader succeeded, with one request taking up to 4.266 s across a Control
+election. Timestamp failover still put the first successful write beyond
+6.5 s in two faults. The trace shows that the client tried the silent
+Timestamp voter for two seconds again between visits to the survivors.
+[Linux packet-drop results](https://github.com/zPy52/nabedra-database/actions/runs/44947875503)
+
+After shortening the Timestamp probe, `1e6edd4d9e71` served writes in
+4.758 s when only the Timestamp leader was lost. With Control, Timestamp
+and both Data leaders on the lost node, the two ranges served reads in
+6.099 and 6.302 s and writes in 6.838 and 6.908 s. This missed the first
+6.5 s assertion. The final 8 s budget accounts for the metadata calls
+needed on a cold replacement leader. All point attempts on surviving Data
+leaders returned HTTP 200. Dropping a follower alone returned the first
+reads in 8–9 ms and writes in 19–20 ms.
+[Timestamp failover run](https://github.com/zPy52/nabedra-database/actions/runs/44948558360)
+
+The final Linux candidate, `b423c2d731dd`, passed the packet-drop assertions.
+When Control, Timestamp and both Data leaders shared the lost worker, the
+survivors agreed on the Data leaders in 4.636 and 4.859 s, Control in
+4.920 s, and Timestamp in 5.278 s. The affected reads completed in
+5.913 and 5.963 s. Both write streams acknowledged their first write in
+6.114 s. Losing only the Timestamp leader restored writes in 5.612–5.613 s
+and surviving Data leaders kept serving reads. With a follower lost,
+the first reads completed in 13 ms and first writes in 24–27 ms.
+All 523 reads and 384 writes returned HTTP 200, and all acknowledged
+writes passed the row and same-ID replay checks.
+[Final Linux measurements](az1/linux-final.json) ·
+[Final Linux packet-drop assertions](https://github.com/zPy52/nabedra-database/actions/runs/44949594158)
+
+The checksum-verified release of the same commit passed LIVE3's `zone`
+scenario in kind, using the same external SSD as the earlier attempts.
+The first verified read completed 5.028 s after zone A stopped. The first
+read and write that started after the stop completed at 5.294 and 5.491 s.
+Every attempt started during the 22.397 s outage succeeded. Nearest-rank
+p99 was 407.574 ms across 61 reads and 616.721 ms across 69 writes.
+Both CoreDNS replicas ran on the control-plane node. All 52 DNS samples
+resolved the surviving peers, with a maximum of 23.785 ms. The driver
+restored the original PVC, verified both RF3 placements, and audited
+202 exact rows, 167 acknowledged direct writes and 35 settled receipts.
+The session deleted its nodes and released the Docker lane.
+[Final kind evidence](az1/kind-final.json) ·
+[Raw CI test results](az1/ci-test-results.txt)
