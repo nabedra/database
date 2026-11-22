@@ -1,0 +1,11 @@
+id = "kind-events"
+module = "events"
+kinds = ["R"]
+guarantees = ["EVT-G01", "EVT-G14"]
+scenarios = ["EV06", "EV07"]
+tiers = ["T2"]
+command = ["python3", "-m", "scripts.testing.kind.suite_events"]
+cwd = "."
+timeout_s = 1800
+needs = ["docker", "kind"]
+result_parser = "exit-code"

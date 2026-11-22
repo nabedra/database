@@ -1,12 +1,14 @@
 # Heavy builds and verification on free standard runners.
 # How agents run it: .agents/skills/code-review/references/gh-actions.md. Where builds run:
-# .agents/skills/nabedra-builds/SKILL.md. The workflow uses no secrets and only reads the repository.
+# .agents/skills/nabedra-builds/SKILL.md. Opt-in S3 checks use OIDC on dispatches.
 #
-# Nothing starts on push or commit. A run starts in one of two ways:
+# Nothing starts on push or commit. A run starts in one of three ways:
 # - A deliberate dispatch, pinned to a pushed commit:
 #     gh workflow run nabedra-build.yml --ref <branch> -f sha=<40-char sha> -f request_id=<id> [-f jobs=direct ...]
 #   Job definitions come from the --ref branch head; the code under test is `sha`. Every dispatch has its own
 #   concurrency group, so no push, commit or other dispatch can cancel it.
+# - The scheduled nightly (nabedra-nightly.yml), which resolves `main` to its SHA when it starts and dispatches
+#   this workflow pinned to that SHA, with the same uncancellable concurrency group as any dispatch.
 # - The pull-request merge gate (base jobs and the non-blocking quarantine job on the merge commit). Only a newer
 #   head of the same pull request cancels a gate run. `[skip ci]` in the head commit skips it for docs-only PRs.
 #
@@ -23,6 +25,8 @@
 #   migrate     MIG1/MIG2 RocksDB-era RF3 archive export and restore
 #   live3, live3-fixture  LIVE3 Linux release binaries per engine; the library test executable
 #   campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1  long, image and measurement jobs
+#   engine-tests, check-tests  Cache, OLAP and nabedra-check tests, also in the base jobs
+#   fuzz, mutants  libFuzzer targets or mutation tests on the diff from main's merge base
 #
 # Builds. The `build` job compiles the debug OLTP server and every OLTP test executable once and shares them as
 # one artifact. Jobs that test that build download it instead of compiling. `growth-build` makes the one
@@ -56,13 +60,21 @@ on:
         required: true
         type: string
       base:
-        description: Base jobs (kv, features, OLTP lib and integration, Events) and the quarantine job
+        description: Base jobs (kv, features, Cache, OLAP, nabedra-check, OLTP, Events, quarantine)
         type: boolean
         default: true
       jobs:
-        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1"
+        description: "Comma-separated opt-in jobs: direct, acceptance, o02, growth, rep1, rep4-mixed, o22, blackhole, migrate, live3, live3-fixture, campaign, docker, memory, bench, perf, g7, gc1, perf1, snap1, engine-tests, check-tests, fuzz, mutants"
         type: string
         default: ""
+      checks:
+        description: Comma-separated check IDs from docs/testing/checks
+        type: string
+        default: ""
+      fuzz_seconds:
+        description: Seconds to fuzz each target
+        type: number
+        default: 300
       scenarios:
         description: "Comma-separated OLTP acceptance scenarios to run on the shared build, e.g. O26,O21"
         type: string
@@ -95,6 +107,7 @@ defaults:
 env:
   # Must match rust-toolchain.toml; every Toolchain step checks that they agree.
   RUST_TOOLCHAIN: "1.94.1"
+  RUST_NIGHTLY: "nightly-2026-11-20"
   # The code under test: the dispatched commit, or the pull request's merge commit.
   TESTED_SHA: ${{ inputs.sha || github.sha }}
   SAVE_CACHE: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
@@ -120,6 +133,8 @@ jobs:
       has_scenarios: ${{ steps.plan.outputs.has_scenarios }}
       growth: ${{ steps.plan.outputs.growth }}
       has_growth: ${{ steps.plan.outputs.has_growth }}
+      checks: ${{ steps.checks.outputs.matrix }}
+      fuzz: ${{ steps.fuzz.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -135,6 +150,7 @@ jobs:
           SCENARIOS: ${{ inputs.scenarios }}
           TESTS: ${{ inputs.tests }}
           REPEAT: ${{ inputs.repeat }}
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
           MODES: ${{ inputs.modes || 'on,off' }}
           WORKFLOW_REF: ${{ github.ref }}
           WORKFLOW_SHA: ${{ github.sha }}
@@ -146,8 +162,9 @@ jobs:
             [ "$head" = "$SHA_INPUT" ] || fail "checked out $head, expected $SHA_INPUT"
             [[ "$REQUEST_ID" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || fail "request_id must be 1-80 of [A-Za-z0-9._-]"
             [[ "$REPEAT" =~ ^[0-9]+$ ]] && [ "$REPEAT" -ge 1 ] && [ "$REPEAT" -le 200 ] || fail "repeat must be 1-200"
+            [[ "$FUZZ_SECONDS" =~ ^[0-9]+$ ]] && [ "$FUZZ_SECONDS" -ge 1 ] || fail "fuzz_seconds must be a positive integer"
           fi
-          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,"
+          known=",direct,acceptance,o02,growth,rep1,rep4-mixed,o22,blackhole,migrate,live3,live3-fixture,campaign,docker,memory,bench,perf,g7,gc1,perf1,snap1,engine-tests,check-tests,fuzz,mutants,"
           selected=","
           add() { [[ "$selected" == *",$1,"* ]] || selected+="$1,"; }
           has() { [[ "$selected" == *",$1,"* ]]; }
@@ -217,6 +234,248 @@ jobs:
             echo
             python3 scripts/ci_quarantine.py report
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Validate registered checks and plan their jobs
+        id: checks
+        if: github.event_name == 'workflow_dispatch' && inputs.checks != ''
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          matrix=$(python3 scripts/testing/ci/plan_checks.py)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+          printf '\nRegistered checks: %s\n' "$(jq -r 'map(.id) | join(", ")' <<< "$matrix")" >> "$GITHUB_STEP_SUMMARY"
+      - name: Discover fuzz targets
+        id: fuzz
+        if: contains(steps.plan.outputs.jobs, ',fuzz,')
+        run: |
+          matrix=$(python3 scripts/testing/ci/plan_fuzz.py)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          if [ "$matrix" = '[]' ]; then
+            echo "Fuzz not-run: this revision has no server/fuzz targets." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  pr-lint:
+    name: PR body lint (non-blocking)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Lint the pull request body
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ ! -f scripts/testing/pr_lint.py ]; then
+            echo "PR body lint not-run: pr_lint.py is absent." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 scripts/testing/pr_lint.py
+
+  select:
+    name: Select checks for the diff (non-blocking)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Show the checks the diff selects
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ ! -f scripts/testing/matrix.py ]; then
+            echo "Check selection not-run: matrix.py is absent." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 scripts/testing/matrix.py select --base "$BASE" --head "$HEAD" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  checks:
+    name: Check ${{ matrix.id }}
+    needs: revision
+    # Scheduled work reaches this job through nabedra-nightly's workflow_dispatch.
+    if: github.event_name == 'workflow_dispatch' && needs.revision.outputs.checks != '' && needs.revision.outputs.checks != '[]'
+    runs-on: ubuntu-24.04
+    # The check's timeout_s plus setup, capped at six hours (scripts/testing/ci/plan_checks.py).
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      # Together the nightly check and fuzz matrices use at most eight runners.
+      max-parallel: ${{ needs.revision.outputs.fuzz != '' && needs.revision.outputs.fuzz != '[]' && 6 || 8 }}
+      matrix:
+        include: ${{ fromJSON(needs.revision.outputs.checks) }}
+    env:
+      ID: ${{ matrix.id }}
+      NABEDRA_REQUEST_ID: ${{ inputs.request_id }}
+      NABEDRA_TEST_S3_BUCKET: ${{ contains(matrix.tools, 's3') && vars.NABEDRA_TEST_S3_ROLE_ARN != '' && vars.NABEDRA_TEST_S3_BUCKET || '' }}
+      NABEDRA_TEST_S3_REGION: ${{ vars.NABEDRA_TEST_S3_REGION || 'us-east-1' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TESTED_SHA }}
+          # Replay checks resolve historical commits from the tested revision.
+          fetch-depth: 0
+          persist-credentials: false
+      # The runner scripts need 3.11 or later, and OLAP fixtures invoke python3.11 by name.
+      # The job builds nothing itself: a check whose command needs a binary builds it (gh-actions.md).
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install the Rust nightly
+        if: contains(matrix.tools, 'rust-nightly')
+        run: |
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal
+          # The runner's preflight and check commands can explicitly say `cargo +nightly`.
+          # Route that spelling to the same pinned toolchain as plain `cargo`.
+          mkdir -p "$RUNNER_TEMP/pinned-cargo"
+          cat > "$RUNNER_TEMP/pinned-cargo/cargo" <<'SH'
+          #!/usr/bin/env bash
+          if [ "${1:-}" = +nightly ]; then shift; fi
+          exec "$NABEDRA_REAL_CARGO" "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/pinned-cargo/cargo"
+          {
+            echo "RUSTUP_TOOLCHAIN=$RUST_NIGHTLY"
+            echo "NABEDRA_REAL_CARGO=$(command -v cargo)"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/pinned-cargo" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: contains(matrix.tools, 'node')
+        with:
+          node-version: "22"
+      - name: Install the Python ORM
+        if: contains(matrix.tools, 'python-orm')
+        run: python3 -m pip install './orm/python[gateway]'
+      - name: Verify Docker
+        if: contains(matrix.tools, 'docker') || contains(matrix.tools, 'kind')
+        run: docker info
+      - name: Install kind
+        if: contains(matrix.tools, 'kind')
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64 -o kind
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum --check
+          install -Dm755 kind "$RUNNER_TEMP/kind-bin/kind"
+          echo "$RUNNER_TEMP/kind-bin" >> "$GITHUB_PATH"
+      - name: Install Valkey
+        if: contains(matrix.tools, 'valkey')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends valkey-server
+          sudo systemctl stop valkey-server
+      - name: Assume the test bucket role
+        if: contains(matrix.tools, 's3') && env.NABEDRA_TEST_S3_BUCKET != ''
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.NABEDRA_TEST_S3_ROLE_ARN }}
+          aws-region: ${{ env.NABEDRA_TEST_S3_REGION }}
+          role-session-name: nabedra-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Run the check
+        run: python3 scripts/testing/run_check.py "$ID" --evidence-dir evidence/
+      - name: Upload check evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: evidence-${{ matrix.id }}
+          path: |
+            evidence/
+            target/testing-logs/
+          retention-days: 14
+      - name: Attest the evidence records
+        if: ${{ !cancelled() && hashFiles('evidence/**/*.json') != '' }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: evidence/**/*.json
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    needs: revision
+    if: needs.revision.outputs.fuzz != '' && needs.revision.outputs.fuzz != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJSON(needs.revision.outputs.fuzz) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TESTED_SHA }}
+          persist-credentials: false
+      - name: Install the nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install "$RUST_NIGHTLY" --profile minimal
+          cargo +"$RUST_NIGHTLY" install --locked --version 0.13.2 cargo-fuzz
+      - name: Fuzz the target
+        working-directory: server
+        env:
+          FUZZ_SECONDS: ${{ inputs.fuzz_seconds }}
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_FEATURES: ${{ matrix.features }}
+        run: |
+          features=()
+          if [ -n "$FUZZ_FEATURES" ]; then features=(--no-default-features --features "$FUZZ_FEATURES"); fi
+          cargo +"$RUST_NIGHTLY" fuzz run "$FUZZ_TARGET" "${features[@]}" -- "-max_total_time=$FUZZ_SECONDS"
+      - name: Upload fuzz crashes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: server/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  mutants:
+    name: Mutation tests on the diff
+    needs: revision
+    if: contains(needs.revision.outputs.jobs, ',mutants,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TESTED_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install cargo-mutants
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz \
+            -o cargo-mutants.tar.gz
+          echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  cargo-mutants.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/mutants-bin"
+          tar -xzf cargo-mutants.tar.gz -C "$RUNNER_TEMP/mutants-bin" cargo-mutants
+          echo "$RUNNER_TEMP/mutants-bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # The baseline runs the default-feature OLAP tests, whose fixtures invoke python3.11 by name.
+          python-version: "3.11"
+      - name: Test mutants from the merge base
+        working-directory: server
+        run: |
+          git fetch --no-tags origin main
+          base=$(git merge-base HEAD FETCH_HEAD)
+          git diff --relative "$base" HEAD -- '*.rs' > "$RUNNER_TEMP/mutants.diff"
+          RUST_TEST_THREADS=4 cargo mutants --in-diff "$RUNNER_TEMP/mutants.diff"
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mutants-diff
+          path: server/mutants.out/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # One debug OLTP build for every job that tests it: the server, the library test executable and
   # the integration test executables, packed with their paths so they land where they were built.
@@ -419,7 +678,7 @@ jobs:
           restore-keys: features-${{ env.RUST_TOOLCHAIN }}-
       - name: Use restored target
         run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
-      - name: No RocksDB or C toolchain crates
+      - name: Check production dependencies and feature flags (O02, NS26)
         run: python scripts/check_engine_features.py --dependencies-only
       - name: Check every engine build
         working-directory: server
@@ -475,6 +734,128 @@ jobs:
           path: |
             o02-engine-features.json
             t02-commit.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  engine-tests:
+    name: ${{ matrix.suite }} tests
+    needs: revision
+    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',engine-tests,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: Cache library
+            engine: cache
+            shard: 1
+          - suite: OLAP shard 1 of 2
+            engine: olap
+            shard: 1
+          - suite: OLAP shard 2 of 2
+            engine: olap
+            shard: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+          test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN"
+      - name: Restore Cargo cache
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: test-${{ matrix.engine }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('server/Cargo.lock', 'server/Cargo.toml', 'server/kv/Cargo.toml', 'server/check/Cargo.toml') }}
+          restore-keys: test-${{ matrix.engine }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Use restored target
+        run: if [ -d ~/cargo-cache/target ]; then mv ~/cargo-cache/target server/target; fi
+      - name: Build tests
+        working-directory: server
+        env:
+          ENGINE: ${{ matrix.engine }}
+        run: |
+          if [ "$ENGINE" = cache ]; then
+            cargo test --locked --no-default-features --features cache --lib --no-run
+          else
+            cargo test --locked --lib --tests --no-run
+          fi
+      - name: Stage Cargo cache without workspace crates
+        if: matrix.shard == 1 && env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf ~/cargo-cache && mkdir -p ~/cargo-cache && cp -al server/target ~/cargo-cache/target
+          packages=(-p nabedra-database -p nabedra-kv)
+          if [ -f server/check/Cargo.toml ]; then packages+=(-p nabedra-check); fi
+          CARGO_TARGET_DIR=~/cargo-cache/target cargo clean --offline --locked --manifest-path server/Cargo.toml "${packages[@]}"
+          du -sh ~/cargo-cache/target
+      - name: Save Cargo cache
+        if: matrix.shard == 1 && env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/cargo-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Read the quarantine
+        run: python3 scripts/ci_quarantine.py tests > "$RUNNER_TEMP/quarantined-tests"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: matrix.engine == 'olap'
+        with:
+          # The OLAP HTTP store and shared-worker fixtures invoke python3.11 by name.
+          python-version: "3.11"
+      - name: Cache library tests
+        if: matrix.engine == 'cache'
+        working-directory: server
+        run: |
+          skips=()
+          while IFS= read -r test; do skips+=(--skip "$test"); done < "$RUNNER_TEMP/quarantined-tests"
+          cargo test --locked --no-default-features --features cache --lib -- --test-threads 4 --exact "${skips[@]}" 2>&1 | tee ../cache-test.log
+      - name: OLAP library, integration and streaming tests
+        if: matrix.engine == 'olap'
+        working-directory: server
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          python3 ../scripts/testing/ci/shard_tests.py --shard "$SHARD" --shards 2 --test-threads 4 \
+            --exclude-file "$RUNNER_TEMP/quarantined-tests" -- --locked --lib --tests 2>&1 | tee ../olap-test.log
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine-tests-${{ matrix.engine }}-${{ matrix.shard }}
+          path: ${{ matrix.engine }}-test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  check-tests:
+    name: nabedra-check tests
+    needs: revision
+    if: github.event_name == 'pull_request' || inputs.base || contains(needs.revision.outputs.jobs, ',check-tests,')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TESTED_SHA }}
+      - name: Test
+        working-directory: server
+        run: |
+          if [ ! -f check/Cargo.toml ]; then
+            echo "nabedra-check tests not-run: this revision predates the crate." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          RUST_TEST_THREADS=4 cargo test --locked -p nabedra-check --no-fail-fast 2>&1 | tee ../check-test.log
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nabedra-check-tests
+          path: check-test.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -787,6 +1168,15 @@ jobs:
           mkdir -p events-acceptance
           python server/events/tests/acceptance.py --image nabedra-events:ci --cpus 2 --memory-mib 1536 \
             --fault-image python:3.11-slim-bookworm --output events-acceptance/result.json --logs events-acceptance/logs
+      - name: Events kind suite (non-blocking until verified)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && hashFiles('scripts/testing/kind/suite_events.py') != '' }}
+        continue-on-error: true
+        timeout-minutes: 45
+        run: |
+          mkdir -p events-acceptance
+          python -m scripts.testing.kind.install --output "$RUNNER_TEMP/bin/kind"
+          NABEDRA_KIND="$RUNNER_TEMP/bin/kind" python -m scripts.testing.kind.suite_events \
+            --image nabedra-events:ci --history events-acceptance/kind-events.jsonl
       - name: Acceptance summary
         if: always()
         run: |
