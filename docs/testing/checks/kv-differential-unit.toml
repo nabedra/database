@@ -1,0 +1,11 @@
+id = "kv-differential-unit"
+module = "kv"
+kinds = ["U"]
+guarantees = ["KV-G01", "KV-G02"]
+scenarios = ["K01"]
+tiers = ["T0", "T1"]
+command = ["python3", "-m", "unittest", "discover", "-s", "scripts/cache-acceptance", "-p", "test_differential.py", "-v"]
+cwd = "."
+timeout_s = 60
+needs = []
+result_parser = "unittest"
