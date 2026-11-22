@@ -932,6 +932,24 @@ fn marker(assertion: &str, status: &str, detail: Value) {
     );
 }
 
+#[test]
+#[ignore = "real RF1 processes, run through the CI tests input with modes=on"]
+fn d11_hot_key_index_process() {
+    let binary = std::env::var_os("NABEDRA_BIN").expect("CI server binary");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oltp_direct_acceptance.py");
+    let output = Directory::new();
+    let status = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--binary")
+        .arg(binary)
+        .args(["--suite", "d11", "--output"])
+        .arg(&output.0)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .status()
+        .expect("launch D11 index fixture");
+    assert!(status.success(), "D11 index fixture failed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "run through scripts/acceptance_oltp.py"]
 async fn acceptance_o12() {

@@ -475,11 +475,13 @@ def create_d11_index(admin, definition):
     for retries in range(8):
         build_id = uid()
         code, reply = admin('storage.index.create', definition, build_id)
+        message = reply.get('error', {}).get('message', '')
         refusal = {
             'request_id': build_id,
-            'error': {'code': 'overloaded', 'message': 'worker outgoing lane full', 'outcome': 'not_applied'},
+            'error': {'code': 'overloaded', 'message': message, 'outcome': 'not_applied'},
         }
-        if code == 429 and reply == refusal and retries < 7:
+        if code == 429 and reply == refusal and retries < 7 and re.fullmatch(
+                r'worker outgoing lane full \([A-Z][A-Za-z]*(?:/(?:direct|ingress))?\)', message):
             # A refused declaration can leave a terminal failure for its build
             # UUID. Keep the index definition and use a fresh build UUID only
             # after this exact, definitive refusal.
@@ -520,13 +522,11 @@ def d11_index(url, token, ca, admin, stats):
     key_limit = seed_count + 16 * writers
     initial_updates = [threading.Event() for _ in range(writers)]
     declared, inserted, ready, updated_after_ready, stop = (threading.Event() for _ in range(5))
+    hot_key_updated = threading.Event()
 
     def writer(index):
         client = Http(url, token, 30, ca)
-        # Backfill starts at the low end of the primary key order. Keep the
-        # initial writer keys at the end so the build can start on untouched
-        # rows while writers switch to new keys after declaration.
-        target, next_key, revision = seed_count - writers + index, seed_count + index, 0
+        target, next_key, revision = index, seed_count + index, 0
         acknowledged, refused = {}, 0
 
         def write(name, payload):
@@ -548,18 +548,23 @@ def d11_index(url, token, ca, admin, stats):
                     row = {'id': next_key, 'category': next_key % 8, 'label': f'w{index}-{next_key}'}
                     next_key += writers
                     if write('table.insert', {'table_id': table.id, 'row': row}):
-                        target = row['id']
+                        # Keep the first source key hot across publication.
+                        if index != 0:
+                            target = row['id']
                         acknowledged[target] = row
                         inserted.set()
 
                 # Each writer owns its keys. Keep moving rows between categories and
                 # changing the covered label through the Ready publication.
                 after_ready = ready.is_set()
+                building = declared.is_set() and not after_ready
                 revision += 1
                 values = {'category': (target + revision) % 8, 'label': f'w{index}-update-{revision}'}
                 if write('table.update', {'table_id': table.id, 'key': target, 'values': values}):
                     acknowledged[target] = {'id': target, **values}
                     initial_updates[index].set()
+                    if target == 0 and building:
+                        hot_key_updated.set()
                     if after_ready:
                         updated_after_ready.set()
             return acknowledged, refused
@@ -582,16 +587,20 @@ def d11_index(url, token, ca, admin, stats):
             deadline = time.monotonic() + 120
             state = created['state']
             saw_insert_while_building = False
+            saw_hot_update_while_building = False
             declared.set()
             while state != 'ready':
                 assert state in (None, 'building', 'pending', 'backfilling', 'validating'), created
                 assert time.monotonic() < deadline, f'index never became ready: {state}'
                 time.sleep(poll)
                 inserted_before_poll = inserted.is_set()
+                hot_updated_before_poll = hot_key_updated.is_set()
                 state = status(selector)
                 saw_insert_while_building |= inserted_before_poll and state == 'building'
+                saw_hot_update_while_building |= hot_updated_before_poll and state == 'building'
             ready_seconds = time.monotonic() - started
             assert saw_insert_while_building, 'no insert was acknowledged while the index was Building'
+            assert saw_hot_update_while_building, 'no update of source key 0 was acknowledged while Building'
             ready.set()
             assert updated_after_ready.wait(timeout=15), 'no update started and succeeded after Ready'
         finally:
@@ -618,6 +627,7 @@ def d11_index(url, token, ca, admin, stats):
     report('D11-index', table=table.id, rows=len(rows), acknowledged_rows=acknowledged_rows,
            not_applied_errors=errors, index_state=state, create_retries=create_retries, status_retried=retried[:8],
            status_retries=len(retried), ready_seconds=round(ready_seconds, 3),
+           hot_key_updated_while_building=saw_hot_update_while_building,
            insert_acknowledged_while_building=True, update_acknowledged_after_ready=True,
            direct_entries=direct_entries,
            # GC2: DirectBatch entries (`data.direct.batch` enabled by the processes
