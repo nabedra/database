@@ -47,8 +47,8 @@ for each comparison.
 Use Callgrind on Linux or WSL to compare the phase 7 runtime wrappers in a
 release build. Run from a checkout containing the harness and pass two refs
 available in that clone. The registered `rt-zero-cost` check compares the
-tested revision with the phase 7 base at `e3d51a6`. Install Valgrind on the
-runner before dispatching the check.
+tested revision with the phase 7 base at `e3d51a6`. The check installs
+Valgrind when needed on GitHub Actions. Install it before running locally.
 
 ```sh
 python3 scripts/testing/insn_count.py --base e3d51a6 --head HEAD --output counts.json
