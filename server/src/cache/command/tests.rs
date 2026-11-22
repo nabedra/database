@@ -154,6 +154,24 @@ fn k01_validates_driver_handshake_and_metadata() {
 }
 
 #[test]
+fn k01_getkeys_does_not_apply_wall_clock_expiry_limit() {
+    let command = parse(&[
+        b"COMMAND",
+        b"GETKEYS",
+        b"SET",
+        b"k",
+        b"v",
+        b"PX",
+        b"9223372036854775807",
+    ])
+    .unwrap();
+    assert_eq!(
+        command.metadata_response(1024),
+        Some(Response::Array(vec![Response::bulk(b"k")]))
+    );
+}
+
+#[test]
 fn k02_validates_item_sizes_in_every_operation() {
     let oversized_key = Bytes::from(vec![b'k'; MAX_KEY_BYTES + 1]);
     assert!(matches!(

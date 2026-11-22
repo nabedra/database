@@ -737,7 +737,7 @@ impl PinnedSnapshot {
     }
 }
 
-fn absolute_deadline(now: u64, ttl: u64) -> Result<u64, StoreError> {
+pub(super) fn absolute_deadline(now: u64, ttl: u64) -> Result<u64, StoreError> {
     now.checked_add(ttl)
         .filter(|deadline| ttl != 0 && *deadline <= i64::MAX as u64)
         .ok_or(StoreError::InvalidTtl)

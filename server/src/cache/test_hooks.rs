@@ -266,6 +266,15 @@ mod tests {
                 backend.actor.try_lock().is_err(),
                 "SLEEP released the store"
             );
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    run(&backend, &["DEBUG", "SET-ACTIVE-EXPIRE", "0"]),
+                )
+                .await
+                .is_err(),
+                "SET-ACTIVE-EXPIRE ran while SLEEP held the store"
+            );
         });
         assert_eq!(reply, Response::ok());
         assert!(started.elapsed() >= Duration::from_millis(2_500));

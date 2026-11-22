@@ -376,10 +376,12 @@ mod tests {
             (&[b"EXPIRE".as_slice(), b"k", max][..], "expire"),
             (&[b"EXPIRE", b"missing", max], "expire"),
             (&[b"EXPIRE", b"k", b"-9223372036854775807"], "expire"),
+            (&[b"EXPIRE", b"k", b"-9223372036854776"], "expire"),
             (&[b"PEXPIRE", b"k", max], "pexpire"),
             (&[b"PEXPIRE", b"k", b"9223372036854000000"], "pexpire"),
             (&[b"EXPIRE", b"k", b"9223372036854775"], "expire"),
             (&[b"SET", b"k", b"v", b"PX", max], "set"),
+            (&[b"SET", b"k", b"v", b"EX", b"9223372036854775"], "set"),
         ] {
             let text = format!("ERR invalid expire time in '{expected}' command");
             assert_eq!(
@@ -392,6 +394,14 @@ mod tests {
             run(&[b"GET", b"k"]).await,
             Response::Bulk(Some(bytes::Bytes::from_static(b"v")))
         );
+        for words in [
+            [b"EXPIRE".as_slice(), b"k", b"-9223372036854775"],
+            [b"PEXPIRE", b"k", b"-9223372036854775808"],
+        ] {
+            assert_eq!(run(&[b"SET", b"k", b"v"]).await, Response::ok());
+            assert_eq!(run(&words).await, Response::Integer(1));
+            assert_eq!(run(&[b"EXISTS", b"k"]).await, Response::Integer(0));
+        }
     }
 
     #[test]
