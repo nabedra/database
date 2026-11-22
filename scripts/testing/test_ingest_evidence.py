@@ -55,8 +55,13 @@ elif args[:2] == ["pr", "list"]:
     if (fixture / "pr-body").exists():
         print("17")
 elif args[:2] == ["pr", "create"]:
-    (fixture / "pr-body").write_text(sys.stdin.read())
+    if (fixture / "pr-create-error").exists():
+        sys.exit((fixture / "pr-create-error").read_text())
+    body = Path(args[args.index("--body-file") + 1]).read_text()
+    (fixture / "pr-body").write_text(body)
 elif args[:2] == ["pr", "merge"]:
+    if "--auto" in args and (fixture / "pr-merge-error").exists():
+        sys.exit((fixture / "pr-merge-error").read_text())
     (fixture / "merge.json").write_text(json.dumps(args))
 else:
     sys.exit(f"unexpected gh command: {args}")
@@ -215,6 +220,7 @@ class EvidenceWorkflowTests(EvidenceFixture):
         (records / "fixture.json").write_text("{}\n")
         (testing / "coverage-matrix.json").write_text("{}\n")
         (testing / "coverage-matrix.md").write_text("# Matrix\n")
+        self.summary = self.fixture / "summary.md"
 
     def publish(self):
         workflow = evidence.REPO_ROOT / ".github" / "workflows" / "nabedra-evidence.yml"
@@ -222,7 +228,8 @@ class EvidenceWorkflowTests(EvidenceFixture):
         script = textwrap.dedent(step.split("        run: |\n", 1)[1])
         return subprocess.run(
             ["bash", "-eo", "pipefail", "-c", script], cwd=self.repo,
-            env={**self.env, "RUN_ID": RUN_ID, "GITHUB_REPOSITORY": REPO},
+            env={**self.env, "RUN_ID": RUN_ID, "GITHUB_REPOSITORY": REPO,
+                 "GITHUB_STEP_SUMMARY": str(self.summary)},
             text=True, capture_output=True,
         )
 
@@ -245,3 +252,95 @@ class EvidenceWorkflowTests(EvidenceFixture):
         ref = git(self.repo, "ls-remote", "origin", f"refs/heads/evidence/{RUN_ID}")
         self.assertEqual(ref.stdout, "")
         self.assertFalse((self.fixture / "merge.json").exists())
+
+    def reset_checkout(self):
+        git(self.repo, "switch", "-q", "-f", "main")
+        git(self.repo, "branch", "-q", "-D", f"evidence/{RUN_ID}", check=False)
+        git(self.repo, "push", "-q", "origin", f":refs/heads/evidence/{RUN_ID}", check=False)
+        git(self.repo, "reset", "-q", "--hard", "main")
+        git(self.repo, "clean", "-qfdx")
+        testing = self.repo / "docs" / "testing"
+        records = testing / "evidence" / "records" / "2026" / "11"
+        records.mkdir(parents=True)
+        (records / "fixture.json").write_text("{}\n")
+        (testing / "coverage-matrix.json").write_text("{}\n")
+        (testing / "coverage-matrix.md").write_text("# Matrix\n")
+
+    def assert_refused(self, result, *needles):
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        output = result.stdout + result.stderr
+        for needle in needles:
+            self.assertIn(needle, output)
+        ref = git(self.repo, "ls-remote", "origin", f"refs/heads/evidence/{RUN_ID}")
+        self.assertEqual(ref.stdout, "")
+        self.assertFalse((self.fixture / "merge.json").exists())
+
+    def test_refuses_crafted_paths_next_to_the_allowed_ones(self):
+        # Each name sits next to an allowed path or tries to escape it. A compromised import step
+        # could stage any of them before the publish step runs.
+        crafted = [
+            "docs/testing/evidence/records-x/2026/11/a.json",
+            "docs/testing/evidence/recordsx.json",
+            "docs/testing/coverage-matrix.md.sh",
+            "docs/testing/coverage-matrix.json/../../../.github/workflows/x.yml",
+            "docs/testing/evidence/records/../../../../.github/workflows/evil.yml",
+            "docs/testing/evidence/records\n.github/workflows/x.yml",
+            ".github/workflows/docs/testing/evidence/records/a.json",
+        ]
+        for name in crafted:
+            with self.subTest(name=name):
+                self.reset_checkout()
+                target = Path(os.path.normpath(self.repo / name))
+                self.assertTrue(target.is_relative_to(self.repo))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("payload\n")
+                git(self.repo, "add", "-f", "--", str(target.relative_to(self.repo)))
+                self.assert_refused(self.publish())
+
+    def test_refuses_symlinks_and_executables_inside_the_records(self):
+        records = self.repo / "docs" / "testing" / "evidence" / "records"
+        (records / "link.json").symlink_to("../../../README.md")
+        git(self.repo, "add", "-f", "--", "docs/testing/evidence/records/link.json")
+        self.assert_refused(self.publish(), "not a regular file write")
+
+        self.reset_checkout()
+        (records / "2026" / "11" / "fixture.json").chmod(0o755)
+        self.assert_refused(self.publish(), "not a regular file write")
+
+    def test_reports_disabled_pull_request_creation(self):
+        (self.fixture / "pr-create-error").write_text(
+            "pull request create failed: GraphQL: GitHub Actions is not permitted to create or "
+            "approve pull requests (createPullRequest)")
+        result = self.publish()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("::error title=Evidence not published::", result.stdout)
+        summary = self.summary.read_text()
+        self.assertIn("Allow GitHub Actions to create and approve pull requests", summary)
+        self.assertIn(f"run_id={RUN_ID}", summary)
+        self.assertFalse((self.fixture / "merge.json").exists())
+
+    def test_reports_disabled_auto_merge(self):
+        (self.fixture / "pr-merge-error").write_text(
+            "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)")
+        result = self.publish()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.summary.read_text()
+        self.assertIn('"Allow auto-merge"', summary)
+        self.assertIn("#17", summary)
+        self.assertFalse((self.fixture / "merge.json").exists())
+
+    def test_merges_a_clean_pull_request_at_the_checked_head(self):
+        (self.fixture / "pr-merge-error").write_text(
+            "GraphQL: Pull request Pull request is in clean status (enablePullRequestAutoMerge)")
+        result = self.publish()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sha = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        merge = json.loads((self.fixture / "merge.json").read_text())
+        self.assertEqual(merge, ["pr", "merge", "17", "--repo", REPO, "--merge",
+                                 "--match-head-commit", sha])
+
+    def test_unknown_merge_failure_fails_without_a_settings_message(self):
+        (self.fixture / "pr-merge-error").write_text("HTTP 502: Bad gateway")
+        result = self.publish()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(self.summary.exists())

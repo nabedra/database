@@ -148,8 +148,20 @@ gh run list -e schedule -L 5
 
 The evidence workflow imports attested records and opens an evidence-only PR. Once on `main`,
 those records feed the coverage matrix and the S3 budget. Use `gh workflow run nabedra-evidence.yml
---ref main -f run_id=<id>` to retry a completed build run. Repository settings must let GitHub
-Actions create pull requests and allow auto-merge.
+--ref main -f run_id=<id>` to retry a completed build run.
+
+The workflow can publish only when two repository settings are on. A repository admin switches
+them on in the GitHub web interface:
+
+| Setting | Where | Without it |
+| --- | --- | --- |
+| Allow GitHub Actions to create and approve pull requests | Settings, Actions, General, Workflow permissions | The job pushes `evidence/<run id>` but cannot open the PR |
+| Allow auto-merge | Settings, General, Pull Requests | The job opens the PR but cannot merge it |
+
+When either setting is off, the job fails with an `Evidence not published` error that names the
+setting, and the run summary says how to retry. The verified records wait on the `evidence/<run id>`
+branch, and a retry reuses it after its paths pass the same check. When the PR has no pending checks,
+GitHub refuses to queue auto-merge, so the job merges it directly at the checked head commit.
 
 ### 6. Read the matrix
 
