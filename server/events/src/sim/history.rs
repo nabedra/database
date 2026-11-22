@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde::{Serialize, Serializer};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -19,13 +19,25 @@ pub struct Event {
     pub index: usize,
     #[serde(rename = "type")]
     pub kind: &'static str,
+    #[serde(serialize_with = "serialize_process")]
     pub process: u64,
     pub f: &'static str,
+    #[serde(skip_serializing_if = "str::is_empty")]
     pub key: &'static str,
     pub value: Value,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub request_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub node: String,
     pub time_ns: u64,
+}
+
+fn serialize_process<S: Serializer>(process: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    if *process == u64::MAX {
+        serializer.serialize_str("nemesis")
+    } else {
+        serializer.serialize_u64(*process)
+    }
 }
 
 #[derive(Default)]
@@ -63,12 +75,55 @@ impl History {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        self.write(std::io::BufWriter::new(std::fs::File::create(path)?))
+    }
+
+    fn write(&self, mut output: impl Write) -> std::io::Result<()> {
         for event in &self.events {
-            serde_json::to_writer(&mut file, event)?;
-            file.write_all(b"\n")?;
+            serde_json::to_writer(&mut output, event)?;
+            output.write_all(b"\n")?;
         }
-        file.flush()
+        output.flush()
+    }
+
+    pub fn heal(&mut self, time_ms: u64) {
+        self.events.push(Event {
+            index: self.events.len(),
+            kind: "ok",
+            process: u64::MAX,
+            f: "heal",
+            key: "",
+            value: Value::Null,
+            request_id: String::new(),
+            node: String::new(),
+            time_ns: time_ms * 1_000_000,
+        });
+    }
+
+    #[cfg(test)]
+    pub fn check_queue(&self, bound: std::time::Duration) -> std::io::Result<Vec<String>> {
+        use nabedra_check::{checker::queue, history::read_jsonl};
+
+        let mut jsonl = Vec::new();
+        self.write(&mut jsonl)?;
+        let events = read_jsonl(jsonl.as_slice())?;
+        let verdict = queue::check_with(
+            &events,
+            &queue::Options {
+                redelivery_bound_ns: Some(bound.as_nanos().try_into().expect("bound fits u64")),
+                ..queue::Options::default()
+            },
+        );
+        Ok(verdict
+            .anomalies
+            .into_iter()
+            .map(|a| {
+                format!(
+                    "queue checker {}: {} (events {:?})",
+                    a.kind, a.detail, a.events
+                )
+            })
+            .collect())
     }
 }
 
@@ -112,7 +167,7 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|item| item.get(0).and_then(uuid_of))
+                    .filter_map(uuid_of)
                     .collect();
                 invoked.extend(ids.iter().copied());
                 // This workload retries whole batches, so even an unknown outcome can
@@ -127,18 +182,12 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                 batches.insert((event.process, event.request_id.as_str()), ids);
             }
             ("publish", "ok") => {
-                let pairs: Vec<(Uuid, u64)> = event
-                    .value
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|pair| Some((uuid_of(pair.get(0)?)?, pair.get(1)?.as_u64()?)))
-                    .collect();
+                let items = |field| event.value[field].as_array().into_iter().flatten();
+                let ids: Vec<_> = items("event_ids").filter_map(uuid_of).collect();
+                let offsets: Vec<_> = items("offsets").filter_map(Value::as_u64).collect();
+                let pairs: Vec<_> = ids.iter().copied().zip(offsets.iter().copied()).collect();
                 let request = (event.process, event.request_id.as_str());
-                if !batches
-                    .get(&request)
-                    .is_some_and(|ids| ids.iter().copied().eq(pairs.iter().map(|(id, _)| *id)))
-                {
+                if ids.len() != offsets.len() || batches.get(&request) != Some(&ids) {
                     anomalies.push(format!(
                         "EVT-G04 incomplete-receipt: the receipt does not match the invoked event IDs (history index {})",
                         event.index,
@@ -153,7 +202,6 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
                         ));
                     }
                 }
-                let offsets: Vec<u64> = pairs.iter().map(|(_, offset)| *offset).collect();
                 let fresh = offsets.windows(2).all(|pair| pair[1] == pair[0] + 1);
                 if !fresh && offsets.iter().collect::<BTreeSet<_>>().len() == offsets.len() {
                     // A batch of new events gets consecutive offsets; a retry of an older
@@ -247,13 +295,4 @@ pub fn check(history: &History, log: &FinalLog, final_checkpoint: u64) -> Vec<St
     anomalies.sort();
     anomalies.dedup();
     anomalies
-}
-
-pub fn publish_value(events: &[(Uuid, u64)]) -> Value {
-    Value::Array(
-        events
-            .iter()
-            .map(|(id, n)| json!([id.to_string(), n]))
-            .collect(),
-    )
 }

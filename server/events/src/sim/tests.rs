@@ -5,6 +5,7 @@
 //! - `NABEDRA_SEEDS`: how many consecutive seeds the sweep runs (default 20).
 //! - `NABEDRA_SIM_HISTORY_DIR`: also write every run's history there.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::cluster::{Knobs, Report, SimConfig, run};
@@ -108,6 +109,46 @@ fn same_seed_same_trace() {
         a.stats
     );
     assert_same_trace(&a, &b);
+    assert_client_history(&a);
+}
+
+fn assert_client_history(report: &Report) {
+    let mut requests = BTreeMap::new();
+    let mut receipts = BTreeMap::new();
+    let mut retired = BTreeSet::new();
+    let mut dedup_hits = 0;
+    for event in &report.history {
+        if event.kind == "info" {
+            retired.insert(event.process);
+        }
+        if event.kind == "invoke" {
+            assert!(
+                !retired.contains(&event.process),
+                "retired process at {event:?}"
+            );
+        }
+        match (event.f, event.kind) {
+            ("publish", "invoke") => {
+                let first_id = event.value[0].as_str().unwrap();
+                let request = event.request_id.as_str();
+                assert_eq!(*requests.entry(first_id).or_insert(request), request);
+            }
+            ("publish", "ok") => {
+                let dedup = event.value["dedup"].as_bool().unwrap();
+                let offsets = &event.value["offsets"];
+                if let Some(previous) = receipts.insert(&event.request_id, offsets) {
+                    assert!(dedup, "replayed receipt at {event:?}");
+                    assert_eq!(previous, offsets);
+                    dedup_hits += 1;
+                }
+            }
+            ("poll" | "ack", _) => {
+                assert_eq!(event.value["subscription"], "s");
+            }
+            _ => {}
+        }
+    }
+    assert!(dedup_hits > 0 && !retired.is_empty());
 }
 
 fn assert_same_trace(a: &Report, b: &Report) {
@@ -129,6 +170,8 @@ fn assert_same_trace(a: &Report, b: &Report) {
 fn different_seeds_differ() {
     let a = run(SimConfig::new(11));
     let b = run(SimConfig::new(12));
+    assert!(a.passed(), "{}", describe(&a, "different-seeds"));
+    assert!(b.passed(), "{}", describe(&b, "different-seeds"));
     assert_ne!(a.trace_hash, b.trace_hash);
 }
 
@@ -192,8 +235,23 @@ fn planted_offset_reuse_after_dedup_is_caught() {
             reuse_offset_after_dedup: true,
             ..Knobs::default()
         },
-        &["duplicate-offset", "offset-reassigned"],
+        &[
+            "queue checker duplicate-offset",
+            "queue checker duplicate-event",
+        ],
         "offset-reuse-after-dedup",
+    );
+}
+
+#[test]
+fn planted_missing_redelivery_after_heal_is_caught() {
+    find_planted(
+        Knobs {
+            delay_redelivery_after_heal: true,
+            ..Knobs::default()
+        },
+        &["queue checker redelivery-missing"],
+        "missing-redelivery-after-heal",
     );
 }
 
@@ -235,8 +293,13 @@ mod checkers {
         history
     }
 
-    fn publish(events: &[(u128, u64)]) -> serde_json::Value {
-        history::publish_value(&events.iter().map(|(n, o)| (id(*n), *o)).collect::<Vec<_>>())
+    fn publish(ids: &[u128]) -> serde_json::Value {
+        json!(ids.iter().copied().map(id).collect::<Vec<_>>())
+    }
+
+    fn receipt(events: &[(u128, u64)]) -> serde_json::Value {
+        let (ids, offsets): (Vec<_>, Vec<_>) = events.iter().copied().unzip();
+        json!({ "event_ids": publish(&ids), "offsets": offsets })
     }
 
     fn log(events: &[(u64, u128)]) -> FinalLog {
@@ -254,10 +317,10 @@ mod checkers {
     #[test]
     fn a_clean_history_passes() {
         let h = history(&[
-            ("invoke", "publish", publish(&[(1, 1), (2, 2)])),
-            ("ok", "publish", publish(&[(1, 1), (2, 2)])),
-            ("invoke", "publish", publish(&[(1, 1), (2, 2)])),
-            ("ok", "publish", publish(&[(1, 1), (2, 2)])),
+            ("invoke", "publish", publish(&[1, 2])),
+            ("ok", "publish", receipt(&[(1, 1), (2, 2)])),
+            ("invoke", "publish", publish(&[1, 2])),
+            ("ok", "publish", receipt(&[(1, 1), (2, 2)])),
             ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
         ]);
         assert_eq!(
@@ -272,8 +335,8 @@ mod checkers {
             (
                 "lost-write",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0)])),
-                    ("ok", "publish", publish(&[(1, 1)])),
+                    ("invoke", "publish", publish(&[1])),
+                    ("ok", "publish", receipt(&[(1, 1)])),
                 ]),
                 log(&[]),
                 0,
@@ -281,9 +344,9 @@ mod checkers {
             (
                 "duplicate-offset",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
-                    ("ok", "publish", publish(&[(1, 1)])),
-                    ("ok", "publish", publish(&[(2, 1)])),
+                    ("invoke", "publish", publish(&[1, 2])),
+                    ("ok", "publish", receipt(&[(1, 1)])),
+                    ("ok", "publish", receipt(&[(2, 1)])),
                 ]),
                 log(&[(1, 1)]),
                 1,
@@ -291,16 +354,16 @@ mod checkers {
             (
                 "offset-reassigned",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0)])),
-                    ("ok", "publish", publish(&[(1, 1)])),
-                    ("ok", "publish", publish(&[(1, 2)])),
+                    ("invoke", "publish", publish(&[1])),
+                    ("ok", "publish", receipt(&[(1, 1)])),
+                    ("ok", "publish", receipt(&[(1, 2)])),
                 ]),
                 log(&[(1, 1)]),
                 1,
             ),
             (
                 "gap",
-                history(&[("invoke", "publish", publish(&[(1, 0), (2, 0)]))]),
+                history(&[("invoke", "publish", publish(&[1, 2]))]),
                 log(&[(1, 1), (3, 2)]),
                 3,
             ),
@@ -308,7 +371,7 @@ mod checkers {
             (
                 "poll-order",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("invoke", "publish", publish(&[1, 2])),
                     ("ok", "poll", poll(0, &[(2, 2)])),
                 ]),
                 log(&[(1, 1), (2, 2)]),
@@ -317,8 +380,8 @@ mod checkers {
             (
                 "split-batch",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
-                    ("ok", "publish", publish(&[(1, 1), (2, 3)])),
+                    ("invoke", "publish", publish(&[1, 2])),
+                    ("ok", "publish", receipt(&[(1, 1), (2, 3)])),
                 ]),
                 log(&[(1, 1), (2, 2), (3, 2)]),
                 3,
@@ -326,8 +389,8 @@ mod checkers {
             (
                 "incomplete-receipt",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
-                    ("ok", "publish", publish(&[(1, 1)])),
+                    ("invoke", "publish", publish(&[1, 2])),
+                    ("ok", "publish", receipt(&[(1, 1)])),
                     ("ok", "poll", poll(0, &[(1, 1), (2, 2)])),
                 ]),
                 log(&[(1, 1), (2, 2)]),
@@ -336,7 +399,7 @@ mod checkers {
             (
                 "partial-batch",
                 history(&[
-                    ("invoke", "publish", publish(&[(1, 0), (2, 0)])),
+                    ("invoke", "publish", publish(&[1, 2])),
                     ("info", "publish", serde_json::Value::Null),
                     ("ok", "poll", poll(0, &[(1, 1)])),
                 ]),
@@ -345,7 +408,7 @@ mod checkers {
             ),
             (
                 "drain-incomplete",
-                history(&[("invoke", "publish", publish(&[(1, 0)]))]),
+                history(&[("invoke", "publish", publish(&[1]))]),
                 log(&[(1, 1)]),
                 0,
             ),

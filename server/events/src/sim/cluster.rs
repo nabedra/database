@@ -28,9 +28,15 @@ const OWNER: &str = "c1";
 const LEASE_TTL_MS: i64 = 4_000;
 const TICK: Duration = Duration::from_millis(10);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const LEASE_SETTLE: Duration = Duration::from_millis(LEASE_TTL_MS as u64 + 200);
+// The final heal allows one convergence window, lease expiry, and one drain window.
+const REDELIVERY_BOUND: Duration =
+    Duration::from_millis((2 * RECOVERY_TIMEOUT.as_millis() + LEASE_SETTLE.as_millis()) as u64);
 const PRODUCER: u64 = 0;
 const CONSUMER: u64 = 1;
 const DRAINER: u64 = 2;
+const CLIENTS: u64 = 3;
 
 /// Test-only planted bugs. Each must make some seed fail.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,6 +48,8 @@ pub struct Knobs {
     pub reuse_offset_after_dedup: bool,
     /// A restarted broker's volume loses every write fsynced since its previous start.
     pub lose_fsynced_on_restart: bool,
+    /// The consumer cannot redeliver until the post-heal deadline has passed.
+    pub delay_redelivery_after_heal: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +310,13 @@ pub fn run(config: SimConfig) -> Report {
     let mut state = world.lock();
     let mut all = std::mem::take(&mut state.observer.violations);
     all.append(&mut violations);
+    #[cfg(test)]
+    match state.history.check_queue(REDELIVERY_BOUND) {
+        Ok(violations) => all.extend(violations),
+        Err(error) => all.push(format!(
+            "queue checker could not read seed history: {error}"
+        )),
+    }
     Report {
         seed,
         trace_hash: state.trace.finish(),
@@ -645,7 +660,7 @@ impl Cluster {
                 state.net.epoch += 1;
                 state.net.blocked.clear();
                 drop(state);
-                self.trace(format_args!("heal"));
+                self.record_heal();
             }
             66..=75 => {
                 if self.world.is_up(pick) && !self.world.is_paused(pick) {
@@ -704,13 +719,18 @@ impl Cluster {
         for id in self.down() {
             self.start(id).await?;
         }
-        self.trace(format_args!("heal all"));
+        self.record_heal();
         Ok(())
+    }
+
+    fn record_heal(&self) {
+        self.trace(format_args!("heal"));
+        self.world.lock().history.heal(self.now());
     }
 
     /// Waits until every replica applied the same entries and a leader exists.
     async fn converge(&mut self) {
-        let deadline = self.now() + 30_000;
+        let deadline = self.now() + RECOVERY_TIMEOUT.as_millis() as u64;
         let mut stable = 0;
         while self.now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -741,10 +761,15 @@ impl Cluster {
 
     /// Takes a fresh lease after the old one expires and acknowledges everything.
     async fn drain(&mut self) -> u64 {
-        tokio::time::sleep(Duration::from_millis(LEASE_TTL_MS as u64 + 200)).await;
+        let delay = if self.config.knobs.delay_redelivery_after_heal {
+            REDELIVERY_BOUND
+        } else {
+            LEASE_SETTLE
+        };
+        tokio::time::sleep(delay).await;
         let mut client = Client::new(self.world.clone(), DRAINER, self.config.seed ^ 0xd7a1);
         let mut checkpoint = None;
-        let deadline = self.now() + 30_000;
+        let deadline = self.now() + RECOVERY_TIMEOUT.as_millis() as u64;
         while self.now() < deadline {
             match client.consume_once().await {
                 Step::Drained(at) => {
@@ -895,7 +920,20 @@ impl Client {
         self.rng.range(1, self.nodes)
     }
 
-    fn record(&self, kind: &'static str, f: &'static str, value: Value, request: &str, node: u64) {
+    fn record(
+        &mut self,
+        kind: &'static str,
+        f: &'static str,
+        mut value: Value,
+        request: &str,
+        node: u64,
+    ) {
+        if matches!(f, "poll" | "ack") {
+            if !value.is_object() {
+                value = json!({ "error": value });
+            }
+            value["subscription"] = json!(SUBSCRIPTION);
+        }
         let now = self.world.elapsed_ms();
         self.world.trace(format_args!(
             "history {kind} p{} {f} {request} n{node} {value}",
@@ -905,6 +943,10 @@ impl Client {
             .lock()
             .history
             .push(kind, self.process, f, value, request, node, now);
+        if kind == "info" {
+            // Each client owns one residue class, so retired process IDs stay unique.
+            self.process += CLIENTS;
+        }
     }
 
     /// Sends one Raft command to `node` and returns its domain outcome.
@@ -940,13 +982,12 @@ impl Client {
 
     /// Publishes `batch` once. Returns whether the outcome is known.
     async fn publish(&mut self, batch: &[(Uuid, u64)]) -> Outcome<()> {
-        self.ops += 1;
-        let request = format!("p-{}", self.ops);
+        let request = batch[0].0.to_string();
         let node = self.target();
         self.record(
             "invoke",
             "publish",
-            history::publish_value(batch),
+            json!(batch.iter().map(|(id, _)| id).collect::<Vec<_>>()),
             &request,
             node,
         );
@@ -963,15 +1004,14 @@ impl Client {
             .await;
         match outcome {
             Outcome::Ok(Reply::Published(published)) => {
-                let pairs: Vec<(Uuid, u64)> = published
-                    .events
-                    .iter()
-                    .map(|event| (event.event_id, event.offset))
-                    .collect();
                 self.record(
                     "ok",
                     "publish",
-                    history::publish_value(&pairs),
+                    json!({
+                        "event_ids": published.events.iter().map(|event| event.event_id).collect::<Vec<_>>(),
+                        "offsets": published.events.iter().map(|event| event.offset).collect::<Vec<_>>(),
+                        "dedup": published.inserted == 0,
+                    }),
                     &request,
                     node,
                 );
