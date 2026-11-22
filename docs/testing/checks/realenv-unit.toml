@@ -1,0 +1,21 @@
+id = "realenv-unit"
+module = "testing"
+kinds = ["U"]
+guarantees = []
+scenarios = []
+tiers = ["T0", "T1"]
+command = [
+    "python3", "-m", "unittest",
+    "scripts.testing.kind.test_faults",
+    "scripts.testing.kind.test_install",
+    "scripts.testing.kind.test_manifests",
+    "scripts.testing.kind.test_suite_events",
+    "scripts.testing.realenv.test_cache_cluster",
+    "scripts.testing.realenv.test_history",
+    "scripts.testing.realenv.test_nemesis",
+    "scripts.testing.realenv.test_upgrade_matrix",
+]
+cwd = "."
+timeout_s = 30
+needs = []
+result_parser = "unittest"
