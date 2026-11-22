@@ -20,18 +20,22 @@ const PUBLISH_ONE: &str = "/v1/topics/fuzz/partitions/0/events";
 const PUBLISH_BATCH: &str = "/v1/topics/fuzz/partitions/0/batches";
 const SUBSCRIPTION: &str = "/v1/topics/fuzz/partitions/0/subscriptions/test";
 
-pub fn fuzz_events_publish(data: &[u8]) {
+/// Returns the decoder verdicts, for example `event=accept batch=reject`.
+/// `accept` means the request passed every decoder and reached route
+/// resolution, which this harness answers with 404.
+pub fn fuzz_events_publish(data: &[u8]) -> String {
     let single = check_json("POST", PUBLISH_ONE, data);
-    check_json("POST", PUBLISH_BATCH, data);
+    let batch_status = check_json("POST", PUBLISH_BATCH, data);
     if single == StatusCode::NOT_FOUND {
         let mut batch = b"{\"events\":[".to_vec();
         batch.extend_from_slice(data);
         batch.extend_from_slice(b"]}");
         assert_eq!(status("POST", PUBLISH_BATCH, &batch), single);
     }
+    format!("event={} batch={}", verdict(single), verdict(batch_status))
 }
 
-pub fn fuzz_events_poll(data: &[u8]) {
+pub fn fuzz_events_poll(data: &[u8]) -> String {
     let uri = poll_uri(data);
     let result = status("GET", &uri, b"");
     assert!(matches!(
@@ -42,15 +46,35 @@ pub fn fuzz_events_poll(data: &[u8]) {
         let unknown = format!("{uri}&unexpected=1");
         assert_eq!(status("GET", &unknown, b""), StatusCode::BAD_REQUEST);
     }
+    verdict(result).to_owned()
 }
 
-pub fn fuzz_events_ack(data: &[u8]) {
-    check_json("PUT", &format!("{SUBSCRIPTION}/checkpoint"), data);
+pub fn fuzz_events_ack(data: &[u8]) -> String {
+    verdict(check_json(
+        "PUT",
+        &format!("{SUBSCRIPTION}/checkpoint"),
+        data,
+    ))
+    .to_owned()
 }
 
-pub fn fuzz_events_lease(data: &[u8]) {
-    for action in ["claim", "renew", "release"] {
-        check_json("POST", &format!("{SUBSCRIPTION}/{action}"), data);
+pub fn fuzz_events_lease(data: &[u8]) -> String {
+    let verdicts: Vec<_> = ["claim", "renew", "release"]
+        .into_iter()
+        .map(|action| {
+            let result = check_json("POST", &format!("{SUBSCRIPTION}/{action}"), data);
+            format!("{action}={}", verdict(result))
+        })
+        .collect();
+    verdicts.join(" ")
+}
+
+fn verdict(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::NOT_FOUND => "accept",
+        StatusCode::BAD_REQUEST => "reject",
+        StatusCode::PAYLOAD_TOO_LARGE => "too-large",
+        other => panic!("unexpected decoder status {other}"),
     }
 }
 

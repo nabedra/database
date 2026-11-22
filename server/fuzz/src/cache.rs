@@ -5,10 +5,13 @@ use nabedra_database_server::cache::{
 
 type Frames = Vec<Vec<Bytes>>;
 
-pub fn fuzz_cache_resp(data: &[u8]) {
+/// Checks the RESP decoder properties and returns its verdict, for example
+/// `2 frames, Ok(())` or `0 frames, Err(InvalidTerminator)`.
+pub fn fuzz_cache_resp(data: &[u8]) -> String {
     let limits = FrameLimits::default();
     let whole = decode_stream(data, limits, data.len().max(1));
     assert_eq!(decode_stream(data, limits, 17), whole);
+    let outcome = format!("{} frames, {:?}", whole.0.len(), whole.1);
     for frame in whole.0 {
         let response = Response::Array(
             frame
@@ -33,6 +36,7 @@ pub fn fuzz_cache_resp(data: &[u8]) {
         decode_stream(data, small, 1),
         decode_stream(data, small, data.len().max(1)),
     );
+    outcome
 }
 
 fn decode_stream(
@@ -60,16 +64,20 @@ fn decode_stream(
     (frames, decoder.eof(&buffer))
 }
 
-pub fn fuzz_cache_command(data: &[u8]) {
+/// Checks the command parser properties and returns one verdict per parsed
+/// frame, for example `Data(Set)` or `Err(Syntax)`, joined by `; `.
+pub fn fuzz_cache_command(data: &[u8]) -> String {
     let limits = FrameLimits::default();
     let Some((&selector, tail)) = data.split_first() else {
-        check_command(Vec::new());
-        return;
+        return check_command(Vec::new());
     };
     if selector == b'*' {
-        for frame in decode_stream(data, limits, data.len()).0 {
-            check_command(frame);
-        }
+        let verdicts: Vec<_> = decode_stream(data, limits, data.len())
+            .0
+            .into_iter()
+            .map(check_command)
+            .collect();
+        verdicts.join("; ")
     } else {
         // Select a supported command independently of its arguments so mutations
         // routinely reach the parser's command-specific branches.
@@ -82,7 +90,7 @@ pub fn fuzz_cache_command(data: &[u8]) {
                     .map(Bytes::copy_from_slice),
             );
         }
-        check_command(frame);
+        check_command(frame)
     }
 }
 
@@ -91,15 +99,19 @@ const COMMANDS: &[&[u8]] = &[
     b"INCRBY", b"AUTH", b"HELLO", b"PING", b"ECHO", b"CLIENT", b"COMMAND", b"CLUSTER", b"QUIT",
 ];
 
-fn check_command(frame: Vec<Bytes>) {
+fn check_command(frame: Vec<Bytes>) -> String {
     let mut lowercase = frame.clone();
     if let Some(name) = lowercase.first_mut() {
         *name = name.to_ascii_lowercase().into();
     }
     match (Command::parse(frame.clone()), Command::parse(lowercase)) {
-        (Err(original), Err(lowercase)) => assert_eq!(original, lowercase),
+        (Err(original), Err(lowercase)) => {
+            assert_eq!(original, lowercase);
+            format!("Err({original:?})")
+        }
         (Ok(Command::Data(original)), Ok(Command::Data(lowercase))) => {
             assert_eq!(original.kind(), lowercase.kind());
+            let verdict = format!("Data({:?})", original.kind());
             let keys: Vec<_> = original.keys().cloned().collect();
             let first = keys.first().expect("data command has a key");
             let slot = key_slot(first);
@@ -122,6 +134,7 @@ fn check_command(frame: Vec<Bytes>) {
                 );
             }
             assert_eq!(original.into_operation(), lowercase.into_operation());
+            verdict
         }
         (Ok(original), Ok(lowercase)) => {
             assert_eq!(
@@ -132,8 +145,28 @@ fn check_command(frame: Vec<Bytes>) {
                 original.metadata_response(4096),
                 lowercase.metadata_response(4096)
             );
+            command_name(&original).to_owned()
         }
         _ => panic!("command name case changed acceptance"),
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Auth(_) => "Auth",
+        Command::Hello { .. } => "Hello",
+        Command::Ping(_) => "Ping",
+        Command::Echo(_) => "Echo",
+        Command::ClientSetInfo => "ClientSetInfo",
+        Command::ClientSetName(_) => "ClientSetName",
+        Command::CommandInfo(_) => "CommandInfo",
+        Command::CommandCount => "CommandCount",
+        Command::CommandGetKeys(_) => "CommandGetKeys",
+        Command::ClusterSlots => "ClusterSlots",
+        Command::ClusterShards => "ClusterShards",
+        Command::ClusterKeySlot(_) => "ClusterKeySlot",
+        Command::Quit => "Quit",
+        Command::Data(_) => "Data",
     }
 }
 

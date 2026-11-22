@@ -17,15 +17,23 @@ Use the main checkout's `server/fuzz/target` as `CARGO_TARGET_DIR` when working 
 worktree. Both commands together replay every seed and regression. The `fuzz-replay` check
 runs both.
 
+Each target returns its decoder verdict, such as `accept`, `reject`, `Data(Set)` or
+`0 frames, Err(InvalidTerminator)`. Replay compares every input with its line in
+`corpus/<target>.expected` or `regressions/<target>.expected`. A decoder that starts accepting a
+known-bad input, or rejecting a valid one, fails replay even when nothing panics. A new input
+without an expectation also fails. After adding inputs or making an intended decoder change, run
+the commands with `NABEDRA_FUZZ_BLESS=1`, then review the diff of the `.expected` files.
+
 ## Run a target on nightly
 
 The `fuzz-nightly` check runs `sh nightly.sh` from this directory. The script runs each target
 for 300 seconds by default. The Actions fuzz job can set `RUST_NIGHTLY` and `FUZZ_SECONDS`.
-CI installs the nightly toolchain and cargo-fuzz. On a machine with those tools already
-installed, use the following command from `server`, with a target and features from the table.
+The script needs the nightly toolchain, `nightly-2026-11-20` unless `RUST_NIGHTLY` is set. It
+installs cargo-fuzz 0.13.2 when that version is absent. To run one target, use the following
+command from `server`, with a target and features from the table.
 
 ```sh
-cargo +nightly fuzz run "$target" --no-default-features --features "$features" -- -max_total_time=300
+cargo +nightly-2026-11-20 fuzz run "$target" --no-default-features --features "$features" -- -max_total_time=300
 ```
 
 | Target | Features | Decoder and assertion |
@@ -51,10 +59,11 @@ cargo-fuzz writes crash inputs under `server/fuzz/artifacts/<target>/`. Minimize
 `server` with the same feature flags as the run.
 
 ```sh
-cargo +nightly fuzz tmin "$target" "$crash" --no-default-features --features "$features"
+cargo +nightly-2026-11-20 fuzz tmin "$target" "$crash" --no-default-features --features "$features"
 ```
 
-Copy the minimized bytes to `server/fuzz/regressions/<target>/<name>` and rerun stable replay.
+Copy the minimized bytes to `server/fuzz/regressions/<target>/<name>`, bless its verdict as
+described above, check that the verdict is the intended one, and rerun stable replay.
 For a crash that still reproduces, give the file a dedicated `#[ignore = "reason and issue"]`
 test in `tests/replay.rs` and list that exact path as an exception in the normal replay.
 Remove the exception and the ignore attribute when the fix lands.

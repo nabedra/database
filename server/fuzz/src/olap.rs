@@ -3,37 +3,48 @@ use nabedra_database_server::{
     storage::{ClusterCatalog, StorageError},
 };
 
-pub fn fuzz_olap_operation(data: &[u8]) {
-    if let Ok(request) = parse_request(data) {
-        let encoded = serde_json::to_vec(&request).expect("decoded operation serializes");
-        // Canonical UUIDs or numbers can make the encoding larger than the input.
-        if encoded.len() <= MAX_BODY_BYTES {
-            let round_trip = parse_request(&encoded).expect("encoded operation decodes");
-            assert_eq!(round_trip, request);
-        }
+/// Returns `accept` or `reject`.
+pub fn fuzz_olap_operation(data: &[u8]) -> String {
+    let Ok(request) = parse_request(data) else {
+        return "reject".to_owned();
+    };
+    let encoded = serde_json::to_vec(&request).expect("decoded operation serializes");
+    // Canonical UUIDs or numbers can make the encoding larger than the input.
+    if encoded.len() <= MAX_BODY_BYTES {
+        let round_trip = parse_request(&encoded).expect("encoded operation decodes");
+        assert_eq!(round_trip, request);
     }
+    "accept".to_owned()
 }
 
-pub fn fuzz_olap_predicate(data: &[u8]) {
-    if let Ok(predicate) = serde_json::from_slice::<Predicate>(data) {
-        let encoded = serde_json::to_vec(&predicate).expect("decoded predicate serializes");
-        let round_trip =
-            serde_json::from_slice::<Predicate>(&encoded).expect("encoded predicate decodes");
-        assert_eq!(predicate, round_trip);
-    }
+/// Returns `accept` or `reject`.
+pub fn fuzz_olap_predicate(data: &[u8]) -> String {
+    let Ok(predicate) = serde_json::from_slice::<Predicate>(data) else {
+        return "reject".to_owned();
+    };
+    let encoded = serde_json::to_vec(&predicate).expect("decoded predicate serializes");
+    let round_trip =
+        serde_json::from_slice::<Predicate>(&encoded).expect("encoded predicate decodes");
+    assert_eq!(predicate, round_trip);
+    "accept".to_owned()
 }
 
-pub fn fuzz_olap_catalog(data: &[u8]) {
-    if let Ok(catalog) = ClusterCatalog::decode(data) {
-        match catalog.encode() {
-            Ok(encoded) => assert_eq!(
+/// Returns `accept`, `accept, too large to re-encode` or `reject`.
+pub fn fuzz_olap_catalog(data: &[u8]) -> String {
+    let Ok(catalog) = ClusterCatalog::decode(data) else {
+        return "reject".to_owned();
+    };
+    match catalog.encode() {
+        Ok(encoded) => {
+            assert_eq!(
                 ClusterCatalog::decode(&encoded).expect("encoded catalog decodes"),
                 catalog,
-            ),
-            // The canonical representation can be larger than the input.
-            Err(StorageError::LimitExceeded) => {}
-            Err(error) => panic!("decoded catalog failed validation on encode: {error:?}"),
+            );
+            "accept".to_owned()
         }
+        // The canonical representation can be larger than the input.
+        Err(StorageError::LimitExceeded) => "accept, too large to re-encode".to_owned(),
+        Err(error) => panic!("decoded catalog failed validation on encode: {error:?}"),
     }
 }
 
