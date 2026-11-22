@@ -173,3 +173,23 @@ fn k02_validates_item_sizes_in_every_operation() {
         Err(CommandError::InvalidValueSize)
     ));
 }
+
+/// Release builds have no DEBUG command: every form gets the ordinary
+/// unknown-command error, exactly as an unsupported command does.
+#[cfg(not(feature = "test-hooks"))]
+#[test]
+fn test_hooks_debug_is_unknown_without_the_feature() {
+    for words in [
+        &[b"DEBUG".as_slice(), b"DIGEST"][..],
+        &[b"debug", b"SET-ACTIVE-EXPIRE", b"0"],
+        &[b"DEBUG", b"SLEEP", b"1"],
+        &[b"DEBUG"],
+    ] {
+        let error = parse(words).err().expect("DEBUG must not parse");
+        assert_eq!(error, CommandError::Unsupported);
+        assert_eq!(
+            error.response(),
+            Response::error(b"ERR unknown or unsupported command")
+        );
+    }
+}

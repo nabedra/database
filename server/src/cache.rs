@@ -9,6 +9,8 @@ mod config;
 mod listener;
 mod standalone;
 mod store;
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 mod wire;
 
 pub use cluster::{AdminCommand, run_admin, run_controller, run_worker};

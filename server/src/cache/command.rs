@@ -54,6 +54,9 @@ pub enum Command {
     ClusterKeySlot(Bytes),
     Quit,
     Data(DataCommand),
+    /// Test-only hooks; see `test_hooks`.
+    #[cfg(feature = "test-hooks")]
+    Debug(super::test_hooks::DebugCommand),
 }
 
 pub struct DataCommand {
@@ -141,6 +144,8 @@ impl Command {
             name if word(name, b"CLUSTER") => parse_cluster(arguments),
             name if word(name, b"QUIT") && arguments.len() == 0 => Ok(Self::Quit),
             name if word(name, b"QUIT") => Err(CommandError::Arity),
+            #[cfg(feature = "test-hooks")]
+            name if word(name, b"DEBUG") => super::test_hooks::parse(arguments).map(Self::Debug),
             _ => Err(CommandError::Unsupported),
         }
     }

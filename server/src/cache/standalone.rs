@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore};
@@ -12,11 +13,30 @@ use super::listener::{Backend, listen, shutdown};
 use super::store::{EvictionPolicy, Operation, Reply, SlotStore, StoreError, TurnLimits};
 use super::wire::Response;
 
-struct Standalone {
-    actor: Arc<Mutex<SlotStore>>,
+pub(super) struct Standalone {
+    pub(super) actor: Arc<Mutex<SlotStore>>,
     pending: Semaphore,
-    started: Instant,
+    pub(super) started: Instant,
     limits: TurnLimits,
+    /// Cleared only by the test-hooks `DEBUG SET-ACTIVE-EXPIRE 0`.
+    pub(super) active_expire: Arc<AtomicBool>,
+}
+
+impl Standalone {
+    pub(super) fn new(
+        data_bytes: usize,
+        eviction: EvictionPolicy,
+        max_pending: usize,
+        limits: TurnLimits,
+    ) -> Self {
+        Self {
+            actor: Arc::new(Mutex::new(SlotStore::new(data_bytes, eviction))),
+            pending: Semaphore::new(max_pending),
+            started: Instant::now(),
+            limits,
+            active_expire: Arc::new(AtomicBool::new(true)),
+        }
+    }
 }
 
 impl Backend for Standalone {
@@ -34,6 +54,27 @@ impl Backend for Standalone {
             self.started,
             self.limits,
         ))
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn debug(&self, command: super::test_hooks::DebugCommand) -> Response {
+        use super::test_hooks::{DebugCommand, digest_response};
+        match command {
+            DebugCommand::Digest => {
+                let store = self.actor.lock().await;
+                digest_response(store.digest(elapsed_ms(self.started)))
+            }
+            DebugCommand::SetActiveExpire(enabled) => {
+                self.active_expire.store(enabled, Ordering::Relaxed);
+                Response::ok()
+            }
+            DebugCommand::Sleep(duration) => {
+                // Hold the actor as Valkey's blocking sleep holds the server.
+                let _store = self.actor.lock().await;
+                time::sleep(duration).await;
+                Response::ok()
+            }
+        }
     }
 }
 
@@ -54,21 +95,21 @@ pub fn run(path: &Path) -> io::Result<()> {
 async fn serve(config: ListenerConfig, eviction: EvictionPolicy) -> io::Result<()> {
     let socket = tokio::net::TcpListener::bind(config.listen).await?;
     let stop = shutdown()?;
-    let actor = Arc::new(Mutex::new(SlotStore::new(
+    let backend = Standalone::new(
         config.limits.data_bytes,
         eviction,
-    )));
-    let started = Instant::now();
-    let maintenance = tokio::spawn(expire(Arc::clone(&actor), started));
-    let backend = Standalone {
-        actor: Arc::clone(&actor),
-        pending: Semaphore::new(config.limits.max_pending),
-        started,
-        limits: TurnLimits {
+        config.limits.max_pending,
+        TurnLimits {
             growth_bytes: config.turn_reserve_bytes,
             reply_bytes: config.limits.max_reply_bytes,
         },
-    };
+    );
+    let actor = Arc::clone(&backend.actor);
+    let maintenance = tokio::spawn(expire(
+        Arc::clone(&actor),
+        backend.started,
+        Arc::clone(&backend.active_expire),
+    ));
     eprintln!(
         "nabedra-db: standalone cache listening on {}",
         socket.local_addr()?
@@ -83,11 +124,18 @@ async fn serve(config: ListenerConfig, eviction: EvictionPolicy) -> io::Result<(
     result
 }
 
-async fn expire(actor: Arc<Mutex<SlotStore>>, started: Instant) {
+pub(super) async fn expire(
+    actor: Arc<Mutex<SlotStore>>,
+    started: Instant,
+    active: Arc<AtomicBool>,
+) {
     let mut expiry = time::interval(Duration::from_millis(10));
     expiry.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         expiry.tick().await;
+        if !active.load(Ordering::Relaxed) {
+            continue;
+        }
         let mut store = actor.lock().await;
         let prepared = store.prepare_expiry(elapsed_ms(started), 64, Duration::from_micros(200));
         store.commit(prepared);

@@ -30,6 +30,14 @@ pub(super) trait Backend: Send + Sync + 'static {
     fn shards(&self) -> Response {
         self.slots()
     }
+
+    #[cfg(feature = "test-hooks")]
+    fn debug(
+        &self,
+        _command: super::test_hooks::DebugCommand,
+    ) -> impl Future<Output = Response> + Send {
+        async { Response::error(b"ERR DEBUG is not supported by this backend") }
+    }
 }
 
 pub(super) async fn listen<B: Backend>(
@@ -292,6 +300,8 @@ async fn dispatch<'a, B: Backend>(
             }
             backend.execute(command).await
         }
+        #[cfg(feature = "test-hooks")]
+        Command::Debug(command) => backend.debug(command).await,
         _ => Response::error(b"ERR unsupported command"),
     }
 }
