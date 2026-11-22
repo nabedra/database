@@ -1,0 +1,8 @@
+{"type":"invoke","process":0,"f":"write","key":"x","value":1}
+{"type":"ok","process":0,"f":"write","key":"x","value":1}
+{"type":"invoke","process":1,"f":"write","key":"x","value":2}
+{"type":"ok","process":1,"f":"write","key":"x","value":2}
+{"type":"invoke","process":2,"f":"read","key":"y","value":null}
+{"type":"ok","process":2,"f":"read","key":"y","value":null}
+{"type":"invoke","process":2,"f":"read","key":"x","value":null}
+{"type":"ok","process":2,"f":"read","key":"x","value":1}

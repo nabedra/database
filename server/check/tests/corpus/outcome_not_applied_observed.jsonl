@@ -1,0 +1,4 @@
+{"type":"invoke","process":0,"f":"write","key":"k","value":6,"request_id":"r-2"}
+{"type":"ok","process":0,"f":"write","key":"k","value":{"outcome":"not_applied","code":"conflict"},"request_id":"r-2"}
+{"type":"invoke","process":1,"f":"txn","value":[["r","k",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","k",6]]}

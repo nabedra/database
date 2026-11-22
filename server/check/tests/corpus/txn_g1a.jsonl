@@ -1,0 +1,4 @@
+{"type":"invoke","process":0,"f":"txn","value":[["append","x",1]]}
+{"type":"fail","process":0,"f":"txn","value":[["append","x",1]]}
+{"type":"invoke","process":1,"f":"txn","value":[["r","x",null]]}
+{"type":"ok","process":1,"f":"txn","value":[["r","x",[1]]]}

@@ -1,0 +1,12 @@
+{"type":"invoke","process":0,"f":"incr","key":"c","value":1}
+{"type":"ok","process":0,"f":"incr","key":"c","value":{"value":1,"epoch":1}}
+{"type":"invoke","process":1,"f":"incr","key":"c","value":5}
+{"type":"info","process":1,"f":"incr","key":"c","value":5}
+{"type":"invoke","process":2,"f":"get","key":"c","value":null}
+{"type":"ok","process":2,"f":"get","key":"c","value":{"value":6,"epoch":1}}
+{"type":"invoke","process":0,"f":"incr","key":"c","value":1}
+{"type":"ok","process":0,"f":"incr","key":"c","value":{"value":7,"epoch":1}}
+{"type":"invoke","process":"nemesis","f":"failover","value":null}
+{"type":"info","process":"nemesis","f":"failover","value":null}
+{"type":"invoke","process":2,"f":"get","key":"c","value":null}
+{"type":"ok","process":2,"f":"get","key":"c","value":{"value":6,"epoch":2}}

@@ -1,0 +1,8 @@
+{"type":"invoke","process":0,"f":"set","key":"a","value":1,"time_ns":0}
+{"type":"ok","process":0,"f":"set","key":"a","value":null,"time_ns":1000}
+{"type":"invoke","process":0,"f":"expire","key":"a","value":{"at_ns":100000000},"time_ns":2000}
+{"type":"ok","process":0,"f":"expire","key":"a","value":null,"time_ns":3000}
+{"type":"invoke","process":1,"f":"get","key":"a","value":null,"time_ns":50000000}
+{"type":"ok","process":1,"f":"get","key":"a","value":1,"time_ns":50001000}
+{"type":"invoke","process":1,"f":"get","key":"a","value":null,"time_ns":200000000}
+{"type":"ok","process":1,"f":"get","key":"a","value":1,"time_ns":200001000}
