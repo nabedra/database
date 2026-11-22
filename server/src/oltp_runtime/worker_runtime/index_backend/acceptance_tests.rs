@@ -362,6 +362,36 @@ fn row(id: i64, category: i64, label: &str) -> Value {
     json!({"id":id,"category":category,"label":label})
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o12_refresh_survives_temporary_ingress_saturation() {
+    let fixture = Fixture::new().await;
+    let seed = row(0, 0, "seed");
+    fixture.insert_rows(vec![seed.clone()]).await;
+    let record = fixture.declare().await;
+    let owner = MaintenanceOwnerRef {
+        catalog_group_id: fixture.runtime.services.catalog.participant().identity().group_id,
+        table_id: fixture.definition.table_id,
+        index_id: fixture.definition.index_id,
+        build_id: fixture.build_id,
+        attempt: 1,
+    };
+    let job = crate::oltp::mvcc::index::build::refresh_job(owner, &protocol::Key::Int64(0)).unwrap();
+    let permits: Vec<_> = std::iter::from_fn(|| fixture.runtime.ingress.try_admit().ok()).collect();
+    assert!(!permits.is_empty());
+    let refused = index_holds::register_checkpoint(job, Checkpoint::RefreshAdmissionRefused);
+    let mut actor = fixture.spawn_resume(record);
+    let hold = tokio::select! {
+        hold = reached(refused) => hold,
+        result = &mut actor => panic!("an ingress refusal stopped the build: {result:?}"),
+    };
+    drop(permits);
+    hold.release.send(false).unwrap();
+    tokio::time::timeout(WAIT, actor).await.unwrap().unwrap().unwrap();
+    fixture.assert_status(1, "ready", false).await;
+    fixture.assert_query(0, &json!([seed]), true).await;
+    fixture.close().await;
+}
+
 fn original(category: i64) -> Value {
     match category {
         7 => json!([

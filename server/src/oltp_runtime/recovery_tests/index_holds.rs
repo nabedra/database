@@ -34,6 +34,7 @@ struct Registry {
 pub(crate) enum Checkpoint {
     Backfill,
     Refresh,
+    RefreshAdmissionRefused,
     RefreshPrepare,
     Validation,
     ReadPin,
