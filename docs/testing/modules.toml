@@ -349,7 +349,7 @@ hot_paths = [
 [[module]]
 name = "lsm"
 level = "L3"
-register = "docs/testing/guarantees/oltp.md"
+register = "docs/testing/guarantees/lsm.md"
 paths = [
   "server/kv/**",
 ]
