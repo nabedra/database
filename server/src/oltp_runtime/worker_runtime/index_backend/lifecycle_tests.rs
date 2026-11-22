@@ -282,8 +282,12 @@ async fn exercise_case(case: &str) {
                 expected_version: None,
                 change: Change::Put(value),
             }];
+            // IDXHOT: a settled durable ABORT is returned as `Aborted`, not `Err`.
             assert!(
-                backend.commit(attempt, plan).await.is_err(),
+                !matches!(
+                    backend.commit(attempt, plan).await,
+                    Ok(IndexCommitOutcome::Committed)
+                ),
                 "metadata cleanup authorized a Data mutation"
             );
             let status = runtime
