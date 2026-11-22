@@ -23,6 +23,11 @@ pub(super) struct Record {
 }
 
 impl Record {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn key(&self) -> &Bytes {
+        &self.key
+    }
+
     pub fn is_expired(&self, now_ms: u64) -> bool {
         self.deadline_ms.is_some_and(|deadline| now_ms >= deadline)
     }
@@ -134,6 +139,11 @@ impl Records {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn iter(&self) -> impl Iterator<Item = &Record> {
+        self.entries.iter()
     }
 
     pub fn get(&self, key: &Bytes) -> Option<(usize, &Record)> {

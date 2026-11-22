@@ -295,6 +295,36 @@ impl SlotStore {
         self.len() == 0
     }
 
+    /// An order-independent digest of the live keyspace at `now_ms`, in the
+    /// style of Valkey's `DEBUG DIGEST`: the XOR of one SHA-256 per record over
+    /// its length-prefixed key and value and its absolute deadline, truncated
+    /// to 20 bytes. An empty keyspace digests to zero. Keys that are logically
+    /// expired but not yet removed are left out, so two copies compare equal
+    /// whatever their sweep progress.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn digest(&self, now_ms: u64) -> [u8; 20] {
+        use sha2::{Digest as _, Sha256};
+        let mut digest = [0u8; 20];
+        for record in self.records.iter().filter(|record| !record.is_expired(now_ms)) {
+            let mut hash = Sha256::new();
+            hash.update((record.key().len() as u64).to_le_bytes());
+            hash.update(record.key());
+            hash.update((record.value.len() as u64).to_le_bytes());
+            hash.update(&record.value);
+            match record.deadline_ms {
+                None => hash.update([0]),
+                Some(deadline) => {
+                    hash.update([1]);
+                    hash.update(deadline.to_le_bytes());
+                }
+            }
+            for (out, byte) in digest.iter_mut().zip(hash.finalize().iter()) {
+                *out ^= byte;
+            }
+        }
+        digest
+    }
+
     pub fn prepare(&self, op: &Operation, now_ms: u64, limits: TurnLimits) -> Prepared {
         let mut turn = self.turn(now_ms);
         let result = self
@@ -734,5 +764,7 @@ pub fn parse_integer(bytes: &[u8]) -> Option<i64> {
     std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
+#[cfg(test)]
+mod model_tests;
 #[cfg(test)]
 mod tests;
