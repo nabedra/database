@@ -13,21 +13,36 @@ pub fn expect_passed<M: Model>(name: &str, model: &M, max_states: usize) -> Expl
     let out = explore(model, max_states);
     println!("[{name}] {}", out.report());
     match out {
-        Outcome::Passed(e) => e,
+        Outcome::Passed(e) => {
+            assert!(
+                e.states > 1,
+                "[{name}] expected at least one reachable transition: {e:?}"
+            );
+            e
+        }
         other => panic!("[{name}] expected Passed, got:\n{}", other.report()),
     }
 }
 
 /// Explores `model` and asserts a violation of the invariant whose name is `invariant`
 /// (the text before the first ':'). Returns the trace length in steps.
-pub fn expect_violated<M: Model>(name: &str, model: &M, max_states: usize, invariant: &str) -> usize {
+pub fn expect_violated<M: Model>(
+    name: &str,
+    model: &M,
+    max_states: usize,
+    invariant: &str,
+) -> usize {
     let out = explore(model, max_states);
     println!("[{name}] {}", out.report());
     match &out {
-        Outcome::Violated { invariant: got, trace } => {
+        Outcome::Violated {
+            invariant: got,
+            trace,
+        } => {
             let got_name = got.split(':').next().unwrap_or("").trim();
             assert_eq!(
-                got_name, invariant,
+                got_name,
+                invariant,
                 "[{name}] wrong invariant violated:\n{}",
                 out.report()
             );

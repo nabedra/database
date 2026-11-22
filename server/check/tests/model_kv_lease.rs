@@ -15,10 +15,11 @@
 //!   (placement.rs:611-616); the new primary serves once a renewal moves `expires`
 //!   past `not_before`.
 //!
-//! Time is in units of 10 ms, so the bound is 1 unit and a lease is 300 units. Each
-//! clock read by a node returns `true time + offset` for any offset within the actual
-//! error, chosen freshly per read: per-node error and drift as bounded nondeterminism.
-//! The declared interval is that reading plus or minus the declared bound.
+//! Time advances in 5 ms steps. An interval has a 5 ms radius and a total width of
+//! 10 ms. Each sample's midpoint is true time plus a fresh offset. The safety
+//! argument uses containment of true time, so we omit ClockBound's monotonic
+//! endpoint validation and rounding. An isolated old primary keeps its local
+//! grant after failover and can try to serve until its own clock fences it.
 //!
 //! Invariant: one-live-primary, at most one node serves the slot at any true instant.
 //!
@@ -32,10 +33,9 @@ mod common;
 
 use nabedra_check::model::Model;
 
-/// 3 s in 10 ms units.
-const LEASE: i32 = 300;
-/// 10 ms.
-const BOUND: i32 = 1;
+const TICK_MS: i32 = 5;
+const LEASE: i32 = 3_000 / TICK_MS;
+const BOUND: i32 = 5 / TICK_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Lease {
@@ -99,7 +99,13 @@ impl Model for KvLease {
                 let (lower, _) = self.interval(0, offset);
                 State {
                     t: 0,
-                    leases: [Some(Lease { not_before: 0, expires: lower + LEASE }), None],
+                    leases: [
+                        Some(Lease {
+                            not_before: 0,
+                            expires: lower + LEASE,
+                        }),
+                        None,
+                    ],
                     renewals: 0,
                     serving: [false; 2],
                 }
@@ -131,7 +137,8 @@ impl Model for KvLease {
                 let lease = s.leases[node as usize]?;
                 let (lower, upper) = self.interval(s.t, offset);
                 // worker/actor.rs:187-194.
-                if !(lower >= lease.not_before && upper < lease.expires) || s.serving[node as usize] {
+                if !(lower >= lease.not_before && upper < lease.expires) || s.serving[node as usize]
+                {
                     return None;
                 }
                 n.serving[node as usize] = true;
@@ -146,8 +153,10 @@ impl Model for KvLease {
                 if lower < old.expires {
                     return None;
                 }
-                n.leases[0] = None;
-                n.leases[1] = Some(Lease { not_before: old.expires, expires: old.expires });
+                n.leases[1] = Some(Lease {
+                    not_before: old.expires,
+                    expires: old.expires,
+                });
             }
             Action::Renew { offset } => {
                 let prior = s.leases[1]?;
@@ -171,7 +180,7 @@ impl Model for KvLease {
         if s.serving[0] && s.serving[1] {
             return Err(format!(
                 "one-live-primary: the old and the new primary both serve at true time {} ms",
-                s.t * 10
+                s.t * TICK_MS
             ));
         }
         Ok(())
@@ -186,8 +195,15 @@ const LIMIT: usize = 200_000;
 fn lease_with_error_bound_passes() {
     for actual_error in 0..=BOUND {
         let e = common::expect_passed(
-            &format!("kv-lease with bound, actual error {} ms", actual_error * 10),
-            &KvLease { use_bound: true, actual_error, horizon: HORIZON },
+            &format!(
+                "kv-lease with bound, midpoint error {} ms",
+                actual_error * TICK_MS
+            ),
+            &KvLease {
+                use_bound: true,
+                actual_error,
+                horizon: HORIZON,
+            },
             LIMIT,
         );
         assert!(e.max_depth as i32 >= HORIZON);
@@ -197,20 +213,64 @@ fn lease_with_error_bound_passes() {
 #[test]
 fn lease_without_error_bound_has_two_primaries() {
     common::expect_violated(
-        "kv-lease without bound, actual error 10 ms",
-        &KvLease { use_bound: false, actual_error: BOUND, horizon: HORIZON },
+        "kv-lease without bound, midpoint error 5 ms",
+        &KvLease {
+            use_bound: false,
+            actual_error: BOUND,
+            horizon: HORIZON,
+        },
         LIMIT,
         "one-live-primary",
     );
 }
 
-/// Expected failure: clock error beyond the declared 10 ms breaks the lease even with
-/// the bound applied. This documents the assumption KV-G06 depends on.
+#[test]
+fn promotion_does_not_revoke_the_old_workers_local_grant() {
+    let model = KvLease {
+        use_bound: false,
+        actual_error: BOUND,
+        horizon: HORIZON,
+    };
+    let mut state = model
+        .init_states()
+        .into_iter()
+        .find(|s| s.leases[0].unwrap().expires == LEASE)
+        .unwrap();
+    for _ in 0..LEASE - 1 {
+        state = model.next_state(&state, &Action::Tick).unwrap();
+    }
+    for action in [
+        Action::Failover { offset: 1 },
+        Action::Renew { offset: 1 },
+        Action::Serve { node: 1, offset: 1 },
+        Action::Serve {
+            node: 0,
+            offset: -1,
+        },
+    ] {
+        state = model
+            .next_state(&state, &action)
+            .unwrap_or_else(|| panic!("{action:?} disabled in {state:?}"));
+    }
+    assert!(
+        model
+            .check(&state)
+            .unwrap_err()
+            .starts_with("one-live-primary:")
+    );
+}
+
+/// Expected failure: a sample whose midpoint error exceeds its interval radius
+/// can break the lease even when the protocol uses the reported endpoints.
 #[test]
 fn drift_beyond_the_bound_breaks_the_lease() {
     common::expect_violated(
-        "kv-lease with bound, actual error 20 ms (beyond the bound)",
-        &KvLease { use_bound: true, actual_error: 2 * BOUND, horizon: HORIZON },
+        "kv-lease with bound, midpoint error 20 ms (outside the interval)",
+        &KvLease {
+            use_bound: true,
+            actual_error: 20 / TICK_MS,
+            horizon: HORIZON,
+        },
         LIMIT,
         "one-live-primary",
     );

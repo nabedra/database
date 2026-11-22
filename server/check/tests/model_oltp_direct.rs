@@ -5,8 +5,8 @@
 //! - A single-key write commits as one Data entry `ParticipantCommand::Direct`
 //!   (server/src/oltp/mvcc/store.rs:165). Its apply writes the row versions and the
 //!   dedup record `DirectDedup{table_id, anchor, request_id}` in the same batch
-//!   (server/src/oltp/mvcc/store/direct.rs:341-350, :777-823), so every replica,
-//!   and therefore every later leader, has the record.
+//!   (server/src/oltp/mvcc/store/direct.rs:341-350, :777-823). A later leader catches
+//!   up before serving, so it sees the dedup record of a committed write.
 //! - The leader reads the dedup record before proposing: "The dedup record decides
 //!   before any fallback" (server/src/oltp_runtime/direct/executor.rs:1249-1271). Apply
 //!   checks it again and writes nothing for a replay (direct.rs:726, :480-488).
@@ -29,9 +29,8 @@
 //! Guards:
 //! - `dedup`: the leader's pre-read and the apply-time check of the dedup record.
 //!   Without it, a retry after a lost reply executes the write twice.
-//! - `proof`: `not_applied` only with a proof of non-application. Without it, a
-//!   deadline after a proposal of unknown outcome (leader) or after an uncertain
-//!   attempt (gateway) answers `not_applied`, as BUG1 and FIXA did.
+//! - `leader_proof` and `gateway_proof`: both layers require proof of non-application
+//!   before reporting `not_applied` after an uncertain proposal or attempt.
 
 #[path = "../models/common.rs"]
 mod common;
@@ -52,10 +51,14 @@ enum Reply {
 enum Att {
     Unsent,
     /// Sent to the leader of `term`.
-    Sent { term: u8 },
+    Sent {
+        term: u8,
+    },
     /// Its entry is pending in the log, proposed in `term`.
-    Proposed { term: u8 },
-    /// The replica answered, and the gateway received it.
+    Proposed {
+        term: u8,
+    },
+    /// The replica produced a reply that the gateway can receive or lose.
     Replied(Reply),
     /// The replica answered, and the reply was lost: the gateway times out (uncertain).
     Lost,
@@ -96,7 +99,8 @@ enum Action {
 
 struct OltpDirect {
     dedup: bool,
-    proof: bool,
+    leader_proof: bool,
+    gateway_proof: bool,
 }
 
 impl Model for OltpDirect {
@@ -195,7 +199,7 @@ impl Model for OltpDirect {
                 if !matches!(s.attempts[k], Att::Proposed { term } if term == s.term) {
                     return None;
                 }
-                t.attempts[k] = if self.proof {
+                t.attempts[k] = if self.leader_proof {
                     Att::Replied(Reply::Unknown)
                 } else {
                     // Planted bug (BUG1/FIXA style): the unresolved proposal is
@@ -233,18 +237,20 @@ impl Model for OltpDirect {
                 let uncertain = s.attempts.iter().any(|a| {
                     matches!(
                         a,
-                        Att::Sent { .. } | Att::Proposed { .. } | Att::Lost | Att::Replied(Reply::Unknown)
+                        Att::Sent { .. }
+                            | Att::Proposed { .. }
+                            | Att::Lost
+                            | Att::Replied(Reply::Unknown)
                     )
                 });
                 t.answer = Some(if any_ok {
                     Answer::Ok
                 } else if typed_not_applied {
                     Answer::NotApplied
-                } else if uncertain && self.proof {
+                } else if uncertain && self.gateway_proof {
                     // deadline_error with `uncertain` set (application/direct.rs:1547-1564).
                     Answer::Unknown
                 } else {
-                    // Planted bug when `proof` is off: no proof is required.
                     Answer::NotApplied
                 });
             }
@@ -263,10 +269,14 @@ impl Model for OltpDirect {
             && (s.answer == Some(Answer::NotApplied)
                 || s.attempts.contains(&Att::Replied(Reply::NotApplied)))
         {
-            return Err("no-false-not-applied: not_applied answered for a request that applied".into());
+            return Err(
+                "no-false-not-applied: not_applied answered for a request that applied".into(),
+            );
         }
         if s.answer == Some(Answer::Ok) && s.executions != 1 {
-            return Err("ok-means-applied: success answered for a request that never applied".into());
+            return Err(
+                "ok-means-applied: success answered for a request that never applied".into(),
+            );
         }
         Ok(())
     }
@@ -274,26 +284,51 @@ impl Model for OltpDirect {
 
 const LIMIT: usize = 200_000;
 
+const GUARDED: OltpDirect = OltpDirect {
+    dedup: true,
+    leader_proof: true,
+    gateway_proof: true,
+};
+
 #[test]
 fn direct_path_guarded_passes() {
-    common::expect_passed("oltp-direct guarded", &OltpDirect { dedup: true, proof: true }, LIMIT);
+    common::expect_passed("oltp-direct guarded", &GUARDED, LIMIT);
 }
 
 #[test]
 fn without_dedup_a_retry_executes_twice() {
     common::expect_violated(
         "oltp-direct without dedup",
-        &OltpDirect { dedup: false, proof: true },
+        &OltpDirect {
+            dedup: false,
+            ..GUARDED
+        },
         LIMIT,
         "one-execution",
     );
 }
 
 #[test]
-fn without_proof_an_applied_write_is_reported_not_applied() {
+fn without_leader_proof_an_applied_write_is_reported_not_applied() {
     common::expect_violated(
-        "oltp-direct without not_applied proof",
-        &OltpDirect { dedup: true, proof: false },
+        "oltp-direct without leader not_applied proof",
+        &OltpDirect {
+            leader_proof: false,
+            ..GUARDED
+        },
+        LIMIT,
+        "no-false-not-applied",
+    );
+}
+
+#[test]
+fn without_gateway_proof_an_applied_write_is_reported_not_applied() {
+    common::expect_violated(
+        "oltp-direct without gateway not_applied proof",
+        &OltpDirect {
+            gateway_proof: false,
+            ..GUARDED
+        },
         LIMIT,
         "no-false-not-applied",
     );

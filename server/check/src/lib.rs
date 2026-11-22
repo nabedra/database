@@ -2,8 +2,8 @@
 
 pub mod config;
 pub mod evidence;
-pub mod model;
 pub mod r#gen;
+pub mod model;
 pub mod prop;
 pub mod rng;
 

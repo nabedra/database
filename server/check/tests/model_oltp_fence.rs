@@ -8,7 +8,7 @@
 //! - `plan_finish_index` validates the build: every shard's progress is done with the
 //!   matching build, attempt and span, and routing matches
 //!   (server/src/oltp/mvcc/planner/index_build.rs:94-140). Only then does it fence Data
-//!   with the next table lifecycle, `txn.request_id` (index_build.rs:230, :254-257), and
+//!   with the next table lifecycle, `txn.request_id` (index_build.rs:233, :254-258), and
 //!   the Catalog commit publishes that lifecycle. "Fence before publishing the new
 //!   lifecycle. A rejected validation must leave Data on the current Catalog lifecycle"
 //!   (index_build.rs:254-256).
@@ -98,7 +98,10 @@ fn fence(cur: DirectSchema, lifecycle: u8) -> DirectSchema {
     if cur.lifecycle == lifecycle {
         cur
     } else {
-        DirectSchema { epoch: cur.epoch + 1, lifecycle }
+        DirectSchema {
+            epoch: cur.epoch + 1,
+            lifecycle,
+        }
     }
 }
 
@@ -118,7 +121,10 @@ impl Model for Fence {
                 build_complete,
                 step: Step::Idle,
                 published: L1,
-                data: DirectSchema { epoch: 2, lifecycle: L1 },
+                data: DirectSchema {
+                    epoch: 2,
+                    lifecycle: L1,
+                },
                 crashed: false,
                 last_edge: None,
             })
@@ -141,7 +147,11 @@ impl Model for Fence {
         match *a {
             Action::Acquire if s.step == Step::Idle => go(&mut t, Step::Acquired),
             Action::Validate if s.step == Step::Acquired => {
-                let to = if s.build_complete { Step::Validated } else { Step::Rejected };
+                let to = if s.build_complete {
+                    Step::Validated
+                } else {
+                    Step::Rejected
+                };
                 go(&mut t, to);
             }
             Action::Fence => {
@@ -187,10 +197,15 @@ impl Model for Fence {
         if let Some(edge) = s.last_edge
             && !EDGES.contains(&edge)
         {
-            return Err(format!("lifecycle-edges: undeclared transition {:?} -> {:?}", edge.0, edge.1));
+            return Err(format!(
+                "lifecycle-edges: undeclared transition {:?} -> {:?}",
+                edge.0, edge.1
+            ));
         }
         if s.data.lifecycle == L1 && s.published == L2 {
-            return Err("publish-after-fence: Catalog published L2 while Data still admits L1".into());
+            return Err(
+                "publish-after-fence: Catalog published L2 while Data still admits L1".into(),
+            );
         }
         Ok(())
     }
@@ -200,7 +215,10 @@ impl Model for Fence {
 fn validated_fence_passes() {
     let e = common::expect_passed(
         "oltp-fence guarded",
-        &Fence { validate_before_fence: true, build_states: &[false, true] },
+        &Fence {
+            validate_before_fence: true,
+            build_states: &[false, true],
+        },
         10_000,
     );
     assert!(e.states >= 10, "{e:?}");
@@ -210,7 +228,10 @@ fn validated_fence_passes() {
 fn fence_before_validation_strands_data_under_an_unpublished_lifecycle() {
     let steps = common::expect_violated(
         "oltp-fence without validate-before-fence (ACC2)",
-        &Fence { validate_before_fence: false, build_states: &[false, true] },
+        &Fence {
+            validate_before_fence: false,
+            build_states: &[false, true],
+        },
         10_000,
         "fence-after-validation",
     );
@@ -221,7 +242,10 @@ fn fence_before_validation_strands_data_under_an_unpublished_lifecycle() {
 fn early_fence_is_an_undeclared_edge_even_when_the_build_is_complete() {
     common::expect_violated(
         "oltp-fence without validate-before-fence, complete build",
-        &Fence { validate_before_fence: false, build_states: &[true] },
+        &Fence {
+            validate_before_fence: false,
+            build_states: &[true],
+        },
         10_000,
         "lifecycle-edges",
     );

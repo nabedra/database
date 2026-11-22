@@ -7,21 +7,22 @@
 //! C_old,new and decides a quorum of a joint membership as "a quorum of every config"
 //! (openraft-0.10.0/src/membership/membership_impl_quorum_set.rs:16-23). Both votes
 //! and commits use the membership of the latest membership entry in the node's own
-//! log, committed or not (Raft thesis section 4.3, which openraft follows as the
-//! "effective membership").
+//! log, committed or not (openraft's "effective membership", engine/engine_impl.rs:136
+//! and engine/handler/replication_handler/mod.rs:118).
+//! Nabedra uses advanced leader IDs (server/src/oltp_replication/entry.rs:21).
+//! Votes and log freshness order leaders by (term, node ID), so a higher ID
+//! can become leader within the same numeric term.
 //!
 //! The model has four nodes. C_old = {0, 1, 2} and C_new = {1, 2, 3}: node 3 is added
 //! and node 0 removed. Terms go up to `MAX_TERM` and logs to `MAX_LOG` entries.
-//! Abstractions, each of which only adds behaviours:
-//! - RequestVote and AppendEntries are atomic request-and-reply steps, and replies
-//!   are never lost (a lost reply equals the step not happening).
-//! - AppendEntries replaces the follower's log with the leader's, which is the state
-//!   the consistency check and truncation converge to.
-//! - A commit counts the followers whose current log matches the leader's prefix.
+//! This is a bounded Raft model, with no pre-vote or leadership leases. RequestVote
+//! and replication combine delivery and acknowledgment into one step, so delayed
+//! and lost replies after a follower change are outside the model. Replication
+//! installs the full leader log when the follower lacks that prefix. A commit
+//! counts only matches acknowledged to that leader. Blank entries are omitted.
 //!
-//! Invariants: election safety (at most one leader per term, across configurations),
-//! and leader completeness (an entry committed in term t is in the log of every leader
-//! of a later term, so no committed entry is lost).
+//! Invariants: every higher leader must retain the committed prefix, and a
+//! quorum cannot commit different entries at the same index.
 //!
 //! Guard: `joint_quorum`. With it, a node whose latest configuration is C_old,new needs
 //! a majority of C_old and a majority of C_new. Without it, a majority of C_new alone
@@ -38,6 +39,7 @@ const OLD: u8 = 0b0111; // {0, 1, 2}
 const NEW: u8 = 0b1110; // {1, 2, 3}
 const MAX_TERM: u8 = 2;
 const MAX_LOG: usize = 2;
+type LeaderId = (u8, u8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Kind {
@@ -48,7 +50,7 @@ enum Kind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Entry {
-    term: u8,
+    leader: LeaderId,
     kind: Kind,
 }
 
@@ -67,7 +69,10 @@ struct Log {
     e: [Entry; MAX_LOG],
 }
 
-const BLANK: Entry = Entry { term: 0, kind: Kind::Data };
+const BLANK: Entry = Entry {
+    leader: (0, 0),
+    kind: Kind::Data,
+};
 
 impl Log {
     fn as_slice(&self) -> &[Entry] {
@@ -90,11 +95,12 @@ impl std::fmt::Debug for Log {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Node {
-    term: u8,
-    voted: Option<u8>,
+    vote: LeaderId,
     role: Role,
     /// Votes received while a candidate; cleared in every other role.
     votes: u8,
+    /// Matched log lengths acknowledged to this leader by each follower.
+    matched: [u8; NODES],
     log: Log,
 }
 
@@ -105,13 +111,22 @@ enum Config {
     New,
 }
 
+impl Config {
+    fn voters(self) -> u8 {
+        match self {
+            Self::Old => OLD,
+            Self::Joint => OLD | NEW,
+            Self::New => NEW,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
     nodes: [Node; NODES],
-    /// Ghost: the committed prefix, each entry with the term of the leader that committed it.
-    committed: Vec<(Entry, u8)>,
-    /// Ghost: every (term, node) that became leader.
-    elected: Vec<(u8, u8)>,
+    /// Ghost: the committed prefix and the ID of the leader that committed each entry.
+    committed: Vec<(Entry, LeaderId)>,
+    conflicting_commit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -150,8 +165,8 @@ fn config_of(log: &[Entry]) -> Config {
         .unwrap_or(Config::Old)
 }
 
-fn last_term(log: &[Entry]) -> u8 {
-    log.last().map_or(0, |e| e.term)
+fn last_log_id(log: &[Entry]) -> (LeaderId, usize) {
+    (log.last().map_or((0, 0), |e| e.leader), log.len())
 }
 
 impl JointMembership {
@@ -173,16 +188,19 @@ impl Model for JointMembership {
 
     fn init_states(&self) -> Vec<State> {
         let node = Node {
-            term: 0,
-            voted: None,
+            vote: (0, 0),
             role: Role::Follower,
             votes: 0,
-            log: Log { len: 0, e: [BLANK; MAX_LOG] },
+            matched: [0; NODES],
+            log: Log {
+                len: 0,
+                e: [BLANK; MAX_LOG],
+            },
         };
         vec![State {
             nodes: [node; NODES],
             committed: Vec::new(),
-            elected: Vec::new(),
+            conflicting_commit: false,
         }]
     }
 
@@ -193,9 +211,13 @@ impl Model for JointMembership {
                 Role::Follower | Role::Candidate => {
                     out.push(Action::Timeout(n));
                     if node.role == Role::Candidate {
+                        let voters = config_of(node.log.as_slice()).voters();
                         for v in 0..NODES as u8 {
-                            if v != n {
-                                out.push(Action::RequestVote { candidate: n, voter: v });
+                            if v != n && voters & (1 << v) != 0 {
+                                out.push(Action::RequestVote {
+                                    candidate: n,
+                                    voter: v,
+                                });
                             }
                         }
                         out.push(Action::BecomeLeader(n));
@@ -209,11 +231,17 @@ impl Model for JointMembership {
                     out.push(Action::ProposeNew(n));
                     for f in 0..NODES as u8 {
                         if f != n {
-                            out.push(Action::Replicate { leader: n, follower: f });
+                            out.push(Action::Replicate {
+                                leader: n,
+                                follower: f,
+                            });
                         }
                     }
                     for i in 0..node.log.len() as u8 {
-                        out.push(Action::Commit { leader: n, index: i });
+                        out.push(Action::Commit {
+                            leader: n,
+                            index: i,
+                        });
                     }
                 }
             }
@@ -225,32 +253,26 @@ impl Model for JointMembership {
         match *a {
             Action::Timeout(n) => {
                 let node = &mut t.nodes[n as usize];
-                if node.term >= MAX_TERM {
+                if node.vote.0 >= MAX_TERM
+                    || config_of(node.log.as_slice()).voters() & (1 << n) == 0
+                {
                     return None;
                 }
-                node.term += 1;
+                node.vote = (node.vote.0 + 1, n);
                 node.role = Role::Candidate;
-                node.voted = Some(n);
                 node.votes = 1 << n;
             }
             Action::RequestVote { candidate, voter } => {
                 let c = t.nodes[candidate as usize];
                 let v = &mut t.nodes[voter as usize];
-                if c.term < v.term || (c.term == v.term && v.voted.is_some()) {
+                if c.vote <= v.vote || last_log_id(c.log.as_slice()) < last_log_id(v.log.as_slice())
+                {
                     return None;
                 }
-                if c.term > v.term {
-                    v.term = c.term;
-                    v.voted = None;
-                    v.role = Role::Follower;
-                    v.votes = 0;
-                }
-                // Raft section 5.4.1: grant only to a log at least as up to date.
-                let up_to_date = (last_term(c.log.as_slice()), c.log.len()) >= (last_term(v.log.as_slice()), v.log.len());
-                if !up_to_date {
-                    return Some(t);
-                }
-                v.voted = Some(candidate);
+                v.vote = c.vote;
+                v.role = Role::Follower;
+                v.votes = 0;
+                v.matched = [0; NODES];
                 t.nodes[candidate as usize].votes |= 1 << voter;
             }
             Action::BecomeLeader(n) => {
@@ -260,14 +282,8 @@ impl Model for JointMembership {
                 }
                 node.role = Role::Leader;
                 node.votes = 0;
-                let key = (node.term, n);
-                if !t.elected.contains(&key) {
-                    t.elected.push(key);
-                    t.elected.sort();
-                }
             }
             Action::ClientWrite(n) | Action::ProposeJoint(n) | Action::ProposeNew(n) => {
-                let committed_joint = s.committed.iter().any(|(e, _)| e.kind == Kind::Joint);
                 let node = &mut t.nodes[n as usize];
                 if node.log.len() >= MAX_LOG {
                     return None;
@@ -275,50 +291,65 @@ impl Model for JointMembership {
                 let kind = match a {
                     Action::ClientWrite(_) => Kind::Data,
                     // One change at a time: start only from a uniform C_old.
-                    Action::ProposeJoint(_) if config_of(node.log.as_slice()) == Config::Old => Kind::Joint,
+                    Action::ProposeJoint(_) if config_of(node.log.as_slice()) == Config::Old => {
+                        Kind::Joint
+                    }
                     // The uniform C_new follows once C_old,new is committed.
                     Action::ProposeNew(_)
-                        if config_of(node.log.as_slice()) == Config::Joint && committed_joint =>
+                        if config_of(node.log.as_slice()) == Config::Joint
+                            && node.log.as_slice().iter().zip(&s.committed).any(
+                                |(local, (committed, _))| {
+                                    local == committed && local.kind == Kind::Joint
+                                },
+                            ) =>
                     {
                         Kind::New
                     }
                     _ => return None,
                 };
-                node.log.push(Entry { term: node.term, kind });
+                node.log.push(Entry {
+                    leader: node.vote,
+                    kind,
+                });
             }
             Action::Replicate { leader, follower } => {
                 let l = t.nodes[leader as usize];
                 let f = &mut t.nodes[follower as usize];
-                if f.term > l.term || f.log == l.log && f.term == l.term && f.role == Role::Follower {
+                if f.vote > l.vote {
                     return None;
                 }
-                if f.term < l.term {
-                    f.voted = None;
-                }
-                f.term = l.term;
+                f.vote = l.vote;
                 f.role = Role::Follower;
                 f.votes = 0;
-                f.log = l.log;
+                f.matched = [0; NODES];
+                if !f.log.as_slice().starts_with(l.log.as_slice()) {
+                    f.log = l.log;
+                }
+                t.nodes[leader as usize].matched[follower as usize] = l.log.len;
             }
             Action::Commit { leader, index } => {
                 let i = index as usize;
                 let l = s.nodes[leader as usize];
                 let l_log = l.log.as_slice();
-                // Raft section 5.4.2: count replicas only for an entry of the leader's term.
-                if l_log[i].term != l.term || s.committed.len() > i {
+                // Only an entry of the current leader ID can advance the commit index.
+                if l_log[i].leader != l.vote {
                     return None;
                 }
-                let mut acks = 0u8;
-                for (k, node) in s.nodes.iter().enumerate() {
-                    if node.log.len() > i && node.log.as_slice()[..=i] == l_log[..=i] {
+                let mut acks = 1 << leader;
+                for (k, &matched) in l.matched.iter().enumerate() {
+                    if matched as usize > i {
                         acks |= 1 << k;
                     }
                 }
                 if !self.is_quorum(config_of(l.log.as_slice()), acks) {
                     return None;
                 }
-                for k in s.committed.len()..=i {
-                    t.committed.push((l_log[k], l.term));
+                t.conflicting_commit |= l_log[..=i]
+                    .iter()
+                    .zip(&s.committed)
+                    .any(|(local, (committed, _))| local != committed);
+                for &entry in l_log.iter().take(i + 1).skip(s.committed.len()) {
+                    t.committed.push((entry, l.vote));
                 }
             }
         }
@@ -326,26 +357,23 @@ impl Model for JointMembership {
     }
 
     fn check(&self, s: &State) -> Result<(), String> {
-        for w in s.elected.windows(2) {
-            if w[0].0 == w[1].0 {
-                return Err(format!(
-                    "election-safety: nodes {} and {} both lead term {}",
-                    w[0].1, w[1].1, w[0].0
-                ));
-            }
-        }
         for (n, node) in s.nodes.iter().enumerate() {
             if node.role != Role::Leader {
                 continue;
             }
-            for (i, (e, ct)) in s.committed.iter().enumerate() {
-                if *ct < node.term && node.log.as_slice().get(i) != Some(e) {
+            for (i, (e, committed_by)) in s.committed.iter().enumerate() {
+                if *committed_by < node.vote && node.log.as_slice().get(i) != Some(e) {
                     return Err(format!(
-                        "leader-completeness: leader {n} of term {} lacks entry {i} {e:?} committed in term {ct}",
-                        node.term
+                        "leader-completeness: leader {n} at {:?} lacks entry {i} {e:?} committed by {committed_by:?}",
+                        node.vote
                     ));
                 }
             }
+        }
+        if s.conflicting_commit {
+            return Err(
+                "commit-agreement: two quorums committed different entries at one index".into(),
+            );
         }
         Ok(())
     }
@@ -354,29 +382,45 @@ impl Model for JointMembership {
 const LIMIT: usize = 3_000_000;
 
 #[test]
-fn joint_quorum_keeps_one_leader_per_term_and_committed_entries() {
-    let e = common::expect_passed("joint-membership guarded", &JointMembership { joint_quorum: true, client_writes: false }, LIMIT);
-    assert!(e.states > 1_000, "the bounded space should be non-trivial: {e:?}");
+fn joint_quorum_preserves_committed_entries_across_leaders() {
+    let e = common::expect_passed(
+        "joint-membership guarded",
+        &JointMembership {
+            joint_quorum: true,
+            client_writes: false,
+        },
+        LIMIT,
+    );
+    assert!(
+        e.states > 1_000,
+        "the bounded space should be non-trivial: {e:?}"
+    );
 }
 
 #[test]
 fn incoming_majority_alone_loses_a_committed_entry() {
     let steps = common::expect_violated(
         "joint-membership without joint quorum",
-        &JointMembership { joint_quorum: false, client_writes: false },
+        &JointMembership {
+            joint_quorum: false,
+            client_writes: false,
+        },
         LIMIT,
         "leader-completeness",
     );
     assert!(steps >= 4);
 }
 
-/// The same space with data entries as well (about 620,000 states, over a minute in debug).
+/// Optional larger space with both data and membership entries.
 #[test]
 #[ignore]
 fn joint_quorum_with_client_writes() {
     common::expect_passed(
         "joint-membership guarded with client writes",
-        &JointMembership { joint_quorum: true, client_writes: true },
+        &JointMembership {
+            joint_quorum: true,
+            client_writes: true,
+        },
         LIMIT,
     );
 }

@@ -12,16 +12,16 @@
 //!   prefix (:83-88), and moves the checkpoint forward only (:89-94).
 //! - Poll checks the live lease and returns events after the checkpoint without
 //!   changing state (:105-121), so unacked events are redelivered.
-//! - Each command carries the API node's wall clock; apply uses the maximum clock ever
-//!   applied, so a later leader with a slower clock cannot revive an expired grant
-//!   (:265-286).
+//! - Lease commands use and persist the maximum applied clock, including domain
+//!   rejections (:265-286). Poll is a read-only query and uses the maximum of its own
+//!   wall clock and the stored clock (:103-121).
 //!
 //! The model has one partition with two events and two processes of the same owner: an
 //! old instance and its restart, which claims with a new claim ID. When the owner names
 //! match, the generation is the only thing that tells the two apart. Two API nodes have
-//! independent clocks. A process that processes events while its lease is not the live
-//! one has its side effects fenced off downstream, so only processing under the live
-//! lease counts.
+//! independent clocks. The processing invariant assumes a downstream generation fence:
+//! processing under a stale lease cannot produce a valid side effect. The Events server
+//! itself enforces the generation on poll and ack. Release and renew are outside this model.
 //!
 //! Invariants:
 //! - acked-means-processed: every event at or below the checkpoint was processed by the
@@ -54,8 +54,6 @@ struct Proc {
     generation: Option<u8>,
     /// Delivered prefix (after, last].
     delivery: Option<(u8, u8)>,
-    /// Whether it processed its delivery while holding the live lease.
-    processed_live: bool,
     processed: bool,
 }
 
@@ -166,22 +164,30 @@ impl Model for EventsLease {
                 let now = self.apply_clock(&mut t, node);
                 // Busy while any grant with another claim ID is live (:156-161).
                 if matches!(s.lease, Some(l) if now < l.expires) {
-                    return None;
+                    // A rejected command still advances the persisted clock.
+                    return Some(t);
                 }
                 let generation = s.lease.map_or(1, |l| l.generation + 1);
                 if generation > MAX_GEN {
                     return None;
                 }
-                t.lease = Some(Lease { holder: p, generation, expires: now + TTL });
-                t.procs[p as usize] = Proc { generation: Some(generation), ..Proc::default() };
+                t.lease = Some(Lease {
+                    holder: p,
+                    generation,
+                    expires: now + TTL,
+                });
+                t.procs[p as usize] = Proc {
+                    generation: Some(generation),
+                    ..Proc::default()
+                };
             }
             Action::Poll { p, node } => {
                 let pr = s.procs[p as usize];
                 if pr.delivery.is_some() || s.checkpoint >= EVENTS {
                     return None;
                 }
-                let now = self.apply_clock(&mut t, node);
-                if !self.live(&t, pr.generation, now) {
+                let now = s.clock.max(s.nodes[node as usize]);
+                if !self.live(s, pr.generation, now) {
                     return None;
                 }
                 t.procs[p as usize].delivery = Some((s.checkpoint, EVENTS));
@@ -193,7 +199,6 @@ impl Model for EventsLease {
                 }
                 let live = Self::truly_live(s, p as usize);
                 t.procs[p as usize].processed = true;
-                t.procs[p as usize].processed_live = live;
                 if live {
                     let (after, last) = pr.delivery.unwrap();
                     for e in after + 1..=last {
@@ -226,7 +231,9 @@ impl Model for EventsLease {
 
     fn check(&self, s: &State) -> Result<(), String> {
         if s.clock_regressed {
-            return Err("lease-clock-monotone: an applied command moved the lease clock backward".into());
+            return Err(
+                "lease-clock-monotone: an applied command moved the lease clock backward".into(),
+            );
         }
         for e in 1..=s.checkpoint {
             if !s.handled[e as usize] {
@@ -246,7 +253,10 @@ const LIMIT: usize = 500_000;
 fn events_lease_guarded_passes() {
     common::expect_passed(
         "events-lease guarded",
-        &EventsLease { generation_check: true, max_clock: true },
+        &EventsLease {
+            generation_check: true,
+            max_clock: true,
+        },
         LIMIT,
     );
 }
@@ -255,7 +265,10 @@ fn events_lease_guarded_passes() {
 fn without_generation_check_a_stale_ack_skips_events() {
     common::expect_violated(
         "events-lease without generation check",
-        &EventsLease { generation_check: false, max_clock: true },
+        &EventsLease {
+            generation_check: false,
+            max_clock: true,
+        },
         LIMIT,
         "acked-means-processed",
     );
@@ -265,7 +278,10 @@ fn without_generation_check_a_stale_ack_skips_events() {
 fn without_max_clock_the_lease_clock_moves_backward() {
     common::expect_violated(
         "events-lease without max clock",
-        &EventsLease { generation_check: true, max_clock: false },
+        &EventsLease {
+            generation_check: true,
+            max_clock: false,
+        },
         LIMIT,
         "lease-clock-monotone",
     );
