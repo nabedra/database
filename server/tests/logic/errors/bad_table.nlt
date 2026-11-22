@@ -1,0 +1,46 @@
+# name: errors/bad_table
+
+# Every table-bound operation on an unknown table is not_found.
+
+statement error not_found
+{"op":"table.drop","table":"nope"}
+
+statement error not_found
+{"op":"table.insert","table":"nope","row":{"id":1}}
+
+statement error not_found
+{"op":"table.insert_many","table":"nope","rows":[{"id":1}]}
+
+statement error not_found
+{"op":"table.get","table":"nope","key":1}
+
+statement error not_found
+{"op":"table.update","table":"nope","key":1,"values":{}}
+
+statement error not_found
+{"op":"table.upsert","table":"nope","row":{"id":1}}
+
+statement error not_found
+{"op":"table.delete","table":"nope","key":1}
+
+statement error not_found
+{"op":"query.collect","table":"nope"}
+
+statement error not_found
+{"op":"query.count","table":"nope"}
+
+statement error not_found
+{"op":"query.explain","table":"nope"}
+
+statement error not_found
+{"op":"table.describe","name":"nope"}
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8"},"key":"id","format":"parquet"}
+
+# A known table with a column that does not exist is a validation error, not not_found.
+statement error unknown row column
+{"op":"table.insert","table":"t","row":{"id":1,"w":"x"}}
+
+statement error validation_error
+{"op":"query.collect","table_id":"not-a-uuid","query":{"select":null,"filter":null,"order_by":null,"limit":null}}

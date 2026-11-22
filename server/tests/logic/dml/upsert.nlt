@@ -1,0 +1,25 @@
+# name: dml/upsert
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"table.upsert","table":"t","row":{"id":1,"v":"new","f":1.0,"b":true}}
+----
+
+query nosort
+{"op":"table.upsert","table":"t","row":{"id":1,"v":"replaced","f":-2.5,"b":false}}
+----
+
+statement error complete row must contain every schema column
+{"op":"table.upsert","table":"t","row":{"id":1,"v":"partial"}}
+
+query nosort
+{"op":"query.collect","table":"t"}
+----
+false	-2.5	1	replaced
+
+query nosort
+{"op":"query.count","table":"t"}
+----
+1

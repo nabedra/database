@@ -1,0 +1,41 @@
+# name: dml/update
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"t","rows":[{"id":1,"v":"a","f":1.0,"b":true},{"id":2,"v":"b","f":2.0,"b":false}]}
+
+query nosort
+{"op":"table.update","table":"t","key":1,"values":{"v":"a2","b":false}}
+----
+true
+
+query nosort
+{"op":"table.update","table":"t","key":99,"values":{"v":"none"}}
+----
+false
+
+# An empty update finds the row and changes nothing.
+query nosort
+{"op":"table.update","table":"t","key":2,"values":{}}
+----
+true
+
+statement error update cannot contain the primary key
+{"op":"table.update","table":"t","key":1,"values":{"id":5}}
+
+statement error unknown row column
+{"op":"table.update","table":"t","key":1,"values":{"nope":1}}
+
+statement error scalar must match exact column type
+{"op":"table.update","table":"t","key":1,"values":{"f":3}}
+
+statement error validation_error
+{"op":"table.update","table":"t","key":1,"values":{"v":null}}
+
+query nosort
+{"op":"query.collect","table":"t"}
+----
+false	1.0	1	a2
+false	2.0	2	b

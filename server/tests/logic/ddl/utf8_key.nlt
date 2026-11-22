@@ -1,0 +1,34 @@
+# name: ddl/utf8_key
+
+statement ok
+{"op":"table.create","name":"s","schema":{"k":"utf8","n":"int64"},"key":"k","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"s","rows":[{"k":"b","n":1},{"k":"B","n":2},{"k":"a","n":3},{"k":"é","n":4},{"k":"aa","n":5},{"k":"","n":6},{"k":"Z","n":7}]}
+
+# Primary-key order is UTF-8 byte order: empty, uppercase, lowercase, then non-ASCII.
+query nosort
+{"op":"query.collect","table":"s"}
+----
+(empty)	6
+B	2
+Z	7
+a	3
+aa	5
+b	1
+é	4
+
+query nosort
+{"op":"table.get","table":"s","key":"é"}
+----
+é	4
+
+statement error key type does not match schema
+{"op":"table.get","table":"s","key":1}
+
+query nosort
+{"op":"query.collect","table":"s","filter":{"op":"gt","column":"k","value":"a"}}
+----
+aa	5
+b	1
+é	4

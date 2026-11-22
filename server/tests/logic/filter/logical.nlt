@@ -1,0 +1,61 @@
+# name: filter/logical
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"and","args":[{"op":"eq","column":"b","value":true},{"op":"gt","column":"x","value":0}]}}
+----
+3
+5
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"or","args":[{"op":"eq","column":"s","value":"apple"},{"op":"eq","column":"s","value":"cherry"}]}}
+----
+1
+3
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"not","arg":{"op":"eq","column":"b","value":true}}}
+----
+2
+4
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"and","args":[{"op":"eq","column":"x","value":5}]}}
+----
+3
+4
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"or","args":[{"op":"and","args":[{"op":"ge","column":"x","value":0},{"op":"le","column":"x","value":5}]},{"op":"not","arg":{"op":"ne","column":"id","value":6}}]}}
+----
+2
+3
+4
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"not","arg":{"op":"not","arg":{"op":"lt","column":"f","value":0.0}}}}
+----
+4
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"and","args":[{"op":"eq","column":"x","value":5},{"op":"ne","column":"x","value":5}]}}
+----
+
+statement error logical args must be nonempty
+{"op":"query.collect","table":"n","filter":{"op":"and","args":[]}}
+
+statement error logical args must be nonempty
+{"op":"query.collect","table":"n","filter":{"op":"or","args":[]}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"xor","args":[{"op":"eq","column":"x","value":5}]}}
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"not","args":[{"op":"eq","column":"x","value":5}]}}

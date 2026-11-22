@@ -1,0 +1,62 @@
+# name: filter/comparisons_int
+
+statement ok
+{"op":"table.create","name":"n","schema":{"id":"int64","x":"int64","s":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+statement ok
+{"op":"table.insert_many","table":"n","rows":[{"id":1,"x":-5,"s":"apple","f":-0.0,"b":true},{"id":2,"x":0,"s":"Banana","f":0.0,"b":false},{"id":3,"x":5,"s":"cherry","f":2.5,"b":true},{"id":4,"x":5,"s":"apple pie","f":-3.75,"b":false},{"id":5,"x":9223372036854775807,"s":"","f":1e-7,"b":true},{"id":6,"x":-9223372036854775808,"s":"Ünïcode","f":1e300,"b":false}]}
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"eq","column":"x","value":5}}
+----
+3
+4
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"ne","column":"x","value":5}}
+----
+1
+2
+5
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"gt","column":"x","value":5}}
+----
+5
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"ge","column":"x","value":5}}
+----
+3
+4
+5
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"lt","column":"x","value":5}}
+----
+1
+2
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"le","column":"x","value":5}}
+----
+1
+2
+3
+4
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"lt","column":"x","value":-9223372036854775807}}
+----
+6
+
+query rowsort
+{"op":"query.collect","table":"n","select":["id"],"filter":{"op":"ge","column":"x","value":9223372036854775807}}
+----
+5
+
+statement error validation_error
+{"op":"query.collect","table":"n","filter":{"op":"eq","column":"x","value":9223372036854775808}}

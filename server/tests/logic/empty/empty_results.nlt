@@ -1,0 +1,55 @@
+# name: empty/empty_results
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"query.collect","table":"t"}
+----
+
+query nosort
+{"op":"query.count","table":"t"}
+----
+0
+
+query rowsort hash
+{"op":"query.collect","table":"t"}
+----
+0 values hashing to e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+query nosort
+{"op":"table.get","table":"t","key":1}
+----
+
+query nosort
+{"op":"table.delete","table":"t","key":1}
+----
+false
+
+query nosort
+{"op":"table.update","table":"t","key":1,"values":{"v":"x"}}
+----
+false
+
+skipif standalone and fixed-cluster OLAP explain disagree on the partition footer
+explain
+{"op":"query.explain","table":"t"}
+----
+scan t (<uuid>)
+filter none
+sort id ASC (primary key)
+limit none
+projection all
+partitions 0; worker execution
+
+statement ok
+{"op":"table.insert","table":"t","row":{"id":1,"v":"only"}}
+
+query nosort
+{"op":"query.collect","table":"t","filter":{"op":"ne","column":"v","value":"only"}}
+----
+
+query nosort
+{"op":"query.count","table":"t","filter":{"op":"gt","column":"id","value":1}}
+----
+0

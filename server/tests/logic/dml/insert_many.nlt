@@ -1,0 +1,35 @@
+# name: dml/insert_many
+
+statement ok
+{"op":"table.create","name":"t","schema":{"id":"int64","v":"utf8","f":"float64","b":"bool"},"key":"id","format":"parquet"}
+
+query nosort
+{"op":"table.insert_many","table":"t","rows":[{"id":3,"v":"c","f":3.5,"b":false},{"id":1,"v":"a","f":1.5,"b":true}]}
+----
+2
+
+query nosort
+{"op":"table.insert_many","table":"t","rows":[]}
+----
+0
+
+# A batch that repeats a key, or collides with a stored key, applies nothing.
+statement error conflict
+{"op":"table.insert_many","table":"t","rows":[{"id":5,"v":"e","f":5.0,"b":true},{"id":5,"v":"e2","f":5.0,"b":true}]}
+
+statement error conflict
+{"op":"table.insert_many","table":"t","rows":[{"id":6,"v":"f","f":6.0,"b":true},{"id":1,"v":"dup","f":0.0,"b":true}]}
+
+statement error scalar must match exact column type
+{"op":"table.insert_many","table":"t","rows":[{"id":7,"v":"g","f":7.0,"b":true},{"id":8,"v":"h","f":8,"b":true}]}
+
+query nosort
+{"op":"query.collect","table":"t"}
+----
+true	1.5	1	a
+false	3.5	3	c
+
+query nosort
+{"op":"query.count","table":"t"}
+----
+2

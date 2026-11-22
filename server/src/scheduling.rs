@@ -11,6 +11,8 @@ use tokio::sync::oneshot;
 
 #[cfg(test)]
 mod remote_placement_tests;
+#[cfg(test)]
+mod scheduler_properties;
 
 #[derive(Clone)]
 pub struct ResourceScheduler {
