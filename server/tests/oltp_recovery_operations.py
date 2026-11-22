@@ -838,8 +838,6 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
             write_json(cluster.barrier_dir(name) / 'gates.json',
                        {queued_id: 'queued', preparation_write_id: 'queued', fenced_id: 'prepared'})
             write_json(cluster.barrier_dir(name) / 'inspect.json', ids)
-            write_json(cluster.barrier_dir(name) / 'transaction-gates.json',
-                       {fenced_id: {'retry-aborted-1': False, 'decision': False}})
         for request in requests:
             accepted = send_op(request, '/v1/requests')
             assert accepted == (202, dict(request_id=request['request_id'], run_id=cluster.run_id, state='queued')), accepted
@@ -965,7 +963,7 @@ def o06_r01_r03_r06_retained_restart(binary, test_executable, root):
 
         def checkpoints(stage):
             return [json.loads(path.read_text()) for name in WORKERS if
-                    (path := cluster.barrier_dir(name) / f'transaction-{fenced_id}-{stage}.json').is_file()]
+                    (path := cluster.barrier_dir(name) / f'{stage}-{fenced_id}.json').is_file()]
 
         aborts = checkpoints('retry-aborted-1')
         assert aborts and all(abort == aborts[0] for abort in aborts), aborts

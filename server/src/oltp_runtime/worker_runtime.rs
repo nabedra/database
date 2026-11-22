@@ -1571,7 +1571,10 @@ impl WorkerRuntime {
             .ready
             .view
             .authority();
-        if let Some(decision) = self.transactions.recover(authority, intent.txn).await? {
+        if let Some(decision) = self
+            .recover_queued_transaction(authority, intent.txn)
+            .await?
+        {
             if decision.statement().manifest != intent.manifest {
                 return Err(unknown());
             }
@@ -1590,28 +1593,30 @@ impl WorkerRuntime {
             .ready
             .view
             .authority();
-        let settled =
-            if let Some(decision) = self.transactions.recover(authority, binding.txn).await? {
-                let statement = decision.statement();
-                self.services
-                    .status
-                    .settled_proof(statement.txn, statement.manifest)
-                    .await?
-            } else {
-                // A planning actor may own a guard before a manifest exists. Only
-                // its immutable Status failure proves that no Prepare can follow.
-                let identity = self.durable_lookup(binding.request.request_id).await?;
-                if !matches!(
-                    identity,
-                    Some(IdentityLookup::Terminal(TerminalIdentity::Failed { .. }))
-                ) {
-                    return Ok(());
-                }
-                self.services
-                    .status
-                    .failure_settled_proof(binding.txn, binding.request)
-                    .await?
-            };
+        let decision = self
+            .recover_queued_transaction(authority, binding.txn)
+            .await?;
+        let settled = if let Some(decision) = decision {
+            let statement = decision.statement();
+            self.services
+                .status
+                .settled_proof(statement.txn, statement.manifest)
+                .await?
+        } else {
+            // A planning actor may own a guard before a manifest exists. Only
+            // its immutable Status failure proves that no Prepare can follow.
+            let identity = self.durable_lookup(binding.request.request_id).await?;
+            if !matches!(
+                identity,
+                Some(IdentityLookup::Terminal(TerminalIdentity::Failed { .. }))
+            ) {
+                return Ok(());
+            }
+            self.services
+                .status
+                .failure_settled_proof(binding.txn, binding.request)
+                .await?
+        };
         let participant = self.services.catalog.participant();
         if let Some(guard) = participant.lifecycle_guard(&binding).await? {
             participant

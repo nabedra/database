@@ -606,7 +606,8 @@ pub(super) fn apply(
                     load(tx, &key(IDENTITIES, txn.request_id))?.ok_or_else(unknown)?;
                 if identity.reservation.scoped.is_some()
                     || identity.terminal.is_some()
-                    || state.created_authority != current
+                    || state.created_authority.run_id != current.run_id
+                    || state.created_authority.owner_term > current.owner_term
                     || txn.attempt >= MAX_QUEUED_MUTATION_ATTEMPTS
                     || !outcome.is_not_applied()
                 {

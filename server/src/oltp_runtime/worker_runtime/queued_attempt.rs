@@ -23,6 +23,32 @@ impl QueuedAttempt {
 }
 
 impl WorkerRuntime {
+    // Intent and lifecycle helpers can reach a fenced attempt before the
+    // recovery actor. Use the same decision policy for an accepted RAM copy.
+    pub(super) async fn recover_queued_transaction(
+        &self,
+        authority: Authority,
+        txn: TxnId,
+    ) -> Result<Option<VerifiedStatusDecision>, ProtocolError> {
+        let retained = self
+            .services
+            .replica
+            .lock()
+            .map_err(|_| unknown())?
+            .record(txn.request_id)
+            .is_some_and(|record| {
+                record.run_id == authority.run_id
+                    && record.accepted
+                    && !record.state.terminal()
+                    && !record.body.is_empty()
+                    && record.pinned_catalog.is_some()
+            });
+        let retry_switch = self.direct_switch().map(Arc::as_ref).filter(|_| retained);
+        self.transactions
+            .recover_queued(authority, txn, retry_switch)
+            .await
+    }
+
     pub(super) async fn advance_queued_attempt(
         &self,
         current: QueueAuthority,
@@ -72,7 +98,9 @@ impl WorkerRuntime {
         let authority = current.ready.view.authority();
         let mut attempt = QueuedAttempt::original(input.request.request_id, read.storage_pin);
         loop {
-            let decision = self.transactions.recover(authority, attempt.txn).await?;
+            let decision = self
+                .recover_queued_transaction(authority, attempt.txn)
+                .await?;
             let Some(prior) = decision.as_ref() else {
                 return Ok((attempt, None));
             };
