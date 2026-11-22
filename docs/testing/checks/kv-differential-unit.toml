@@ -1,7 +1,9 @@
 id = "kv-differential-unit"
 module = "kv"
 kinds = ["U"]
-guarantees = ["KV-G01", "KV-G02"]
+# These tests run the comparator against in-process fakes, not Nabedra, so
+# they show the harness is sensitive and qualify no KV guarantee.
+guarantees = []
 scenarios = ["K01"]
 tiers = ["T0", "T1"]
 command = ["python3", "-m", "unittest", "discover", "-s", "scripts/cache-acceptance", "-p", "test_differential.py", "-v"]

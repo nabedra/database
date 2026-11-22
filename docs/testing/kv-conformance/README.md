@@ -34,8 +34,9 @@ The check uses the supported data commands and SET options. It covers signed
 duplicate keys, empty strings, and binary payloads. It exercises string values
 that `INCRBY` rejects as non-integers. Nabedra stores strings, so the data
 command set cannot create a list or another value that triggers `WRONGTYPE`.
-The direct RESP2 comparison covers the server behavior that the ORM clients
-depend on for KV-G12. The existing K01 client checks exercise those clients.
+The direct RESP2 comparison sends raw frames and runs no client library, so it
+is not evidence for KV-G12. The existing K01 client checks exercise those
+clients.
 
 The comparator accepts live PTTL values within 50 ms by default. TTL replies
 round to whole seconds, so the same tolerance allows adjacent live TTL values

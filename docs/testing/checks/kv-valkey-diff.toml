@@ -1,7 +1,8 @@
 id = "kv-valkey-diff"
 module = "kv"
 kinds = ["D"]
-guarantees = ["KV-G01", "KV-G02", "KV-G12"]
+# KV-G12 needs the ORM and stock-driver clients. This check sends raw RESP2 only.
+guarantees = ["KV-G01", "KV-G02"]
 scenarios = ["K01"]
 tiers = ["T1", "T2"]
 command = [
