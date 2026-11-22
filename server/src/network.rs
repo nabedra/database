@@ -994,7 +994,7 @@ mod keep_alive_tests {
         stream.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
         let started = nabedra_rt::time::now_std();
         assert!(closed(&mut stream, Duration::from_secs(3)).await);
-        let elapsed = started.elapsed();
+        let elapsed = nabedra_rt::time::now_std().duration_since(started);
         assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(2500), "{elapsed:?}");
     }

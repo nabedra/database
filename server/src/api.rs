@@ -467,7 +467,14 @@ fn complete(
     };
     // For admitted work this runs before returning to the executor, so disconnects
     // cannot discard diagnostics. Never record error messages or request values.
-    tracing::info!(request_id = ?id, operation, elapsed_ms = started.elapsed().as_millis() as u64, error_code = ?code, status = encoded.status, "operation completed");
+    tracing::info!(
+        request_id = ?id,
+        operation,
+        elapsed_ms = nabedra_rt::time::now_std().duration_since(started).as_millis() as u64,
+        error_code = ?code,
+        status = encoded.status,
+        "operation completed"
+    );
     let mut response = Response::new(Body::from(encoded.body));
     *response.status_mut() = StatusCode::from_u16(encoded.status).expect("protocol HTTP status");
     response.headers_mut().insert(
