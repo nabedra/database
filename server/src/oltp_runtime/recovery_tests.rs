@@ -537,7 +537,10 @@ pub(super) fn hold_o21_ready_view() -> bool {
 
 fn o21_ready_hold() -> Option<PathBuf> {
     let directory = PathBuf::from(std::env::var_os("NABEDRA_OLTP_TEST_BARRIER_DIR")?);
-    directory.join("o21-hold-ready-view").is_file().then_some(directory)
+    directory
+        .join("o21-hold-ready-view")
+        .is_file()
+        .then_some(directory)
 }
 
 pub(super) fn observe_o21_stale_copy(request: Uuid) {

@@ -644,6 +644,10 @@ def create_with_lagging_queue_replica(constrained, holds):
     request = operation('table.create', dict(name='capacity_deficit', schema=dict(id='int64', data='utf8'),
                                              key='id', format='parquet'))
     reached = [hold.parent / f"o21-stale-copy-{request['request_id']}" for hold in holds]
+    submissions = [cluster.barrier_dir(worker) / f"submissions-{request['request_id']}"
+                   for worker in WORKERS]
+    for path in submissions:
+        path.touch()
     with ThreadPoolExecutor(max_workers=1) as executor:
         creating = executor.submit(constrained.api, 'api1', OPERATIONS, request)
 
@@ -660,9 +664,8 @@ def create_with_lagging_queue_replica(constrained, holds):
                 hold.unlink()
         status, reply = creating.result(timeout=30)
     assert status == 200 and reply['request_id'] == request['request_id'], (status, reply)
-    submissions = sum(len(path.read_text().splitlines()) for path in
-                      cluster.root.glob(f"barriers/*/submissions-{request['request_id']}"))
-    assert submissions == 1, submissions
+    attempts = [line for path in submissions for line in path.read_text().splitlines()]
+    assert attempts == [request['request_id']], attempts
     assert constrained.api('api1', OPERATIONS, request) == (status, reply)
     changed = request | {'payload': request['payload'] | {'name': 'different'}}
     conflict, response = constrained.api('api1', OPERATIONS, changed)

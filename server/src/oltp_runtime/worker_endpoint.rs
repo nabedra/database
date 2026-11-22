@@ -1288,7 +1288,10 @@ impl QueueEndpoint {
         }
         Ok(current)
     }
-    async fn wait_for_local_ready_view(&self, expected: QueueAuthority) -> Result<(), ProtocolError> {
+    async fn wait_for_local_ready_view(
+        &self,
+        expected: QueueAuthority,
+    ) -> Result<(), ProtocolError> {
         tokio::time::timeout(LOCAL_READY_VIEW_TIMEOUT, async {
             loop {
                 let local = self.replica.lock().map_err(|_| unavailable())?.authority();
