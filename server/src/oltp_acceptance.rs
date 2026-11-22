@@ -1,6 +1,6 @@
 //! Essential production acceptance entry points. Component regressions remain
 //! in their owning modules. Run these explicitly through the central runner.
-use std::{path::PathBuf, process::Command};
+use std::{ffi::OsString, path::PathBuf, process::Command};
 
 #[path = "oltp_acceptance/acc6.rs"]
 mod acc6;
@@ -13,29 +13,50 @@ fn transaction_scenario(scenario: &str) {
     process_scenario(scenario, "oltp_transaction_acceptance.py");
 }
 
+fn process_binary() -> Option<OsString> {
+    std::env::var_os("NABEDRA_OLTP_BINARY").or_else(|| std::env::var_os("NABEDRA_BIN"))
+}
+
+fn process_driver(driver: &str) -> Command {
+    let python = std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| {
+        if std::env::var_os("NABEDRA_OLTP_BINARY").is_some() {
+            "python3.11".into()
+        } else {
+            // The shared-build repeat job provides NABEDRA_BIN and runner Python.
+            "python3".into()
+        }
+    });
+    let mut command = Command::new(python);
+    command
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join(driver),
+        )
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env(
+            "TOKIO_WORKER_THREADS",
+            std::env::var_os("TOKIO_WORKER_THREADS").unwrap_or_else(|| "2".into()),
+        );
+    command
+}
+
 fn process_scenario(scenario: &str, driver: &str) {
-    let Some(binary) = std::env::var_os("NABEDRA_OLTP_BINARY") else {
+    let Some(binary) = process_binary() else {
         let marker = serde_json::json!({
             "scenario": scenario, "status": "not-run", "reason": "missing actual OLTP server executable",
         });
         eprintln!("NABEDRA_OLTP_ACCEPTANCE {marker}");
         return;
     };
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join(driver);
-    let status = Command::new(
-        std::env::var_os("NABEDRA_ACCEPTANCE_PYTHON").unwrap_or_else(|| "python3.11".into()),
-    )
-    .arg(script)
-    .args(["--scenario", scenario])
-    .arg("--binary")
-    .arg(binary)
-    .arg("--test-executable")
-    .arg(std::env::current_exe().unwrap())
-    .env("PYTHONDONTWRITEBYTECODE", "1")
-    .status()
-    .expect("launch RF3 acceptance driver");
+    let status = process_driver(driver)
+        .args(["--scenario", scenario])
+        .arg("--binary")
+        .arg(binary)
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .status()
+        .expect("launch RF3 acceptance driver");
     assert!(status.success(), "{scenario} RF3 process assertions failed");
 }
 
@@ -89,6 +110,27 @@ fn acceptance_o08() {
 #[ignore = "run through scripts/acceptance_oltp.py"]
 fn acceptance_o09() {
     process_scenario("O09", "oltp_hardening_acceptance.py");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an OLTP server and Linux network namespaces with passwordless sudo"]
+fn o06_o18_packet_drop_failover() {
+    let output = tempfile::tempdir().expect("packet-drop fixture directory");
+    let status = process_driver("oltp_blackhole.py")
+        .arg("--binary")
+        .arg(process_binary().expect("shared-build OLTP binary"))
+        .arg("--test-executable")
+        .arg(std::env::current_exe().unwrap())
+        .arg("--output")
+        .arg(output.path())
+        .env(
+            "PYTHONPATH",
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../orm/python/src"),
+        )
+        .status()
+        .expect("launch packet-drop fixture");
+    assert!(status.success(), "O06/O18 packet-drop assertions failed");
 }
 
 #[test]
