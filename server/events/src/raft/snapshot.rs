@@ -217,7 +217,7 @@ impl Snapshots {
                 let mut temporary = NamedTempFile::new_in(dir)?;
                 let (_, cut) = manager.generate(
                     temporary.as_file_mut(),
-                    Uuid::new_v4().to_string(),
+                    crate::rt::uuid_v4().to_string(),
                     maximum_bytes,
                 )?;
                 temporary
@@ -292,7 +292,7 @@ impl Snapshots {
             );
         }
 
-        let generation = Uuid::new_v4();
+        let generation = crate::rt::uuid_v4();
         let db = &self.store.db;
         self.store.cleanup_interrupted_stage()?;
         let mut stage = WriteBatch::new();
@@ -347,7 +347,7 @@ impl Snapshots {
         let mut descriptor = None;
         if let Some(path) = incoming {
             file.sync_all()?;
-            let file_id = Uuid::new_v4();
+            let file_id = crate::rt::uuid_v4();
             let dir = self.store.snapshot_dir();
             path.persist(dir.join(file_id.to_string()))
                 .map_err(|error| error.error)?;
@@ -444,7 +444,7 @@ impl Snapshots {
     fn build(&self) -> Result<Snapshot<TypeConfig>> {
         let dir = self.store.snapshot_dir();
         let mut temporary = NamedTempFile::new_in(&dir)?;
-        let file_id = Uuid::new_v4();
+        let file_id = crate::rt::uuid_v4();
         let (header, _) = self.generate(
             temporary.as_file_mut(),
             file_id.to_string(),

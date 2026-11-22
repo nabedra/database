@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::Bytes;
@@ -200,9 +200,7 @@ fn park_for_space(delay: Duration) -> Result<()> {
 }
 
 fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    crate::rt::unix_ms()
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -618,7 +616,7 @@ impl Database {
         let permit = semaphore.clone().acquire_owned().await?;
         let database = self.clone();
         let semaphore = semaphore.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::rt::blocking(move || {
             let (_permit, _scope) = match retry {
                 Some((label, closing)) => (
                     None,

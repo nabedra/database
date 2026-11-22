@@ -61,12 +61,20 @@ impl fmt::Debug for RaftCommand {
     }
 }
 
+/// Product groups run on tokio. Simulation swaps in a runtime with a per-node clock,
+/// seeded randomness (election timeouts) and a per-node task registry.
+#[cfg(not(feature = "sim"))]
+type Runtime = openraft::TokioRuntime;
+#[cfg(feature = "sim")]
+type Runtime = crate::sim::runtime::SimRuntime;
+
 openraft::declare_raft_types!(
     TypeConfig:
         D = RaftCommand,
         R = Value,
         Node = Node,
         SnapshotData = SnapshotFile,
+        AsyncRuntime = Runtime,
 );
 
 const READ_DEADLINE: Duration = Duration::from_secs(2);
@@ -493,7 +501,7 @@ impl Broker {
             accepts_votes: AtomicBool::new(accepts_votes),
         });
         if let Some(cut) = election_after.filter(|_| !accepts_votes) {
-            tokio::spawn(group.clone().enable_votes_after(cut));
+            crate::rt::spawn(group.clone().enable_votes_after(cut));
         }
         self.groups
             .write()
@@ -516,7 +524,7 @@ impl Broker {
         let change = self.change_groups.clone().lock_owned().await;
         // Once accepted, the disk and registry transition owns the lock through
         // completion even if a private RPC stops waiting for its response.
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let _change = change;
             operation.await
         })
@@ -1151,4 +1159,63 @@ fn storage_error(
     error: anyhow::Error,
 ) -> StorageError<u64> {
     StorageError::from_io_error(subject, verb, io::Error::other(error.to_string()))
+}
+
+/// Simulation access to a broker on a [`nabedra_kv::fs::FaultFs`] volume.
+#[cfg(feature = "sim")]
+impl Broker {
+    pub(crate) fn sim_open(
+        id: u64,
+        cluster_id: Uuid,
+        root: &Path,
+        fs: nabedra_kv::fs::FaultFs,
+    ) -> Result<Arc<Self>> {
+        let config = BrokerConfig {
+            id,
+            cluster_id,
+            data_dir: root.into(),
+            peer_token: "simulated-events-peer-token-0123456789".into(),
+            peer_ca: None,
+            peer_identity: None,
+            allow_plaintext: true,
+        };
+        let peers = PeerTransport::new(cluster_id, &config.peer_token, None, None, true)?;
+        let mut options = Database::options(Arc::new(fs));
+        // FaultFs keeps every byte in memory and copies the volume on a crash; a 64 MiB
+        // preallocated journal segment would dominate the run. The memtable stays at its
+        // product size, so a run never flushes on the background threads.
+        options.journal.segment_bytes = 256 << 10;
+        let database = Database::open_with(root, cluster_id, id, options)?;
+        Ok(Self::with_database(config, peers, database))
+    }
+}
+
+#[cfg(feature = "sim")]
+impl Group {
+    pub(crate) fn sim_metrics(&self) -> openraft::RaftMetrics<u64, Node> {
+        self.raft.metrics().borrow().clone()
+    }
+
+    /// The log ids this replica's storage holds, read back after a restart.
+    pub(crate) async fn sim_log_ids(&self) -> Result<Vec<openraft::LogId<u64>>> {
+        use openraft::storage::RaftLogReader;
+        let mut log = LogStore(self.snapshots.store.clone());
+        let entries = log
+            .try_get_log_entries(..)
+            .await
+            .map_err(|error| anyhow!("read the simulated log: {error}"))?;
+        Ok(entries.into_iter().map(|entry| entry.log_id).collect())
+    }
+
+    /// Runs `f` on this replica's local state, without a quorum check.
+    pub(crate) async fn sim_local_read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.snapshots.store.clone();
+        self.snapshots
+            .store
+            .run(move |_| f(&store.transaction()?))
+            .await
+    }
 }

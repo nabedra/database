@@ -253,6 +253,30 @@ pub fn query(tx: &Transaction<'_>, query: Query) -> StorageResult<Result<QueryRe
     as_outcome(read(tx, query))
 }
 
+/// Every retained event as `(offset, event ID)`, read from a local transaction, for the
+/// simulator's end-of-run consistency check.
+#[cfg(feature = "sim")]
+pub(crate) fn sim_events(tx: &Transaction<'_>) -> StorageResult<Result<Vec<(u64, Uuid)>, Error>> {
+    as_outcome((|| {
+        let head = load_head(tx)?;
+        let mut out = Vec::new();
+        let mut after = head.first_checkpoint();
+        while after < head.tail() {
+            let page = events::page(tx, &head, after, MAX_PAGE_EVENTS)?;
+            let Some(last) = page.events.last() else {
+                break;
+            };
+            after = last.offset;
+            out.extend(
+                page.events
+                    .iter()
+                    .map(|event| (event.offset, event.event_id)),
+            );
+        }
+        Ok(out)
+    })())
+}
+
 #[derive(Serialize, Deserialize)]
 struct Head {
     topic_id: Uuid,

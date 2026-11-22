@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::rt::{timeout, timeout_at};
 use anyhow::anyhow;
 use openraft::Raft;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::time::{Instant, timeout, timeout_at};
 
 use super::{
     GroupError, GroupResult, MAX_COMMAND_BYTES, RaftCommand, TypeConfig, WRITE_DEADLINE,
@@ -30,7 +30,7 @@ pub(super) struct PublishBatcher {
 impl PublishBatcher {
     pub fn new(raft: Raft<TypeConfig>, budget: Arc<Semaphore>) -> Self {
         let (queue, receiver) = mpsc::channel(MAX_COMMANDS);
-        tokio::spawn(send_batches(raft, receiver));
+        crate::rt::spawn(send_batches(raft, receiver));
         Self { queue, budget }
     }
 
@@ -83,7 +83,7 @@ async fn send_batches(raft: Raft<TypeConfig>, mut receiver: mpsc::Receiver<Pendi
         }
         let mut bytes = first.bytes;
         let mut pending = vec![first];
-        let deadline = Instant::now() + MAX_DELAY;
+        let deadline = crate::rt::now() + MAX_DELAY;
         while pending.len() < MAX_COMMANDS {
             let Ok(Some(next)) = timeout_at(deadline, receiver.recv()).await else {
                 break;

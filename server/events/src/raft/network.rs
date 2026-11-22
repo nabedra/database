@@ -28,9 +28,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
+#[cfg_attr(feature = "sim", allow(unused_imports))]
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
+#[cfg_attr(feature = "sim", allow(unused_imports))]
 use super::snapshot::{CHUNK_BYTES, MAX_SNAPSHOT_BYTES};
 use super::{Broker, Group, Node, TypeConfig};
 
@@ -52,6 +54,7 @@ pub struct PeerTransport {
     lanes: Arc<Lanes>,
 }
 
+#[cfg_attr(feature = "sim", allow(dead_code))]
 struct Lanes {
     outgoing_control: Semaphore,
     outgoing_data: Semaphore,
@@ -363,6 +366,7 @@ pub(super) struct NetworkFactory {
     pub group: Arc<str>,
 }
 
+#[cfg_attr(feature = "sim", allow(dead_code))]
 pub(super) struct Network {
     peers: PeerTransport,
     group: Arc<str>,
@@ -383,6 +387,7 @@ impl RaftNetworkFactory<TypeConfig> for NetworkFactory {
     }
 }
 
+#[cfg_attr(feature = "sim", allow(dead_code))]
 impl Network {
     async fn call<T, R, E>(
         &self,
@@ -416,6 +421,7 @@ impl Network {
     }
 }
 
+#[cfg(not(feature = "sim"))]
 impl RaftNetwork<TypeConfig> for Network {
     async fn append_entries(
         &mut self,
@@ -480,4 +486,80 @@ impl RaftNetwork<TypeConfig> for Network {
         .map_err(|error| Unreachable::new(&io::Error::other(error.to_string())))?;
         result.map_err(|error| RemoteError::new(self.target, error).into())
     }
+}
+
+/// The simulated peer network: the same receiving checks as [`handle`], carried by the
+/// in-memory router in [`crate::sim::net`] instead of reqwest and axum.
+#[cfg(feature = "sim")]
+impl RaftNetwork<TypeConfig> for Network {
+    async fn append_entries(
+        &mut self,
+        append: AppendEntriesRequest<TypeConfig>,
+        option: RPCOption,
+    ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, Node, RaftError<u64>>> {
+        let rpc = if append.entries.is_empty() {
+            "heartbeat"
+        } else {
+            "append"
+        };
+        let group = self.group.clone();
+        let delivered = crate::sim::net::call(self.target, rpc, option.hard_ttl(), move |broker| {
+            let append = append.clone();
+            let group = broker.group(&group);
+            async move { Some(group?.raft.append_entries(append).await) }
+        })
+        .await;
+        match delivered {
+            Some(reply) => reply.map_err(|error| RemoteError::new(self.target, error).into()),
+            // Planted bug (simulation only): an unreachable follower counts as having
+            // acknowledged the append, so the leader can commit without a majority.
+            None if crate::sim::hooks::ack_unreachable_appends() => {
+                Ok(AppendEntriesResponse::Success)
+            }
+            None => Err(sim_unreachable()),
+        }
+    }
+
+    async fn vote(
+        &mut self,
+        vote: VoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<u64>, RPCError<u64, Node, RaftError<u64>>> {
+        let group = self.group.clone();
+        let delivered =
+            crate::sim::net::call(self.target, "vote", option.hard_ttl(), move |broker| {
+                let (group, vote) = (broker.group(&group), vote.clone());
+                async move {
+                    let group = group?;
+                    if !group.accepts_votes() {
+                        return None;
+                    }
+                    Some(group.raft.vote(vote).await)
+                }
+            })
+            .await;
+        match delivered {
+            Some(reply) => reply.map_err(|error| RemoteError::new(self.target, error).into()),
+            None => Err(sim_unreachable()),
+        }
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        _vote: Vote<u64>,
+        _snapshot: Snapshot<TypeConfig>,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        _option: RPCOption,
+    ) -> Result<SnapshotResponse<u64>, StreamingError<TypeConfig, Fatal<u64>>> {
+        // Snapshot transfer is not simulated yet; runs stay below the snapshot threshold.
+        Err(Unreachable::new(&io::Error::other(
+            "simulated snapshot transfer is not supported",
+        ))
+        .into())
+    }
+}
+
+#[cfg(feature = "sim")]
+fn sim_unreachable<E: std::error::Error>() -> RPCError<u64, Node, E> {
+    Unreachable::new(&io::Error::other("simulated peer unreachable")).into()
 }

@@ -1,0 +1,14 @@
+id = "events-sim"
+module = "events"
+kinds = ["S", "H"]
+guarantees = ["EVT-G01", "EVT-G02", "EVT-G03", "EVT-G04", "EVT-G06"]
+scenarios = ["EV01", "EV02", "EV07"]
+tiers = ["T1", "T2"]
+command = ["cargo", "test", "-j", "2", "--features", "sim", "--lib", "sim::"]
+cwd = "server/events"
+timeout_s = 3600
+needs = []
+result_parser = "cargo-test"
+# tokio_unstable enables Builder::rng_seed (select! order). A separate target directory
+# keeps these RUSTFLAGS from invalidating other Events builds.
+env = { RUSTFLAGS = "--cfg tokio_unstable", CARGO_TARGET_DIR = "target/sim", NABEDRA_SEEDS = "500" }

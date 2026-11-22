@@ -66,6 +66,8 @@ impl RaftStateMachine<TypeConfig> for AppliedState {
                     let mut replies = Vec::with_capacity(batch.len());
                     for entry in batch {
                         let mut tx = store.transaction()?;
+                        #[cfg(feature = "sim")]
+                        let payload_hash = crate::sim::hooks::payload_hash(&entry.payload);
                         let reply = match entry.payload {
                             EntryPayload::Blank => Value::Null,
                             EntryPayload::Membership(membership) => {
@@ -85,6 +87,8 @@ impl RaftStateMachine<TypeConfig> for AppliedState {
                         };
                         tx.header.applied = Some(entry.log_id);
                         tx.commit()?;
+                        #[cfg(feature = "sim")]
+                        crate::sim::hooks::applied(&store.id, entry.log_id, payload_hash);
                         replies.push(reply);
                     }
                     Ok(replies)
