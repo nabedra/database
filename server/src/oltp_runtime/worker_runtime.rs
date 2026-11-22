@@ -327,6 +327,20 @@ impl WorkerRuntime {
                 timestamps: runtime.services.timestamps.identity().clone(),
                 local_timestamps: runtime.services.direct_timestamps.clone(),
             });
+            // CAP1: watch the cluster features this worker's own tasks and
+            // hosted leaders gate on, from activation on (no feature is
+            // enabled before it).
+            let features = runtime.services.manager.cluster_features().clone();
+            let control = runtime.services.control_client.clone();
+            let local = runtime.services.local;
+            direct.on_active(move || {
+                crate::oltp_replication::authority::control::watch_cluster_features(
+                    &control,
+                    local,
+                    &[crate::oltp_replication::authority::control::INDEX_RECLAIM_FEATURE],
+                    &features,
+                );
+            });
             direct.start();
             runtime.direct.set(direct).map_err(|_| unknown())?;
         }

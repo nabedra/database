@@ -37,9 +37,10 @@ pub(super) const BUDGET: TransactionBudget = TransactionBudget {
 pub(crate) struct ControlMachine {
     store: GroupStore,
     replacement_trust: Option<system_trust::ReplacementTrust>,
-    /// GC2 mixed-version tests: apply as the build before cluster features.
+    /// GC2/CAP1 mixed-version tests: apply as a build that knows only the
+    /// first this many cluster features.
     #[cfg(test)]
-    legacy_v1: bool,
+    known_features: usize,
 }
 impl ControlMachine {
     pub(crate) fn new(store: GroupStore) -> Result<Self, ProtocolError> {
@@ -50,13 +51,19 @@ impl ControlMachine {
             store,
             replacement_trust: None,
             #[cfg(test)]
-            legacy_v1: false,
+            known_features: super::direct::CLUSTER_FEATURES.len(),
         })
     }
     /// GC2: this replica applies every entry as a pre-feature build would.
     #[cfg(test)]
-    pub(crate) fn legacy_v1_for_test(mut self) -> Self {
-        self.legacy_v1 = true;
+    pub(crate) fn legacy_v1_for_test(self) -> Self {
+        self.known_features_for_test(0)
+    }
+    /// CAP1: this replica applies every entry as a build that knows only the
+    /// first `count` registered cluster features would.
+    #[cfg(test)]
+    pub(crate) fn known_features_for_test(mut self, count: usize) -> Self {
+        self.known_features = count;
         self
     }
     pub(crate) fn store(&self) -> &GroupStore {
@@ -98,7 +105,7 @@ impl ControlMachine {
             .map(|_| std::sync::Arc::new(std::sync::OnceLock::new()));
         let revoke = revoked.clone();
         #[cfg(test)]
-        let legacy_v1 = self.legacy_v1;
+        let known_features = self.known_features;
         let result = self
             .store
             .transaction(meta, BUDGET, move |tx| {
@@ -106,12 +113,13 @@ impl ControlMachine {
                     return Err(unavailable("Control command digest differs"));
                 }
                 #[cfg(test)]
-                direct::LEGACY_V1.with(|legacy| legacy.set(legacy_v1));
+                direct::KNOWN_FEATURES.with(|known| known.set(known_features));
                 let transition = command
                     .payload()
                     .and_then(|payload| apply(tx, &scope, position, digest, payload));
                 #[cfg(test)]
-                direct::LEGACY_V1.with(|legacy| legacy.set(false));
+                direct::KNOWN_FEATURES
+                    .with(|known| known.set(super::direct::CLUSTER_FEATURES.len()));
                 let transition = transition?;
                 if let (Some(id), Some(revoke)) = (mount, revoke)
                     && let Transition::Commit(reply) = &transition

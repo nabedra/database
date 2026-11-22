@@ -5,9 +5,8 @@
 //! did not advertise cannot become a voter or learner of any group.
 use super::*;
 use crate::oltp_replication::authority::control::direct::{
-    DIRECT_BATCH_FEATURE, DIRECT_VERSION, DirectActivation, DirectCapability,
-    DirectCapabilityOperation, FeatureActivation, QUEUED_SNAPSHOT_RETRY_FEATURE,
-    feature_operation_id,
+    CLUSTER_FEATURES, ClusterFeature, DIRECT_VERSION, DirectActivation, DirectCapability,
+    DirectCapabilityOperation, FeatureActivation, feature_operation_id,
 };
 
 const ACTIVATION: &[u8] = b"ct/direct-capability";
@@ -17,28 +16,34 @@ const READERS: &[u8] = b"ct/direct-reader/";
 const QUEUED_HISTORY: &[u8] = b"ct/direct-queued-history";
 /// GC2: `data.direct.batch` is enabled (a `FeatureActivation`). Written only
 /// by a feature-aware build, never deleted.
-const BATCH_ENABLED: &[u8] = b"ct/feature/data.direct.batch";
+const BATCH_ENABLED: &[u8] = CLUSTER_FEATURES[0].enabled_key;
 pub(in crate::oltp_replication::authority::control) const SNAPSHOT_RETRY_ENABLED: &[u8] =
-    b"ct/feature/status.queued-snapshot-retry";
+    CLUSTER_FEATURES[1].enabled_key;
 
 pub(in crate::oltp_replication::authority::control) fn batch_key() -> &'static [u8] {
     BATCH_ENABLED
 }
 
-// Mixed-version tests (GC2): a Control replica of the build before cluster
-// features, simulated by switching off every feature-aware rule. Set by
-// `ControlMachine::apply` around one apply on the native thread that runs it.
+// Mixed-version tests (GC2, CAP1): a Control replica of an older build,
+// simulated by knowing only the first `KNOWN_FEATURES` registry entries (0:
+// the build before cluster features; 2: the build before
+// `data.index.reclaim`). Set by `ControlMachine::apply` around one apply on
+// the native thread that runs it.
 #[cfg(test)]
 thread_local! {
-    pub(super) static LEGACY_V1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static KNOWN_FEATURES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(CLUSTER_FEATURES.len()) };
 }
+/// The registered features this build applies.
 #[cfg(test)]
-fn legacy_v1() -> bool {
-    LEGACY_V1.with(std::cell::Cell::get)
+fn registry() -> &'static [ClusterFeature] {
+    &CLUSTER_FEATURES[..KNOWN_FEATURES
+        .with(std::cell::Cell::get)
+        .min(CLUSTER_FEATURES.len())]
 }
 #[cfg(not(test))]
-fn legacy_v1() -> bool {
-    false
+fn registry() -> &'static [ClusterFeature] {
+    &CLUSTER_FEATURES
 }
 
 pub(in crate::oltp_replication::authority::control) fn activation_key() -> &'static [u8] {
@@ -104,16 +109,16 @@ pub(super) fn apply(
     // GC2: the reply and every write above are what a pre-feature build
     // produces for this entry. A feature-aware build may add only the
     // enablement, and only when every enrolled worker advertised it.
-    if activation.is_some() && !legacy_v1() {
-        for (feature, enabled_key) in FEATURES {
+    if activation.is_some() {
+        for &feature in registry() {
             let advert = matches!(action, DirectCapabilityOperation::Advertise { .. })
-                && operation_id == feature_operation_id(feature, actor);
+                && operation_id == feature_operation_id(feature.name, actor);
             maybe_enable(
                 tx,
                 state,
                 position,
-                feature,
-                enabled_key,
+                feature.name,
+                feature.enabled_key,
                 advert.then_some(actor),
             )?;
         }
@@ -143,12 +148,9 @@ pub(super) fn active(tx: &mut GroupTransaction<'_>) -> Result<bool, ProtocolErro
     Ok(tx.get(ACTIVATION)?.is_some())
 }
 
-const FEATURES: [(&str, &[u8]); 2] = [
-    (DIRECT_BATCH_FEATURE, BATCH_ENABLED),
-    (QUEUED_SNAPSHOT_RETRY_FEATURE, SNAPSHOT_RETRY_ENABLED),
-];
-
-fn supports_feature(
+/// Whether `worker`'s exact identity advertised `feature`: the receipt of
+/// its derived advert operation holds a `DirectCapability` reply.
+pub(in crate::oltp_replication::authority::control) fn supports_feature(
     tx: &mut GroupTransaction<'_>,
     feature: &str,
     worker: WorkerIdentity,
@@ -162,11 +164,9 @@ fn features_admit(
     tx: &mut GroupTransaction<'_>,
     worker: WorkerIdentity,
 ) -> Result<bool, ProtocolError> {
-    if !legacy_v1() {
-        for (feature, enabled_key) in FEATURES {
-            if tx.get(enabled_key)?.is_some() && !supports_feature(tx, feature, worker)? {
-                return Ok(false);
-            }
+    for feature in registry() {
+        if tx.get(feature.enabled_key)?.is_some() && !supports_feature(tx, feature.name, worker)? {
+            return Ok(false);
         }
     }
     Ok(true)

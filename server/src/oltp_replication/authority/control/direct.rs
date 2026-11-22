@@ -40,6 +40,59 @@ pub(crate) const DIRECT_VERSION: u32 = 1;
 /// `DirectBatch` entry.
 pub(crate) const DIRECT_BATCH_FEATURE: &str = "data.direct.batch";
 pub(crate) const QUEUED_SNAPSHOT_RETRY_FEATURE: &str = "status.queued-snapshot-retry";
+/// CAP1: Data leaders may propose `ReclaimIndex` entries (IDXGC1), and
+/// workers may send the reclamation service calls (`ParticipantStoredIndex`,
+/// `ParticipantIndexReclaim`, the Timestamp `AdvanceFloor` call). An older
+/// build cannot decode them.
+pub(crate) const INDEX_RECLAIM_FEATURE: &str = "data.index.reclaim";
+
+/// One registered cluster feature: its advertised name and the Control key
+/// of its sticky enablement (`ct/feature/<name>`, a `FeatureActivation`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterFeature {
+    pub name: &'static str,
+    pub enabled_key: &'static [u8],
+}
+
+/// The cluster feature registry (CAP1), as ScyllaDB's feature service keeps
+/// one list of known features. Every worker of this build advertises each
+/// entry on its join paths; Control's feature-aware apply evaluates each
+/// entry's enablement and refuses joiners that did not advertise an enabled
+/// one (`machine::direct`). Entries are only ever appended: a name, once
+/// shipped, keeps its meaning and its key.
+pub(crate) const CLUSTER_FEATURES: [ClusterFeature; 3] = [
+    ClusterFeature {
+        name: DIRECT_BATCH_FEATURE,
+        enabled_key: b"ct/feature/data.direct.batch",
+    },
+    ClusterFeature {
+        name: QUEUED_SNAPSHOT_RETRY_FEATURE,
+        enabled_key: b"ct/feature/status.queued-snapshot-retry",
+    },
+    ClusterFeature {
+        name: INDEX_RECLAIM_FEATURE,
+        enabled_key: b"ct/feature/data.index.reclaim",
+    },
+];
+
+/// The registry entry named `name`.
+pub(crate) fn cluster_feature(name: &str) -> Option<ClusterFeature> {
+    CLUSTER_FEATURES
+        .into_iter()
+        .find(|feature| feature.name == name)
+}
+
+/// Control's answer to `ReadRequest::ClusterFeature`: one registered
+/// feature's enablement and whether the caller's current enrolled identity
+/// advertised it. An older Control rejects the request in its parser, and a
+/// Control that does not know the name answers an error: both read as "not
+/// enabled".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClusterFeatureState {
+    pub enabled: Option<FeatureActivation>,
+    pub advertised: bool,
+}
 
 /// The operation id of `actor`'s advert of `feature` (see the module doc).
 /// It covers the exact enrolled identity, so a new incarnation (possibly an

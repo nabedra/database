@@ -3,7 +3,7 @@
 //! Current process enrollment remains a transport concern, not a Raft node ID.
 use super::{
     authority::consensus::Applied,
-    entry::{CommittedLeaderId, LogId, Membership, OwnedRaftEntry, Payload, Vote},
+    entry::{CommittedLeaderId, LogId, Membership, OwnedRaftEntry, Vote},
     hosted::{HostedState, RaftCores, TypedMachine, TypedSnapshot},
     multiplex::{
         AuthenticatedSession, ChargedReply, ChargedSections, Endpoint, EndpointFuture, PeerFeature,
@@ -353,7 +353,10 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
         rpc.entries.truncate(encoded.len());
         let previous = rpc.prev_log_id;
         let last = rpc.last_log_id();
-        let (payload, entries, mut target) = match encoded.len() {
+        // CAP1: entries Control's cluster features gate (`ReclaimIndex`) need
+        // no per-connection check here: a leader proposes one only once every
+        // replica host's build decodes it.
+        let (payload, entries, target) = match encoded.len() {
             0 => (None, None, RequestTarget::from(self.node.worker_id)),
             1 => (
                 encoded.pop(),
@@ -371,12 +374,6 @@ impl<C: TypedConfig> RaftNetworkV2<C> for TypedNetwork<C> {
                 )
             }
         };
-        if rpc.entries.iter().any(|entry| match entry.payload() {
-            Payload::Normal(command) => command.payload().is_ok_and(C::requires_index_reclamation),
-            _ => false,
-        }) {
-            target = RequestTarget::Feature(self.node.worker_id, PeerFeature::IndexReclamation);
-        }
         let header = Header {
             from_node: self.factory.local.node_id,
             to_node: self.target,
