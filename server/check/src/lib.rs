@@ -8,3 +8,5 @@ pub mod rng;
 
 pub use r#gen::Gen;
 pub use r#gen as generator;
+pub mod checker;
+pub mod history;
